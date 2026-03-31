@@ -581,8 +581,11 @@ async fn route_source_status_snapshot(
             break Err(last_err.unwrap_or(CnxError::Timeout));
         }
         let attempt_timeout = remaining.min(Duration::from_secs(5));
-        let adapter =
-            exchange_host_adapter(boundary.clone(), origin_id.clone(), default_route_bindings());
+        let adapter = exchange_host_adapter(
+            boundary.clone(),
+            origin_id.clone(),
+            default_route_bindings(),
+        );
         match adapter
             .call_collect(
                 ROUTE_TOKEN_FS_META_INTERNAL,
@@ -629,8 +632,11 @@ pub(crate) async fn route_sink_status_snapshot(
             break Err(last_err.unwrap_or(CnxError::Timeout));
         }
         let attempt_timeout = remaining.min(Duration::from_secs(5));
-        let adapter =
-            exchange_host_adapter(boundary.clone(), origin_id.clone(), default_route_bindings());
+        let adapter = exchange_host_adapter(
+            boundary.clone(),
+            origin_id.clone(),
+            default_route_bindings(),
+        );
         match adapter
             .call_collect(
                 ROUTE_TOKEN_FS_META_INTERNAL,
@@ -698,10 +704,9 @@ async fn load_materialized_status_snapshots(
             Ok(snapshot) => snapshot,
             Err(err @ CnxError::Timeout)
             | Err(err @ CnxError::TransportClosed(_))
-            | Err(err @ CnxError::ProtocolViolation(_)) => source
-                .status_snapshot()
-                .await
-                .map_err(|_| err)?,
+            | Err(err @ CnxError::ProtocolViolation(_)) => {
+                source.status_snapshot().await.map_err(|_| err)?
+            }
             Err(err) => return Err(err),
         },
         QueryBackend::Local { .. } => source.status_snapshot().await?,
@@ -1431,9 +1436,13 @@ async fn query_materialized_events(
                     );
                     return result;
                 }
-                let result =
-                    route_materialized_events_via_node(boundary.clone(), node_id.clone(), params.clone(), timeout)
-                        .await;
+                let result = route_materialized_events_via_node(
+                    boundary.clone(),
+                    node_id.clone(),
+                    params.clone(),
+                    timeout,
+                )
+                .await;
                 eprintln!(
                     "fs_meta_query_api: query_materialized_events selected-group route owner_node={} local_owner=false ok={}",
                     node_id.0,
@@ -1523,9 +1532,7 @@ async fn route_materialized_events_via_node(
             ),
             Err(err) => eprintln!(
                 "fs_meta_query_api: materialized_route_capture failed owner_node={} selected_group={:?} err={}",
-                owner_node,
-                params.scope.selected_group,
-                err
+                owner_node, params.scope.selected_group, err
             ),
         }
     }
@@ -2624,30 +2631,30 @@ async fn build_tree_pit_session(
         )
         .await
         {
-                Ok(events) => events,
-                Err(CnxError::Timeout)
-                | Err(CnxError::TransportClosed(_))
-                | Err(CnxError::ProtocolViolation(_)) => {
-                    let response = empty_materialized_tree_group_payload(&params.path);
-                    groups.push(GroupPitSnapshot {
-                        group: rank.group_key,
-                        status: "ok",
-                        reliable: response.reliability.reliable,
-                        unreliable_reason: response.reliability.unreliable_reason,
-                        stability: response.stability,
-                        meta: PitMetadata {
-                            read_class,
-                            metadata_available: true,
-                            withheld_reason: None,
-                        },
-                        root: Some(response.root),
-                        entries: response.entries,
-                        errors: Vec::new(),
-                    });
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
+            Ok(events) => events,
+            Err(CnxError::Timeout)
+            | Err(CnxError::TransportClosed(_))
+            | Err(CnxError::ProtocolViolation(_)) => {
+                let response = empty_materialized_tree_group_payload(&params.path);
+                groups.push(GroupPitSnapshot {
+                    group: rank.group_key,
+                    status: "ok",
+                    reliable: response.reliability.reliable,
+                    unreliable_reason: response.reliability.unreliable_reason,
+                    stability: response.stability,
+                    meta: PitMetadata {
+                        read_class,
+                        metadata_available: true,
+                        withheld_reason: None,
+                    },
+                    root: Some(response.root),
+                    entries: response.entries,
+                    errors: Vec::new(),
+                });
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         match decode_materialized_selected_group_response(
             &events,
             policy,
@@ -3657,7 +3664,6 @@ mod tests {
         sink_reply_sent: std::sync::atomic::AtomicBool,
     }
 
-
     struct MaterializedSelectedGroupTreeStallBoundary {
         owner_request_channel: String,
         sink_status_request_channel: String,
@@ -3900,7 +3906,6 @@ mod tests {
         }
     }
 
-
     impl MaterializedSelectedGroupTreeStallBoundary {
         fn new(owner_request_channel: String, sink_status_request_channel: String) -> Self {
             Self {
@@ -4011,7 +4016,9 @@ mod tests {
                     .send_batches_by_channel
                     .lock()
                     .expect("reusable route boundary send batches lock");
-                *send_batches.entry(request.channel_key.0.clone()).or_default() += 1;
+                *send_batches
+                    .entry(request.channel_key.0.clone())
+                    .or_default() += 1;
             }
             {
                 let mut channels = self.channels.lock().await;
@@ -4043,12 +4050,17 @@ mod tests {
                             .recv_batches_by_channel
                             .lock()
                             .expect("reusable route boundary recv batches lock");
-                        *recv_batches.entry(request.channel_key.0.clone()).or_default() += 1;
+                        *recv_batches
+                            .entry(request.channel_key.0.clone())
+                            .or_default() += 1;
                         return Ok(events);
                     }
                 }
                 {
-                    let closed = self.closed.lock().expect("reusable route boundary closed lock");
+                    let closed = self
+                        .closed
+                        .lock()
+                        .expect("reusable route boundary closed lock");
                     if closed.contains(&request.channel_key.0) {
                         return Err(CnxError::ChannelClosed);
                     }
@@ -4113,7 +4125,9 @@ mod tests {
                 .recv_batches_by_channel
                 .lock()
                 .expect("source/sink selective boundary recv batches lock");
-            *recv_batches.entry(request.channel_key.0.clone()).or_default() += 1;
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
             drop(recv_batches);
             if request.channel_key.0 == self.sink_reply_channel
                 && !self
@@ -4172,7 +4186,9 @@ mod tests {
                 .recv_batches_by_channel
                 .lock()
                 .expect("source retry boundary recv batches lock");
-            *recv_batches.entry(request.channel_key.0.clone()).or_default() += 1;
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
             drop(recv_batches);
 
             if request.channel_key.0 == self.source_reply_channel {
@@ -4265,7 +4281,9 @@ mod tests {
                 .recv_batches_by_channel
                 .lock()
                 .expect("sink retry boundary recv batches lock");
-            *recv_batches.entry(request.channel_key.0.clone()).or_default() += 1;
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
             drop(recv_batches);
 
             if request.channel_key.0 != self.sink_reply_channel {
@@ -4339,7 +4357,9 @@ mod tests {
                 .recv_batches_by_channel
                 .lock()
                 .expect("sink peer transport retry boundary recv batches lock");
-            *recv_batches.entry(request.channel_key.0.clone()).or_default() += 1;
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
             drop(recv_batches);
 
             if request.channel_key.0 != self.sink_reply_channel {
@@ -4370,7 +4390,6 @@ mod tests {
             )])
         }
     }
-
 
     #[async_trait]
     impl ChannelIoSubset for MaterializedSelectedGroupTreeStallBoundary {
@@ -4474,8 +4493,7 @@ mod tests {
                 }
                 let notified = self.changed.notified();
                 if let Some(timeout_ms) = request.timeout_ms {
-                    let deadline =
-                        tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+                    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
                     match tokio::time::timeout_at(deadline, notified).await {
                         Ok(()) => {}
                         Err(_) => return Err(CnxError::Timeout),
@@ -5002,7 +5020,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn load_materialized_status_snapshots_falls_back_to_local_source_when_route_source_status_times_out()
-    {
+     {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let node_a_root = tmp.path().join("node-a");
         fs::create_dir_all(&node_a_root).expect("create node-a dir");
@@ -5540,8 +5558,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let root = tmp.path().join("node-a");
         fs::create_dir_all(root.join("force-find-stress")).expect("create node-a dir");
-        fs::write(root.join("force-find-stress").join("seed.txt"), b"a")
-            .expect("seed node-a file");
+        fs::write(root.join("force-find-stress").join("seed.txt"), b"a").expect("seed node-a file");
         let grants = vec![GrantedMountRoot {
             object_ref: "node-a::nfs1".to_string(),
             host_ref: "node-a".to_string(),
@@ -5578,12 +5595,8 @@ mod tests {
                 }
             },
         );
-        let state = test_api_state_for_route_source(
-            source,
-            sink,
-            boundary,
-            NodeId("node-d".to_string()),
-        );
+        let state =
+            test_api_state_for_route_source(source, sink, boundary, NodeId("node-d".to_string()));
 
         let result = query_force_find_group_tree(
             &state,
@@ -5618,8 +5631,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let root = tmp.path().join("node-a");
         fs::create_dir_all(root.join("force-find-stress")).expect("create node-a dir");
-        fs::write(root.join("force-find-stress").join("seed.txt"), b"a")
-            .expect("seed node-a file");
+        fs::write(root.join("force-find-stress").join("seed.txt"), b"a").expect("seed node-a file");
         let grants = vec![GrantedMountRoot {
             object_ref: "node-a::nfs1".to_string(),
             host_ref: "node-a".to_string(),
@@ -5641,24 +5653,22 @@ mod tests {
         let route = sink_query_request_route_for("node-a");
         let observed_request_nodes = Arc::new(Mutex::new(Vec::<String>::new()));
         let observed_request_nodes_for_handler = observed_request_nodes.clone();
-        let payload = rmp_serde::to_vec_named(&MaterializedQueryPayload::Tree(
-            TreeGroupPayload {
-                reliability: GroupReliability {
-                    reliable: true,
-                    unreliable_reason: None,
-                },
-                stability: TreeStability::not_evaluated(),
-                root: TreePageRoot {
-                    path: b"/force-find-stress".to_vec(),
-                    size: 0,
-                    modified_time_us: 1,
-                    is_dir: true,
-                    exists: true,
-                    has_children: true,
-                },
-                entries: Vec::new(),
+        let payload = rmp_serde::to_vec_named(&MaterializedQueryPayload::Tree(TreeGroupPayload {
+            reliability: GroupReliability {
+                reliable: true,
+                unreliable_reason: None,
             },
-        ))
+            stability: TreeStability::not_evaluated(),
+            root: TreePageRoot {
+                path: b"/force-find-stress".to_vec(),
+                size: 0,
+                modified_time_us: 1,
+                is_dir: true,
+                exists: true,
+                has_children: true,
+            },
+            entries: Vec::new(),
+        }))
         .expect("encode materialized tree payload");
         let mut endpoint = ManagedEndpointTask::spawn(
             boundary.clone(),
@@ -5691,12 +5701,8 @@ mod tests {
                 }
             },
         );
-        let state = test_api_state_for_route_source(
-            source,
-            sink,
-            boundary,
-            NodeId("node-d".to_string()),
-        );
+        let state =
+            test_api_state_for_route_source(source, sink, boundary, NodeId("node-d".to_string()));
 
         let result = query_materialized_events(
             state.backend.clone(),
@@ -5713,7 +5719,10 @@ mod tests {
         .expect("selected-group materialized route query");
 
         assert_eq!(
-            observed_request_nodes.lock().expect("request nodes lock").as_slice(),
+            observed_request_nodes
+                .lock()
+                .expect("request nodes lock")
+                .as_slice(),
             &["node-a".to_string()],
             "selected-group routed materialized query should call the internal sink-query endpoint as the chosen owner node"
         );
@@ -5749,10 +5758,9 @@ mod tests {
                 let non_owner_groups = non_owner_groups_for_handler.clone();
                 async move {
                     for req in requests {
-                        let params = rmp_serde::from_slice::<InternalQueryRequest>(
-                            req.payload_bytes(),
-                        )
-                        .expect("decode non-owner internal query request");
+                        let params =
+                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                                .expect("decode non-owner internal query request");
                         non_owner_groups
                             .lock()
                             .expect("non-owner groups lock")
@@ -5778,10 +5786,9 @@ mod tests {
                 async move {
                     let mut responses = Vec::new();
                     for req in requests {
-                        let params = rmp_serde::from_slice::<InternalQueryRequest>(
-                            req.payload_bytes(),
-                        )
-                        .expect("decode owner internal query request");
+                        let params =
+                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                                .expect("decode owner internal query request");
                         let group_id = params
                             .scope
                             .selected_group
@@ -5856,7 +5863,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn selected_group_materialized_route_waits_for_owner_payload_instead_of_settling_on_fast_empty_proxy_reply() {
+    async fn selected_group_materialized_route_waits_for_owner_payload_instead_of_settling_on_fast_empty_proxy_reply()
+     {
         let proxy_route = default_route_bindings()
             .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
             .expect("resolve sink-query-proxy route");
@@ -5903,7 +5911,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sequential_selected_group_materialized_route_reaches_owner_twice_for_same_owner_node() {
+    async fn sequential_selected_group_materialized_route_reaches_owner_twice_for_same_owner_node()
+    {
         let route = sink_query_request_route_for("node-a");
         let reply_route = format!("{}:reply", route.0);
         let boundary = Arc::new(ReusableObservedRouteBoundary::default());
@@ -5919,15 +5928,10 @@ mod tests {
                 async move {
                     let mut responses = Vec::new();
                     for req in requests {
-                        let params = rmp_serde::from_slice::<InternalQueryRequest>(
-                            req.payload_bytes(),
-                        )
-                        .expect("decode internal query request");
-                        let group_id = params
-                            .scope
-                            .selected_group
-                            .clone()
-                            .expect("selected group");
+                        let params =
+                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                                .expect("decode internal query request");
+                        let group_id = params.scope.selected_group.clone().expect("selected group");
                         observed_groups
                             .lock()
                             .expect("observed groups lock")
@@ -5980,7 +5984,10 @@ mod tests {
             boundary.recv_batch_count(&route.0),
             boundary.send_batch_count(&reply_route),
             boundary.recv_batch_count(&reply_route),
-            observed_groups.lock().expect("observed groups lock").clone(),
+            observed_groups
+                .lock()
+                .expect("observed groups lock")
+                .clone(),
             first.as_ref().err(),
         );
         assert!(
@@ -5990,7 +5997,10 @@ mod tests {
             boundary.recv_batch_count(&route.0),
             boundary.send_batch_count(&reply_route),
             boundary.recv_batch_count(&reply_route),
-            observed_groups.lock().expect("observed groups lock").clone(),
+            observed_groups
+                .lock()
+                .expect("observed groups lock")
+                .clone(),
             second.as_ref().err(),
         );
 
@@ -6014,7 +6024,10 @@ mod tests {
         assert!(first_payload.root.exists);
         assert!(second_payload.root.exists);
         assert_eq!(
-            observed_groups.lock().expect("observed groups lock").as_slice(),
+            observed_groups
+                .lock()
+                .expect("observed groups lock")
+                .as_slice(),
             &["nfs1".to_string(), "nfs2".to_string()],
             "owner endpoint should receive both sequential same-owner selected-group materialized reads"
         );
@@ -6096,16 +6109,16 @@ mod tests {
         let source_runtime =
             FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-a".to_string()), None)
                 .expect("init owner source runtime");
-        let mut stream = source_runtime.pub_().await.expect("start owner source stream");
+        let mut stream = source_runtime
+            .pub_()
+            .await
+            .expect("start owner source stream");
 
         let boundary = Arc::new(ReusableObservedRouteBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
-        let factory = RuntimeWorkerClientFactory::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
         let sink_worker = SinkWorkerClientHandle::new(
             NodeId("node-a".to_string()),
             cfg,
@@ -6307,13 +6320,16 @@ mod tests {
             "caller should receive one reply batch for each direct internal sink-query request"
         );
 
-        source_runtime.close().await.expect("close owner source runtime");
+        source_runtime
+            .close()
+            .await
+            .expect("close owner source runtime");
         sink_worker.close().await.expect("close sink worker");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn selected_group_materialized_route_prefers_sink_scheduled_owner_over_stale_source_primary(
-    ) {
+    async fn selected_group_materialized_route_prefers_sink_scheduled_owner_over_stale_source_primary()
+     {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let node_a_root = tmp.path().join("node-a");
         fs::create_dir_all(node_a_root.join("retired-layout")).expect("create node-a dir");
@@ -6389,20 +6405,16 @@ mod tests {
                 let node_a_groups = node_a_groups_for_handler.clone();
                 async move {
                     for req in requests {
-                        let params = rmp_serde::from_slice::<InternalQueryRequest>(
-                            req.payload_bytes(),
-                        )
-                        .expect("decode node-a internal query request");
-                        node_a_groups
-                            .lock()
-                            .expect("node-a groups lock")
-                            .push(
-                                params
-                                    .scope
-                                    .selected_group
-                                    .clone()
-                                    .expect("selected group for node-a request"),
-                            );
+                        let params =
+                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                                .expect("decode node-a internal query request");
+                        node_a_groups.lock().expect("node-a groups lock").push(
+                            params
+                                .scope
+                                .selected_group
+                                .clone()
+                                .expect("selected group for node-a request"),
+                        );
                     }
                     Vec::new()
                 }
@@ -6418,10 +6430,9 @@ mod tests {
                 async move {
                     let mut responses = Vec::new();
                     for req in requests {
-                        let params = rmp_serde::from_slice::<InternalQueryRequest>(
-                            req.payload_bytes(),
-                        )
-                        .expect("decode node-b internal query request");
+                        let params =
+                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                                .expect("decode node-b internal query request");
                         let group_id = params
                             .scope
                             .selected_group
@@ -6483,10 +6494,7 @@ mod tests {
         .expect("decode selected-group scheduled owner response");
         assert!(payload.root.exists);
         assert!(
-            node_a_groups
-                .lock()
-                .expect("node-a groups lock")
-                .is_empty(),
+            node_a_groups.lock().expect("node-a groups lock").is_empty(),
             "stale source-primary owner should not receive the selected-group materialized request once sink scheduling points elsewhere"
         );
         assert_eq!(
@@ -6603,10 +6611,9 @@ mod tests {
                 async move {
                     let mut responses = Vec::new();
                     for req in requests {
-                        let params = rmp_serde::from_slice::<InternalQueryRequest>(
-                            req.payload_bytes(),
-                        )
-                        .expect("decode node-a internal query request");
+                        let params =
+                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                                .expect("decode node-a internal query request");
                         let group_id = params
                             .scope
                             .selected_group
@@ -6722,12 +6729,8 @@ mod tests {
             owner_route.0.clone(),
             sink_status_route.0,
         ));
-        let state = test_api_state_for_route_source(
-            source,
-            sink,
-            boundary,
-            NodeId("node-d".to_string()),
-        );
+        let state =
+            test_api_state_for_route_source(source, sink, boundary, NodeId("node-d".to_string()));
         let params = NormalizedApiParams {
             path: b"/".to_vec(),
             group: None,
@@ -6753,7 +6756,9 @@ mod tests {
             ),
         )
         .await
-        .expect("selected-group materialized route stall should not hang tree PIT beyond query timeout")
+        .expect(
+            "selected-group materialized route stall should not hang tree PIT beyond query timeout",
+        )
         .expect("build tree pit session");
 
         assert_eq!(
@@ -6822,11 +6827,19 @@ mod tests {
         );
 
         let nfs1 = crate::runtime_app::shared_tokio_runtime()
-            .block_on(materialized_owner_node_for_group(source.as_ref(), None, "nfs1"))
+            .block_on(materialized_owner_node_for_group(
+                source.as_ref(),
+                None,
+                "nfs1",
+            ))
             .expect("resolve nfs1 owner")
             .expect("nfs1 owner");
         let nfs2 = crate::runtime_app::shared_tokio_runtime()
-            .block_on(materialized_owner_node_for_group(source.as_ref(), None, "nfs2"))
+            .block_on(materialized_owner_node_for_group(
+                source.as_ref(),
+                None,
+                "nfs2",
+            ))
             .expect("resolve nfs2 owner")
             .expect("nfs2 owner");
 

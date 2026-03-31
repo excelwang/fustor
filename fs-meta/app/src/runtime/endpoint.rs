@@ -1,7 +1,7 @@
-use std::sync::{Arc, Mutex as StdMutex};
-use std::sync::mpsc::{Receiver, sync_channel};
-use std::time::Duration;
 use std::panic::AssertUnwindSafe;
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +15,8 @@ use futures_util::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::routes::ROUTE_KEY_SINK_QUERY_INTERNAL;
+#[cfg(test)]
+use crate::runtime::routes::sink_query_request_route_for;
 
 const ENDPOINT_READY_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 
@@ -46,7 +48,20 @@ fn debug_materialized_route_lifecycle_enabled() -> bool {
 }
 
 fn is_materialized_internal_query_route(route: &RouteKey) -> bool {
-    route.0 == format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL)
+    let Some(request_route) = route.0.strip_suffix(".req") else {
+        return false;
+    };
+    let Some((stem, version)) = ROUTE_KEY_SINK_QUERY_INTERNAL.rsplit_once(':') else {
+        return request_route == ROUTE_KEY_SINK_QUERY_INTERNAL
+            || request_route.starts_with(&format!("{ROUTE_KEY_SINK_QUERY_INTERNAL}."));
+    };
+    if request_route == ROUTE_KEY_SINK_QUERY_INTERNAL {
+        return true;
+    }
+    let Some(route_stem) = request_route.strip_suffix(&format!(":{version}")) else {
+        return false;
+    };
+    route_stem.starts_with(&format!("{stem}."))
 }
 
 fn is_stale_grant_attachment_recv_gap(err: &CnxError) -> bool {
@@ -83,8 +98,10 @@ async fn close_stale_recv_channel(
     let close_boundary = boundary.clone();
     let close_ctx = ctx.clone();
     let close_channel = channel.clone();
-    match tokio::task::spawn_blocking(move || close_boundary.channel_close(close_ctx, close_channel))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        close_boundary.channel_close(close_ctx, close_channel)
+    })
+    .await
     {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
@@ -107,7 +124,9 @@ async fn close_stale_recv_channel(
 fn summarize_event_origins(events: &[Event]) -> Vec<String> {
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
     for event in events {
-        *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+        *counts
+            .entry(event.metadata().origin_id.0.clone())
+            .or_default() += 1;
     }
     counts
         .into_iter()
@@ -299,8 +318,7 @@ impl ManagedEndpointTask {
                 };
                 *terminal_reason_for_runner
                     .lock()
-                    .expect("terminal_reason lock") =
-                    Some(format!("panic:{panic_message}"));
+                    .expect("terminal_reason lock") = Some(format!("panic:{panic_message}"));
                 log::warn!(
                     "endpoint task {} panicked for {}: {}",
                     join_name,
@@ -368,8 +386,7 @@ impl ManagedEndpointTask {
                 };
                 *terminal_reason_for_runner
                     .lock()
-                    .expect("terminal_reason lock") =
-                    Some(format!("panic:{panic_message}"));
+                    .expect("terminal_reason lock") = Some(format!("panic:{panic_message}"));
                 log::warn!(
                     "stream task {} panicked for {}: {}",
                     name_for_runner,
@@ -717,9 +734,7 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
     if debug_materialized_route {
         eprintln!(
             "fs_meta_runtime_endpoint: materialized_route loop_exit route={} task={} reason={}",
-            route.0,
-            join_name,
-            final_reason
+            route.0, join_name, final_reason
         );
     }
 }
@@ -1268,6 +1283,22 @@ mod tests {
     }
 
     #[test]
+    fn materialized_route_debug_scope_includes_per_peer_sink_query_routes_only() {
+        assert!(is_materialized_internal_query_route(&RouteKey(
+            "materialized-find:v1.req".into()
+        )));
+        assert!(is_materialized_internal_query_route(
+            &sink_query_request_route_for("node-b")
+        ));
+        assert!(!is_materialized_internal_query_route(&RouteKey(
+            "materialized-find-proxy:v1.req".into()
+        )));
+        assert!(!is_materialized_internal_query_route(&RouteKey(
+            "sink-status:v1.req".into()
+        )));
+    }
+
+    #[test]
     fn spawned_endpoint_waits_briefly_for_loop_start_before_returning() {
         install_endpoint_loop_start_delay_hook(Duration::from_millis(40));
         let boundary = Arc::new(RecordingBoundary::new());
@@ -1428,7 +1459,6 @@ mod tests {
             ]
         );
     }
-
 
     #[test]
     fn endpoint_loop_retries_stale_drained_fenced_grant_attachment_errors() {
@@ -1644,7 +1674,10 @@ mod tests {
         while !endpoint.is_finished() && started.elapsed() < Duration::from_secs(1) {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(endpoint.is_finished(), "endpoint should have exited for the test seam");
+        assert!(
+            endpoint.is_finished(),
+            "endpoint should have exited for the test seam"
+        );
         assert_eq!(
             endpoint.finish_reason().as_deref(),
             Some("recv_failed:internal error: stop after first recv"),
@@ -1681,7 +1714,6 @@ mod tests {
             "endpoint loop should keep serving later materialized batches after a transient reply send timeout"
         );
     }
-
 
     #[test]
     fn stream_loop_retries_stale_drained_fenced_grant_attachment_errors() {

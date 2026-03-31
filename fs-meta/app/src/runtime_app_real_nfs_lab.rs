@@ -4,6 +4,33 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use tempfile::TempDir;
 
+const E2E_TMP_ROOT_ENV: &str = "DATANIX_E2E_TMP_ROOT";
+const LEGACY_E2E_TMP_ROOT_ENV: &str = "CAPANIX_E2E_TMP_ROOT";
+const REAL_NFS_LAB_COMPONENT: &str = "runtime-app-real-nfs";
+
+fn e2e_tmp_root() -> PathBuf {
+    if let Ok(raw) = std::env::var(E2E_TMP_ROOT_ENV)
+        .or_else(|_| std::env::var(LEGACY_E2E_TMP_ROOT_ENV))
+    {
+        let dir = PathBuf::from(raw);
+        fs::create_dir_all(&dir).expect("create e2e temp root");
+        return dir;
+    }
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join(".tmp")
+        .join("fs-meta-e2e");
+    fs::create_dir_all(&dir).expect("create default e2e temp root");
+    dir
+}
+
+fn real_nfs_lab_parent_dir() -> PathBuf {
+    let dir = e2e_tmp_root().join(REAL_NFS_LAB_COMPONENT);
+    fs::create_dir_all(&dir).expect("create runtime app real nfs parent dir");
+    dir
+}
+
 #[derive(Debug, Clone)]
 pub struct RealNfsPreflight {
     pub enabled: bool,
@@ -92,8 +119,10 @@ impl NfsLab {
                 .reason
                 .unwrap_or_else(|| "real NFS preflight failed".to_string()));
         }
-        let temp =
-            tempfile::tempdir().map_err(|e| format!("create NFS lab tempdir failed: {e}"))?;
+        let temp = tempfile::Builder::new()
+            .prefix(".tmp")
+            .tempdir_in(real_nfs_lab_parent_dir())
+            .map_err(|e| format!("create NFS lab tempdir failed: {e}"))?;
         let exports_dir = temp.path().join("exports");
         let mounts_dir = temp.path().join("mounts");
         fs::create_dir_all(&exports_dir).map_err(|e| format!("create exports dir failed: {e}"))?;

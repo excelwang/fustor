@@ -277,9 +277,7 @@ fn scenario_tree_stats_stable_across_upgrade(harness: &mut UpgradeHarness) -> Re
     Ok(())
 }
 
-fn scenario_tree_materialization_after_upgrade(
-    harness: &mut UpgradeHarness,
-) -> Result<(), String> {
+fn scenario_tree_materialization_after_upgrade(harness: &mut UpgradeHarness) -> Result<(), String> {
     upgrade_to_generation_two(harness)?;
     harness.session.rescan()?;
     wait_for_primary_tree_materialization(
@@ -289,9 +287,7 @@ fn scenario_tree_materialization_after_upgrade(
     Ok(())
 }
 
-fn scenario_sink_control_roles_after_upgrade(
-    harness: &mut UpgradeHarness,
-) -> Result<(), String> {
+fn scenario_sink_control_roles_after_upgrade(harness: &mut UpgradeHarness) -> Result<(), String> {
     let upgrade_result = upgrade_to_generation_two(harness);
     let convergence_result = wait_for_node_a_sink_control_convergence(
         &harness.cluster,
@@ -309,9 +305,7 @@ fn scenario_sink_control_roles_after_upgrade(
     }
 }
 
-fn scenario_source_control_roles_after_upgrade(
-    harness: &mut UpgradeHarness,
-) -> Result<(), String> {
+fn scenario_source_control_roles_after_upgrade(harness: &mut UpgradeHarness) -> Result<(), String> {
     let upgrade_result = upgrade_to_generation_two(harness);
     let convergence_result = wait_for_peer_source_control_convergence(
         &harness.cluster,
@@ -403,30 +397,35 @@ fn wait_for_node_a_sink_control_convergence(
     app_id: &str,
     timeout: Duration,
 ) -> Result<(), String> {
-    wait_until(timeout, "node-a sink control converges after generation-two upgrade", || {
-        let sink_active = cluster.unit_active_pids_for_instance("node-a", app_id, "runtime.exec.sink")?;
-        let node_status = cluster.status("node-a")?;
-        let mut status_session = probe_status_session(cluster, candidate_base_urls)?;
-        let app_status = status_session.status()?;
-        let scheduled_sink = status_debug_groups_by_node(
-            &app_status,
-            "sink",
-            "scheduled_groups_by_node",
-            "node-a",
-        );
-        let expected = BTreeMap::from([(
-            "node-a".to_string(),
-            vec!["nfs1".to_string(), "nfs2".to_string()],
-        )]);
-        if !sink_active.is_empty() && scheduled_sink == expected {
-            Ok(true)
-        } else {
-            Err(format!(
+    wait_until(
+        timeout,
+        "node-a sink control converges after generation-two upgrade",
+        || {
+            let sink_active =
+                cluster.unit_active_pids_for_instance("node-a", app_id, "runtime.exec.sink")?;
+            let node_status = cluster.status("node-a")?;
+            let mut status_session = probe_status_session(cluster, candidate_base_urls)?;
+            let app_status = status_session.status()?;
+            let scheduled_sink = status_debug_groups_by_node(
+                &app_status,
+                "sink",
+                "scheduled_groups_by_node",
+                "node-a",
+            );
+            let expected = BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]);
+            if !sink_active.is_empty() && scheduled_sink == expected {
+                Ok(true)
+            } else {
+                Err(format!(
                 "node-a sink not converged: active_pids={sink_active:?}; scheduled_sink={scheduled_sink:?}; routes={:?}",
                 activation_route_summaries(&node_status)
             ))
-        }
-    })
+            }
+        },
+    )
 }
 
 fn wait_for_peer_source_control_convergence(
@@ -435,50 +434,70 @@ fn wait_for_peer_source_control_convergence(
     app_id: &str,
     timeout: Duration,
 ) -> Result<(), String> {
-    wait_until(timeout, "node-b/c/d source control converges after generation-two upgrade", || {
-        let mut failures = Vec::new();
-        let mut status_session = probe_status_session(cluster, candidate_base_urls)?;
-        let app_status = status_session.status()?;
-        for (node_name, expected_groups) in [
-            ("node-b", vec!["nfs1".to_string()]),
-            ("node-c", vec!["nfs1".to_string(), "nfs2".to_string()]),
-            ("node-d", vec!["nfs2".to_string()]),
-        ] {
-            let source_active =
-                cluster.unit_active_pids_for_instance(node_name, app_id, "runtime.exec.source")?;
-            let scan_active =
-                cluster.unit_active_pids_for_instance(node_name, app_id, "runtime.exec.scan")?;
-            let node_status = cluster.status(node_name)?;
-            let scheduled_source = status_debug_groups_by_node(
-                &app_status,
-                "source",
-                "scheduled_source_groups_by_node",
-                node_name,
-            );
-            let scheduled_scan = status_debug_groups_by_node(
-                &app_status,
-                "source",
-                "scheduled_scan_groups_by_node",
-                node_name,
-            );
-            let raw_scheduled_source =
-                status_debug_groups_field(&app_status, "source", "scheduled_source_groups_by_node");
-            let raw_scheduled_scan =
-                status_debug_groups_field(&app_status, "source", "scheduled_scan_groups_by_node");
-            let expected = BTreeMap::from([(node_name.to_string(), expected_groups.clone())]);
-            if source_active.is_empty() || scan_active.is_empty() || scheduled_source != expected || scheduled_scan != expected {
-                failures.push(format!(
+    wait_until(
+        timeout,
+        "node-b/c/d source control converges after generation-two upgrade",
+        || {
+            let mut failures = Vec::new();
+            let mut status_session = probe_status_session(cluster, candidate_base_urls)?;
+            let app_status = status_session.status()?;
+            for (node_name, expected_groups) in [
+                ("node-b", vec!["nfs1".to_string()]),
+                ("node-c", vec!["nfs1".to_string(), "nfs2".to_string()]),
+                ("node-d", vec!["nfs2".to_string()]),
+            ] {
+                let source_active = cluster.unit_active_pids_for_instance(
+                    node_name,
+                    app_id,
+                    "runtime.exec.source",
+                )?;
+                let scan_active = cluster.unit_active_pids_for_instance(
+                    node_name,
+                    app_id,
+                    "runtime.exec.scan",
+                )?;
+                let node_status = cluster.status(node_name)?;
+                let scheduled_source = status_debug_groups_by_node(
+                    &app_status,
+                    "source",
+                    "scheduled_source_groups_by_node",
+                    node_name,
+                );
+                let scheduled_scan = status_debug_groups_by_node(
+                    &app_status,
+                    "source",
+                    "scheduled_scan_groups_by_node",
+                    node_name,
+                );
+                let raw_scheduled_source = status_debug_groups_field(
+                    &app_status,
+                    "source",
+                    "scheduled_source_groups_by_node",
+                );
+                let raw_scheduled_scan = status_debug_groups_field(
+                    &app_status,
+                    "source",
+                    "scheduled_scan_groups_by_node",
+                );
+                let expected = BTreeMap::from([(node_name.to_string(), expected_groups.clone())]);
+                if source_active.is_empty()
+                    || scan_active.is_empty()
+                    || scheduled_source != expected
+                    || scheduled_scan != expected
+                {
+                    failures.push(format!(
                     "{node_name}: source_active={source_active:?} scan_active={scan_active:?} scheduled_source={scheduled_source:?} scheduled_scan={scheduled_scan:?} raw_scheduled_source={raw_scheduled_source} raw_scheduled_scan={raw_scheduled_scan} routes={:?}",
                     activation_route_summaries(&node_status)
                 ));
+                }
             }
-        }
-        if failures.is_empty() {
-            Ok(true)
-        } else {
-            Err(failures.join(" || "))
-        }
-    })
+            if failures.is_empty() {
+                Ok(true)
+            } else {
+                Err(failures.join(" || "))
+            }
+        },
+    )
 }
 
 fn probe_status_session(

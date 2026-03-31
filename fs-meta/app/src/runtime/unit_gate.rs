@@ -215,6 +215,19 @@ impl RuntimeUnitGate {
         Ok(())
     }
 
+    pub(crate) fn route_generation(&self, unit_id: &str, route_key: &str) -> Result<Option<u64>> {
+        self.validate_runtime_unit(unit_id)?;
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| CnxError::Internal("RuntimeUnitGate lock poisoned".into()))?;
+        Ok(gate
+            .units
+            .get(unit_id)
+            .and_then(|state| state.routes.get(route_key))
+            .map(|route| route.generation))
+    }
+
     pub(crate) fn has_runtime_state(&self) -> bool {
         self.gate
             .lock()
@@ -330,7 +343,10 @@ mod tests {
                 "runtime.exec.source",
                 "source-status:v1.req",
                 2,
-                &[bound_scope("nfs1", "node-b::nfs1"), bound_scope("nfs2", "node-c::nfs2")]
+                &[
+                    bound_scope("nfs1", "node-b::nfs1"),
+                    bound_scope("nfs2", "node-c::nfs2")
+                ]
             )
             .expect("initial activate")
         );

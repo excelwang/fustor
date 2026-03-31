@@ -411,8 +411,8 @@ impl LogicalRootsCell {
                     )?;
                     snapshot
                 } else {
-                    let decoded: LogicalRootsSnapshot =
-                        rmp_serde::from_slice(&resp.payload).map_err(|err| {
+                    let decoded: LogicalRootsSnapshot = rmp_serde::from_slice(&resp.payload)
+                        .map_err(|err| {
                             std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
                                 format!("decode logical roots snapshot failed: {err}"),
@@ -521,8 +521,8 @@ impl HostObjectGrantsCell {
                     )?;
                     snapshot
                 } else {
-                    let decoded: HostObjectGrantsSnapshot =
-                        rmp_serde::from_slice(&resp.payload).map_err(|err| {
+                    let decoded: HostObjectGrantsSnapshot = rmp_serde::from_slice(&resp.payload)
+                        .map_err(|err| {
                             std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
                                 format!("decode host object grants snapshot failed: {err}"),
@@ -632,9 +632,11 @@ fn write_logical_roots_snapshot_blocking(
             lease_epoch: Some(snapshot.seq),
         },
     )
-    .map_err(|err| std::io::Error::other(format!(
-        "statecell_write failed for logical roots scope={scope}: {err}"
-    )))?;
+    .map_err(|err| {
+        std::io::Error::other(format!(
+            "statecell_write failed for logical roots scope={scope}: {err}"
+        ))
+    })?;
     if result.status != "committed" && result.status != "ok" {
         return Err(std::io::Error::other(format!(
             "statecell_write returned non-committed status for logical roots scope={scope}: {}",
@@ -665,9 +667,11 @@ fn write_host_object_grants_snapshot_blocking(
             lease_epoch: Some(snapshot.version),
         },
     )
-    .map_err(|err| std::io::Error::other(format!(
-        "statecell_write failed for host object grants scope={scope}: {err}"
-    )))?;
+    .map_err(|err| {
+        std::io::Error::other(format!(
+            "statecell_write failed for host object grants scope={scope}: {err}"
+        ))
+    })?;
     if result.status != "committed" && result.status != "ok" {
         return Err(std::io::Error::other(format!(
             "statecell_write returned non-committed status for host object grants scope={scope}: {}",

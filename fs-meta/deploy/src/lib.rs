@@ -13,11 +13,11 @@ use fs_meta::product_model::execution_units::{
 };
 use fs_meta::product_model::routes::{
     ROUTE_KEY_EVENTS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY,
-    ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_STATUS_INTERNAL,
-    ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SOURCE_FIND_INTERNAL,
+    ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_ROOTS_CONTROL,
+    ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_KEY_SOURCE_FIND_INTERNAL,
     ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
-    ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SOURCE_STATUS_INTERNAL,
-    sink_query_request_route_for, sink_query_route_key_for,
+    ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, sink_query_request_route_for,
+    sink_query_route_key_for,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -188,7 +188,10 @@ fn activation_routes_from_manifest(
     manifest: &serde_yaml::Value,
 ) -> std::collections::BTreeSet<String> {
     let mut routes = std::collections::BTreeSet::new();
-    if let Some(ports) = manifest.get("ports").and_then(serde_yaml::Value::as_sequence) {
+    if let Some(ports) = manifest
+        .get("ports")
+        .and_then(serde_yaml::Value::as_sequence)
+    {
         for port in ports {
             let route_key = port.get("route_key").and_then(serde_yaml::Value::as_str);
             let pattern = port.get("pattern").and_then(serde_yaml::Value::as_str);
@@ -213,9 +216,7 @@ fn ensure_scoped_sink_query_ports(
     let ports = manifest
         .get_mut("ports")
         .and_then(serde_yaml::Value::as_sequence_mut)
-        .ok_or_else(|| {
-            CnxError::InvalidInput("fs-meta startup manifest missing ports[]".into())
-        })?;
+        .ok_or_else(|| CnxError::InvalidInput("fs-meta startup manifest missing ports[]".into()))?;
     let template = ports
         .iter()
         .find(|port| {
@@ -244,9 +245,9 @@ fn ensure_scoped_sink_query_ports(
             continue;
         }
         let mut scoped_port = template.clone();
-        let scoped_map = scoped_port
-            .as_mapping_mut()
-            .ok_or_else(|| CnxError::InvalidInput("fs-meta startup manifest port must be a mapping".into()))?;
+        let scoped_map = scoped_port.as_mapping_mut().ok_or_else(|| {
+            CnxError::InvalidInput("fs-meta startup manifest port must be a mapping".into())
+        })?;
         scoped_map.insert(
             serde_yaml::Value::String("route_key".into()),
             serde_yaml::Value::String(scoped_route_key),
@@ -364,16 +365,30 @@ fn build_route_plans_json(_spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
             .unwrap_or_else(|_| serde_json::json!({})),
         );
     };
-    push_plan(RouteKey(format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)));
-    push_plan(RouteKey(format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL)));
+    push_plan(RouteKey(format!(
+        "{}.stream",
+        ROUTE_KEY_SOURCE_RESCAN_CONTROL
+    )));
+    push_plan(RouteKey(format!(
+        "{}.stream",
+        ROUTE_KEY_SOURCE_ROOTS_CONTROL
+    )));
     push_plan(RouteKey(format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL)));
     push_plan(RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL)));
-    for node_id in _spec.route_plan_node_ids.iter().cloned().collect::<std::collections::BTreeSet<_>>() {
+    for node_id in _spec
+        .route_plan_node_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+    {
         push_plan(sink_query_request_route_for(&node_id));
     }
     push_plan(RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)));
     push_plan(RouteKey(format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)));
-    push_plan(RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)));
+    push_plan(RouteKey(format!(
+        "{}.req",
+        ROUTE_KEY_SOURCE_STATUS_INTERNAL
+    )));
     push_plan(RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)));
     plans
 }
@@ -601,7 +616,8 @@ mod tests {
         let plans = build_route_plans_json(&spec);
         let expected_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL);
         let has_internal_sink_query = plans.iter().any(|plan| {
-            plan.get("route_key").and_then(serde_json::Value::as_str) == Some(expected_route.as_str())
+            plan.get("route_key").and_then(serde_json::Value::as_str)
+                == Some(expected_route.as_str())
         });
 
         assert!(
@@ -689,9 +705,7 @@ mod tests {
 
         let release_doc = build_release_doc_value(&spec);
         let route_units = release_doc["units"][0]["runtime"]["route_units"].clone();
-        let route_units_map = route_units
-            .as_object()
-            .expect("route_units object");
+        let route_units_map = route_units.as_object().expect("route_units object");
 
         for expected_route in spec
             .route_plan_node_ids
@@ -748,10 +762,10 @@ mod tests {
             worker_modes: Default::default(),
         };
 
-        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../fixtures/manifests/fs-meta.yaml");
-        let manifest = build_startup_manifest_value(&manifest_path, &spec)
-            .expect("load startup manifest");
+        let manifest_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/manifests/fs-meta.yaml");
+        let manifest =
+            build_startup_manifest_value(&manifest_path, &spec).expect("load startup manifest");
         let activation_routes = activation_routes_from_manifest(&manifest);
 
         for expected_route in [
@@ -784,10 +798,10 @@ mod tests {
         let route_units = release_doc["units"][0]["runtime"]["route_units"]
             .as_object()
             .expect("route_units object");
-        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../fixtures/manifests/fs-meta.yaml");
-        let manifest = build_startup_manifest_value(&manifest_path, &spec)
-            .expect("load startup manifest");
+        let manifest_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/manifests/fs-meta.yaml");
+        let manifest =
+            build_startup_manifest_value(&manifest_path, &spec).expect("load startup manifest");
         let activation_routes = activation_routes_from_manifest(&manifest);
 
         for route_key in route_units.keys() {

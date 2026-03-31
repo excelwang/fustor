@@ -29,6 +29,8 @@ use crate::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
 const ROUTE_KEY_EVENTS: &str = "fs-meta.events:v1";
 const SOURCE_WORKER_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SOURCE_WORKER_STOP_ABORT_TIMEOUT: Duration = Duration::from_millis(250);
+const SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
+const SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
 struct SourceWorkerState {
     source: Option<Arc<FSMetaSource>>,
@@ -81,6 +83,12 @@ fn next_source_worker_request_seq() -> u64 {
     NEXT_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+fn is_transient_statecell_fenced_init_error(err: &CnxError) -> bool {
+    matches!(err, CnxError::InvalidInput(message)
+        if message.contains("statecell")
+            && message.contains("status=fenced"))
+}
+
 fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
     match request {
         SourceWorkerRequest::UpdateLogicalRoots { .. } => "UpdateLogicalRoots",
@@ -130,14 +138,20 @@ fn host_ref_matches_node_id(host_ref: &str, node_id: &NodeId) -> bool {
             .is_some_and(|suffix| suffix.starts_with('-'))
 }
 
-fn stable_host_ref_for_node_id(node_id: &NodeId, grants: &[crate::source::config::GrantedMountRoot]) -> String {
+fn stable_host_ref_for_node_id(
+    node_id: &NodeId,
+    grants: &[crate::source::config::GrantedMountRoot],
+) -> String {
     let host_refs = grants
         .iter()
         .filter(|grant| host_ref_matches_node_id(&grant.host_ref, node_id))
         .map(|grant| grant.host_ref.clone())
         .collect::<std::collections::BTreeSet<_>>();
     match host_refs.len() {
-        1 => host_refs.into_iter().next().unwrap_or_else(|| node_id.0.clone()),
+        1 => host_refs
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| node_id.0.clone()),
         _ => node_id.0.clone(),
     }
 }
@@ -696,18 +710,39 @@ async fn bootstrap_start_source_runtime(
         let Some((node_id, config)) = state.pending_init.clone() else {
             return Err(bootstrap_not_ready());
         };
-        eprintln!(
-            "fs_meta_source_worker_server: bootstrap_start build_source begin node={} roots={} grants={}",
-            node_id.0,
-            config.roots.len(),
-            config.host_object_grants.len()
-        );
-        match FSMetaSource::with_boundaries_and_state(config, node_id, None, state_boundary) {
-            Ok(inner) => {
-                state.source = Some(Arc::new(inner));
-                eprintln!("fs_meta_source_worker_server: bootstrap_start build_source ok");
+        let deadline = std::time::Instant::now() + SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_TIMEOUT;
+        loop {
+            eprintln!(
+                "fs_meta_source_worker_server: bootstrap_start build_source begin node={} roots={} grants={}",
+                node_id.0,
+                config.roots.len(),
+                config.host_object_grants.len()
+            );
+            match FSMetaSource::with_boundaries_and_state(
+                config.clone(),
+                node_id.clone(),
+                None,
+                state_boundary.clone(),
+            ) {
+                Ok(inner) => {
+                    state.source = Some(Arc::new(inner));
+                    eprintln!("fs_meta_source_worker_server: bootstrap_start build_source ok");
+                    break;
+                }
+                Err(err)
+                    if is_transient_statecell_fenced_init_error(&err)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    eprintln!(
+                        "fs_meta_source_worker_server: bootstrap_start build_source retry err={err}"
+                    );
+                    tokio::time::sleep(SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_BACKOFF).await;
+                }
+                Err(err) => {
+                    eprintln!("fs_meta_source_worker_server: bootstrap_start build_source err={err}");
+                    return Err(err);
+                }
             }
-            Err(err) => return Err(err),
         }
     }
     if state.pump_task.is_none() {
@@ -1140,8 +1175,13 @@ impl TypedWorkerBootstrapSession<SourceConfig> for SourceWorkerSession {
         )
         .await;
         eprintln!(
-            "fs_meta_source_worker_server: on_start done ok={}",
-            result.is_ok()
+            "fs_meta_source_worker_server: on_start done ok={} err={}",
+            result.is_ok(),
+            result
+                .as_ref()
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "none".to_string())
         );
         result
     }
@@ -1168,27 +1208,93 @@ impl TypedWorkerBootstrapSession<SourceConfig> for SourceWorkerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capanix_app_sdk::runtime::in_memory_state_boundary;
+    use capanix_app_sdk::runtime::{
+        KernelResultEnvelope, StateCellReadRequest, StateCellWatchRequest,
+        StateCellWriteRequest, in_memory_state_boundary,
+    };
     use capanix_runtime_entry_sdk::control::{
         RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, encode_runtime_exec_control,
     };
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures_util::StreamExt;
     use tempfile::tempdir;
 
-    use crate::source::config::GrantedMountRoot;
-    use crate::source::config::RootSpec;
     use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID};
     use crate::runtime::routes::{
         ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
         ROUTE_KEY_SOURCE_ROOTS_CONTROL,
     };
+    use crate::source::config::GrantedMountRoot;
+    use crate::source::config::RootSpec;
 
     struct NoopBoundary;
 
     #[async_trait::async_trait]
     impl ChannelIoSubset for NoopBoundary {}
+
+    struct FencedThenOkStateBoundary {
+        inner: Arc<dyn StateBoundary>,
+        authority_fenced_reads_remaining: AtomicUsize,
+    }
+
+    impl FencedThenOkStateBoundary {
+        fn new(inner: Arc<dyn StateBoundary>, authority_fenced_reads_remaining: usize) -> Self {
+            Self {
+                inner,
+                authority_fenced_reads_remaining: AtomicUsize::new(authority_fenced_reads_remaining),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateBoundary for FencedThenOkStateBoundary {
+        async fn statecell_read(
+            &self,
+            ctx: BoundaryContext,
+            request: StateCellReadRequest,
+        ) -> Result<KernelResultEnvelope> {
+            if request.handle.cell_id == "fs-meta.authority.runtime.exec.source"
+                && self
+                    .authority_fenced_reads_remaining
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        if remaining > 0 {
+                            Some(remaining - 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .is_ok()
+            {
+                return Ok(KernelResultEnvelope {
+                    correlation_id: None,
+                    status: "fenced".to_string(),
+                    payload: Vec::new(),
+                    diagnostics: Some(
+                        "runtime state carrier fenced stale caller on statecell_read".to_string(),
+                    ),
+                });
+            }
+            self.inner.statecell_read(ctx, request).await
+        }
+
+        async fn statecell_write(
+            &self,
+            ctx: BoundaryContext,
+            request: StateCellWriteRequest,
+        ) -> Result<KernelResultEnvelope> {
+            self.inner.statecell_write(ctx, request).await
+        }
+
+        async fn statecell_watch(
+            &self,
+            ctx: BoundaryContext,
+            request: StateCellWatchRequest,
+        ) -> Result<KernelResultEnvelope> {
+            self.inner.statecell_watch(ctx, request).await
+        }
+    }
 
     fn test_root(id: &str, path: PathBuf) -> RootSpec {
         let mut root = RootSpec::new(id, path);
@@ -1241,10 +1347,7 @@ mod tests {
 
         let mut state = SourceWorkerState {
             source: None,
-            pending_init: Some((
-                NodeId("node-a-29775285406139598021591041".to_string()),
-                cfg,
-            )),
+            pending_init: Some((NodeId("node-a-29775285406139598021591041".to_string()), cfg)),
             pump_task: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
@@ -1364,6 +1467,43 @@ mod tests {
         }
 
         stop_source_runtime(&mut state).await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_start_retries_transient_fenced_authority_statecell_read() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_watch_scan_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![test_export("node-a::nfs1", nfs1)],
+            ..SourceConfig::default()
+        };
+
+        let mut state = SourceWorkerState {
+            source: None,
+            pending_init: Some((NodeId("node-a-boot-fenced".to_string()), cfg)),
+            pump_task: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        };
+
+        let state_boundary: Arc<dyn StateBoundary> = Arc::new(FencedThenOkStateBoundary::new(
+            in_memory_state_boundary(),
+            1,
+        ));
+
+        bootstrap_start_source_runtime(&mut state, Arc::new(NoopBoundary), state_boundary)
+            .await
+            .expect(
+                "bootstrap start should recover when authority statecell read is transiently fenced during same-runtime-incarnation reopen",
+            );
+
+        assert!(
+            state.source.is_some(),
+            "bootstrap start should initialize source after transient fenced authority read recovers",
+        );
     }
 
     #[tokio::test]

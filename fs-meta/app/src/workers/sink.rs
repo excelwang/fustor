@@ -66,6 +66,10 @@ fn debug_control_scope_capture_enabled() -> bool {
     std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
 }
 
+fn debug_sink_worker_pre_dispatch_enabled() -> bool {
+    std::env::var_os("FSMETA_DEBUG_SINK_WORKER_PRE_DISPATCH").is_some()
+}
+
 fn summarize_bound_scopes(
     bound_scopes: &[capanix_runtime_entry_sdk::control::RuntimeBoundScope],
 ) -> Vec<String> {
@@ -210,6 +214,7 @@ pub struct SinkWorkerClientHandle {
     worker: Arc<TypedRuntimeWorkerClient<SinkWorkerRpc, SourceConfig>>,
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
+    scheduled_groups_cache: Arc<Mutex<Option<std::collections::BTreeSet<String>>>>,
     control_ops_inflight: Arc<AtomicUsize>,
 }
 
@@ -217,6 +222,7 @@ struct SharedSinkWorkerHandleState {
     worker: Arc<TypedRuntimeWorkerClient<SinkWorkerRpc, SourceConfig>>,
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
+    scheduled_groups_cache: Arc<Mutex<Option<std::collections::BTreeSet<String>>>>,
     control_ops_inflight: Arc<AtomicUsize>,
 }
 
@@ -305,6 +311,14 @@ pub(crate) struct SinkWorkerStatusErrorHook {
 }
 
 #[cfg(test)]
+pub(crate) struct SinkWorkerScheduledGroupsErrorHook {
+    pub err: CnxError,
+}
+
+#[cfg(test)]
+pub(crate) struct SinkWorkerStatusNonblockingCacheFallbackHook;
+
+#[cfg(test)]
 fn sink_worker_close_hook_cell() -> &'static Mutex<Option<SinkWorkerCloseHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerCloseHook>>> =
         std::sync::OnceLock::new();
@@ -319,16 +333,16 @@ fn sink_worker_update_roots_hook_cell() -> &'static Mutex<Option<SinkWorkerUpdat
 }
 
 #[cfg(test)]
-fn sink_worker_control_frame_error_hook_cell(
-) -> &'static Mutex<Option<SinkWorkerControlFrameErrorHook>> {
+fn sink_worker_control_frame_error_hook_cell()
+-> &'static Mutex<Option<SinkWorkerControlFrameErrorHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerControlFrameErrorHook>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
 
 #[cfg(test)]
-fn sink_worker_control_frame_pause_hook_cell(
-) -> &'static Mutex<Option<SinkWorkerControlFramePauseHook>> {
+fn sink_worker_control_frame_pause_hook_cell()
+-> &'static Mutex<Option<SinkWorkerControlFramePauseHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerControlFramePauseHook>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
@@ -337,6 +351,22 @@ fn sink_worker_control_frame_pause_hook_cell(
 #[cfg(test)]
 fn sink_worker_status_error_hook_cell() -> &'static Mutex<Option<SinkWorkerStatusErrorHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerStatusErrorHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn sink_worker_scheduled_groups_error_hook_cell()
+-> &'static Mutex<Option<SinkWorkerScheduledGroupsErrorHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerScheduledGroupsErrorHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn sink_worker_status_nonblocking_cache_fallback_hook_cell()
+-> &'static Mutex<Option<SinkWorkerStatusNonblockingCacheFallbackHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerStatusNonblockingCacheFallbackHook>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
@@ -378,9 +408,7 @@ pub(crate) fn clear_sink_worker_update_roots_hook() {
 }
 
 #[cfg(test)]
-pub(crate) fn install_sink_worker_control_frame_error_hook(
-    hook: SinkWorkerControlFrameErrorHook,
-) {
+pub(crate) fn install_sink_worker_control_frame_error_hook(hook: SinkWorkerControlFrameErrorHook) {
     let mut guard = match sink_worker_control_frame_error_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -389,9 +417,7 @@ pub(crate) fn install_sink_worker_control_frame_error_hook(
 }
 
 #[cfg(test)]
-pub(crate) fn install_sink_worker_control_frame_pause_hook(
-    hook: SinkWorkerControlFramePauseHook,
-) {
+pub(crate) fn install_sink_worker_control_frame_pause_hook(hook: SinkWorkerControlFramePauseHook) {
     let mut guard = match sink_worker_control_frame_pause_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -409,8 +435,48 @@ pub(crate) fn install_sink_worker_status_error_hook(hook: SinkWorkerStatusErrorH
 }
 
 #[cfg(test)]
+pub(crate) fn install_sink_worker_scheduled_groups_error_hook(
+    hook: SinkWorkerScheduledGroupsErrorHook,
+) {
+    let mut guard = match sink_worker_scheduled_groups_error_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn install_sink_worker_status_nonblocking_cache_fallback_hook(
+    hook: SinkWorkerStatusNonblockingCacheFallbackHook,
+) {
+    let mut guard = match sink_worker_status_nonblocking_cache_fallback_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn clear_sink_worker_control_frame_error_hook() {
     let mut guard = match sink_worker_control_frame_error_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_sink_worker_scheduled_groups_error_hook() {
+    let mut guard = match sink_worker_scheduled_groups_error_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_sink_worker_status_nonblocking_cache_fallback_hook() {
+    let mut guard = match sink_worker_status_nonblocking_cache_fallback_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -442,6 +508,24 @@ fn take_sink_worker_status_error_hook() -> Option<CnxError> {
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.take().map(|hook| hook.err)
+}
+
+#[cfg(test)]
+fn take_sink_worker_scheduled_groups_error_hook() -> Option<CnxError> {
+    let mut guard = match sink_worker_scheduled_groups_error_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.take().map(|hook| hook.err)
+}
+
+#[cfg(test)]
+fn take_sink_worker_status_nonblocking_cache_fallback_hook() -> bool {
+    let mut guard = match sink_worker_status_nonblocking_cache_fallback_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.take().is_some()
 }
 
 #[cfg(test)]
@@ -518,6 +602,7 @@ impl SinkWorkerClientHandle {
                     )?),
                     logical_roots_cache: Arc::new(Mutex::new(config.roots.clone())),
                     status_cache: Arc::new(Mutex::new(SinkStatusSnapshot::default())),
+                    scheduled_groups_cache: Arc::new(Mutex::new(None)),
                     control_ops_inflight: Arc::new(AtomicUsize::new(0)),
                 });
                 registry.insert(key, Arc::downgrade(&shared));
@@ -531,6 +616,7 @@ impl SinkWorkerClientHandle {
             worker_factory,
             logical_roots_cache: shared.logical_roots_cache.clone(),
             status_cache: shared.status_cache.clone(),
+            scheduled_groups_cache: shared.scheduled_groups_cache.clone(),
             control_ops_inflight: shared.control_ops_inflight.clone(),
         })
     }
@@ -591,12 +677,64 @@ impl SinkWorkerClientHandle {
         Ok(())
     }
 
+    fn cached_scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
+        self.scheduled_groups_cache
+            .lock()
+            .map(|guard| guard.clone())
+            .map_err(|_| {
+                CnxError::Internal("sink worker scheduled groups cache lock poisoned".into())
+            })
+    }
+
+    fn update_cached_scheduled_group_ids(
+        &self,
+        groups: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        let mut guard = self.scheduled_groups_cache.lock().map_err(|_| {
+            CnxError::Internal("sink worker scheduled groups cache lock poisoned".into())
+        })?;
+        *guard = Some(groups.clone());
+        Ok(())
+    }
+
     async fn with_started_retry<T, F, Fut>(&self, op: F) -> Result<T>
     where
         F: Fn(TypedWorkerClient<SinkWorkerRpc>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        self.worker.with_started_retry(op).await
+        let closure_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let existing_client = self.worker.existing_client().await?.is_some();
+        if debug_sink_worker_pre_dispatch_enabled() {
+            eprintln!(
+                "fs_meta_sink_worker_client: pre_dispatch with_started_retry begin node={} existing_client={}",
+                self.node_id.0,
+                existing_client
+            );
+        }
+        let result = self
+            .worker
+            .with_started_retry(|client| {
+                closure_entered.store(true, std::sync::atomic::Ordering::Relaxed);
+                op(client)
+            })
+            .await;
+        let closure_entered = closure_entered.load(std::sync::atomic::Ordering::Relaxed);
+        if debug_sink_worker_pre_dispatch_enabled() {
+            match &result {
+                Ok(_) => eprintln!(
+                    "fs_meta_sink_worker_client: pre_dispatch with_started_retry done node={} ok=true closure_entered={}",
+                    self.node_id.0,
+                    closure_entered
+                ),
+                Err(err) => eprintln!(
+                    "fs_meta_sink_worker_client: pre_dispatch with_started_retry done node={} ok=false closure_entered={} err={}",
+                    self.node_id.0,
+                    closure_entered,
+                    err
+                ),
+            }
+        }
+        result
     }
 
     async fn client(&self) -> Result<TypedWorkerClient<SinkWorkerRpc>> {
@@ -714,7 +852,9 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
-        let snapshot = self.status_snapshot_with_timeout(Duration::from_secs(5)).await?;
+        let snapshot = self
+            .status_snapshot_with_timeout(Duration::from_secs(5))
+            .await?;
         if debug_control_scope_capture_enabled() {
             eprintln!(
                 "fs_meta_sink_worker_client: status_snapshot reply node={} {}",
@@ -727,6 +867,18 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
+        #[cfg(test)]
+        if take_sink_worker_status_nonblocking_cache_fallback_hook() {
+            let snapshot = self.cached_status_snapshot()?;
+            if debug_control_scope_capture_enabled() {
+                eprintln!(
+                    "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=test_hook {}",
+                    self.node_id.0,
+                    summarize_sink_status_snapshot(&snapshot)
+                );
+            }
+            return Ok(snapshot);
+        }
         if self.control_op_inflight() {
             let snapshot = self.cached_status_snapshot()?;
             if debug_control_scope_capture_enabled() {
@@ -739,7 +891,10 @@ impl SinkWorkerClientHandle {
             return Ok(snapshot);
         }
         match self.existing_client().await? {
-            Some(_) => match self.status_snapshot_with_timeout(Duration::from_secs(5)).await {
+            Some(_) => match self
+                .status_snapshot_with_timeout(Duration::from_secs(5))
+                .await
+            {
                 Ok(snapshot) => {
                     if debug_control_scope_capture_enabled() {
                         eprintln!(
@@ -799,8 +954,7 @@ impl SinkWorkerClientHandle {
             match rpc_result {
                 Ok(response) => break response,
                 Err(err)
-                    if can_retry_on_control_frame(&err)
-                        && std::time::Instant::now() < deadline =>
+                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -817,20 +971,51 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
-        match Self::call_worker(
-            &self.client().await?,
-            SinkWorkerRequest::ScheduledGroupIds,
-            Duration::from_secs(5),
-        )
-        .await?
+        match self.scheduled_group_ids_with_timeout().await?
         {
             SinkWorkerResponse::ScheduledGroupIds(groups) => {
-                Ok(groups.map(|groups| groups.into_iter().collect()))
+                let groups =
+                    groups.map(|groups| groups.into_iter().collect::<std::collections::BTreeSet<_>>());
+                if let Some(groups) = groups.as_ref().filter(|groups| !groups.is_empty()) {
+                    self.update_cached_scheduled_group_ids(groups)?;
+                    return Ok(Some(groups.clone()));
+                }
+                self.cached_scheduled_group_ids()
             }
             other => Err(CnxError::ProtocolViolation(format!(
                 "unexpected sink worker response for scheduled groups: {:?}",
                 other
             ))),
+        }
+    }
+
+    async fn scheduled_group_ids_with_timeout(&self) -> Result<SinkWorkerResponse> {
+        let deadline = std::time::Instant::now() + SINK_WORKER_CONTROL_TOTAL_TIMEOUT;
+        loop {
+            let now = std::time::Instant::now();
+            let attempt_timeout = Duration::from_secs(5).min(deadline.saturating_duration_since(now));
+            if attempt_timeout.is_zero() {
+                return Err(CnxError::Timeout);
+            }
+            let rpc_result = self
+                .with_started_retry(|client| async move {
+                    #[cfg(test)]
+                    if let Some(err) = take_sink_worker_scheduled_groups_error_hook() {
+                        return Err(err);
+                    }
+                    Self::call_worker(&client, SinkWorkerRequest::ScheduledGroupIds, attempt_timeout)
+                        .await
+                })
+                .await;
+            match rpc_result {
+                Ok(response) => return Ok(response),
+                Err(err)
+                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(err) => return Err(err),
+            }
         }
     }
 
@@ -1118,8 +1303,7 @@ impl SinkWorkerClientHandle {
                     )));
                 }
                 Err(err)
-                    if can_retry_on_control_frame(&err)
-                        && std::time::Instant::now() < deadline =>
+                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -1420,12 +1604,12 @@ mod tests {
     use tokio::sync::{Mutex as AsyncMutex, Notify};
     use tokio::time::Duration;
 
-    use crate::source::FSMetaSource;
-    use crate::source::config::RootSpec;
     use crate::runtime::routes::{
         METHOD_SINK_QUERY, ROUTE_KEY_EVENTS, ROUTE_KEY_QUERY, ROUTE_TOKEN_FS_META_INTERNAL,
         default_route_bindings,
     };
+    use crate::source::FSMetaSource;
+    use crate::source::config::RootSpec;
 
     #[derive(Default)]
     struct LoopbackWorkerBoundary {
@@ -1468,7 +1652,9 @@ mod tests {
                     .send_batches_by_channel
                     .lock()
                     .expect("loopback send batches lock");
-                *send_batches.entry(request.channel_key.0.clone()).or_default() += 1;
+                *send_batches
+                    .entry(request.channel_key.0.clone())
+                    .or_default() += 1;
             }
             {
                 let mut channels = self.channels.lock().await;
@@ -1500,7 +1686,9 @@ mod tests {
                             .recv_batches_by_channel
                             .lock()
                             .expect("loopback recv batches lock");
-                        *recv_batches.entry(request.channel_key.0.clone()).or_default() += 1;
+                        *recv_batches
+                            .entry(request.channel_key.0.clone())
+                            .or_default() += 1;
                         return Ok(events);
                     }
                 }
@@ -1672,11 +1860,8 @@ mod tests {
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
         let binding = external_sink_worker_binding(worker_socket_dir.path());
-        let factory = RuntimeWorkerClientFactory::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
         let first = Arc::new(
             SinkWorkerClientHandle::new(
                 NodeId("node-a".to_string()),
@@ -1687,13 +1872,8 @@ mod tests {
             .expect("construct first sink worker client"),
         );
         let second = Arc::new(
-            SinkWorkerClientHandle::new(
-                NodeId("node-a".to_string()),
-                cfg,
-                binding,
-                factory,
-            )
-            .expect("construct second sink worker client"),
+            SinkWorkerClientHandle::new(NodeId("node-a".to_string()), cfg, binding, factory)
+                .expect("construct second sink worker client"),
         );
         let envelopes = vec![
             encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
@@ -1737,8 +1917,7 @@ mod tests {
         let first_status = first.status_snapshot().await.expect("first status");
         let second_status = second.status_snapshot().await.expect("second status");
         assert_eq!(
-            first_status.scheduled_groups_by_node,
-            second_status.scheduled_groups_by_node,
+            first_status.scheduled_groups_by_node, second_status.scheduled_groups_by_node,
             "same-binding sink worker handles should observe one shared external worker state",
         );
 
@@ -1756,10 +1935,8 @@ mod tests {
         let nfs2 = tmp.path().join("nfs2");
         std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
         std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
-        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a")
-            .expect("seed nfs1");
-        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b")
-            .expect("seed nfs2");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b").expect("seed nfs2");
 
         let cfg = SourceConfig {
             roots: vec![
@@ -1779,11 +1956,8 @@ mod tests {
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
-        let factory = RuntimeWorkerClientFactory::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
         let sink = SinkWorkerClientHandle::new(
             NodeId("node-a".to_string()),
             cfg,
@@ -1937,10 +2111,8 @@ mod tests {
         let nfs2 = tmp.path().join("nfs2");
         std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
         std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
-        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a")
-            .expect("seed nfs1");
-        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b")
-            .expect("seed nfs2");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b").expect("seed nfs2");
 
         let cfg = SourceConfig {
             roots: vec![
@@ -1960,11 +2132,8 @@ mod tests {
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
-        let factory = RuntimeWorkerClientFactory::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
         let sink = SinkWorkerClientHandle::new(
             NodeId("node-a".to_string()),
             cfg,
@@ -2013,9 +2182,7 @@ mod tests {
                         deferred_nfs2_batches.push(nfs2_batch);
                     }
                     if !nfs1_batch.is_empty() {
-                        sink.send(nfs1_batch)
-                            .await
-                            .expect("apply nfs1-only batch");
+                        sink.send(nfs1_batch).await.expect("apply nfs1-only batch");
                     }
                 }
                 Ok(None) => break,
@@ -2120,17 +2287,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn external_sink_worker_internal_materialized_route_delivers_sequential_same_owner_queries_twice(
-    ) {
+    async fn external_sink_worker_internal_materialized_route_delivers_sequential_same_owner_queries_twice()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
         std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
         std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
-        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a")
-            .expect("seed nfs1");
-        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b")
-            .expect("seed nfs2");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b").expect("seed nfs2");
 
         let cfg = SourceConfig {
             roots: vec![
@@ -2150,11 +2315,8 @@ mod tests {
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
-        let factory = RuntimeWorkerClientFactory::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
         let sink = SinkWorkerClientHandle::new(
             NodeId("node-a".to_string()),
             cfg,
@@ -2361,6 +2523,14 @@ mod tests {
         }
     }
 
+    struct SinkWorkerScheduledGroupsErrorHookReset;
+
+    impl Drop for SinkWorkerScheduledGroupsErrorHookReset {
+        fn drop(&mut self) {
+            clear_sink_worker_scheduled_groups_error_hook();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn on_control_frame_retries_stale_drained_fenced_pid_errors() {
         let tmp = tempdir().expect("create temp dir");
@@ -2380,11 +2550,8 @@ mod tests {
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
-        let factory = RuntimeWorkerClientFactory::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
         let sink = SinkWorkerClientHandle::new(
             NodeId("node-d".to_string()),
             cfg,
@@ -2448,8 +2615,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn on_control_frame_retries_stale_drained_fenced_pid_errors_after_first_wave_succeeded()
-    {
+    async fn on_control_frame_retries_stale_drained_fenced_pid_errors_after_first_wave_succeeded() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -2467,11 +2633,8 @@ mod tests {
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
-        let factory = RuntimeWorkerClientFactory::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
         let sink = SinkWorkerClientHandle::new(
             NodeId("node-d".to_string()),
             cfg,
@@ -2528,10 +2691,7 @@ mod tests {
         sink.close().await.expect("close sink worker");
     }
 
-    async fn assert_on_control_frame_retries_bridge_reset_error(
-        err: CnxError,
-        label: &str,
-    ) {
+    async fn assert_on_control_frame_retries_bridge_reset_error(err: CnxError, label: &str) {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -2549,11 +2709,8 @@ mod tests {
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
-        let factory = RuntimeWorkerClientFactory::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
         let sink = SinkWorkerClientHandle::new(
             NodeId("node-d".to_string()),
             cfg,
@@ -2657,11 +2814,8 @@ mod tests {
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
-        let factory = RuntimeWorkerClientFactory::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
         let sink = SinkWorkerClientHandle::new(
             NodeId("node-d".to_string()),
             cfg,
@@ -2698,6 +2852,94 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scheduled_group_ids_retry_stale_drained_fenced_pid_errors() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![sink_worker_root("nfs1", &nfs1)],
+            host_object_grants: vec![
+                sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let sink = SinkWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+            .await
+            .expect("sink worker start timed out")
+            .expect("start sink worker");
+
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                ],
+            }))
+            .expect("encode sink activate"),
+        ])
+        .await
+        .expect("apply sink control");
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let scheduled = sink
+                .scheduled_group_ids()
+                .await
+                .expect("initial scheduled groups")
+                .unwrap_or_default();
+            if scheduled == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for scheduled groups before stale-pid retry test: scheduled={scheduled:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let _reset = SinkWorkerScheduledGroupsErrorHookReset;
+        install_sink_worker_scheduled_groups_error_hook(SinkWorkerScheduledGroupsErrorHook {
+            err: CnxError::AccessDenied(
+                "sink worker unavailable: pid Pid(1) is drained/fenced and cannot obtain new grant attachments"
+                    .to_string(),
+            ),
+        });
+
+        let scheduled = sink
+            .scheduled_group_ids()
+            .await
+            .expect("scheduled_group_ids should retry stale drained/fenced pid errors and reach the live sink worker");
+
+        assert_eq!(scheduled, Some(expected_groups));
+
+        sink.close().await.expect("close sink worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn status_snapshot_nonblocking_retries_peer_bridge_stopped_errors_after_begin() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
@@ -2716,11 +2958,8 @@ mod tests {
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
-        let factory = RuntimeWorkerClientFactory::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
         let sink = SinkWorkerClientHandle::new(
             NodeId("node-d".to_string()),
             cfg,
@@ -2751,9 +2990,7 @@ mod tests {
                 lease: None,
                 generation: 2,
                 expires_at_ms: 1,
-                bound_scopes: vec![
-                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
-                ],
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-d::nfs1"])],
             }))
             .expect("encode sink activate"),
         ])
@@ -2762,7 +2999,9 @@ mod tests {
 
         let _reset = SinkWorkerStatusErrorHookReset;
         install_sink_worker_status_error_hook(SinkWorkerStatusErrorHook {
-            err: CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
+            err: CnxError::PeerError(
+                "transport closed: sidecar control bridge stopped".to_string(),
+            ),
         });
 
         let snapshot = sink
@@ -2836,18 +3075,8 @@ mod tests {
                             sink_worker_root("nfs2", &nfs2),
                         ],
                         vec![
-                            sink_worker_export(
-                                "node-d::nfs1",
-                                "node-d",
-                                "10.0.0.41",
-                                nfs1.clone(),
-                            ),
-                            sink_worker_export(
-                                "node-d::nfs2",
-                                "node-d",
-                                "10.0.0.42",
-                                nfs2.clone(),
-                            ),
+                            sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
                         ],
                     )
                     .await
@@ -2877,7 +3106,10 @@ mod tests {
             .await
             .expect("logical roots snapshot after update");
         assert_eq!(
-            roots.iter().map(|root| root.id.as_str()).collect::<Vec<_>>(),
+            roots
+                .iter()
+                .map(|root| root.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["nfs1", "nfs2"],
             "logical roots should reflect the post-handoff sink update"
         );
@@ -2990,8 +3222,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn second_on_control_frame_reacquires_worker_client_after_first_wave_succeeded_and_transport_closes_mid_handoff(
-    ) {
+    async fn second_on_control_frame_reacquires_worker_client_after_first_wave_succeeded_and_transport_closes_mid_handoff()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -3027,8 +3259,8 @@ mod tests {
             .expect("start sink worker");
 
         client
-            .on_control_frame(vec![encode_runtime_exec_control(&RuntimeExecControl::Activate(
-                RuntimeExecActivate {
+            .on_control_frame(vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                     route_key: ROUTE_KEY_QUERY.to_string(),
                     unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
                     lease: None,
@@ -3038,9 +3270,9 @@ mod tests {
                         bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
                         bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
                     ],
-                },
-            ))
-            .expect("encode first-wave sink activate")])
+                }))
+                .expect("encode first-wave sink activate"),
+            ])
             .await
             .expect("first sink control wave should succeed");
 
@@ -3056,21 +3288,23 @@ mod tests {
             let client = client.clone();
             async move {
                 client
-                    .on_control_frame(vec![encode_runtime_exec_control(
-                        &RuntimeExecControl::Activate(RuntimeExecActivate {
-                            route_key: ROUTE_KEY_QUERY.to_string(),
-                            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
-                                .to_string(),
-                            lease: None,
-                            generation: 2,
-                            expires_at_ms: 1,
-                            bound_scopes: vec![
-                                bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
-                                bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
-                            ],
-                        }),
-                    )
-                    .expect("encode second-wave sink activate")])
+                    .on_control_frame(vec![
+                        encode_runtime_exec_control(&RuntimeExecControl::Activate(
+                            RuntimeExecActivate {
+                                route_key: ROUTE_KEY_QUERY.to_string(),
+                                unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
+                                    .to_string(),
+                                lease: None,
+                                generation: 2,
+                                expires_at_ms: 1,
+                                bound_scopes: vec![
+                                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                                ],
+                            },
+                        ))
+                        .expect("encode second-wave sink activate"),
+                    ])
                     .await
             }
         });
@@ -3101,10 +3335,7 @@ mod tests {
                 .expect("scheduled groups")
                 .unwrap_or_default();
             if scheduled
-                == std::collections::BTreeSet::from([
-                    "nfs1".to_string(),
-                    "nfs2".to_string(),
-                ])
+                == std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])
             {
                 break;
             }
@@ -3119,8 +3350,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn second_on_control_frame_reacquires_worker_client_after_first_wave_succeeded_without_external_ensure_started(
-    ) {
+    async fn second_on_control_frame_reacquires_worker_client_after_first_wave_succeeded_without_external_ensure_started()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -3156,8 +3387,8 @@ mod tests {
             .expect("start sink worker");
 
         client
-            .on_control_frame(vec![encode_runtime_exec_control(&RuntimeExecControl::Activate(
-                RuntimeExecActivate {
+            .on_control_frame(vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                     route_key: ROUTE_KEY_QUERY.to_string(),
                     unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
                     lease: None,
@@ -3167,9 +3398,9 @@ mod tests {
                         bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
                         bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
                     ],
-                },
-            ))
-            .expect("encode first-wave sink activate")])
+                }))
+                .expect("encode first-wave sink activate"),
+            ])
             .await
             .expect("first sink control wave should succeed");
 
@@ -3185,21 +3416,23 @@ mod tests {
             let client = client.clone();
             async move {
                 client
-                    .on_control_frame(vec![encode_runtime_exec_control(
-                        &RuntimeExecControl::Activate(RuntimeExecActivate {
-                            route_key: ROUTE_KEY_QUERY.to_string(),
-                            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
-                                .to_string(),
-                            lease: None,
-                            generation: 2,
-                            expires_at_ms: 1,
-                            bound_scopes: vec![
-                                bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
-                                bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
-                            ],
-                        }),
-                    )
-                    .expect("encode second-wave sink activate")])
+                    .on_control_frame(vec![
+                        encode_runtime_exec_control(&RuntimeExecControl::Activate(
+                            RuntimeExecActivate {
+                                route_key: ROUTE_KEY_QUERY.to_string(),
+                                unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
+                                    .to_string(),
+                                lease: None,
+                                generation: 2,
+                                expires_at_ms: 1,
+                                bound_scopes: vec![
+                                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                                ],
+                            },
+                        ))
+                        .expect("encode second-wave sink activate"),
+                    ])
                     .await
             }
         });
@@ -3226,10 +3459,7 @@ mod tests {
                 .expect("scheduled groups")
                 .unwrap_or_default();
             if scheduled
-                == std::collections::BTreeSet::from([
-                    "nfs1".to_string(),
-                    "nfs2".to_string(),
-                ])
+                == std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])
             {
                 break;
             }
@@ -3242,6 +3472,7 @@ mod tests {
 
         client.close().await.expect("close sink worker");
     }
+
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn close_keeps_shared_sink_worker_client_alive_when_another_handle_still_exists() {
@@ -3314,12 +3545,18 @@ mod tests {
             .await
             .expect("successor sink logical_roots_snapshot after predecessor close");
         assert_eq!(
-            roots.iter().map(|root| root.id.as_str()).collect::<Vec<_>>(),
+            roots
+                .iter()
+                .map(|root| root.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["nfs1"],
             "shared sink worker should stay usable for the successor after predecessor close"
         );
 
-        successor.close().await.expect("close successor sink worker");
+        successor
+            .close()
+            .await
+            .expect("close successor sink worker");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3379,18 +3616,8 @@ mod tests {
                             sink_worker_root("nfs2", &nfs2),
                         ],
                         vec![
-                            sink_worker_export(
-                                "node-d::nfs1",
-                                "node-d",
-                                "10.0.0.41",
-                                nfs1.clone(),
-                            ),
-                            sink_worker_export(
-                                "node-d::nfs2",
-                                "node-d",
-                                "10.0.0.42",
-                                nfs2.clone(),
-                            ),
+                            sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
                         ],
                     )
                     .await

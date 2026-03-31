@@ -1,6 +1,6 @@
 use std::path::Path;
-use std::sync::Mutex as StdMutex;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
@@ -12,8 +12,9 @@ use capanix_runtime_entry_sdk::worker_runtime::{
 };
 use tokio::sync::Mutex;
 
-use crate::sink::SinkFileMeta;
 use crate::runtime::orchestration::{SinkControlSignal, sink_control_signals_from_envelopes};
+use crate::runtime::routes::ROUTE_KEY_SINK_QUERY_INTERNAL;
+use crate::sink::SinkFileMeta;
 use crate::source::config::SourceConfig;
 use crate::workers::sink::SinkWorkerRpc;
 use crate::workers::sink_ipc::{
@@ -88,6 +89,38 @@ fn debug_sink_query_flow_enabled() -> bool {
     std::env::var_os("FSMETA_DEBUG_SINK_QUERY_FLOW").is_some()
 }
 
+fn debug_sink_query_route_trace_enabled() -> bool {
+    std::env::var_os("FSMETA_DEBUG_SINK_QUERY_ROUTE_TRACE").is_some()
+}
+
+fn is_per_peer_sink_query_request_route(route_key: &str) -> bool {
+    let Some(request_route) = route_key.strip_suffix(".req") else {
+        return false;
+    };
+    let Some((stem, version)) = ROUTE_KEY_SINK_QUERY_INTERNAL.rsplit_once(':') else {
+        return request_route.starts_with(&format!("{ROUTE_KEY_SINK_QUERY_INTERNAL}."));
+    };
+    let Some(route_stem) = request_route.strip_suffix(&format!(":{version}")) else {
+        return false;
+    };
+    route_stem.starts_with(&format!("{stem}."))
+}
+
+fn traced_per_peer_sink_query_routes(signals: &[SinkControlSignal]) -> Vec<String> {
+    signals
+        .iter()
+        .filter_map(|signal| match signal {
+            SinkControlSignal::Activate { route_key, .. }
+            | SinkControlSignal::Deactivate { route_key, .. }
+                if is_per_peer_sink_query_request_route(route_key) =>
+            {
+                Some(route_key.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn summarize_bound_scopes(
     bound_scopes: &[capanix_runtime_entry_sdk::control::RuntimeBoundScope],
 ) -> Vec<String> {
@@ -145,7 +178,9 @@ fn summarize_sink_control_signals(signals: &[SinkControlSignal]) -> Vec<String> 
 fn summarize_event_origins(events: &[Event]) -> Vec<String> {
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
     for event in events {
-        *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+        *counts
+            .entry(event.metadata().origin_id.0.clone())
+            .or_default() += 1;
     }
     counts
         .into_iter()
@@ -210,21 +245,16 @@ fn update_received_stats(stats: &Arc<StdMutex<ReceivedBatchStats>>, update: &Rec
     guard.last_received_at_us = update.last_received_at_us;
     guard.last_received_origins = update.last_received_origins.clone();
     for (origin, count) in &update.received_origin_counts {
-        *guard.received_origin_counts.entry(origin.clone()).or_default() += *count;
+        *guard
+            .received_origin_counts
+            .entry(origin.clone())
+            .or_default() += *count;
     }
 }
 
 fn received_stats_snapshot(
     stats: &Arc<StdMutex<ReceivedBatchStats>>,
-) -> (
-    u64,
-    u64,
-    u64,
-    u64,
-    Option<u64>,
-    Vec<String>,
-    Vec<String>,
-) {
+) -> (u64, u64, u64, u64, Option<u64>, Vec<String>, Vec<String>) {
     let guard = lock_received_stats(stats);
     (
         guard.batch_count,
@@ -369,7 +399,10 @@ async fn bootstrap_stop_sink_runtime(state: &mut SinkWorkerState) {
     state.endpoints_started = false;
 }
 
-fn plan_worker_request(request: SinkWorkerRequest, state: &mut SinkWorkerState) -> SinkWorkerAction {
+fn plan_worker_request(
+    request: SinkWorkerRequest,
+    state: &mut SinkWorkerState,
+) -> SinkWorkerAction {
     match request {
         SinkWorkerRequest::UpdateLogicalRoots {
             roots,
@@ -470,7 +503,10 @@ fn plan_worker_request(request: SinkWorkerRequest, state: &mut SinkWorkerState) 
                         snapshot.received_batches_by_node = if received_batches == 0 {
                             std::collections::BTreeMap::new()
                         } else {
-                            std::collections::BTreeMap::from([(node_id.0.clone(), received_batches)])
+                            std::collections::BTreeMap::from([(
+                                node_id.0.clone(),
+                                received_batches,
+                            )])
                         };
                         snapshot.received_events_by_node = if received_events == 0 {
                             std::collections::BTreeMap::new()
@@ -480,7 +516,10 @@ fn plan_worker_request(request: SinkWorkerRequest, state: &mut SinkWorkerState) 
                         snapshot.received_control_events_by_node = if received_control == 0 {
                             std::collections::BTreeMap::new()
                         } else {
-                            std::collections::BTreeMap::from([(node_id.0.clone(), received_control)])
+                            std::collections::BTreeMap::from([(
+                                node_id.0.clone(),
+                                received_control,
+                            )])
                         };
                         snapshot.received_data_events_by_node = if received_data == 0 {
                             std::collections::BTreeMap::new()
@@ -488,9 +527,12 @@ fn plan_worker_request(request: SinkWorkerRequest, state: &mut SinkWorkerState) 
                             std::collections::BTreeMap::from([(node_id.0.clone(), received_data)])
                         };
                         snapshot.last_received_at_us_by_node = last_received_at_us
-                            .map(|value| std::collections::BTreeMap::from([(node_id.0.clone(), value)]))
+                            .map(|value| {
+                                std::collections::BTreeMap::from([(node_id.0.clone(), value)])
+                            })
                             .unwrap_or_default();
-                        snapshot.last_received_origins_by_node = if last_received_origins.is_empty() {
+                        snapshot.last_received_origins_by_node = if last_received_origins.is_empty()
+                        {
                             std::collections::BTreeMap::new()
                         } else {
                             std::collections::BTreeMap::from([(
@@ -498,14 +540,15 @@ fn plan_worker_request(request: SinkWorkerRequest, state: &mut SinkWorkerState) 
                                 last_received_origins,
                             )])
                         };
-                        snapshot.received_origin_counts_by_node = if received_origin_counts.is_empty() {
-                            std::collections::BTreeMap::new()
-                        } else {
-                            std::collections::BTreeMap::from([(
-                                node_id.0.clone(),
-                                received_origin_counts,
-                            )])
-                        };
+                        snapshot.received_origin_counts_by_node =
+                            if received_origin_counts.is_empty() {
+                                std::collections::BTreeMap::new()
+                            } else {
+                                std::collections::BTreeMap::from([(
+                                    node_id.0.clone(),
+                                    received_origin_counts,
+                                )])
+                            };
                     }
                     SinkWorkerAction::Immediate(SinkWorkerResponse::StatusSnapshot(snapshot), false)
                 }
@@ -552,11 +595,12 @@ fn plan_worker_request(request: SinkWorkerRequest, state: &mut SinkWorkerState) 
                                 summarize_event_origins(&events)
                             );
                         }
-                    SinkWorkerAction::Immediate(SinkWorkerResponse::Events(events), false)
+                        SinkWorkerAction::Immediate(SinkWorkerResponse::Events(events), false)
                     }
-                    Err(err) => {
-                        SinkWorkerAction::Immediate(SinkWorkerResponse::Error(err.to_string()), false)
-                    }
+                    Err(err) => SinkWorkerAction::Immediate(
+                        SinkWorkerResponse::Error(err.to_string()),
+                        false,
+                    ),
                 }
             }
             None => SinkWorkerAction::Immediate(
@@ -602,8 +646,7 @@ fn plan_worker_request(request: SinkWorkerRequest, state: &mut SinkWorkerState) 
                 if debug_control_scope_capture_enabled() {
                     eprintln!(
                         "fs_meta_sink_worker_server: on_control_frame summary node={} signals={:?}",
-                        node_id,
-                        summary
+                        node_id, summary
                     );
                 }
                 SinkWorkerAction::OnControlFrame { sink, envelopes }
@@ -628,28 +671,28 @@ async fn execute_worker_action(action: SinkWorkerAction) -> (SinkWorkerResponse,
             Some(send_tx) => {
                 let update = summarize_received_batch(&events);
                 match send_tx.send(events) {
-                Ok(()) => {
-                    update_received_stats(&received_stats, &update);
-                    (SinkWorkerResponse::Ack, false)
+                    Ok(()) => {
+                        update_received_stats(&received_stats, &update);
+                        (SinkWorkerResponse::Ack, false)
+                    }
+                    Err(err) => (
+                        SinkWorkerResponse::Error(format!(
+                            "sink worker send queue unavailable: {} event(s) dropped",
+                            err.0.len()
+                        )),
+                        false,
+                    ),
                 }
-                Err(err) => (
-                    SinkWorkerResponse::Error(format!(
-                        "sink worker send queue unavailable: {} event(s) dropped",
-                        err.0.len()
-                    )),
-                    false,
-                ),
-            }
             }
             None => {
                 let update = summarize_received_batch(&events);
                 match sink.send(&events).await {
-                Ok(_) => {
-                    update_received_stats(&received_stats, &update);
-                    (SinkWorkerResponse::Ack, false)
+                    Ok(_) => {
+                        update_received_stats(&received_stats, &update);
+                        (SinkWorkerResponse::Ack, false)
+                    }
+                    Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
                 }
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
-            }
             }
         },
         SinkWorkerAction::Recv {
@@ -661,9 +704,51 @@ async fn execute_worker_action(action: SinkWorkerAction) -> (SinkWorkerResponse,
             Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
         },
         SinkWorkerAction::OnControlFrame { sink, envelopes } => {
+            let traced_routes = if debug_sink_query_route_trace_enabled() {
+                sink_control_signals_from_envelopes(&envelopes)
+                    .ok()
+                    .map(|signals| traced_per_peer_sink_query_routes(&signals))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if debug_sink_query_route_trace_enabled() && !traced_routes.is_empty() {
+                let route_states: Vec<String> = traced_routes
+                    .iter()
+                    .filter_map(|route| sink.debug_traced_route_state(route).ok())
+                    .collect();
+                eprintln!(
+                    "fs_meta_sink_worker_server: traced_on_control_frame begin routes={:?} states={:?}",
+                    traced_routes, route_states
+                );
+            }
             match sink.on_control_frame(&envelopes).await {
-                Ok(_) => (SinkWorkerResponse::Ack, false),
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+                Ok(_) => {
+                    if debug_sink_query_route_trace_enabled() && !traced_routes.is_empty() {
+                        let route_states: Vec<String> = traced_routes
+                            .iter()
+                            .filter_map(|route| sink.debug_traced_route_state(route).ok())
+                            .collect();
+                        eprintln!(
+                            "fs_meta_sink_worker_server: traced_on_control_frame done routes={:?} ok=true states={:?}",
+                            traced_routes, route_states
+                        );
+                    }
+                    (SinkWorkerResponse::Ack, false)
+                }
+                Err(err) => {
+                    if debug_sink_query_route_trace_enabled() && !traced_routes.is_empty() {
+                        let route_states: Vec<String> = traced_routes
+                            .iter()
+                            .filter_map(|route| sink.debug_traced_route_state(route).ok())
+                            .collect();
+                        eprintln!(
+                            "fs_meta_sink_worker_server: traced_on_control_frame done routes={:?} ok=false err={} states={:?}",
+                            traced_routes, err, route_states
+                        );
+                    }
+                    (SinkWorkerResponse::Error(err.to_string()), false)
+                }
             }
         }
     }

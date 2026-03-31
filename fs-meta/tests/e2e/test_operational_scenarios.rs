@@ -191,8 +191,7 @@ fn run_activation_scope_capture_preserved_layout() -> Result<(), String> {
                 &harness.app_id,
                 "runtime.exec.sink",
             )?;
-            sink_holder =
-                current_sink_holder_for_group(&harness.cluster, &harness.app_id, "nfs2")?;
+            sink_holder = current_sink_holder_for_group(&harness.cluster, &harness.app_id, "nfs2")?;
             if !node_a_source_pids.is_empty() && !node_a_sink_pids.is_empty() {
                 return Ok(true);
             }
@@ -272,7 +271,11 @@ fn run_activation_scope_capture_nfs2_visibility_contracted_to_node_a() -> Result
     }
 
     let mut harness = build_operational_harness("fs-meta-activation-scope-node-a", false, 1)?;
-    let single_root = json!([root_payload("nfs2", &harness.lab.export_source("nfs2"), "/")]);
+    let single_root = json!([root_payload(
+        "nfs2",
+        &harness.lab.export_source("nfs2"),
+        "/"
+    )]);
     harness.session.update_roots(&single_root)?;
     harness.session.rescan()?;
 
@@ -352,8 +355,7 @@ fn run_activation_scope_capture_nfs2_visibility_contracted_to_node_a() -> Result
                 &harness.app_id,
                 "runtime.exec.sink",
             )?;
-            sink_holder =
-                current_sink_holder_for_group(&harness.cluster, &harness.app_id, "nfs2")?;
+            sink_holder = current_sink_holder_for_group(&harness.cluster, &harness.app_id, "nfs2")?;
             if !node_a_source_pids.is_empty()
                 && !node_a_sink_pids.is_empty()
                 && sink_holder.as_deref() == Some("node-a")
@@ -372,10 +374,16 @@ fn run_activation_scope_capture_nfs2_visibility_contracted_to_node_a() -> Result
         "node-a",
         "runtime.exec.source",
     )?;
-    let node_a_scan =
-        unit_bound_scope_ids_from_activation_status(&harness.cluster, "node-a", "runtime.exec.scan")?;
-    let node_a_sink =
-        unit_bound_scope_ids_from_activation_status(&harness.cluster, "node-a", "runtime.exec.sink")?;
+    let node_a_scan = unit_bound_scope_ids_from_activation_status(
+        &harness.cluster,
+        "node-a",
+        "runtime.exec.scan",
+    )?;
+    let node_a_sink = unit_bound_scope_ids_from_activation_status(
+        &harness.cluster,
+        "node-a",
+        "runtime.exec.sink",
+    )?;
 
     eprintln!(
         "[fs-meta-api-ops] activation-scope-node-a source_pids={node_a_source_pids:?} sink_pids={node_a_sink_pids:?} sink_holder={sink_holder:?} routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
@@ -406,7 +414,8 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
         return Ok(());
     }
 
-    let mut harness = build_operational_harness("fs-meta-activation-force-find-preserved", false, 1)?;
+    let mut harness =
+        build_operational_harness("fs-meta-activation-force-find-preserved", false, 1)?;
     scenario_force_find_smoke(&mut harness.lab, &mut harness.session)?;
     let node_a_id = harness.cluster.node_id("node-a")?;
 
@@ -525,12 +534,8 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
                 "published_batches_by_node",
                 &node_a_id,
             );
-            node_a_source_published_events = status_debug_u64_by_node(
-                &status,
-                "source",
-                "published_events_by_node",
-                &node_a_id,
-            );
+            node_a_source_published_events =
+                status_debug_u64_by_node(&status, "source", "published_events_by_node", &node_a_id);
             node_a_source_published_control = status_debug_u64_by_node(
                 &status,
                 "source",
@@ -590,18 +595,10 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
                 "published_path_origin_counts_by_node",
                 &node_a_id,
             );
-            node_a_sink_received_batches = status_debug_u64_by_node(
-                &status,
-                "sink",
-                "received_batches_by_node",
-                &node_a_id,
-            );
-            node_a_sink_received_events = status_debug_u64_by_node(
-                &status,
-                "sink",
-                "received_events_by_node",
-                &node_a_id,
-            );
+            node_a_sink_received_batches =
+                status_debug_u64_by_node(&status, "sink", "received_batches_by_node", &node_a_id);
+            node_a_sink_received_events =
+                status_debug_u64_by_node(&status, "sink", "received_events_by_node", &node_a_id);
             node_a_sink_received_control = status_debug_u64_by_node(
                 &status,
                 "sink",
@@ -626,16 +623,12 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
                 "received_origin_counts_by_node",
                 &node_a_id,
             );
-            node_a_nfs1_concrete = source_concrete_root_summaries(
-                &mut harness.session,
-                &node_a_nfs1_object_ref,
-            )?;
+            node_a_nfs1_concrete =
+                source_concrete_root_summaries(&mut harness.session, &node_a_nfs1_object_ref)?;
             nfs2_primary = source_primary_for_group(&mut harness.session, "nfs2")?;
             nfs2_logical = source_logical_root_summary(&mut harness.session, "nfs2")?;
-            node_a_nfs2_concrete = source_concrete_root_summaries(
-                &mut harness.session,
-                &node_a_nfs2_object_ref,
-            )?;
+            node_a_nfs2_concrete =
+                source_concrete_root_summaries(&mut harness.session, &node_a_nfs2_object_ref)?;
             if nfs1_nodes > 0
                 && nfs2_nodes > 0
                 && nfs2_selected_root_exists
@@ -662,10 +655,14 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
         let mut late_published_events = node_a_source_published_events;
         let mut late_published_data = node_a_source_published_data;
         let mut late_last_published_at_us = 0u64;
-        let initial_nfs1_path_count =
-            published_origin_count(&node_a_source_published_path_origin_counts, &node_a_nfs1_object_ref);
-        let initial_nfs2_path_count =
-            published_origin_count(&node_a_source_published_path_origin_counts, &node_a_nfs2_object_ref);
+        let initial_nfs1_path_count = published_origin_count(
+            &node_a_source_published_path_origin_counts,
+            &node_a_nfs1_object_ref,
+        );
+        let initial_nfs2_path_count = published_origin_count(
+            &node_a_source_published_path_origin_counts,
+            &node_a_nfs2_object_ref,
+        );
         let initial_nfs1_emitted_path_events = source_concrete_root_field_u64(
             &mut harness.session,
             &node_a_nfs1_object_ref,
@@ -688,10 +685,8 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
         let mut late_nfs2_emitted_path_events = initial_nfs2_emitted_path_events;
         let mut late_nfs1_transition = initial_nfs1_transition.clone();
         let mut late_nfs2_transition = initial_nfs2_transition.clone();
-        let mut saw_late_publish = published_origin_counts_include(
-            &late_path_counts,
-            &node_a_nfs2_object_ref,
-        );
+        let mut saw_late_publish =
+            published_origin_counts_include(&late_path_counts, &node_a_nfs2_object_ref);
         let mut saw_late_tree = late_nfs2_nodes > 0;
         let deadline = std::time::Instant::now() + Duration::from_secs(window_secs);
         while std::time::Instant::now() < deadline {
@@ -701,12 +696,8 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
             ])?;
             late_nfs2_nodes = group_total_nodes(&tree, "nfs2");
             let status = harness.session.status()?;
-            late_published_events = status_debug_u64_by_node(
-                &status,
-                "source",
-                "published_events_by_node",
-                &node_a_id,
-            );
+            late_published_events =
+                status_debug_u64_by_node(&status, "source", "published_events_by_node", &node_a_id);
             late_published_data = status_debug_u64_by_node(
                 &status,
                 "source",
@@ -751,8 +742,10 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
             }
             thread::sleep(Duration::from_millis(250));
         }
-        let late_nfs1_path_count = published_origin_count(&late_path_counts, &node_a_nfs1_object_ref);
-        let late_nfs2_path_count = published_origin_count(&late_path_counts, &node_a_nfs2_object_ref);
+        let late_nfs1_path_count =
+            published_origin_count(&late_path_counts, &node_a_nfs1_object_ref);
+        let late_nfs2_path_count =
+            published_origin_count(&late_path_counts, &node_a_nfs2_object_ref);
         eprintln!(
             "[fs-meta-api-ops] activation-scope-preserved-lag-window window_secs={window_secs} saw_late_publish={saw_late_publish} saw_late_tree={saw_late_tree} initial_published_events={node_a_source_published_events} initial_published_data={node_a_source_published_data} late_published_events={late_published_events} late_published_data={late_published_data} late_last_published_at_us={late_last_published_at_us} initial_nfs1_path_count={initial_nfs1_path_count} late_nfs1_path_count={late_nfs1_path_count} initial_nfs2_path_count={initial_nfs2_path_count} late_nfs2_path_count={late_nfs2_path_count} initial_nfs1_emitted_path_events={initial_nfs1_emitted_path_events} late_nfs1_emitted_path_events={late_nfs1_emitted_path_events} initial_nfs2_emitted_path_events={initial_nfs2_emitted_path_events} late_nfs2_emitted_path_events={late_nfs2_emitted_path_events} initial_nfs1_transition={} late_nfs1_transition={} initial_nfs2_transition={} late_nfs2_transition={} initial_path_counts={node_a_source_published_path_origin_counts:?} late_path_counts={late_path_counts:?} initial_nfs2_nodes={nfs2_nodes} late_nfs2_nodes={late_nfs2_nodes}",
             initial_nfs1_transition.summary(),
@@ -1052,9 +1045,12 @@ fn scenario_visibility_change_and_sink_selection(
                 break;
             }
             if Instant::now() > deadline {
-                let raw_metrics_a = cluster.ctl_ok("node-a", json!({ "command": "metrics_get" }))?;
-                let raw_metrics_c = cluster.ctl_ok("node-c", json!({ "command": "metrics_get" }))?;
-                let raw_metrics_d = cluster.ctl_ok("node-d", json!({ "command": "metrics_get" }))?;
+                let raw_metrics_a =
+                    cluster.ctl_ok("node-a", json!({ "command": "metrics_get" }))?;
+                let raw_metrics_c =
+                    cluster.ctl_ok("node-c", json!({ "command": "metrics_get" }))?;
+                let raw_metrics_d =
+                    cluster.ctl_ok("node-d", json!({ "command": "metrics_get" }))?;
                 return Err(format!(
                     "timeout waiting for source active on nfs2 visible members: node-a pids={a:?} raw_metrics={raw_metrics_a} node-c pids={c:?} raw_metrics={raw_metrics_c} node-d pids={d:?} raw_metrics={raw_metrics_d}"
                 ));
@@ -1142,10 +1138,14 @@ fn scenario_sink_failover(
         },
     )?;
 
-    wait_until(Duration::from_secs(90), "new scoped sink holder elected", || {
-        let next = current_sink_failover_holder_snapshot(cluster, app_id)?;
-        Ok(sink_failover_successor_elected(&before, next.as_ref()))
-    })?;
+    wait_until(
+        Duration::from_secs(90),
+        "new scoped sink holder elected",
+        || {
+            let next = current_sink_failover_holder_snapshot(cluster, app_id)?;
+            Ok(sink_failover_successor_elected(&before, next.as_ref()))
+        },
+    )?;
     Ok(())
 }
 
@@ -1470,7 +1470,11 @@ fn sink_holder_snapshot_from_status(
             let active_unit = row
                 .get("unit_ids")
                 .and_then(Value::as_array)
-                .is_some_and(|units| units.iter().any(|v| v.as_str() == Some("runtime.exec.sink")));
+                .is_some_and(|units| {
+                    units
+                        .iter()
+                        .any(|v| v.as_str() == Some("runtime.exec.sink"))
+                });
             if !active_unit {
                 continue;
             }
@@ -1615,7 +1619,10 @@ fn activation_route_summaries(cluster: &Cluster5, node_name: &str) -> Result<Vec
                 .get("bound_scopes_by_unit")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let gate = row.get("gate").and_then(Value::as_str).unwrap_or("<unknown>");
+            let gate = row
+                .get("gate")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
             let delivered = row
                 .get("delivered")
                 .and_then(Value::as_bool)
@@ -1673,12 +1680,7 @@ fn status_debug_strings_by_node(
         .unwrap_or_default()
 }
 
-fn status_debug_u64_by_node(
-    status: &Value,
-    section: &str,
-    field: &str,
-    node_name: &str,
-) -> u64 {
+fn status_debug_u64_by_node(status: &Value, section: &str, field: &str, node_name: &str) -> u64 {
     status
         .get(section)
         .and_then(|v| v.get("debug"))
@@ -1771,11 +1773,15 @@ fn source_logical_root_summary(
             .and_then(|source| source.get("logical_roots"))
             .and_then(Value::as_array)
             .and_then(|roots| {
-                roots.iter()
+                roots
+                    .iter()
                     .find(|root| root.get("root_id").and_then(Value::as_str) == Some(root_id))
             })
         {
-            let status_label = root.get("status").and_then(Value::as_str).unwrap_or("<missing>");
+            let status_label = root
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>");
             let matched_grants = root
                 .get("matched_grants")
                 .and_then(Value::as_u64)
@@ -1807,9 +1813,9 @@ fn source_concrete_root_summaries(
             .and_then(|source| source.get("concrete_roots"))
             .and_then(Value::as_array)
             .and_then(|roots| {
-                roots.iter().find(|root| {
-                    root.get("object_ref").and_then(Value::as_str) == Some(object_ref)
-                })
+                roots
+                    .iter()
+                    .find(|root| root.get("object_ref").and_then(Value::as_str) == Some(object_ref))
             })
         {
             summaries.push(format!(
@@ -1898,9 +1904,9 @@ fn source_concrete_root_field_u64(
             .and_then(|source| source.get("concrete_roots"))
             .and_then(Value::as_array)
             .and_then(|roots| {
-                roots.iter().find(|root| {
-                    root.get("object_ref").and_then(Value::as_str) == Some(object_ref)
-                })
+                roots
+                    .iter()
+                    .find(|root| root.get("object_ref").and_then(Value::as_str) == Some(object_ref))
             })
             .and_then(|root| root.get(field))
             .and_then(Value::as_u64)
@@ -1921,9 +1927,9 @@ fn source_concrete_root_transition_snapshot(
             .and_then(|source| source.get("concrete_roots"))
             .and_then(Value::as_array)
             .and_then(|roots| {
-                roots.iter().find(|root| {
-                    root.get("object_ref").and_then(Value::as_str) == Some(object_ref)
-                })
+                roots
+                    .iter()
+                    .find(|root| root.get("object_ref").and_then(Value::as_str) == Some(object_ref))
             })
         {
             return Ok(ConcreteRootTransitionSnapshot {
@@ -1955,9 +1961,7 @@ fn source_concrete_root_transition_snapshot(
                     .get("emitted_path_event_count")
                     .and_then(Value::as_u64)
                     .unwrap_or_default(),
-                last_emitted_at_us: root
-                    .get("last_emitted_at_us")
-                    .and_then(Value::as_u64),
+                last_emitted_at_us: root.get("last_emitted_at_us").and_then(Value::as_u64),
                 forwarded_event_count: root
                     .get("forwarded_event_count")
                     .and_then(Value::as_u64)
@@ -1966,18 +1970,12 @@ fn source_concrete_root_transition_snapshot(
                     .get("forwarded_path_event_count")
                     .and_then(Value::as_u64)
                     .unwrap_or_default(),
-                last_forwarded_at_us: root
-                    .get("last_forwarded_at_us")
-                    .and_then(Value::as_u64),
-                current_revision: root
-                    .get("current_revision")
-                    .and_then(Value::as_u64),
+                last_forwarded_at_us: root.get("last_forwarded_at_us").and_then(Value::as_u64),
+                current_revision: root.get("current_revision").and_then(Value::as_u64),
                 current_stream_generation: root
                     .get("current_stream_generation")
                     .and_then(Value::as_u64),
-                candidate_revision: root
-                    .get("candidate_revision")
-                    .and_then(Value::as_u64),
+                candidate_revision: root.get("candidate_revision").and_then(Value::as_u64),
                 candidate_stream_generation: root
                     .get("candidate_stream_generation")
                     .and_then(Value::as_u64),
@@ -1985,9 +1983,7 @@ fn source_concrete_root_transition_snapshot(
                     .get("candidate_status")
                     .and_then(Value::as_str)
                     .map(str::to_string),
-                draining_revision: root
-                    .get("draining_revision")
-                    .and_then(Value::as_u64),
+                draining_revision: root.get("draining_revision").and_then(Value::as_u64),
                 draining_stream_generation: root
                     .get("draining_stream_generation")
                     .and_then(Value::as_u64),

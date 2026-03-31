@@ -8,3 +8,4 @@ fs-meta.query-keys.json
 .cargo/config.toml
 
 fs-meta.query-keys.json
+.tmp/

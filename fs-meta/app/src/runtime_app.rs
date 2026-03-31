@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
@@ -23,10 +24,11 @@ use crate::runtime::orchestration::{
     split_app_control_signals,
 };
 use crate::runtime::routes::{
-    METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
-    METHOD_SOURCE_STATUS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_PROXY,
-    ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_KEY_SOURCE_FIND_INTERNAL,
-    ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_INTERNAL,
+    METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS,
+    METHOD_SOURCE_FIND, METHOD_SOURCE_STATUS, ROUTE_KEY_EVENTS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_QUERY,
+    ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_STATUS_INTERNAL,
+    ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META,
+    ROUTE_TOKEN_FS_META_INTERNAL,
     default_route_bindings,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
@@ -65,6 +67,7 @@ use crate::source::config::SourceConfig;
 const ACTIVE_FACADE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_FRAME_LEASE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 struct FacadeActivation {
     route_key: String,
@@ -225,6 +228,15 @@ fn debug_force_find_runner_capture_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("FSMETA_DEBUG_FORCE_FIND_RUNNER_CAPTURE")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
+fn debug_sink_query_route_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_SINK_QUERY_ROUTE_TRACE")
             .ok()
             .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
     })
@@ -517,6 +529,19 @@ fn is_internal_status_route(route_key: &str) -> bool {
         || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
 }
 
+fn is_per_peer_sink_query_request_route(route_key: &str) -> bool {
+    let Some(request_route) = route_key.strip_suffix(".req") else {
+        return false;
+    };
+    let Some((stem, version)) = ROUTE_KEY_SINK_QUERY_INTERNAL.rsplit_once(':') else {
+        return request_route.starts_with(&format!("{ROUTE_KEY_SINK_QUERY_INTERNAL}."));
+    };
+    let Some(route_stem) = request_route.strip_suffix(&format!(":{version}")) else {
+        return false;
+    };
+    route_stem.starts_with(&format!("{stem}."))
+}
+
 fn is_retryable_worker_control_reset(err: &CnxError) -> bool {
     matches!(err, CnxError::TransportClosed(_) | CnxError::Timeout)
         || matches!(
@@ -533,6 +558,19 @@ fn is_retryable_worker_control_reset(err: &CnxError) -> bool {
             CnxError::AccessDenied(message) | CnxError::PeerError(message)
                 if message.contains("drained/fenced")
                     && message.contains("grant attachments")
+        )
+}
+
+fn is_retryable_worker_transport_close_reset(err: &CnxError) -> bool {
+    matches!(err, CnxError::TransportClosed(_) | CnxError::Timeout)
+        || matches!(
+            err,
+            CnxError::PeerError(message) | CnxError::Internal(message)
+                if message.contains("transport closed")
+                    && (message.contains("Connection reset by peer")
+                        || message.contains("early eof")
+                        || message.contains("Broken pipe")
+                        || message.contains("bridge stopped"))
         )
 }
 
@@ -562,10 +600,7 @@ fn shared_api_request_tracker_for_config(config: &api::ApiConfig) -> Arc<ApiRequ
     }
     static CELL: OnceLock<StdMutex<BTreeMap<Vec<String>, Arc<ApiRequestTracker>>>> =
         OnceLock::new();
-    let mut guard = match CELL
-        .get_or_init(|| StdMutex::new(BTreeMap::new()))
-        .lock()
-    {
+    let mut guard = match CELL.get_or_init(|| StdMutex::new(BTreeMap::new())).lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -583,21 +618,17 @@ fn runtime_worker_binding_serial_key(binding: &RuntimeWorkerBinding) -> String {
 }
 
 fn shared_control_frame_serial_for_runtime(
-    node_id: &NodeId,
+    _node_id: &NodeId,
     source_worker_binding: &RuntimeWorkerBinding,
     sink_worker_binding: &RuntimeWorkerBinding,
 ) -> Arc<Mutex<()>> {
     static CELL: OnceLock<StdMutex<BTreeMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     let key = format!(
-        "{}|{}|{}",
-        node_id.0,
+        "{}|{}",
         runtime_worker_binding_serial_key(source_worker_binding),
         runtime_worker_binding_serial_key(sink_worker_binding)
     );
-    let mut guard = match CELL
-        .get_or_init(|| StdMutex::new(BTreeMap::new()))
-        .lock()
-    {
+    let mut guard = match CELL.get_or_init(|| StdMutex::new(BTreeMap::new())).lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -607,10 +638,103 @@ fn shared_control_frame_serial_for_runtime(
         .clone()
 }
 
-type SharedSinkRouteClaims = std::collections::BTreeMap<
-    (String, String),
-    std::collections::BTreeSet<u64>,
->;
+fn shared_control_frame_lease_path_for_runtime(
+    node_id: &NodeId,
+    source_worker_binding: &RuntimeWorkerBinding,
+    sink_worker_binding: &RuntimeWorkerBinding,
+) -> Option<std::path::PathBuf> {
+    if source_worker_binding.mode != WorkerMode::External
+        && sink_worker_binding.mode != WorkerMode::External
+    {
+        return None;
+    }
+    let lease_root = std::env::var("DATANIX_E2E_TMP_ROOT")
+        .or_else(|_| std::env::var("CAPANIX_E2E_TMP_ROOT"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("fs-meta-control-frame-leases");
+    let node_token = node_id
+        .0
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '-',
+        })
+        .collect::<String>();
+    let serial_token = format!(
+        "{}--{}",
+        runtime_worker_binding_serial_key(source_worker_binding),
+        runtime_worker_binding_serial_key(sink_worker_binding)
+    )
+    .chars()
+    .map(|ch| match ch {
+        'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+        _ => '-',
+    })
+    .collect::<String>();
+    Some(lease_root.join(format!(
+        "control-frame-{node_token}-{serial_token}.lock"
+    )))
+}
+
+struct ControlFrameLeaseGuard {
+    file: File,
+}
+
+impl ControlFrameLeaseGuard {
+    fn flock(file: &File, op: libc::c_int) -> std::io::Result<()> {
+        let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(file), op) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn try_acquire(path: &std::path::Path) -> std::io::Result<Option<Self>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        match Self::flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(err)
+                if matches!(
+                    err.raw_os_error(),
+                    Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn acquire(path: &std::path::Path) -> std::io::Result<Self> {
+        loop {
+            if let Some(guard) = Self::try_acquire(path)? {
+                return Ok(guard);
+            }
+            tokio::time::sleep(CONTROL_FRAME_LEASE_RETRY_INTERVAL).await;
+        }
+    }
+}
+
+impl Drop for ControlFrameLeaseGuard {
+    fn drop(&mut self) {
+        let _ = Self::flock(&self.file, libc::LOCK_UN);
+    }
+}
+
+type SharedSinkRouteClaims =
+    std::collections::BTreeMap<(String, String), std::collections::BTreeSet<u64>>;
+type SharedSourceRouteClaims =
+    std::collections::BTreeMap<(String, String), std::collections::BTreeSet<u64>>;
 
 fn shared_sink_route_claims_for_runtime(
     node_id: &NodeId,
@@ -625,16 +749,36 @@ fn shared_sink_route_claims_for_runtime(
         runtime_worker_binding_serial_key(source_worker_binding),
         runtime_worker_binding_serial_key(sink_worker_binding)
     );
-    let mut guard = match CELL
-        .get_or_init(|| StdMutex::new(BTreeMap::new()))
-        .lock()
-    {
+    let mut guard = match CELL.get_or_init(|| StdMutex::new(BTreeMap::new())).lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     guard
         .entry(key)
         .or_insert_with(|| Arc::new(Mutex::new(SharedSinkRouteClaims::default())))
+        .clone()
+}
+
+fn shared_source_route_claims_for_runtime(
+    node_id: &NodeId,
+    source_worker_binding: &RuntimeWorkerBinding,
+    sink_worker_binding: &RuntimeWorkerBinding,
+) -> Arc<Mutex<SharedSourceRouteClaims>> {
+    static CELL: OnceLock<StdMutex<BTreeMap<String, Arc<Mutex<SharedSourceRouteClaims>>>>> =
+        OnceLock::new();
+    let key = format!(
+        "{}|{}|{}",
+        node_id.0,
+        runtime_worker_binding_serial_key(source_worker_binding),
+        runtime_worker_binding_serial_key(sink_worker_binding)
+    );
+    let mut guard = match CELL.get_or_init(|| StdMutex::new(BTreeMap::new())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(SharedSourceRouteClaims::default())))
         .clone()
 }
 
@@ -681,6 +825,13 @@ struct RuntimeControlFrameStartHook {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+struct FacadeDeactivatePauseHook {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
 fn facade_shutdown_start_hook_cell() -> &'static StdMutex<Option<FacadeShutdownStartHook>> {
     static CELL: OnceLock<StdMutex<Option<FacadeShutdownStartHook>>> = OnceLock::new();
     CELL.get_or_init(|| StdMutex::new(None))
@@ -719,8 +870,8 @@ fn notify_facade_shutdown_started() {
 }
 
 #[cfg(test)]
-fn runtime_proxy_request_pause_hook_cell(
-) -> &'static StdMutex<BTreeMap<&'static str, RuntimeProxyRequestPauseHook>> {
+fn runtime_proxy_request_pause_hook_cell()
+-> &'static StdMutex<BTreeMap<&'static str, RuntimeProxyRequestPauseHook>> {
     static CELL: OnceLock<StdMutex<BTreeMap<&'static str, RuntimeProxyRequestPauseHook>>> =
         OnceLock::new();
     CELL.get_or_init(|| StdMutex::new(BTreeMap::new()))
@@ -763,8 +914,8 @@ async fn maybe_pause_runtime_proxy_request(label: &'static str) {
 }
 
 #[cfg(test)]
-fn runtime_control_frame_start_hook_cell(
-) -> &'static StdMutex<Option<RuntimeControlFrameStartHook>> {
+fn runtime_control_frame_start_hook_cell() -> &'static StdMutex<Option<RuntimeControlFrameStartHook>>
+{
     static CELL: OnceLock<StdMutex<Option<RuntimeControlFrameStartHook>>> = OnceLock::new();
     CELL.get_or_init(|| StdMutex::new(None))
 }
@@ -801,6 +952,53 @@ fn notify_runtime_control_frame_started() {
     }
 }
 
+#[cfg(test)]
+fn facade_deactivate_pause_hook_cell()
+-> &'static StdMutex<BTreeMap<(String, String), FacadeDeactivatePauseHook>> {
+    static CELL: OnceLock<StdMutex<BTreeMap<(String, String), FacadeDeactivatePauseHook>>> =
+        OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn install_facade_deactivate_pause_hook(
+    unit_id: &str,
+    route_key: &str,
+    hook: FacadeDeactivatePauseHook,
+) {
+    let mut guard = match facade_deactivate_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.insert((unit_id.to_string(), route_key.to_string()), hook);
+}
+
+#[cfg(test)]
+fn clear_facade_deactivate_pause_hook(unit_id: &str, route_key: &str) {
+    let mut guard = match facade_deactivate_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.remove(&(unit_id.to_string(), route_key.to_string()));
+}
+
+#[cfg(test)]
+async fn maybe_pause_facade_deactivate(unit_id: &str, route_key: &str) {
+    let hook = {
+        let guard = match facade_deactivate_pause_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .get(&(unit_id.to_string(), route_key.to_string()))
+            .cloned()
+    };
+    if let Some(hook) = hook {
+        hook.entered.notify_waiters();
+        hook.release.notified().await;
+    }
+}
+
 pub struct FSMetaApp {
     instance_id: u64,
     config: FSMetaConfig,
@@ -818,6 +1016,7 @@ pub struct FSMetaApp {
     api_request_tracker: Arc<ApiRequestTracker>,
     api_control_gate: Arc<ApiControlGate>,
     control_frame_serial: Arc<Mutex<()>>,
+    shared_control_frame_serial: Arc<Mutex<()>>,
     facade_pending_status: SharedFacadePendingStatusCell,
     facade_gate: RuntimeUnitGate,
     mirrored_query_peer_routes: Mutex<std::collections::BTreeMap<String, u64>>,
@@ -826,7 +1025,9 @@ pub struct FSMetaApp {
     source_state_replay_required: AtomicBool,
     retained_sink_control_state: Mutex<RetainedSinkControlState>,
     sink_state_replay_required: AtomicBool,
+    shared_source_route_claims: Arc<Mutex<SharedSourceRouteClaims>>,
     shared_sink_route_claims: Arc<Mutex<SharedSinkRouteClaims>>,
+    control_frame_lease_path: Option<std::path::PathBuf>,
     control_init_lock: Mutex<()>,
 }
 
@@ -988,12 +1189,22 @@ impl FSMetaApp {
             },
         };
         let query_sink = sink.clone();
-        let control_frame_serial = shared_control_frame_serial_for_runtime(
+        let shared_control_frame_serial = shared_control_frame_serial_for_runtime(
+            &node_id,
+            &source_worker_binding,
+            &sink_worker_binding,
+        );
+        let shared_source_route_claims = shared_source_route_claims_for_runtime(
             &node_id,
             &source_worker_binding,
             &sink_worker_binding,
         );
         let shared_sink_route_claims = shared_sink_route_claims_for_runtime(
+            &node_id,
+            &source_worker_binding,
+            &sink_worker_binding,
+        );
+        let control_frame_lease_path = shared_control_frame_lease_path_for_runtime(
             &node_id,
             &source_worker_binding,
             &sink_worker_binding,
@@ -1014,7 +1225,8 @@ impl FSMetaApp {
             facade_spawn_in_progress: Arc::new(Mutex::new(None)),
             api_request_tracker,
             api_control_gate,
-            control_frame_serial,
+            control_frame_serial: Arc::new(Mutex::new(())),
+            shared_control_frame_serial,
             facade_pending_status: shared_facade_pending_status_cell(),
             facade_gate: RuntimeUnitGate::new(
                 "fs-meta",
@@ -1030,7 +1242,9 @@ impl FSMetaApp {
             source_state_replay_required: AtomicBool::new(false),
             retained_sink_control_state: Mutex::new(RetainedSinkControlState::default()),
             sink_state_replay_required: AtomicBool::new(false),
+            shared_source_route_claims,
             shared_sink_route_claims,
+            control_frame_lease_path,
             control_init_lock: Mutex::new(()),
         })
     }
@@ -1071,11 +1285,32 @@ impl FSMetaApp {
         )
     }
 
-    fn facade_signal_can_initialize(signal: &FacadeControlSignal) -> bool {
+    fn sink_signal_is_cleanup_only(signal: &SinkControlSignal) -> bool {
         matches!(
             signal,
-            FacadeControlSignal::Activate { .. }
-                | FacadeControlSignal::Deactivate { .. }
+            SinkControlSignal::Deactivate { .. } | SinkControlSignal::Tick { .. }
+        )
+    }
+
+    fn sink_signal_requires_fail_closed_retry_after_generation_cutover(
+        signal: &SinkControlSignal,
+    ) -> bool {
+        matches!(
+            signal,
+            SinkControlSignal::Activate { route_key, .. }
+                | SinkControlSignal::Deactivate { route_key, .. }
+                if route_key == &format!("{}.stream", ROUTE_KEY_EVENTS)
+        )
+    }
+
+    fn facade_signal_can_initialize(signal: &FacadeControlSignal) -> bool {
+        matches!(signal, FacadeControlSignal::Activate { .. })
+    }
+
+    fn facade_signal_is_cleanup_only(signal: &FacadeControlSignal) -> bool {
+        matches!(
+            signal,
+            FacadeControlSignal::Deactivate { .. }
                 | FacadeControlSignal::Tick { .. }
                 | FacadeControlSignal::ExposureConfirmed { .. }
         )
@@ -1113,6 +1348,7 @@ impl FSMetaApp {
         }
         let mut guard = self.pump_task.lock().await;
         if guard.is_none() {
+            self.wait_for_shared_worker_control_handoff().await;
             eprintln!("fs_meta_runtime_app: initialize_from_control source.start begin");
             *guard = self
                 .source
@@ -1285,6 +1521,7 @@ impl FSMetaApp {
                 // Not currently selected as query/query-peer sink-status owner, or already running.
             } else {
                 let api_request_tracker = self.api_request_tracker.clone();
+                let api_control_gate = self.api_control_gate.clone();
                 let sink = self.sink.clone();
                 eprintln!(
                     "fs_meta_runtime_app: spawning sink status endpoint route={}",
@@ -1300,11 +1537,18 @@ impl FSMetaApp {
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
                         let api_request_tracker = api_request_tracker.clone();
+                        let api_control_gate = api_control_gate.clone();
                         let sink = sink.clone();
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
                                 let _request_guard = api_request_tracker.begin();
+                                if !api_control_gate.is_ready() {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: sink status endpoint unavailable reason=control_not_ready"
+                                    );
+                                    continue;
+                                }
                                 #[cfg(test)]
                                 maybe_pause_runtime_proxy_request("sink_status").await;
                                 match sink.status_snapshot_nonblocking().await {
@@ -1361,6 +1605,7 @@ impl FSMetaApp {
                     "internal query endpoint unit must exist when route is active"
                 );
                 let api_request_tracker = self.api_request_tracker.clone();
+                let api_control_gate = self.api_control_gate.clone();
                 let source = self.source.clone();
                 let node_id = self.node_id.clone();
                 eprintln!(
@@ -1378,12 +1623,19 @@ impl FSMetaApp {
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
                         let api_request_tracker = api_request_tracker.clone();
+                        let api_control_gate = api_control_gate.clone();
                         let source = source.clone();
                         let node_id = node_id.clone();
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
                                 let _request_guard = api_request_tracker.begin();
+                                if !api_control_gate.is_ready() {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: source status endpoint unavailable reason=control_not_ready"
+                                    );
+                                    api_control_gate.wait_ready().await;
+                                }
                                 let trace_id = next_source_status_endpoint_trace_id();
                                 let route_name = format!(
                                     "{}:{}",
@@ -1556,11 +1808,22 @@ impl FSMetaApp {
                                                 )
                                             })
                                             .unwrap_or(true);
-                                        if should_bridge_selected_group_sink_query(
+                                        let should_bridge = should_bridge_selected_group_sink_query(
                                             &params,
                                             &events,
                                             local_selected_group_bridge_eligible,
-                                        ) {
+                                        );
+                                        if debug_sink_query_route_trace_enabled() {
+                                            eprintln!(
+                                                "fs_meta_runtime_app: sink query proxy bridge_decision correlation={:?} selected_group={:?} local_events={} eligible={} should_bridge={}",
+                                                req.metadata().correlation_id,
+                                                params.scope.selected_group,
+                                                events.len(),
+                                                local_selected_group_bridge_eligible,
+                                                should_bridge
+                                            );
+                                        }
+                                        if should_bridge {
                                             match rmp_serde::to_vec(&params) {
                                                 Ok(payload) => {
                                                     match capanix_host_adapter_fs::HostAdapter::call_collect(
@@ -2081,11 +2344,7 @@ impl FSMetaApp {
         )
         .await?
         {
-            Self::set_pending_facade_status_waiting(
-                &facade_pending_status,
-                &pending,
-                wait_reason,
-            );
+            Self::set_pending_facade_status_waiting(&facade_pending_status, &pending, wait_reason);
             return Ok(false);
         }
         if let Some((route_key, resource_ids, generation)) = same_resource_replacement.take() {
@@ -2227,7 +2486,10 @@ impl FSMetaApp {
                 "fs_meta_runtime_app: shutting down previous active facade generation={}",
                 current.generation
             );
-            current.handle.shutdown(ACTIVE_FACADE_SHUTDOWN_TIMEOUT).await;
+            current
+                .handle
+                .shutdown(ACTIVE_FACADE_SHUTDOWN_TIMEOUT)
+                .await;
         }
         Ok(true)
     }
@@ -2303,8 +2565,7 @@ impl FSMetaApp {
         if !pending.runtime_exposure_confirmed {
             return Ok(Some(FacadePendingReason::AwaitingRuntimeExposure));
         }
-        if pending.runtime_managed
-            && !Self::observation_eligible_for(source, sink, pending).await?
+        if pending.runtime_managed && !Self::observation_eligible_for(source, sink, pending).await?
         {
             return Ok(Some(FacadePendingReason::AwaitingObservationEligibility));
         }
@@ -2464,7 +2725,10 @@ impl FSMetaApp {
             return Ok(());
         }
         if matches!(unit, FacadeRuntimeUnit::Query) {
-            self.mirrored_query_peer_routes.lock().await.remove(route_key);
+            self.mirrored_query_peer_routes
+                .lock()
+                .await
+                .remove(route_key);
         } else if matches!(unit, FacadeRuntimeUnit::QueryPeer)
             && is_dual_lane_internal_query_route(route_key)
         {
@@ -2551,7 +2815,10 @@ impl FSMetaApp {
                 "fs_meta_runtime_app: shutting down previous active facade generation={}",
                 current.generation
             );
-            current.handle.shutdown(ACTIVE_FACADE_SHUTDOWN_TIMEOUT).await;
+            current
+                .handle
+                .shutdown(ACTIVE_FACADE_SHUTDOWN_TIMEOUT)
+                .await;
         }
         clear_owned_process_facade_claim(self.instance_id);
     }
@@ -2568,7 +2835,10 @@ impl FSMetaApp {
             let _ = self
                 .facade_gate
                 .clear_route(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, route_key);
-            self.mirrored_query_peer_routes.lock().await.remove(route_key);
+            self.mirrored_query_peer_routes
+                .lock()
+                .await
+                .remove(route_key);
         }
 
         let mut endpoint_tasks = std::mem::take(&mut *self.runtime_endpoint_tasks.lock().await);
@@ -2587,7 +2857,9 @@ impl FSMetaApp {
     }
 
     async fn wait_for_shared_worker_control_handoff(&self) {
-        self.source.wait_for_control_ops_to_drain_for_handoff().await;
+        self.source
+            .wait_for_control_ops_to_drain_for_handoff()
+            .await;
         self.sink.wait_for_control_ops_to_drain_for_handoff().await;
     }
 
@@ -2616,72 +2888,39 @@ impl FSMetaApp {
         &self,
         source_signals: &[SourceControlSignal],
     ) -> Vec<SourceControlSignal> {
-        if !self
-            .source_state_replay_required
-            .load(Ordering::Acquire)
-        {
+        if !self.source_state_replay_required.load(Ordering::Acquire) {
             return source_signals.to_vec();
         }
 
-        let retained = self.retained_source_control_state.lock().await.clone();
-        let mut merged = Vec::new();
-        let current_has_host_grant = source_signals
-            .iter()
-            .any(|signal| matches!(signal, SourceControlSignal::RuntimeHostGrantChange { .. }));
-        if !current_has_host_grant {
-            if let Some(changed) = retained.latest_host_grant_change {
-                merged.push(changed);
-            }
-        }
-
-        let current_routes = source_signals
-            .iter()
-            .filter_map(|signal| match signal {
-                SourceControlSignal::Activate {
-                    unit, route_key, ..
-                }
-                | SourceControlSignal::Deactivate { unit, route_key, .. } => {
-                    Some((unit.unit_id().to_string(), route_key.clone()))
-                }
-                // Tick-only followups cannot rebuild fresh worker state after a restart.
-                // Keep replaying retained active routes unless a new activate/deactivate
-                // for that route is actually present in the current batch.
-                SourceControlSignal::Tick { .. } => None,
-                SourceControlSignal::RuntimeHostGrantChange { .. }
-                | SourceControlSignal::ManualRescan { .. }
-                | SourceControlSignal::Passthrough(_) => None,
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-
-        for (route_id, signal) in retained.active_by_route {
-            if !current_routes.contains(&route_id) {
-                merged.push(signal);
-            }
-        }
-        merged.extend_from_slice(source_signals);
-        merged
+        let mut desired = self.retained_source_control_state.lock().await.clone();
+        Self::apply_source_signals_to_state(&mut desired, source_signals);
+        Self::source_signals_from_state(&desired)
     }
 
     async fn record_retained_source_control_state(&self, source_signals: &[SourceControlSignal]) {
         let mut retained = self.retained_source_control_state.lock().await;
+        Self::apply_source_signals_to_state(&mut retained, source_signals);
+    }
+
+    fn apply_source_signals_to_state(
+        state: &mut RetainedSourceControlState,
+        source_signals: &[SourceControlSignal],
+    ) {
         for signal in source_signals {
             match signal {
                 SourceControlSignal::Activate {
                     unit, route_key, ..
-                } => {
-                    retained
-                        .active_by_route
-                        .insert((unit.unit_id().to_string(), route_key.clone()), signal.clone());
                 }
-                SourceControlSignal::Deactivate {
+                | SourceControlSignal::Deactivate {
                     unit, route_key, ..
                 } => {
-                    retained
-                        .active_by_route
-                        .remove(&(unit.unit_id().to_string(), route_key.clone()));
+                    state.active_by_route.insert(
+                        (unit.unit_id().to_string(), route_key.clone()),
+                        signal.clone(),
+                    );
                 }
                 SourceControlSignal::RuntimeHostGrantChange { .. } => {
-                    retained.latest_host_grant_change = Some(signal.clone());
+                    state.latest_host_grant_change = Some(signal.clone());
                 }
                 SourceControlSignal::Tick { .. }
                 | SourceControlSignal::ManualRescan { .. }
@@ -2690,20 +2929,101 @@ impl FSMetaApp {
         }
     }
 
+    fn source_signals_from_state(state: &RetainedSourceControlState) -> Vec<SourceControlSignal> {
+        let mut merged = Vec::new();
+        if let Some(changed) = state.latest_host_grant_change.clone() {
+            merged.push(changed);
+        }
+        merged.extend(state.active_by_route.values().cloned());
+        merged
+    }
+
+    async fn filter_shared_source_route_deactivates(
+        &self,
+        source_signals: &[SourceControlSignal],
+    ) -> Vec<SourceControlSignal> {
+        let claims = self.shared_source_route_claims.lock().await;
+        source_signals
+            .iter()
+            .filter(|signal| match signal {
+                SourceControlSignal::Deactivate {
+                    unit, route_key, ..
+                } => claims
+                    .get(&(unit.unit_id().to_string(), route_key.clone()))
+                    .is_none_or(|owners| owners.iter().all(|owner| *owner == self.instance_id)),
+                _ => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    async fn record_shared_source_route_claims(&self, source_signals: &[SourceControlSignal]) {
+        let mut claims = self.shared_source_route_claims.lock().await;
+        for signal in source_signals {
+            match signal {
+                SourceControlSignal::Activate {
+                    unit, route_key, ..
+                } => {
+                    claims
+                        .entry((unit.unit_id().to_string(), route_key.clone()))
+                        .or_default()
+                        .insert(self.instance_id);
+                }
+                SourceControlSignal::Deactivate {
+                    unit, route_key, ..
+                } => {
+                    let route_id = (unit.unit_id().to_string(), route_key.clone());
+                    if let Some(owners) = claims.get_mut(&route_id) {
+                        owners.remove(&self.instance_id);
+                        if owners.is_empty() {
+                            claims.remove(&route_id);
+                        }
+                    }
+                }
+                SourceControlSignal::Tick { .. }
+                | SourceControlSignal::RuntimeHostGrantChange { .. }
+                | SourceControlSignal::ManualRescan { .. }
+                | SourceControlSignal::Passthrough(_) => {}
+            }
+        }
+    }
+
+    async fn clear_shared_source_route_claims_for_instance(&self) {
+        let mut claims = self.shared_source_route_claims.lock().await;
+        claims.retain(|_, owners| {
+            owners.remove(&self.instance_id);
+            !owners.is_empty()
+        });
+    }
+
     async fn apply_source_signals_with_recovery(
         &self,
         source_signals: &[SourceControlSignal],
     ) -> Result<()> {
+        let filtered_source_signals = self
+            .filter_shared_source_route_deactivates(source_signals)
+            .await;
+        self.record_retained_source_control_state(&filtered_source_signals)
+            .await;
         let deadline = tokio::time::Instant::now() + SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT;
         loop {
-            let effective_source_signals = self.source_signals_with_replay(source_signals).await;
+            let effective_source_signals = self
+                .source_signals_with_replay(&filtered_source_signals)
+                .await;
+            if effective_source_signals.is_empty() {
+                self.record_shared_source_route_claims(&effective_source_signals)
+                    .await;
+                self.source_state_replay_required
+                    .store(false, Ordering::Release);
+                return Ok(());
+            }
             match self
                 .source
                 .apply_orchestration_signals(&effective_source_signals)
                 .await
             {
                 Ok(()) => {
-                    self.record_retained_source_control_state(&effective_source_signals)
+                    self.record_shared_source_route_claims(&effective_source_signals)
                         .await;
                     self.source_state_replay_required
                         .store(false, Ordering::Release);
@@ -2727,70 +3047,56 @@ impl FSMetaApp {
         }
     }
 
-    async fn sink_signals_with_replay(&self, sink_signals: &[SinkControlSignal]) -> Vec<SinkControlSignal> {
+    async fn sink_signals_with_replay(
+        &self,
+        sink_signals: &[SinkControlSignal],
+    ) -> Vec<SinkControlSignal> {
         if !self.sink_state_replay_required.load(Ordering::Acquire) {
             return sink_signals.to_vec();
         }
 
-        let retained = self.retained_sink_control_state.lock().await.clone();
-        let mut merged = Vec::new();
-        let current_has_host_grant = sink_signals
-            .iter()
-            .any(|signal| matches!(signal, SinkControlSignal::RuntimeHostGrantChange { .. }));
-        if !current_has_host_grant {
-            if let Some(changed) = retained.latest_host_grant_change {
-                merged.push(changed);
-            }
-        }
+        let mut desired = self.retained_sink_control_state.lock().await.clone();
+        Self::apply_sink_signals_to_state(&mut desired, sink_signals);
+        Self::sink_signals_from_state(&desired)
+    }
 
-        let current_routes = sink_signals
-            .iter()
-            .filter_map(|signal| match signal {
+    async fn record_retained_sink_control_state(&self, sink_signals: &[SinkControlSignal]) {
+        let mut retained = self.retained_sink_control_state.lock().await;
+        Self::apply_sink_signals_to_state(&mut retained, sink_signals);
+    }
+
+    fn apply_sink_signals_to_state(
+        state: &mut RetainedSinkControlState,
+        sink_signals: &[SinkControlSignal],
+    ) {
+        for signal in sink_signals {
+            match signal {
                 SinkControlSignal::Activate {
                     unit, route_key, ..
                 }
                 | SinkControlSignal::Deactivate {
                     unit, route_key, ..
-                } => Some((unit.unit_id().to_string(), route_key.clone())),
-                SinkControlSignal::Tick { .. } => None,
-                SinkControlSignal::RuntimeHostGrantChange { .. }
-                | SinkControlSignal::Passthrough(_) => None,
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-
-        for (route_id, signal) in retained.active_by_route {
-            if !current_routes.contains(&route_id) {
-                merged.push(signal);
-            }
-        }
-        merged.extend_from_slice(sink_signals);
-        merged
-    }
-
-    async fn record_retained_sink_control_state(&self, sink_signals: &[SinkControlSignal]) {
-        let mut retained = self.retained_sink_control_state.lock().await;
-        for signal in sink_signals {
-            match signal {
-                SinkControlSignal::Activate {
-                    unit, route_key, ..
                 } => {
-                    retained
-                        .active_by_route
-                        .insert((unit.unit_id().to_string(), route_key.clone()), signal.clone());
-                }
-                SinkControlSignal::Deactivate {
-                    unit, route_key, ..
-                } => {
-                    retained
-                        .active_by_route
-                        .remove(&(unit.unit_id().to_string(), route_key.clone()));
+                    state.active_by_route.insert(
+                        (unit.unit_id().to_string(), route_key.clone()),
+                        signal.clone(),
+                    );
                 }
                 SinkControlSignal::RuntimeHostGrantChange { .. } => {
-                    retained.latest_host_grant_change = Some(signal.clone());
+                    state.latest_host_grant_change = Some(signal.clone());
                 }
                 SinkControlSignal::Tick { .. } | SinkControlSignal::Passthrough(_) => {}
             }
         }
+    }
+
+    fn sink_signals_from_state(state: &RetainedSinkControlState) -> Vec<SinkControlSignal> {
+        let mut merged = Vec::new();
+        if let Some(changed) = state.latest_host_grant_change.clone() {
+            merged.push(changed);
+        }
+        merged.extend(state.active_by_route.values().cloned());
+        merged
     }
 
     async fn filter_shared_sink_route_deactivates(
@@ -2850,44 +3156,110 @@ impl FSMetaApp {
         });
     }
 
+    async fn clear_shared_sink_query_route_claims_for_cleanup(&self) {
+        let mut claims = self.shared_sink_route_claims.lock().await;
+        claims.retain(|(unit_id, route_key), _| {
+            !(unit_id == execution_units::SINK_RUNTIME_UNIT_ID
+                && is_per_peer_sink_query_request_route(route_key))
+        });
+    }
+
+    async fn sink_signals_are_in_shared_generation_cutover_lane(
+        &self,
+        sink_signals: &[SinkControlSignal],
+    ) -> bool {
+        if sink_signals.is_empty()
+            || !sink_signals
+                .iter()
+                .all(Self::sink_signal_requires_fail_closed_retry_after_generation_cutover)
+        {
+            return false;
+        }
+
+        let claims = self.shared_sink_route_claims.lock().await;
+        sink_signals.iter().any(|signal| match signal {
+            SinkControlSignal::Activate {
+                unit, route_key, ..
+            }
+            | SinkControlSignal::Deactivate {
+                unit, route_key, ..
+            } => claims
+                .get(&(unit.unit_id().to_string(), route_key.clone()))
+                .is_some_and(|owners| owners.iter().any(|owner| *owner != self.instance_id)),
+            SinkControlSignal::Tick { .. }
+            | SinkControlSignal::RuntimeHostGrantChange { .. }
+            | SinkControlSignal::Passthrough(_) => false,
+        })
+    }
+
     async fn apply_sink_signals_with_recovery(
         &self,
         sink_signals: &[SinkControlSignal],
+        replay_retained_state: bool,
+        fail_closed_in_generation_cutover_lane: bool,
     ) -> Result<()> {
+        let filtered_sink_signals = self.filter_shared_sink_route_deactivates(sink_signals).await;
+        self.record_retained_sink_control_state(&filtered_sink_signals)
+            .await;
         let deadline = tokio::time::Instant::now() + SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT;
         loop {
-            let replayed_sink_signals = self.sink_signals_with_replay(sink_signals).await;
-            let effective_sink_signals = self
-                .filter_shared_sink_route_deactivates(&replayed_sink_signals)
-                .await;
+            let effective_sink_signals = if replay_retained_state {
+                let replayed_sink_signals =
+                    self.sink_signals_with_replay(&filtered_sink_signals).await;
+                self.filter_shared_sink_route_deactivates(&replayed_sink_signals)
+                    .await
+            } else {
+                filtered_sink_signals.clone()
+            };
             if effective_sink_signals.is_empty() {
-                self.record_retained_sink_control_state(sink_signals).await;
-                self.record_shared_sink_route_claims(sink_signals).await;
-                self.sink_state_replay_required
+                self.record_shared_sink_route_claims(&effective_sink_signals)
+                    .await;
+                if replay_retained_state {
+                    self.sink_state_replay_required
                     .store(false, Ordering::Release);
+                }
                 return Ok(());
             }
+            self.record_shared_sink_route_claims(&effective_sink_signals)
+                .await;
             match self
                 .sink
                 .apply_orchestration_signals(&effective_sink_signals)
                 .await
             {
                 Ok(()) => {
-                    self.record_retained_sink_control_state(sink_signals).await;
-                    self.record_shared_sink_route_claims(sink_signals).await;
-                    self.sink_state_replay_required
-                        .store(false, Ordering::Release);
+                    if fail_closed_in_generation_cutover_lane {
+                        self.mark_control_uninitialized_after_failure().await;
+                        return Err(CnxError::TransportClosed(
+                            "sink-only shared-route generation cutover must reconcile through the uninitialized recovery path"
+                                .to_string(),
+                        ));
+                    }
+                    if replay_retained_state {
+                        self.sink_state_replay_required
+                            .store(false, Ordering::Release);
+                    }
                     return Ok(());
                 }
                 Err(err)
                     if is_retryable_worker_control_reset(&err)
                         && tokio::time::Instant::now() < deadline =>
                 {
+                    if fail_closed_in_generation_cutover_lane
+                        && is_retryable_worker_transport_close_reset(&err)
+                    {
+                        self.mark_control_uninitialized_after_failure().await;
+                        return Err(err);
+                    }
                     eprintln!(
                         "fs_meta_runtime_app: sink control replay after retryable reset err={}",
                         err
                     );
-                    self.reinitialize_after_control_reset().await?;
+                    if replay_retained_state {
+                        self.reinitialize_after_control_reset().await?;
+                    } else {
+                        self.sink.ensure_started().await?;
+                    }
                 }
                 Err(err) => {
                     self.mark_control_uninitialized_after_failure().await;
@@ -2912,12 +3284,37 @@ impl FSMetaApp {
         if !facade_route_key_matches(unit, route_key) {
             return Ok(());
         }
-        if matches!(unit, FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer)
-            && is_internal_status_route(route_key)
+        if matches!(
+            unit,
+            FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer
+        ) && is_internal_status_route(route_key)
         {
             self.api_control_gate.wait_for_facade_request_drain().await;
         }
+        if matches!(
+            unit,
+            FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer
+        ) {
+            self.wait_for_shared_worker_control_handoff().await;
+        }
+        if !self.control_initialized()
+            && matches!(unit, FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer)
+            && route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
+        {
+            let current_generation = self
+                .facade_gate
+                .route_generation(unit.unit_id(), route_key)?
+                .unwrap_or(0);
+            // Only clear per-peer sink-query shared claims as part of the uninitialized
+            // stale cleanup chain. Clearing these claims during a live proxy deactivate
+            // can disrupt in-flight internal proxy requests.
+            if generation < current_generation {
+                self.clear_shared_sink_query_route_claims_for_cleanup().await;
+            }
+        }
         let unit_id = unit.unit_id();
+        #[cfg(test)]
+        maybe_pause_facade_deactivate(unit_id, route_key).await;
         let accepted = self
             .facade_gate
             .apply_deactivate(unit_id, route_key, generation)?;
@@ -2930,7 +3327,10 @@ impl FSMetaApp {
             return Ok(());
         }
         if matches!(unit, FacadeRuntimeUnit::Query) {
-            self.mirrored_query_peer_routes.lock().await.remove(route_key);
+            self.mirrored_query_peer_routes
+                .lock()
+                .await
+                .remove(route_key);
         } else if matches!(unit, FacadeRuntimeUnit::QueryPeer)
             && is_dual_lane_internal_query_route(route_key)
         {
@@ -2948,8 +3348,10 @@ impl FSMetaApp {
             }
         }
         let facade_control_route_key = format!("{}.stream", ROUTE_KEY_FACADE_CONTROL);
-        if matches!(unit, FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer) {
-            self.wait_for_shared_worker_control_handoff().await;
+        if matches!(
+            unit,
+            FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer
+        ) {
             return Ok(());
         }
         if !matches!(unit, FacadeRuntimeUnit::Facade) || route_key != facade_control_route_key {
@@ -3001,13 +3403,32 @@ impl FSMetaApp {
     }
 
     async fn service_on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
+        let (source_signals, sink_signals, facade_signals) = split_app_control_signals(envelopes)?;
+        let control_initialized_at_entry = self.control_initialized();
         let _serial_guard = self.control_frame_serial.lock().await;
+        let _lease_guard = match self.control_frame_lease_path.as_deref() {
+            Some(path) => Some(ControlFrameLeaseGuard::acquire(path).await.map_err(|err| {
+                CnxError::Internal(format!(
+                    "fs-meta control-frame lease acquisition failed at {}: {err}",
+                    path.display()
+                ))
+            })?),
+            None => None,
+        };
+        let requires_shared_serial = !source_signals.is_empty()
+            || !sink_signals.is_empty()
+            || self.control_initialized()
+            || (!self.source_state_replay_required.load(Ordering::Acquire)
+                && !self.sink_state_replay_required.load(Ordering::Acquire));
+        let _shared_serial_guard = if requires_shared_serial {
+            Some(self.shared_control_frame_serial.lock().await)
+        } else {
+            None
+        };
         #[cfg(test)]
         notify_runtime_control_frame_started();
-        let (source_signals, sink_signals, facade_signals) = split_app_control_signals(envelopes)?;
-        let request_sensitive = !source_signals.is_empty()
-            || !sink_signals.is_empty()
-            || !facade_signals.is_empty();
+        let request_sensitive =
+            !source_signals.is_empty() || !sink_signals.is_empty() || !facade_signals.is_empty();
         if request_sensitive && self.api_request_tracker.inflight() > 0 {
             self.api_request_tracker.wait_for_drain().await;
         }
@@ -3021,12 +3442,47 @@ impl FSMetaApp {
             facade_signals.len(),
             self.control_initialized()
         );
+        let facade_cleanup_only_while_uninitialized = !self.control_initialized()
+            && source_signals.is_empty()
+            && sink_signals.is_empty()
+            && !facade_signals.is_empty()
+            && facade_signals
+                .iter()
+                .all(Self::facade_signal_is_cleanup_only);
+        let sink_cleanup_only_while_uninitialized = !self.control_initialized()
+            && source_signals.is_empty()
+            && facade_signals.is_empty()
+            && !sink_signals.is_empty()
+            && sink_signals.iter().all(Self::sink_signal_is_cleanup_only);
+        let fail_closed_in_generation_cutover_lane = control_initialized_at_entry
+            && source_signals.is_empty()
+            && facade_signals.is_empty()
+            && sink_signals.len() == 1
+            && self
+                .sink_signals_are_in_shared_generation_cutover_lane(&sink_signals)
+                .await;
         if Self::should_initialize_from_control(&source_signals, &sink_signals, &facade_signals) {
-            self.initialize_from_control().await?;
-        } else if !self.control_initialized() {
+            if !sink_cleanup_only_while_uninitialized {
+                self.initialize_from_control().await?;
+            }
+        } else if !self.control_initialized()
+            && !facade_cleanup_only_while_uninitialized
+            && !sink_cleanup_only_while_uninitialized
+        {
             return Err(Self::not_ready_error());
         }
-        self.ensure_runtime_proxy_endpoints_started().await?;
+        if !facade_cleanup_only_while_uninitialized && !sink_cleanup_only_while_uninitialized {
+            self.ensure_runtime_proxy_endpoints_started().await?;
+        }
+        if !sink_signals.is_empty() {
+            let staged_sink_signals = if sink_cleanup_only_while_uninitialized {
+                sink_signals.clone()
+            } else {
+                self.filter_shared_sink_route_deactivates(&sink_signals).await
+            };
+            self.record_retained_sink_control_state(&staged_sink_signals)
+                .await;
+        }
         for signal in facade_signals {
             match signal {
                 FacadeControlSignal::Activate {
@@ -3092,23 +3548,28 @@ impl FSMetaApp {
                 | FacadeControlSignal::Passthrough => {}
             }
         }
+        if facade_cleanup_only_while_uninitialized {
+            eprintln!(
+                "fs_meta_runtime_app: on_control_frame cleanup-only facade followup left runtime uninitialized"
+            );
+            return Ok(());
+        }
         if !source_signals.is_empty() {
             eprintln!(
                 "fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals begin"
             );
-            if let Err(err) = self.apply_source_signals_with_recovery(&source_signals).await {
-                if !sink_signals.is_empty() {
-                    // Preserve the admitted sink wave for a later replay when source.apply
-                    // fails before sink.apply can run in the same control batch.
-                    self.record_retained_sink_control_state(&sink_signals).await;
-                    self.record_shared_sink_route_claims(&sink_signals).await;
-                }
+            if let Err(err) = self
+                .apply_source_signals_with_recovery(&source_signals)
+                .await
+            {
                 return Err(err);
             }
             eprintln!(
                 "fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals ok"
             );
-        } else if self.source_state_replay_required.load(Ordering::Acquire) {
+        } else if self.source_state_replay_required.load(Ordering::Acquire)
+            && !sink_cleanup_only_while_uninitialized
+        {
             eprintln!("fs_meta_runtime_app: on_control_frame source.replay_retained begin");
             self.apply_source_signals_with_recovery(&[]).await?;
             eprintln!("fs_meta_runtime_app: on_control_frame source.replay_retained ok");
@@ -3117,15 +3578,23 @@ impl FSMetaApp {
             eprintln!(
                 "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals begin"
             );
-            self.apply_sink_signals_with_recovery(&sink_signals).await?;
+            self.apply_sink_signals_with_recovery(
+                &sink_signals,
+                !sink_cleanup_only_while_uninitialized,
+                fail_closed_in_generation_cutover_lane,
+            )
+            .await?;
             eprintln!("fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals ok");
         } else if self.sink_state_replay_required.load(Ordering::Acquire) {
             eprintln!("fs_meta_runtime_app: on_control_frame sink.replay_retained begin");
-            self.apply_sink_signals_with_recovery(&[]).await?;
+            self.apply_sink_signals_with_recovery(&[], true, false)
+                .await?;
             eprintln!("fs_meta_runtime_app: on_control_frame sink.replay_retained ok");
         }
-        self.ensure_runtime_proxy_endpoints_started().await?;
-        if request_sensitive {
+        if !sink_cleanup_only_while_uninitialized {
+            self.ensure_runtime_proxy_endpoints_started().await?;
+        }
+        if request_sensitive && !sink_cleanup_only_while_uninitialized {
             self.api_control_gate.set_ready(true);
         }
         eprintln!("fs_meta_runtime_app: on_control_frame done");
@@ -3140,6 +3609,7 @@ impl FSMetaApp {
         self.api_request_tracker.wait_for_drain().await;
         self.control_initialized.store(false, Ordering::Release);
         self.api_control_gate.set_ready(false);
+        self.clear_shared_source_route_claims_for_instance().await;
         self.clear_shared_sink_route_claims_for_instance().await;
         *self.pending_facade.lock().await = None;
         *self.facade_spawn_in_progress.lock().await = None;
@@ -3400,13 +3870,13 @@ impl RuntimeBoundaryApp for FSMetaRuntimeApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ControlEvent, FileMetaRecord};
-    use crate::{FSMetaConfig, FSMetaProductConfig, api, query, source};
     use crate::runtime::routes::{
         ROUTE_KEY_EVENTS, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_SINK_ROOTS_CONTROL,
         ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
         ROUTE_KEY_SOURCE_ROOTS_CONTROL, sink_query_request_route_for,
     };
+    use crate::{ControlEvent, FileMetaRecord};
+    use crate::{FSMetaConfig, FSMetaProductConfig, api, query, source};
     use bytes::Bytes;
     use capanix_app_sdk::raw::{
         BoundaryContext, ChannelBoundary, ChannelKey, ChannelRecvRequest, ChannelSendRequest,
@@ -3419,10 +3889,10 @@ mod tests {
     use capanix_host_fs_types::UnixStat;
     use capanix_runtime_entry_sdk::control::{
         RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate,
-        RuntimeHostDescriptor,
-        RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState, RuntimeHostObjectType,
-        RuntimeObjectDescriptor, RuntimeUnitExposure, RuntimeUnitTick, encode_runtime_exec_control,
-        encode_runtime_host_grant_change, encode_runtime_unit_exposure, encode_runtime_unit_tick,
+        RuntimeHostDescriptor, RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState,
+        RuntimeHostObjectType, RuntimeObjectDescriptor, RuntimeUnitExposure, RuntimeUnitTick,
+        encode_runtime_exec_control, encode_runtime_host_grant_change,
+        encode_runtime_unit_exposure, encode_runtime_unit_tick,
     };
     use reqwest::Client;
     use serde_json::json;
@@ -3459,6 +3929,150 @@ mod tests {
 
     fn local_source_config() -> SourceConfig {
         SourceConfig::default()
+    }
+
+    fn fs_meta_runtime_workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf()
+    }
+
+    fn worker_socket_tmp_root() -> PathBuf {
+        let repo_root = fs_meta_runtime_workspace_root()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(fs_meta_runtime_workspace_root);
+        // Keep test worker socket paths under the UNIX-domain socket length limit.
+        let dir = repo_root.join(".w");
+        fs::create_dir_all(&dir).expect("create worker socket temp root");
+        dir
+    }
+
+    fn worker_socket_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("t")
+            .tempdir_in(worker_socket_tmp_root())
+            .expect("create worker socket dir")
+    }
+
+    fn worker_role_socket_dir(root: &Path, role_id: &str) -> PathBuf {
+        let leaf = match role_id {
+            "source" => "s",
+            "sink" => "k",
+            other => other,
+        };
+        let dir = root.join(leaf);
+        fs::create_dir_all(&dir).expect("create role socket dir");
+        dir
+    }
+
+    fn worker_stderr_excerpt(socket_dir: &Path) -> String {
+        let Ok(entries) = fs::read_dir(socket_dir) else {
+            return "<socket dir unreadable>".to_string();
+        };
+        let mut excerpts = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".stderr.log"))
+            {
+                let body = fs::read_to_string(&path).unwrap_or_else(|_| "<unreadable>".to_string());
+                excerpts.push(format!("{}:\n{}", path.display(), body.trim()));
+            }
+        }
+        if excerpts.is_empty() {
+            "<no stderr logs>".to_string()
+        } else {
+            excerpts.join("\n---\n")
+        }
+    }
+
+    #[test]
+    fn control_frame_lease_path_is_stable_per_node_and_binding_even_across_socket_roots() {
+        let worker_socket_root_a = worker_socket_tempdir();
+        let source_socket_dir_a = worker_role_socket_dir(worker_socket_root_a.path(), "source");
+        let sink_socket_dir_a = worker_role_socket_dir(worker_socket_root_a.path(), "sink");
+
+        let worker_socket_root_b = worker_socket_tempdir();
+        let source_socket_dir_b = worker_role_socket_dir(worker_socket_root_b.path(), "source");
+        let sink_socket_dir_b = worker_role_socket_dir(worker_socket_root_b.path(), "sink");
+
+        let binding_source_a = external_runtime_worker_binding("source", &source_socket_dir_a);
+        let binding_sink_a = external_runtime_worker_binding("sink", &sink_socket_dir_a);
+        let binding_source_b = external_runtime_worker_binding("source", &source_socket_dir_b);
+        let binding_sink_b = external_runtime_worker_binding("sink", &sink_socket_dir_b);
+
+        let first = shared_control_frame_lease_path_for_runtime(
+            &NodeId("node-a".into()),
+            &binding_source_a,
+            &binding_sink_a,
+        )
+        .expect("external runtime bindings should derive a cross-process lease path");
+        let second = shared_control_frame_lease_path_for_runtime(
+            &NodeId("node-a".into()),
+            &binding_source_b,
+            &binding_sink_b,
+        )
+        .expect("external runtime bindings should derive the same lease path");
+
+        assert_eq!(
+            first, second,
+            "same node and logical runtime worker binding must resolve to one stable control-frame lease path even when successor and predecessor use different socket roots"
+        );
+        assert!(
+            first.file_name().is_some_and(|name| name.to_string_lossy().contains("node-a")),
+            "lease path should remain node-scoped so distinct nodes do not contend on the same control-frame lease: {first:?}"
+        );
+    }
+
+    #[test]
+    fn control_frame_lease_guard_is_exclusive_for_same_runtime_path() {
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+
+        let binding_source = external_runtime_worker_binding("source", &source_socket_dir);
+        let binding_sink = external_runtime_worker_binding("sink", &sink_socket_dir);
+        let lease_path = shared_control_frame_lease_path_for_runtime(
+            &NodeId("node-a".into()),
+            &binding_source,
+            &binding_sink,
+        )
+        .expect("external runtime bindings should derive a cross-process lease path");
+
+        let _first_guard = ControlFrameLeaseGuard::try_acquire(&lease_path)
+            .expect("first control-frame lease acquisition should succeed")
+            .expect("first control-frame lease acquisition should return a guard");
+        let second_guard = ControlFrameLeaseGuard::try_acquire(&lease_path)
+            .expect("second control-frame lease attempt should complete");
+        assert!(
+            second_guard.is_none(),
+            "a second independent open on the same control-frame lease path must block/fail until the first guard is dropped"
+        );
+    }
+
+    #[test]
+    fn control_frame_lease_path_exists_for_external_bindings_without_explicit_socket_dirs() {
+        let binding_source = default_runtime_worker_binding("source", WorkerMode::External, None);
+        let binding_sink = default_runtime_worker_binding("sink", WorkerMode::External, None);
+
+        let lease_path = shared_control_frame_lease_path_for_runtime(
+            &NodeId("node-a".into()),
+            &binding_source,
+            &binding_sink,
+        )
+        .expect("external runtime bindings should still derive a cross-process lease path even when socket_dir is implicit");
+
+        assert!(
+            lease_path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains("node-a")),
+            "implicit-socket external bindings should still resolve to a node-scoped lease path: {lease_path:?}"
+        );
     }
 
     fn fs_meta_worker_module_path(path: &str) -> std::path::PathBuf {
@@ -3594,10 +4208,7 @@ mod tests {
                 .iter()
                 .map(|(scope_id, resource_ids)| RuntimeBoundScope {
                     scope_id: (*scope_id).to_string(),
-                    resource_ids: resource_ids
-                        .iter()
-                        .map(|id| (*id).to_string())
-                        .collect(),
+                    resource_ids: resource_ids.iter().map(|id| (*id).to_string()).collect(),
                 })
                 .collect(),
         }))
@@ -3736,6 +4347,12 @@ mod tests {
         root
     }
 
+    fn worker_watch_scan_root(id: &str, path: &Path) -> source::config::RootSpec {
+        let mut root = worker_root(id, path);
+        root.watch = true;
+        root
+    }
+
     fn worker_fs_source_root(id: &str, fs_source: &str) -> source::config::RootSpec {
         source::config::RootSpec {
             id: id.to_string(),
@@ -3822,9 +4439,7 @@ mod tests {
         for event in events {
             let payload = rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes())
                 .map_err(|err| {
-                    CnxError::Internal(format!(
-                        "decode selected-group tree payload failed: {err}"
-                    ))
+                    CnxError::Internal(format!("decode selected-group tree payload failed: {err}"))
                 })?;
             let MaterializedQueryPayload::Tree(payload) = payload else {
                 return Err(CnxError::Internal(
@@ -3936,7 +4551,9 @@ mod tests {
                     event.payload_bytes(),
                 )
                 .map_err(|err| {
-                    CnxError::Internal(format!("decode source observability snapshot failed: {err}"))
+                    CnxError::Internal(format!(
+                        "decode source observability snapshot failed: {err}"
+                    ))
                 })
             })
             .collect()
@@ -3978,7 +4595,6 @@ mod tests {
         sink_query_proxy_recv_unit_ids: StdMutex<Vec<Option<String>>>,
     }
 
-
     impl SourceStatusUnitAwareBoundary {
         fn new(required_unit_id: &'static str) -> Self {
             Self {
@@ -4018,7 +4634,6 @@ mod tests {
             }
         }
     }
-
 
     #[async_trait]
     impl ChannelIoSubset for LoopbackWorkerBoundary {
@@ -4214,7 +4829,6 @@ mod tests {
             self.inner.channel_close(ctx, channel)
         }
     }
-
 
     impl ChannelBoundary for SourceStatusUnitAwareBoundary {
         fn log(&self, _ctx: BoundaryContext, _level: LogLevel, _msg: &str) {}
@@ -4530,11 +5144,7 @@ mod tests {
             },
             Some(query::TreeQueryOptions::default()),
         );
-        assert!(should_bridge_selected_group_sink_query(
-            &request,
-            &[],
-            true,
-        ));
+        assert!(should_bridge_selected_group_sink_query(&request, &[], true,));
     }
 
     #[test]
@@ -4612,7 +5222,7 @@ mod tests {
 
     #[test]
     fn selected_group_tree_empty_payload_skips_sink_query_bridge_when_selected_group_missing_locally()
-    {
+     {
         let request = query::InternalQueryRequest::materialized(
             query::QueryOp::Tree,
             query::QueryScope {
@@ -4964,19 +5574,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successor_control_frame_waits_for_predecessor_source_control_handoff_across_shared_runtime_instances(
-    ) {
+    async fn successor_control_frame_waits_for_predecessor_source_control_handoff_across_shared_runtime_instances()
+     {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
-        let source_socket_dir = worker_socket_root.path().join("source");
-        let sink_socket_dir = worker_socket_root.path().join("sink");
-        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
-        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
 
         let make_app = || {
             Arc::new(
@@ -5033,7 +5641,11 @@ mod tests {
 
         let predecessor_control = tokio::spawn({
             let predecessor = predecessor.clone();
-            async move { predecessor.on_control_frame(&[activate_envelope("runtime.exec.source")]).await }
+            async move {
+                predecessor
+                    .on_control_frame(&[activate_envelope("runtime.exec.source")])
+                    .await
+            }
         });
 
         control_entered.notified().await;
@@ -5046,7 +5658,11 @@ mod tests {
 
         let successor_control = tokio::spawn({
             let successor = successor.clone();
-            async move { successor.on_control_frame(&[activate_envelope("runtime.exec.source")]).await }
+            async move {
+                successor
+                    .on_control_frame(&[activate_envelope("runtime.exec.source")])
+                    .await
+            }
         });
 
         assert!(
@@ -5065,6 +5681,80 @@ mod tests {
             .await
             .expect("join successor control")
             .expect("successor source-only control after predecessor handoff");
+
+        predecessor.close().await.expect("close predecessor app");
+        successor.close().await.expect("close successor app");
+    }
+
+    #[tokio::test]
+    async fn first_source_only_control_frame_converges_across_shared_runtime_instances_before_handoff_checks()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            predecessor.on_control_frame(&[activate_envelope("runtime.exec.source")]),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "first shared-runtime source-only control frame timed out: source_stderr={} sink_stderr={}",
+                worker_stderr_excerpt(&source_socket_dir),
+                worker_stderr_excerpt(&sink_socket_dir)
+            )
+        })
+        .expect("first shared-runtime source-only control frame should converge");
 
         predecessor.close().await.expect("close predecessor app");
         successor.close().await.expect("close successor app");
@@ -5966,18 +6656,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_worker_status_fails_closed_before_remote_collection_when_pending_facade_awaits_observation_eligibility(
-    ) {
+    async fn external_worker_status_fails_closed_before_remote_collection_when_pending_facade_awaits_observation_eligibility()
+     {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
-        let source_socket_dir = worker_socket_root.path().join("source");
-        let sink_socket_dir = worker_socket_root.path().join("sink");
-        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
-        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
         let cfg = FSMetaConfig {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
@@ -6024,7 +6712,11 @@ mod tests {
                 {
                     return;
                 }
-                Err(err) => panic!("start app: {err}"),
+                Err(err) => panic!(
+                    "start app: {err}\nsource stderr:\n{}\nsink stderr:\n{}",
+                    worker_stderr_excerpt(&source_socket_dir),
+                    worker_stderr_excerpt(&sink_socket_dir),
+                ),
             }
         } else {
             let err = app.start().await.expect_err("non-linux should fail fast");
@@ -6151,18 +6843,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_worker_status_fails_closed_before_remote_collection_when_active_observation_is_untrusted(
-    ) {
+    async fn external_worker_status_fails_closed_before_remote_collection_when_active_observation_is_untrusted()
+    {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
-        let source_socket_dir = worker_socket_root.path().join("source");
-        let sink_socket_dir = worker_socket_root.path().join("sink");
-        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
-        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
         let cfg = FSMetaConfig {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
@@ -6203,7 +6893,11 @@ mod tests {
                 {
                     return;
                 }
-                Err(err) => panic!("start app: {err}"),
+                Err(err) => panic!(
+                    "start app: {err}\nsource stderr:\n{}\nsink stderr:\n{}",
+                    worker_stderr_excerpt(&source_socket_dir),
+                    worker_stderr_excerpt(&sink_socket_dir),
+                ),
             }
         } else {
             let err = app.start().await.expect_err("non-linux should fail fast");
@@ -6338,6 +7032,290 @@ mod tests {
         app.close().await.expect("close fs-meta app");
     }
 
+    #[tokio::test]
+    async fn external_worker_status_uses_cached_observation_reason_before_blocking_sink_timeout() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+        let cfg = FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
+                host_object_grants: vec![granted_mount_root("single-app-node::root-1", tmp.path())],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: "listener-a".to_string(),
+                local_listener_resources: vec![api::config::ApiListenerResource {
+                    resource_id: "listener-a".to_string(),
+                    bind_addr: bind_addr.clone(),
+                }],
+                auth: api::ApiAuthConfig {
+                    passwd_path,
+                    shadow_path,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        };
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                cfg,
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    app.close().await.expect("close app after bind restriction");
+                    return;
+                }
+                Err(err) => panic!(
+                    "start app: {err}\nsource stderr:\n{}\nsink stderr:\n{}",
+                    worker_stderr_excerpt(&source_socket_dir),
+                    worker_stderr_excerpt(&sink_socket_dir),
+                ),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        };
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let active_generation = PendingFacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: "listener-a".to_string(),
+                resource_ids: vec!["listener-a".to_string()],
+            }],
+            group_ids: Vec::new(),
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            resolved: app
+                .config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+        };
+        assert!(
+            !FSMetaApp::observation_eligible_for(
+                app.source.as_ref(),
+                app.sink.as_ref(),
+                &active_generation,
+            )
+            .await
+            .expect("evaluate active observation eligibility"),
+            "active external-worker fixture must keep observation untrusted"
+        );
+
+        let primed_cached_sink = app
+            .sink
+            .status_snapshot_nonblocking()
+            .await
+            .expect("prime cached local sink status");
+
+        app.on_control_frame(&[
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("source-only wave should establish untrusted local observation evidence");
+
+        let expected_local_source = app.source.observability_snapshot_nonblocking().await;
+        let expected_local_sink = primed_cached_sink.clone();
+        let mut expected_candidate_groups = expected_local_source
+            .scheduled_source_groups_by_node
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        expected_candidate_groups.extend(
+            expected_local_source
+                .scheduled_scan_groups_by_node
+                .values()
+                .flatten()
+                .cloned(),
+        );
+        let expected_sink_groups = expected_local_sink
+            .scheduled_groups_by_node
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if !expected_candidate_groups.is_empty() && !expected_sink_groups.is_empty() {
+            expected_candidate_groups = expected_candidate_groups
+                .intersection(&expected_sink_groups)
+                .cloned()
+                .collect();
+        }
+        let expected_observation_status = capanix_managed_state_sdk::evaluate_observation_status(
+            &query::observation::candidate_group_observation_evidence(
+                &expected_local_source.status,
+                &expected_local_sink,
+                &expected_candidate_groups,
+            ),
+            capanix_managed_state_sdk::ObservationTrustPolicy::candidate_generation(),
+        );
+        assert_ne!(
+            expected_observation_status.state,
+            query::ObservationState::TrustedMaterialized,
+            "fixture must remain untrusted before forcing the blocking sink-status timeout"
+        );
+        let expected_reason =
+            query::observation::trusted_materialized_not_ready_message(&expected_observation_status);
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token");
+
+        let _sink_nonblocking_cache_reset = SinkWorkerStatusNonblockingCacheFallbackHookReset;
+        crate::workers::sink::install_sink_worker_status_nonblocking_cache_fallback_hook(
+            crate::workers::sink::SinkWorkerStatusNonblockingCacheFallbackHook,
+        );
+        let trace_events = Arc::new(StdMutex::new(Vec::new()));
+        crate::api::install_status_route_trace_capture(trace_events.clone());
+        struct StatusRouteTraceCaptureReset;
+        impl Drop for StatusRouteTraceCaptureReset {
+            fn drop(&mut self) {
+                crate::api::clear_status_route_trace_capture();
+            }
+        }
+        let _status_route_trace_reset = StatusRouteTraceCaptureReset;
+
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.to_string();
+            async move {
+                client
+                    .get(format!("http://{bind_addr}/api/fs-meta/v1/status"))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+            }
+        });
+        let response = request
+            .await
+            .expect("join status request")
+            .expect("status request should complete");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "status should fail closed while active external-worker observation is untrusted"
+        );
+        let body = response.text().await.expect("decode status body");
+        let trace_events = trace_events
+            .lock()
+            .expect("status route trace lock")
+            .clone();
+        let gate_event = trace_events
+            .iter()
+            .find(|event| event.contains("status.local.gate"))
+            .cloned();
+        assert!(
+            gate_event.is_some(),
+            "status route trace should capture local gate inputs before returning; trace_events={trace_events:?}; body={body}"
+        );
+        let gate_event = gate_event.expect("gate event already asserted");
+        assert!(
+            !trace_events
+                .iter()
+                .any(|event| event.contains("status.remote.begin")),
+            "status should fail closed before remote collection; gate_event={gate_event}; trace_events={trace_events:?}; body={body}"
+        );
+        assert!(
+            body.contains(&expected_reason),
+            "status should preserve the cached trusted-materialized readiness reason instead of surfacing the blocking sink-status timeout: gate_event={gate_event}; trace_events={trace_events:?}; body={body}"
+        );
+        assert!(
+            !body.contains("sink status failed"),
+            "status should not wait for a blocking local sink-status fetch once cached observation is already untrusted: gate_event={gate_event}; trace_events={trace_events:?}; body={body}"
+        );
+
+        app.close().await.expect("close fs-meta app");
+    }
+
     struct RootsPutPauseHookReset;
 
     impl Drop for RootsPutPauseHookReset {
@@ -6383,6 +7361,14 @@ mod tests {
     impl Drop for SinkWorkerControlFramePauseHookReset {
         fn drop(&mut self) {
             crate::workers::sink::clear_sink_worker_control_frame_pause_hook();
+        }
+    }
+
+    struct SinkWorkerStatusNonblockingCacheFallbackHookReset;
+
+    impl Drop for SinkWorkerStatusNonblockingCacheFallbackHookReset {
+        fn drop(&mut self) {
+            crate::workers::sink::clear_sink_worker_status_nonblocking_cache_fallback_hook();
         }
     }
 
@@ -6444,11 +7430,9 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
-        let source_socket_dir = worker_socket_root.path().join("source");
-        let sink_socket_dir = worker_socket_root.path().join("sink");
-        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
-        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
         let app = Arc::new(
             FSMetaApp::with_boundaries_and_state(
                 FSMetaConfig {
@@ -6542,7 +7526,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -6569,7 +7557,9 @@ mod tests {
             let token = token.clone();
             async move {
                 client
-                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .put(format!(
+                        "http://{bind_addr}/api/fs-meta/v1/monitoring/roots"
+                    ))
                     .bearer_auth(token)
                     .json(&roots_body)
                     .send()
@@ -6607,19 +7597,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_app_does_not_start_source_close_before_inflight_roots_put_reaches_worker_dispatch(
-    ) {
+    async fn closing_app_does_not_start_source_close_before_inflight_roots_put_reaches_worker_dispatch()
+     {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
-        let source_socket_dir = worker_socket_root.path().join("source");
-        let sink_socket_dir = worker_socket_root.path().join("sink");
-        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
-        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
         let app = Arc::new(
             FSMetaApp::with_boundaries_and_state(
                 FSMetaConfig {
@@ -6713,7 +7701,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -6748,7 +7740,9 @@ mod tests {
             let token = token.clone();
             async move {
                 client
-                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .put(format!(
+                        "http://{bind_addr}/api/fs-meta/v1/monitoring/roots"
+                    ))
                     .bearer_auth(token)
                     .json(&roots_body)
                     .send()
@@ -6787,15 +7781,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_app_does_not_start_facade_shutdown_while_inflight_roots_put_is_dispatching_to_source_worker(
-    ) {
+    async fn closing_app_does_not_start_facade_shutdown_while_inflight_roots_put_is_dispatching_to_source_worker()
+     {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -6893,7 +7887,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -6928,7 +7926,9 @@ mod tests {
             let token = token.clone();
             async move {
                 client
-                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .put(format!(
+                        "http://{bind_addr}/api/fs-meta/v1/monitoring/roots"
+                    ))
                     .bearer_auth(token)
                     .json(&roots_body)
                     .send()
@@ -6974,7 +7974,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -7056,7 +8056,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -7085,7 +8089,9 @@ mod tests {
             let token = token.clone();
             async move {
                 client
-                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .put(format!(
+                        "http://{bind_addr}/api/fs-meta/v1/monitoring/roots"
+                    ))
                     .bearer_auth(token)
                     .json(&roots_body)
                     .send()
@@ -7129,7 +8135,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -7227,7 +8233,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -7262,7 +8272,9 @@ mod tests {
             let token = token.clone();
             async move {
                 client
-                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .put(format!(
+                        "http://{bind_addr}/api/fs-meta/v1/monitoring/roots"
+                    ))
                     .bearer_auth(token)
                     .json(&roots_body)
                     .send()
@@ -7273,7 +8285,10 @@ mod tests {
         entered.notified().await;
         let control_task = tokio::spawn({
             let app = app.clone();
-            async move { app.on_control_frame(&[activate_envelope("runtime.exec.source")]).await }
+            async move {
+                app.on_control_frame(&[activate_envelope("runtime.exec.source")])
+                    .await
+            }
         });
         assert!(
             tokio::time::timeout(Duration::from_millis(600), control_started.notified())
@@ -7310,7 +8325,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -7408,7 +8423,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -7444,7 +8463,10 @@ mod tests {
         entered.notified().await;
         let control_task = tokio::spawn({
             let app = app.clone();
-            async move { app.on_control_frame(&[activate_envelope("runtime.exec.source")]).await }
+            async move {
+                app.on_control_frame(&[activate_envelope("runtime.exec.source")])
+                    .await
+            }
         });
         assert!(
             tokio::time::timeout(Duration::from_millis(600), control_started.notified())
@@ -7479,7 +8501,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -7624,7 +8646,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -7689,7 +8715,9 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(5), request_entered.notified())
             .await
-            .expect("status should issue remote source-status collection after control wave settles");
+            .expect(
+                "status should issue remote source-status collection after control wave settles",
+            );
         request_release.notify_waiters();
 
         control_task
@@ -7716,7 +8744,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -7803,8 +8831,14 @@ mod tests {
             Err(CnxError::InvalidInput(msg))
                 if msg.contains("fs-meta api bind failed: Operation not permitted") =>
             {
-                app_1.close().await.expect("close app after bind restriction");
-                app_2.close().await.expect("close second app after bind restriction");
+                app_1
+                    .close()
+                    .await
+                    .expect("close app after bind restriction");
+                app_2
+                    .close()
+                    .await
+                    .expect("close second app after bind restriction");
                 return;
             }
             Err(err) => panic!("spawn active facade: {err}"),
@@ -7823,7 +8857,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -7858,7 +8896,9 @@ mod tests {
             let token = token.clone();
             async move {
                 client
-                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .put(format!(
+                        "http://{bind_addr}/api/fs-meta/v1/monitoring/roots"
+                    ))
                     .bearer_auth(token)
                     .json(&roots_body)
                     .send()
@@ -7905,7 +8945,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -7992,8 +9032,14 @@ mod tests {
             Err(CnxError::InvalidInput(msg))
                 if msg.contains("fs-meta api bind failed: Operation not permitted") =>
             {
-                app_1.close().await.expect("close app after bind restriction");
-                app_2.close().await.expect("close second app after bind restriction");
+                app_1
+                    .close()
+                    .await
+                    .expect("close app after bind restriction");
+                app_2
+                    .close()
+                    .await
+                    .expect("close second app after bind restriction");
                 return;
             }
             Err(err) => panic!("spawn active facade: {err}"),
@@ -8012,7 +9058,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -8049,7 +9099,9 @@ mod tests {
             let token = token.clone();
             async move {
                 client
-                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .put(format!(
+                        "http://{bind_addr}/api/fs-meta/v1/monitoring/roots"
+                    ))
                     .bearer_auth(token)
                     .json(&roots_body)
                     .send()
@@ -8096,7 +9148,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -8194,7 +9246,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -8229,7 +9285,9 @@ mod tests {
             let token = token.clone();
             async move {
                 client
-                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .put(format!(
+                        "http://{bind_addr}/api/fs-meta/v1/monitoring/roots"
+                    ))
                     .bearer_auth(token)
                     .json(&roots_body)
                     .send()
@@ -8247,10 +9305,7 @@ mod tests {
                         "test-root",
                         &["listener-a"],
                     ),
-                    trusted_exposure_confirmed_envelope(
-                        execution_units::FACADE_RUNTIME_UNIT_ID,
-                        1,
-                    ),
+                    trusted_exposure_confirmed_envelope(execution_units::FACADE_RUNTIME_UNIT_ID, 1),
                 ])
                 .await
             }
@@ -8289,7 +9344,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -8387,7 +9442,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -8422,7 +9481,9 @@ mod tests {
             let token = token.clone();
             async move {
                 client
-                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .put(format!(
+                        "http://{bind_addr}/api/fs-meta/v1/monitoring/roots"
+                    ))
                     .bearer_auth(token)
                     .json(&roots_body)
                     .send()
@@ -8440,10 +9501,7 @@ mod tests {
                         "test-root",
                         &["listener-a"],
                     ),
-                    trusted_exposure_confirmed_envelope(
-                        execution_units::FACADE_RUNTIME_UNIT_ID,
-                        1,
-                    ),
+                    trusted_exposure_confirmed_envelope(execution_units::FACADE_RUNTIME_UNIT_ID, 1),
                 ])
                 .await
             }
@@ -8482,7 +9540,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -8580,7 +9638,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -8615,7 +9677,9 @@ mod tests {
             let token = token.clone();
             async move {
                 client
-                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .put(format!(
+                        "http://{bind_addr}/api/fs-meta/v1/monitoring/roots"
+                    ))
                     .bearer_auth(token)
                     .json(&roots_body)
                     .send()
@@ -8668,7 +9732,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -8812,7 +9876,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -8887,7 +9955,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -9014,7 +10082,11 @@ mod tests {
 
         let successor_control = tokio::spawn({
             let successor = successor.clone();
-            async move { successor.on_control_frame(&[activate_envelope("runtime.exec.source")]).await }
+            async move {
+                successor
+                    .on_control_frame(&[activate_envelope("runtime.exec.source")])
+                    .await
+            }
         });
 
         control_entered.notified().await;
@@ -9053,8 +10125,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successor_recovery_waits_for_predecessor_source_start_across_runtime_instances_with_distinct_worker_bindings(
-    ) {
+    async fn successor_recovery_waits_for_predecessor_source_start_across_runtime_instances_with_distinct_worker_bindings()
+     {
         struct SourceControlErrorHookReset;
 
         impl Drop for SourceControlErrorHookReset {
@@ -9078,8 +10150,7 @@ mod tests {
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
 
-        let make_app =
-            |source_socket_dir: &Path, sink_socket_dir: &Path| {
+        let make_app = |source_socket_dir: &Path, sink_socket_dir: &Path| {
             Arc::new(
                 FSMetaApp::with_boundaries_and_state(
                     FSMetaConfig {
@@ -9124,10 +10195,7 @@ mod tests {
         let predecessor_sink_socket_dir = predecessor_socket_root.path().join("sink");
         fs::create_dir_all(&predecessor_source_socket_dir).expect("create source socket dir");
         fs::create_dir_all(&predecessor_sink_socket_dir).expect("create sink socket dir");
-        let predecessor = make_app(
-            &predecessor_source_socket_dir,
-            &predecessor_sink_socket_dir,
-        );
+        let predecessor = make_app(&predecessor_source_socket_dir, &predecessor_sink_socket_dir);
 
         predecessor
             .on_control_frame(&[
@@ -9248,8 +10316,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successor_recovery_waits_for_predecessor_source_start_across_runtime_instances_with_distinct_worker_module_paths(
-    ) {
+    async fn successor_recovery_waits_for_predecessor_source_start_across_runtime_instances_with_distinct_worker_module_paths()
+     {
         struct SourceControlErrorHookReset;
 
         impl Drop for SourceControlErrorHookReset {
@@ -9282,8 +10350,7 @@ mod tests {
                         sink_socket_dir: &Path,
                         source_module_path: &Path,
                         sink_module_path: &Path| {
-            let mut source_binding =
-                external_runtime_worker_binding("source", source_socket_dir);
+            let mut source_binding = external_runtime_worker_binding("source", source_socket_dir);
             source_binding.module_path = Some(source_module_path.to_path_buf());
             let mut sink_binding = external_runtime_worker_binding("sink", sink_socket_dir);
             sink_binding.module_path = Some(sink_module_path.to_path_buf());
@@ -9460,7 +10527,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -9587,7 +10654,11 @@ mod tests {
 
         let successor_control = tokio::spawn({
             let successor = successor.clone();
-            async move { successor.on_control_frame(&[activate_envelope("runtime.exec.sink")]).await }
+            async move {
+                successor
+                    .on_control_frame(&[activate_envelope("runtime.exec.sink")])
+                    .await
+            }
         });
 
         control_entered.notified().await;
@@ -9633,7 +10704,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -9726,7 +10797,11 @@ mod tests {
 
         let successor_control = tokio::spawn({
             let successor = successor.clone();
-            async move { successor.on_control_frame(&[activate_envelope("runtime.exec.source")]).await }
+            async move {
+                successor
+                    .on_control_frame(&[activate_envelope("runtime.exec.source")])
+                    .await
+            }
         });
 
         control_entered.notified().await;
@@ -9773,7 +10848,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -9866,7 +10941,11 @@ mod tests {
 
         let successor_control = tokio::spawn({
             let successor = successor.clone();
-            async move { successor.on_control_frame(&[activate_envelope("runtime.exec.sink")]).await }
+            async move {
+                successor
+                    .on_control_frame(&[activate_envelope("runtime.exec.sink")])
+                    .await
+            }
         });
 
         control_entered.notified().await;
@@ -9906,15 +10985,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successor_sink_control_recovers_after_predecessor_facade_deactivate_resets_shared_worker(
-    ) {
+    async fn successor_sink_control_recovers_after_predecessor_facade_deactivate_resets_shared_worker()
+     {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -10050,7 +11129,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -10194,7 +11273,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -10323,7 +11402,11 @@ mod tests {
 
         let successor_control = tokio::spawn({
             let successor = successor.clone();
-            async move { successor.on_control_frame(&[activate_envelope("runtime.exec.sink")]).await }
+            async move {
+                successor
+                    .on_control_frame(&[activate_envelope("runtime.exec.sink")])
+                    .await
+            }
         });
 
         control_entered.notified().await;
@@ -10372,7 +11455,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -10527,6 +11610,519 @@ mod tests {
         predecessor.close().await.expect("close predecessor app");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_successor_sink_only_mid_handoff_close_falls_into_cleanup_only_facade_then_one_uninitialized_sink_retry()
+     {
+        struct SinkWorkerControlFramePauseHookReset;
+
+        impl Drop for SinkWorkerControlFramePauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_pause_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_watch_scan_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        ..FSMetaConfig::default()
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+        let sink_events_route = (
+            execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+        );
+
+        predecessor
+            .on_control_frame(&[
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    2,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    &[("test-root", &["single-app-node::root-1"])],
+                    2,
+                ),
+            ])
+            .await
+            .expect("initial predecessor sink events wave should succeed");
+
+        successor
+            .on_control_frame(&[
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    2,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    &[("test-root", &["single-app-node::root-1"])],
+                    2,
+                ),
+            ])
+            .await
+            .expect("initial successor sink events wave should succeed");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = SinkWorkerControlFramePauseHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let successor_sink_only = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                successor
+                    .on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                        execution_units::SINK_RUNTIME_UNIT_ID,
+                        format!("{}.stream", ROUTE_KEY_EVENTS),
+                        &[("test-root", &["single-app-node::root-1"])],
+                        3,
+                    )])
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("live successor sink-only control should reach sink.apply");
+        successor
+            .sink
+            .close()
+            .await
+            .expect("close live successor shared sink worker bridge mid-handoff");
+        release.notify_waiters();
+
+        let err = successor_sink_only
+            .await
+            .expect("join live successor sink-only control")
+            .expect_err(
+                "preserved exact chain requires the live successor sink-only lane to fail under mid-handoff close before cleanup-only facade followup begins",
+            );
+        assert!(
+            is_retryable_worker_control_reset(&err),
+            "expected retryable sink transport-close error, got: {err}"
+        );
+
+        assert!(
+            !successor.control_initialized(),
+            "failed live successor sink-only lane must leave the runtime uninitialized before the cleanup-only facade followup",
+        );
+
+        successor
+            .on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                3,
+            )])
+            .await
+            .expect("cleanup-only facade followup should complete on uninitialized runtime");
+        assert!(
+            !successor.control_initialized(),
+            "cleanup-only facade followup must leave the runtime uninitialized",
+        );
+
+        successor
+            .on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                4,
+            )])
+            .await
+            .expect("one uninitialized sink-only retry should complete after cleanup-only facade followup");
+        assert!(
+            !successor.control_initialized(),
+            "one uninitialized sink-only retry must leave the runtime uninitialized",
+        );
+        match successor
+            .retained_sink_control_state
+            .lock()
+            .await
+            .active_by_route
+            .get(&sink_events_route)
+        {
+            Some(SinkControlSignal::Deactivate { generation, .. }) => assert_eq!(
+                *generation, 4,
+                "first uninitialized shared-owner sink cleanup retry must advance retained desired state to the later deactivate generation",
+            ),
+            other => panic!(
+                "expected retained sink deactivate for {sink_events_route:?} after the first uninitialized retry: {other:?}"
+            ),
+        }
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn first_uninitialized_materialized_find_node_a_deactivate_enters_sink_worker_after_fail_closed_cutover_source_failure_and_proxy_cleanup()
+     {
+        struct SinkWorkerControlFramePauseHookReset;
+        struct SourceControlErrorHookReset;
+
+        impl Drop for SinkWorkerControlFramePauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_pause_hook();
+            }
+        }
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_role_socket_dir(worker_socket_tempdir().path(), "tmp");
+        let source_socket_dir = worker_role_socket_dir(&worker_socket_root, "source");
+        let sink_socket_dir = worker_role_socket_dir(&worker_socket_root, "sink");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![
+                                worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                                worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                            ],
+                            host_object_grants: vec![
+                                worker_export_with_fs_source(
+                                    "node-a::nfs1",
+                                    "node-a",
+                                    "10.0.0.11",
+                                    &nfs1_source,
+                                    nfs1.clone(),
+                                ),
+                                worker_export_with_fs_source(
+                                    "node-a::nfs2",
+                                    "node-a",
+                                    "10.0.0.12",
+                                    &nfs2_source,
+                                    nfs2.clone(),
+                                ),
+                            ],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("node-a".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let sink_wave = |generation| {
+            let root_scopes = &[
+                ("nfs1", &["node-a::nfs1"][..]),
+                ("nfs2", &["node-a::nfs2"][..]),
+            ];
+            let mut signals = vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                    root_scopes,
+                    generation,
+                ),
+            ];
+            for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+                signals.push(activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    sink_query_request_route_for(node_id).0,
+                    root_scopes,
+                    generation,
+                ));
+            }
+            signals
+        };
+        let facade_wave = |generation| {
+            let listener_scopes = &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])];
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+            ]
+        };
+
+        predecessor
+            .on_control_frame(&sink_wave(2))
+            .await
+            .expect("initial predecessor sink wave should succeed");
+
+        let mut initial = source_wave(2);
+        initial.extend(sink_wave(2));
+        initial.extend(facade_wave(2));
+        successor
+            .on_control_frame(&initial)
+            .await
+            .expect("initial successor exact-shaped full wave should succeed");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = SinkWorkerControlFramePauseHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let fail_closed_events = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                successor
+                    .on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                        execution_units::SINK_RUNTIME_UNIT_ID,
+                        format!("{}.stream", ROUTE_KEY_EVENTS),
+                        &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                        3,
+                    )])
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("current-owner sink-only fs-meta.events lane should reach sink.apply");
+        successor
+            .sink
+            .close()
+            .await
+            .expect("close live successor sink worker bridge mid-handoff");
+        release.notify_waiters();
+
+        fail_closed_events
+            .await
+            .expect("join fail-closed events lane")
+            .expect_err("current-owner sink-only fs-meta.events lane should fail closed");
+        assert!(
+            !successor.control_initialized(),
+            "fail-closed current-owner sink-only events lane must leave runtime uninitialized",
+        );
+
+        let _source_error_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated source apply failure after fail-closed sink cutover".to_string(),
+                ),
+            },
+        );
+
+        let mut followup = source_wave(4);
+        followup.extend(sink_wave(4));
+        followup.extend(facade_wave(4));
+        successor
+            .on_control_frame(&followup)
+            .await
+            .expect_err("immediate exact-shaped full wave should fail in source.apply");
+
+        successor
+            .on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                3,
+            )])
+            .await
+            .expect("cleanup-only materialized-find-proxy deactivate should complete");
+        assert!(
+            !successor.control_initialized(),
+            "cleanup-only proxy deactivate must keep runtime uninitialized",
+        );
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let node_a_deactivate = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                successor
+                    .on_control_frame(&[deactivate_envelope_with_route_key(
+                        execution_units::SINK_RUNTIME_UNIT_ID,
+                        sink_query_request_route_for("node-a").0,
+                        3,
+                    )])
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_millis(600), entered.notified())
+            .await
+            .expect(
+                "first uninitialized materialized-find.node_a deactivate must reach sink worker begin after the preserved fail-closed/source-failure/proxy-cleanup precondition",
+            );
+        release.notify_waiters();
+        node_a_deactivate
+            .await
+            .expect("join node-a deactivate")
+            .expect("node-a deactivate after worker entry");
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
     #[tokio::test]
     async fn successor_full_control_survives_late_predecessor_sink_events_deactivate_reset() {
         struct SinkControlErrorHookReset;
@@ -10543,7 +12139,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -10756,8 +12352,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successor_exact_shaped_sink_nine_wave_survives_late_predecessor_sink_events_deactivate(
-    ) {
+    async fn successor_exact_shaped_sink_nine_wave_survives_late_predecessor_sink_events_deactivate()
+     {
         struct SinkControlErrorHookReset;
 
         impl Drop for SinkControlErrorHookReset {
@@ -10777,11 +12373,9 @@ mod tests {
         let nfs2_source = nfs2.display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
-        let source_socket_dir = worker_socket_root.path().join("source");
-        let sink_socket_dir = worker_socket_root.path().join("sink");
-        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
-        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
 
         let make_app = || {
             Arc::new(
@@ -10886,7 +12480,10 @@ mod tests {
             ]
         };
         let sink_wave = |generation| {
-            let root_scopes = &[("nfs1", &["node-a::nfs1"][..]), ("nfs2", &["node-a::nfs2"][..])];
+            let root_scopes = &[
+                ("nfs1", &["node-a::nfs1"][..]),
+                ("nfs2", &["node-a::nfs2"][..]),
+            ];
             let mut signals = vec![
                 activate_envelope_with_scope_rows(
                     execution_units::SINK_RUNTIME_UNIT_ID,
@@ -11017,8 +12614,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successor_exact_shaped_source_wave_survives_late_predecessor_source_roots_deactivate(
-    ) {
+    async fn peer_sink_status_fails_closed_while_successor_second_exact_shaped_wave_sink_apply_is_pending()
+     {
+        struct SinkControlErrorHookReset;
+
+        impl Drop for SinkControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_error_hook();
+            }
+        }
+
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -11030,7 +12635,1559 @@ mod tests {
         let nfs2_source = nfs2.display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![
+                                worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                                worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                            ],
+                            host_object_grants: vec![
+                                worker_export_with_fs_source(
+                                    "node-a::nfs1",
+                                    "node-a",
+                                    "10.0.0.11",
+                                    &nfs1_source,
+                                    nfs1.clone(),
+                                ),
+                                worker_export_with_fs_source(
+                                    "node-a::nfs2",
+                                    "node-a",
+                                    "10.0.0.12",
+                                    &nfs2_source,
+                                    nfs2.clone(),
+                                ),
+                            ],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("node-a".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let sink_wave = |generation| {
+            let root_scopes = &[
+                ("nfs1", &["node-a::nfs1"][..]),
+                ("nfs2", &["node-a::nfs2"][..]),
+            ];
+            let mut signals = vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                    root_scopes,
+                    generation,
+                ),
+            ];
+            for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+                signals.push(activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    sink_query_request_route_for(node_id).0,
+                    root_scopes,
+                    generation,
+                ));
+            }
+            signals
+        };
+        let facade_wave = |generation| {
+            let listener_scopes = &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])];
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+            ]
+        };
+
+        predecessor
+            .on_control_frame(&[
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    2,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    2,
+                ),
+            ])
+            .await
+            .expect("initial predecessor sink events wave should succeed");
+
+        let mut initial = source_wave(2);
+        initial.extend(sink_wave(2));
+        initial.extend(facade_wave(2));
+        successor
+            .on_control_frame(&initial)
+            .await
+            .expect("initial successor exact-shaped full wave should succeed");
+
+        let _err_reset = SinkControlErrorHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_error_hook(
+            crate::workers::sink::SinkWorkerControlFrameErrorHook {
+                err: CnxError::AccessDenied(
+                    "sink worker unavailable: pid Pid(1) is drained/fenced and cannot obtain new grant attachments"
+                        .to_string(),
+                ),
+            },
+        );
+
+        predecessor
+            .on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                3,
+            )])
+            .await
+            .expect("late predecessor sink events deactivate should recover");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = SinkWorkerControlFramePauseHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let successor_wave = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                let mut followup = source_wave(3);
+                followup.extend(sink_wave(3));
+                followup.extend(facade_wave(3));
+                successor.on_control_frame(&followup).await
+            }
+        });
+
+        entered.notified().await;
+
+        let request_result = internal_sink_status_request_with_timeout(
+            boundary.clone(),
+            NodeId("node-d".into()),
+            Duration::from_millis(250),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            request_result.is_err(),
+            "peer-facing sink-status must fail closed while the successor exact-shaped second wave is still paused in sink.apply"
+        );
+
+        release.notify_waiters();
+
+        successor_wave
+            .await
+            .expect("join successor exact-shaped second wave")
+            .expect("successor exact-shaped second wave after paused sink.apply");
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn peer_source_status_fails_closed_while_successor_second_exact_shaped_wave_source_apply_is_pending()
+     {
+        struct SinkControlErrorHookReset;
+
+        impl Drop for SinkControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_error_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![
+                                worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                                worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                            ],
+                            host_object_grants: vec![
+                                worker_export_with_fs_source(
+                                    "node-a::nfs1",
+                                    "node-a",
+                                    "10.0.0.11",
+                                    &nfs1_source,
+                                    nfs1.clone(),
+                                ),
+                                worker_export_with_fs_source(
+                                    "node-a::nfs2",
+                                    "node-a",
+                                    "10.0.0.12",
+                                    &nfs2_source,
+                                    nfs2.clone(),
+                                ),
+                            ],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("node-a".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let sink_wave = |generation| {
+            let root_scopes = &[
+                ("nfs1", &["node-a::nfs1"][..]),
+                ("nfs2", &["node-a::nfs2"][..]),
+            ];
+            let mut signals = vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                    root_scopes,
+                    generation,
+                ),
+            ];
+            for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+                signals.push(activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    sink_query_request_route_for(node_id).0,
+                    root_scopes,
+                    generation,
+                ));
+            }
+            signals
+        };
+        let facade_wave = |generation| {
+            let listener_scopes = &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])];
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+            ]
+        };
+
+        predecessor
+            .on_control_frame(&[
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    2,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    2,
+                ),
+            ])
+            .await
+            .expect("initial predecessor sink events wave should succeed");
+
+        let mut initial = source_wave(2);
+        initial.extend(sink_wave(2));
+        initial.extend(facade_wave(2));
+        successor
+            .on_control_frame(&initial)
+            .await
+            .expect("initial successor exact-shaped full wave should succeed");
+
+        let _err_reset = SinkControlErrorHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_error_hook(
+            crate::workers::sink::SinkWorkerControlFrameErrorHook {
+                err: CnxError::AccessDenied(
+                    "sink worker unavailable: pid Pid(1) is drained/fenced and cannot obtain new grant attachments"
+                        .to_string(),
+                ),
+            },
+        );
+
+        predecessor
+            .on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                3,
+            )])
+            .await
+            .expect("late predecessor sink events deactivate should recover");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let successor_wave = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                let mut followup = source_wave(3);
+                followup.extend(sink_wave(3));
+                followup.extend(facade_wave(3));
+                successor.on_control_frame(&followup).await
+            }
+        });
+
+        entered.notified().await;
+
+        let request_result = internal_source_status_snapshots_with_timeout(
+            boundary.clone(),
+            NodeId("node-d".into()),
+            Duration::from_millis(250),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            request_result.is_err(),
+            "peer-facing source-status must fail closed while the successor exact-shaped second wave is still paused in source.apply"
+        );
+
+        release.notify_waiters();
+
+        successor_wave
+            .await
+            .expect("join successor exact-shaped second wave")
+            .expect("successor exact-shaped second wave after paused source.apply");
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn successor_exact_shaped_full_wave_does_not_wait_for_stale_predecessor_facade_only_recovery_after_second_wave_failure()
+     {
+        struct SourceControlErrorHookReset;
+        struct SourceWorkerStartPauseHookReset;
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerStartPauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_start_pause_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![
+                                worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                                worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                            ],
+                            host_object_grants: vec![
+                                worker_export_with_fs_source(
+                                    "node-a::nfs1",
+                                    "node-a",
+                                    "10.0.0.11",
+                                    &nfs1_source,
+                                    nfs1.clone(),
+                                ),
+                                worker_export_with_fs_source(
+                                    "node-a::nfs2",
+                                    "node-a",
+                                    "10.0.0.12",
+                                    &nfs2_source,
+                                    nfs2.clone(),
+                                ),
+                            ],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("node-a".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let predecessor_source_client = match &*predecessor.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let sink_wave = |generation| {
+            let root_scopes = &[
+                ("nfs1", &["node-a::nfs1"][..]),
+                ("nfs2", &["node-a::nfs2"][..]),
+            ];
+            let mut signals = vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                    root_scopes,
+                    generation,
+                ),
+            ];
+            for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+                signals.push(activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    sink_query_request_route_for(node_id).0,
+                    root_scopes,
+                    generation,
+                ));
+            }
+            signals
+        };
+        let facade_wave = |generation| {
+            let listener_scopes = &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])];
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+            ]
+        };
+
+        let mut predecessor_initial = source_wave(2);
+        predecessor_initial.extend(sink_wave(2));
+        predecessor_initial.extend(facade_wave(2));
+        predecessor
+            .on_control_frame(&predecessor_initial)
+            .await
+            .expect("predecessor initial exact-shaped wave should succeed");
+
+        let mut successor_initial = source_wave(2);
+        successor_initial.extend(sink_wave(2));
+        successor_initial.extend(facade_wave(2));
+        successor
+            .on_control_frame(&successor_initial)
+            .await
+            .expect("successor initial exact-shaped wave should succeed");
+
+        predecessor
+            .on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                3,
+            )])
+            .await
+            .expect("late predecessor sink events deactivate should succeed");
+
+        let _source_error_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated predecessor second-wave source.apply failure".to_string(),
+                ),
+            },
+        );
+        let mut predecessor_second = source_wave(3);
+        predecessor_second.extend(sink_wave(3));
+        predecessor_second.extend(facade_wave(3));
+        predecessor
+            .on_control_frame(&predecessor_second)
+            .await
+            .expect_err("predecessor second exact-shaped wave should fail");
+        crate::workers::source::clear_source_worker_control_frame_error_hook();
+        assert!(
+            !predecessor.control_initialized(),
+            "predecessor should be uninitialized before stale facade-only recovery begins"
+        );
+
+        predecessor_source_client
+            .shutdown_shared_worker_for_tests()
+            .await
+            .expect("shutdown predecessor source worker before stale facade-only recovery");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _start_pause_reset = SourceWorkerStartPauseHookReset;
+        crate::workers::source::install_source_worker_start_pause_hook(
+            crate::workers::source::SourceWorkerStartPauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let predecessor_recovery = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move {
+                predecessor
+                    .on_control_frame(&[tick_envelope(execution_units::FACADE_RUNTIME_UNIT_ID, 3)])
+                    .await
+            }
+        });
+
+        entered.notified().await;
+
+        let successor_started = Arc::new(Notify::new());
+        let _start_hook_reset = RuntimeControlFrameStartHookReset;
+        install_runtime_control_frame_start_hook(RuntimeControlFrameStartHook {
+            entered: successor_started.clone(),
+        });
+
+        let successor_followup = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                let mut followup = source_wave(4);
+                followup.extend(sink_wave(4));
+                followup.extend(facade_wave(4));
+                successor.on_control_frame(&followup).await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_millis(600), successor_started.notified())
+            .await
+            .expect(
+                "successor exact-shaped full wave should not be starved behind a stale predecessor facade-only recovery frame after the predecessor already failed its second wave",
+            );
+
+        release.notify_waiters();
+
+        predecessor_recovery
+            .await
+            .expect("join predecessor recovery task")
+            .expect("predecessor stale facade-only recovery should finish");
+        successor_followup
+            .await
+            .expect("join successor followup task")
+            .expect("successor followup exact-shaped full wave should succeed");
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn successor_second_exact_shaped_full_wave_source_apply_survives_interleaving_stale_predecessor_facade_only_recovery()
+     {
+        struct SourceControlErrorHookReset;
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![
+                                worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                                worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                            ],
+                            host_object_grants: vec![
+                                worker_export_with_fs_source(
+                                    "node-a::nfs1",
+                                    "node-a",
+                                    "10.0.0.11",
+                                    &nfs1_source,
+                                    nfs1.clone(),
+                                ),
+                                worker_export_with_fs_source(
+                                    "node-a::nfs2",
+                                    "node-a",
+                                    "10.0.0.12",
+                                    &nfs2_source,
+                                    nfs2.clone(),
+                                ),
+                            ],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("node-a".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let predecessor_source_client = match &*predecessor.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let sink_wave = |generation| {
+            let root_scopes = &[
+                ("nfs1", &["node-a::nfs1"][..]),
+                ("nfs2", &["node-a::nfs2"][..]),
+            ];
+            let mut signals = vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                    root_scopes,
+                    generation,
+                ),
+            ];
+            for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+                signals.push(activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    sink_query_request_route_for(node_id).0,
+                    root_scopes,
+                    generation,
+                ));
+            }
+            signals
+        };
+        let facade_wave = |generation| {
+            let listener_scopes = &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])];
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+            ]
+        };
+
+        let mut predecessor_initial = source_wave(2);
+        predecessor_initial.extend(sink_wave(2));
+        predecessor_initial.extend(facade_wave(2));
+        predecessor
+            .on_control_frame(&predecessor_initial)
+            .await
+            .expect("predecessor initial exact-shaped wave should succeed");
+
+        let mut successor_initial = source_wave(2);
+        successor_initial.extend(sink_wave(2));
+        successor_initial.extend(facade_wave(2));
+        successor
+            .on_control_frame(&successor_initial)
+            .await
+            .expect("successor initial exact-shaped wave should succeed");
+
+        predecessor
+            .on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                3,
+            )])
+            .await
+            .expect("late predecessor sink events deactivate should succeed");
+
+        let _source_error_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated predecessor second-wave source.apply failure".to_string(),
+                ),
+            },
+        );
+        let mut predecessor_second = source_wave(3);
+        predecessor_second.extend(sink_wave(3));
+        predecessor_second.extend(facade_wave(3));
+        predecessor
+            .on_control_frame(&predecessor_second)
+            .await
+            .expect_err("predecessor second exact-shaped wave should fail");
+        crate::workers::source::clear_source_worker_control_frame_error_hook();
+        assert!(
+            !predecessor.control_initialized(),
+            "predecessor should be uninitialized before stale facade-only recovery begins"
+        );
+
+        predecessor_source_client
+            .shutdown_shared_worker_for_tests()
+            .await
+            .expect("shutdown predecessor source worker before stale facade-only recovery");
+
+        let source_entered = Arc::new(Notify::new());
+        let source_release = Arc::new(Notify::new());
+        let _control_pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: source_entered.clone(),
+                release: source_release.clone(),
+            },
+        );
+
+        let successor_followup = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                let mut followup = source_wave(4);
+                followup.extend(sink_wave(4));
+                followup.extend(facade_wave(4));
+                successor.on_control_frame(&followup).await
+            }
+        });
+
+        source_entered.notified().await;
+
+        let predecessor_started = Arc::new(Notify::new());
+        let _start_hook_reset = RuntimeControlFrameStartHookReset;
+        install_runtime_control_frame_start_hook(RuntimeControlFrameStartHook {
+            entered: predecessor_started.clone(),
+        });
+
+        let predecessor_recovery = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move {
+                predecessor
+                    .on_control_frame(&[tick_envelope(execution_units::FACADE_RUNTIME_UNIT_ID, 3)])
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_millis(600), predecessor_started.notified())
+            .await
+            .expect(
+                "stale predecessor facade-only recovery must begin while the successor second exact-shaped full wave is paused in source.apply",
+            );
+
+        source_release.notify_waiters();
+
+        predecessor_recovery
+            .await
+            .expect("join predecessor stale facade-only recovery")
+            .expect("predecessor stale facade-only recovery should finish");
+        successor_followup
+            .await
+            .expect("join successor second exact-shaped followup")
+            .expect(
+                "successor second exact-shaped full wave should survive an interleaving stale predecessor facade-only recovery during source.apply",
+            );
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn stale_predecessor_facade_only_recovery_waits_before_source_start_while_successor_second_wave_source_apply_is_live()
+     {
+        struct SourceControlErrorHookReset;
+        struct SourceWorkerControlFramePauseHookReset;
+        struct SourceWorkerStartPauseHookReset;
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerControlFramePauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_pause_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerStartPauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_start_pause_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![
+                                worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                                worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                            ],
+                            host_object_grants: vec![
+                                worker_export_with_fs_source(
+                                    "node-a::nfs1",
+                                    "node-a",
+                                    "10.0.0.11",
+                                    &nfs1_source,
+                                    nfs1.clone(),
+                                ),
+                                worker_export_with_fs_source(
+                                    "node-a::nfs2",
+                                    "node-a",
+                                    "10.0.0.12",
+                                    &nfs2_source,
+                                    nfs2.clone(),
+                                ),
+                            ],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("node-a".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let predecessor_source_client = match &*predecessor.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let sink_wave = |generation| {
+            let root_scopes = &[
+                ("nfs1", &["node-a::nfs1"][..]),
+                ("nfs2", &["node-a::nfs2"][..]),
+            ];
+            let mut signals = vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                    root_scopes,
+                    generation,
+                ),
+            ];
+            for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+                signals.push(activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    sink_query_request_route_for(node_id).0,
+                    root_scopes,
+                    generation,
+                ));
+            }
+            signals
+        };
+        let facade_wave = |generation| {
+            let listener_scopes = &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])];
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+            ]
+        };
+
+        let mut predecessor_initial = source_wave(2);
+        predecessor_initial.extend(sink_wave(2));
+        predecessor_initial.extend(facade_wave(2));
+        predecessor
+            .on_control_frame(&predecessor_initial)
+            .await
+            .expect("predecessor initial exact-shaped wave should succeed");
+
+        let mut successor_initial = source_wave(2);
+        successor_initial.extend(sink_wave(2));
+        successor_initial.extend(facade_wave(2));
+        successor
+            .on_control_frame(&successor_initial)
+            .await
+            .expect("successor initial exact-shaped wave should succeed");
+
+        predecessor
+            .on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                3,
+            )])
+            .await
+            .expect("late predecessor sink events deactivate should succeed");
+
+        let _source_error_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated predecessor second-wave source.apply failure".to_string(),
+                ),
+            },
+        );
+        let mut predecessor_second = source_wave(3);
+        predecessor_second.extend(sink_wave(3));
+        predecessor_second.extend(facade_wave(3));
+        predecessor
+            .on_control_frame(&predecessor_second)
+            .await
+            .expect_err("predecessor second exact-shaped wave should fail");
+        crate::workers::source::clear_source_worker_control_frame_error_hook();
+        assert!(
+            !predecessor.control_initialized(),
+            "predecessor should be uninitialized before stale facade-only recovery begins"
+        );
+
+        predecessor_source_client
+            .shutdown_shared_worker_for_tests()
+            .await
+            .expect("shutdown predecessor source worker before stale facade-only recovery");
+
+        let source_entered = Arc::new(Notify::new());
+        let source_release = Arc::new(Notify::new());
+        let _control_pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: source_entered.clone(),
+                release: source_release.clone(),
+            },
+        );
+
+        let successor_followup = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                let mut followup = source_wave(4);
+                followup.extend(sink_wave(4));
+                followup.extend(facade_wave(4));
+                successor.on_control_frame(&followup).await
+            }
+        });
+
+        source_entered.notified().await;
+
+        let predecessor_start_entered = Arc::new(Notify::new());
+        let predecessor_start_release = Arc::new(Notify::new());
+        let _start_pause_reset = SourceWorkerStartPauseHookReset;
+        crate::workers::source::install_source_worker_start_pause_hook(
+            crate::workers::source::SourceWorkerStartPauseHook {
+                entered: predecessor_start_entered.clone(),
+                release: predecessor_start_release.clone(),
+            },
+        );
+
+        let predecessor_recovery = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move {
+                predecessor
+                    .on_control_frame(&[tick_envelope(execution_units::FACADE_RUNTIME_UNIT_ID, 3)])
+                    .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                predecessor_start_entered.notified()
+            )
+            .await
+            .is_err(),
+            "stale predecessor facade-only recovery must not re-enter source.start while the successor second exact-shaped full wave is still paused in source.apply",
+        );
+
+        source_release.notify_waiters();
+
+        tokio::time::timeout(Duration::from_millis(600), predecessor_start_entered.notified())
+            .await
+            .expect(
+                "stale predecessor facade-only recovery should be allowed to reach source.start after successor source.apply releases",
+            );
+        predecessor_start_release.notify_waiters();
+
+        predecessor_recovery
+            .await
+            .expect("join predecessor stale facade-only recovery")
+            .expect("predecessor stale facade-only recovery should finish");
+        successor_followup
+            .await
+            .expect("join successor second exact-shaped followup")
+            .expect(
+                "successor second exact-shaped full wave should survive once stale predecessor source.start waits for the live source.apply handoff",
+            );
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn successor_exact_shaped_source_wave_survives_late_predecessor_source_roots_deactivate()
+    {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -11180,7 +14337,8 @@ mod tests {
             .await
             .expect("initial successor exact-shaped source wave should succeed");
 
-        let expected_groups = std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let source_groups = successor
@@ -11249,19 +14407,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successor_second_source_control_survives_late_predecessor_query_peer_sink_route_deactivates(
-    ) {
+    async fn successor_second_source_control_survives_late_predecessor_query_peer_sink_route_deactivates()
+     {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
-        let source_socket_dir = worker_socket_root.path().join("source");
-        let sink_socket_dir = worker_socket_root.path().join("sink");
-        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
-        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
 
         let make_app = || {
             Arc::new(
@@ -11376,15 +14532,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successor_second_source_control_survives_late_predecessor_all_query_peer_route_deactivates(
-    ) {
+    async fn successor_second_source_control_survives_late_predecessor_all_query_peer_route_deactivates()
+     {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -11547,15 +14703,785 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_facade_exposure_confirmed_waits_for_inflight_roots_put_after_sink_update_begins(
-    ) {
+    async fn stale_predecessor_query_peer_deactivate_waits_before_route_mutation_during_successor_second_wave_source_apply()
+     {
+        struct SourceControlErrorHookReset;
+        struct SourceWorkerControlFramePauseHookReset;
+        struct FacadeDeactivatePauseHookReset {
+            unit_id: String,
+            route_key: String,
+        }
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerControlFramePauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_pause_hook();
+            }
+        }
+
+        impl Drop for FacadeDeactivatePauseHookReset {
+            fn drop(&mut self) {
+                clear_facade_deactivate_pause_hook(&self.unit_id, &self.route_key);
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![
+                                worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                                worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                            ],
+                            host_object_grants: vec![
+                                worker_export_with_fs_source(
+                                    "node-a::nfs1",
+                                    "node-a",
+                                    "10.0.0.11",
+                                    &nfs1_source,
+                                    nfs1.clone(),
+                                ),
+                                worker_export_with_fs_source(
+                                    "node-a::nfs2",
+                                    "node-a",
+                                    "10.0.0.12",
+                                    &nfs2_source,
+                                    nfs2.clone(),
+                                ),
+                            ],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("node-a".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let predecessor_source_client = match &*predecessor.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let sink_wave = |generation| {
+            let root_scopes = &[
+                ("nfs1", &["node-a::nfs1"][..]),
+                ("nfs2", &["node-a::nfs2"][..]),
+            ];
+            let mut signals = vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                    root_scopes,
+                    generation,
+                ),
+            ];
+            for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+                signals.push(activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    sink_query_request_route_for(node_id).0,
+                    root_scopes,
+                    generation,
+                ));
+            }
+            signals
+        };
+        let facade_wave = |generation| {
+            let listener_scopes = &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])];
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+            ]
+        };
+
+        let mut predecessor_initial = source_wave(2);
+        predecessor_initial.extend(sink_wave(2));
+        predecessor_initial.extend(facade_wave(2));
+        predecessor
+            .on_control_frame(&predecessor_initial)
+            .await
+            .expect("predecessor initial exact-shaped wave should succeed");
+
+        let mut successor_initial = source_wave(2);
+        successor_initial.extend(sink_wave(2));
+        successor_initial.extend(facade_wave(2));
+        successor
+            .on_control_frame(&successor_initial)
+            .await
+            .expect("successor initial exact-shaped wave should succeed");
+
+        predecessor
+            .on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                3,
+            )])
+            .await
+            .expect("late predecessor sink events deactivate should succeed");
+
+        let _source_error_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated predecessor second-wave source.apply failure".to_string(),
+                ),
+            },
+        );
+        let mut predecessor_second = source_wave(3);
+        predecessor_second.extend(sink_wave(3));
+        predecessor_second.extend(facade_wave(3));
+        predecessor
+            .on_control_frame(&predecessor_second)
+            .await
+            .expect_err("predecessor second exact-shaped wave should fail");
+        crate::workers::source::clear_source_worker_control_frame_error_hook();
+        assert!(
+            !predecessor.control_initialized(),
+            "predecessor should be uninitialized before stale query-peer deactivate begins"
+        );
+
+        predecessor_source_client
+            .shutdown_shared_worker_for_tests()
+            .await
+            .expect("shutdown predecessor source worker before stale query-peer deactivate");
+
+        let source_entered = Arc::new(Notify::new());
+        let source_release = Arc::new(Notify::new());
+        let _control_pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: source_entered.clone(),
+                release: source_release.clone(),
+            },
+        );
+
+        let successor_followup = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                let mut followup = source_wave(4);
+                followup.extend(sink_wave(4));
+                followup.extend(facade_wave(4));
+                successor.on_control_frame(&followup).await
+            }
+        });
+
+        source_entered.notified().await;
+
+        let deactivate_entered = Arc::new(Notify::new());
+        let deactivate_release = Arc::new(Notify::new());
+        let route_key = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
+        let _deactivate_pause_reset = FacadeDeactivatePauseHookReset {
+            unit_id: execution_units::QUERY_PEER_RUNTIME_UNIT_ID.to_string(),
+            route_key: route_key.clone(),
+        };
+        install_facade_deactivate_pause_hook(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            &route_key,
+            FacadeDeactivatePauseHook {
+                entered: deactivate_entered.clone(),
+                release: deactivate_release.clone(),
+            },
+        );
+
+        let predecessor_deactivate = tokio::spawn({
+            let predecessor = predecessor.clone();
+            let route_key = route_key.clone();
+            async move {
+                predecessor
+                    .on_control_frame(&[deactivate_envelope_with_route_key(
+                        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                        route_key,
+                        3,
+                    )])
+                    .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), deactivate_entered.notified())
+                .await
+                .is_err(),
+            "stale predecessor query-peer deactivate must not reach route-state mutation while the successor second exact-shaped full wave is still paused in source.apply",
+        );
+
+        source_release.notify_waiters();
+
+        tokio::time::timeout(Duration::from_millis(600), deactivate_entered.notified())
+            .await
+            .expect("stale predecessor query-peer deactivate should reach route-state mutation after successor source.apply releases");
+        deactivate_release.notify_waiters();
+
+        predecessor_deactivate
+            .await
+            .expect("join predecessor stale query-peer deactivate")
+            .expect("predecessor stale query-peer deactivate should finish");
+        successor_followup
+            .await
+            .expect("join successor second exact-shaped followup")
+            .expect(
+                "successor second exact-shaped full wave should survive the stale predecessor query-peer deactivate overlap",
+            );
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn peer_source_owner_query_peer_sink_deactivate_waits_before_route_mutation_during_remote_sink_owner_exact_wave_source_apply()
+     {
+        struct SourceWorkerControlFramePauseHookReset;
+
+        impl Drop for SourceWorkerControlFramePauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_pause_hook();
+            }
+        }
+
+        struct FacadeDeactivatePauseHookReset {
+            unit_id: String,
+            route_key: String,
+        }
+
+        impl Drop for FacadeDeactivatePauseHookReset {
+            fn drop(&mut self) {
+                clear_facade_deactivate_pause_hook(&self.unit_id, &self.route_key);
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let node_a_nfs1 = tmp.path().join("node-a-nfs1");
+        let node_a_nfs2 = tmp.path().join("node-a-nfs2");
+        let node_b_nfs1 = tmp.path().join("node-b-nfs1");
+        let node_b_nfs2 = tmp.path().join("node-b-nfs2");
+        fs::create_dir_all(&node_a_nfs1).expect("create node-a nfs1 dir");
+        fs::create_dir_all(&node_a_nfs2).expect("create node-a nfs2 dir");
+        fs::create_dir_all(&node_b_nfs1).expect("create node-b nfs1 dir");
+        fs::create_dir_all(&node_b_nfs2).expect("create node-b nfs2 dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_node_a = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![
+                                worker_fs_watch_scan_root(
+                                    "nfs1",
+                                    &node_a_nfs1.display().to_string(),
+                                ),
+                                worker_fs_watch_scan_root(
+                                    "nfs2",
+                                    &node_a_nfs2.display().to_string(),
+                                ),
+                            ],
+                            host_object_grants: vec![
+                                worker_export_with_fs_source(
+                                    "node-a::nfs1",
+                                    "node-a",
+                                    "10.0.0.11",
+                                    &node_a_nfs1.display().to_string(),
+                                    node_a_nfs1.clone(),
+                                ),
+                                worker_export_with_fs_source(
+                                    "node-a::nfs2",
+                                    "node-a",
+                                    "10.0.0.12",
+                                    &node_a_nfs2.display().to_string(),
+                                    node_a_nfs2.clone(),
+                                ),
+                            ],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("node-a".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init node-a app"),
+            )
+        };
+
+        let make_node_b = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![
+                                worker_fs_watch_scan_root(
+                                    "nfs1",
+                                    &node_b_nfs1.display().to_string(),
+                                ),
+                                worker_fs_watch_scan_root(
+                                    "nfs2",
+                                    &node_b_nfs2.display().to_string(),
+                                ),
+                            ],
+                            host_object_grants: vec![
+                                worker_export_with_fs_source(
+                                    "node-b::nfs1",
+                                    "node-b",
+                                    "10.0.0.21",
+                                    &node_b_nfs1.display().to_string(),
+                                    node_b_nfs1.clone(),
+                                ),
+                                worker_export_with_fs_source(
+                                    "node-b::nfs2",
+                                    "node-b",
+                                    "10.0.0.22",
+                                    &node_b_nfs2.display().to_string(),
+                                    node_b_nfs2.clone(),
+                                ),
+                            ],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("node-b".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init node-b app"),
+            )
+        };
+
+        let node_a = make_node_a();
+        let node_b = make_node_b();
+
+        if cfg!(target_os = "linux") {
+            match node_a.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start node-a app: {err}"),
+            }
+        } else {
+            let err = node_a
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let node_a_source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let node_a_sink_wave = |generation| {
+            let root_scopes = &[
+                ("nfs1", &["node-a::nfs1"][..]),
+                ("nfs2", &["node-a::nfs2"][..]),
+            ];
+            let mut signals = vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                    root_scopes,
+                    generation,
+                ),
+            ];
+            for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+                signals.push(activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    sink_query_request_route_for(node_id).0,
+                    root_scopes,
+                    generation,
+                ));
+            }
+            signals
+        };
+        let node_a_facade_wave = |generation| {
+            let listener_scopes = &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])];
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+            ]
+        };
+        let node_b_initial = vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["node-b::nfs1"]), ("nfs2", &["node-b::nfs2"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("nfs1", &["node-b::nfs1"]), ("nfs2", &["node-b::nfs2"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["node-b::nfs1"]), ("nfs2", &["node-b::nfs2"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["node-b::nfs1"]), ("nfs2", &["node-b::nfs2"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+        ];
+
+        let mut node_a_initial = node_a_source_wave(2);
+        node_a_initial.extend(node_a_sink_wave(2));
+        node_a_initial.extend(node_a_facade_wave(2));
+        node_a
+            .on_control_frame(&node_a_initial)
+            .await
+            .expect("node-a initial exact-shaped full wave should succeed");
+        node_b
+            .on_control_frame(&node_b_initial)
+            .await
+            .expect("node-b initial peer source-owner wave should succeed");
+
+        let source_entered = Arc::new(Notify::new());
+        let source_release = Arc::new(Notify::new());
+        let _source_pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: source_entered.clone(),
+                release: source_release.clone(),
+            },
+        );
+
+        let node_a_followup = tokio::spawn({
+            let node_a = node_a.clone();
+            async move {
+                let mut followup = node_a_source_wave(3);
+                followup.extend(node_a_sink_wave(3));
+                followup.extend(node_a_facade_wave(3));
+                node_a.on_control_frame(&followup).await
+            }
+        });
+
+        source_entered.notified().await;
+
+        let deactivate_entered = Arc::new(Notify::new());
+        let deactivate_release = Arc::new(Notify::new());
+        let route_key = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
+        let _deactivate_pause_reset = FacadeDeactivatePauseHookReset {
+            unit_id: execution_units::QUERY_PEER_RUNTIME_UNIT_ID.to_string(),
+            route_key: route_key.clone(),
+        };
+        install_facade_deactivate_pause_hook(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            &route_key,
+            FacadeDeactivatePauseHook {
+                entered: deactivate_entered.clone(),
+                release: deactivate_release.clone(),
+            },
+        );
+
+        let node_b_deactivate = tokio::spawn({
+            let node_b = node_b.clone();
+            async move {
+                node_b
+                    .on_control_frame(&[deactivate_envelope_with_route_key(
+                        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                        format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                        3,
+                    )])
+                    .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), deactivate_entered.notified())
+                .await
+                .is_err(),
+            "peer source-owner query-peer sink-route deactivate must not reach route-state mutation while the remote sink-owner exact-shaped wave is still paused in source.apply",
+        );
+
+        source_release.notify_waiters();
+        let _ = tokio::time::timeout(Duration::from_millis(600), deactivate_entered.notified())
+            .await
+            .expect("peer source-owner query-peer sink-route deactivate should reach route-state mutation after remote sink-owner source.apply releases");
+        deactivate_release.notify_waiters();
+
+        node_b_deactivate
+            .await
+            .expect("join node-b deactivate")
+            .expect("node-b deactivate should finish");
+        node_a_followup
+            .await
+            .expect("join node-a followup")
+            .expect("node-a followup exact-shaped wave should finish");
+
+        node_b.close().await.expect("close node-b app");
+        node_a.close().await.expect("close node-a app");
+    }
+
+    #[tokio::test]
+    async fn pending_facade_exposure_confirmed_waits_for_inflight_roots_put_after_sink_update_begins()
+     {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -11665,7 +15591,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -11700,7 +15630,9 @@ mod tests {
             let token = token.clone();
             async move {
                 client
-                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .put(format!(
+                        "http://{bind_addr}/api/fs-meta/v1/monitoring/roots"
+                    ))
                     .bearer_auth(token)
                     .json(&roots_body)
                     .send()
@@ -11861,8 +15793,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn future_generation_facade_deactivate_without_successor_activate_keeps_active_listener_available(
-    ) {
+    async fn future_generation_facade_deactivate_without_successor_activate_keeps_active_listener_available()
+     {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let root = tmp.path().join("root-a");
@@ -11983,7 +15915,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -12107,9 +16039,7 @@ mod tests {
 
         let request_task = tokio::spawn({
             let boundary = boundary.clone();
-            async move {
-                internal_sink_status_request(boundary, NodeId("single-app-node".into())).await
-            }
+            async move { internal_sink_status_request(boundary, NodeId("single-app-node".into())).await }
         });
 
         entered.notified().await;
@@ -12154,7 +16084,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -12328,15 +16258,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_peer_deactivate_waits_for_status_remote_source_collection_before_endpoint_begin(
-    ) {
+    async fn query_peer_deactivate_waits_for_status_remote_source_collection_before_endpoint_begin()
+    {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -12482,7 +16412,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
@@ -12555,7 +16489,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -12729,7 +16663,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
 
         app.on_control_frame(&[
             deactivate_envelope_with_route_key(
@@ -12778,8 +16716,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_peer_deactivate_and_facade_shutdown_replays_followup_source_control_after_bridge_reset(
-    ) {
+    async fn route_peer_deactivate_and_facade_shutdown_replays_followup_source_control_after_bridge_reset()
+     {
         struct SourceControlErrorHookReset;
 
         impl Drop for SourceControlErrorHookReset {
@@ -12794,7 +16732,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -12968,7 +16906,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
 
         app.on_control_frame(&[
             deactivate_envelope_with_route_key(
@@ -13008,7 +16950,9 @@ mod tests {
         let _reset = SourceControlErrorHookReset;
         crate::workers::source::install_source_worker_control_frame_error_hook(
             crate::workers::source::SourceWorkerControlFrameErrorHook {
-                err: CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
+                err: CnxError::PeerError(
+                    "transport closed: sidecar control bridge stopped".to_string(),
+                ),
             },
         );
 
@@ -13026,15 +16970,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_peer_deactivate_and_facade_shutdown_followup_source_control_survives_mid_handoff_shared_source_worker_shutdown(
-    ) {
+    async fn route_peer_deactivate_and_facade_shutdown_followup_source_control_survives_mid_handoff_shared_source_worker_shutdown()
+     {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -13208,7 +17152,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
 
         app.on_control_frame(&[
             deactivate_envelope_with_route_key(
@@ -13290,8 +17238,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_peer_deactivate_and_facade_shutdown_replays_followup_source_control_after_repeated_retryable_resets(
-    ) {
+    async fn route_peer_deactivate_and_facade_shutdown_replays_followup_source_control_after_repeated_retryable_resets()
+     {
         use std::collections::VecDeque;
 
         struct SourceControlErrorHookReset;
@@ -13308,7 +17256,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -13482,7 +17430,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
 
         app.on_control_frame(&[
             deactivate_envelope_with_route_key(
@@ -13530,6 +17482,8 @@ mod tests {
                         "transport closed: sidecar control bridge stopped".to_string(),
                     ),
                 ]),
+                sticky_worker_instance_id: None,
+                sticky_peer_err: None,
             },
         );
 
@@ -13547,8 +17501,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_peer_deactivate_and_facade_shutdown_restores_runnable_source_schedule_after_repeated_retryable_resets(
-    ) {
+    async fn route_peer_deactivate_and_facade_shutdown_restores_runnable_source_schedule_after_repeated_retryable_resets()
+     {
         use std::collections::VecDeque;
 
         struct SourceControlErrorHookReset;
@@ -13568,7 +17522,7 @@ mod tests {
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -13821,7 +17775,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
 
         app.on_control_frame(&[
             deactivate_envelope_with_route_key(
@@ -13869,6 +17827,8 @@ mod tests {
                         "transport closed: sidecar control bridge stopped".to_string(),
                     ),
                 ]),
+                sticky_worker_instance_id: None,
+                sticky_peer_err: None,
             },
         );
 
@@ -13911,7 +17871,9 @@ mod tests {
             ),
         ])
         .await
-        .expect("follow-up multi-root source control should recover after repeated retryable resets");
+        .expect(
+            "follow-up multi-root source control should recover after repeated retryable resets",
+        );
 
         app.on_control_frame(&[
             tick_envelope_with_route_key(
@@ -13978,7 +17940,7 @@ mod tests {
         let nfs2_source = nfs2.display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -14213,7 +18175,11 @@ mod tests {
             .send()
             .await
             .expect("login request");
-        assert!(login.status().is_success(), "login failed: {}", login.status());
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
 
         app.on_control_frame(&[
             deactivate_envelope_with_route_key(
@@ -14261,6 +18227,8 @@ mod tests {
                         "transport closed: sidecar control bridge stopped".to_string(),
                     ),
                 ]),
+                sticky_worker_instance_id: None,
+                sticky_peer_err: None,
             },
         );
 
@@ -14337,7 +18305,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn source_status_route_respawns_after_runtime_endpoint_shutdown_during_peer_upgrade_recovery()
-    {
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -14347,7 +18315,7 @@ mod tests {
         let nfs2_source = nfs2.display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -14469,7 +18437,9 @@ mod tests {
                     && snapshot
                         .scheduled_scan_groups_by_node
                         .get("node-c")
-                        .is_some_and(|groups| groups == &vec!["nfs1".to_string(), "nfs2".to_string()])
+                        .is_some_and(|groups| {
+                            groups == &vec!["nfs1".to_string(), "nfs2".to_string()]
+                        })
             }),
             "initial source-status route should expose peer scheduled groups: {initial_snapshots:?}"
         );
@@ -14498,7 +18468,9 @@ mod tests {
                     && snapshot
                         .scheduled_scan_groups_by_node
                         .get("node-c")
-                        .is_some_and(|groups| groups == &vec!["nfs1".to_string(), "nfs2".to_string()])
+                        .is_some_and(|groups| {
+                            groups == &vec!["nfs1".to_string(), "nfs2".to_string()]
+                        })
             }),
             "respawned source-status route should preserve peer scheduled groups after endpoint shutdown: {respawned_snapshots:?}"
         );
@@ -14507,8 +18479,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn source_status_route_serves_peer_only_requests_under_query_peer_runtime_unit_after_turnover(
-    ) {
+    async fn source_status_route_serves_peer_only_requests_under_query_peer_runtime_unit_after_turnover()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -14520,7 +18492,7 @@ mod tests {
             execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
         ));
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -14652,7 +18624,8 @@ mod tests {
         assert!(
             recv_unit_ids
                 .iter()
-                .any(|unit_id| unit_id.as_deref() == Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)),
+                .any(|unit_id| unit_id.as_deref()
+                    == Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)),
             "peer-only source-status requests must recv under runtime.exec.query-peer: {recv_unit_ids:?}"
         );
 
@@ -14660,8 +18633,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn source_status_route_serves_mixed_query_and_query_peer_requests_under_query_runtime_unit(
-    ) {
+    async fn source_status_route_serves_mixed_query_and_query_peer_requests_under_query_runtime_unit()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs2 = tmp.path().join("nfs2");
         fs::create_dir_all(&nfs2).expect("create nfs2 dir");
@@ -14670,7 +18643,7 @@ mod tests {
             execution_units::QUERY_RUNTIME_UNIT_ID,
         ));
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -14795,8 +18768,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn source_status_route_serves_peer_only_requests_when_turnover_delivery_uses_query_runtime_fallback_unit(
-    ) {
+    async fn source_status_route_serves_peer_only_requests_when_turnover_delivery_uses_query_runtime_fallback_unit()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -14809,7 +18782,7 @@ mod tests {
             None,
         ));
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -14948,8 +18921,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sink_query_proxy_route_serves_peer_only_requests_under_query_peer_runtime_unit_after_turnover(
-    ) {
+    async fn sink_query_proxy_route_serves_peer_only_requests_under_query_peer_runtime_unit_after_turnover()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -14962,7 +18935,7 @@ mod tests {
             Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID),
         ));
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -15087,7 +19060,8 @@ mod tests {
         assert!(
             recv_unit_ids
                 .iter()
-                .any(|unit_id| unit_id.as_deref() == Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)),
+                .any(|unit_id| unit_id.as_deref()
+                    == Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)),
             "peer-only sink query proxy requests must recv under runtime.exec.query-peer: {recv_unit_ids:?}"
         );
 
@@ -15095,8 +19069,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sink_query_proxy_route_serves_mixed_query_and_query_peer_requests_under_query_runtime_unit(
-    ) {
+    async fn sink_query_proxy_route_serves_mixed_query_and_query_peer_requests_under_query_runtime_unit()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs2 = tmp.path().join("nfs2");
         fs::create_dir_all(&nfs2).expect("create nfs2 dir");
@@ -15106,7 +19080,7 @@ mod tests {
             Some(execution_units::QUERY_RUNTIME_UNIT_ID),
         ));
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -15225,8 +19199,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sink_query_proxy_route_serves_peer_only_requests_when_turnover_delivery_uses_query_runtime_fallback_unit(
-    ) {
+    async fn sink_query_proxy_route_serves_peer_only_requests_when_turnover_delivery_uses_query_runtime_fallback_unit()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -15239,7 +19213,7 @@ mod tests {
             Some(execution_units::QUERY_RUNTIME_UNIT_ID),
         ));
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -15372,8 +19346,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn source_status_route_republishes_peer_schedule_after_query_peer_deactivate_and_reactivate(
-    ) {
+    async fn source_status_route_republishes_peer_schedule_after_query_peer_deactivate_and_reactivate()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -15383,7 +19357,7 @@ mod tests {
         let nfs2_source = nfs2.display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -15507,7 +19481,9 @@ mod tests {
                     && snapshot
                         .scheduled_scan_groups_by_node
                         .get("node-c")
-                        .is_some_and(|groups| groups == &vec!["nfs1".to_string(), "nfs2".to_string()])
+                        .is_some_and(|groups| {
+                            groups == &vec!["nfs1".to_string(), "nfs2".to_string()]
+                        })
             }),
             "initial source-status route should expose peer scheduled groups: {initial_snapshots:?}"
         );
@@ -15544,7 +19520,9 @@ mod tests {
                     && snapshot
                         .scheduled_scan_groups_by_node
                         .get("node-c")
-                        .is_some_and(|groups| groups == &vec!["nfs1".to_string(), "nfs2".to_string()])
+                        .is_some_and(|groups| {
+                            groups == &vec!["nfs1".to_string(), "nfs2".to_string()]
+                        })
             }),
             "reactivated source-status route must publish peer scheduled groups after query-peer deactivate/reactivate: {reactivated_snapshots:?}"
         );
@@ -15553,8 +19531,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn peer_only_source_status_route_republishes_schedule_after_turnover_and_retryable_source_resets(
-    ) {
+    async fn peer_only_source_status_route_republishes_schedule_after_turnover_and_retryable_source_resets()
+     {
         use std::collections::VecDeque;
 
         struct SourceControlErrorHookReset;
@@ -15574,7 +19552,7 @@ mod tests {
         let nfs2_source = nfs2.display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -15688,7 +19666,9 @@ mod tests {
                     && snapshot
                         .scheduled_scan_groups_by_node
                         .get("node-c")
-                        .is_some_and(|groups| groups == &vec!["nfs1".to_string(), "nfs2".to_string()])
+                        .is_some_and(|groups| {
+                            groups == &vec!["nfs1".to_string(), "nfs2".to_string()]
+                        })
             }),
             "initial source-status route should expose peer scheduled groups: {initial_snapshots:?}"
         );
@@ -15696,12 +19676,12 @@ mod tests {
         app.on_control_frame(&[
             deactivate_envelope_with_route_key(
                 execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-                sink_query_proxy_route,
+                sink_query_proxy_route.clone(),
                 3,
             ),
             deactivate_envelope_with_route_key(
                 execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-                sink_status_route,
+                sink_status_route.clone(),
                 3,
             ),
             deactivate_envelope_with_route_key(
@@ -15724,6 +19704,8 @@ mod tests {
                         "transport closed: sidecar control bridge stopped".to_string(),
                     ),
                 ]),
+                sticky_worker_instance_id: None,
+                sticky_peer_err: None,
             },
         );
 
@@ -15751,7 +19733,9 @@ mod tests {
                     && snapshot
                         .scheduled_scan_groups_by_node
                         .get("node-c")
-                        .is_some_and(|groups| groups == &vec!["nfs1".to_string(), "nfs2".to_string()])
+                        .is_some_and(|groups| {
+                            groups == &vec!["nfs1".to_string(), "nfs2".to_string()]
+                        })
             }),
             "peer-only source-status route must republish scheduled groups after turnover and retryable source resets: {reactivated_snapshots:?}"
         );
@@ -15775,7 +19759,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -15904,7 +19888,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -16013,8 +19997,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn followup_sink_events_deactivate_retries_stale_drained_fenced_pid_without_poisoning_runtime_control(
-    ) {
+    async fn followup_sink_events_deactivate_retries_stale_drained_fenced_pid_without_poisoning_runtime_control()
+     {
         struct SinkControlErrorHookReset;
 
         impl Drop for SinkControlErrorHookReset {
@@ -16029,7 +20013,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -16126,7 +20110,9 @@ mod tests {
             4,
         )])
         .await
-        .expect("follow-up sink control should still succeed after sink events deactivate recovery");
+        .expect(
+            "follow-up sink control should still succeed after sink events deactivate recovery",
+        );
 
         assert!(
             app.control_initialized(),
@@ -16157,7 +20143,7 @@ mod tests {
         let nfs2_source = nfs2.display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -16262,11 +20248,18 @@ mod tests {
         let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
         let source_find_route = format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL);
         let listener_scopes = &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])];
-        let root_scopes = &[("nfs1", &["node-a::nfs1"][..]), ("nfs2", &["node-a::nfs2"][..])];
+        let root_scopes = &[
+            ("nfs1", &["node-a::nfs1"][..]),
+            ("nfs2", &["node-a::nfs2"][..]),
+        ];
 
         let mut initial = source_wave(2);
         initial.extend([
-            activate_envelope_with_scope_rows(execution_units::SINK_RUNTIME_UNIT_ID, root_scopes, 2),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                root_scopes,
+                2,
+            ),
             activate_envelope_with_route_key_and_scope_rows(
                 execution_units::SINK_RUNTIME_UNIT_ID,
                 format!("{}.stream", ROUTE_KEY_EVENTS),
@@ -16302,7 +20295,8 @@ mod tests {
             .await
             .expect("initial multi-root peer full wave should succeed");
 
-        let expected_groups = std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let source_groups = app
@@ -16356,7 +20350,11 @@ mod tests {
 
         let mut followup = source_wave(3);
         followup.extend([
-            activate_envelope_with_scope_rows(execution_units::SINK_RUNTIME_UNIT_ID, root_scopes, 3),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                root_scopes,
+                3,
+            ),
             activate_envelope_with_route_key_and_scope_rows(
                 execution_units::SINK_RUNTIME_UNIT_ID,
                 format!("{}.stream", ROUTE_KEY_EVENTS),
@@ -16416,11 +20414,9 @@ mod tests {
         let nfs2_source = nfs2.display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
-        let source_socket_dir = worker_socket_root.path().join("source");
-        let sink_socket_dir = worker_socket_root.path().join("sink");
-        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
-        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
 
         let app = Arc::new(
             FSMetaApp::with_boundaries_and_state(
@@ -16517,9 +20513,16 @@ mod tests {
             ]
         };
         let sink_wave = |generation| {
-            let root_scopes = &[("nfs1", &["node-a::nfs1"][..]), ("nfs2", &["node-a::nfs2"][..])];
+            let root_scopes = &[
+                ("nfs1", &["node-a::nfs1"][..]),
+                ("nfs2", &["node-a::nfs2"][..]),
+            ];
             let mut signals = vec![
-                activate_envelope_with_scope_rows(execution_units::SINK_RUNTIME_UNIT_ID, root_scopes, generation),
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
                 activate_envelope_with_route_key_and_scope_rows(
                     execution_units::SINK_RUNTIME_UNIT_ID,
                     format!("{}.stream", ROUTE_KEY_EVENTS),
@@ -16615,6 +20618,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_app_start_converges_with_exact_fs_source_exports_on_fresh_external_runtime_worker_binding()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![
+                            worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                            worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                        ],
+                        host_object_grants: vec![
+                            worker_export_with_fs_source(
+                                "node-a::nfs1",
+                                "node-a",
+                                "10.0.0.11",
+                                &nfs1_source,
+                                nfs1.clone(),
+                            ),
+                            worker_export_with_fs_source(
+                                "node-a::nfs2",
+                                "node-a",
+                                "10.0.0.12",
+                                &nfs2_source,
+                                nfs2.clone(),
+                            ),
+                        ],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("node-a".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        if cfg!(target_os = "linux") {
+            match tokio::time::timeout(Duration::from_secs(8), app.start()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(CnxError::InvalidInput(msg)))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Ok(Err(err)) => panic!(
+                    "start app: {err}\nsource stderr:\n{}\nsink stderr:\n{}",
+                    worker_stderr_excerpt(&source_socket_dir),
+                    worker_stderr_excerpt(&sink_socket_dir),
+                ),
+                Err(_) => panic!(
+                    "fresh exact-config runtime-app start timed out: source stderr:\n{}\nsink stderr:\n{}",
+                    worker_stderr_excerpt(&source_socket_dir),
+                    worker_stderr_excerpt(&sink_socket_dir),
+                ),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
     async fn failed_second_full_wave_preserves_incoming_sink_routes_for_later_replay() {
         struct SourceControlErrorHookReset;
 
@@ -16635,11 +20734,9 @@ mod tests {
         let nfs2_source = nfs2.display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
-        let source_socket_dir = worker_socket_root.path().join("source");
-        let sink_socket_dir = worker_socket_root.path().join("sink");
-        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
-        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
 
         let app = Arc::new(
             FSMetaApp::with_boundaries_and_state(
@@ -16736,9 +20833,16 @@ mod tests {
             ]
         };
         let sink_wave = |generation| {
-            let root_scopes = &[("nfs1", &["node-a::nfs1"][..]), ("nfs2", &["node-a::nfs2"][..])];
+            let root_scopes = &[
+                ("nfs1", &["node-a::nfs1"][..]),
+                ("nfs2", &["node-a::nfs2"][..]),
+            ];
             let mut signals = vec![
-                activate_envelope_with_scope_rows(execution_units::SINK_RUNTIME_UNIT_ID, root_scopes, generation),
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
                 activate_envelope_with_route_key_and_scope_rows(
                     execution_units::SINK_RUNTIME_UNIT_ID,
                     format!("{}.stream", ROUTE_KEY_EVENTS),
@@ -16826,14 +20930,21 @@ mod tests {
         .await
         .expect("late sink events deactivate should succeed");
 
-        assert!(
-            !app.retained_sink_control_state
-                .lock()
-                .await
-                .active_by_route
-                .contains_key(&sink_events_route),
-            "late sink events deactivate should clear the retained events route before the follow-up full wave restores it"
-        );
+        match app
+            .retained_sink_control_state
+            .lock()
+            .await
+            .active_by_route
+            .get(&sink_events_route)
+        {
+            Some(SinkControlSignal::Deactivate { generation, .. }) => assert_eq!(
+                *generation, 3,
+                "late sink events deactivate must become the latest desired directive for later reconcile"
+            ),
+            other => panic!(
+                "expected retained sink deactivate for {sink_events_route:?} after late deactivate: {other:?}"
+            ),
+        }
 
         let _reset = SourceControlErrorHookReset;
         crate::workers::source::install_source_worker_control_frame_error_hook(
@@ -16847,10 +20958,9 @@ mod tests {
         let mut followup = source_wave(3);
         followup.extend(sink_wave(3));
         followup.extend(facade_wave(3));
-        let err = app
-            .on_control_frame(&followup)
-            .await
-            .expect_err("follow-up exact-shaped full wave should fail in source.apply before sink replay");
+        let err = app.on_control_frame(&followup).await.expect_err(
+            "follow-up exact-shaped full wave should fail in source.apply before sink replay",
+        );
         assert!(
             err.to_string()
                 .contains("simulated source apply failure before sink replay"),
@@ -16860,16 +20970,1187 @@ mod tests {
             !app.control_initialized(),
             "failed follow-up full wave must leave runtime uninitialized"
         );
-        assert!(
-            app.retained_sink_control_state
-                .lock()
-                .await
-                .active_by_route
-                .contains_key(&sink_events_route),
-            "failed full wave must preserve the incoming sink events activate for later replay when source.apply fails before sink.apply"
-        );
+        match app
+            .retained_sink_control_state
+            .lock()
+            .await
+            .active_by_route
+            .get(&sink_events_route)
+        {
+            Some(SinkControlSignal::Activate { generation, .. }) => assert_eq!(
+                *generation, 3,
+                "failed full wave must preserve the incoming sink events activate as the latest desired directive when source.apply fails before sink.apply"
+            ),
+            other => panic!(
+                "expected retained sink activate for {sink_events_route:?} after failed full wave: {other:?}"
+            ),
+        }
 
         app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn filtered_stale_shared_source_deactivate_does_not_clear_desired_source_state() {
+        let app = FSMetaApp::new(
+            FSMetaConfig {
+                source: local_source_config(),
+                ..FSMetaConfig::default()
+            },
+            NodeId("single-app-node".into()),
+        )
+        .expect("init app");
+
+        let route_key = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+        let route_id = (execution_units::SOURCE_RUNTIME_UNIT_ID.to_string(), route_key.clone());
+
+        let (initial_source_signals, _, _) = split_app_control_signals(&[
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                route_key.clone(),
+                &[("root-a", &["single-app-node::root-1"])],
+                2,
+            ),
+        ])
+        .expect("split initial source activate");
+        app.record_retained_source_control_state(&initial_source_signals)
+            .await;
+
+        app.shared_source_route_claims
+            .lock()
+            .await
+            .insert(route_id.clone(), std::collections::BTreeSet::from([app.instance_id + 1]));
+
+        let (stale_source_deactivate, _, _) = split_app_control_signals(&[
+            deactivate_envelope_with_route_key(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                route_key.clone(),
+                3,
+            ),
+        ])
+        .expect("split stale source deactivate");
+
+        app.apply_source_signals_with_recovery(&stale_source_deactivate)
+            .await
+            .expect("stale source deactivate should be filtered");
+
+        match app
+            .retained_source_control_state
+            .lock()
+            .await
+            .active_by_route
+            .get(&route_id)
+        {
+            Some(SourceControlSignal::Activate { generation, .. }) => assert_eq!(
+                *generation, 2,
+                "filtered stale source deactivate must not clear or rewrite the desired source route"
+            ),
+            other => panic!("expected retained source activate for {route_id:?}: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn source_reconcile_retains_latest_deactivate_directive_after_reset() {
+        let app = FSMetaApp::new(
+            FSMetaConfig {
+                source: local_source_config(),
+                ..FSMetaConfig::default()
+            },
+            NodeId("single-app-node".into()),
+        )
+        .expect("init app");
+
+        let route_key = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+        let route_id = (execution_units::SOURCE_RUNTIME_UNIT_ID.to_string(), route_key.clone());
+
+        let (initial_source_signals, _, _) = split_app_control_signals(&[
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                route_key.clone(),
+                &[("root-a", &["single-app-node::root-1"])],
+                2,
+            ),
+        ])
+        .expect("split initial source activate");
+        app.record_retained_source_control_state(&initial_source_signals)
+            .await;
+        app.source_state_replay_required
+            .store(true, Ordering::Release);
+
+        let (deactivate_source_signals, _, _) = split_app_control_signals(&[
+            deactivate_envelope_with_route_key(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                route_key.clone(),
+                3,
+            ),
+        ])
+        .expect("split source deactivate");
+        app.record_retained_source_control_state(&deactivate_source_signals)
+            .await;
+
+        let replayed = app.source_signals_with_replay(&[]).await;
+        match replayed
+            .iter()
+            .find(|signal| match signal {
+                SourceControlSignal::Activate {
+                    unit, route_key, ..
+                }
+                | SourceControlSignal::Deactivate {
+                    unit, route_key, ..
+                } => {
+                    unit.unit_id() == execution_units::SOURCE_RUNTIME_UNIT_ID
+                        && route_key == &route_id.1
+                }
+                SourceControlSignal::Tick { .. }
+                | SourceControlSignal::RuntimeHostGrantChange { .. }
+                | SourceControlSignal::ManualRescan { .. }
+                | SourceControlSignal::Passthrough(_) => false,
+            }) {
+            Some(SourceControlSignal::Deactivate { generation, .. }) => assert_eq!(
+                *generation, 3,
+                "desired-state reconcile must retain the latest deactivate directive for the route after reset"
+            ),
+            other => panic!(
+                "expected replayed source deactivate for {route_id:?}, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn filtered_stale_shared_sink_deactivate_does_not_clear_desired_sink_state() {
+        let app = FSMetaApp::new(
+            FSMetaConfig {
+                source: local_source_config(),
+                ..FSMetaConfig::default()
+            },
+            NodeId("single-app-node".into()),
+        )
+        .expect("init app");
+
+        let route_key = format!("{}.stream", ROUTE_KEY_EVENTS);
+        let route_id = (execution_units::SINK_RUNTIME_UNIT_ID.to_string(), route_key.clone());
+
+        let (_, initial_sink_signals, _) = split_app_control_signals(&[
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                route_key.clone(),
+                &[("root-a", &["single-app-node::root-1"])],
+                2,
+            ),
+        ])
+        .expect("split initial sink activate");
+        app.record_retained_sink_control_state(&initial_sink_signals).await;
+
+        app.shared_sink_route_claims
+            .lock()
+            .await
+            .insert(route_id.clone(), std::collections::BTreeSet::from([app.instance_id + 1]));
+
+        let (_, stale_sink_deactivate, _) = split_app_control_signals(&[
+            deactivate_envelope_with_route_key(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                route_key.clone(),
+                3,
+            ),
+        ])
+        .expect("split stale sink deactivate");
+
+        app.apply_sink_signals_with_recovery(&stale_sink_deactivate, true, false)
+            .await
+            .expect("stale sink deactivate should be filtered");
+
+        match app
+            .retained_sink_control_state
+            .lock()
+            .await
+            .active_by_route
+            .get(&route_id)
+        {
+            Some(SinkControlSignal::Activate { generation, .. }) => assert_eq!(
+                *generation, 2,
+                "filtered stale sink deactivate must not clear or rewrite the desired sink route"
+            ),
+            other => panic!("expected retained sink activate for {route_id:?}: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_flight_successor_sink_wave_filters_late_predecessor_sink_deactivate_before_claim_publication()
+     {
+        struct SinkWorkerControlFramePauseHookReset;
+
+        impl Drop for SinkWorkerControlFramePauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_pause_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_watch_scan_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        ..FSMetaConfig::default()
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        predecessor
+            .on_control_frame(&[
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    2,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    &[("test-root", &["single-app-node::root-1"])],
+                    2,
+                ),
+            ])
+            .await
+            .expect("initial predecessor sink events wave should succeed");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = SinkWorkerControlFramePauseHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let successor_wave = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                successor
+                    .on_control_frame(&[
+                        activate_envelope_with_scope_rows(
+                            execution_units::SINK_RUNTIME_UNIT_ID,
+                            &[("test-root", &["single-app-node::root-1"])],
+                            2,
+                        ),
+                        activate_envelope_with_route_key_and_scope_rows(
+                            execution_units::SINK_RUNTIME_UNIT_ID,
+                            format!("{}.stream", ROUTE_KEY_EVENTS),
+                            &[("test-root", &["single-app-node::root-1"])],
+                            2,
+                        ),
+                    ])
+                    .await
+            }
+        });
+
+        entered.notified().await;
+
+        let (_, late_deactivate, _) = split_app_control_signals(&[deactivate_envelope_with_route_key(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            3,
+        )])
+        .expect("split late predecessor sink deactivate");
+
+        let filtered = predecessor
+            .filter_shared_sink_route_deactivates(&late_deactivate)
+            .await;
+
+        release.notify_waiters();
+        successor_wave
+            .await
+            .expect("join successor sink wave")
+            .expect("successor sink wave after pause release");
+
+        predecessor.close().await.expect("close predecessor app");
+        successor.close().await.expect("close successor app");
+
+        assert!(
+            filtered.is_empty(),
+            "late predecessor sink deactivate must already be filtered once the successor sink wave has begun and owns the shared route logically, even before claim publication"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn successor_source_status_followup_survives_mid_handoff_shared_source_worker_shutdown_after_predecessor_failed_second_exact_wave_and_matched_sink_handoff()
+     {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SinkControlErrorHookReset;
+        struct SourceControlErrorHookReset;
+        struct SourceStartErrorQueueHookReset;
+        struct SourceWorkerStartPauseHookReset;
+
+        impl Drop for SinkControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SourceStartErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_start_error_queue_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerStartPauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_start_pause_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![
+                                worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                                worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                            ],
+                            host_object_grants: vec![
+                                worker_export_with_fs_source(
+                                    "node-a::nfs1",
+                                    "node-a",
+                                    "10.0.0.11",
+                                    &nfs1_source,
+                                    nfs1.clone(),
+                                ),
+                                worker_export_with_fs_source(
+                                    "node-a::nfs2",
+                                    "node-a",
+                                    "10.0.0.12",
+                                    &nfs2_source,
+                                    nfs2.clone(),
+                                ),
+                            ],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("node-a".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        let predecessor_source_client = match &*predecessor.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external predecessor source worker client"),
+        };
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let sink_wave = |generation| {
+            let root_scopes = &[
+                ("nfs1", &["node-a::nfs1"][..]),
+                ("nfs2", &["node-a::nfs2"][..]),
+            ];
+            let mut signals = vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                    root_scopes,
+                    generation,
+                ),
+            ];
+            for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+                signals.push(activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    sink_query_request_route_for(node_id).0,
+                    root_scopes,
+                    generation,
+                ));
+            }
+            signals
+        };
+        let facade_wave = |generation| {
+            let listener_scopes = &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])];
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+            ]
+        };
+
+        let mut initial = source_wave(2);
+        initial.extend(sink_wave(2));
+        initial.extend(facade_wave(2));
+        predecessor
+            .on_control_frame(&initial)
+            .await
+            .expect("predecessor initial exact-shaped source/sink/facade wave should succeed");
+
+        let sink_entered = Arc::new(Notify::new());
+        let sink_release = Arc::new(Notify::new());
+        let _sink_pause_reset = SinkWorkerControlFramePauseHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: sink_entered.clone(),
+                release: sink_release.clone(),
+            },
+        );
+
+        let late_sink_deactivate = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move {
+                predecessor
+                    .on_control_frame(&[deactivate_envelope_with_route_key(
+                        execution_units::SINK_RUNTIME_UNIT_ID,
+                        format!("{}.stream", ROUTE_KEY_EVENTS),
+                        3,
+                    )])
+                    .await
+            }
+        });
+
+        sink_entered.notified().await;
+        let _sink_err_reset = SinkControlErrorHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_error_hook(
+            crate::workers::sink::SinkWorkerControlFrameErrorHook {
+                err: CnxError::PeerError(
+                    "transport closed: sidecar control bridge stopped".to_string(),
+                ),
+            },
+        );
+        predecessor
+            .sink
+            .close()
+            .await
+            .expect("close predecessor sink worker bridge during late sink deactivate");
+        sink_release.notify_waiters();
+
+        late_sink_deactivate
+            .await
+            .expect("join predecessor late sink deactivate")
+            .expect_err(
+                "predecessor late sink deactivate should fail after mid-handoff sink close and retryable stop",
+            );
+
+        crate::workers::sink::clear_sink_worker_control_frame_error_hook();
+
+        let source_entered = Arc::new(Notify::new());
+        let source_release = Arc::new(Notify::new());
+        let _source_pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: source_entered.clone(),
+                release: source_release.clone(),
+            },
+        );
+
+        let _source_error_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated predecessor source apply failure before successor mid-handoff replay"
+                        .to_string(),
+                ),
+            },
+        );
+
+        let mut second_wave = source_wave(3);
+        second_wave.extend(sink_wave(3));
+        second_wave.extend(facade_wave(3));
+        let predecessor_second_wave = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move { predecessor.on_control_frame(&second_wave).await }
+        });
+
+        source_entered.notified().await;
+
+        let successor_started = Arc::new(Notify::new());
+        let successor_started_flag = Arc::new(AtomicBool::new(false));
+        let _start_hook_reset = RuntimeControlFrameStartHookReset;
+        install_runtime_control_frame_start_hook(RuntimeControlFrameStartHook {
+            entered: successor_started.clone(),
+        });
+        let successor_started_waiter = tokio::spawn({
+            let successor_started = successor_started.clone();
+            let successor_started_flag = successor_started_flag.clone();
+            async move {
+                successor_started.notified().await;
+                successor_started_flag.store(true, Ordering::Release);
+            }
+        });
+
+        let start_entered = Arc::new(Notify::new());
+        let start_release = Arc::new(Notify::new());
+        let _start_pause_reset = SourceWorkerStartPauseHookReset;
+        crate::workers::source::install_source_worker_start_pause_hook(
+            crate::workers::source::SourceWorkerStartPauseHook {
+                entered: start_entered.clone(),
+                release: start_release.clone(),
+            },
+        );
+
+        let _start_error_reset = SourceStartErrorQueueHookReset;
+        crate::workers::source::install_source_worker_start_error_queue_hook(
+            crate::workers::source::SourceWorkerStartErrorQueueHook {
+                errs: VecDeque::from([
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: Connection reset by peer (os error 104)"
+                            .to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: Connection reset by peer (os error 104)"
+                            .to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: Connection reset by peer (os error 104)"
+                            .to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                ]),
+                sticky_worker_instance_id: None,
+                sticky_peer_err: None,
+            },
+        );
+
+        let successor_followup = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                successor
+                    .on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                        format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                        &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                        4,
+                    )])
+                    .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !successor_started_flag.load(Ordering::Acquire),
+            "successor one-envelope source-status followup must remain blocked while predecessor second exact-shaped wave is still paused in source.apply"
+        );
+
+        source_release.notify_waiters();
+
+        predecessor_second_wave
+            .await
+            .expect("join predecessor second exact-shaped full wave")
+            .expect_err("predecessor second exact-shaped full wave should fail in source.apply");
+
+        tokio::time::timeout(Duration::from_millis(600), async {
+            loop {
+                if successor_started_flag.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(
+            "successor one-envelope source-status followup should begin after predecessor second exact-shaped wave fails and releases the shared control-frame gate",
+        );
+        successor_started_waiter
+            .await
+            .expect("join successor source-status start waiter");
+
+        start_entered.notified().await;
+        predecessor_source_client
+            .shutdown_shared_worker_for_tests()
+            .await
+            .expect("shutdown shared source worker during successor followup start");
+        start_release.notify_waiters();
+
+        successor_followup
+            .await
+            .expect("join successor source-status followup")
+            .expect(
+                "successor source-status followup should recover after a mid-handoff shared source worker shutdown plus repeated retryable source.start resets",
+            );
+
+        predecessor.close().await.expect("close predecessor app");
+        successor.close().await.expect("close successor app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn uninitialized_successor_source_status_followup_can_begin_during_predecessor_failed_generation_skewed_second_exact_wave_and_mid_handoff_shared_source_worker_shutdown()
+     {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SinkControlErrorHookReset;
+        struct SourceControlErrorHookReset;
+        struct SourceStartErrorQueueHookReset;
+        struct SourceWorkerStartPauseHookReset;
+
+        impl Drop for SinkControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SourceStartErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_start_error_queue_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerStartPauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_start_pause_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![
+                                worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                                worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                            ],
+                            host_object_grants: vec![
+                                worker_export_with_fs_source(
+                                    "node-a::nfs1",
+                                    "node-a",
+                                    "10.0.0.11",
+                                    &nfs1_source,
+                                    nfs1.clone(),
+                                ),
+                                worker_export_with_fs_source(
+                                    "node-a::nfs2",
+                                    "node-a",
+                                    "10.0.0.12",
+                                    &nfs2_source,
+                                    nfs2.clone(),
+                                ),
+                            ],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("node-a".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        let predecessor_source_client = match &*predecessor.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external predecessor source worker client"),
+        };
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let sink_wave = |generation| {
+            let root_scopes = &[
+                ("nfs1", &["node-a::nfs1"][..]),
+                ("nfs2", &["node-a::nfs2"][..]),
+            ];
+            let mut signals = vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                    root_scopes,
+                    generation,
+                ),
+            ];
+            for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+                signals.push(activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    sink_query_request_route_for(node_id).0,
+                    root_scopes,
+                    generation,
+                ));
+            }
+            signals
+        };
+
+        let mut initial = source_wave(2);
+        initial.extend(sink_wave(2));
+        initial.extend([
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])],
+                2,
+            ),
+        ]);
+        predecessor
+            .on_control_frame(&initial)
+            .await
+            .expect("predecessor initial exact-shaped source/sink/facade wave should succeed");
+
+        successor.mark_control_uninitialized_after_failure().await;
+        assert!(
+            !successor.control_initialized(),
+            "successor should start from replay-required uninitialized state before the one-envelope followup"
+        );
+
+        let sink_entered = Arc::new(Notify::new());
+        let sink_release = Arc::new(Notify::new());
+        let _sink_pause_reset = SinkWorkerControlFramePauseHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: sink_entered.clone(),
+                release: sink_release.clone(),
+            },
+        );
+
+        let late_sink_deactivate = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move {
+                predecessor
+                    .on_control_frame(&[deactivate_envelope_with_route_key(
+                        execution_units::SINK_RUNTIME_UNIT_ID,
+                        format!("{}.stream", ROUTE_KEY_EVENTS),
+                        3,
+                    )])
+                    .await
+            }
+        });
+
+        sink_entered.notified().await;
+        let _sink_err_reset = SinkControlErrorHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_error_hook(
+            crate::workers::sink::SinkWorkerControlFrameErrorHook {
+                err: CnxError::PeerError(
+                    "transport closed: sidecar control bridge stopped".to_string(),
+                ),
+            },
+        );
+        predecessor
+            .sink
+            .close()
+            .await
+            .expect("close predecessor sink worker bridge during late sink deactivate");
+        sink_release.notify_waiters();
+
+        late_sink_deactivate
+            .await
+            .expect("join predecessor late sink deactivate")
+            .expect_err(
+                "predecessor late sink deactivate should fail after mid-handoff sink close and retryable stop",
+            );
+
+        crate::workers::sink::clear_sink_worker_control_frame_error_hook();
+
+        let source_entered = Arc::new(Notify::new());
+        let source_release = Arc::new(Notify::new());
+        let _source_pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: source_entered.clone(),
+                release: source_release.clone(),
+            },
+        );
+
+        let _source_error_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated predecessor generation-skewed source.apply failure while uninitialized successor followup starts"
+                        .to_string(),
+                ),
+            },
+        );
+
+        let listener_scopes = &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])];
+        let mut second_wave = source_wave(3);
+        second_wave.extend(sink_wave(3));
+        second_wave.extend([
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                listener_scopes,
+                3,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                listener_scopes,
+                3,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                listener_scopes,
+                3,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                listener_scopes,
+                4,
+            ),
+        ]);
+        let predecessor_second_wave = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move { predecessor.on_control_frame(&second_wave).await }
+        });
+
+        source_entered.notified().await;
+
+        let successor_started = Arc::new(Notify::new());
+        let successor_started_flag = Arc::new(AtomicBool::new(false));
+        let _start_hook_reset = RuntimeControlFrameStartHookReset;
+        install_runtime_control_frame_start_hook(RuntimeControlFrameStartHook {
+            entered: successor_started.clone(),
+        });
+        let successor_started_waiter = tokio::spawn({
+            let successor_started = successor_started.clone();
+            let successor_started_flag = successor_started_flag.clone();
+            async move {
+                successor_started.notified().await;
+                successor_started_flag.store(true, Ordering::Release);
+            }
+        });
+
+        let start_entered = Arc::new(Notify::new());
+        let start_release = Arc::new(Notify::new());
+        let _start_pause_reset = SourceWorkerStartPauseHookReset;
+        crate::workers::source::install_source_worker_start_pause_hook(
+            crate::workers::source::SourceWorkerStartPauseHook {
+                entered: start_entered.clone(),
+                release: start_release.clone(),
+            },
+        );
+
+        let _start_error_reset = SourceStartErrorQueueHookReset;
+        crate::workers::source::install_source_worker_start_error_queue_hook(
+            crate::workers::source::SourceWorkerStartErrorQueueHook {
+                errs: VecDeque::from([
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: Connection reset by peer (os error 104)"
+                            .to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: Connection reset by peer (os error 104)"
+                            .to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: Connection reset by peer (os error 104)"
+                            .to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                ]),
+                sticky_worker_instance_id: None,
+                sticky_peer_err: None,
+            },
+        );
+
+        let successor_followup = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                successor
+                    .on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                        format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                        &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                        4,
+                    )])
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_millis(600), async {
+            loop {
+                if successor_started_flag.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(
+            "uninitialized successor one-envelope source-status followup should begin while the predecessor generation-skewed second exact-shaped wave is still paused in source.apply",
+        );
+        successor_started_waiter
+            .await
+            .expect("join uninitialized successor source-status start waiter");
+
+        start_entered.notified().await;
+        predecessor_source_client
+            .shutdown_shared_worker_for_tests()
+            .await
+            .expect("shutdown shared source worker during uninitialized successor followup start");
+        source_release.notify_waiters();
+
+        predecessor_second_wave
+            .await
+            .expect("join predecessor generation-skewed second exact-shaped full wave")
+            .expect_err(
+                "predecessor generation-skewed second exact-shaped full wave should fail in source.apply",
+            );
+
+        start_release.notify_waiters();
+
+        successor_followup
+            .await
+            .expect("join uninitialized successor source-status followup")
+            .expect(
+                "uninitialized successor source-status followup should recover after beginning during the predecessor generation-skewed source failure window and surviving a mid-handoff shared worker shutdown plus repeated retryable source.start resets",
+            );
+
+        predecessor.close().await.expect("close predecessor app");
+        successor.close().await.expect("close successor app");
     }
 
     #[tokio::test]
@@ -16888,7 +22169,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -17087,8 +22368,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_node_recovery_preserves_runtime_host_grants_injected_by_control_after_worker_restart(
-    ) {
+    async fn same_node_recovery_preserves_runtime_host_grants_injected_by_control_after_worker_restart()
+     {
         struct SourceControlErrorHookReset;
 
         impl Drop for SourceControlErrorHookReset {
@@ -17103,7 +22384,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -17319,8 +22600,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_recovery_preserves_control_injected_peer_grants_for_instance_suffixed_runtime_app(
-    ) {
+    async fn restart_recovery_preserves_control_injected_peer_grants_for_instance_suffixed_runtime_app()
+     {
         struct SourceControlErrorHookReset;
 
         impl Drop for SourceControlErrorHookReset {
@@ -17340,7 +22621,7 @@ mod tests {
         let nfs2_source = nfs2.display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -17552,8 +22833,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn facade_only_recovery_preserves_control_injected_peer_grants_for_instance_suffixed_runtime_app(
-    ) {
+    async fn facade_only_recovery_preserves_control_injected_peer_grants_for_instance_suffixed_runtime_app()
+     {
         struct SourceControlErrorHookReset;
 
         impl Drop for SourceControlErrorHookReset {
@@ -17573,7 +22854,7 @@ mod tests {
         let nfs2_source = nfs2.display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -17806,7 +23087,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -17876,7 +23157,8 @@ mod tests {
         ];
         let (initial_source, _, _) =
             split_app_control_signals(&initial).expect("split initial source control");
-        app.record_retained_source_control_state(&initial_source).await;
+        app.record_retained_source_control_state(&initial_source)
+            .await;
         app.source_state_replay_required
             .store(true, Ordering::Release);
 
@@ -17892,11 +23174,15 @@ mod tests {
         let replayed_routes = replayed
             .iter()
             .filter_map(|signal| match signal {
-                SourceControlSignal::Activate { unit, route_key, .. }
-                | SourceControlSignal::Deactivate { unit, route_key, .. }
-                | SourceControlSignal::Tick { unit, route_key, .. } => {
-                    Some((unit.unit_id().to_string(), route_key.clone()))
+                SourceControlSignal::Activate {
+                    unit, route_key, ..
                 }
+                | SourceControlSignal::Deactivate {
+                    unit, route_key, ..
+                }
+                | SourceControlSignal::Tick {
+                    unit, route_key, ..
+                } => Some((unit.unit_id().to_string(), route_key.clone())),
                 SourceControlSignal::RuntimeHostGrantChange { .. }
                 | SourceControlSignal::ManualRescan { .. }
                 | SourceControlSignal::Passthrough(_) => None,
@@ -17937,7 +23223,7 @@ mod tests {
 
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket root");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -17946,7 +23232,10 @@ mod tests {
         let app = FSMetaApp::with_boundaries_and_state(
             FSMetaConfig {
                 source: SourceConfig {
-                    roots: vec![worker_root("nfs1", &nfs1), worker_root("nfs2", &nfs2)],
+                    roots: vec![
+                        worker_watch_scan_root("nfs1", &nfs1),
+                        worker_watch_scan_root("nfs2", &nfs2),
+                    ],
                     host_object_grants: vec![
                         worker_export(
                             "single-app-node::nfs1",
@@ -18090,7 +23379,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -18207,7 +23496,7 @@ mod tests {
         let fs_source = tmp.path().display().to_string();
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -18305,8 +23594,7 @@ mod tests {
             .await
             .expect("initial real source control wave should succeed");
 
-        let expected_groups =
-            std::collections::BTreeSet::from(["test-root".to_string()]);
+        let expected_groups = std::collections::BTreeSet::from(["test-root".to_string()]);
         let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let source_groups = app
@@ -18413,6 +23701,572 @@ mod tests {
         assert_eq!(
             scan_groups, expected_groups,
             "facade-only recovery must replay retained scan activate scopes after worker restart"
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn facade_only_deactivate_does_not_reinitialize_unready_runtime_or_replay_source_state() {
+        use std::collections::VecDeque;
+
+        struct SourceStartErrorQueueHookReset;
+
+        impl Drop for SourceStartErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_start_error_queue_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_watch_scan_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let source_client = match &*app.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        app.on_control_frame(&[
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial source and query-peer activate should succeed");
+
+        app.mark_control_uninitialized_after_failure().await;
+        assert!(
+            !app.control_initialized(),
+            "forced failure seam should leave runtime uninitialized"
+        );
+        assert!(
+            app.source_state_replay_required.load(Ordering::Acquire),
+            "forced failure seam should leave retained source replay pending"
+        );
+
+        source_client
+            .shutdown_shared_worker_for_tests()
+            .await
+            .expect("shutdown source worker before facade-only cleanup");
+
+        let _start_error_reset = SourceStartErrorQueueHookReset;
+        crate::workers::source::install_source_worker_start_error_queue_hook(
+            crate::workers::source::SourceWorkerStartErrorQueueHook {
+                errs: VecDeque::from([CnxError::PeerError(
+                    "facade-only deactivate must not reinitialize source.start".to_string(),
+                )]),
+                sticky_worker_instance_id: None,
+                sticky_peer_err: None,
+            },
+        );
+
+        app.on_control_frame(&[deactivate_envelope_with_route_key(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+            3,
+        )])
+        .await
+        .expect(
+            "facade-only deactivate on an unready runtime must stay fail-closed cleanup-only and must not restart source or replay retained source state",
+        );
+
+        assert!(
+            !app.control_initialized(),
+            "facade-only deactivate cleanup must not reinitialize an unready runtime"
+        );
+        assert!(
+            app.source_state_replay_required.load(Ordering::Acquire),
+            "facade-only deactivate cleanup must leave retained source replay pending for the next authoritative source wave"
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sink_only_deactivate_does_not_reinitialize_unready_runtime_or_replay_source_state() {
+        use std::collections::VecDeque;
+
+        struct SourceStartErrorQueueHookReset;
+
+        impl Drop for SourceStartErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_start_error_queue_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_watch_scan_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        let source_client = match &*app.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        app.on_control_frame(&[
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial source+sink activate should succeed");
+
+        app.mark_control_uninitialized_after_failure().await;
+        assert!(
+            !app.control_initialized(),
+            "forced failure seam should leave runtime uninitialized"
+        );
+        assert!(
+            app.source_state_replay_required.load(Ordering::Acquire),
+            "forced failure seam should leave retained source replay pending"
+        );
+
+        source_client
+            .shutdown_shared_worker_for_tests()
+            .await
+            .expect("shutdown source worker before sink-only cleanup");
+
+        let _start_error_reset = SourceStartErrorQueueHookReset;
+        crate::workers::source::install_source_worker_start_error_queue_hook(
+            crate::workers::source::SourceWorkerStartErrorQueueHook {
+                errs: VecDeque::from([CnxError::PeerError(
+                    "sink-only deactivate must not reinitialize source.start".to_string(),
+                )]),
+                sticky_worker_instance_id: None,
+                sticky_peer_err: None,
+            },
+        );
+
+        app.on_control_frame(&[deactivate_envelope_with_route_key(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            3,
+        )])
+        .await
+        .expect(
+            "sink-only deactivate on an unready runtime must not restart source or replay retained source state",
+        );
+
+        assert!(
+            !app.control_initialized(),
+            "sink-only deactivate cleanup must not reinitialize an unready runtime"
+        );
+        assert!(
+            app.source_state_replay_required.load(Ordering::Acquire),
+            "sink-only deactivate cleanup must leave retained source replay pending for the next authoritative source wave",
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sink_only_deactivate_retries_retryable_sink_reset_without_reinitializing_source_state()
+     {
+        use std::collections::VecDeque;
+
+        struct SourceStartErrorQueueHookReset;
+
+        impl Drop for SourceStartErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_start_error_queue_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_watch_scan_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        let source_client = match &*app.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        app.on_control_frame(&[
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial source+sink activate should succeed");
+
+        app.mark_control_uninitialized_after_failure().await;
+        assert!(
+            !app.control_initialized(),
+            "forced failure seam should leave runtime uninitialized"
+        );
+
+        source_client
+            .shutdown_shared_worker_for_tests()
+            .await
+            .expect("shutdown source worker before sink-only retry");
+        app.sink
+            .close()
+            .await
+            .expect("close sink worker before sink-only retry");
+
+        let _start_error_reset = SourceStartErrorQueueHookReset;
+        crate::workers::source::install_source_worker_start_error_queue_hook(
+            crate::workers::source::SourceWorkerStartErrorQueueHook {
+                errs: VecDeque::from([CnxError::PeerError(
+                    "sink-only retry must not reinitialize source.start".to_string(),
+                )]),
+                sticky_worker_instance_id: None,
+                sticky_peer_err: None,
+            },
+        );
+
+        app.on_control_frame(&[deactivate_envelope_with_route_key(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            3,
+        )])
+        .await
+        .expect(
+            "sink-only deactivate must recover a retryable sink reset without reinitializing source state",
+        );
+
+        assert!(
+            !app.control_initialized(),
+            "sink-only retry recovery must leave runtime uninitialized until the next authoritative source wave",
+        );
+        assert!(
+            app.source_state_replay_required.load(Ordering::Acquire),
+            "sink-only retry recovery must preserve pending source replay state",
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sink_only_deactivate_on_unready_runtime_stays_cleanup_only_without_retained_sink_replay()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_watch_scan_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        app.on_control_frame(&[
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial source+sink activate should succeed");
+
+        app.mark_control_uninitialized_after_failure().await;
+        assert!(
+            !app.control_initialized(),
+            "forced failure seam should leave runtime uninitialized"
+        );
+
+        app.on_control_frame(&[deactivate_envelope_with_route_key(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            3,
+        )])
+        .await
+        .expect("sink-only cleanup followup should complete");
+
+        let snapshot = app
+            .sink
+            .status_snapshot()
+            .await
+            .expect("sink status snapshot after sink-only cleanup");
+        let last_signals = snapshot
+            .last_control_frame_signals_by_node
+            .values()
+            .flat_map(|signals| signals.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            last_signals,
+            std::collections::BTreeSet::from([format!(
+                "deactivate unit={} route={}.stream generation=3",
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                ROUTE_KEY_EVENTS
+            )]),
+            "sink-only cleanup on an unready runtime must stay cleanup-only and must not piggyback retained sink activations into the worker replay batch",
         );
 
         app.close().await.expect("close app");
@@ -18950,7 +24804,7 @@ mod tests {
 
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -19048,7 +24902,10 @@ mod tests {
             while tokio::time::Instant::now() < deadline {
                 match app.query_tree(&request).await {
                     Ok(grouped) => {
-                        if grouped.get(group_id).is_some_and(|payload| payload.root.exists) {
+                        if grouped
+                            .get(group_id)
+                            .is_some_and(|payload| payload.root.exists)
+                        {
                             direct_ready = true;
                         }
                     }
@@ -19064,7 +24921,10 @@ mod tests {
                     Ok(grouped) => {
                         last_proxy_keys = grouped.keys().cloned().collect();
                         last_proxy_err = None;
-                        if grouped.get(group_id).is_some_and(|payload| payload.root.exists) {
+                        if grouped
+                            .get(group_id)
+                            .is_some_and(|payload| payload.root.exists)
+                        {
                             proxy_ready = true;
                         }
                     }
@@ -19093,8 +24953,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
-    async fn external_runtime_app_selected_group_proxy_materializes_each_local_primary_root_real_nfs(
-    ) {
+    async fn external_runtime_app_selected_group_proxy_materializes_each_local_primary_root_real_nfs()
+     {
         let preflight = real_nfs_lab::RealNfsPreflight::detect();
         if !preflight.enabled {
             eprintln!(
@@ -19124,7 +24984,7 @@ mod tests {
 
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -19241,7 +25101,8 @@ mod tests {
                 {
                     Ok(grouped) => {
                         last_proxy_keys = grouped.keys().cloned().collect();
-                        last_proxy_exists = grouped.get(group_id).map(|payload| payload.root.exists);
+                        last_proxy_exists =
+                            grouped.get(group_id).map(|payload| payload.root.exists);
                         last_proxy_err = None;
                         if last_proxy_exists == Some(true) {
                             proxy_ready = true;
@@ -19272,8 +25133,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
-    async fn external_runtime_app_selected_group_proxy_real_nfs_remote_same_group_grant_keeps_owner_host_materialized(
-    ) {
+    async fn external_runtime_app_selected_group_proxy_real_nfs_remote_same_group_grant_keeps_owner_host_materialized()
+     {
         let preflight = real_nfs_lab::RealNfsPreflight::detect();
         if !preflight.enabled {
             eprintln!(
@@ -19309,7 +25170,7 @@ mod tests {
 
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -19476,7 +25337,8 @@ mod tests {
                 {
                     Ok(grouped) => {
                         last_proxy_keys = grouped.keys().cloned().collect();
-                        last_proxy_exists = grouped.get(group_id).map(|payload| payload.root.exists);
+                        last_proxy_exists =
+                            grouped.get(group_id).map(|payload| payload.root.exists);
                         last_proxy_err = None;
                         if last_proxy_exists == Some(true) {
                             proxy_ready = true;
@@ -19507,8 +25369,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
-    async fn external_runtime_app_selected_group_proxy_real_nfs_grant_change_after_activation_keeps_owner_host_materialized(
-    ) {
+    async fn external_runtime_app_selected_group_proxy_real_nfs_grant_change_after_activation_keeps_owner_host_materialized()
+     {
         let preflight = real_nfs_lab::RealNfsPreflight::detect();
         if !preflight.enabled {
             eprintln!(
@@ -19544,7 +25406,7 @@ mod tests {
 
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -19710,7 +25572,8 @@ mod tests {
                 {
                     Ok(grouped) => {
                         last_proxy_keys = grouped.keys().cloned().collect();
-                        last_proxy_exists = grouped.get(group_id).map(|payload| payload.root.exists);
+                        last_proxy_exists =
+                            grouped.get(group_id).map(|payload| payload.root.exists);
                         last_proxy_err = None;
                         if last_proxy_exists == Some(true) {
                             proxy_ready = true;
@@ -19741,8 +25604,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
-    async fn external_runtime_app_selected_group_proxy_real_nfs_peer_owned_source_scope_leaves_group_unmaterialized(
-    ) {
+    async fn external_runtime_app_selected_group_proxy_real_nfs_peer_owned_source_scope_leaves_group_unmaterialized()
+     {
         let preflight = real_nfs_lab::RealNfsPreflight::detect();
         if !preflight.enabled {
             eprintln!(
@@ -19778,7 +25641,7 @@ mod tests {
 
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let worker_socket_root = worker_socket_tempdir();
         let source_socket_dir = worker_socket_root.path().join("source");
         let sink_socket_dir = worker_socket_root.path().join("sink");
         fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
@@ -19922,10 +25785,14 @@ mod tests {
             {
                 nfs1_direct_ready = true;
             }
-            if selected_group_proxy_tree(boundary.clone(), NodeId("node-a".to_string()), &nfs1_request)
-                .await
-                .ok()
-                .and_then(|grouped| grouped.get("nfs1").map(|payload| payload.root.exists))
+            if selected_group_proxy_tree(
+                boundary.clone(),
+                NodeId("node-a".to_string()),
+                &nfs1_request,
+            )
+            .await
+            .ok()
+            .and_then(|grouped| grouped.get("nfs1").map(|payload| payload.root.exists))
                 == Some(true)
             {
                 nfs1_proxy_ready = true;
@@ -19935,8 +25802,14 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(nfs1_direct_ready, "nfs1 direct query should still materialize");
-        assert!(nfs1_proxy_ready, "nfs1 selected-group proxy should still materialize");
+        assert!(
+            nfs1_direct_ready,
+            "nfs1 direct query should still materialize"
+        );
+        assert!(
+            nfs1_proxy_ready,
+            "nfs1 selected-group proxy should still materialize"
+        );
 
         let nfs2_request = selected_group_dir_request(b"/force-find-stress", "nfs2");
         let nfs2_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -19948,8 +25821,12 @@ mod tests {
             if let Ok(grouped) = app.query_tree(&nfs2_request).await {
                 last_direct_exists = grouped.get("nfs2").map(|payload| payload.root.exists);
             }
-            match selected_group_proxy_tree(boundary.clone(), NodeId("node-a".to_string()), &nfs2_request)
-                .await
+            match selected_group_proxy_tree(
+                boundary.clone(),
+                NodeId("node-a".to_string()),
+                &nfs2_request,
+            )
+            .await
             {
                 Ok(grouped) => {
                     last_proxy_keys = grouped.keys().cloned().collect();

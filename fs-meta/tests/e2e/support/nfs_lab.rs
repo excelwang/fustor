@@ -10,6 +10,9 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use tempfile::TempDir;
 
 const LAB_MARKER_FILENAME: &str = ".fs_meta_nfs_lab";
+const E2E_TMP_ROOT_ENV: &str = "DATANIX_E2E_TMP_ROOT";
+const LEGACY_E2E_TMP_ROOT_ENV: &str = "CAPANIX_E2E_TMP_ROOT";
+const NFS_LAB_COMPONENT: &str = "nfs-lab";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StaleLabCleanupPlan {
@@ -19,6 +22,27 @@ struct StaleLabCleanupPlan {
 
 fn lab_marker_path(root: &Path) -> PathBuf {
     root.join(LAB_MARKER_FILENAME)
+}
+
+fn e2e_tmp_root() -> PathBuf {
+    if let Ok(raw) =
+        std::env::var(E2E_TMP_ROOT_ENV).or_else(|_| std::env::var(LEGACY_E2E_TMP_ROOT_ENV))
+    {
+        let dir = PathBuf::from(raw);
+        fs::create_dir_all(&dir).expect("create e2e temp root");
+        return dir;
+    }
+    let dir = crate::path_support::workspace_root()
+        .join(".tmp")
+        .join("fs-meta-e2e");
+    fs::create_dir_all(&dir).expect("create default e2e temp root");
+    dir
+}
+
+fn nfs_lab_parent_dir() -> PathBuf {
+    let dir = e2e_tmp_root().join(NFS_LAB_COMPONENT);
+    fs::create_dir_all(&dir).expect("create nfs lab parent dir");
+    dir
 }
 
 fn decode_mountinfo_path(raw: &str) -> PathBuf {
@@ -31,26 +55,26 @@ fn decode_mountinfo_path(raw: &str) -> PathBuf {
 }
 
 fn nfs_lab_root_for_mount_target(target: &Path) -> Option<PathBuf> {
-    let mut components = target.components();
-    match (
-        components.next(),
-        components.next(),
-        components.next(),
-        components.next(),
+    if !target.components().any(
+        |component| matches!(component, Component::Normal(name) if name == OsStr::new("mounts")),
     ) {
-        (
-            Some(Component::RootDir),
-            Some(Component::Normal(tmp)),
-            Some(Component::Normal(root)),
-            Some(Component::Normal(mounts)),
-        ) if tmp == OsStr::new("tmp")
-            && mounts == OsStr::new("mounts")
-            && root.to_string_lossy().starts_with(".tmp") =>
-        {
-            Some(Path::new("/tmp").join(root))
-        }
-        _ => None,
+        return None;
     }
+    for ancestor in target.ancestors() {
+        if ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".tmp"))
+        {
+            return Some(ancestor.to_path_buf());
+        }
+        if lab_marker_path(ancestor).exists()
+            || (ancestor.join("mounts").exists() && ancestor.join("exports").exists())
+        {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
 }
 
 fn discover_candidate_lab_roots_under(base_dir: &Path) -> Vec<PathBuf> {
@@ -121,7 +145,10 @@ fn join_cleanup_errors(context: &str, errors: &[String]) -> String {
 fn stale_lab_cleanup_plans() -> Result<Vec<StaleLabCleanupPlan>, String> {
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")
         .map_err(|e| format!("read /proc/self/mountinfo failed: {e}"))?;
-    let filesystem_roots = discover_candidate_lab_roots_under(Path::new("/tmp"));
+    let mut filesystem_roots = discover_candidate_lab_roots_under(Path::new("/tmp"));
+    filesystem_roots.extend(discover_candidate_lab_roots_under(&nfs_lab_parent_dir()));
+    filesystem_roots.sort();
+    filesystem_roots.dedup();
     Ok(stale_lab_cleanup_plans_from_mountinfo(
         &mountinfo,
         &filesystem_roots,
@@ -300,8 +327,10 @@ impl NfsLab {
                 .unwrap_or_else(|| "real NFS preflight failed".to_string()));
         }
         cleanup_stale_labs_before_start()?;
-        let temp =
-            tempfile::tempdir().map_err(|e| format!("create NFS lab tempdir failed: {e}"))?;
+        let temp = tempfile::Builder::new()
+            .prefix(".tmp")
+            .tempdir_in(nfs_lab_parent_dir())
+            .map_err(|e| format!("create NFS lab tempdir failed: {e}"))?;
         let exports_dir = temp.path().join("exports");
         let mounts_dir = temp.path().join("mounts");
         fs::create_dir_all(&exports_dir).map_err(|e| format!("create exports dir failed: {e}"))?;
@@ -701,17 +730,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nfs_lab_root_for_mount_target_requires_tmp_mounts_path() {
+    fn nfs_lab_root_for_mount_target_finds_structured_root_under_any_base() {
+        let base = tempfile::tempdir().expect("base tempdir");
+        let root = base.path().join(".tmpabc123");
+        fs::create_dir_all(root.join("mounts/node-a/nfs1")).expect("mount path");
+        fs::create_dir_all(root.join("exports/nfs1")).expect("exports path");
+        fs::write(lab_marker_path(&root), b"marker\n").expect("marker file");
+
         assert_eq!(
-            nfs_lab_root_for_mount_target(Path::new("/tmp/.tmpabc123/mounts/node-a/nfs1")),
-            Some(PathBuf::from("/tmp/.tmpabc123"))
+            nfs_lab_root_for_mount_target(&root.join("mounts/node-a/nfs1")),
+            Some(root.clone())
         );
         assert_eq!(
-            nfs_lab_root_for_mount_target(Path::new("/tmp/.tmpabc123/exports/nfs1")),
-            None
-        );
-        assert_eq!(
-            nfs_lab_root_for_mount_target(Path::new("/var/tmp/.tmpabc123/mounts/node-a/nfs1")),
+            nfs_lab_root_for_mount_target(&root.join("exports/nfs1")),
             None
         );
     }

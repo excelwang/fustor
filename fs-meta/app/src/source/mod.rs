@@ -45,6 +45,7 @@ use crate::query::result_ops::{
 use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::seam::resolve_host_fs_facade;
 
+use crate::FileMetaRecord;
 use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNITS};
 use crate::runtime::orchestration::{
     SourceControlSignal, SourceRuntimeUnit, decode_logical_roots_control_payload,
@@ -62,7 +63,6 @@ use crate::source::sentinel::{HealthSignal, Sentinel, SentinelAction, SentinelCo
 use crate::source::watcher::WatchManager;
 use crate::state::cell::{AuthorityJournal, HostObjectGrantsCell, LogicalRootsCell, SignalCell};
 use crate::state::commit_boundary::CommitBoundary;
-use crate::FileMetaRecord;
 
 #[cfg(test)]
 use crate::runtime::routes::ROUTE_KEY_QUERY;
@@ -998,7 +998,10 @@ impl FSMetaSource {
         }
         let groups = match self.unit_control.unit_state(unit.unit_id())? {
             Some((true, rows)) => {
-                let active_groups = rows.into_iter().map(|row| row.scope_id).collect::<BTreeSet<_>>();
+                let active_groups = rows
+                    .into_iter()
+                    .map(|row| row.scope_id)
+                    .collect::<BTreeSet<_>>();
                 let logical_roots = self.logical_roots_snapshot();
                 let host_object_grants = self.host_object_grants_snapshot();
                 let runnable_local_groups = logical_roots
@@ -1095,7 +1098,10 @@ impl FSMetaSource {
                 // locally bound host. Remote hosts participate through their own
                 // source realizations plus routed query fan-in, not by spawning
                 // local source tasks for foreign grants.
-                .filter(|grant| host_ref_matches_node_id(&grant.host_ref, node_id) && root.selector.matches(grant))
+                .filter(|grant| {
+                    host_ref_matches_node_id(&grant.host_ref, node_id)
+                        && root.selector.matches(grant)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             if members.is_empty() {
@@ -1321,13 +1327,8 @@ impl FSMetaSource {
             tasks.drain().collect::<Vec<_>>()
         };
         for (key, entry) in existing {
-            Self::cancel_root_task_slot(
-                &self.state_cell.fanout_health,
-                &key,
-                entry.active,
-                true,
-            )
-            .await;
+            Self::cancel_root_task_slot(&self.state_cell.fanout_health, &key, entry.active, true)
+                .await;
             if let Some(candidate) = entry.candidate {
                 candidate.handle.cancel.cancel();
                 let _ = tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
@@ -1630,15 +1631,15 @@ impl FSMetaSource {
         if path_origin_counts.is_empty() {
             return;
         }
-        let mut stats = lock_or_recover(
-            frontier,
-            "source.current_stream_path_frontier.enqueue",
-        );
+        let mut stats = lock_or_recover(frontier, "source.current_stream_path_frontier.enqueue");
         if stats.generation != Some(generation) {
             return;
         }
         for (origin, count) in path_origin_counts {
-            *stats.enqueued_path_origin_counts.entry(origin.clone()).or_default() += *count;
+            *stats
+                .enqueued_path_origin_counts
+                .entry(origin.clone())
+                .or_default() += *count;
         }
     }
 
@@ -1716,7 +1717,9 @@ impl FSMetaSource {
     fn summarize_emitted_origins(events: &[Event]) -> Vec<String> {
         let mut counts = BTreeMap::<String, usize>::new();
         for event in events {
-            *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+            *counts
+                .entry(event.metadata().origin_id.0.clone())
+                .or_default() += 1;
         }
         counts
             .into_iter()
@@ -1810,12 +1813,9 @@ impl FSMetaSource {
         detail.emitted_event_count = detail
             .emitted_event_count
             .saturating_add(batch.len() as u64);
-        detail.emitted_control_event_count = detail
-            .emitted_control_event_count
-            .saturating_add(control);
-        detail.emitted_data_event_count = detail
-            .emitted_data_event_count
-            .saturating_add(data);
+        detail.emitted_control_event_count =
+            detail.emitted_control_event_count.saturating_add(control);
+        detail.emitted_data_event_count = detail.emitted_data_event_count.saturating_add(data);
         let capture_target = debug_stream_path_capture_target();
         if let Some(target) = capture_target.as_deref() {
             detail.emitted_path_event_count = detail
@@ -1851,9 +1851,7 @@ impl FSMetaSource {
             .entry(root_key.to_string())
             .or_default();
         detail.forwarded_batch_count = detail.forwarded_batch_count.saturating_add(1);
-        detail.forwarded_event_count = detail
-            .forwarded_event_count
-            .saturating_add(event_count);
+        detail.forwarded_event_count = detail.forwarded_event_count.saturating_add(event_count);
         detail.forwarded_path_event_count = detail
             .forwarded_path_event_count
             .saturating_add(path_event_count);
@@ -1945,7 +1943,9 @@ impl FSMetaSource {
             state_boundary.clone(),
         )
         .map_err(|err| {
-            CnxError::InvalidInput(format!("source host-object-grants state init failed: {err}"))
+            CnxError::InvalidInput(format!(
+                "source host-object-grants state init failed: {err}"
+            ))
         })?;
         let (initial_host_object_grants_version, initial_host_object_grants) =
             host_object_grants_cell.snapshot();
@@ -3156,7 +3156,8 @@ impl FSMetaSource {
                                 .as_deref()
                                 .filter(|_| path_matching > 0)
                                 .map(|target| {
-                                    batch.iter()
+                                    batch
+                                        .iter()
                                         .filter_map(|event| {
                                             let record = rmp_serde::from_slice::<FileMetaRecord>(
                                                 event.payload_bytes(),
@@ -3698,15 +3699,13 @@ impl FSMetaSource {
         self.start_manual_rescan_watch().await?;
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<Event>>();
         let stream_generation = self.state_cell.next_stream_generation();
-        let had_existing_stream = lock_or_recover(
-            &self.state_cell.stream_binding,
-            "source.pub.stream_binding",
-        )
-        .replace(SourceStreamBinding {
-            generation: stream_generation,
-            tx: out_tx.clone(),
-        })
-        .is_some();
+        let had_existing_stream =
+            lock_or_recover(&self.state_cell.stream_binding, "source.pub.stream_binding")
+                .replace(SourceStreamBinding {
+                    generation: stream_generation,
+                    tx: out_tx.clone(),
+                })
+                .is_some();
         self.reset_current_stream_path_frontier_stats(stream_generation);
         *lock_or_recover(&self.state, "source.pub.state") = LifecycleState::Scanning;
         let roots_snapshot = lock_or_recover(&self.state_cell.roots, "source.pub.roots").clone();
@@ -4645,7 +4644,10 @@ mod tests {
         match rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes()) {
             Ok(MaterializedQueryPayload::Tree(payload)) => {
                 (payload.root.exists && payload.root.path == needle_path)
-                    || payload.entries.iter().any(|entry| entry.path == needle_path)
+                    || payload
+                        .entries
+                        .iter()
+                        .any(|entry| entry.path == needle_path)
             }
             _ => false,
         }
@@ -4816,8 +4818,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_host_object_grants_changed_survives_restart_on_shared_state_boundary_for_runtime_managed_schedule_recovery(
-    ) {
+    async fn runtime_host_object_grants_changed_survives_restart_on_shared_state_boundary_for_runtime_managed_schedule_recovery()
+     {
         let boundary = in_memory_state_boundary();
         let mut cfg = SourceConfig::default();
         cfg.roots = vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")];
@@ -5253,8 +5255,11 @@ mod tests {
             None,
         )
         .expect("init source");
-        let runtimes = lock_or_recover(&source.state_cell.roots, "test.instance_suffix_local_member")
-            .clone();
+        let runtimes = lock_or_recover(
+            &source.state_cell.roots,
+            "test.instance_suffix_local_member",
+        )
+        .clone();
         assert_eq!(
             runtimes
                 .iter()
@@ -5399,11 +5404,15 @@ mod tests {
             .await
             .expect("apply initial runtime-managed source wave");
         assert_eq!(
-            source.scheduled_source_group_ids().expect("source groups after initial wave"),
+            source
+                .scheduled_source_group_ids()
+                .expect("source groups after initial wave"),
             Some(BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])),
         );
         assert_eq!(
-            source.scheduled_scan_group_ids().expect("scan groups after initial wave"),
+            source
+                .scheduled_scan_group_ids()
+                .expect("scan groups after initial wave"),
             Some(BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])),
         );
 
@@ -5983,8 +5992,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_micros();
-        let base =
-            std::env::temp_dir().join(format!("fs-meta-manual-rescan-source-sink-{unique}"));
+        let base = std::env::temp_dir().join(format!("fs-meta-manual-rescan-source-sink-{unique}"));
         let nfs1 = base.join("nfs1");
         let nfs2 = base.join("nfs2");
         let subdir = "force-find-stress";
@@ -6054,10 +6062,8 @@ mod tests {
                 Ok(None) => break,
                 Err(_) => continue,
             }
-            let nfs1_done =
-                selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_new);
-            let nfs2_done =
-                selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_new);
+            let nfs1_done = selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_new);
+            let nfs2_done = selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_new);
             if nfs1_done && nfs2_done {
                 break;
             }
@@ -6460,11 +6466,19 @@ mod tests {
             "nfs2 should still forward subtree events during the manual-rescan window: initial={initial_nfs2_forwarded} final={final_nfs2_forwarded}"
         );
         assert!(
-            second_stream_counts.get("node-a::nfs1").copied().unwrap_or(0) > 0,
+            second_stream_counts
+                .get("node-a::nfs1")
+                .copied()
+                .unwrap_or(0)
+                > 0,
             "second stream should receive nfs1 subtree data after the partial respawn: {second_stream_counts:?}"
         );
         assert!(
-            second_stream_counts.get("node-a::nfs2").copied().unwrap_or(0) > 0,
+            second_stream_counts
+                .get("node-a::nfs2")
+                .copied()
+                .unwrap_or(0)
+                > 0,
             "second stream should keep receiving nfs2 subtree data after the partial respawn instead of leaving nfs2 on a stale sender: {second_stream_counts:?}; initial_nfs2_forwarded={initial_nfs2_forwarded} final_nfs2_forwarded={final_nfs2_forwarded}"
         );
         assert_eq!(

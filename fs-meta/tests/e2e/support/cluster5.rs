@@ -34,6 +34,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEV_ADMIN_SIGNING_KEY_B64: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+const E2E_TMP_ROOT_ENV: &str = "DATANIX_E2E_TMP_ROOT";
+const LEGACY_E2E_TMP_ROOT_ENV: &str = "CAPANIX_E2E_TMP_ROOT";
+const CLUSTER_ARTIFACT_COMPONENT: &str = "cluster5";
 const FULL_NODE_DELEGATION_SCOPES: &[&str] = &[
     "cluster_read",
     "metrics_read",
@@ -165,6 +168,7 @@ impl Cluster5 {
                 "capanixd binary not found; set CAPANIXD_BIN or build capanix-daemon".into(),
             );
         };
+        cleanup_stale_cluster_artifacts_before_start()?;
         let suffix = unique_suffix();
         let identities = NODE_NAMES
             .iter()
@@ -642,8 +646,7 @@ impl Cluster5 {
         let mut value = build_release_doc_value(&spec);
         value["target_generation"] = json!(generation);
         value["units"][0]["startup"]["path"] = json!(app_path.to_string_lossy().to_string());
-        value["units"][0]["startup"]["manifest"] =
-            json!(manifest_path.display().to_string());
+        value["units"][0]["startup"]["manifest"] = json!(manifest_path.display().to_string());
         value["units"][0]["version"] = json!(format!("real-nfs-{generation}"));
         value["units"][0]["restart_policy"] = json!("Never");
         value["units"][0]["policy"]["generation"] = json!(generation);
@@ -683,7 +686,10 @@ impl Cluster5 {
         instance_id: &str,
     ) -> Result<BTreeSet<u32>, String> {
         let status = self.status(node_name)?;
-        Ok(managed_host_pids_for_instance_from_status(&status, instance_id))
+        Ok(managed_host_pids_for_instance_from_status(
+            &status,
+            instance_id,
+        ))
     }
 
     pub fn unit_active_pids_for_instance(
@@ -856,6 +862,49 @@ fn cargo_build_silent(command: &mut Command) -> Option<std::process::Output> {
     command.output().ok()
 }
 
+fn e2e_tmp_root() -> PathBuf {
+    if let Ok(raw) =
+        std::env::var(E2E_TMP_ROOT_ENV).or_else(|_| std::env::var(LEGACY_E2E_TMP_ROOT_ENV))
+    {
+        let dir = PathBuf::from(raw);
+        fs::create_dir_all(&dir).expect("create e2e temp root");
+        return dir;
+    }
+    let dir = repo_root().join(".tmp").join("fs-meta-e2e");
+    fs::create_dir_all(&dir).expect("create default e2e temp root");
+    dir
+}
+
+fn cluster_artifact_root() -> PathBuf {
+    let dir = e2e_tmp_root().join(CLUSTER_ARTIFACT_COMPONENT);
+    fs::create_dir_all(&dir).expect("create cluster artifact root");
+    dir
+}
+
+fn cleanup_stale_cluster_artifacts_before_start() -> Result<(), String> {
+    let root = cluster_artifact_root();
+    let entries =
+        fs::read_dir(&root).map_err(|e| format!("read cluster artifact root failed: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read cluster artifact entry failed: {e}"))?;
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|e| format!("stat cluster artifact {} failed: {e}", path.display()))?;
+        if meta.file_type().is_dir() {
+            fs::remove_dir_all(&path)
+                .map_err(|e| format!("remove stale cluster dir {} failed: {e}", path.display()))?;
+        } else {
+            fs::remove_file(&path).map_err(|e| {
+                format!(
+                    "remove stale cluster artifact {} failed: {e}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn tmp_dir(prefix: &str) -> PathBuf {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -870,7 +919,7 @@ fn tmp_dir(prefix: &str) -> PathBuf {
         .filter(|c| c.is_ascii_alphanumeric())
         .take(8)
         .collect::<String>();
-    let dir = std::env::temp_dir().join(format!("dx-{short_prefix}-{ts:x}-{seq:x}"));
+    let dir = cluster_artifact_root().join(format!("dx-{short_prefix}-{ts:x}-{seq:x}"));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
@@ -1008,7 +1057,7 @@ fn try_find_cnxctl_bin() -> Option<PathBuf> {
 }
 
 fn write_temp_json(prefix: &str, value: &Value) -> Result<PathBuf, String> {
-    let path = std::env::temp_dir().join(format!("capanix-{prefix}-{}.json", unique_suffix()));
+    let path = cluster_artifact_root().join(format!("capanix-{prefix}-{}.json", unique_suffix()));
     let body = serde_json::to_vec_pretty(value)
         .map_err(|e| format!("serialize {prefix} json failed: {e}"))?;
     fs::write(&path, body).map_err(|e| format!("write {prefix} json failed: {e}"))?;
@@ -1732,10 +1781,7 @@ fn canonicalize_value(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn managed_host_pids_for_instance_from_status(
-    status: &Value,
-    instance_id: &str,
-) -> BTreeSet<u32> {
+fn managed_host_pids_for_instance_from_status(status: &Value, instance_id: &str) -> BTreeSet<u32> {
     status
         .get("daemon")
         .and_then(|v| v.get("managed_processes"))
@@ -1991,6 +2037,28 @@ fn next_auth_seq_global() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        match LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn with_e2e_tmp_root<T>(f: impl FnOnce(&TempDir) -> T) -> T {
+        let _lock = env_lock();
+        let root = tempfile::tempdir().expect("e2e temp root");
+        let previous = std::env::var(E2E_TMP_ROOT_ENV).ok();
+        std::env::set_var(E2E_TMP_ROOT_ENV, root.path());
+        let result = f(&root);
+        match previous {
+            Some(value) => std::env::set_var(E2E_TMP_ROOT_ENV, value),
+            None => std::env::remove_var(E2E_TMP_ROOT_ENV),
+        }
+        result
+    }
 
     #[test]
     fn managed_runtime_pids_use_node_local_process_kill_transport() {
@@ -2220,5 +2288,29 @@ mod tests {
                 Value::String("nfs2".to_string())
             ])
         );
+    }
+
+    #[test]
+    fn tmp_dir_uses_cluster_artifact_root() {
+        with_e2e_tmp_root(|root| {
+            let dir = tmp_dir("cluster-node");
+            assert!(dir.starts_with(root.path().join(CLUSTER_ARTIFACT_COMPONENT)));
+        });
+    }
+
+    #[test]
+    fn cleanup_stale_cluster_artifacts_before_start_removes_previous_entries() {
+        with_e2e_tmp_root(|root| {
+            let cluster_root = root.path().join(CLUSTER_ARTIFACT_COMPONENT);
+            fs::create_dir_all(cluster_root.join("old-dir")).expect("create old dir");
+            fs::write(cluster_root.join("old-file.json"), b"{}").expect("create old file");
+
+            cleanup_stale_cluster_artifacts_before_start().expect("cleanup cluster artifacts");
+
+            assert!(fs::read_dir(&cluster_root)
+                .expect("read cluster root")
+                .next()
+                .is_none());
+        });
     }
 }

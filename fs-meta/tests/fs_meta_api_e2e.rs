@@ -98,8 +98,7 @@ fn fs_meta_release_upgrade_tree_stats_stable_real_nfs() {
 #[test]
 #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
 fn fs_meta_release_upgrade_tree_materialization_real_nfs() {
-    test_release_upgrade::run_tree_materialization_after_upgrade()
-        .unwrap();
+    test_release_upgrade::run_tree_materialization_after_upgrade().unwrap();
 }
 
 #[test]
