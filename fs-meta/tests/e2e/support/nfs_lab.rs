@@ -156,15 +156,18 @@ fn stale_lab_cleanup_plans() -> Result<Vec<StaleLabCleanupPlan>, String> {
 }
 
 fn cleanup_stale_lab_mount_target(target: &Path) -> Result<(), String> {
-    let status = sudo_status(["umount", target.to_string_lossy().as_ref()])?;
-    if !status.success() {
-        let fallback = sudo_status(["umount", "-f", "-l", target.to_string_lossy().as_ref()])?;
-        if !fallback.success() {
+    let output = sudo_output(["umount", target.to_string_lossy().as_ref()])?;
+    if !output.status.success() {
+        if output_indicates_absent_mount(&output) {
+            return Ok(());
+        }
+        let fallback = sudo_output(["umount", "-f", "-l", target.to_string_lossy().as_ref()])?;
+        if !fallback.status.success() && !output_indicates_absent_mount(&fallback) {
             return Err(format!(
                 "umount {} failed with status {}; fallback umount -f -l failed with status {}",
                 target.display(),
-                status,
-                fallback
+                output.status,
+                fallback.status
             ));
         }
     }
@@ -172,12 +175,12 @@ fn cleanup_stale_lab_mount_target(target: &Path) -> Result<(), String> {
 }
 
 fn unexport_dir_path(dir: &Path) -> Result<(), String> {
-    let status = sudo_status(["exportfs", "-u", &format!("127.0.0.1:{}", dir.display())])?;
-    if !status.success() {
+    let output = sudo_output(["exportfs", "-u", &format!("127.0.0.1:{}", dir.display())])?;
+    if !output.status.success() && !output_indicates_absent_export(&output) {
         return Err(format!(
             "exportfs remove {} failed with status {}",
             dir.display(),
-            status
+            output.status
         ));
     }
     Ok(())
@@ -236,6 +239,22 @@ fn cleanup_stale_labs_before_start() -> Result<(), String> {
             &errors,
         ))
     }
+}
+
+fn output_stderr_string(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_ascii_lowercase()
+}
+
+fn output_indicates_absent_mount(output: &std::process::Output) -> bool {
+    let stderr = output_stderr_string(output);
+    stderr.contains("no mount point specified")
+        || stderr.contains("not mounted")
+        || stderr.contains("not a mountpoint")
+}
+
+fn output_indicates_absent_export(output: &std::process::Output) -> bool {
+    let stderr = output_stderr_string(output);
+    stderr.contains("could not find") && stderr.contains("to unexport")
 }
 
 #[derive(Debug, Clone)]
@@ -676,12 +695,12 @@ impl NfsLab {
     }
 
     fn unexport_dir(&self, dir: &Path) -> Result<(), String> {
-        let status = sudo_status(["exportfs", "-u", &format!("127.0.0.1:{}", dir.display())])?;
-        if !status.success() {
+        let output = sudo_output(["exportfs", "-u", &format!("127.0.0.1:{}", dir.display())])?;
+        if !output.status.success() && !output_indicates_absent_export(&output) {
             return Err(format!(
                 "exportfs remove {} failed with status {}",
                 dir.display(),
-                status
+                output.status
             ));
         }
         Ok(())
@@ -728,6 +747,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
 
     #[test]
     fn nfs_lab_root_for_mount_target_finds_structured_root_under_any_base() {
@@ -786,5 +806,26 @@ mod tests {
         );
         assert_eq!(plans[1].root, PathBuf::from("/tmp/.tmpdef456"));
         assert!(plans[1].mount_targets.is_empty());
+    }
+
+    #[test]
+    fn output_indicates_absent_mount_accepts_no_mount_point_shape() {
+        let output = std::process::Output {
+            status: ExitStatus::from_raw(32 << 8),
+            stdout: Vec::new(),
+            stderr: b"umount: /tmp/lab/mounts/node-a/nfs1: no mount point specified.\n".to_vec(),
+        };
+        assert!(output_indicates_absent_mount(&output));
+    }
+
+    #[test]
+    fn output_indicates_absent_export_accepts_not_found_shape() {
+        let output = std::process::Output {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"exportfs: Could not find '127.0.0.1:/tmp/lab/exports/nfs1' to unexport.\n"
+                .to_vec(),
+        };
+        assert!(output_indicates_absent_export(&output));
     }
 }

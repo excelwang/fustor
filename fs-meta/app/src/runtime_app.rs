@@ -3562,6 +3562,10 @@ impl FSMetaApp {
                 .apply_source_signals_with_recovery(&source_signals)
                 .await
             {
+                eprintln!(
+                    "fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals err={}",
+                    err
+                );
                 return Err(err);
             }
             eprintln!(
@@ -3578,12 +3582,20 @@ impl FSMetaApp {
             eprintln!(
                 "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals begin"
             );
-            self.apply_sink_signals_with_recovery(
+            if let Err(err) = self
+                .apply_sink_signals_with_recovery(
                 &sink_signals,
                 !sink_cleanup_only_while_uninitialized,
                 fail_closed_in_generation_cutover_lane,
             )
-            .await?;
+            .await
+            {
+                eprintln!(
+                    "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals err={}",
+                    err
+                );
+                return Err(err);
+            }
             eprintln!("fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals ok");
         } else if self.sink_state_replay_required.load(Ordering::Acquire) {
             eprintln!("fs_meta_runtime_app: on_control_frame sink.replay_retained begin");
@@ -19738,6 +19750,537 @@ mod tests {
                         })
             }),
             "peer-only source-status route must republish scheduled groups after turnover and retryable source resets: {reactivated_snapshots:?}"
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_only_source_status_route_republishes_after_sink_turnover_and_sticky_source_bridge_reset_on_source_only_followup()
+     {
+        struct SourceControlErrorQueueHookReset;
+
+        impl Drop for SourceControlErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_queue_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![
+                            worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                            worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                        ],
+                        host_object_grants: vec![
+                            worker_export_with_fs_source(
+                                "node-c::nfs1",
+                                "node-c",
+                                "10.0.0.31",
+                                &nfs1_source,
+                                nfs1.clone(),
+                            ),
+                            worker_export_with_fs_source(
+                                "node-c::nfs2",
+                                "node-c",
+                                "10.0.0.32",
+                                &nfs2_source,
+                                nfs2.clone(),
+                            ),
+                        ],
+                        ..SourceConfig::default()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("node-c-29775497172756365788053507".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        let source_client = match &*app.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-c::nfs1"]), ("nfs2", &["node-c::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-c::nfs1"]), ("nfs2", &["node-c::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-c::nfs1"]), ("nfs2", &["node-c::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-c::nfs1"]), ("nfs2", &["node-c::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+        let sink_status_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
+        let sink_query_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
+
+        let mut initial = source_wave(2);
+        initial.extend([
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_status_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_query_proxy_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+        ]);
+        app.on_control_frame(&initial)
+            .await
+            .expect("initial peer source/status wave should succeed");
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("initial source groups")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("initial scan groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < initial_deadline,
+                "timed out waiting for initial peer source schedule convergence: source={source_groups:?} scan={scan_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let initial_snapshots =
+            internal_source_status_snapshots(boundary.clone(), NodeId("node-a".to_string()))
+                .await
+                .expect("initial source status route response");
+        assert!(
+            initial_snapshots.iter().any(|snapshot| {
+                snapshot
+                    .scheduled_source_groups_by_node
+                    .get("node-c")
+                    .is_some_and(|groups| groups == &vec!["nfs1".to_string(), "nfs2".to_string()])
+                    && snapshot
+                        .scheduled_scan_groups_by_node
+                        .get("node-c")
+                        .is_some_and(|groups| {
+                            groups == &vec!["nfs1".to_string(), "nfs2".to_string()]
+                        })
+            }),
+            "initial source-status route should expose peer scheduled groups: {initial_snapshots:?}"
+        );
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_query_proxy_route,
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_status_route,
+                3,
+            ),
+        ])
+        .await
+        .expect("peer sink route turnover deactivates should complete");
+
+        let previous_instance_id = source_client.worker_instance_id_for_tests().await;
+        let _reset = SourceControlErrorQueueHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_queue_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorQueueHook {
+                errs: std::collections::VecDeque::new(),
+                sticky_worker_instance_id: Some(previous_instance_id),
+                sticky_peer_err: Some("transport closed: sidecar control bridge stopped".to_string()),
+            },
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["node-c::nfs1"]), ("nfs2", &["node-c::nfs2"])],
+                3,
+            )]),
+        )
+        .await
+        .expect(
+            "source-only peer followup should not stall when the current source worker bridge stays stuck on retryable bridge-stopped errors",
+        )
+        .expect(
+            "source-only peer followup should recover after reacquiring a fresh worker client",
+        );
+
+        let next_instance_id = source_client.worker_instance_id_for_tests().await;
+        assert_ne!(
+            next_instance_id, previous_instance_id,
+            "source-only peer followup must reacquire a fresh source worker client after sticky bridge-stop continuity gaps"
+        );
+
+        let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups after recovery")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups after recovery")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < recovery_deadline,
+                "peer source-only followup must preserve peer schedule after sticky bridge-stop recovery: source={source_groups:?} scan={scan_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let followup_snapshots =
+            internal_source_status_snapshots(boundary.clone(), NodeId("node-a".to_string()))
+                .await
+                .expect("source status route response after source-only recovery");
+        assert!(
+            followup_snapshots.iter().any(|snapshot| {
+                snapshot
+                    .scheduled_source_groups_by_node
+                    .get("node-c")
+                    .is_some_and(|groups| groups == &vec!["nfs1".to_string(), "nfs2".to_string()])
+                    && snapshot
+                        .scheduled_scan_groups_by_node
+                        .get("node-c")
+                        .is_some_and(|groups| {
+                            groups == &vec!["nfs1".to_string(), "nfs2".to_string()]
+                        })
+            }),
+            "peer-only source-status route must keep publishing peer scheduled groups after sink turnover plus sticky source bridge-stop recovery on a later source-only followup: {followup_snapshots:?}"
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_only_source_status_route_republishes_after_sink_turnover_and_repeated_source_start_resets_on_source_only_followup()
+     {
+        use std::collections::VecDeque;
+
+        struct SourceStartErrorQueueHookReset;
+
+        impl Drop for SourceStartErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_start_error_queue_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![
+                            worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                            worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                        ],
+                        host_object_grants: vec![
+                            worker_export_with_fs_source(
+                                "node-c::nfs1",
+                                "node-c",
+                                "10.0.0.31",
+                                &nfs1_source,
+                                nfs1.clone(),
+                            ),
+                            worker_export_with_fs_source(
+                                "node-c::nfs2",
+                                "node-c",
+                                "10.0.0.32",
+                                &nfs2_source,
+                                nfs2.clone(),
+                            ),
+                        ],
+                        ..SourceConfig::default()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("node-c-29775497172756365788053508".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        let source_client = match &*app.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-c::nfs1"]), ("nfs2", &["node-c::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-c::nfs1"]), ("nfs2", &["node-c::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-c::nfs1"]), ("nfs2", &["node-c::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-c::nfs1"]), ("nfs2", &["node-c::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+        let sink_status_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
+        let sink_query_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
+
+        let mut initial = source_wave(2);
+        initial.extend([
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_status_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_query_proxy_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+        ]);
+        app.on_control_frame(&initial)
+            .await
+            .expect("initial peer source/status wave should succeed");
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("initial source groups")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("initial scan groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < initial_deadline,
+                "timed out waiting for initial peer source schedule convergence: source={source_groups:?} scan={scan_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_query_proxy_route,
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_status_route,
+                3,
+            ),
+        ])
+        .await
+        .expect("peer sink route turnover deactivates should complete");
+
+        source_client
+            .shutdown_shared_worker_for_tests()
+            .await
+            .expect("shutdown peer source worker before source-only recovery");
+
+        let _reset = SourceStartErrorQueueHookReset;
+        crate::workers::source::install_source_worker_start_error_queue_hook(
+            crate::workers::source::SourceWorkerStartErrorQueueHook {
+                errs: VecDeque::from([
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: Connection reset by peer (os error 104)"
+                            .to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: Connection reset by peer (os error 104)"
+                            .to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                ]),
+                sticky_worker_instance_id: None,
+                sticky_peer_err: None,
+            },
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["node-c::nfs1"]), ("nfs2", &["node-c::nfs2"])],
+                3,
+            )]),
+        )
+        .await
+        .expect(
+            "source-only peer followup should not stall when restarting the source worker requires repeated retryable source.start resets",
+        )
+        .expect(
+            "source-only peer followup should recover after repeated retryable source.start resets",
+        );
+
+        let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups after recovery")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups after recovery")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < recovery_deadline,
+                "peer source-only followup must preserve peer schedule after repeated source.start reset recovery: source={source_groups:?} scan={scan_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let followup_snapshots =
+            internal_source_status_snapshots(boundary.clone(), NodeId("node-a".to_string()))
+                .await
+                .expect("source status route response after source-only recovery");
+        assert!(
+            followup_snapshots.iter().any(|snapshot| {
+                snapshot
+                    .scheduled_source_groups_by_node
+                    .get("node-c")
+                    .is_some_and(|groups| groups == &vec!["nfs1".to_string(), "nfs2".to_string()])
+                    && snapshot
+                        .scheduled_scan_groups_by_node
+                        .get("node-c")
+                        .is_some_and(|groups| {
+                            groups == &vec!["nfs1".to_string(), "nfs2".to_string()]
+                        })
+            }),
+            "peer-only source-status route must keep publishing peer scheduled groups after sink turnover plus repeated source.start reset recovery on a later source-only followup: {followup_snapshots:?}"
         );
 
         app.close().await.expect("close app");

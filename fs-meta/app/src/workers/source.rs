@@ -83,13 +83,17 @@ fn can_retry_update_logical_roots(err: &CnxError) -> bool {
     matches!(
         err,
         CnxError::PeerError(message) if message == "worker not initialized"
-    ) || matches!(err, CnxError::TransportClosed(_) | CnxError::Timeout)
+    ) || matches!(
+        err,
+        CnxError::TransportClosed(_) | CnxError::Timeout | CnxError::ChannelClosed
+    )
         || is_retryable_worker_bridge_peer_error(err)
         || matches!(
             err,
             CnxError::AccessDenied(message) | CnxError::PeerError(message)
                 if message.contains("drained/fenced")
                     && message.contains("grant attachments")
+                    || message.contains("invalid or revoked grant attachment token")
         )
 }
 
@@ -652,10 +656,19 @@ fn next_shared_source_worker_instance_id() -> u64 {
 fn source_worker_handle_registry_key(
     node_id: &NodeId,
     worker_binding: &RuntimeWorkerBinding,
+    worker_factory: &RuntimeWorkerClientFactory,
 ) -> String {
+    let runtime_boundary_id = {
+        let io_boundary = worker_factory.io_boundary();
+        Arc::as_ptr(&io_boundary) as *const () as usize
+    };
     format!(
-        "{}|{}|{:?}|{:?}",
-        node_id.0, worker_binding.role_id, worker_binding.mode, worker_binding.launcher_kind
+        "{}|{}|{:?}|{:?}|{}",
+        node_id.0,
+        worker_binding.role_id,
+        worker_binding.mode,
+        worker_binding.launcher_kind,
+        runtime_boundary_id
     )
 }
 
@@ -970,6 +983,15 @@ pub(crate) fn clear_source_worker_control_frame_hook() {
 #[cfg(test)]
 pub(crate) fn clear_source_worker_control_frame_pause_hook() {
     let mut guard = match source_worker_control_frame_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_source_worker_control_frame_error_queue_hook() {
+    let mut guard = match source_worker_control_frame_error_queue_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -1390,7 +1412,7 @@ impl SourceWorkerClientHandle {
         worker_binding: RuntimeWorkerBinding,
         worker_factory: RuntimeWorkerClientFactory,
     ) -> Result<Self> {
-        let key = source_worker_handle_registry_key(&node_id, &worker_binding);
+        let key = source_worker_handle_registry_key(&node_id, &worker_binding, &worker_factory);
         let shared = {
             let mut registry = lock_source_worker_handle_registry();
             if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
@@ -1454,7 +1476,7 @@ impl SourceWorkerClientHandle {
     }
 
     #[cfg(test)]
-    async fn worker_instance_id_for_tests(&self) -> u64 {
+    pub(crate) async fn worker_instance_id_for_tests(&self) -> u64 {
         self.shared_worker().await.0
     }
 
@@ -1558,6 +1580,10 @@ impl SourceWorkerClientHandle {
     }
 
     async fn refresh_cached_scheduled_groups_from_live_worker(&self) -> Result<()> {
+        eprintln!(
+            "fs_meta_source_worker_client: refresh_cached_scheduled_groups begin node={}",
+            self.node_id.0
+        );
         let deadline = std::time::Instant::now() + SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT;
         loop {
             let worker = self.worker_client().await;
@@ -1566,22 +1592,42 @@ impl SourceWorkerClientHandle {
                 Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
+                    eprintln!(
+                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry ensure_started node={} err={}",
+                        self.node_id.0, err
+                    );
                     self.reconnect_shared_worker_client().await?;
                     tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    eprintln!(
+                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups err ensure_started node={} err={}",
+                        self.node_id.0, err
+                    );
+                    return Err(err);
+                }
             }
             let client = match worker.client().await {
                 Ok(client) => client,
                 Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
+                    eprintln!(
+                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry client node={} err={}",
+                        self.node_id.0, err
+                    );
                     self.reconnect_shared_worker_client().await?;
                     tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    eprintln!(
+                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups err client node={} err={}",
+                        self.node_id.0, err
+                    );
+                    return Err(err);
+                }
             };
             let grants = match Self::call_worker(
                 &client,
@@ -1608,11 +1654,21 @@ impl SourceWorkerClientHandle {
                 Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
+                    eprintln!(
+                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry grants node={} err={}",
+                        self.node_id.0, err
+                    );
                     self.reconnect_shared_worker_client().await?;
                     tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    eprintln!(
+                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups err grants node={} err={}",
+                        self.node_id.0, err
+                    );
+                    return Err(err);
+                }
             };
             let stable_host_ref = {
                 let stable = stable_host_ref_for_node_id(&self.node_id, &grants);
@@ -1646,11 +1702,21 @@ impl SourceWorkerClientHandle {
                 Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
+                    eprintln!(
+                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry schedule node={} err={}",
+                        self.node_id.0, err
+                    );
                     self.reconnect_shared_worker_client().await?;
                     tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    eprintln!(
+                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups err schedule node={} err={}",
+                        self.node_id.0, err
+                    );
+                    return Err(err);
+                }
             };
             let cache_empty = self.with_cache_mut(|cache| {
                 cache
@@ -1677,6 +1743,10 @@ impl SourceWorkerClientHandle {
                     scheduled_scan,
                 );
             });
+            eprintln!(
+                "fs_meta_source_worker_client: refresh_cached_scheduled_groups ok node={}",
+                self.node_id.0
+            );
             return Ok(());
         }
     }
@@ -1900,6 +1970,10 @@ impl SourceWorkerClientHandle {
                 Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
+                    eprintln!(
+                        "fs_meta_source_worker_client: on_control_frame retry node={} err={}",
+                        self.node_id.0, err
+                    );
                     self.reconnect_shared_worker_client().await?;
                     tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
                 }
@@ -2471,8 +2545,8 @@ impl SourceWorkerClientHandle {
                 }
                 Ok(other) => {
                     eprintln!(
-                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false",
-                        self.node_id.0
+                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false err=unexpected_response:{:?}",
+                        self.node_id.0, other
                     );
                     return Err(CnxError::ProtocolViolation(format!(
                         "unexpected source worker response for on_control_frame: {:?}",
@@ -2487,8 +2561,8 @@ impl SourceWorkerClientHandle {
                 }
                 Err(err) => {
                     eprintln!(
-                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false",
-                        self.node_id.0
+                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={}",
+                        self.node_id.0, err
                     );
                     return Err(err);
                 }
@@ -5581,6 +5655,94 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn distinct_runtime_factories_do_not_share_started_source_worker_client_on_same_node() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![worker_source_root("nfs1", &nfs1)],
+            host_object_grants: vec![worker_source_export(
+                "node-d::nfs1",
+                "node-d",
+                "10.0.0.41",
+                nfs1.clone(),
+            )],
+            ..SourceConfig::default()
+        };
+        let state_boundary_a = in_memory_state_boundary();
+        let state_boundary_b = in_memory_state_boundary();
+        let boundary_a = Arc::new(LoopbackWorkerBoundary::default());
+        let boundary_b = Arc::new(LoopbackWorkerBoundary::default());
+        let worker_socket_dir = worker_socket_tempdir();
+        let binding = external_source_worker_binding(worker_socket_dir.path());
+        let predecessor = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg.clone(),
+                binding.clone(),
+                RuntimeWorkerClientFactory::new(
+                    boundary_a.clone(),
+                    boundary_a.clone(),
+                    state_boundary_a,
+                ),
+            )
+            .expect("construct predecessor source worker client"),
+        );
+        let successor = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg,
+                binding,
+                RuntimeWorkerClientFactory::new(
+                    boundary_b.clone(),
+                    boundary_b.clone(),
+                    state_boundary_b,
+                ),
+            )
+            .expect("construct successor source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), predecessor.start())
+            .await
+            .expect("predecessor source worker start timed out")
+            .expect("start predecessor source worker");
+
+        assert!(
+            successor
+                .existing_client()
+                .await
+                .expect("successor existing client after predecessor start")
+                .is_none(),
+            "a successor created through a distinct runtime worker factory must not inherit the predecessor's started source worker client"
+        );
+        assert!(
+            !Arc::ptr_eq(&predecessor._shared, &successor._shared),
+            "distinct runtime worker factories must not share one source worker handle state"
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), successor.start())
+            .await
+            .expect("successor source worker start timed out")
+            .expect("start successor source worker");
+
+        assert_ne!(
+            predecessor.worker_instance_id_for_tests().await,
+            successor.worker_instance_id_for_tests().await,
+            "distinct runtime worker factories must drive distinct source worker client instances"
+        );
+
+        predecessor
+            .close()
+            .await
+            .expect("close predecessor source worker");
+        successor
+            .close()
+            .await
+            .expect("close successor source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_recovery_starts_on_same_shared_source_handle_serialize_worker_ready_recovery()
      {
         let tmp = tempdir().expect("create temp dir");
@@ -6247,6 +6409,266 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generation_two_fs_source_selected_wave_reacquires_worker_client_after_invalid_or_revoked_grant_attachment_token_error_on_current_instance()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        let nfs1_source = "127.0.0.1:/exports/nfs1";
+
+        let cfg = SourceConfig {
+            roots: vec![worker_fs_source_watch_scan_root("nfs1", nfs1_source)],
+            host_object_grants: Vec::new(),
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = worker_socket_tempdir();
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-b-29775497172756365788053506".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let source_wave = |generation| {
+            vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![bound_scope_with_resources("nfs1", &["nfs1"])],
+                }))
+                .expect("encode source roots activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![bound_scope_with_resources("nfs1", &["nfs1"])],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![bound_scope_with_resources("nfs1", &["nfs1"])],
+                }))
+                .expect("encode source rescan activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![bound_scope_with_resources("nfs1", &["nfs1"])],
+                }))
+                .expect("encode source scan activate"),
+            ]
+        };
+        let initial_control = std::iter::once(
+            encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+                version: 1,
+                grants: vec![worker_route_export_with_fs_source(
+                    "node-b::nfs1",
+                    "node-b",
+                    "10.0.0.21",
+                    &nfs1,
+                    nfs1_source,
+                )],
+            })
+            .expect("encode runtime host grants changed"),
+        )
+        .chain(source_wave(1))
+        .collect::<Vec<_>>();
+
+        client
+            .on_control_frame(initial_control)
+            .await
+            .expect("initial fs_source-selected single-root control wave should succeed");
+
+        let previous_instance_id = client.worker_instance_id_for_tests().await;
+        let _reset = SourceWorkerControlFrameErrorHookReset;
+        install_source_worker_control_frame_error_hook(SourceWorkerControlFrameErrorHook {
+            err: CnxError::AccessDenied("invalid or revoked grant attachment token".to_string()),
+        });
+
+        tokio::time::timeout(Duration::from_secs(4), client.on_control_frame(source_wave(2)))
+            .await
+            .expect(
+                "generation-two fs_source-selected replay should reacquire a fresh worker client instead of stalling on an invalid or revoked grant attachment token",
+            )
+            .expect(
+                "generation-two fs_source-selected replay should recover after reacquiring a fresh worker client on invalid token",
+            );
+
+        let next_instance_id = client.worker_instance_id_for_tests().await;
+        assert_ne!(
+            next_instance_id, previous_instance_id,
+            "generation-two invalid-token recovery must reacquire a fresh shared source worker client instance"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = client
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups")
+                .unwrap_or_default();
+            let scan_groups = client
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups")
+                .unwrap_or_default();
+            if source_groups == std::collections::BTreeSet::from(["nfs1".to_string()])
+                && scan_groups == std::collections::BTreeSet::from(["nfs1".to_string()])
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "scheduled groups should remain converged after invalid-token recovery: source={source_groups:?} scan={scan_groups:?}",
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generation_two_fs_source_selected_wave_reacquires_worker_client_after_channel_closed_on_current_instance()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        let nfs1_source = "127.0.0.1:/exports/nfs1";
+
+        let cfg = SourceConfig {
+            roots: vec![worker_fs_source_watch_scan_root("nfs1", nfs1_source)],
+            host_object_grants: Vec::new(),
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = worker_socket_tempdir();
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-b-29775497172756365788053506".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let source_wave = |generation| {
+            vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![bound_scope_with_resources("nfs1", &["nfs1"])],
+                }))
+                .expect("encode source roots activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![bound_scope_with_resources("nfs1", &["nfs1"])],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![bound_scope_with_resources("nfs1", &["nfs1"])],
+                }))
+                .expect("encode source rescan activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![bound_scope_with_resources("nfs1", &["nfs1"])],
+                }))
+                .expect("encode source scan activate"),
+            ]
+        };
+        let initial_control = std::iter::once(
+            encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+                version: 1,
+                grants: vec![worker_route_export_with_fs_source(
+                    "node-b::nfs1",
+                    "node-b",
+                    "10.0.0.21",
+                    &nfs1,
+                    nfs1_source,
+                )],
+            })
+            .expect("encode runtime host grants changed"),
+        )
+        .chain(source_wave(1))
+        .collect::<Vec<_>>();
+
+        client
+            .on_control_frame(initial_control)
+            .await
+            .expect("initial fs_source-selected single-root control wave should succeed");
+
+        let previous_instance_id = client.worker_instance_id_for_tests().await;
+        let _reset = SourceWorkerControlFrameErrorHookReset;
+        install_source_worker_control_frame_error_hook(SourceWorkerControlFrameErrorHook {
+            err: CnxError::ChannelClosed,
+        });
+
+        tokio::time::timeout(Duration::from_secs(4), client.on_control_frame(source_wave(2)))
+            .await
+            .expect(
+                "generation-two fs_source-selected replay should reacquire a fresh worker client instead of stalling on channel-closed current-instance errors",
+            )
+            .expect(
+                "generation-two fs_source-selected replay should recover after channel-closed current-instance errors",
+            );
+
+        let next_instance_id = client.worker_instance_id_for_tests().await;
+        assert_ne!(
+            next_instance_id, previous_instance_id,
+            "generation-two channel-closed recovery must reacquire a fresh shared source worker client instance"
+        );
 
         client.close().await.expect("close source worker");
     }

@@ -1,6 +1,7 @@
 use std::panic::AssertUnwindSafe;
+use std::sync::Mutex as StdMutex;
 use std::sync::mpsc::{Receiver, sync_channel};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(test)]
@@ -19,6 +20,7 @@ use crate::runtime::routes::ROUTE_KEY_SINK_QUERY_INTERNAL;
 use crate::runtime::routes::sink_query_request_route_for;
 
 const ENDPOINT_READY_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
+const ENDPOINT_RETRY_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 fn debug_source_status_lifecycle_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -82,12 +84,38 @@ fn is_retryable_worker_bridge_transport_error_message(message: &str) -> bool {
             || message.contains("bridge stopped"))
 }
 
+fn is_authoritative_ipc_transport_close(err: &CnxError) -> bool {
+    matches!(
+        err,
+        CnxError::TransportClosed(message)
+            if message.contains("IPC control transport closed")
+                || message.contains("IPC data transport closed")
+    )
+}
+
 fn is_retryable_worker_bridge_peer_error(err: &CnxError) -> bool {
     matches!(
         err,
         CnxError::PeerError(message) | CnxError::Internal(message)
             if is_retryable_worker_bridge_transport_error_message(message)
     )
+}
+
+fn should_emit_endpoint_retry_log(key: &str) -> bool {
+    static LAST_EMIT: std::sync::OnceLock<StdMutex<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    let now = std::time::Instant::now();
+    let mut guard = LAST_EMIT
+        .get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+        .lock()
+        .expect("endpoint retry log limiter lock");
+    match guard.get(key).copied() {
+        Some(last) if now.duration_since(last) < ENDPOINT_RETRY_LOG_INTERVAL => false,
+        _ => {
+            guard.insert(key.to_string(), now);
+            true
+        }
+    }
 }
 
 async fn close_stale_recv_channel(
@@ -585,6 +613,12 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
                     | Err(err @ CnxError::TransportClosed(_))
                     | Err(err @ CnxError::ChannelClosed)
                     | Err(err @ CnxError::LinkError(_)) => {
+                        if is_authoritative_ipc_transport_close(&err) {
+                            if fatal_err.is_none() {
+                                fatal_err = Some(err);
+                            }
+                            continue;
+                        }
                         if debug_materialized_route {
                             eprintln!(
                                 "fs_meta_runtime_endpoint: materialized_route recv_retry route={} task={} err={}",
@@ -766,10 +800,13 @@ async fn run_stream_loop<F, Fut, G>(
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         }
-        eprintln!(
-            "fs_meta_runtime_endpoint: stream loop recv route={} task={}",
-            stream_channel.0, join_name
-        );
+        if should_emit_endpoint_retry_log(&format!("recv_begin:{}:{}", stream_channel.0, join_name))
+        {
+            eprintln!(
+                "fs_meta_runtime_endpoint: stream loop recv route={} task={}",
+                stream_channel.0, join_name
+            );
+        }
         let events = match boundary
             .channel_recv(
                 ctx.clone(),
@@ -783,10 +820,15 @@ async fn run_stream_loop<F, Fut, G>(
             Ok(events) => events,
             Err(CnxError::Timeout) => continue,
             Err(err) if is_retryable_worker_bridge_peer_error(&err) => {
-                eprintln!(
-                    "fs_meta_runtime_endpoint: retryable stream recv gap task={} route={} err={:?}",
-                    join_name, stream_channel.0, err
-                );
+                if should_emit_endpoint_retry_log(&format!(
+                    "retryable_gap:{}:{}",
+                    stream_channel.0, join_name
+                )) {
+                    eprintln!(
+                        "fs_meta_runtime_endpoint: retryable stream recv gap task={} route={} err={:?}",
+                        join_name, stream_channel.0, err
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -795,20 +837,45 @@ async fn run_stream_loop<F, Fut, G>(
             | Err(err @ CnxError::TransportClosed(_))
             | Err(err @ CnxError::ChannelClosed)
             | Err(err @ CnxError::LinkError(_)) => {
-                eprintln!(
-                    "fs_meta_runtime_endpoint: transient stream recv gap task={} route={} err={:?}",
-                    join_name, stream_channel.0, err
-                );
+                if is_authoritative_ipc_transport_close(&err) {
+                    eprintln!(
+                        "fs_meta_runtime_endpoint: terminal stream recv failure task={} route={} err={:?}",
+                        join_name, stream_channel.0, err
+                    );
+                    log::warn!(
+                        "stream task {} recv failed for {}: {:?}",
+                        join_name,
+                        stream_channel.0,
+                        err
+                    );
+                    *terminal_reason.lock().expect("terminal_reason lock") =
+                        Some(format!("recv_failed:{err}"));
+                    break;
+                }
+                if should_emit_endpoint_retry_log(&format!(
+                    "transient_gap:{}:{}",
+                    stream_channel.0, join_name
+                )) {
+                    eprintln!(
+                        "fs_meta_runtime_endpoint: transient stream recv gap task={} route={} err={:?}",
+                        join_name, stream_channel.0, err
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
             Err(err) if is_stale_grant_attachment_recv_gap(&err) => {
                 close_stale_recv_channel(boundary.clone(), ctx.clone(), stream_channel.clone())
                     .await;
-                eprintln!(
-                    "fs_meta_runtime_endpoint: stale grant-attachment recv gap task={} route={} err={:?}",
-                    join_name, stream_channel.0, err
-                );
+                if should_emit_endpoint_retry_log(&format!(
+                    "stale_gap:{}:{}",
+                    stream_channel.0, join_name
+                )) {
+                    eprintln!(
+                        "fs_meta_runtime_endpoint: stale grant-attachment recv gap task={} route={} err={:?}",
+                        join_name, stream_channel.0, err
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
@@ -930,6 +997,7 @@ mod tests {
         RevokedGrantAttachmentToken,
         RetryableBridgePeerError,
         RetryableBridgeInternalError,
+        AuthoritativeIpcTransportClosed,
     }
 
     enum RecvStep {
@@ -1053,6 +1121,9 @@ mod tests {
                         "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
                             .into(),
                     )),
+                    FirstFailure::AuthoritativeIpcTransportClosed => Err(
+                        CnxError::TransportClosed("IPC control transport closed".into()),
+                    ),
                 };
             }
             Err(CnxError::Internal("stop after first recv".into()))
@@ -1584,6 +1655,41 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_loop_exits_on_authoritative_ipc_transport_close() {
+        let boundary = Arc::new(RecordingBoundary {
+            recv_keys: Mutex::new(Vec::new()),
+            recv_unit_ids: Mutex::new(Vec::new()),
+            close_keys: Mutex::new(Vec::new()),
+            first_failure: Mutex::new(Some(FirstFailure::AuthoritativeIpcTransportClosed)),
+        });
+        let terminal_reason = test_terminal_reason();
+        crate::runtime_app::shared_tokio_runtime().block_on(run_endpoint_loop(
+            boundary.clone(),
+            RouteKey("source-status:v1.req".into()),
+            "test-endpoint".into(),
+            BoundaryContext::for_unit("runtime.exec.query-peer"),
+            CancellationToken::new(),
+            Arc::new(|_events: Vec<Event>| std::future::ready(Vec::new())),
+            terminal_reason.clone(),
+        ));
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert_eq!(
+            recv_keys,
+            vec!["source-status:v1.req".to_string()],
+            "authoritative IPC transport close must stop the endpoint loop instead of retrying forever on a dead worker-side IPC plane"
+        );
+        assert!(
+            terminal_reason
+                .lock()
+                .expect("terminal_reason lock")
+                .as_deref()
+                .is_some_and(|reason| reason.contains("IPC control transport closed")),
+            "terminal reason should preserve the authoritative IPC transport-close evidence"
+        );
+    }
+
+    #[test]
     fn endpoint_loop_retries_recv_panics_without_silent_task_death() {
         let boundary = Arc::new(PanicOnceThenStopBoundary::new());
         crate::runtime_app::shared_tokio_runtime().block_on(run_endpoint_loop(
@@ -1744,6 +1850,42 @@ mod tests {
         );
         let close_keys = boundary.close_keys.lock().expect("close_keys lock").clone();
         assert_eq!(close_keys, vec!["fs-meta.events:v1.stream".to_string()]);
+    }
+
+    #[test]
+    fn stream_loop_exits_on_authoritative_ipc_transport_close() {
+        let boundary = Arc::new(RecordingBoundary {
+            recv_keys: Mutex::new(Vec::new()),
+            recv_unit_ids: Mutex::new(Vec::new()),
+            close_keys: Mutex::new(Vec::new()),
+            first_failure: Mutex::new(Some(FirstFailure::AuthoritativeIpcTransportClosed)),
+        });
+        let terminal_reason = test_terminal_reason();
+        crate::runtime_app::shared_tokio_runtime().block_on(run_stream_loop(
+            boundary.clone(),
+            RouteKey("fs-meta.events:v1.stream".into()),
+            "test-stream".into(),
+            "runtime.exec.sink".to_string(),
+            CancellationToken::new(),
+            Arc::new(|| true),
+            Arc::new(|_events: Vec<Event>| std::future::ready(())),
+            terminal_reason.clone(),
+        ));
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert_eq!(
+            recv_keys,
+            vec!["fs-meta.events:v1.stream".to_string()],
+            "authoritative IPC transport close must stop the stream loop instead of retrying forever on a dead worker-side IPC plane"
+        );
+        assert!(
+            terminal_reason
+                .lock()
+                .expect("terminal_reason lock")
+                .as_deref()
+                .is_some_and(|reason| reason.contains("IPC control transport closed")),
+            "terminal stream reason should preserve the authoritative IPC transport-close evidence"
+        );
     }
 
     #[test]

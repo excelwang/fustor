@@ -36,13 +36,14 @@ fn can_retry_on_control_frame(err: &CnxError) -> bool {
     matches!(
         err,
         CnxError::PeerError(message) if message == "worker not initialized"
-    ) || matches!(err, CnxError::TransportClosed(_) | CnxError::Timeout)
+    ) || matches!(err, CnxError::TransportClosed(_) | CnxError::Timeout | CnxError::ChannelClosed)
         || is_retryable_worker_bridge_peer_error(err)
         || matches!(
             err,
             CnxError::AccessDenied(message) | CnxError::PeerError(message)
                 if message.contains("drained/fenced")
                     && message.contains("grant attachments")
+                    || message.contains("invalid or revoked grant attachment token")
         )
 }
 
@@ -239,13 +240,19 @@ impl Drop for InflightControlOpGuard {
 fn sink_worker_handle_registry_key(
     node_id: &NodeId,
     worker_binding: &RuntimeWorkerBinding,
+    worker_factory: &RuntimeWorkerClientFactory,
 ) -> String {
+    let runtime_boundary_id = {
+        let io_boundary = worker_factory.io_boundary();
+        Arc::as_ptr(&io_boundary) as *const () as usize
+    };
     format!(
-        "{}|{}|{:?}|{:?}|{}|{}",
+        "{}|{}|{:?}|{:?}|{}|{}|{}",
         node_id.0,
         worker_binding.role_id,
         worker_binding.mode,
         worker_binding.launcher_kind,
+        runtime_boundary_id,
         worker_binding
             .module_path
             .as_ref()
@@ -588,7 +595,7 @@ impl SinkWorkerClientHandle {
         worker_binding: RuntimeWorkerBinding,
         worker_factory: RuntimeWorkerClientFactory,
     ) -> Result<Self> {
-        let key = sink_worker_handle_registry_key(&node_id, &worker_binding);
+        let key = sink_worker_handle_registry_key(&node_id, &worker_binding, &worker_factory);
         let shared = {
             let mut registry = lock_sink_worker_handle_registry();
             if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
@@ -1294,8 +1301,8 @@ impl SinkWorkerClientHandle {
                 }
                 Ok(other) => {
                     eprintln!(
-                        "fs_meta_sink_worker_client: on_control_frame done node={} ok=false",
-                        self.node_id.0
+                        "fs_meta_sink_worker_client: on_control_frame done node={} ok=false err=unexpected_response:{:?}",
+                        self.node_id.0, other
                     );
                     return Err(CnxError::ProtocolViolation(format!(
                         "unexpected sink worker response for on_control_frame: {:?}",
@@ -1309,8 +1316,8 @@ impl SinkWorkerClientHandle {
                 }
                 Err(err) => {
                     eprintln!(
-                        "fs_meta_sink_worker_client: on_control_frame done node={} ok=false",
-                        self.node_id.0
+                        "fs_meta_sink_worker_client: on_control_frame done node={} ok=false err={}",
+                        self.node_id.0, err
                     );
                     return Err(err);
                 }
@@ -2691,6 +2698,25 @@ mod tests {
         sink.close().await.expect("close sink worker");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn on_control_frame_retries_invalid_or_revoked_grant_attachment_tokens_after_first_wave_succeeded()
+     {
+        assert_on_control_frame_retries_bridge_reset_error(
+            CnxError::AccessDenied("invalid or revoked grant attachment token".to_string()),
+            "on_control_frame should retry an invalid or revoked grant attachment token after the first sink wave already succeeded",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn on_control_frame_retries_channel_closed_after_first_wave_succeeded() {
+        assert_on_control_frame_retries_bridge_reset_error(
+            CnxError::ChannelClosed,
+            "on_control_frame should retry channel-closed continuity gaps after the first sink wave already succeeded",
+        )
+        .await;
+    }
+
     async fn assert_on_control_frame_retries_bridge_reset_error(err: CnxError, label: &str) {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
@@ -3645,5 +3671,124 @@ mod tests {
             .await
             .expect("join sink close task")
             .expect("close sink worker after update");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn distinct_runtime_factories_do_not_share_started_sink_worker_client_on_same_node() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![sink_worker_root("nfs1", &nfs1)],
+            host_object_grants: vec![sink_worker_export(
+                "node-d::nfs1",
+                "node-d",
+                "10.0.0.41",
+                nfs1.clone(),
+            )],
+            ..SourceConfig::default()
+        };
+        let state_boundary_a = in_memory_state_boundary();
+        let state_boundary_b = in_memory_state_boundary();
+        let boundary_a = Arc::new(LoopbackWorkerBoundary::default());
+        let boundary_b = Arc::new(LoopbackWorkerBoundary::default());
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let binding = external_sink_worker_binding(worker_socket_dir.path());
+        let predecessor = Arc::new(
+            SinkWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg.clone(),
+                binding.clone(),
+                RuntimeWorkerClientFactory::new(
+                    boundary_a.clone(),
+                    boundary_a.clone(),
+                    state_boundary_a,
+                ),
+            )
+            .expect("construct predecessor sink worker client"),
+        );
+        let successor = Arc::new(
+            SinkWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg,
+                binding,
+                RuntimeWorkerClientFactory::new(
+                    boundary_b.clone(),
+                    boundary_b.clone(),
+                    state_boundary_b,
+                ),
+            )
+            .expect("construct successor sink worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), predecessor.ensure_started())
+            .await
+            .expect("predecessor sink worker start timed out")
+            .expect("start predecessor sink worker");
+
+        assert!(
+            predecessor
+                .worker
+                .existing_client()
+                .await
+                .expect("predecessor existing sink client")
+                .is_some(),
+            "predecessor should have a started sink worker client"
+        );
+        assert!(
+            successor
+                .worker
+                .existing_client()
+                .await
+                .expect("successor existing sink client after predecessor start")
+                .is_none(),
+            "a successor created through a distinct runtime worker factory must not inherit the predecessor's started sink worker client"
+        );
+        assert!(
+            !Arc::ptr_eq(&predecessor._shared, &successor._shared),
+            "distinct runtime worker factories must not share one sink worker handle state"
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), successor.ensure_started())
+            .await
+            .expect("successor sink worker start timed out")
+            .expect("start successor sink worker");
+
+        assert!(
+            !Arc::ptr_eq(&predecessor.worker, &successor.worker),
+            "distinct runtime worker factories must not share one sink runtime worker client wrapper"
+        );
+        assert_eq!(
+            predecessor
+                .logical_roots_snapshot()
+                .await
+                .expect("predecessor logical_roots_snapshot after successor start")
+                .iter()
+                .map(|root| root.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nfs1"],
+            "predecessor sink worker should remain independently usable"
+        );
+        assert_eq!(
+            successor
+                .logical_roots_snapshot()
+                .await
+                .expect("successor logical_roots_snapshot after successor start")
+                .iter()
+                .map(|root| root.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nfs1"],
+            "successor sink worker should be independently usable"
+        );
+
+        predecessor
+            .close()
+            .await
+            .expect("close predecessor sink worker");
+        successor
+            .close()
+            .await
+            .expect("close successor sink worker");
     }
 }
