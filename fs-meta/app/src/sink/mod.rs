@@ -46,7 +46,8 @@ use crate::runtime::orchestration::{
 };
 use crate::runtime::routes::{
     METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SOURCE_FIND,
-    METHOD_STREAM, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL,
+    METHOD_STREAM, ROUTE_KEY_EVENTS, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_EVENTS,
+    ROUTE_TOKEN_FS_META_INTERNAL,
     default_route_bindings, sink_query_request_route_for,
 };
 use crate::runtime::seam::exchange_host_adapter;
@@ -1117,6 +1118,22 @@ impl SinkFileMeta {
         Ok(sink)
     }
 
+    fn prune_finished_endpoint_tasks(&self, context: &str) {
+        let mut tasks = lock_or_recover(&self.endpoint_tasks, context);
+        tasks.retain(|task| {
+            if !task.is_finished() {
+                return true;
+            }
+            eprintln!(
+                "fs_meta_sink: pruning finished endpoint route={} reason={}",
+                task.route_key(),
+                task.finish_reason()
+                    .unwrap_or_else(|| "unclassified_finish".to_string())
+            );
+            false
+        });
+    }
+
     pub fn start_runtime_endpoints(
         &self,
         boundary: Arc<dyn ChannelIoSubset>,
@@ -1127,6 +1144,7 @@ impl SinkFileMeta {
             "fs_meta_sink: start_runtime_endpoints begin node={}",
             node_id.0
         );
+        self.prune_finished_endpoint_tasks("sink.start_runtime_endpoints.prune");
         if !lock_or_recover(&self.endpoint_tasks, "sink.start_runtime_endpoints").is_empty() {
             eprintln!(
                 "fs_meta_sink: start_runtime_endpoints skip node={} reason=already-started elapsed_ms={}",
@@ -1540,6 +1558,7 @@ impl SinkFileMeta {
                 start.elapsed().as_millis()
             );
             let roots_control_stream_receive_enabled = self.stream_receive_enabled.clone();
+            let roots_control_route_key = route.0.clone();
             let sink = Arc::new(SinkFileMeta {
                 node_id: self.node_id.clone(),
                 state: self.state.clone(),
@@ -1553,6 +1572,7 @@ impl SinkFileMeta {
                 shutdown: self.shutdown.clone(),
                 endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
             });
+            let roots_control_ready = sink.clone();
             let endpoint = ManagedEndpointTask::spawn_stream(
                 boundary,
                 route,
@@ -1562,7 +1582,10 @@ impl SinkFileMeta {
                 ),
                 SINK_RUNTIME_UNIT_ID,
                 self.shutdown.clone(),
-                move || true,
+                move || {
+                    roots_control_ready
+                        .should_receive_control_stream_route(&roots_control_route_key)
+                },
                 move |events| {
                     let sink = sink.clone();
                     async move {
@@ -1624,6 +1647,7 @@ impl SinkFileMeta {
             "fs_meta_sink: start_stream_endpoint requested node={}",
             node_id.0
         );
+        self.prune_finished_endpoint_tasks("sink.start_stream_endpoint.prune");
         if !lock_or_recover(&self.endpoint_tasks, "sink.start_stream_endpoint").is_empty() {
             eprintln!(
                 "fs_meta_sink: start_stream_endpoint skipped node={} reason=already-started",
@@ -2248,7 +2272,22 @@ impl SinkFileMeta {
     }
 
     fn should_receive_stream_events(&self) -> bool {
-        self.stream_receive_enabled.load(Ordering::Acquire) && self.has_scheduled_stream_targets()
+        let route_key = format!("{}.{}", ROUTE_KEY_EVENTS, METHOD_STREAM);
+        self.stream_receive_enabled.load(Ordering::Acquire)
+            && self.has_scheduled_stream_targets()
+            && self.should_receive_control_stream_route(&route_key)
+    }
+
+    fn should_receive_control_stream_route(&self, route_key: &str) -> bool {
+        let Ok(Some(generation)) = self
+            .unit_control
+            .route_generation(SINK_RUNTIME_UNIT_ID, route_key)
+        else {
+            return false;
+        };
+        self.unit_control
+            .accept_tick(SINK_RUNTIME_UNIT_ID, route_key, generation)
+            .unwrap_or(false)
     }
 
     pub(crate) fn enable_stream_receive(&self) {
@@ -2838,12 +2877,60 @@ mod tests {
     use bytes::Bytes;
     use capanix_app_sdk::runtime::EventMetadata;
     use capanix_host_fs_types::UnixStat;
+    use capanix_runtime_entry_sdk::advanced::boundary::BoundaryContext;
     use capanix_runtime_entry_sdk::control::{
         RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate,
         RuntimeHostDescriptor, RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState,
         RuntimeHostObjectType, RuntimeObjectDescriptor, RuntimeUnitTick,
         encode_runtime_exec_control, encode_runtime_host_grant_change, encode_runtime_unit_tick,
     };
+
+    struct NoopBoundary;
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for NoopBoundary {}
+
+    #[derive(Default)]
+    struct RouteCountingTimeoutBoundary {
+        recv_counts: std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
+    }
+
+    impl RouteCountingTimeoutBoundary {
+        fn recv_count(&self, route_key: &str) -> usize {
+            self.recv_counts
+                .lock()
+                .expect("route recv counts lock")
+                .get(route_key)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn recv_counts_snapshot(&self) -> std::collections::BTreeMap<String, usize> {
+            self.recv_counts
+                .lock()
+                .expect("route recv counts lock")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for RouteCountingTimeoutBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> Result<Vec<Event>> {
+            let route_key = request.channel_key.0;
+            *self
+                .recv_counts
+                .lock()
+                .expect("route recv counts lock")
+                .entry(route_key)
+                .or_default() += 1;
+            Err(CnxError::Timeout)
+        }
+    }
+
     fn default_materialized_request() -> InternalQueryRequest {
         InternalQueryRequest::default()
     }
@@ -2963,6 +3050,27 @@ mod tests {
         SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("build sink")
     }
 
+    fn finished_endpoint_task_for_test(route_key: &str) -> ManagedEndpointTask {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let task = ManagedEndpointTask::spawn(
+            Arc::new(NoopBoundary),
+            capanix_app_sdk::runtime::RouteKey(route_key.to_string()),
+            format!("test-finished-{route_key}"),
+            shutdown,
+            |_requests| async { Vec::<Event>::new() },
+        );
+        let started = std::time::Instant::now();
+        while !task.is_finished() && started.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            task.is_finished(),
+            "test fixture endpoint task must finish deterministically before insertion"
+        );
+        task
+    }
+
     fn bound_scope(scope_id: &str) -> RuntimeBoundScope {
         RuntimeBoundScope {
             scope_id: scope_id.to_string(),
@@ -3028,6 +3136,142 @@ mod tests {
         sink.on_control_frame(&[envelope])
             .await
             .expect("sink should accept unit tick control frame");
+    }
+
+    #[tokio::test]
+    async fn start_runtime_endpoints_restarts_after_finished_endpoint_task() {
+        let sink = build_single_group_sink();
+        lock_or_recover(
+            &sink.endpoint_tasks,
+            "test.sink.restart_after_finished.endpoint_tasks.seed",
+        )
+        .push(finished_endpoint_task_for_test("sink.test.finished:v1.req"));
+
+        sink.start_runtime_endpoints(Arc::new(NoopBoundary), NodeId("node-a".to_string()))
+            .expect("start runtime endpoints");
+
+        let endpoint_count = lock_or_recover(
+            &sink.endpoint_tasks,
+            "test.sink.restart_after_finished.endpoint_tasks.after",
+        )
+        .len();
+        assert!(
+            endpoint_count > 1,
+            "sink runtime start must prune terminal endpoint tasks and restart endpoints instead of treating any non-empty task list as already-started"
+        );
+
+        sink.close().await.expect("close sink");
+    }
+
+    #[tokio::test]
+    async fn roots_control_stream_stays_gated_until_route_activation() {
+        let sink = build_single_group_sink();
+        let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+
+        sink.start_runtime_endpoints(boundary.clone(), NodeId("node-a".to_string()))
+            .expect("start runtime endpoints");
+
+        let roots_control_route =
+            format!("{}.stream", crate::runtime::routes::ROUTE_KEY_SINK_ROOTS_CONTROL);
+        let pre_activation_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < pre_activation_deadline {
+            let recv = boundary.recv_count(&roots_control_route);
+            assert_eq!(
+                recv,
+                0,
+                "sink roots-control stream must remain gated before runtime route activation; recv_counts={:?}",
+                boundary.recv_counts_snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        sink.on_control_frame(&[
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: roots_control_route.clone(),
+                unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope("nfs1")],
+            }))
+            .expect("encode sink roots-control activate"),
+        ])
+        .await
+        .expect("activate sink roots-control route");
+
+        let activated_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let recv = boundary.recv_count(&roots_control_route);
+            if recv > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < activated_deadline,
+                "sink roots-control stream must begin receiving after route activation; recv_counts={:?}",
+                boundary.recv_counts_snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        sink.close().await.expect("close sink");
+    }
+
+    #[tokio::test]
+    async fn events_stream_stays_gated_until_route_activation() {
+        let sink = build_single_group_sink();
+        let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+
+        assert!(
+            sink.has_scheduled_stream_targets(),
+            "fixture must include scheduled stream targets so pre-activation recv attempts are meaningful"
+        );
+
+        sink.start_runtime_endpoints(boundary.clone(), NodeId("node-a".to_string()))
+            .expect("start runtime endpoints");
+        sink.enable_stream_receive();
+
+        let events_route = format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS);
+        let pre_activation_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < pre_activation_deadline {
+            let recv = boundary.recv_count(&events_route);
+            assert_eq!(
+                recv,
+                0,
+                "sink events stream must remain gated before runtime route activation; recv_counts={:?}",
+                boundary.recv_counts_snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        sink.on_control_frame(&[
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: events_route.clone(),
+                unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope("nfs1")],
+            }))
+            .expect("encode sink events activate"),
+        ])
+        .await
+        .expect("activate sink events route");
+
+        let activated_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let recv = boundary.recv_count(&events_route);
+            if recv > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < activated_deadline,
+                "sink events stream must begin receiving after route activation; recv_counts={:?}",
+                boundary.recv_counts_snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        sink.close().await.expect("close sink");
     }
 
     #[tokio::test]
@@ -3663,8 +3907,8 @@ mod tests {
         assert!(!payload_contains_path(&response, b"/ignored.txt"));
     }
 
-    #[test]
-    fn stream_receive_gate_stays_closed_until_enabled() {
+    #[tokio::test]
+    async fn stream_receive_gate_stays_closed_until_enabled() {
         let sink = build_single_group_sink();
         assert!(
             !sink.should_receive_stream_events(),
@@ -3672,8 +3916,25 @@ mod tests {
         );
         sink.enable_stream_receive();
         assert!(
+            !sink.should_receive_stream_events(),
+            "stream receive gate must remain closed until events stream route is runtime-activated"
+        );
+        sink.on_control_frame(&[
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+                unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope("nfs1")],
+            }))
+            .expect("encode events route activation"),
+        ])
+        .await
+        .expect("activate events stream route");
+        assert!(
             sink.should_receive_stream_events(),
-            "stream receive gate should open only after bootstrap enables it"
+            "stream receive gate should open after both bootstrap enablement and current-generation route activation"
         );
         sink.disable_stream_receive();
         assert!(

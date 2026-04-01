@@ -745,15 +745,15 @@ async fn bootstrap_start_source_runtime(
             }
         }
     }
+    let Some(source) = state.source.as_ref() else {
+        return Err(CnxError::Internal(
+            "source worker runtime missing during start".into(),
+        ));
+    };
+    eprintln!("fs_meta_source_worker_server: bootstrap_start endpoints begin");
+    source.start_runtime_endpoints(boundary.clone()).await?;
+    eprintln!("fs_meta_source_worker_server: bootstrap_start endpoints ok");
     if state.pump_task.is_none() {
-        let Some(source) = state.source.as_ref() else {
-            return Err(CnxError::Internal(
-                "source worker runtime missing during start".into(),
-            ));
-        };
-        eprintln!("fs_meta_source_worker_server: bootstrap_start endpoints begin");
-        source.start_runtime_endpoints(boundary.clone()).await?;
-        eprintln!("fs_meta_source_worker_server: bootstrap_start endpoints ok");
         let source = source.clone();
         eprintln!("fs_meta_source_worker_server: bootstrap_start pub begin");
         let stream = source.pub_().await?;
@@ -1234,6 +1234,100 @@ mod tests {
     #[async_trait::async_trait]
     impl ChannelIoSubset for NoopBoundary {}
 
+    #[derive(Default)]
+    struct TerminatingRecvBoundary {
+        recv_counts: StdMutex<std::collections::BTreeMap<String, usize>>,
+    }
+
+    impl TerminatingRecvBoundary {
+        fn recv_count(&self, route: &str) -> usize {
+            self.recv_counts
+                .lock()
+                .expect("recv_count lock")
+                .get(route)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn recv_counts_snapshot(&self) -> std::collections::BTreeMap<String, usize> {
+            self.recv_counts.lock().expect("recv_counts_snapshot lock").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for TerminatingRecvBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> Result<Vec<Event>> {
+            let route = request.channel_key.0;
+            *self
+                .recv_counts
+                .lock()
+                .expect("channel_recv recv_counts lock")
+                .entry(route)
+                .or_default() += 1;
+            Err(CnxError::TransportClosed(
+                "IPC control transport closed".to_string(),
+            ))
+        }
+
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            _request: ChannelSendRequest,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingTimeoutBoundary {
+        recv_counts: StdMutex<std::collections::BTreeMap<String, usize>>,
+    }
+
+    impl CountingTimeoutBoundary {
+        fn recv_count(&self, route: &str) -> usize {
+            self.recv_counts
+                .lock()
+                .expect("recv_count lock")
+                .get(route)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn recv_counts_snapshot(&self) -> std::collections::BTreeMap<String, usize> {
+            self.recv_counts.lock().expect("recv_counts_snapshot lock").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for CountingTimeoutBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> Result<Vec<Event>> {
+            let route = request.channel_key.0;
+            *self
+                .recv_counts
+                .lock()
+                .expect("channel_recv recv_counts lock")
+                .entry(route)
+                .or_default() += 1;
+            Err(CnxError::Timeout)
+        }
+
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            _request: ChannelSendRequest,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
     struct FencedThenOkStateBoundary {
         inner: Arc<dyn StateBoundary>,
         authority_fenced_reads_remaining: AtomicUsize,
@@ -1504,6 +1598,122 @@ mod tests {
             state.source.is_some(),
             "bootstrap start should initialize source after transient fenced authority read recovers",
         );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_start_repairs_control_stream_continuity_even_when_pump_task_is_alive() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_watch_scan_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![test_export("node-a::nfs1", nfs1)],
+            ..SourceConfig::default()
+        };
+
+        let mut state = SourceWorkerState {
+            source: None,
+            pending_init: Some((NodeId("node-a-bootstrap-restart".to_string()), cfg)),
+            pump_task: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        };
+
+        let first_boundary = Arc::new(TerminatingRecvBoundary::default());
+        bootstrap_start_source_runtime(
+            &mut state,
+            first_boundary.clone(),
+            in_memory_state_boundary(),
+        )
+        .await
+        .expect("first bootstrap start source runtime");
+
+        let roots_control_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+        let rescan_control_route = format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL);
+        let source = state
+            .source
+            .as_ref()
+            .cloned()
+            .expect("source runtime after first bootstrap");
+        source
+            .on_control_frame(&[
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: rescan_control_route.clone(),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![RuntimeBoundScope {
+                        scope_id: "nfs1".to_string(),
+                        resource_ids: vec!["node-a::nfs1".to_string()],
+                    }],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: roots_control_route.clone(),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![RuntimeBoundScope {
+                        scope_id: "nfs1".to_string(),
+                        resource_ids: vec!["node-a::nfs1".to_string()],
+                    }],
+                }))
+                .expect("encode source roots-control activate"),
+            ])
+            .await
+            .expect("activate source control stream routes");
+        let first_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let saw_roots = first_boundary.recv_count(&roots_control_route) > 0;
+            let saw_rescan = first_boundary.recv_count(&rescan_control_route) > 0;
+            if saw_roots && saw_rescan {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < first_deadline,
+                "first bootstrap should start source control stream recv loops after activation before continuity-repair check: counts={:?}",
+                first_boundary.recv_counts_snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pump_task = state
+            .pump_task
+            .as_ref()
+            .expect("source worker pump task should exist after first bootstrap");
+        assert!(
+            !pump_task.is_finished(),
+            "source worker pump must stay alive while runtime-boundary stream endpoints terminate so second bootstrap tests continuity repair with live pump_task"
+        );
+
+        let second_boundary = Arc::new(CountingTimeoutBoundary::default());
+        bootstrap_start_source_runtime(
+            &mut state,
+            second_boundary.clone(),
+            in_memory_state_boundary(),
+        )
+        .await
+        .expect("second bootstrap start source runtime");
+
+        let second_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let roots_count = second_boundary.recv_count(&roots_control_route);
+            let rescan_count = second_boundary.recv_count(&rescan_control_route);
+            if roots_count > 0 && rescan_count > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < second_deadline,
+                "second bootstrap must refresh source control stream recv continuity even when pump_task stays alive; roots_count={roots_count} rescan_count={rescan_count} counts={:?}",
+                second_boundary.recv_counts_snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        stop_source_runtime(&mut state).await;
     }
 
     #[tokio::test]

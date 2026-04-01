@@ -321,72 +321,66 @@ fn bootstrap_start_sink_runtime(
     io_boundary: Arc<dyn ChannelIoSubset>,
     state_boundary: Arc<dyn StateBoundary>,
 ) -> Result<(), CnxError> {
-    match state.sink.as_ref() {
-        Some(_) if state.endpoints_started => Ok(()),
-        Some(_) | None => {
-            if state.sink.is_none() {
-                let Some((node_id, config)) = state.pending_init.clone() else {
-                    return Err(bootstrap_not_ready());
-                };
-                let mut source_cfg = SourceConfig::default();
-                source_cfg.roots = config.roots;
-                source_cfg.host_object_grants = config.host_object_grants;
-                source_cfg.sink_tombstone_ttl =
-                    Duration::from_millis(config.sink_tombstone_ttl_ms.max(1));
-                source_cfg.sink_tombstone_tolerance_us = config.sink_tombstone_tolerance_us;
-                let inner = SinkFileMeta::with_boundaries_and_state_deferred_authority(
-                    node_id.clone(),
-                    None,
-                    state_boundary,
-                    source_cfg,
-                )?;
-                state.sink = Some(Arc::new(inner));
-            }
-            let Some(sink) = state.sink.as_ref() else {
-                return Err(bootstrap_not_ready());
-            };
-            let Some(node_id) = state.node_id.clone() else {
-                return Err(CnxError::Internal(
-                    "sink worker missing node_id during start".into(),
-                ));
-            };
-            eprintln!(
-                "fs_meta_sink_worker_server: bootstrap_start begin node={} endpoints_started={}",
-                node_id.0, state.endpoints_started
-            );
-            sink.start_runtime_endpoints(io_boundary, node_id)?;
-            eprintln!("fs_meta_sink_worker_server: bootstrap_start endpoints ok");
-            if state.send_tx.is_none() {
-                let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Event>>();
-                let sink_for_send = sink.clone();
-                tokio::spawn(async move {
-                    while let Some(events) = send_rx.recv().await {
-                        if debug_sink_query_flow_enabled() {
-                            eprintln!(
-                                "fs_meta_sink_worker_server: async_send_apply begin origins={:?}",
-                                summarize_event_origins(&events)
-                            );
-                        }
-                        if let Err(err) = sink_for_send.send(&events).await {
-                            eprintln!("fs_meta_sink_worker: async Send apply failed: {err}");
-                        } else if debug_sink_query_flow_enabled()
-                            && let Ok(snapshot) = sink_for_send.status_snapshot()
-                        {
-                            eprintln!(
-                                "fs_meta_sink_worker_server: async_send_apply ok groups={:?}",
-                                summarize_sink_snapshot_groups(&snapshot)
-                            );
-                        }
-                    }
-                });
-                state.send_tx = Some(send_tx);
-            }
-            state.endpoints_started = true;
-            sink.enable_stream_receive();
-            eprintln!("fs_meta_sink_worker_server: bootstrap_start ok");
-            Ok(())
-        }
+    if state.sink.is_none() {
+        let Some((node_id, config)) = state.pending_init.clone() else {
+            return Err(bootstrap_not_ready());
+        };
+        let mut source_cfg = SourceConfig::default();
+        source_cfg.roots = config.roots;
+        source_cfg.host_object_grants = config.host_object_grants;
+        source_cfg.sink_tombstone_ttl = Duration::from_millis(config.sink_tombstone_ttl_ms.max(1));
+        source_cfg.sink_tombstone_tolerance_us = config.sink_tombstone_tolerance_us;
+        let inner = SinkFileMeta::with_boundaries_and_state_deferred_authority(
+            node_id.clone(),
+            None,
+            state_boundary,
+            source_cfg,
+        )?;
+        state.sink = Some(Arc::new(inner));
     }
+    let Some(sink) = state.sink.as_ref() else {
+        return Err(bootstrap_not_ready());
+    };
+    let Some(node_id) = state.node_id.clone() else {
+        return Err(CnxError::Internal(
+            "sink worker missing node_id during start".into(),
+        ));
+    };
+    eprintln!(
+        "fs_meta_sink_worker_server: bootstrap_start begin node={} endpoints_started={}",
+        node_id.0, state.endpoints_started
+    );
+    sink.start_runtime_endpoints(io_boundary, node_id)?;
+    eprintln!("fs_meta_sink_worker_server: bootstrap_start endpoints ok");
+    if state.send_tx.is_none() {
+        let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Event>>();
+        let sink_for_send = sink.clone();
+        tokio::spawn(async move {
+            while let Some(events) = send_rx.recv().await {
+                if debug_sink_query_flow_enabled() {
+                    eprintln!(
+                        "fs_meta_sink_worker_server: async_send_apply begin origins={:?}",
+                        summarize_event_origins(&events)
+                    );
+                }
+                if let Err(err) = sink_for_send.send(&events).await {
+                    eprintln!("fs_meta_sink_worker: async Send apply failed: {err}");
+                } else if debug_sink_query_flow_enabled()
+                    && let Ok(snapshot) = sink_for_send.status_snapshot()
+                {
+                    eprintln!(
+                        "fs_meta_sink_worker_server: async_send_apply ok groups={:?}",
+                        summarize_sink_snapshot_groups(&snapshot)
+                    );
+                }
+            }
+        });
+        state.send_tx = Some(send_tx);
+    }
+    state.endpoints_started = true;
+    sink.enable_stream_receive();
+    eprintln!("fs_meta_sink_worker_server: bootstrap_start ok");
+    Ok(())
 }
 
 async fn bootstrap_stop_sink_runtime(state: &mut SinkWorkerState) {
@@ -864,5 +858,161 @@ impl TypedWorkerBootstrapSession<SinkWorkerInitConfig> for SinkWorkerSession {
         let mut guard = self.state.lock().await;
         stop_sink_runtime(&mut guard).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::routes::{METHOD_STREAM, ROUTE_TOKEN_FS_META_EVENTS, default_route_bindings};
+    use crate::source::config::{GrantedMountRoot, RootSpec};
+    use capanix_runtime_entry_sdk::control::{
+        RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, encode_runtime_exec_control,
+    };
+
+    struct FailingBoundary;
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for FailingBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: capanix_runtime_entry_sdk::advanced::boundary::BoundaryContext,
+            _request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            Err(CnxError::TransportClosed(
+                "IPC control transport closed".to_string(),
+            ))
+        }
+    }
+
+    struct TimeoutBoundary;
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for TimeoutBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: capanix_runtime_entry_sdk::advanced::boundary::BoundaryContext,
+            _request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            Err(CnxError::Timeout)
+        }
+    }
+
+    fn root(id: &str, path: &str) -> RootSpec {
+        RootSpec::new(id, std::path::PathBuf::from(path))
+    }
+
+    fn granted_mount_root(
+        object_ref: &str,
+        host_ref: &str,
+        host_ip: &str,
+        mount_point: impl Into<std::path::PathBuf>,
+        active: bool,
+    ) -> GrantedMountRoot {
+        let mount_point = mount_point.into();
+        GrantedMountRoot {
+            object_ref: object_ref.to_string(),
+            host_ref: host_ref.to_string(),
+            host_ip: host_ip.to_string(),
+            host_name: Some(host_ref.to_string()),
+            site: None,
+            zone: None,
+            host_labels: Default::default(),
+            mount_point: mount_point.clone(),
+            fs_source: mount_point.display().to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: vec!["posix-fs".to_string(), "inotify".to_string()],
+            active,
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_start_must_repair_endpoint_continuity_even_when_endpoints_started_flag_is_true()
+     {
+        let node_id = NodeId("node-a".to_string());
+        let mut source_cfg = SourceConfig::default();
+        source_cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+        source_cfg.host_object_grants = vec![granted_mount_root(
+            "node-a::exp",
+            "node-a",
+            "10.0.0.11",
+            "/mnt/nfs1",
+            true,
+        )];
+        let sink = Arc::new(
+            SinkFileMeta::with_boundaries(node_id.clone(), None, source_cfg)
+                .expect("build sink runtime"),
+        );
+
+        sink.start_stream_endpoint(Arc::new(FailingBoundary), node_id.clone())
+            .expect("seed terminal stream endpoint");
+
+        let stream_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM)
+            .expect("resolve stream route")
+            .0;
+        sink.on_control_frame(&[
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: stream_route.clone(),
+                unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: Vec::new(),
+                }],
+            }))
+            .expect("encode sink events activate"),
+        ])
+        .await
+        .expect("activate sink events route before terminal seeding");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let traced = sink
+                .debug_traced_route_state(&stream_route)
+                .expect("trace route state");
+            if traced.contains("finished=true") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failed to deterministically seed a terminal stream endpoint before bootstrap restart check"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut state = SinkWorkerState {
+            sink: Some(sink.clone()),
+            node_id: Some(node_id),
+            pending_init: None,
+            endpoints_started: true,
+            send_tx: None,
+            last_control_frame_signals: Vec::new(),
+            received_stats: Arc::new(StdMutex::new(ReceivedBatchStats::default())),
+        };
+
+        bootstrap_start_sink_runtime(
+            &mut state,
+            Arc::new(TimeoutBoundary),
+            capanix_app_sdk::runtime::in_memory_state_boundary(),
+        )
+        .expect("bootstrap start should re-check endpoint continuity");
+
+        let traced_after = sink
+            .debug_traced_route_state(&stream_route)
+            .expect("trace route state after bootstrap restart");
+        assert!(
+            !traced_after.contains("finished=true"),
+            "bootstrap start must not skip endpoint continuity repair when endpoints_started=true and a predecessor stream endpoint already terminated: {traced_after}"
+        );
+        assert!(
+            traced_after.contains("finished=false"),
+            "bootstrap start should restore a live stream endpoint after pruning terminal predecessor endpoint tasks: {traced_after}"
+        );
+
+        bootstrap_stop_sink_runtime(&mut state).await;
     }
 }

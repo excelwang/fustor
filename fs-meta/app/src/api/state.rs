@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use tokio::sync::Notify;
@@ -23,6 +23,7 @@ pub struct ApiRequestTracker {
 
 pub struct ApiControlGate {
     ready: AtomicBool,
+    epoch: AtomicU64,
     changed: Notify,
     facade_request_tracker: Arc<ApiRequestTracker>,
 }
@@ -57,6 +58,7 @@ impl ApiControlGate {
     pub fn new(ready: bool) -> Self {
         Self {
             ready: AtomicBool::new(ready),
+            epoch: AtomicU64::new(0),
             changed: Notify::new(),
             facade_request_tracker: Arc::new(ApiRequestTracker::default()),
         }
@@ -67,8 +69,15 @@ impl ApiControlGate {
     }
 
     pub fn set_ready(&self, ready: bool) {
+        if !ready {
+            self.epoch.fetch_add(1, Ordering::AcqRel);
+        }
         self.ready.store(ready, Ordering::Release);
         self.changed.notify_waiters();
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
     }
 
     pub async fn wait_ready(&self) {

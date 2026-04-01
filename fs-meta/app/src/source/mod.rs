@@ -707,6 +707,18 @@ impl FSMetaSource {
         self.boundary.clone()
     }
 
+    fn should_receive_control_stream_route(&self, route_key: &str) -> bool {
+        let Ok(Some(generation)) = self
+            .unit_control
+            .route_generation(SOURCE_RUNTIME_UNIT_ID, route_key)
+        else {
+            return false;
+        };
+        self.unit_control
+            .accept_tick(SOURCE_RUNTIME_UNIT_ID, route_key, generation)
+            .unwrap_or(false)
+    }
+
     fn apply_activate_signal(
         &self,
         unit: SourceRuntimeUnit,
@@ -2252,7 +2264,24 @@ impl FSMetaSource {
         Ok(source)
     }
 
+    fn prune_finished_endpoint_tasks(&self, context: &str) {
+        let mut tasks = lock_or_recover(&self.endpoint_tasks, context);
+        tasks.retain(|task| {
+            if !task.is_finished() {
+                return true;
+            }
+            eprintln!(
+                "fs_meta_source: pruning finished endpoint route={} reason={}",
+                task.route_key(),
+                task.finish_reason()
+                    .unwrap_or_else(|| "unclassified_finish".to_string())
+            );
+            false
+        });
+    }
+
     pub async fn start_runtime_endpoints(&self, boundary: Arc<dyn ChannelIoSubset>) -> Result<()> {
+        self.prune_finished_endpoint_tasks("source.start_runtime_endpoints.prune");
         if !lock_or_recover(&self.endpoint_tasks, "source.start_runtime_endpoints").is_empty() {
             return Ok(());
         }
@@ -2386,6 +2415,8 @@ impl FSMetaSource {
                 let control_roots = self.state_cell.roots_handle();
                 let control_fanout_health = self.state_cell.fanout_health_handle();
                 let control_manual_rescan_intents = self.state_cell.manual_rescan_intents_handle();
+                let control_route_key = route.0.clone();
+                let control_ready = self.clone();
                 let endpoint_task = ManagedEndpointTask::spawn_stream(
                     boundary.clone(),
                     route,
@@ -2395,7 +2426,9 @@ impl FSMetaSource {
                     ),
                     SOURCE_RUNTIME_UNIT_ID,
                     self.shutdown.clone(),
-                    move || true,
+                    move || {
+                        control_ready.should_receive_control_stream_route(&control_route_key)
+                    },
                     move |events| {
                         let control_roots = control_roots.clone();
                         let control_fanout_health = control_fanout_health.clone();
@@ -2443,6 +2476,8 @@ impl FSMetaSource {
                 );
                 let source = self.clone();
                 let control_node_id = self.node_id.clone();
+                let control_route_key = route.0.clone();
+                let control_ready = self.clone();
                 let endpoint_task = ManagedEndpointTask::spawn_stream(
                     boundary.clone(),
                     route,
@@ -2452,7 +2487,9 @@ impl FSMetaSource {
                     ),
                     SOURCE_RUNTIME_UNIT_ID,
                     self.shutdown.clone(),
-                    move || true,
+                    move || {
+                        control_ready.should_receive_control_stream_route(&control_route_key)
+                    },
                     move |events| {
                         let source = source.clone();
                         let control_node_id = control_node_id.clone();
@@ -4469,13 +4506,15 @@ mod tests {
     use super::*;
     use crate::ControlEvent;
     use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
+    use crate::runtime::routes::{ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_ROOTS_CONTROL};
     use crate::runtime::execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID;
     use crate::sink::SinkFileMeta;
     use capanix_app_sdk::runtime::ControlEnvelope;
+    use capanix_runtime_entry_sdk::advanced::boundary::BoundaryContext;
     use capanix_runtime_entry_sdk::control::{
-        RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate, RuntimeHostDescriptor,
-        RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState, RuntimeHostObjectType,
-        RuntimeObjectDescriptor, RuntimeUnitTick, encode_runtime_exec_control,
+        RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate,
+        RuntimeHostDescriptor, RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState,
+        RuntimeHostObjectType, RuntimeObjectDescriptor, RuntimeUnitTick, encode_runtime_exec_control,
         encode_runtime_host_grant_change, encode_runtime_unit_tick,
     };
     use std::collections::BTreeSet;
@@ -4484,6 +4523,47 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ChannelIoSubset for NoopBoundary {}
+
+    #[derive(Default)]
+    struct RouteCountingTimeoutBoundary {
+        recv_counts: std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
+    }
+
+    impl RouteCountingTimeoutBoundary {
+        fn recv_count(&self, route_key: &str) -> usize {
+            self.recv_counts
+                .lock()
+                .expect("route recv counts lock")
+                .get(route_key)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn recv_counts_snapshot(&self) -> std::collections::BTreeMap<String, usize> {
+            self.recv_counts
+                .lock()
+                .expect("route recv counts lock")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for RouteCountingTimeoutBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> Result<Vec<Event>> {
+            let route_key = request.channel_key.0;
+            *self
+                .recv_counts
+                .lock()
+                .expect("route recv counts lock")
+                .entry(route_key)
+                .or_default() += 1;
+            Err(CnxError::Timeout)
+        }
+    }
 
     fn root(id: &str, path: &str) -> RootSpec {
         RootSpec::new(id, std::path::PathBuf::from(path))
@@ -4553,6 +4633,27 @@ mod tests {
         cfg.host_object_grants = initial_grants;
         FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
             .expect("build source")
+    }
+
+    fn finished_endpoint_task_for_test(route_key: &str) -> ManagedEndpointTask {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let task = ManagedEndpointTask::spawn(
+            Arc::new(NoopBoundary),
+            capanix_app_sdk::runtime::RouteKey(route_key.to_string()),
+            format!("test-finished-{route_key}"),
+            shutdown,
+            |_requests| async { Vec::<Event>::new() },
+        );
+        let started = std::time::Instant::now();
+        while !task.is_finished() && started.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            task.is_finished(),
+            "test fixture endpoint task must finish deterministically before insertion"
+        );
+        task
     }
 
     fn pending_root_task_handle() -> RootTaskHandle {
@@ -4720,6 +4821,125 @@ mod tests {
             health.logical_root.get("nfs2").map(String::as_str),
             Some("ready")
         );
+    }
+
+    #[tokio::test]
+    async fn start_runtime_endpoints_restarts_after_finished_endpoint_task() {
+        let source = build_source(vec![test_export(
+            "node-a",
+            "node-a",
+            "10.0.0.11",
+            "/mnt/nfs1",
+            true,
+        )]);
+
+        lock_or_recover(
+            &source.endpoint_tasks,
+            "test.source.restart_after_finished.endpoint_tasks.seed",
+        )
+        .push(finished_endpoint_task_for_test("source.test.finished:v1.req"));
+
+        source
+            .start_runtime_endpoints(Arc::new(NoopBoundary))
+            .await
+            .expect("start runtime endpoints");
+
+        let endpoint_count = lock_or_recover(
+            &source.endpoint_tasks,
+            "test.source.restart_after_finished.endpoint_tasks.after",
+        )
+        .len();
+        assert!(
+            endpoint_count > 1,
+            "source runtime start must prune terminal endpoint tasks and restart endpoints instead of treating any non-empty task list as already-started"
+        );
+
+        source.close().await.expect("close source");
+    }
+
+    #[tokio::test]
+    async fn control_stream_endpoints_stay_gated_until_route_activation() {
+        let source = build_source(vec![test_export(
+            "node-a",
+            "node-a",
+            "10.0.0.11",
+            "/mnt/nfs1",
+            true,
+        )]);
+        let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+
+        source
+            .start_runtime_endpoints(boundary.clone())
+            .await
+            .expect("start runtime endpoints");
+
+        let rescan_control_route = format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL);
+        let roots_control_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+        let pre_activation_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < pre_activation_deadline {
+            let rescan_recv = boundary.recv_count(&rescan_control_route);
+            let roots_recv = boundary.recv_count(&roots_control_route);
+            assert_eq!(
+                rescan_recv, 0,
+                "source rescan-control stream must remain gated before runtime route activation; recv_counts={:?}",
+                boundary.recv_counts_snapshot()
+            );
+            assert_eq!(
+                roots_recv, 0,
+                "source logical-roots control stream must remain gated before runtime route activation; recv_counts={:?}",
+                boundary.recv_counts_snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        source
+            .on_control_frame(&[
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![RuntimeBoundScope {
+                        scope_id: "nfs1".to_string(),
+                        resource_ids: vec!["node-a::nfs1".to_string()],
+                    }],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![RuntimeBoundScope {
+                        scope_id: "nfs1".to_string(),
+                        resource_ids: vec!["node-a::nfs1".to_string()],
+                    }],
+                }))
+                .expect("encode source roots-control activate"),
+            ])
+            .await
+            .expect("activate source control streams");
+
+        let activated_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let rescan_recv = boundary.recv_count(&rescan_control_route);
+            let roots_recv = boundary.recv_count(&roots_control_route);
+            if rescan_recv > 0 && roots_recv > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < activated_deadline,
+                "source control streams must begin receiving after route activation; rescan_recv={} roots_recv={} recv_counts={:?}",
+                rescan_recv,
+                roots_recv,
+                boundary.recv_counts_snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        source.close().await.expect("close source");
     }
 
     #[tokio::test]

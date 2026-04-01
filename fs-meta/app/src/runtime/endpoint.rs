@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use capanix_app_sdk::runtime::RouteKey;
 use capanix_app_sdk::{CnxError, Event};
@@ -21,6 +21,7 @@ use crate::runtime::routes::sink_query_request_route_for;
 
 const ENDPOINT_READY_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 const ENDPOINT_RETRY_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const STREAM_STALE_RECV_GAP_RETRY_LIMIT: usize = 12;
 
 fn debug_source_status_lifecycle_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -789,6 +790,7 @@ async fn run_stream_loop<F, Fut, G>(
 {
     let ctx = BoundaryContext::for_unit(unit_id);
     let stream_channel = ChannelKey(route.0.clone());
+    let mut stale_recv_gap_count = 0usize;
 
     loop {
         if shutdown_for_task.is_cancelled() {
@@ -797,6 +799,7 @@ async fn run_stream_loop<F, Fut, G>(
             break;
         }
         if !should_recv() {
+            stale_recv_gap_count = 0;
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         }
@@ -817,9 +820,16 @@ async fn run_stream_loop<F, Fut, G>(
             )
             .await
         {
-            Ok(events) => events,
-            Err(CnxError::Timeout) => continue,
+            Ok(events) => {
+                stale_recv_gap_count = 0;
+                events
+            }
+            Err(CnxError::Timeout) => {
+                stale_recv_gap_count = 0;
+                continue;
+            }
             Err(err) if is_retryable_worker_bridge_peer_error(&err) => {
+                stale_recv_gap_count = 0;
                 if should_emit_endpoint_retry_log(&format!(
                     "retryable_gap:{}:{}",
                     stream_channel.0, join_name
@@ -837,6 +847,7 @@ async fn run_stream_loop<F, Fut, G>(
             | Err(err @ CnxError::TransportClosed(_))
             | Err(err @ CnxError::ChannelClosed)
             | Err(err @ CnxError::LinkError(_)) => {
+                stale_recv_gap_count = 0;
                 if is_authoritative_ipc_transport_close(&err) {
                     eprintln!(
                         "fs_meta_runtime_endpoint: terminal stream recv failure task={} route={} err={:?}",
@@ -865,6 +876,7 @@ async fn run_stream_loop<F, Fut, G>(
                 continue;
             }
             Err(err) if is_stale_grant_attachment_recv_gap(&err) => {
+                stale_recv_gap_count = stale_recv_gap_count.saturating_add(1);
                 close_stale_recv_channel(boundary.clone(), ctx.clone(), stream_channel.clone())
                     .await;
                 if should_emit_endpoint_retry_log(&format!(
@@ -875,6 +887,21 @@ async fn run_stream_loop<F, Fut, G>(
                         "fs_meta_runtime_endpoint: stale grant-attachment recv gap task={} route={} err={:?}",
                         join_name, stream_channel.0, err
                     );
+                }
+                if stale_recv_gap_count >= STREAM_STALE_RECV_GAP_RETRY_LIMIT {
+                    let reason = format!(
+                        "stale grant-attachment recv gap retry exhausted after {} attempts",
+                        stale_recv_gap_count
+                    );
+                    log::warn!(
+                        "stream task {} recv failed for {}: {}",
+                        join_name,
+                        stream_channel.0,
+                        reason
+                    );
+                    *terminal_reason.lock().expect("terminal_reason lock") =
+                        Some(format!("recv_failed:{reason}"));
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
@@ -989,6 +1016,11 @@ mod tests {
         dropped_without_query_recv_interest: AtomicBool,
     }
 
+    struct PersistentStaleGrantAttachmentBoundary {
+        recv_attempts: AtomicUsize,
+        close_keys: Mutex<Vec<String>>,
+    }
+
     #[derive(Clone, Copy)]
     enum FirstFailure {
         NotSupported,
@@ -1081,6 +1113,15 @@ mod tests {
                 request_available: tokio::sync::Notify::new(),
                 queued_requests: tokio::sync::Mutex::new(Vec::new()),
                 dropped_without_query_recv_interest: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl PersistentStaleGrantAttachmentBoundary {
+        fn new() -> Self {
+            Self {
+                recv_attempts: AtomicUsize::new(0),
+                close_keys: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1286,6 +1327,32 @@ mod tests {
                 }
                 _ => Err(CnxError::Timeout),
             }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for PersistentStaleGrantAttachmentBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            _request: ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            self.recv_attempts.fetch_add(1, Ordering::SeqCst);
+            Err(CnxError::AccessDenied(
+                "pid Pid(1) is drained/fenced and cannot obtain new grant attachments".into(),
+            ))
+        }
+
+        fn channel_close(
+            &self,
+            _ctx: BoundaryContext,
+            channel: ChannelKey,
+        ) -> capanix_app_sdk::Result<()> {
+            self.close_keys
+                .lock()
+                .expect("close_keys lock")
+                .push(channel.0);
+            Ok(())
         }
     }
 
@@ -1850,6 +1917,46 @@ mod tests {
         );
         let close_keys = boundary.close_keys.lock().expect("close_keys lock").clone();
         assert_eq!(close_keys, vec!["fs-meta.events:v1.stream".to_string()]);
+    }
+
+    #[test]
+    fn stream_loop_must_not_spin_forever_on_persistent_stale_grant_attachment_recv_gaps() {
+        let boundary = Arc::new(PersistentStaleGrantAttachmentBoundary::new());
+        let terminal_reason = test_terminal_reason();
+        let result = crate::runtime_app::shared_tokio_runtime().block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(800),
+                run_stream_loop(
+                    boundary.clone(),
+                    RouteKey("source-logical-roots-control:v1.stream".into()),
+                    "test-stream".into(),
+                    "runtime.exec.source".to_string(),
+                    CancellationToken::new(),
+                    Arc::new(|| true),
+                    Arc::new(|_events: Vec<Event>| std::future::ready(())),
+                    terminal_reason.clone(),
+                ),
+            )
+            .await
+        });
+
+        assert!(
+            result.is_ok(),
+            "persistent stale grant-attachment recv gaps must terminate this stream loop with a classified reason instead of spinning forever on one stale generation attachment"
+        );
+        let reason = terminal_reason
+            .lock()
+            .expect("terminal_reason lock")
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            reason.contains("stale grant-attachment"),
+            "terminal reason should preserve stale grant-attachment continuity evidence; reason={reason}"
+        );
+        assert!(
+            boundary.recv_attempts.load(Ordering::SeqCst) > 1,
+            "stream loop should still retry stale recv gaps before escalating"
+        );
     }
 
     #[test]

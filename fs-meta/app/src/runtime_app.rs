@@ -1604,7 +1604,6 @@ impl FSMetaApp {
                     !endpoint_unit_ids.is_empty(),
                     "internal query endpoint unit must exist when route is active"
                 );
-                let api_request_tracker = self.api_request_tracker.clone();
                 let api_control_gate = self.api_control_gate.clone();
                 let source = self.source.clone();
                 let node_id = self.node_id.clone();
@@ -1622,19 +1621,22 @@ impl FSMetaApp {
                     endpoint_unit_ids,
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
-                        let api_request_tracker = api_request_tracker.clone();
                         let api_control_gate = api_control_gate.clone();
                         let source = source.clone();
                         let node_id = node_id.clone();
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
-                                let _request_guard = api_request_tracker.begin();
+                                // Internal source-status should fail closed on gate transitions,
+                                // but must not block generation control continuity by counting
+                                // toward global control-frame request drain.
+                                let mut ready_epoch = api_control_gate.epoch();
                                 if !api_control_gate.is_ready() {
                                     eprintln!(
                                         "fs_meta_runtime_app: source status endpoint unavailable reason=control_not_ready"
                                     );
                                     api_control_gate.wait_ready().await;
+                                    ready_epoch = api_control_gate.epoch();
                                 }
                                 let trace_id = next_source_status_endpoint_trace_id();
                                 let route_name = format!(
@@ -1656,6 +1658,18 @@ impl FSMetaApp {
                                 }
                                 #[cfg(test)]
                                 maybe_pause_runtime_proxy_request("source_status").await;
+                                if !api_control_gate.is_ready() {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: source status endpoint unavailable reason=control_not_ready_after_pause"
+                                    );
+                                    continue;
+                                }
+                                if api_control_gate.epoch() != ready_epoch {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: source status endpoint unavailable reason=control_epoch_advanced"
+                                    );
+                                    continue;
+                                }
                                 let snapshot = source.observability_snapshot_nonblocking().await;
                                 trace_guard.phase("after_source_snapshot_await");
                                 eprintln!(
@@ -3360,12 +3374,14 @@ impl FSMetaApp {
         let retain_active_facade = {
             let active_guard = self.api_task.lock().await;
             active_guard.as_ref().is_some_and(|active| {
-                active.route_key == route_key && generation > active.generation
+                active.route_key == route_key
+                    && (generation > active.generation
+                        || (!self.control_initialized() && generation == active.generation))
             })
         };
         if retain_active_facade {
             eprintln!(
-                "fs_meta_runtime_app: retain active facade during future-generation deactivate route_key={} generation={}",
+                "fs_meta_runtime_app: retain active facade during continuity-preserving deactivate route_key={} generation={}",
                 route_key, generation
             );
             return Ok(());
@@ -3404,7 +3420,6 @@ impl FSMetaApp {
 
     async fn service_on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
         let (source_signals, sink_signals, facade_signals) = split_app_control_signals(envelopes)?;
-        let control_initialized_at_entry = self.control_initialized();
         let _serial_guard = self.control_frame_serial.lock().await;
         let _lease_guard = match self.control_frame_lease_path.as_deref() {
             Some(path) => Some(ControlFrameLeaseGuard::acquire(path).await.map_err(|err| {
@@ -3425,12 +3440,19 @@ impl FSMetaApp {
         } else {
             None
         };
+        let control_initialized_at_entry = self.control_initialized();
         #[cfg(test)]
         notify_runtime_control_frame_started();
+        let should_initialize_from_control =
+            Self::should_initialize_from_control(&source_signals, &sink_signals, &facade_signals);
         let request_sensitive =
             !source_signals.is_empty() || !sink_signals.is_empty() || !facade_signals.is_empty();
         if request_sensitive && self.api_request_tracker.inflight() > 0 {
-            self.api_request_tracker.wait_for_drain().await;
+            let skip_request_drain_for_uninitialized_recovery =
+                !self.control_initialized() && should_initialize_from_control;
+            if !skip_request_drain_for_uninitialized_recovery {
+                self.api_request_tracker.wait_for_drain().await;
+            }
         }
         if request_sensitive {
             self.api_control_gate.set_ready(false);
@@ -3461,7 +3483,7 @@ impl FSMetaApp {
             && self
                 .sink_signals_are_in_shared_generation_cutover_lane(&sink_signals)
                 .await;
-        if Self::should_initialize_from_control(&source_signals, &sink_signals, &facade_signals) {
+        if should_initialize_from_control {
             if !sink_cleanup_only_while_uninitialized {
                 self.initialize_from_control().await?;
             }
@@ -8502,6 +8524,146 @@ mod tests {
             .await
             .expect("join control-frame task")
             .expect("handle control frame after status request");
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn initialized_source_followup_does_not_wait_for_inflight_internal_source_status_request()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_watch_scan_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route.clone(),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial source/sink + peer source-status wave should succeed");
+        assert!(
+            app.control_initialized(),
+            "initial control wave should leave runtime initialized before testing followup continuity"
+        );
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = RuntimeProxyRequestPauseHookReset {
+            label: "source_status",
+        };
+        install_runtime_proxy_request_pause_hook(
+            "source_status",
+            RuntimeProxyRequestPauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let request_task = tokio::spawn({
+            let boundary = boundary.clone();
+            async move {
+                internal_source_status_snapshots_with_timeout(
+                    boundary,
+                    NodeId("single-app-node".into()),
+                    Duration::from_secs(8),
+                    Duration::from_millis(50),
+                )
+                .await
+            }
+        });
+
+        entered.notified().await;
+
+        let control_started = Arc::new(Notify::new());
+        let _control_reset = SourceWorkerControlFrameHookReset;
+        crate::workers::source::install_source_worker_control_frame_hook(
+            crate::workers::source::SourceWorkerControlFrameHook {
+                entered: control_started.clone(),
+            },
+        );
+
+        let followup = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[activate_envelope_with_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    3,
+                )])
+                .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), control_started.notified())
+                .await
+                .is_ok(),
+            "initialized source followup should not wait for an in-flight internal source-status request before source.apply begins"
+        );
+
+        release.notify_waiters();
+        request_task.abort();
+        tokio::task::yield_now().await;
+
+        followup
+            .await
+            .expect("join source followup")
+            .expect("initialized source followup should complete after paused request release");
+        assert!(
+            app.control_initialized(),
+            "initialized source followup should preserve runtime control initialization continuity"
+        );
+
         app.close().await.expect("close app");
     }
 
@@ -15920,6 +16082,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uninitialized_same_generation_facade_deactivate_keeps_listener_available() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let root = tmp.path().join("root-a");
+        fs::create_dir_all(&root).expect("create root");
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let cfg = FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("root-a", &root)],
+                host_object_grants: vec![granted_mount_root("single-app-node::root-a-1", &root)],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: "listener-a".to_string(),
+                local_listener_resources: vec![api::config::ApiListenerResource {
+                    resource_id: "listener-a".to_string(),
+                    bind_addr: bind_addr.clone(),
+                }],
+                auth: api::ApiAuthConfig {
+                    passwd_path,
+                    shadow_path,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        };
+        let app = FSMetaApp::with_boundaries(
+            cfg,
+            NodeId("single-app-node".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init app");
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        assert!(
+            !app.control_initialized(),
+            "test seam requires uninitialized runtime"
+        );
+
+        let shutdown_started = Arc::new(Notify::new());
+        let _shutdown_reset = FacadeShutdownStartHookReset;
+        install_facade_shutdown_start_hook(FacadeShutdownStartHook {
+            entered: shutdown_started.clone(),
+        });
+        let shutdown_wait = shutdown_started.notified();
+
+        app.apply_facade_deactivate(FacadeRuntimeUnit::Facade, &facade_control_stream_route(), 1)
+            .await
+            .expect("same-generation facade deactivate should not error");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), shutdown_wait)
+                .await
+                .is_err(),
+            "uninitialized same-generation facade deactivate must not tear down the active listener before replacement continuity is recovered"
+        );
+        assert!(
+            app.api_task.lock().await.is_some(),
+            "uninitialized same-generation facade deactivate must retain the active facade handle"
+        );
+
+        let login = Client::new()
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(
+            login.status().is_success(),
+            "uninitialized same-generation facade deactivate must keep login available: status={}",
+            login.status()
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
     async fn query_peer_deactivate_waits_for_inflight_internal_sink_status_request() {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
@@ -20287,6 +20556,196 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uninitialized_peer_source_status_followup_does_not_wait_for_stale_inflight_source_status_request()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_watch_scan_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route.clone(),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial source/sink + peer source-status wave should succeed");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = RuntimeProxyRequestPauseHookReset {
+            label: "source_status",
+        };
+        install_runtime_proxy_request_pause_hook(
+            "source_status",
+            RuntimeProxyRequestPauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let request_task = tokio::spawn({
+            let boundary = boundary.clone();
+            async move {
+                internal_source_status_snapshots_with_timeout(
+                    boundary,
+                    NodeId("single-app-node".into()),
+                    Duration::from_secs(8),
+                    Duration::from_millis(50),
+                )
+                .await
+            }
+        });
+
+        entered.notified().await;
+
+        app.mark_control_uninitialized_after_failure().await;
+        assert!(
+            !app.control_initialized(),
+            "forced failure seam should leave runtime uninitialized before peer source-status followup"
+        );
+
+        let source_entered = Arc::new(Notify::new());
+        let source_release = Arc::new(Notify::new());
+        let _source_pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: source_entered.clone(),
+                release: source_release.clone(),
+            },
+        );
+
+        let followup = tokio::spawn({
+            let app = app.clone();
+            let source_status_route = source_status_route.clone();
+            async move {
+                app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    source_status_route,
+                    &[("test-root", &["listener-a"])],
+                    3,
+                )])
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_millis(600), source_entered.notified())
+            .await
+            .expect(
+                "uninitialized peer source-status followup must reach source.apply even while a stale in-flight source-status request is still paused",
+            );
+
+        followup.abort();
+        source_release.notify_waiters();
+        release.notify_waiters();
+
+        request_task.abort();
+        tokio::task::yield_now().await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route,
+                &[("test-root", &["listener-a"])],
+                4,
+            )]),
+        )
+        .await
+        .expect(
+            "uninitialized peer source-status followup should finish after in-flight source-status request release",
+        )
+        .expect(
+            "fresh peer source-status followup should recover after stale in-flight request lane is cleared",
+        );
+        assert!(
+            app.control_initialized(),
+            "successful peer source-status followup should restore runtime control initialization"
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
     async fn failed_followup_source_control_marks_runtime_uninitialized_for_same_node_recovery() {
         struct SourceControlErrorHookReset;
 
@@ -20660,6 +21119,170 @@ mod tests {
         assert!(
             app.control_initialized(),
             "runtime should stay control-initialized after sink events deactivate recovery"
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_sink_cutover_followup_recomputes_control_initialized_after_prior_sink_lane_failure()
+     {
+        struct SinkControlErrorHookReset;
+        struct SinkWorkerControlFramePauseHookReset;
+
+        impl Drop for SinkControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SinkWorkerControlFramePauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_pause_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_watch_scan_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        let sink_events_route = (
+            execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+        );
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                sink_events_route.1.clone(),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial sink events wave should succeed");
+        assert!(
+            app.control_initialized(),
+            "initial sink activation should initialize runtime control"
+        );
+
+        app.shared_sink_route_claims.lock().await.insert(
+            sink_events_route.clone(),
+            std::collections::BTreeSet::from([app.instance_id, app.instance_id + 1]),
+        );
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = SinkWorkerControlFramePauseHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let _err_reset = SinkControlErrorHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_error_hook(
+            crate::workers::sink::SinkWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated first sink-only cutover lane failure".to_string(),
+                ),
+            },
+        );
+
+        let first = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    &[("test-root", &["single-app-node::root-1"])],
+                    3,
+                )])
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("first sink-only cutover lane should reach sink.apply");
+
+        let second = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    &[("test-root", &["single-app-node::root-1"])],
+                    4,
+                )])
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        release.notify_waiters();
+
+        let first_err = first
+            .await
+            .expect("join first sink-only lane")
+            .expect_err("first sink-only lane should fail");
+        assert!(
+            first_err
+                .to_string()
+                .contains("simulated first sink-only cutover lane failure"),
+            "unexpected first sink-only lane error: {first_err}"
+        );
+        assert!(
+            !app.control_initialized(),
+            "failed first sink-only lane must leave runtime uninitialized"
+        );
+
+        second
+            .await
+            .expect("join second queued sink-only lane")
+            .expect(
+                "queued follow-up sink-only lane must recompute runtime initialization state and recover after the prior failure",
+            );
+        assert!(
+            app.control_initialized(),
+            "queued follow-up sink-only lane should restore runtime initialization continuity after prior failure"
         );
 
         app.close().await.expect("close app");
