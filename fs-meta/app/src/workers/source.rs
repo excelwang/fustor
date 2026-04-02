@@ -1597,6 +1597,29 @@ impl SourceWorkerClientHandle {
         Ok(())
     }
 
+    pub(crate) async fn reconnect_after_fail_closed_control_error(&self) -> Result<()> {
+        let replacement = SharedSourceWorkerClient {
+            instance_id: next_shared_source_worker_instance_id(),
+            client: Arc::new(self.worker_factory.connect(
+                self.node_id.clone(),
+                self.config.clone(),
+                self.worker_binding.clone(),
+            )?),
+        };
+        let stale_client = {
+            let mut guard = self._shared.worker.lock().await;
+            let stale = guard.client.clone();
+            *guard = replacement;
+            stale
+        };
+        let _ = stale_client.shutdown(Duration::from_millis(250)).await;
+        Ok(())
+    }
+
+    pub(crate) async fn reconnect_after_retryable_control_reset(&self) -> Result<()> {
+        self.reconnect_after_fail_closed_control_error().await
+    }
+
     fn begin_control_op(&self) -> InflightControlOpGuard {
         self.control_ops_inflight.fetch_add(1, Ordering::Relaxed);
         InflightControlOpGuard {
@@ -3204,6 +3227,20 @@ impl SourceFacade {
                 Ok(())
             }
             Self::Worker(client) => client.trigger_rescan_when_ready().await,
+        }
+    }
+
+    pub(crate) async fn reconnect_after_fail_closed_control_error(&self) -> Result<()> {
+        match self {
+            Self::Local(_) => Ok(()),
+            Self::Worker(client) => client.reconnect_after_fail_closed_control_error().await,
+        }
+    }
+
+    pub(crate) async fn reconnect_after_retryable_control_reset(&self) -> Result<()> {
+        match self {
+            Self::Local(_) => Ok(()),
+            Self::Worker(client) => client.reconnect_after_retryable_control_reset().await,
         }
     }
 

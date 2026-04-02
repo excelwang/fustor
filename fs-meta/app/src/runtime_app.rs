@@ -2838,6 +2838,46 @@ impl FSMetaApp {
         }
     }
 
+    fn facade_signal_apply_priority(signal: &FacadeControlSignal) -> u8 {
+        match signal {
+            FacadeControlSignal::Activate {
+                unit: FacadeRuntimeUnit::Facade,
+                ..
+            } => 0,
+            _ => 1,
+        }
+    }
+
+    async fn query_route_activate_blocked_by_pending_facade_claim_conflict(
+        &self,
+        generation: u64,
+    ) -> bool {
+        let pending = self.pending_facade.lock().await.clone();
+        let Some(pending) = pending else {
+            return false;
+        };
+        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+            || generation < pending.generation
+        {
+            return false;
+        }
+        if facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
+            return false;
+        }
+        if self.api_task.lock().await.as_ref().is_some_and(|active| {
+            active.route_key == pending.route_key && active.resource_ids == pending.resource_ids
+        }) {
+            return false;
+        }
+        let guard = match process_facade_claim_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.get(&pending.resolved.bind_addr).is_some_and(|claim| {
+            claim.owner_instance_id != self.instance_id && claim.matches_pending(&pending)
+        })
+    }
+
     async fn apply_facade_activate(
         &self,
         unit: FacadeRuntimeUnit,
@@ -2853,6 +2893,21 @@ impl FSMetaApp {
             bound_scopes.len()
         );
         if !facade_route_key_matches(unit, route_key) {
+            return Ok(());
+        }
+        if matches!(
+            unit,
+            FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer
+        ) && self
+            .query_route_activate_blocked_by_pending_facade_claim_conflict(generation)
+            .await
+        {
+            eprintln!(
+                "fs_meta_runtime_app: suppress facade-dependent route unit={} route_key={} generation={} while pending facade fixed-bind claim is still owned by another instance",
+                unit.unit_id(),
+                route_key,
+                generation
+            );
             return Ok(());
         }
         // Facade activation is a runtime-owned generation/bind/run handoff carrier.
@@ -3181,8 +3236,14 @@ impl FSMetaApp {
         let filtered_source_signals = self
             .filter_shared_source_route_deactivates(source_signals)
             .await;
-        self.record_retained_source_control_state(&filtered_source_signals)
-            .await;
+        let defer_retained_state_until_success = fail_closed_in_generation_cutover_lane
+            && filtered_source_signals
+                .iter()
+                .all(Self::source_signal_is_restart_deferred_retire_pending);
+        if !defer_retained_state_until_success {
+            self.record_retained_source_control_state(&filtered_source_signals)
+                .await;
+        }
         let deadline = tokio::time::Instant::now() + SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT;
         loop {
             let effective_source_signals = self
@@ -3205,6 +3266,10 @@ impl FSMetaApp {
                 .await
             {
                 Ok(()) => {
+                    if defer_retained_state_until_success {
+                        self.record_retained_source_control_state(&filtered_source_signals)
+                            .await;
+                    }
                     self.record_shared_source_route_claims(&effective_source_signals)
                         .await;
                     self.source_state_replay_required
@@ -3216,7 +3281,9 @@ impl FSMetaApp {
                         "fs_meta_runtime_app: source control fail-closed restart_deferred_retire_pending err={}",
                         err
                     );
-                    self.record_shared_source_route_claims(&effective_source_signals)
+                    let _ = self
+                        .source
+                        .reconnect_after_fail_closed_control_error()
                         .await;
                     self.mark_control_uninitialized_after_failure().await;
                     return Ok(());
@@ -3229,6 +3296,7 @@ impl FSMetaApp {
                         "fs_meta_runtime_app: source control replay after retryable reset err={}",
                         err
                     );
+                    let _ = self.source.reconnect_after_retryable_control_reset().await;
                     self.reinitialize_after_control_reset().await?;
                 }
                 Err(err) => {
@@ -3679,7 +3747,9 @@ impl FSMetaApp {
     }
 
     async fn service_on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
-        let (source_signals, sink_signals, facade_signals) = split_app_control_signals(envelopes)?;
+        let (source_signals, sink_signals, mut facade_signals) =
+            split_app_control_signals(envelopes)?;
+        facade_signals.sort_by_key(Self::facade_signal_apply_priority);
         let requires_shared_serial = !source_signals.is_empty()
             || !sink_signals.is_empty()
             || self.control_initialized()
@@ -3808,8 +3878,6 @@ impl FSMetaApp {
             self.ensure_runtime_proxy_endpoints_started().await?;
         }
         if source_cleanup_only_while_uninitialized {
-            self.record_retained_source_control_state(&source_signals)
-                .await;
             self.record_shared_source_route_claims(&source_signals)
                 .await;
         }
@@ -20742,6 +20810,387 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_peer_turnover_does_not_publish_query_routes_while_fixed_bind_facade_claim_is_owned_by_predecessor()
+     {
+        struct ProcessFacadeClaimReset;
+
+        impl Drop for ProcessFacadeClaimReset {
+            fn drop(&mut self) {
+                clear_process_facade_claim_for_tests();
+            }
+        }
+
+        clear_process_facade_claim_for_tests();
+        let _claim_reset = ProcessFacadeClaimReset;
+
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        let predecessor_root = tmp.path().join("predecessor-root");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        fs::create_dir_all(&predecessor_root).expect("create predecessor root");
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let listener_resource = api::config::ApiListenerResource {
+            resource_id: "listener-a".to_string(),
+            bind_addr: bind_addr.clone(),
+        };
+
+        let (passwd_path_1, shadow_path_1) = write_auth_files(&tmp);
+        let predecessor = FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new(
+                        "predecessor-root",
+                        &predecessor_root,
+                    )],
+                    host_object_grants: vec![granted_mount_root(
+                        "node-d-predecessor::predecessor-root",
+                        &predecessor_root,
+                    )],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path: passwd_path_1,
+                        shadow_path: shadow_path_1,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-d-fixed-bind-predecessor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init predecessor app");
+        *predecessor.pending_facade.lock().await = Some(PendingFacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec![listener_resource.resource_id.clone()],
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: listener_resource.resource_id.clone(),
+                resource_ids: vec![listener_resource.resource_id.clone()],
+            }],
+            group_ids: Vec::new(),
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            resolved: predecessor
+                .config
+                .api
+                .resolve_for_candidate_ids(std::slice::from_ref(&listener_resource.resource_id))
+                .expect("resolve predecessor facade config"),
+        });
+        match predecessor.try_spawn_pending_facade().await {
+            Ok(true) => {}
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Ok(false) => panic!("predecessor fixed-bind facade should claim the listener"),
+            Err(err) => panic!("spawn predecessor facade: {err}"),
+        }
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let (passwd_path_2, shadow_path_2) = write_auth_files(&tmp);
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![
+                            worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                            worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                        ],
+                        host_object_grants: Vec::new(),
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: listener_resource.resource_id.clone(),
+                        local_listener_resources: vec![listener_resource.clone()],
+                        auth: api::ApiAuthConfig {
+                            passwd_path: passwd_path_2,
+                            shadow_path: shadow_path_2,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("node-d-fixed-bind-successor".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init successor app"),
+        );
+
+        if cfg!(target_os = "linux") {
+            if let Err(err) = app.start().await {
+                predecessor
+                    .close()
+                    .await
+                    .expect("close predecessor after successor start failure");
+                match err {
+                    CnxError::InvalidInput(msg)
+                        if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                    {
+                        return;
+                    }
+                    other => panic!("start successor app: {other}"),
+                }
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            predecessor
+                .close()
+                .await
+                .expect("close predecessor after non-linux failure");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        app.on_control_frame(&[host_object_grants_changed_rows_envelope(
+            1,
+            &[
+                (
+                    "node-d::nfs1",
+                    "node-d",
+                    "10.0.0.41",
+                    nfs1.to_string_lossy().as_ref(),
+                    &nfs1_source,
+                    true,
+                ),
+                (
+                    "node-d::nfs2",
+                    "node-d",
+                    "10.0.0.42",
+                    nfs2.to_string_lossy().as_ref(),
+                    &nfs2_source,
+                    true,
+                ),
+            ],
+        )])
+        .await
+        .expect("apply peer runtime host grants changed");
+
+        let mixed_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-d::nfs1"]), ("nfs2", &["node-d::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_QUERY),
+                    &[("nfs1", &["listener-a"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::FACADE_RUNTIME_UNIT_ID,
+                    facade_control_stream_route(),
+                    &[("nfs1", &["listener-a"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-d::nfs1"]), ("nfs2", &["node-d::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    &[("nfs1", &["listener-a"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-d::nfs1"]), ("nfs2", &["node-d::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    &[("nfs1", &["listener-a"])],
+                    generation + 1,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                    generation + 1,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-d::nfs1"]), ("nfs2", &["node-d::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    &[("nfs1", &["listener-a"])],
+                    generation + 1,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                    generation + 1,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    &[("nfs1", &["listener-a"])],
+                    generation + 1,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                    generation + 1,
+                ),
+            ]
+        };
+
+        app.on_control_frame(&mixed_wave(2))
+            .await
+            .expect("mixed successor route/facade wave should apply");
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("successor source groups")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("successor scan groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < recovery_deadline,
+                "successor source wave should still converge schedule under fixed-bind claim continuity: source={source_groups:?} scan={scan_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let claim = {
+            let guard = match process_facade_claim_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard
+                .get(&bind_addr)
+                .cloned()
+                .expect("fixed-bind facade claim should remain owned by predecessor")
+        };
+        assert_eq!(
+            claim.owner_instance_id, predecessor.instance_id,
+            "predecessor must continue owning the fixed bind while successor stays pending"
+        );
+        assert!(
+            app.api_task.lock().await.is_none(),
+            "successor must not install a local active facade handle while the predecessor still owns the fixed bind"
+        );
+        assert!(
+            app.pending_facade.lock().await.is_some(),
+            "successor facade should remain pending while the predecessor owns the fixed bind"
+        );
+
+        let query_routes = [
+            (
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_QUERY),
+            ),
+            (
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+            ),
+            (
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+            ),
+            (
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+            ),
+            (
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+            ),
+            (
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+            ),
+            (
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+            ),
+            (
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            ),
+            (
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            ),
+        ];
+        for (unit_id, route_key) in query_routes {
+            assert!(
+                !app.facade_gate
+                    .route_active(unit_id, &route_key)
+                    .expect("query route state"),
+                "successor must not publish facade-dependent route {route_key} under unit {unit_id} while the predecessor still owns the fixed bind"
+            );
+        }
+
+        let login = Client::new()
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request against predecessor facade");
+        assert!(
+            login.status().is_success(),
+            "predecessor facade listener should remain available during fixed-bind continuity: status={}",
+            login.status()
+        );
+
+        app.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
     async fn route_peer_turnover_restores_runnable_schedule_with_control_injected_peer_grants() {
         use std::collections::VecDeque;
 
@@ -23758,7 +24207,9 @@ mod tests {
         let _refresh_reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
         crate::workers::source::install_source_worker_scheduled_groups_refresh_error_queue_hook(
             crate::workers::source::SourceWorkerScheduledGroupsRefreshErrorQueueHook {
-                errs: std::collections::VecDeque::from([CnxError::Timeout]),
+                errs: std::iter::repeat_with(|| CnxError::Timeout)
+                    .take(64)
+                    .collect(),
                 sticky_worker_instance_id: Some(previous_instance_id),
                 sticky_peer_err: None,
             },
@@ -24029,6 +24480,331 @@ mod tests {
             .expect(
                 "replayed peer source wave should not exhaust runtime-app source recovery on repeated post-ack scheduled-groups refresh timeouts",
             );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_only_source_status_route_republishes_after_cleanup_only_tail_before_later_node_c_four_envelope_source_reactivation()
+     {
+        struct SourceControlErrorHookReset;
+        struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+        struct SourceWorkerControlFramePauseHookReset;
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_scheduled_groups_refresh_error_queue_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerControlFramePauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_pause_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![
+                            worker_watch_scan_root("nfs1", &nfs1),
+                            worker_watch_scan_root("nfs2", &nfs2),
+                        ],
+                        host_object_grants: Vec::new(),
+                        ..SourceConfig::default()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("node-c-peer-cleanup-tail-replay".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        let source_client = match &*app.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+        let source_find_route = format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL);
+        let sink_status_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
+        let sink_query_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
+
+        let mut initial = source_wave(2);
+        initial.extend([
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_find_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_status_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_query_proxy_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+        ]);
+        app.on_control_frame(&initial)
+            .await
+            .expect("initial peer source/status wave should succeed");
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_query_proxy_route.clone(),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_status_route.clone(),
+                3,
+            ),
+        ])
+        .await
+        .expect("peer sink route turnover deactivates should complete");
+
+        let _source_error_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated peer source control failure after ok=false".to_string(),
+                ),
+            },
+        );
+
+        app.on_control_frame(&[deactivate_envelope_with_route_key_reason_and_lease(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            3,
+            "restart_deferred_retire_pending",
+            7,
+            11,
+            22,
+        )])
+        .await
+        .expect(
+            "peer source-only deactivate should fail-close into uninitialized replay-required recovery",
+        );
+        crate::workers::source::clear_source_worker_control_frame_error_hook();
+        assert!(!app.control_initialized());
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let cleanup_task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[
+                    deactivate_envelope_with_route_key_reason_and_lease(
+                        execution_units::SOURCE_RUNTIME_UNIT_ID,
+                        format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                        3,
+                        "restart_deferred_retire_pending",
+                        7,
+                        11,
+                        22,
+                    ),
+                    deactivate_envelope_with_route_key_reason_and_lease(
+                        execution_units::SOURCE_RUNTIME_UNIT_ID,
+                        format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                        3,
+                        "restart_deferred_retire_pending",
+                        7,
+                        11,
+                        22,
+                    ),
+                    deactivate_envelope_with_route_key_reason_and_lease(
+                        execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                        format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                        3,
+                        "restart_deferred_retire_pending",
+                        7,
+                        11,
+                        22,
+                    ),
+                ])
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_millis(600), entered.notified())
+            .await
+            .expect_err(
+                "cleanup-only source tail must stay cleanup-only and must not re-enter source worker",
+            );
+        release.notify_waiters();
+        cleanup_task
+            .await
+            .expect("join cleanup-only source tail")
+            .expect("cleanup-only source tail should settle while runtime remains uninitialized");
+        crate::workers::source::clear_source_worker_control_frame_pause_hook();
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_find_route.clone(),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route.clone(),
+                3,
+            ),
+        ])
+        .await
+        .expect(
+            "query-peer source cleanup routes should deactivate while runtime stays uninitialized",
+        );
+
+        let replayed = app.source_signals_with_replay(&[]).await;
+        let replayed_activates = replayed
+            .iter()
+            .filter(|signal| matches!(signal, SourceControlSignal::Activate { .. }))
+            .count();
+        assert_eq!(
+            replayed_activates, 4,
+            "cleanup-only source tail must not collapse retained replay from four source routes before the later node-c reactivation: {replayed:?}",
+        );
+
+        let previous_instance_id = source_client.worker_instance_id_for_tests().await;
+        let _refresh_reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+        crate::workers::source::install_source_worker_scheduled_groups_refresh_error_queue_hook(
+            crate::workers::source::SourceWorkerScheduledGroupsRefreshErrorQueueHook {
+                errs: std::iter::repeat_with(|| CnxError::Timeout)
+                    .take(64)
+                    .collect(),
+                sticky_worker_instance_id: Some(previous_instance_id),
+                sticky_peer_err: None,
+            },
+        );
+
+        let mut later = source_wave(4);
+        later.extend([
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route,
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                4,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_find_route,
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                4,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_status_route,
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                4,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_query_proxy_route,
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                4,
+            ),
+        ]);
+        tokio::time::timeout(Duration::from_secs(5), app.on_control_frame(&later))
+            .await
+            .expect(
+                "later node-c four-envelope source reactivation should settle after the cleanup-only tail",
+            )
+            .expect(
+                "later node-c four-envelope source reactivation should not exhaust runtime-app source recovery after the cleanup-only tail",
+            );
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        assert_eq!(
+            app.source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups after later reactivation")
+                .unwrap_or_default(),
+            expected_groups
+        );
+        assert_eq!(
+            app.source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups after later reactivation")
+                .unwrap_or_default(),
+            expected_groups
+        );
 
         app.close().await.expect("close app");
     }
@@ -30155,6 +30931,254 @@ mod tests {
         assert!(
             app.control_initialized(),
             "mixed replay after the retryable source-roots tick timeout must leave runtime control initialized once the retained wave plus tick has settled"
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn current_generation_source_roots_tick_timeout_replayed_mixed_wave_reacquires_fresh_source_client_before_replay()
+     {
+        struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+        struct SourceWorkerStartPauseHookReset;
+        struct SourceWorkerControlFrameErrorQueueHookReset;
+
+        impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_scheduled_groups_refresh_error_queue_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerStartPauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_start_pause_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerControlFrameErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_queue_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![
+                            worker_watch_scan_root("nfs1", &nfs1),
+                            worker_watch_scan_root("nfs2", &nfs2),
+                        ],
+                        host_object_grants: vec![
+                            worker_export(
+                                "single-app-node::nfs1",
+                                "single-app-node",
+                                "10.0.0.11",
+                                nfs1.clone(),
+                            ),
+                            worker_export(
+                                "single-app-node::nfs2",
+                                "single-app-node",
+                                "10.0.0.12",
+                                nfs2.clone(),
+                            ),
+                        ],
+                        ..SourceConfig::default()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".to_string()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init external-worker runtime app"),
+        );
+
+        let source_client = match &*app.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        let source_wave = || {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[
+                        ("nfs1", &["single-app-node::nfs1"]),
+                        ("nfs2", &["single-app-node::nfs2"]),
+                    ],
+                    2,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[
+                        ("nfs1", &["single-app-node::nfs1"]),
+                        ("nfs2", &["single-app-node::nfs2"]),
+                    ],
+                    2,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[
+                        ("nfs1", &["single-app-node::nfs1"]),
+                        ("nfs2", &["single-app-node::nfs2"]),
+                    ],
+                    2,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[
+                        ("nfs1", &["single-app-node::nfs1"]),
+                        ("nfs2", &["single-app-node::nfs2"]),
+                    ],
+                    2,
+                ),
+            ]
+        };
+
+        app.on_control_frame(&source_wave())
+            .await
+            .expect("generation-two source activate should succeed before the current-generation tick retry seam");
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups after generation-two activate")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups after generation-two activate")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for generation-two source/scan schedule convergence: source={source_groups:?} scan={scan_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let previous_instance_id = source_client.worker_instance_id_for_tests().await;
+        let _refresh_reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+        crate::workers::source::install_source_worker_scheduled_groups_refresh_error_queue_hook(
+            crate::workers::source::SourceWorkerScheduledGroupsRefreshErrorQueueHook {
+                errs: std::iter::repeat_with(|| CnxError::Timeout)
+                    .take(64)
+                    .collect(),
+                sticky_worker_instance_id: Some(previous_instance_id),
+                sticky_peer_err: None,
+            },
+        );
+
+        let start_entered = Arc::new(Notify::new());
+        let start_release = Arc::new(Notify::new());
+        let _start_pause_reset = SourceWorkerStartPauseHookReset;
+        crate::workers::source::install_source_worker_start_pause_hook(
+            crate::workers::source::SourceWorkerStartPauseHook {
+                entered: start_entered.clone(),
+                release: start_release.clone(),
+            },
+        );
+
+        let tick_task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[tick_envelope_with_route_key(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    2,
+                )])
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), start_entered.notified())
+            .await
+            .expect(
+                "current-generation source-roots tick refresh timeout should force replay-required reinitialize before the replayed mixed wave",
+            );
+
+        let _control_error_reset = SourceWorkerControlFrameErrorQueueHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_queue_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorQueueHook {
+                errs: std::collections::VecDeque::new(),
+                sticky_worker_instance_id: Some(previous_instance_id),
+                sticky_peer_err: Some(
+                    "transport closed: sidecar control bridge stopped".to_string(),
+                ),
+            },
+        );
+        start_release.notify_waiters();
+
+        tokio::time::timeout(Duration::from_secs(5), tick_task)
+            .await
+            .expect(
+                "current-generation source-roots tick recovery should settle after replay-required reinitialize even when the stale pre-timeout source client is poisoned for the replayed mixed wave",
+            )
+            .expect("join current-generation source-roots tick replay task")
+            .expect(
+                "replayed mixed source wave should reacquire a fresh source client before the stale pre-timeout client can stall the replayed five-envelope batch",
+            );
+
+        let next_instance_id = source_client.worker_instance_id_for_tests().await;
+        assert_ne!(
+            next_instance_id, previous_instance_id,
+            "current-generation source tick recovery must reacquire a fresh source worker client before replaying the retained mixed wave"
+        );
+
+        let source_groups = app
+            .source
+            .scheduled_source_group_ids()
+            .await
+            .expect("source groups after stale-client recovery")
+            .unwrap_or_default();
+        let scan_groups = app
+            .source
+            .scheduled_scan_group_ids()
+            .await
+            .expect("scan groups after stale-client recovery")
+            .unwrap_or_default();
+
+        assert_eq!(
+            source_groups, expected_groups,
+            "current-generation source tick stale-client recovery must preserve source groups after replaying the retained mixed wave"
+        );
+        assert_eq!(
+            scan_groups, expected_groups,
+            "current-generation source tick stale-client recovery must preserve scan groups after replaying the retained mixed wave"
+        );
+        assert!(
+            app.control_initialized(),
+            "current-generation source tick stale-client recovery must leave runtime control initialized once the replayed mixed wave has settled"
         );
 
         app.close().await.expect("close app");
