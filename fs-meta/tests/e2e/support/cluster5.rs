@@ -434,14 +434,42 @@ impl Cluster5 {
                 generation,
                 started.elapsed().as_millis()
             ),
-            Err(err) => eprintln!(
-                "cluster5: apply-release err node={} target_id={} generation={} elapsed_ms={} error={}",
-                node_name,
-                target_id,
-                generation,
-                started.elapsed().as_millis(),
-                err
-            ),
+            Err(err) => {
+                eprintln!(
+                    "cluster5: apply-release err node={} target_id={} generation={} elapsed_ms={} error={}",
+                    node_name,
+                    target_id,
+                    generation,
+                    started.elapsed().as_millis(),
+                    err
+                );
+                let process = self
+                    .node_process_status(node_name)
+                    .unwrap_or_else(|process_err| json!({ "error": process_err }));
+                let logs = self
+                    .node_log_excerpt(node_name)
+                    .unwrap_or_else(|logs_err| json!({ "error": logs_err }));
+                let evidence = json!({
+                    "node": node_name,
+                    "target_id": target_id,
+                    "target_generation": target_generation,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "error": err,
+                    "process": process,
+                    "logs": logs,
+                });
+                match write_temp_json("apply-release-node-evidence", &evidence) {
+                    Ok(path) => eprintln!(
+                        "cluster5: apply-release evidence node={} path={}",
+                        node_name,
+                        path.display()
+                    ),
+                    Err(write_err) => eprintln!(
+                        "cluster5: apply-release evidence write failed node={} error={}",
+                        node_name, write_err
+                    ),
+                }
+            }
         }
         result
     }

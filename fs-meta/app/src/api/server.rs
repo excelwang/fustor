@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex, RwLock};
@@ -42,6 +44,14 @@ pub struct ApiServerHandle {
     join: Option<ApiServerJoin>,
 }
 
+#[cfg(test)]
+static SHUTDOWN_BLOCKING_JOIN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn shutdown_blocking_join_inflight() -> usize {
+    SHUTDOWN_BLOCKING_JOIN_INFLIGHT.load(Ordering::SeqCst)
+}
+
 impl ApiServerHandle {
     pub async fn shutdown(mut self, timeout: Duration) {
         eprintln!("fs_meta_api_server: shutdown requested");
@@ -51,18 +61,16 @@ impl ApiServerHandle {
         };
         match join {
             ApiServerJoin::Thread(join) => {
-                let blocking_join = tokio::task::spawn_blocking(move || join.join());
-                match tokio::time::timeout(timeout, blocking_join).await {
-                    Ok(Ok(Ok(()))) => {}
-                    Ok(Ok(Err(err))) => {
-                        log::warn!("fs-meta api server thread panicked: {:?}", err);
-                    }
-                    Ok(Err(err)) => {
-                        log::warn!("fs-meta api server join wrapper failed: {:?}", err);
-                    }
-                    Err(_) => {
+                let deadline = tokio::time::Instant::now() + timeout;
+                while !join.is_finished() {
+                    if tokio::time::Instant::now() >= deadline {
                         log::warn!("fs-meta api server shutdown timed out");
+                        return;
                     }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if let Err(err) = join.join() {
+                    log::warn!("fs-meta api server thread panicked: {:?}", err);
                 }
             }
         }
@@ -296,7 +304,12 @@ fn request_requires_control_readiness(method: &Method, path: &str) -> bool {
 }
 
 fn request_counts_toward_control_drain(method: &Method, path: &str) -> bool {
-    !(matches!(method, &Method::GET) && path == "/api/fs-meta/v1/status")
+    matches!(
+        (method, path),
+        (&Method::PUT, "/api/fs-meta/v1/monitoring/roots")
+            | (&Method::POST, "/api/fs-meta/v1/index/rescan")
+            | (&Method::POST, "/api/fs-meta/v1/query-api-keys")
+    ) || (matches!(method, &Method::DELETE) && path.starts_with("/api/fs-meta/v1/query-api-keys/"))
 }
 
 async fn request_control_readiness_guard(
@@ -359,5 +372,106 @@ async fn query_api_key_guard(
     match auth.authorize_query_api_key(auth_header) {
         Ok(_) => next.run(request).await,
         Err(err) => err.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_control_drain_counts_only_management_writes() {
+        for (method, path) in [
+            (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
+            (Method::POST, "/api/fs-meta/v1/index/rescan"),
+            (Method::POST, "/api/fs-meta/v1/query-api-keys"),
+            (Method::DELETE, "/api/fs-meta/v1/query-api-keys/key-1"),
+        ] {
+            assert!(
+                request_counts_toward_control_drain(&method, path),
+                "{method} {path} should count toward global control drain"
+            );
+        }
+
+        for (method, path) in [
+            (Method::POST, "/api/fs-meta/v1/session/login"),
+            (Method::GET, "/api/fs-meta/v1/status"),
+            (Method::GET, "/api/fs-meta/v1/runtime/grants"),
+            (Method::GET, "/api/fs-meta/v1/monitoring/roots"),
+            (Method::POST, "/api/fs-meta/v1/monitoring/roots/preview"),
+            (Method::GET, "/api/fs-meta/v1/query-api-keys"),
+            (Method::GET, "/api/fs-meta/v1/tree"),
+            (Method::GET, "/api/fs-meta/v1/stats"),
+            (Method::GET, "/api/fs-meta/v1/on-demand-force-find"),
+            (Method::GET, "/api/fs-meta/v1/bound-route-metrics"),
+        ] {
+            assert!(
+                !request_counts_toward_control_drain(&method, path),
+                "{method} {path} should not count toward global control drain"
+            );
+        }
+    }
+
+    #[test]
+    fn request_control_readiness_stays_limited_to_status_and_roots_put() {
+        for (method, path) in [
+            (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
+            (Method::GET, "/api/fs-meta/v1/status"),
+        ] {
+            assert!(
+                request_requires_control_readiness(&method, path),
+                "{method} {path} should require control readiness"
+            );
+        }
+
+        for (method, path) in [
+            (Method::POST, "/api/fs-meta/v1/session/login"),
+            (Method::GET, "/api/fs-meta/v1/runtime/grants"),
+            (Method::POST, "/api/fs-meta/v1/monitoring/roots/preview"),
+            (Method::POST, "/api/fs-meta/v1/index/rescan"),
+            (Method::GET, "/api/fs-meta/v1/tree"),
+        ] {
+            assert!(
+                !request_requires_control_readiness(&method, path),
+                "{method} {path} should not require control readiness"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_timeout_must_not_leave_blocking_join_task_inflight() {
+        SHUTDOWN_BLOCKING_JOIN_INFLIGHT.store(0, Ordering::SeqCst);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let thread_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_exited_flag = thread_exited.clone();
+        let join = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+            thread_exited_flag.store(true, Ordering::SeqCst);
+        });
+        let handle = ApiServerHandle {
+            shutdown: CancellationToken::new(),
+            join: Some(ApiServerJoin::Thread(join)),
+        };
+
+        handle.shutdown(Duration::from_millis(30)).await;
+        let returned_while_thread_alive = !thread_exited.load(Ordering::SeqCst);
+        let inflight_after_shutdown_return = shutdown_blocking_join_inflight();
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if thread_exited.load(Ordering::SeqCst) && shutdown_blocking_join_inflight() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("join task should settle after releasing the synthetic server thread");
+
+        assert_eq!(
+            inflight_after_shutdown_return, 0,
+            "shutdown returned with an inflight blocking join task; returned_while_thread_alive={returned_while_thread_alive}"
+        );
     }
 }

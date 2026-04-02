@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use capanix_app_sdk::{CnxError, Result};
 use capanix_runtime_entry_sdk::control::RuntimeBoundScope;
@@ -16,7 +16,7 @@ struct UnitControlState {
     routes: HashMap<String, RouteControlState>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct UnitControlGate {
     units: HashMap<String, UnitControlState>,
 }
@@ -96,11 +96,12 @@ impl UnitControlGate {
 /// - unit allowlist contract
 /// - generation fencing behavior
 /// - activate/deactivate/tick acceptance rules
+#[derive(Clone)]
 pub(crate) struct RuntimeUnitGate {
     app_label: &'static str,
     supported_units: BTreeSet<String>,
     runtime_managed: bool,
-    gate: Mutex<UnitControlGate>,
+    gate: Arc<Mutex<UnitControlGate>>,
 }
 
 impl RuntimeUnitGate {
@@ -127,7 +128,7 @@ impl RuntimeUnitGate {
             app_label,
             supported_units,
             runtime_managed,
-            gate: Mutex::new(UnitControlGate::default()),
+            gate: Arc::new(Mutex::new(UnitControlGate::default())),
         }
     }
 
@@ -226,6 +227,19 @@ impl RuntimeUnitGate {
             .get(unit_id)
             .and_then(|state| state.routes.get(route_key))
             .map(|route| route.generation))
+    }
+
+    pub(crate) fn route_active(&self, unit_id: &str, route_key: &str) -> Result<bool> {
+        self.validate_runtime_unit(unit_id)?;
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| CnxError::Internal("RuntimeUnitGate lock poisoned".into()))?;
+        Ok(gate
+            .units
+            .get(unit_id)
+            .and_then(|state| state.routes.get(route_key))
+            .is_some_and(|route| route.active))
     }
 
     pub(crate) fn has_runtime_state(&self) -> bool {
@@ -403,6 +417,71 @@ mod tests {
         let scopes = state.1;
         assert_eq!(scopes.len(), 1);
         assert_eq!(scopes[0].scope_id, "nfs2");
+    }
+
+    #[test]
+    fn route_active_distinguishes_inactive_route_from_retained_generation() {
+        let gate = RuntimeUnitGate::new_runtime_managed("test-gate", &["runtime.exec.query-peer"]);
+
+        gate.apply_activate(
+            "runtime.exec.query-peer",
+            "materialized-find-proxy:v1.req",
+            2,
+            &[bound_scope("nfs1", "listener-a")],
+        )
+        .expect("activate route");
+        gate.apply_deactivate(
+            "runtime.exec.query-peer",
+            "materialized-find-proxy:v1.req",
+            3,
+        )
+        .expect("deactivate route");
+
+        assert_eq!(
+            gate.route_generation("runtime.exec.query-peer", "materialized-find-proxy:v1.req")
+                .expect("route generation"),
+            Some(3),
+            "generation bookkeeping should remain after deactivate",
+        );
+        assert!(
+            !gate
+                .route_active("runtime.exec.query-peer", "materialized-find-proxy:v1.req")
+                .expect("route active"),
+            "route_active must report false once deactivate clears active ownership",
+        );
+    }
+
+    #[test]
+    fn cloned_runtime_unit_gate_shares_live_route_state() {
+        let gate = RuntimeUnitGate::new_runtime_managed("test-gate", &["runtime.exec.query-peer"]);
+        let clone = gate.clone();
+
+        gate.apply_activate(
+            "runtime.exec.query-peer",
+            "materialized-find-proxy:v1.req",
+            2,
+            &[bound_scope("nfs1", "listener-a")],
+        )
+        .expect("activate route");
+        assert!(
+            clone
+                .route_active("runtime.exec.query-peer", "materialized-find-proxy:v1.req")
+                .expect("clone sees active route"),
+            "cloned gate must see live activate state"
+        );
+
+        gate.apply_deactivate(
+            "runtime.exec.query-peer",
+            "materialized-find-proxy:v1.req",
+            3,
+        )
+        .expect("deactivate route");
+        assert!(
+            !clone
+                .route_active("runtime.exec.query-peer", "materialized-find-proxy:v1.req")
+                .expect("clone sees deactivated route"),
+            "cloned gate must observe later deactivates instead of keeping a stale snapshot",
+        );
     }
 
     #[test]

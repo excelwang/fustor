@@ -1,7 +1,7 @@
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::mpsc::{Receiver, sync_channel};
-use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(test)]
@@ -103,8 +103,9 @@ fn is_retryable_worker_bridge_peer_error(err: &CnxError) -> bool {
 }
 
 fn should_emit_endpoint_retry_log(key: &str) -> bool {
-    static LAST_EMIT: std::sync::OnceLock<StdMutex<std::collections::HashMap<String, std::time::Instant>>> =
-        std::sync::OnceLock::new();
+    static LAST_EMIT: std::sync::OnceLock<
+        StdMutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
     let now = std::time::Instant::now();
     let mut guard = LAST_EMIT
         .get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
@@ -181,6 +182,14 @@ pub(crate) struct ManagedEndpointTask {
     shutdown: CancellationToken,
     terminal_reason: Arc<StdMutex<Option<String>>>,
     join: Option<EndpointJoin>,
+}
+
+#[cfg(test)]
+static SHUTDOWN_BLOCKING_JOIN_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn shutdown_blocking_join_inflight() -> usize {
+    SHUTDOWN_BLOCKING_JOIN_INFLIGHT.load(Ordering::SeqCst)
 }
 
 impl ManagedEndpointTask {
@@ -459,26 +468,20 @@ impl ManagedEndpointTask {
         match join {
             EndpointJoin::Thread(join) => {
                 if tokio::runtime::Handle::try_current().is_ok() {
-                    let blocking_join = tokio::task::spawn_blocking(move || join.join());
-                    match tokio::time::timeout(wait_timeout, blocking_join).await {
-                        Ok(Ok(Ok(()))) => {}
-                        Ok(Ok(Err(err))) => {
-                            log::warn!("endpoint task {} thread panicked: {:?}", self.name, err);
-                        }
-                        Ok(Err(err)) => {
-                            log::warn!(
-                                "endpoint task {} join wrapper failed: {:?}",
-                                self.name,
-                                err
-                            );
-                        }
-                        Err(_) => {
+                    let deadline = tokio::time::Instant::now() + wait_timeout;
+                    while !join.is_finished() {
+                        if tokio::time::Instant::now() >= deadline {
                             log::warn!(
                                 "endpoint task {} thread did not exit within {:?}",
                                 self.name,
                                 wait_timeout
                             );
+                            return;
                         }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    if let Err(err) = join.join() {
+                        log::warn!("endpoint task {} thread panicked: {:?}", self.name, err);
                     }
                 } else if let Err(err) = join.join() {
                     log::warn!("endpoint task {} thread panicked: {:?}", self.name, err);
@@ -1456,6 +1459,46 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(30),
             "endpoint spawn must wait for the recv loop to enter loop_start before returning; elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn endpoint_shutdown_timeout_must_not_leave_blocking_join_task_inflight() {
+        SHUTDOWN_BLOCKING_JOIN_INFLIGHT.store(0, Ordering::SeqCst);
+        let (release_tx, release_rx) = sync_channel::<()>(1);
+        let thread_exited = Arc::new(AtomicBool::new(false));
+        let thread_exited_flag = thread_exited.clone();
+        let join = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+            thread_exited_flag.store(true, Ordering::SeqCst);
+        });
+        let mut endpoint = ManagedEndpointTask {
+            name: "test-endpoint".to_string(),
+            route_key: "sink-status:v1.req".to_string(),
+            shutdown: CancellationToken::new(),
+            terminal_reason: Arc::new(StdMutex::new(None)),
+            join: Some(EndpointJoin::Thread(join)),
+        };
+
+        endpoint.shutdown(Duration::from_millis(30)).await;
+        let returned_while_thread_alive = !thread_exited.load(Ordering::SeqCst);
+        let inflight_after_shutdown_return = shutdown_blocking_join_inflight();
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if thread_exited.load(Ordering::SeqCst) && shutdown_blocking_join_inflight() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("endpoint join task should settle after releasing synthetic thread");
+
+        assert_eq!(
+            inflight_after_shutdown_return, 0,
+            "endpoint shutdown returned with an inflight blocking join task; returned_while_thread_alive={returned_while_thread_alive}"
         );
     }
 

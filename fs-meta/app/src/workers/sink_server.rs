@@ -864,7 +864,9 @@ impl TypedWorkerBootstrapSession<SinkWorkerInitConfig> for SinkWorkerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::routes::{METHOD_STREAM, ROUTE_TOKEN_FS_META_EVENTS, default_route_bindings};
+    use crate::runtime::routes::{
+        METHOD_STREAM, ROUTE_TOKEN_FS_META_EVENTS, default_route_bindings,
+    };
     use crate::source::config::{GrantedMountRoot, RootSpec};
     use capanix_runtime_entry_sdk::control::{
         RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, encode_runtime_exec_control,
@@ -952,8 +954,8 @@ mod tests {
             .resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM)
             .expect("resolve stream route")
             .0;
-        sink.on_control_frame(&[
-            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+        sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+            RuntimeExecActivate {
                 route_key: stream_route.clone(),
                 unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
                 lease: None,
@@ -963,11 +965,11 @@ mod tests {
                     scope_id: "nfs1".to_string(),
                     resource_ids: Vec::new(),
                 }],
-            }))
-            .expect("encode sink events activate"),
-        ])
-        .await
-        .expect("activate sink events route before terminal seeding");
+            },
+        ))
+        .expect("encode sink events activate")])
+            .await
+            .expect("activate sink events route before terminal seeding");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         loop {

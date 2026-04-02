@@ -28,6 +28,7 @@ use crate::workers::source_ipc::{
 };
 
 const SOURCE_WORKER_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(15);
+const SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_START_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
@@ -86,19 +87,91 @@ fn can_retry_update_logical_roots(err: &CnxError) -> bool {
     ) || matches!(
         err,
         CnxError::TransportClosed(_) | CnxError::Timeout | CnxError::ChannelClosed
-    )
-        || is_retryable_worker_bridge_peer_error(err)
+    ) || is_retryable_worker_bridge_peer_error(err)
         || matches!(
             err,
-            CnxError::AccessDenied(message) | CnxError::PeerError(message)
+            CnxError::AccessDenied(message)
+                | CnxError::PeerError(message)
+                | CnxError::Internal(message)
                 if message.contains("drained/fenced")
                     && message.contains("grant attachments")
                     || message.contains("invalid or revoked grant attachment token")
+                    || message.contains("missing route state for channel_buffer")
         )
 }
 
 fn can_retry_on_control_frame(err: &CnxError) -> bool {
     can_retry_update_logical_roots(err)
+}
+
+fn source_control_signals_prefer_short_existing_client_attempt(
+    signals: &[SourceControlSignal],
+) -> bool {
+    signals.iter().any(|signal| {
+        matches!(
+            signal,
+            SourceControlSignal::Activate { .. }
+                | SourceControlSignal::Deactivate { .. }
+                | SourceControlSignal::Tick { .. }
+                | SourceControlSignal::ManualRescan { .. }
+                | SourceControlSignal::Passthrough(_)
+        )
+    })
+}
+
+fn source_control_signals_require_post_ack_schedule_refresh(
+    signals: &[SourceControlSignal],
+) -> bool {
+    signals
+        .iter()
+        .any(|signal| !matches!(signal, SourceControlSignal::RuntimeHostGrantChange { .. }))
+}
+
+fn source_control_signals_can_use_primed_schedule_timeout_fallback(
+    signals: &[SourceControlSignal],
+) -> bool {
+    let mut saw_activate = false;
+    for signal in signals {
+        match signal {
+            SourceControlSignal::Activate { .. } => saw_activate = true,
+            SourceControlSignal::RuntimeHostGrantChange { .. }
+            | SourceControlSignal::Tick { .. }
+            | SourceControlSignal::ManualRescan { .. }
+            | SourceControlSignal::Passthrough(_) => {}
+            SourceControlSignal::Deactivate { .. } => return false,
+        }
+    }
+    saw_activate
+}
+
+fn primed_schedule_cache_covers_signals(
+    cache: &SourceWorkerSnapshotCache,
+    node_id: &NodeId,
+    signals: &[SourceControlSignal],
+) -> bool {
+    let has_source_groups =
+        cached_local_scheduled_groups(node_id, &cache.scheduled_source_groups_by_node).is_some();
+    let has_scan_groups =
+        cached_local_scheduled_groups(node_id, &cache.scheduled_scan_groups_by_node).is_some();
+    let needs_source_groups = signals.iter().any(|signal| {
+        matches!(
+            signal,
+            SourceControlSignal::Activate {
+                unit: SourceRuntimeUnit::Source,
+                ..
+            }
+        )
+    });
+    let needs_scan_groups = signals.iter().any(|signal| {
+        matches!(
+            signal,
+            SourceControlSignal::Activate {
+                unit: SourceRuntimeUnit::Scan,
+                ..
+            }
+        )
+    });
+    (!needs_source_groups || has_source_groups) && (!needs_scan_groups || has_scan_groups)
 }
 
 fn debug_control_scope_capture_enabled() -> bool {
@@ -248,7 +321,10 @@ fn update_cached_scheduled_groups_from_refresh(
     mut scheduled_source: std::collections::BTreeMap<String, Vec<String>>,
     mut scheduled_scan: std::collections::BTreeMap<String, Vec<String>>,
 ) {
-    union_cached_groups(&mut scheduled_source, &cache.scheduled_source_groups_by_node);
+    union_cached_groups(
+        &mut scheduled_source,
+        &cache.scheduled_source_groups_by_node,
+    );
     union_cached_groups(&mut scheduled_scan, &cache.scheduled_scan_groups_by_node);
     cache.scheduled_source_groups_by_node = Some(scheduled_source);
     cache.scheduled_scan_groups_by_node = Some(scheduled_scan);
@@ -408,6 +484,8 @@ fn prime_cached_schedule_from_control_signals(
                             && grant.object_ref == *resource_id
                     }) || host_ref_from_resource_id(resource_id)
                         .is_some_and(|host_ref| host_ref_matches_node_id(host_ref, node_id))
+                        || (*resource_id == scope.scope_id
+                            && roots.iter().any(|root| root.id == scope.scope_id))
                 });
             if !applies_locally {
                 continue;
@@ -1316,8 +1394,14 @@ async fn maybe_pause_before_on_control_frame_rpc() {
         guard.take()
     };
     if let Some(hook) = hook {
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
         hook.entered.notify_waiters();
-        hook.release.notified().await;
+        release.await;
     }
 }
 
@@ -1331,8 +1415,14 @@ async fn maybe_pause_before_ensure_started() {
         guard.take()
     };
     if let Some(hook) = hook {
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
         hook.entered.notify_waiters();
-        hook.release.notified().await;
+        release.await;
     }
 }
 
@@ -1360,8 +1450,14 @@ async fn maybe_pause_before_update_logical_roots_rpc() {
         guard.take()
     };
     if let Some(hook) = hook {
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
         hook.entered.notify_waiters();
-        hook.release.notified().await;
+        release.await;
     }
 }
 
@@ -1489,7 +1585,15 @@ impl SourceWorkerClientHandle {
                 self.worker_binding.clone(),
             )?),
         };
-        *self._shared.worker.lock().await = replacement;
+        let stale_client = {
+            let mut guard = self._shared.worker.lock().await;
+            let stale = guard.client.clone();
+            *guard = replacement;
+            stale
+        };
+        tokio::spawn(async move {
+            let _ = stale_client.shutdown(Duration::from_millis(250)).await;
+        });
         Ok(())
     }
 
@@ -1579,6 +1683,15 @@ impl SourceWorkerClientHandle {
         });
     }
 
+    fn schedule_refresh_call_timeout(deadline: std::time::Instant) -> Result<Duration> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            Err(CnxError::Timeout)
+        } else {
+            Ok(std::cmp::min(SOURCE_WORKER_CONTROL_RPC_TIMEOUT, remaining))
+        }
+    }
+
     async fn refresh_cached_scheduled_groups_from_live_worker(&self) -> Result<()> {
         eprintln!(
             "fs_meta_source_worker_client: refresh_cached_scheduled_groups begin node={}",
@@ -1632,7 +1745,7 @@ impl SourceWorkerClientHandle {
             let grants = match Self::call_worker(
                 &client,
                 SourceWorkerRequest::HostObjectGrantsSnapshot,
-                SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                Self::schedule_refresh_call_timeout(deadline)?,
             )
             .await
             {
@@ -1689,13 +1802,13 @@ impl SourceWorkerClientHandle {
                 if let Some(err) = injected {
                     Err(err)
                 } else {
-                    self.fetch_scheduled_groups_refresh_attempt(&client, &stable_host_ref)
+                    self.fetch_scheduled_groups_refresh_attempt(&client, &stable_host_ref, deadline)
                         .await
                 }
             };
             #[cfg(not(test))]
             let refresh_attempt = self
-                .fetch_scheduled_groups_refresh_attempt(&client, &stable_host_ref)
+                .fetch_scheduled_groups_refresh_attempt(&client, &stable_host_ref, deadline)
                 .await;
             let (scheduled_source, scheduled_scan) = match refresh_attempt {
                 Ok(groups) => groups,
@@ -1755,6 +1868,7 @@ impl SourceWorkerClientHandle {
         &self,
         client: &TypedWorkerClient<SourceWorkerRpc>,
         stable_host_ref: &str,
+        deadline: std::time::Instant,
     ) -> Result<(
         std::collections::BTreeMap<String, Vec<String>>,
         std::collections::BTreeMap<String, Vec<String>>,
@@ -1779,7 +1893,7 @@ impl SourceWorkerClientHandle {
         let scheduled_source = match Self::call_worker(
             client,
             SourceWorkerRequest::ScheduledSourceGroupIds,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+            Self::schedule_refresh_call_timeout(deadline)?,
         )
         .await?
         {
@@ -1801,7 +1915,7 @@ impl SourceWorkerClientHandle {
         let scheduled_scan = match Self::call_worker(
             client,
             SourceWorkerRequest::ScheduledScanGroupIds,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+            Self::schedule_refresh_call_timeout(deadline)?,
         )
         .await?
         {
@@ -2199,6 +2313,17 @@ impl SourceWorkerClientHandle {
         }
     }
 
+    #[cfg(test)]
+    async fn on_control_frame_with_timeouts_for_tests(
+        &self,
+        envelopes: Vec<ControlEnvelope>,
+        total_timeout: Duration,
+        rpc_timeout: Duration,
+    ) -> Result<()> {
+        self.on_control_frame_with_timeouts(envelopes, total_timeout, rpc_timeout)
+            .await
+    }
+
     pub async fn scheduled_source_group_ids(
         &self,
     ) -> Result<Option<std::collections::BTreeSet<String>>> {
@@ -2248,8 +2373,8 @@ impl SourceWorkerClientHandle {
         let deadline = std::time::Instant::now() + SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT;
         loop {
             let now = std::time::Instant::now();
-            let attempt_timeout = SOURCE_WORKER_CONTROL_RPC_TIMEOUT
-                .min(deadline.saturating_duration_since(now));
+            let attempt_timeout =
+                SOURCE_WORKER_CONTROL_RPC_TIMEOUT.min(deadline.saturating_duration_since(now));
             if attempt_timeout.is_zero() {
                 return Err(CnxError::Timeout);
             }
@@ -2442,6 +2567,20 @@ impl SourceWorkerClientHandle {
     }
 
     pub async fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
+        self.on_control_frame_with_timeouts(
+            envelopes,
+            SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn on_control_frame_with_timeouts(
+        &self,
+        envelopes: Vec<ControlEnvelope>,
+        total_timeout: Duration,
+        rpc_timeout: Duration,
+    ) -> Result<()> {
         let _inflight = self.begin_control_op();
         let _serial = self.control_ops_serial.lock().await;
         #[cfg(test)]
@@ -2465,47 +2604,63 @@ impl SourceWorkerClientHandle {
                 ),
             }
         }
-        let deadline = std::time::Instant::now() + SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT;
+        let deadline = std::time::Instant::now() + total_timeout;
         loop {
             let now = std::time::Instant::now();
-            let attempt_timeout = std::cmp::min(
-                SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-                deadline.saturating_duration_since(now),
-            );
+            let worker = self.worker_client().await;
+            let prefer_short_existing_client_attempt =
+                decoded_signals.as_ref().is_some_and(|signals| {
+                    source_control_signals_prefer_short_existing_client_attempt(signals)
+                });
+            let rpc_attempt_budget = if prefer_short_existing_client_attempt
+                && worker.existing_client().await?.is_some()
+            {
+                SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT
+            } else {
+                rpc_timeout
+            };
+            let attempt_timeout =
+                std::cmp::min(rpc_attempt_budget, deadline.saturating_duration_since(now));
             if attempt_timeout.is_zero() {
                 return Err(CnxError::Timeout);
             }
-            let worker = self.worker_client().await;
             #[cfg(test)]
             let rpc_result = {
-                let injected_err =
-                    take_on_control_frame_error_hook(self.worker_instance_id_for_tests().await);
-                if let Some(err) = injected_err {
-                    Err(err)
-                } else {
-                    worker
-                        .with_started_retry(|client| {
-                            let envelopes = envelopes.clone();
-                            async move {
-                                #[cfg(test)]
-                                maybe_pause_before_on_control_frame_rpc().await;
-                                Self::call_worker(
-                                    &client,
-                                    SourceWorkerRequest::OnControlFrame {
-                                        envelopes: envelopes.clone(),
-                                    },
-                                    attempt_timeout,
-                                )
-                                .await
+                let worker_instance_id = self.worker_instance_id_for_tests().await;
+                match tokio::time::timeout(
+                    attempt_timeout,
+                    worker.with_started_retry(|client| {
+                        let envelopes = envelopes.clone();
+                        async move {
+                            #[cfg(test)]
+                            maybe_pause_before_on_control_frame_rpc().await;
+                            #[cfg(test)]
+                            if let Some(err) = take_on_control_frame_error_hook(worker_instance_id)
+                            {
+                                return Err(err);
                             }
-                        })
-                        .await
+                            Self::call_worker(
+                                &client,
+                                SourceWorkerRequest::OnControlFrame {
+                                    envelopes: envelopes.clone(),
+                                },
+                                attempt_timeout,
+                            )
+                            .await
+                        }
+                    }),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(CnxError::Timeout),
                 }
             };
             #[cfg(not(test))]
             let rpc_result = {
-                worker
-                    .with_started_retry(|client| {
+                match tokio::time::timeout(
+                    attempt_timeout,
+                    worker.with_started_retry(|client| {
                         let envelopes = envelopes.clone();
                         async move {
                             #[cfg(test)]
@@ -2519,24 +2674,62 @@ impl SourceWorkerClientHandle {
                             )
                             .await
                         }
-                    })
-                    .await
+                    }),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(CnxError::Timeout),
+                }
             };
             match rpc_result {
                 Ok(SourceWorkerResponse::Ack) => {
-                    if let Some(signals) = decoded_signals.as_ref() {
-                        self.with_cache_mut(|cache| {
-                            prime_cached_schedule_from_control_signals(
-                                cache,
-                                &self.node_id,
-                                signals,
-                                &self.config.roots,
-                                &self.config.host_object_grants,
-                            );
-                        });
+                    let should_refresh_cached_schedule =
+                        if let Some(signals) = decoded_signals.as_ref() {
+                            self.with_cache_mut(|cache| {
+                                prime_cached_schedule_from_control_signals(
+                                    cache,
+                                    &self.node_id,
+                                    signals,
+                                    &self.config.roots,
+                                    &self.config.host_object_grants,
+                                );
+                            });
+                            source_control_signals_require_post_ack_schedule_refresh(signals)
+                        } else {
+                            true
+                        };
+                    if should_refresh_cached_schedule {
+                        if let Err(err) = self
+                            .refresh_cached_scheduled_groups_from_live_worker()
+                            .await
+                        {
+                            let can_fail_closed_from_primed_cache = matches!(
+                                err,
+                                CnxError::Timeout
+                            ) && decoded_signals
+                                .as_ref()
+                                .is_some_and(|signals| {
+                                    source_control_signals_can_use_primed_schedule_timeout_fallback(
+                                        signals,
+                                    ) && self.with_cache_mut(|cache| {
+                                        primed_schedule_cache_covers_signals(
+                                            cache,
+                                            &self.node_id,
+                                            signals,
+                                        )
+                                    })
+                                });
+                            if can_fail_closed_from_primed_cache {
+                                eprintln!(
+                                    "fs_meta_source_worker_client: refresh_cached_scheduled_groups fail-closed node={} err={}",
+                                    self.node_id.0, err
+                                );
+                            } else {
+                                return Err(err);
+                            }
+                        }
                     }
-                    self.refresh_cached_scheduled_groups_from_live_worker()
-                        .await?;
                     eprintln!(
                         "fs_meta_source_worker_client: on_control_frame done node={} ok=true",
                         self.node_id.0
@@ -4926,6 +5119,108 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn on_control_frame_enforces_total_timeout_when_worker_call_stalls_after_first_wave() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![worker_source_root("nfs1", &nfs1)],
+            host_object_grants: vec![
+                worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = worker_socket_tempdir();
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        client
+            .on_control_frame(vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: ROUTE_KEY_QUERY.to_string(),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                    ],
+                }))
+                .expect("encode first-wave source activate"),
+            ])
+            .await
+            .expect("first source control wave should succeed");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _reset = SourceWorkerControlFramePauseHookReset;
+        install_source_worker_control_frame_pause_hook(SourceWorkerControlFramePauseHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let control_task = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .on_control_frame_with_timeouts_for_tests(
+                        vec![
+                            encode_runtime_exec_control(&RuntimeExecControl::Activate(
+                                RuntimeExecActivate {
+                                    route_key: ROUTE_KEY_QUERY.to_string(),
+                                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                                    lease: None,
+                                    generation: 2,
+                                    expires_at_ms: 1,
+                                    bound_scopes: vec![
+                                        bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                                        bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                                    ],
+                                },
+                            ))
+                            .expect("encode second-wave source activate"),
+                        ],
+                        Duration::from_millis(150),
+                        Duration::from_millis(150),
+                    )
+                    .await
+            }
+        });
+
+        entered.notified().await;
+        let err = tokio::time::timeout(Duration::from_secs(1), control_task)
+            .await
+            .expect("stalled source on_control_frame should resolve within the local total timeout budget")
+            .expect("join stalled source on_control_frame task")
+            .expect_err("stalled source on_control_frame should fail once its local timeout budget is exhausted");
+        assert!(matches!(err, CnxError::Timeout), "err={err:?}");
+
+        release.notify_waiters();
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn on_control_frame_reacquires_worker_client_after_transport_closes_mid_handoff() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
@@ -6958,7 +7253,10 @@ mod tests {
             "tick-only followup should reconnect to a fresh shared source worker client instance"
         );
 
-        let raw = client.client().await.expect("connect raw source worker client");
+        let raw = client
+            .client()
+            .await
+            .expect("connect raw source worker client");
         let snapshot = match SourceWorkerClientHandle::call_worker(
             &raw,
             SourceWorkerRequest::ObservabilitySnapshot,
@@ -6968,7 +7266,9 @@ mod tests {
         .expect("raw observability snapshot after tick-only reconnect")
         {
             SourceWorkerResponse::ObservabilitySnapshot(snapshot) => snapshot,
-            other => panic!("unexpected source worker response for raw observability snapshot: {other:?}"),
+            other => panic!(
+                "unexpected source worker response for raw observability snapshot: {other:?}"
+            ),
         };
 
         assert_eq!(
@@ -7113,8 +7413,14 @@ mod tests {
                 assert!(
                     tokio::time::Instant::now() < deadline,
                     "{label}: timed out waiting for scheduled groups after real source route replay: source={source_groups:?} scan={scan_groups:?} grants_version={} grants={:?} logical_roots={:?} stderr={}",
-                    client.host_object_grants_version_snapshot().await.unwrap_or_default(),
-                    client.host_object_grants_snapshot().await.unwrap_or_default(),
+                    client
+                        .host_object_grants_version_snapshot()
+                        .await
+                        .unwrap_or_default(),
+                    client
+                        .host_object_grants_snapshot()
+                        .await
+                        .unwrap_or_default(),
                     client.logical_roots_snapshot().await.unwrap_or_default(),
                     worker_stderr_excerpt(worker_socket_dir),
                 );
@@ -7155,6 +7461,675 @@ mod tests {
             worker_socket_dir.path(),
         )
         .await;
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generation_two_real_source_route_reacquires_worker_client_after_sticky_stale_drained_fenced_pid_error_during_post_ack_schedule_refresh()
+     {
+        struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+
+        impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
+            fn drop(&mut self) {
+                clear_source_worker_scheduled_groups_refresh_error_queue_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                worker_watch_scan_root("nfs1", &nfs1),
+                worker_watch_scan_root("nfs2", &nfs2),
+            ],
+            host_object_grants: Vec::new(),
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = worker_socket_tempdir();
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-a-29780730718931112664498177".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let source_wave = |generation| {
+            vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                    ],
+                }))
+                .expect("encode source roots activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                    ],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                    ],
+                }))
+                .expect("encode source rescan activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                    ],
+                }))
+                .expect("encode source scan activate"),
+            ]
+        };
+        let initial_control = std::iter::once(
+            encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+                version: 1,
+                grants: vec![
+                    worker_route_export("node-a::nfs1", "node-a", "10.0.0.11", &nfs1),
+                    worker_route_export("node-a::nfs2", "node-a", "10.0.0.12", &nfs2),
+                ],
+            })
+            .expect("encode runtime host grants changed"),
+        )
+        .chain(source_wave(1))
+        .collect::<Vec<_>>();
+
+        client
+            .on_control_frame(initial_control)
+            .await
+            .expect("initial real source route wave should succeed");
+
+        let previous_instance_id = client.worker_instance_id_for_tests().await;
+        let _reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+        install_source_worker_scheduled_groups_refresh_error_queue_hook(
+            SourceWorkerScheduledGroupsRefreshErrorQueueHook {
+                errs: std::collections::VecDeque::new(),
+                sticky_worker_instance_id: Some(previous_instance_id),
+                sticky_peer_err: Some(
+                    "worker receive request failed: access denied: pid Pid(1) is drained/fenced and cannot obtain new grant attachments"
+                        .to_string(),
+                ),
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(4), client.on_control_frame(source_wave(2)))
+            .await
+            .expect(
+                "generation-two real source route replay should reacquire a fresh worker client when post-ack schedule refresh stalls on a sticky stale drained/fenced pid recv error",
+            )
+            .expect(
+                "generation-two real source route replay should recover when post-ack schedule refresh forces a fresh shared worker client",
+            );
+
+        let next_instance_id = client.worker_instance_id_for_tests().await;
+        assert_ne!(
+            next_instance_id, previous_instance_id,
+            "real source route post-ack scheduled-groups refresh recovery must reacquire a fresh shared source worker client instance"
+        );
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = client
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups")
+                .unwrap_or_default();
+            let scan_groups = client
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "scheduled groups should remain converged after real-source post-ack stale drained/fenced refresh recovery: source={source_groups:?} scan={scan_groups:?}",
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generation_two_real_source_route_reacquires_worker_client_after_timeout_during_post_ack_schedule_refresh()
+     {
+        struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+
+        impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
+            fn drop(&mut self) {
+                clear_source_worker_scheduled_groups_refresh_error_queue_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                worker_watch_scan_root("nfs1", &nfs1),
+                worker_watch_scan_root("nfs2", &nfs2),
+            ],
+            host_object_grants: Vec::new(),
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = worker_socket_tempdir();
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-b-timeout-refresh".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let source_wave = |generation| {
+            vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-b::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-b::nfs2"]),
+                    ],
+                }))
+                .expect("encode source roots activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-b::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-b::nfs2"]),
+                    ],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-b::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-b::nfs2"]),
+                    ],
+                }))
+                .expect("encode source rescan activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-b::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-b::nfs2"]),
+                    ],
+                }))
+                .expect("encode source scan activate"),
+            ]
+        };
+        let initial_control = std::iter::once(
+            encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+                version: 1,
+                grants: vec![
+                    worker_route_export("node-b::nfs1", "node-b", "10.0.0.21", &nfs1),
+                    worker_route_export("node-b::nfs2", "node-b", "10.0.0.22", &nfs2),
+                ],
+            })
+            .expect("encode runtime host grants changed"),
+        )
+        .chain(source_wave(1))
+        .collect::<Vec<_>>();
+
+        client
+            .on_control_frame(initial_control)
+            .await
+            .expect("initial real source route wave should succeed");
+
+        let previous_instance_id = client.worker_instance_id_for_tests().await;
+        let _reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+        install_source_worker_scheduled_groups_refresh_error_queue_hook(
+            SourceWorkerScheduledGroupsRefreshErrorQueueHook {
+                errs: std::collections::VecDeque::from([CnxError::Timeout]),
+                sticky_worker_instance_id: Some(previous_instance_id),
+                sticky_peer_err: None,
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(4), client.on_control_frame(source_wave(2)))
+            .await
+            .expect(
+                "generation-two real source route replay should reacquire a fresh worker client when post-ack schedule refresh times out",
+            )
+            .expect(
+                "generation-two real source route replay should recover after forcing a fresh shared worker client on post-ack refresh timeout",
+            );
+
+        let next_instance_id = client.worker_instance_id_for_tests().await;
+        assert_ne!(
+            next_instance_id, previous_instance_id,
+            "real source route post-ack timeout recovery must reacquire a fresh shared source worker client instance"
+        );
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = client
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups")
+                .unwrap_or_default();
+            let scan_groups = client
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "scheduled groups should remain converged after timeout refresh recovery: source={source_groups:?} scan={scan_groups:?}",
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generation_two_real_source_route_reacquires_worker_client_after_missing_route_state_during_post_ack_schedule_refresh()
+     {
+        struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+
+        impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
+            fn drop(&mut self) {
+                clear_source_worker_scheduled_groups_refresh_error_queue_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                worker_watch_scan_root("nfs1", &nfs1),
+                worker_watch_scan_root("nfs2", &nfs2),
+            ],
+            host_object_grants: Vec::new(),
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = worker_socket_tempdir();
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-d-29780951151719537312792577".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let source_wave = |generation| {
+            vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                    ],
+                }))
+                .expect("encode source roots activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                    ],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                    ],
+                }))
+                .expect("encode source rescan activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                    ],
+                }))
+                .expect("encode source scan activate"),
+            ]
+        };
+        let initial_control = std::iter::once(
+            encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+                version: 1,
+                grants: vec![
+                    worker_route_export("node-d::nfs1", "node-d", "10.0.0.41", &nfs1),
+                    worker_route_export("node-d::nfs2", "node-d", "10.0.0.42", &nfs2),
+                ],
+            })
+            .expect("encode runtime host grants changed"),
+        )
+        .chain(source_wave(1))
+        .collect::<Vec<_>>();
+
+        client
+            .on_control_frame(initial_control)
+            .await
+            .expect("initial real source route wave should succeed");
+
+        let previous_instance_id = client.worker_instance_id_for_tests().await;
+        let _reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+        install_source_worker_scheduled_groups_refresh_error_queue_hook(
+            SourceWorkerScheduledGroupsRefreshErrorQueueHook {
+                errs: std::collections::VecDeque::new(),
+                sticky_worker_instance_id: Some(previous_instance_id),
+                sticky_peer_err: Some(
+                    "source worker unavailable: missing route state for channel_buffer ChannelSlotId(4750)"
+                        .to_string(),
+                ),
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(4), client.on_control_frame(source_wave(2)))
+            .await
+            .expect(
+                "generation-two real source route replay should reacquire a fresh worker client when post-ack schedule refresh hits missing route state for channel_buffer",
+            )
+            .expect(
+                "generation-two real source route replay should recover when post-ack schedule refresh forces a fresh shared worker client after missing route state",
+            );
+
+        let next_instance_id = client.worker_instance_id_for_tests().await;
+        assert_ne!(
+            next_instance_id, previous_instance_id,
+            "real source route post-ack scheduled-groups refresh recovery must reacquire a fresh shared source worker client instance after missing route state"
+        );
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = client
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups")
+                .unwrap_or_default();
+            let scan_groups = client
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "scheduled groups should remain converged after missing-route-state refresh recovery: source={source_groups:?} scan={scan_groups:?}",
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generation_two_real_source_route_post_ack_schedule_refresh_detaches_stale_worker_client()
+     {
+        struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+
+        impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
+            fn drop(&mut self) {
+                clear_source_worker_scheduled_groups_refresh_error_queue_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                worker_watch_scan_root("nfs1", &nfs1),
+                worker_watch_scan_root("nfs2", &nfs2),
+            ],
+            host_object_grants: Vec::new(),
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = worker_socket_tempdir();
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-a-29780730718931112664498177".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let source_wave = |generation| {
+            vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                    ],
+                }))
+                .expect("encode source roots activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                    ],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                    ],
+                }))
+                .expect("encode source rescan activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                    ],
+                }))
+                .expect("encode source scan activate"),
+            ]
+        };
+        let initial_control = std::iter::once(
+            encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+                version: 1,
+                grants: vec![
+                    worker_route_export("node-a::nfs1", "node-a", "10.0.0.11", &nfs1),
+                    worker_route_export("node-a::nfs2", "node-a", "10.0.0.12", &nfs2),
+                ],
+            })
+            .expect("encode runtime host grants changed"),
+        )
+        .chain(source_wave(1))
+        .collect::<Vec<_>>();
+
+        client
+            .on_control_frame(initial_control)
+            .await
+            .expect("initial real source route wave should succeed");
+
+        let stale_worker = client
+            .client()
+            .await
+            .expect("connect stale source worker client");
+        let previous_instance_id = client.worker_instance_id_for_tests().await;
+        let _reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+        install_source_worker_scheduled_groups_refresh_error_queue_hook(
+            SourceWorkerScheduledGroupsRefreshErrorQueueHook {
+                errs: std::collections::VecDeque::new(),
+                sticky_worker_instance_id: Some(previous_instance_id),
+                sticky_peer_err: Some(
+                    "worker receive request failed: access denied: pid Pid(1) is drained/fenced and cannot obtain new grant attachments"
+                        .to_string(),
+                ),
+            },
+        );
+
+        client.on_control_frame(source_wave(2)).await.expect(
+            "generation-two real source route replay should recover after shared-client rebind",
+        );
+
+        let next_instance_id = client.worker_instance_id_for_tests().await;
+        assert_ne!(
+            next_instance_id, previous_instance_id,
+            "post-ack scheduled-groups refresh recovery must reacquire a fresh shared source worker client instance"
+        );
+
+        let stale_err = SourceWorkerClientHandle::call_worker(
+            &stale_worker,
+            SourceWorkerRequest::LogicalRootsSnapshot,
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        )
+        .await
+        .expect_err(
+            "stale pre-rebind source worker client must not keep serving requests after post-ack refresh forced a shared-client rebind",
+        );
+        assert!(
+            matches!(
+                stale_err,
+                CnxError::TransportClosed(_) | CnxError::AccessDenied(_) | CnxError::PeerError(_)
+            ),
+            "stale pre-rebind source worker client should fail closed after shared-client rebind, got {stale_err:?}"
+        );
 
         client.close().await.expect("close source worker");
     }

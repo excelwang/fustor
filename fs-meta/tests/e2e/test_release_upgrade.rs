@@ -8,10 +8,11 @@ use crate::support::{reserve_http_addrs, skip_unless_real_nfs_enabled, wait_unti
 use fs_meta::{RootSelector, RootSpec};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex, MutexGuard, OnceLock,
 };
 use std::thread;
 use std::thread::JoinHandle;
@@ -20,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UpgradeMode {
     Smoke,
+    PeerSourceControlCompletionAfterNodeARestart,
     RootsPersistAcrossUpgrade,
     TreeStatsStableAcrossUpgrade,
     TreeMaterializationAfterUpgrade,
@@ -33,6 +35,9 @@ impl UpgradeMode {
     fn app_prefix(self) -> &'static str {
         match self {
             Self::Smoke => "fs-meta-api-upgrade-smoke",
+            Self::PeerSourceControlCompletionAfterNodeARestart => {
+                "fs-meta-api-upgrade-peer-source-control"
+            }
             Self::RootsPersistAcrossUpgrade => "fs-meta-api-upgrade-roots",
             Self::TreeStatsStableAcrossUpgrade => "fs-meta-api-upgrade-tree-stats",
             Self::TreeMaterializationAfterUpgrade => "fs-meta-api-upgrade-tree-materialization",
@@ -57,6 +62,45 @@ struct UpgradeHarness {
 
 pub fn run() -> Result<(), String> {
     run_mode(UpgradeMode::Smoke)
+}
+
+fn peer_source_control_env_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    match LOCK.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn with_peer_source_control_repro_env<T>(f: impl FnOnce() -> T) -> T {
+    let _lock = peer_source_control_env_lock();
+    let vars = [
+        ("FSMETA_DEBUG_FORCE_FIND_ROUTE_CAPTURE", "1"),
+        ("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE", "1"),
+        ("FSMETA_DEBUG_SINK_WORKER_PRE_DISPATCH", "1"),
+        ("DATANIX_KEEP_E2E_ARTIFACTS", "1"),
+    ];
+    let previous = vars
+        .iter()
+        .map(|(key, _)| ((*key).to_string(), std::env::var_os(key)))
+        .collect::<Vec<(String, Option<OsString>)>>();
+    for (key, value) in vars {
+        std::env::set_var(key, value);
+    }
+    let result = f();
+    for (key, value) in previous {
+        match value {
+            Some(value) => std::env::set_var(&key, value),
+            None => std::env::remove_var(&key),
+        }
+    }
+    result
+}
+
+pub fn run_peer_source_control_completion_after_node_a_recovery() -> Result<(), String> {
+    with_peer_source_control_repro_env(|| {
+        run_mode(UpgradeMode::PeerSourceControlCompletionAfterNodeARestart)
+    })
 }
 
 pub fn run_roots_persist_across_upgrade() -> Result<(), String> {
@@ -100,6 +144,9 @@ fn run_mode(mode: UpgradeMode) -> Result<(), String> {
     )?;
     match mode {
         UpgradeMode::Smoke => upgrade_to_generation_two(&mut harness)?,
+        UpgradeMode::PeerSourceControlCompletionAfterNodeARestart => {
+            scenario_peer_source_control_completion_after_node_a_recovery(&mut harness)?
+        }
         UpgradeMode::RootsPersistAcrossUpgrade => {
             scenario_roots_persist_across_upgrade(&mut harness)?
         }
@@ -189,15 +236,63 @@ fn build_upgrade_harness(
     })
 }
 
-fn upgrade_to_generation_two(harness: &mut UpgradeHarness) -> Result<(), String> {
-    let release_v2 = harness.cluster.build_fs_meta_release(
+fn build_generation_two_release(harness: &UpgradeHarness) -> Result<Value, String> {
+    harness.cluster.build_fs_meta_release(
         &harness.app_id,
         &harness.facade_resource_id,
         harness.roots.clone(),
         2,
         true,
-    )?;
-    harness.cluster.apply_release("node-a", release_v2)?;
+    )
+}
+
+fn node_stderr_tail(
+    cluster: &Cluster5,
+    node_name: &str,
+    line_limit: usize,
+) -> Result<String, String> {
+    let process = cluster.node_process_status(node_name)?;
+    let stderr_log = process
+        .get("stderr_log")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("node {node_name} process status missing stderr_log: {process}"))?;
+    let content = std::fs::read_to_string(stderr_log)
+        .map_err(|err| format!("read {node_name} stderr log failed: {err}"))?;
+    let tail = content
+        .lines()
+        .rev()
+        .take(line_limit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(tail)
+}
+
+fn apply_generation_two_release_only(harness: &mut UpgradeHarness) -> Result<(), String> {
+    let release_v2 = build_generation_two_release(harness)?;
+    match harness.cluster.apply_release("node-a", release_v2) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let node_b_tail = node_stderr_tail(&harness.cluster, "node-b", 80)
+                .unwrap_or_else(|tail_err| format!("<node-b-tail-unavailable: {tail_err}>"));
+            if node_b_tail.contains(
+                "fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals err=operation timed out",
+            ) {
+                return Err(format!(
+                    "generation-two peer source-control completion failed after node-a recovery: upgrade={err}; node_b_tail={node_b_tail}"
+                ));
+            }
+            Err(format!(
+                "generation-two apply failed before the node-b peer source-control seam was visible: upgrade={err}; node_b_tail={node_b_tail}"
+            ))
+        }
+    }
+}
+
+fn upgrade_to_generation_two(harness: &mut UpgradeHarness) -> Result<(), String> {
+    apply_generation_two_release_only(harness)?;
     wait_for_generation(&harness.cluster, 2)?;
     harness.session = OperatorSession::login_many(
         harness.candidate_base_urls.clone(),
@@ -245,6 +340,12 @@ fn current_root_ids(session: &mut OperatorSession) -> Result<Vec<String>, String
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default())
+}
+
+fn scenario_peer_source_control_completion_after_node_a_recovery(
+    harness: &mut UpgradeHarness,
+) -> Result<(), String> {
+    apply_generation_two_release_only(harness)
 }
 
 fn scenario_roots_persist_across_upgrade(harness: &mut UpgradeHarness) -> Result<(), String> {

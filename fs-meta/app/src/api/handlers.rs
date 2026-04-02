@@ -223,8 +223,14 @@ async fn maybe_pause_roots_put_after_previous_source_roots() {
         guard.clone()
     };
     if let Some(hook) = hook {
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
         hook.entered.notify_waiters();
-        hook.release.notified().await;
+        release.await;
     }
 }
 
@@ -238,8 +244,14 @@ async fn maybe_pause_status_before_remote_collection() {
         guard.clone()
     };
     if let Some(hook) = hook {
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
         hook.entered.notify_waiters();
-        hook.release.notified().await;
+        release.await;
     }
 }
 

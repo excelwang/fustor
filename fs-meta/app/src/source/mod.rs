@@ -2426,9 +2426,7 @@ impl FSMetaSource {
                     ),
                     SOURCE_RUNTIME_UNIT_ID,
                     self.shutdown.clone(),
-                    move || {
-                        control_ready.should_receive_control_stream_route(&control_route_key)
-                    },
+                    move || control_ready.should_receive_control_stream_route(&control_route_key),
                     move |events| {
                         let control_roots = control_roots.clone();
                         let control_fanout_health = control_fanout_health.clone();
@@ -2487,9 +2485,7 @@ impl FSMetaSource {
                     ),
                     SOURCE_RUNTIME_UNIT_ID,
                     self.shutdown.clone(),
-                    move || {
-                        control_ready.should_receive_control_stream_route(&control_route_key)
-                    },
+                    move || control_ready.should_receive_control_stream_route(&control_route_key),
                     move |events| {
                         let source = source.clone();
                         let control_node_id = control_node_id.clone();
@@ -4506,16 +4502,16 @@ mod tests {
     use super::*;
     use crate::ControlEvent;
     use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
-    use crate::runtime::routes::{ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_ROOTS_CONTROL};
     use crate::runtime::execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID;
+    use crate::runtime::routes::{ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_ROOTS_CONTROL};
     use crate::sink::SinkFileMeta;
     use capanix_app_sdk::runtime::ControlEnvelope;
     use capanix_runtime_entry_sdk::advanced::boundary::BoundaryContext;
     use capanix_runtime_entry_sdk::control::{
         RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate,
         RuntimeHostDescriptor, RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState,
-        RuntimeHostObjectType, RuntimeObjectDescriptor, RuntimeUnitTick, encode_runtime_exec_control,
-        encode_runtime_host_grant_change, encode_runtime_unit_tick,
+        RuntimeHostObjectType, RuntimeObjectDescriptor, RuntimeUnitTick,
+        encode_runtime_exec_control, encode_runtime_host_grant_change, encode_runtime_unit_tick,
     };
     use std::collections::BTreeSet;
 
@@ -4837,7 +4833,9 @@ mod tests {
             &source.endpoint_tasks,
             "test.source.restart_after_finished.endpoint_tasks.seed",
         )
-        .push(finished_endpoint_task_for_test("source.test.finished:v1.req"));
+        .push(finished_endpoint_task_for_test(
+            "source.test.finished:v1.req",
+        ));
 
         source
             .start_runtime_endpoints(Arc::new(NoopBoundary))
@@ -4880,12 +4878,14 @@ mod tests {
             let rescan_recv = boundary.recv_count(&rescan_control_route);
             let roots_recv = boundary.recv_count(&roots_control_route);
             assert_eq!(
-                rescan_recv, 0,
+                rescan_recv,
+                0,
                 "source rescan-control stream must remain gated before runtime route activation; recv_counts={:?}",
                 boundary.recv_counts_snapshot()
             );
             assert_eq!(
-                roots_recv, 0,
+                roots_recv,
+                0,
                 "source logical-roots control stream must remain gated before runtime route activation; recv_counts={:?}",
                 boundary.recv_counts_snapshot()
             );

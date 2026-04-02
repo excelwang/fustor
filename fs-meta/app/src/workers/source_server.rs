@@ -739,7 +739,9 @@ async fn bootstrap_start_source_runtime(
                     tokio::time::sleep(SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_BACKOFF).await;
                 }
                 Err(err) => {
-                    eprintln!("fs_meta_source_worker_server: bootstrap_start build_source err={err}");
+                    eprintln!(
+                        "fs_meta_source_worker_server: bootstrap_start build_source err={err}"
+                    );
                     return Err(err);
                 }
             }
@@ -1209,8 +1211,8 @@ impl TypedWorkerBootstrapSession<SourceConfig> for SourceWorkerSession {
 mod tests {
     use super::*;
     use capanix_app_sdk::runtime::{
-        KernelResultEnvelope, StateCellReadRequest, StateCellWatchRequest,
-        StateCellWriteRequest, in_memory_state_boundary,
+        KernelResultEnvelope, StateCellReadRequest, StateCellWatchRequest, StateCellWriteRequest,
+        in_memory_state_boundary,
     };
     use capanix_runtime_entry_sdk::control::{
         RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, encode_runtime_exec_control,
@@ -1250,7 +1252,10 @@ mod tests {
         }
 
         fn recv_counts_snapshot(&self) -> std::collections::BTreeMap<String, usize> {
-            self.recv_counts.lock().expect("recv_counts_snapshot lock").clone()
+            self.recv_counts
+                .lock()
+                .expect("recv_counts_snapshot lock")
+                .clone()
         }
     }
 
@@ -1298,7 +1303,10 @@ mod tests {
         }
 
         fn recv_counts_snapshot(&self) -> std::collections::BTreeMap<String, usize> {
-            self.recv_counts.lock().expect("recv_counts_snapshot lock").clone()
+            self.recv_counts
+                .lock()
+                .expect("recv_counts_snapshot lock")
+                .clone()
         }
     }
 
@@ -1337,7 +1345,9 @@ mod tests {
         fn new(inner: Arc<dyn StateBoundary>, authority_fenced_reads_remaining: usize) -> Self {
             Self {
                 inner,
-                authority_fenced_reads_remaining: AtomicUsize::new(authority_fenced_reads_remaining),
+                authority_fenced_reads_remaining: AtomicUsize::new(
+                    authority_fenced_reads_remaining,
+                ),
             }
         }
     }
