@@ -307,7 +307,6 @@ fn request_counts_toward_control_drain(method: &Method, path: &str) -> bool {
     matches!(
         (method, path),
         (&Method::PUT, "/api/fs-meta/v1/monitoring/roots")
-            | (&Method::POST, "/api/fs-meta/v1/index/rescan")
             | (&Method::POST, "/api/fs-meta/v1/query-api-keys")
     ) || (matches!(method, &Method::DELETE) && path.starts_with("/api/fs-meta/v1/query-api-keys/"))
 }
@@ -383,7 +382,6 @@ mod tests {
     fn request_control_drain_counts_only_management_writes() {
         for (method, path) in [
             (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
-            (Method::POST, "/api/fs-meta/v1/index/rescan"),
             (Method::POST, "/api/fs-meta/v1/query-api-keys"),
             (Method::DELETE, "/api/fs-meta/v1/query-api-keys/key-1"),
         ] {
@@ -399,6 +397,7 @@ mod tests {
             (Method::GET, "/api/fs-meta/v1/runtime/grants"),
             (Method::GET, "/api/fs-meta/v1/monitoring/roots"),
             (Method::POST, "/api/fs-meta/v1/monitoring/roots/preview"),
+            (Method::POST, "/api/fs-meta/v1/index/rescan"),
             (Method::GET, "/api/fs-meta/v1/query-api-keys"),
             (Method::GET, "/api/fs-meta/v1/tree"),
             (Method::GET, "/api/fs-meta/v1/stats"),

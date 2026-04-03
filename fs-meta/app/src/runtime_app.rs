@@ -126,6 +126,37 @@ impl ProcessFacadeClaim {
 }
 
 #[derive(Clone)]
+struct PendingFixedBindHandoffRegistrant {
+    instance_id: u64,
+    api_task: Arc<Mutex<Option<FacadeActivation>>>,
+    pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
+    facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
+    facade_pending_status: SharedFacadePendingStatusCell,
+    api_request_tracker: Arc<ApiRequestTracker>,
+    api_control_gate: Arc<ApiControlGate>,
+    node_id: NodeId,
+    runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
+    source: Arc<SourceFacade>,
+    sink: Arc<SinkFacade>,
+    query_sink: Arc<SinkFacade>,
+    query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
+}
+
+#[derive(Clone)]
+struct ActiveFixedBindFacadeRegistrant {
+    instance_id: u64,
+    api_task: Arc<Mutex<Option<FacadeActivation>>>,
+    api_request_tracker: Arc<ApiRequestTracker>,
+    api_control_gate: Arc<ApiControlGate>,
+}
+
+#[derive(Clone)]
+struct PendingFixedBindHandoffReady {
+    instance_id: u64,
+    registrant: PendingFixedBindHandoffRegistrant,
+}
+
+#[derive(Clone)]
 #[cfg_attr(not(test), allow(dead_code))]
 struct PendingFacadeActivation {
     route_key: String,
@@ -818,6 +849,118 @@ fn clear_process_facade_claim_for_tests() {
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.clear();
+    clear_pending_fixed_bind_handoff_ready_for_tests();
+    let mut active_guard = match active_fixed_bind_facade_owner_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    active_guard.clear();
+}
+
+fn pending_fixed_bind_handoff_ready_cell() -> &'static StdMutex<BTreeMap<String, PendingFixedBindHandoffReady>> {
+    static CELL: OnceLock<StdMutex<BTreeMap<String, PendingFixedBindHandoffReady>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(BTreeMap::new()))
+}
+
+fn mark_pending_fixed_bind_handoff_ready(
+    bind_addr: &str,
+    registrant: PendingFixedBindHandoffRegistrant,
+) {
+    let mut guard = match pending_fixed_bind_handoff_ready_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.insert(
+        bind_addr.to_string(),
+        PendingFixedBindHandoffReady {
+            instance_id: registrant.instance_id,
+            registrant,
+        },
+    );
+}
+
+fn clear_pending_fixed_bind_handoff_ready(bind_addr: &str) {
+    let mut guard = match pending_fixed_bind_handoff_ready_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.remove(bind_addr);
+}
+
+fn pending_fixed_bind_handoff_ready_for(bind_addr: &str, instance_id: u64) -> bool {
+    let guard = match pending_fixed_bind_handoff_ready_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .get(bind_addr)
+        .is_some_and(|ready| ready.instance_id != instance_id)
+}
+
+fn pending_fixed_bind_handoff_registrant_for(
+    bind_addr: &str,
+    released_by_instance_id: u64,
+) -> Option<PendingFixedBindHandoffRegistrant> {
+    let guard = match pending_fixed_bind_handoff_ready_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.get(bind_addr).and_then(|ready| {
+        (ready.instance_id != released_by_instance_id).then_some(ready.registrant.clone())
+    })
+}
+
+fn active_fixed_bind_facade_owner_cell(
+) -> &'static StdMutex<BTreeMap<String, ActiveFixedBindFacadeRegistrant>> {
+    static CELL: OnceLock<StdMutex<BTreeMap<String, ActiveFixedBindFacadeRegistrant>>> =
+        OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(BTreeMap::new()))
+}
+
+fn mark_active_fixed_bind_facade_owner(
+    bind_addr: &str,
+    registrant: ActiveFixedBindFacadeRegistrant,
+) {
+    let mut guard = match active_fixed_bind_facade_owner_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.insert(bind_addr.to_string(), registrant);
+}
+
+fn clear_active_fixed_bind_facade_owner(bind_addr: &str, instance_id: u64) {
+    let mut guard = match active_fixed_bind_facade_owner_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard
+        .get(bind_addr)
+        .is_some_and(|registrant| registrant.instance_id == instance_id)
+    {
+        guard.remove(bind_addr);
+    }
+}
+
+fn active_fixed_bind_facade_owner_for(
+    bind_addr: &str,
+    requester_instance_id: u64,
+) -> Option<ActiveFixedBindFacadeRegistrant> {
+    let guard = match active_fixed_bind_facade_owner_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.get(bind_addr).and_then(|registrant| {
+        (registrant.instance_id != requester_instance_id).then_some(registrant.clone())
+    })
+}
+
+#[cfg(test)]
+fn clear_pending_fixed_bind_handoff_ready_for_tests() {
+    let mut guard = match pending_fixed_bind_handoff_ready_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.clear();
 }
 
 #[cfg(test)]
@@ -842,6 +985,13 @@ struct RuntimeControlFrameStartHook {
 #[cfg(test)]
 #[derive(Clone)]
 struct FacadeDeactivatePauseHook {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct SourceApplyPauseHook {
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
 }
@@ -1026,6 +1176,52 @@ async fn maybe_pause_facade_deactivate(unit_id: &str, route_key: &str) {
     }
 }
 
+
+#[cfg(test)]
+fn source_apply_pause_hook_cell() -> &'static StdMutex<Option<SourceApplyPauseHook>> {
+    static CELL: OnceLock<StdMutex<Option<SourceApplyPauseHook>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn install_source_apply_pause_hook(hook: SourceApplyPauseHook) {
+    let mut guard = match source_apply_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+fn clear_source_apply_pause_hook() {
+    let mut guard = match source_apply_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+async fn maybe_pause_before_source_apply() {
+    let hook = {
+        let guard = match source_apply_pause_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        hook.entered.notify_waiters();
+        release.await;
+    }
+}
+
 pub struct FSMetaApp {
     instance_id: u64,
     config: FSMetaConfig,
@@ -1040,6 +1236,8 @@ pub struct FSMetaApp {
     api_task: Arc<Mutex<Option<FacadeActivation>>>,
     pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
     facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
+    retained_active_facade_continuity: AtomicBool,
+    pending_fixed_bind_claim_release_followup: AtomicBool,
     api_request_tracker: Arc<ApiRequestTracker>,
     api_control_gate: Arc<ApiControlGate>,
     control_frame_serial: Arc<Mutex<()>>,
@@ -1250,6 +1448,8 @@ impl FSMetaApp {
             api_task: Arc::new(Mutex::new(None)),
             pending_facade: Arc::new(Mutex::new(None)),
             facade_spawn_in_progress: Arc::new(Mutex::new(None)),
+            retained_active_facade_continuity: AtomicBool::new(false),
+            pending_fixed_bind_claim_release_followup: AtomicBool::new(false),
             api_request_tracker,
             api_control_gate,
             control_frame_serial: Arc::new(Mutex::new(())),
@@ -1455,7 +1655,8 @@ impl FSMetaApp {
         self.ensure_runtime_proxy_endpoints_started().await?;
         eprintln!("fs_meta_runtime_app: initialize_from_control endpoints ok");
         self.control_initialized.store(true, Ordering::Release);
-        self.api_control_gate.set_ready(true);
+        self.api_control_gate
+            .set_ready(self.facade_publication_ready().await);
         eprintln!("fs_meta_runtime_app: initialize_from_control done");
 
         Ok(())
@@ -2321,7 +2522,7 @@ impl FSMetaApp {
     }
 
     async fn try_spawn_pending_facade(&self) -> Result<bool> {
-        Self::try_spawn_pending_facade_from_parts(
+        let spawn_result = Self::try_spawn_pending_facade_from_parts(
             self.instance_id,
             self.api_task.clone(),
             self.pending_facade.clone(),
@@ -2336,7 +2537,44 @@ impl FSMetaApp {
             self.query_sink.clone(),
             self.runtime_boundary.clone(),
         )
-        .await
+        .await;
+        let pending = self.pending_facade.lock().await.clone();
+        match (spawn_result, pending) {
+            (Ok(spawned), Some(pending)) => {
+                let wait_for_claim_release = self
+                    .pending_fixed_bind_facade_claim_conflict(pending.generation)
+                    .await;
+                self.pending_fixed_bind_claim_release_followup
+                    .store(wait_for_claim_release, Ordering::Release);
+                self.refresh_active_fixed_bind_facade_owner().await;
+                Ok(spawned)
+            }
+            (Ok(spawned), None) => {
+                self.pending_fixed_bind_claim_release_followup
+                    .store(false, Ordering::Release);
+                self.refresh_active_fixed_bind_facade_owner().await;
+                Ok(spawned)
+            }
+            (Err(err), Some(pending))
+                if Self::facade_spawn_error_is_bind_addr_in_use(&err)
+                    && pending.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+                    && !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr)
+                    && self.api_task.lock().await.as_ref().is_none_or(|active| {
+                        active.route_key != pending.route_key
+                            || active.resource_ids != pending.resource_ids
+                    }) =>
+            {
+                Self::record_pending_facade_retry_error(
+                    &self.facade_pending_status,
+                    &pending,
+                    &err,
+                );
+                self.pending_fixed_bind_claim_release_followup
+                    .store(true, Ordering::Release);
+                Ok(false)
+            }
+            (Err(err), _) => Err(err),
+        }
     }
 
     async fn try_spawn_pending_facade_from_parts(
@@ -2615,6 +2853,7 @@ impl FSMetaApp {
             resource_ids: pending.resource_ids.clone(),
             handle,
         });
+        clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
         eprintln!(
             "fs_meta_runtime_app: facade handle active generation={} route_key={} resources={:?}",
             adopted_generation, pending.route_key, pending.resource_ids
@@ -2848,17 +3087,50 @@ impl FSMetaApp {
         }
     }
 
-    async fn query_route_activate_blocked_by_pending_facade_claim_conflict(
-        &self,
-        generation: u64,
-    ) -> bool {
+    fn facade_signal_updates_facade_claim(signal: &FacadeControlSignal) -> bool {
+        matches!(
+            signal,
+            FacadeControlSignal::Activate {
+                unit: FacadeRuntimeUnit::Facade,
+                ..
+            }
+                | FacadeControlSignal::Deactivate {
+                    unit: FacadeRuntimeUnit::Facade,
+                    ..
+                }
+                | FacadeControlSignal::Tick {
+                    unit: FacadeRuntimeUnit::Facade,
+                    ..
+                }
+                | FacadeControlSignal::ExposureConfirmed {
+                    unit: FacadeRuntimeUnit::Facade,
+                    ..
+                }
+        )
+    }
+
+    fn facade_publication_signal_is_query_activate(signal: &FacadeControlSignal) -> bool {
+        matches!(
+            signal,
+            FacadeControlSignal::Activate {
+                unit: FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer,
+                ..
+            }
+        )
+    }
+
+    fn facade_spawn_error_is_bind_addr_in_use(err: &CnxError) -> bool {
+        let message = err.to_string().to_ascii_lowercase();
+        message.contains("fs-meta api bind failed") && message.contains("address already in use")
+    }
+
+    async fn pending_fixed_bind_facade_claim_conflict(&self, generation: u64) -> bool {
         let pending = self.pending_facade.lock().await.clone();
         let Some(pending) = pending else {
             return false;
         };
-        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-            || generation < pending.generation
-        {
+        let _ = generation;
+        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL) {
             return false;
         }
         if facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
@@ -2876,6 +3148,87 @@ impl FSMetaApp {
         guard.get(&pending.resolved.bind_addr).is_some_and(|claim| {
             claim.owner_instance_id != self.instance_id && claim.matches_pending(&pending)
         })
+    }
+
+    async fn pending_fixed_bind_facade_publication_incomplete(
+        &self,
+        generation: u64,
+    ) -> Option<PendingFacadeActivation> {
+        let pending = self.pending_facade.lock().await.clone();
+        let Some(pending) = pending else {
+            return None;
+        };
+        let _ = generation;
+        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL) {
+            return None;
+        }
+        if facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
+            return None;
+        }
+        if self.api_task.lock().await.as_ref().is_some_and(|active| {
+            active.route_key == pending.route_key && active.resource_ids == pending.resource_ids
+        }) {
+            return None;
+        }
+        Some(pending)
+    }
+
+    async fn retry_pending_fixed_bind_facade_after_claim_release_without_query_followup(
+        &self,
+        query_followup_present: bool,
+    ) -> Result<()> {
+        if query_followup_present
+            || !self.pending_fixed_bind_claim_release_followup.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let Some(pending) = self.pending_facade.lock().await.clone() else {
+            self.pending_fixed_bind_claim_release_followup
+                .store(false, Ordering::Release);
+            return Ok(());
+        };
+        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+            || facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr)
+        {
+            self.pending_fixed_bind_claim_release_followup
+                .store(false, Ordering::Release);
+            return Ok(());
+        }
+        if self.pending_fixed_bind_facade_claim_conflict(pending.generation).await {
+            return Ok(());
+        }
+        self.retry_pending_facade(&pending.route_key, pending.generation, false)
+            .await?;
+        if self
+            .pending_fixed_bind_facade_publication_incomplete(pending.generation)
+            .await
+            .is_none()
+        {
+            self.pending_fixed_bind_claim_release_followup
+                .store(false, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    async fn retained_active_facade_continuity_keeps_internal_status_routes(&self) -> bool {
+        if !self
+            .retained_active_facade_continuity
+            .load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let facade_control_route_key = format!("{}.stream", ROUTE_KEY_FACADE_CONTROL);
+        self.api_task.lock().await.as_ref().is_some_and(|active| {
+            active.route_key == facade_control_route_key
+        })
+    }
+
+    async fn query_route_activate_blocked_by_pending_facade_claim_conflict(
+        &self,
+        generation: u64,
+    ) -> bool {
+        self.pending_fixed_bind_facade_claim_conflict(generation)
+            .await
     }
 
     async fn apply_facade_activate(
@@ -2909,6 +3262,36 @@ impl FSMetaApp {
                 generation
             );
             return Ok(());
+        }
+        if matches!(
+            unit,
+            FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer
+        ) && self
+            .pending_fixed_bind_claim_release_followup
+            .load(Ordering::Acquire)
+        {
+            if let Some(pending) = self
+                .pending_fixed_bind_facade_publication_incomplete(generation)
+                .await
+            {
+                self.retry_pending_facade(&pending.route_key, pending.generation, false)
+                    .await?;
+                if self
+                    .pending_fixed_bind_facade_publication_incomplete(generation)
+                    .await
+                    .is_some()
+                {
+                    eprintln!(
+                        "fs_meta_runtime_app: suppress facade-dependent route unit={} route_key={} generation={} while pending fixed-bind facade publication is still incomplete after predecessor claim release",
+                        unit.unit_id(),
+                        route_key,
+                        generation
+                    );
+                    return Ok(());
+                }
+                self.pending_fixed_bind_claim_release_followup
+                    .store(false, Ordering::Release);
+            }
         }
         // Facade activation is a runtime-owned generation/bind/run handoff carrier.
         // Trusted external observation remains subordinate to package-local
@@ -2954,6 +3337,8 @@ impl FSMetaApp {
         if matches!(unit, FacadeRuntimeUnit::Query) || route_key != facade_control_route_key {
             return Ok(());
         }
+        self.retained_active_facade_continuity
+            .store(false, Ordering::Release);
         let candidate_resource_ids = Self::facade_candidate_resource_ids(bound_scopes);
         let runtime_managed = self.runtime_boundary.is_some();
         let resolved = self
@@ -3012,6 +3397,18 @@ impl FSMetaApp {
         #[cfg(test)]
         notify_facade_shutdown_started();
         eprintln!("fs_meta_runtime_app: shutdown_active_facade");
+        let released_bind_addr = {
+            let api_task = self.api_task.lock().await;
+            api_task
+                .as_ref()
+                .and_then(|current| {
+                    (current.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL))
+                        .then(|| self.config.api.resolve_for_candidate_ids(&current.resource_ids))
+                        .flatten()
+                })
+                .map(|resolved| resolved.bind_addr)
+                .filter(|bind_addr| !facade_bind_addr_is_ephemeral(bind_addr))
+        };
         if let Some(current) = self.api_task.lock().await.take() {
             eprintln!(
                 "fs_meta_runtime_app: shutting down previous active facade generation={}",
@@ -3023,6 +3420,14 @@ impl FSMetaApp {
                 .await;
         }
         clear_owned_process_facade_claim(self.instance_id);
+        if let Some(bind_addr) = released_bind_addr {
+            clear_active_fixed_bind_facade_owner(&bind_addr, self.instance_id);
+            self.complete_pending_fixed_bind_handoff_after_release(&bind_addr, self.instance_id)
+                .await;
+        }
+        if let Some(pending) = self.pending_facade.lock().await.clone() {
+            clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
+        }
     }
 
     async fn withdraw_uninitialized_query_routes(&self) {
@@ -3657,6 +4062,18 @@ impl FSMetaApp {
         let unit_id = unit.unit_id();
         #[cfg(test)]
         maybe_pause_facade_deactivate(unit_id, route_key).await;
+        if matches!(unit, FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer)
+            && is_internal_status_route(route_key)
+            && self
+                .retained_active_facade_continuity_keeps_internal_status_routes()
+                .await
+        {
+            eprintln!(
+                "fs_meta_runtime_app: retain internal status route during continuity-preserving deactivate route_key={} generation={}",
+                route_key, generation
+            );
+            return Ok(());
+        }
         let accepted = self
             .facade_gate
             .apply_deactivate(unit_id, route_key, generation)?;
@@ -3707,13 +4124,35 @@ impl FSMetaApp {
                         || (!self.control_initialized() && generation == active.generation))
             })
         };
-        if retain_active_facade {
+        let pending_fixed_bind_conflict =
+            self.pending_fixed_bind_facade_claim_conflict(generation).await;
+        let release_for_fixed_bind_handoff =
+            self.fixed_bind_handoff_ready_for_release(generation).await;
+        if retain_active_facade && !pending_fixed_bind_conflict && !release_for_fixed_bind_handoff {
+            self.retained_active_facade_continuity
+                .store(true, Ordering::Release);
             eprintln!(
                 "fs_meta_runtime_app: retain active facade during continuity-preserving deactivate route_key={} generation={}",
                 route_key, generation
             );
             return Ok(());
         }
+        if pending_fixed_bind_conflict || release_for_fixed_bind_handoff {
+            if retain_active_facade {
+                eprintln!(
+                    "fs_meta_runtime_app: release active facade for fixed-bind handoff route_key={} generation={}",
+                    route_key, generation
+                );
+            } else {
+                eprintln!(
+                    "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
+                    route_key, generation
+                );
+                return Ok(());
+            }
+        }
+        self.retained_active_facade_continuity
+            .store(false, Ordering::Release);
         *self.pending_facade.lock().await = None;
         Self::clear_pending_facade_status(&self.facade_pending_status);
         self.wait_for_shared_worker_control_handoff().await;
@@ -3744,6 +4183,282 @@ impl FSMetaApp {
         }
         pending.runtime_exposure_confirmed = true;
         true
+    }
+
+    async fn apply_facade_signal(&self, signal: FacadeControlSignal) -> Result<()> {
+        match signal {
+            FacadeControlSignal::Activate {
+                unit,
+                route_key,
+                generation,
+                bound_scopes,
+            } => {
+                self.apply_facade_activate(unit, &route_key, generation, &bound_scopes)
+                    .await?;
+            }
+            FacadeControlSignal::Deactivate {
+                unit,
+                route_key,
+                generation,
+            } => {
+                self.apply_facade_deactivate(unit, &route_key, generation)
+                    .await?;
+            }
+            FacadeControlSignal::Tick {
+                unit,
+                route_key,
+                generation,
+            } => {
+                let accepted = self.accept_facade_tick(unit, &route_key, generation)?;
+                if !accepted {
+                    log::info!(
+                        "fs-meta facade: ignore stale/inactive tick unit={} generation={}",
+                        unit.unit_id(),
+                        generation
+                    );
+                } else if matches!(unit, FacadeRuntimeUnit::Facade)
+                    && route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+                {
+                    self.retry_pending_facade(&route_key, generation, true)
+                        .await?;
+                }
+            }
+            FacadeControlSignal::ExposureConfirmed {
+                unit,
+                route_key,
+                generation,
+                confirmed_at_us: _confirmed_at_us,
+            } => {
+                let accepted = self.accept_facade_tick(unit, &route_key, generation)?;
+                if !accepted {
+                    log::info!(
+                        "fs-meta facade: ignore stale/inactive exposure_confirmed unit={} generation={}",
+                        unit.unit_id(),
+                        generation
+                    );
+                } else if matches!(unit, FacadeRuntimeUnit::Facade)
+                    && route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+                    && self
+                        .confirm_pending_facade_exposure(&route_key, generation)
+                        .await
+                {
+                    self.retry_pending_facade(&route_key, generation, false)
+                        .await?;
+                }
+            }
+            FacadeControlSignal::RuntimeHostGrantChange { .. }
+            | FacadeControlSignal::Passthrough => {}
+        }
+        Ok(())
+    }
+
+    async fn fixed_bind_handoff_ready_for_release(&self, generation: u64) -> bool {
+        let _ = generation;
+        let Some(active) = self.api_task.lock().await.as_ref().map(|active| (
+            active.route_key.clone(),
+            active.resource_ids.clone(),
+        )) else {
+            return false;
+        };
+        if active.0 != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL) {
+            return false;
+        }
+        let bind_addr = self
+            .config
+            .api
+            .resolve_for_candidate_ids(&active.1)
+            .map(|resolved| resolved.bind_addr)
+            .filter(|bind_addr| !facade_bind_addr_is_ephemeral(bind_addr));
+        let Some(bind_addr) = bind_addr else {
+            return false;
+        };
+        pending_fixed_bind_handoff_ready_for(&bind_addr, self.instance_id)
+    }
+
+    fn pending_fixed_bind_handoff_registrant(&self) -> PendingFixedBindHandoffRegistrant {
+        PendingFixedBindHandoffRegistrant {
+            instance_id: self.instance_id,
+            api_task: self.api_task.clone(),
+            pending_facade: self.pending_facade.clone(),
+            facade_spawn_in_progress: self.facade_spawn_in_progress.clone(),
+            facade_pending_status: self.facade_pending_status.clone(),
+            api_request_tracker: self.api_request_tracker.clone(),
+            api_control_gate: self.api_control_gate.clone(),
+            node_id: self.node_id.clone(),
+            runtime_boundary: self.runtime_boundary.clone(),
+            source: self.source.clone(),
+            sink: self.sink.clone(),
+            query_sink: self.query_sink.clone(),
+            query_runtime_boundary: self.runtime_boundary.clone(),
+        }
+    }
+
+    fn active_fixed_bind_facade_registrant(&self) -> ActiveFixedBindFacadeRegistrant {
+        ActiveFixedBindFacadeRegistrant {
+            instance_id: self.instance_id,
+            api_task: self.api_task.clone(),
+            api_request_tracker: self.api_request_tracker.clone(),
+            api_control_gate: self.api_control_gate.clone(),
+        }
+    }
+
+    async fn refresh_active_fixed_bind_facade_owner(&self) {
+        let active = self.api_task.lock().await.as_ref().map(|active| {
+            (
+                active.route_key.clone(),
+                active.resource_ids.clone(),
+            )
+        });
+        let Some((route_key, resource_ids)) = active else {
+            return;
+        };
+        if route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL) {
+            return;
+        }
+        let Some(bind_addr) = self
+            .config
+            .api
+            .resolve_for_candidate_ids(&resource_ids)
+            .map(|resolved| resolved.bind_addr)
+            .filter(|bind_addr| !facade_bind_addr_is_ephemeral(bind_addr))
+        else {
+            return;
+        };
+        mark_active_fixed_bind_facade_owner(&bind_addr, self.active_fixed_bind_facade_registrant());
+    }
+
+    async fn release_conflicting_active_fixed_bind_facade_for_handoff(&self, bind_addr: &str) {
+        let Some(owner) = active_fixed_bind_facade_owner_for(bind_addr, self.instance_id) else {
+            return;
+        };
+        let released_by_instance_id = owner.instance_id;
+        Self::release_active_fixed_bind_facade_owner_for_handoff(bind_addr, owner).await;
+        self.complete_pending_fixed_bind_handoff_after_release(bind_addr, released_by_instance_id)
+            .await;
+    }
+
+    async fn release_active_fixed_bind_facade_owner_for_handoff(
+        bind_addr: &str,
+        owner: ActiveFixedBindFacadeRegistrant,
+    ) {
+        owner.api_request_tracker.wait_for_drain().await;
+        owner.api_control_gate.wait_for_facade_request_drain().await;
+        if let Some(current) = owner.api_task.lock().await.take() {
+            current
+                .handle
+                .shutdown(ACTIVE_FACADE_SHUTDOWN_TIMEOUT)
+                .await;
+        }
+        clear_owned_process_facade_claim(owner.instance_id);
+        clear_active_fixed_bind_facade_owner(bind_addr, owner.instance_id);
+    }
+
+    async fn complete_pending_fixed_bind_handoff_after_release(
+        &self,
+        bind_addr: &str,
+        released_by_instance_id: u64,
+    ) {
+        let Some(registrant) = pending_fixed_bind_handoff_registrant_for(bind_addr, released_by_instance_id)
+        else {
+            return;
+        };
+        let api_task = registrant.api_task.clone();
+        let pending_facade = registrant.pending_facade.clone();
+        let api_control_gate = registrant.api_control_gate.clone();
+        let api_request_tracker = registrant.api_request_tracker.clone();
+        match Self::try_spawn_pending_facade_from_parts(
+            registrant.instance_id,
+            registrant.api_task,
+            registrant.pending_facade,
+            registrant.facade_spawn_in_progress,
+            registrant.facade_pending_status,
+            registrant.api_request_tracker,
+            registrant.api_control_gate,
+            registrant.node_id,
+            registrant.runtime_boundary,
+            registrant.source,
+            registrant.sink,
+            registrant.query_sink,
+            registrant.query_runtime_boundary,
+        )
+        .await
+        {
+            Ok(_) => {
+                if pending_facade.lock().await.is_none()
+                    && api_task.lock().await.as_ref().is_some_and(|active| {
+                        active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+                    })
+                {
+                    mark_active_fixed_bind_facade_owner(
+                        bind_addr,
+                        ActiveFixedBindFacadeRegistrant {
+                            instance_id: registrant.instance_id,
+                            api_task: api_task.clone(),
+                            api_request_tracker: api_request_tracker.clone(),
+                            api_control_gate: api_control_gate.clone(),
+                        },
+                    );
+                    api_control_gate.set_ready(true);
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "fs_meta_runtime_app: fixed-bind handoff completion retry failed bind_addr={} err={}",
+                    bind_addr, err
+                );
+            }
+        }
+    }
+
+    async fn facade_publication_ready(&self) -> bool {
+        if !self.control_initialized() {
+            return false;
+        }
+        if self.source_state_replay_required.load(Ordering::Acquire)
+            || self.sink_state_replay_required.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let pending = self.pending_facade.lock().await.clone();
+        let Some(pending) = pending else {
+            return true;
+        };
+        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL) {
+            return true;
+        }
+        let active_ready = self.api_task.lock().await.as_ref().is_some_and(|active| {
+            active.route_key == pending.route_key && active.resource_ids == pending.resource_ids
+        });
+        if active_ready {
+            clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
+            return true;
+        }
+        if !pending.runtime_exposure_confirmed {
+            return false;
+        }
+        if !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
+            mark_pending_fixed_bind_handoff_ready(
+                &pending.resolved.bind_addr,
+                self.pending_fixed_bind_handoff_registrant(),
+            );
+            if self
+                .pending_fixed_bind_facade_claim_conflict(pending.generation)
+                .await
+            {
+                self.release_conflicting_active_fixed_bind_facade_for_handoff(
+                    &pending.resolved.bind_addr,
+                )
+                .await;
+                if self.api_task.lock().await.as_ref().is_some_and(|active| {
+                    active.route_key == pending.route_key
+                        && active.resource_ids == pending.resource_ids
+                }) {
+                    clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     async fn service_on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
@@ -3896,72 +4611,17 @@ impl FSMetaApp {
             self.record_retained_sink_control_state(&staged_sink_signals)
                 .await;
         }
-        for signal in facade_signals {
-            match signal {
-                FacadeControlSignal::Activate {
-                    unit,
-                    route_key,
-                    generation,
-                    bound_scopes,
-                } => {
-                    self.apply_facade_activate(unit, &route_key, generation, &bound_scopes)
-                        .await?;
-                }
-                FacadeControlSignal::Deactivate {
-                    unit,
-                    route_key,
-                    generation,
-                } => {
-                    self.apply_facade_deactivate(unit, &route_key, generation)
-                        .await?;
-                }
-                FacadeControlSignal::Tick {
-                    unit,
-                    route_key,
-                    generation,
-                } => {
-                    let accepted = self.accept_facade_tick(unit, &route_key, generation)?;
-                    if !accepted {
-                        log::info!(
-                            "fs-meta facade: ignore stale/inactive tick unit={} generation={}",
-                            unit.unit_id(),
-                            generation
-                        );
-                    } else if matches!(unit, FacadeRuntimeUnit::Facade)
-                        && route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-                    {
-                        self.retry_pending_facade(&route_key, generation, true)
-                            .await?;
-                    }
-                }
-                FacadeControlSignal::ExposureConfirmed {
-                    unit,
-                    route_key,
-                    generation,
-                    confirmed_at_us: _confirmed_at_us,
-                } => {
-                    let accepted = self.accept_facade_tick(unit, &route_key, generation)?;
-                    if !accepted {
-                        log::info!(
-                            "fs-meta facade: ignore stale/inactive exposure_confirmed unit={} generation={}",
-                            unit.unit_id(),
-                            generation
-                        );
-                    } else if matches!(unit, FacadeRuntimeUnit::Facade)
-                        && route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-                        && self
-                            .confirm_pending_facade_exposure(&route_key, generation)
-                            .await
-                    {
-                        self.retry_pending_facade(&route_key, generation, false)
-                            .await?;
-                    }
-                }
-                FacadeControlSignal::RuntimeHostGrantChange { .. }
-                | FacadeControlSignal::Passthrough => {}
-            }
+        let (facade_claim_signals, mut facade_publication_signals): (Vec<_>, Vec<_>) =
+            facade_signals
+                .into_iter()
+                .partition(Self::facade_signal_updates_facade_claim);
+        for signal in facade_claim_signals {
+            self.apply_facade_signal(signal).await?;
         }
         if facade_cleanup_only_while_uninitialized {
+            for signal in facade_publication_signals.drain(..) {
+                self.apply_facade_signal(signal).await?;
+            }
             eprintln!(
                 "fs_meta_runtime_app: on_control_frame cleanup-only facade followup left runtime uninitialized"
             );
@@ -3973,6 +4633,8 @@ impl FSMetaApp {
                     "fs_meta_runtime_app: on_control_frame source cleanup-only followup left runtime uninitialized"
                 );
             } else {
+                #[cfg(test)]
+                maybe_pause_before_source_apply().await;
                 eprintln!(
                     "fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals begin"
                 );
@@ -4034,11 +4696,24 @@ impl FSMetaApp {
                 .await?;
             eprintln!("fs_meta_runtime_app: on_control_frame sink.replay_retained ok");
         }
+        let query_publication_followup_present = facade_publication_signals
+            .iter()
+            .any(Self::facade_publication_signal_is_query_activate);
+        if !source_cleanup_only_while_uninitialized && !sink_cleanup_only_while_uninitialized {
+            self.retry_pending_fixed_bind_facade_after_claim_release_without_query_followup(
+                query_publication_followup_present,
+            )
+            .await?;
+        }
+        for signal in facade_publication_signals {
+            self.apply_facade_signal(signal).await?;
+        }
         if !sink_cleanup_only_while_uninitialized {
             self.ensure_runtime_proxy_endpoints_started().await?;
         }
         if request_sensitive && !sink_cleanup_only_while_uninitialized {
-            self.api_control_gate.set_ready(true);
+            self.api_control_gate
+                .set_ready(self.facade_publication_ready().await);
         }
         eprintln!("fs_meta_runtime_app: on_control_frame done");
         Ok(())
@@ -4052,6 +4727,8 @@ impl FSMetaApp {
         self.api_request_tracker.wait_for_drain().await;
         self.control_initialized.store(false, Ordering::Release);
         self.api_control_gate.set_ready(false);
+        self.retained_active_facade_continuity
+            .store(false, Ordering::Release);
         self.clear_shared_source_route_claims_for_instance().await;
         self.clear_shared_sink_route_claims_for_instance().await;
         *self.pending_facade.lock().await = None;
@@ -7819,6 +8496,14 @@ mod tests {
         }
     }
 
+    struct RescanPauseHookReset;
+
+    impl Drop for RescanPauseHookReset {
+        fn drop(&mut self) {
+            crate::api::clear_rescan_pause_hook();
+        }
+    }
+
     struct StatusPauseHookReset;
 
     impl Drop for StatusPauseHookReset {
@@ -7848,6 +8533,15 @@ mod tests {
     impl Drop for SourceWorkerControlFramePauseHookReset {
         fn drop(&mut self) {
             crate::workers::source::clear_source_worker_control_frame_pause_hook();
+        }
+    }
+
+
+    struct SourceApplyPauseHookReset;
+
+    impl Drop for SourceApplyPauseHookReset {
+        fn drop(&mut self) {
+            clear_source_apply_pause_hook();
         }
     }
 
@@ -8089,6 +8783,169 @@ mod tests {
             .await
             .expect("join app close")
             .expect("close app after in-flight roots_put");
+    }
+
+    #[tokio::test]
+    async fn closing_app_waits_for_inflight_rescan_before_tearing_down_facade() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init external-worker app"),
+        );
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _reset = RescanPauseHookReset;
+        crate::api::install_rescan_pause_hook(crate::api::RescanPauseHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .post(format!("http://{bind_addr}/api/fs-meta/v1/index/rescan"))
+                    .bearer_auth(token)
+                    .json(&json!({}))
+                    .send()
+                    .await
+            }
+        });
+
+        entered.notified().await;
+        let close_task = tokio::spawn({
+            let app = app.clone();
+            async move { app.close().await }
+        });
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(
+            !close_task.is_finished(),
+            "app.close() must wait for the in-flight rescan to finish before tearing down the facade"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join rescan request")
+            .expect("rescan request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode rescan body");
+        assert!(
+            status.is_success(),
+            "in-flight rescan should complete before facade teardown: status={status} body={body}"
+        );
+        close_task
+            .await
+            .expect("join app close")
+            .expect("close app after in-flight rescan");
     }
 
     #[tokio::test]
@@ -18071,6 +18928,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_facade_exposure_confirmed_waits_for_inflight_rescan_before_shutdown() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init external-worker app"),
+        );
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        app.apply_facade_activate(
+            FacadeRuntimeUnit::Facade,
+            &facade_control_stream_route(),
+            2,
+            &[RuntimeBoundScope {
+                scope_id: "test-root".to_string(),
+                resource_ids: vec!["listener-a".to_string()],
+            }],
+        )
+        .await
+        .expect("queue pending facade replacement");
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _rescan_reset = RescanPauseHookReset;
+        crate::api::install_rescan_pause_hook(crate::api::RescanPauseHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let shutdown_started = Arc::new(Notify::new());
+        let _shutdown_reset = FacadeShutdownStartHookReset;
+        install_facade_shutdown_start_hook(FacadeShutdownStartHook {
+            entered: shutdown_started.clone(),
+        });
+
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .post(format!("http://{bind_addr}/api/fs-meta/v1/index/rescan"))
+                    .bearer_auth(token)
+                    .json(&json!({}))
+                    .send()
+                    .await
+            }
+        });
+
+        entered.notified().await;
+        let control_task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[trusted_exposure_confirmed_envelope(
+                    execution_units::FACADE_RUNTIME_UNIT_ID,
+                    2,
+                )])
+                .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), shutdown_started.notified())
+                .await
+                .is_err(),
+            "pending facade exposure confirmation must not start shutdown while rescan is still in flight"
+        );
+
+        release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join rescan request")
+            .expect("rescan request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode rescan body");
+        assert!(
+            status.is_success(),
+            "in-flight rescan should complete before pending facade replacement shutdown starts: status={status} body={body}"
+        );
+        control_task
+            .await
+            .expect("join control-frame task")
+            .expect("handle exposure confirmation after rescan");
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
     async fn query_peer_deactivate_does_not_shutdown_active_facade_listener() {
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
@@ -20810,6 +21854,341 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mixed_source_and_query_wave_does_not_publish_routes_before_source_apply_settles() {
+        let tmp = tempdir().expect("create temp dir");
+        let root = tmp.path().join("root-a");
+        fs::create_dir_all(&root).expect("create root-a");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![source::config::RootSpec::new("root-a", &root)],
+                        host_object_grants: vec![granted_mount_root(
+                            "single-app-node::root-a-1",
+                            &root,
+                        )],
+                        ..local_source_config()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                NodeId("single-app-node".into()),
+                Some(Arc::new(NoopBoundary)),
+            )
+            .expect("init app"),
+        );
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = SourceApplyPauseHookReset;
+        install_source_apply_pause_hook(SourceApplyPauseHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let route_key = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+        let control = tokio::spawn({
+            let app = app.clone();
+            let route_key = route_key.clone();
+            async move {
+                app.on_control_frame(&[
+                    activate_envelope_with_route_key_and_scope_rows(
+                        execution_units::SOURCE_RUNTIME_UNIT_ID,
+                        format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                        &[("root-a", &["single-app-node::root-a-1"])],
+                        2,
+                    ),
+                    activate_envelope_with_route_key_and_scope_rows(
+                        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                        route_key,
+                        &[("listener-a", &["listener-a"])],
+                        2,
+                    ),
+                ])
+                .await
+            }
+        });
+
+        entered.notified().await;
+
+        assert!(
+            !app.facade_gate
+                .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &route_key)
+                .expect("query-peer route state while source.apply is paused"),
+            "mixed source/query wave must not publish query-peer ownership before source.apply settles"
+        );
+        assert!(
+            !app.facade_gate
+                .route_active(execution_units::QUERY_RUNTIME_UNIT_ID, &route_key)
+                .expect("mirrored query route state while source.apply is paused"),
+            "mixed source/query wave must not mirror query ownership before source.apply settles"
+        );
+
+        release.notify_waiters();
+        control
+            .await
+            .expect("join mixed source/query control wave")
+            .expect("mixed source/query control wave should finish");
+
+        assert!(
+            app.facade_gate
+                .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &route_key)
+                .expect("query-peer route state after source.apply settles"),
+            "mixed source/query wave should publish query-peer ownership once source.apply settles"
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn pending_fixed_bind_facade_claim_keeps_successor_not_ready_until_publication_can_complete()
+     {
+        struct ProcessFacadeClaimReset;
+
+        impl Drop for ProcessFacadeClaimReset {
+            fn drop(&mut self) {
+                clear_process_facade_claim_for_tests();
+            }
+        }
+
+        clear_process_facade_claim_for_tests();
+        let _claim_reset = ProcessFacadeClaimReset;
+
+        let tmp = tempdir().expect("create temp dir");
+        let root = tmp.path().join("root-a");
+        fs::create_dir_all(&root).expect("create root-a");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let listener_resource = api::config::ApiListenerResource {
+            resource_id: "listener-a".to_string(),
+            bind_addr: bind_addr.clone(),
+        };
+        let app = FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &root)],
+                    host_object_grants: vec![granted_mount_root(
+                        "node-d-successor::root-a",
+                        &root,
+                    )],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path,
+                        shadow_path,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-d-fixed-bind-successor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init successor app");
+
+        {
+            let mut guard = match process_facade_claim_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.insert(
+                bind_addr.clone(),
+                ProcessFacadeClaim {
+                    owner_instance_id: app.instance_id + 1,
+                    route_key: facade_control_stream_route(),
+                    resource_ids: vec![listener_resource.resource_id.clone()],
+                    bind_addr: bind_addr.clone(),
+                },
+            );
+        }
+
+        app.on_control_frame(&[
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                &[("listener-a", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                &[("listener-a", &["listener-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("successor facade/query wave should stay local and complete");
+
+        assert!(
+            app.pending_facade.lock().await.is_some(),
+            "successor facade should remain pending while the predecessor fixed-bind claim is still owned elsewhere"
+        );
+        assert!(
+            !app.api_control_gate.is_ready(),
+            "successor must remain not-ready until the fixed-bind facade publication barrier can complete"
+        );
+        assert!(
+            !app.facade_gate
+                .route_active(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    &format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
+                )
+                .expect("query-peer source-status route state"),
+            "facade-dependent query ownership must stay unpublished while the fixed-bind claim remains elsewhere"
+        );
+
+        app.close().await.expect("close successor app");
+    }
+
+    #[tokio::test]
+    async fn pending_fixed_bind_facade_claim_survives_later_facade_deactivate_followup_until_publication_can_complete()
+     {
+        struct ProcessFacadeClaimReset;
+
+        impl Drop for ProcessFacadeClaimReset {
+            fn drop(&mut self) {
+                clear_process_facade_claim_for_tests();
+            }
+        }
+
+        clear_process_facade_claim_for_tests();
+        let _claim_reset = ProcessFacadeClaimReset;
+
+        let tmp = tempdir().expect("create temp dir");
+        let root = tmp.path().join("root-a");
+        fs::create_dir_all(&root).expect("create root-a");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let listener_resource = api::config::ApiListenerResource {
+            resource_id: "listener-a".to_string(),
+            bind_addr: bind_addr.clone(),
+        };
+        let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+        let app = FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &root)],
+                    host_object_grants: vec![granted_mount_root(
+                        "node-d-successor::root-a",
+                        &root,
+                    )],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path,
+                        shadow_path,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-d-fixed-bind-successor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init successor app");
+
+        {
+            let mut guard = match process_facade_claim_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.insert(
+                bind_addr.clone(),
+                ProcessFacadeClaim {
+                    owner_instance_id: app.instance_id + 1,
+                    route_key: facade_control_stream_route(),
+                    resource_ids: vec![listener_resource.resource_id.clone()],
+                    bind_addr: bind_addr.clone(),
+                },
+            );
+        }
+
+        app.on_control_frame(&[
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                &[("listener-a", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route.clone(),
+                &[("listener-a", &["listener-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial successor facade/query wave should stay pending");
+
+        assert!(
+            app.pending_facade.lock().await.is_some(),
+            "successor facade should remain pending while the predecessor still owns the fixed bind"
+        );
+        assert!(
+            !app.facade_gate
+                .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &source_status_route)
+                .expect("query-peer source-status route state"),
+            "initial pending successor wave must not publish query-peer source-status"
+        );
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                3,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route.clone(),
+                &[("listener-a", &["listener-a"])],
+                3,
+            ),
+        ])
+        .await
+        .expect("later facade deactivate followup should stay pending");
+
+        let pending = app.pending_facade.lock().await.clone();
+        assert!(
+            pending.is_some(),
+            "later facade deactivate followup must not clear a pending fixed-bind successor before publication can complete"
+        );
+        assert!(
+            pending
+                .as_ref()
+                .is_some_and(|pending| pending.generation == 2),
+            "pending successor should keep waiting on the original fixed-bind claim after the later deactivate followup"
+        );
+        assert!(
+            !app.api_control_gate.is_ready(),
+            "successor must remain not-ready while the fixed-bind claim is still owned elsewhere"
+        );
+        assert!(
+            !app.facade_gate
+                .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &source_status_route)
+                .expect("query-peer source-status route state after later followup"),
+            "later facade deactivate followup must not publish query-peer source-status while the fixed-bind claim remains elsewhere"
+        );
+        let endpoint_routes = app
+            .runtime_endpoint_tasks
+            .lock()
+            .await
+            .iter()
+            .map(|task| task.route_key().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            !endpoint_routes.contains(&source_status_route),
+            "later facade deactivate followup must not spawn source-status endpoint before fixed-bind publication can complete: {endpoint_routes:?}"
+        );
+
+        app.close().await.expect("close successor app");
+    }
+
+    #[tokio::test]
     async fn route_peer_turnover_does_not_publish_query_routes_while_fixed_bind_facade_claim_is_owned_by_predecessor()
      {
         struct ProcessFacadeClaimReset;
@@ -21188,6 +22567,1018 @@ mod tests {
 
         app.close().await.expect("close successor app");
         predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn pending_fixed_bind_claim_suppresses_all_facade_dependent_query_routes_regardless_of_generation_order()
+    {
+        struct ProcessFacadeClaimReset;
+
+        impl Drop for ProcessFacadeClaimReset {
+            fn drop(&mut self) {
+                clear_process_facade_claim_for_tests();
+            }
+        }
+
+        clear_process_facade_claim_for_tests();
+        let _claim_reset = ProcessFacadeClaimReset;
+
+        let tmp = tempdir().expect("create temp dir");
+        let root = tmp.path().join("root-a");
+        fs::create_dir_all(&root).expect("create root-a");
+        let bind_addr = reserve_bind_addr();
+        let listener_resource = api::config::ApiListenerResource {
+            resource_id: "listener-a".to_string(),
+            bind_addr: bind_addr.clone(),
+        };
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let app = FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &root)],
+                    host_object_grants: vec![granted_mount_root("node-d-successor::root-a", &root)],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path,
+                        shadow_path,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-d-fixed-bind-successor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init successor app");
+
+        {
+            let mut guard = match process_facade_claim_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.insert(
+                bind_addr.clone(),
+                ProcessFacadeClaim {
+                    owner_instance_id: app.instance_id + 1,
+                    route_key: facade_control_stream_route(),
+                    resource_ids: vec![listener_resource.resource_id.clone()],
+                    bind_addr: bind_addr.clone(),
+                },
+            );
+        }
+
+        let mixed_wave = vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                &[("listener-a", &["listener-a"])],
+                10,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_QUERY),
+                &[("listener-a", &["listener-a"])],
+                9,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("listener-a", &["listener-a"])],
+                10,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("listener-a", &["listener-a"])],
+                10,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                &[("listener-a", &["listener-a"])],
+                11,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                &[("listener-a", &["listener-a"])],
+                11,
+            ),
+        ];
+        app.on_control_frame(&mixed_wave)
+            .await
+            .expect("mixed facade/query wave should stay pending under fixed-bind conflict");
+
+        for (unit_id, route_key) in [
+            (execution_units::QUERY_RUNTIME_UNIT_ID, format!("{}.req", ROUTE_KEY_QUERY)),
+            (execution_units::QUERY_RUNTIME_UNIT_ID, format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)),
+            (execution_units::QUERY_PEER_RUNTIME_UNIT_ID, format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)),
+            (execution_units::QUERY_RUNTIME_UNIT_ID, format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)),
+            (execution_units::QUERY_PEER_RUNTIME_UNIT_ID, format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)),
+        ] {
+            assert!(
+                !app.facade_gate.route_active(unit_id, &route_key).expect("route state"),
+                "pending fixed-bind claim must suppress facade-dependent route {route_key} under unit {unit_id} even when the route generation is older/newer than the pending facade generation"
+            );
+        }
+        assert!(app.pending_facade.lock().await.is_some());
+        assert!(!app.api_control_gate.is_ready());
+
+        app.close().await.expect("close successor app");
+    }
+
+    #[tokio::test]
+    async fn retained_predecessor_fixed_bind_facade_deactivate_keeps_source_status_route_live_until_successor_claims_bind()
+     {
+        struct ProcessFacadeClaimReset;
+
+        impl Drop for ProcessFacadeClaimReset {
+            fn drop(&mut self) {
+                clear_process_facade_claim_for_tests();
+            }
+        }
+
+        clear_process_facade_claim_for_tests();
+        let _claim_reset = ProcessFacadeClaimReset;
+
+        let tmp = tempdir().expect("create temp dir");
+        let root = tmp.path().join("root-a");
+        fs::create_dir_all(&root).expect("create root-a");
+        let bind_addr = reserve_bind_addr();
+        let listener_resource = api::config::ApiListenerResource {
+            resource_id: "listener-a".to_string(),
+            bind_addr: bind_addr.clone(),
+        };
+
+        let (passwd_path_1, shadow_path_1) = write_auth_files(&tmp);
+        let predecessor = FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &root)],
+                    host_object_grants: vec![granted_mount_root(
+                        "node-d-predecessor::root-a",
+                        &root,
+                    )],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path: passwd_path_1,
+                        shadow_path: shadow_path_1,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-d-fixed-bind-predecessor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init predecessor app");
+        *predecessor.pending_facade.lock().await = Some(PendingFacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec![listener_resource.resource_id.clone()],
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: listener_resource.resource_id.clone(),
+                resource_ids: vec![listener_resource.resource_id.clone()],
+            }],
+            group_ids: Vec::new(),
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            resolved: predecessor
+                .config
+                .api
+                .resolve_for_candidate_ids(std::slice::from_ref(&listener_resource.resource_id))
+                .expect("resolve predecessor facade config"),
+        });
+        match predecessor.try_spawn_pending_facade().await {
+            Ok(true) => {}
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Ok(false) => panic!("predecessor fixed-bind facade should claim the listener"),
+            Err(err) => panic!("spawn predecessor facade: {err}"),
+        }
+
+        let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+        predecessor
+            .apply_facade_activate(
+                FacadeRuntimeUnit::QueryPeer,
+                &source_status_route,
+                1,
+                &[RuntimeBoundScope {
+                    scope_id: listener_resource.resource_id.clone(),
+                    resource_ids: vec![listener_resource.resource_id.clone()],
+                }],
+            )
+            .await
+            .expect("activate predecessor source-status route");
+
+        for unit_id in [
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+        ] {
+            assert!(
+                predecessor
+                    .facade_gate
+                    .route_active(unit_id, &source_status_route)
+                    .expect("initial predecessor source-status route state"),
+                "predecessor should start with source-status active under unit {unit_id}"
+            );
+        }
+
+        let (passwd_path_2, shadow_path_2) = write_auth_files(&tmp);
+        let successor = FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &root)],
+                    host_object_grants: vec![granted_mount_root(
+                        "node-d-successor::root-a",
+                        &root,
+                    )],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path: passwd_path_2,
+                        shadow_path: shadow_path_2,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-d-fixed-bind-successor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init successor app");
+
+        successor
+            .on_control_frame(&[
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::FACADE_RUNTIME_UNIT_ID,
+                    facade_control_stream_route(),
+                    &[("listener-a", &["listener-a"])],
+                    2,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    source_status_route.clone(),
+                    &[("listener-a", &["listener-a"])],
+                    2,
+                ),
+            ])
+            .await
+            .expect("successor fixed-bind facade/query wave should stay pending");
+
+        assert!(
+            successor.pending_facade.lock().await.is_some(),
+            "successor facade should remain pending while predecessor still owns the fixed bind"
+        );
+        assert!(
+            successor.api_task.lock().await.is_none(),
+            "successor must not install an active facade handle before predecessor releases the fixed bind"
+        );
+
+        predecessor
+            .on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                2,
+            )])
+            .await
+            .expect("retained predecessor facade deactivate should settle");
+
+        predecessor
+            .on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route.clone(),
+                2,
+            )])
+            .await
+            .expect("later predecessor source-status deactivate should settle");
+
+        assert!(
+            predecessor.api_task.lock().await.is_some(),
+            "predecessor must keep the active facade handle installed while successor publication is still pending"
+        );
+        for unit_id in [
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+        ] {
+            assert!(
+                predecessor
+                    .facade_gate
+                    .route_active(unit_id, &source_status_route)
+                    .expect("predecessor source-status route state after retained facade continuity"),
+                "retained predecessor facade must keep source-status active under unit {unit_id} until the successor can claim the fixed bind"
+            );
+        }
+        let claim = {
+            let guard = match process_facade_claim_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard
+                .get(&bind_addr)
+                .cloned()
+                .expect("predecessor should still own the fixed-bind claim before release")
+        };
+        assert_eq!(
+            claim.owner_instance_id, predecessor.instance_id,
+            "predecessor should remain the fixed-bind owner until it explicitly releases the retained facade"
+        );
+
+        predecessor.close().await.expect("close predecessor app");
+
+        successor
+            .on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("root-a", &["node-d-successor::root-a"])],
+                3,
+            )])
+            .await
+            .expect("successor source followup after predecessor release should settle");
+
+        let claim = {
+            let guard = match process_facade_claim_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard
+                .get(&bind_addr)
+                .cloned()
+                .expect("successor should claim the released fixed bind on the later source followup")
+        };
+        assert_eq!(
+            claim.owner_instance_id, successor.instance_id,
+            "successor should take over the fixed bind once the retained predecessor facade is released"
+        );
+
+        successor.close().await.expect("close successor app");
+    }
+
+    #[tokio::test]
+    async fn released_predecessor_fixed_bind_claim_requires_later_followup_to_complete_successor_facade_publication()
+     {
+        struct ProcessFacadeClaimReset;
+
+        impl Drop for ProcessFacadeClaimReset {
+            fn drop(&mut self) {
+                clear_process_facade_claim_for_tests();
+            }
+        }
+
+        clear_process_facade_claim_for_tests();
+        let _claim_reset = ProcessFacadeClaimReset;
+
+        let tmp = tempdir().expect("create temp dir");
+        let root = tmp.path().join("root-a");
+        fs::create_dir_all(&root).expect("create root-a");
+        let bind_addr = reserve_bind_addr();
+        let listener_resource = api::config::ApiListenerResource {
+            resource_id: "listener-a".to_string(),
+            bind_addr: bind_addr.clone(),
+        };
+
+        let (passwd_path_1, shadow_path_1) = write_auth_files(&tmp);
+        let predecessor = FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &root)],
+                    host_object_grants: vec![granted_mount_root(
+                        "node-d-predecessor::root-a",
+                        &root,
+                    )],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path: passwd_path_1,
+                        shadow_path: shadow_path_1,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-d-fixed-bind-predecessor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init predecessor app");
+        *predecessor.pending_facade.lock().await = Some(PendingFacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec![listener_resource.resource_id.clone()],
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: listener_resource.resource_id.clone(),
+                resource_ids: vec![listener_resource.resource_id.clone()],
+            }],
+            group_ids: Vec::new(),
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            resolved: predecessor
+                .config
+                .api
+                .resolve_for_candidate_ids(std::slice::from_ref(&listener_resource.resource_id))
+                .expect("resolve predecessor facade config"),
+        });
+        match predecessor.try_spawn_pending_facade().await {
+            Ok(true) => {}
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Ok(false) => panic!("predecessor fixed-bind facade should claim the listener"),
+            Err(err) => panic!("spawn predecessor facade: {err}"),
+        }
+
+        let (passwd_path_2, shadow_path_2) = write_auth_files(&tmp);
+        let successor = FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &root)],
+                    host_object_grants: vec![granted_mount_root(
+                        "node-d-successor::root-a",
+                        &root,
+                    )],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path: passwd_path_2,
+                        shadow_path: shadow_path_2,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-d-fixed-bind-successor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init successor app");
+        let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+
+        successor
+            .on_control_frame(&[
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::FACADE_RUNTIME_UNIT_ID,
+                    facade_control_stream_route(),
+                    &[("listener-a", &["listener-a"])],
+                    2,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    source_status_route.clone(),
+                    &[("listener-a", &["listener-a"])],
+                    2,
+                ),
+            ])
+            .await
+            .expect("initial successor facade/query wave should stay pending");
+
+        assert!(
+            successor.pending_facade.lock().await.is_some(),
+            "successor facade should remain pending while the predecessor still owns the fixed bind"
+        );
+        assert!(
+            !successor.api_control_gate.is_ready(),
+            "successor must remain not-ready until the predecessor claim is released and publication completes"
+        );
+        assert!(
+            !successor
+                .facade_gate
+                .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &source_status_route)
+                .expect("query-peer source-status route state while predecessor owns claim"),
+            "barrier must suppress facade-dependent query publication while the predecessor owns the fixed bind"
+        );
+
+        predecessor.close().await.expect("close predecessor app");
+
+        successor
+            .on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route.clone(),
+                &[("listener-a", &["listener-a"])],
+                3,
+            )])
+            .await
+            .expect("later query followup after predecessor claim release should settle");
+
+        let claim = {
+            let guard = match process_facade_claim_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard
+                .get(&bind_addr)
+                .cloned()
+                .expect("successor should claim the released fixed bind on the later followup")
+        };
+        assert_eq!(
+            claim.owner_instance_id, successor.instance_id,
+            "successor should take over the fixed bind once the predecessor releases it"
+        );
+        assert!(
+            successor.pending_facade.lock().await.is_none(),
+            "later followup should complete successor facade publication once the predecessor claim is released"
+        );
+        assert!(
+            successor.api_task.lock().await.is_some(),
+            "successor should activate its facade handle after the predecessor releases the fixed bind"
+        );
+        assert!(
+            successor.api_control_gate.is_ready(),
+            "successor should become ready once the released fixed bind can be claimed"
+        );
+        assert!(
+            successor
+                .facade_gate
+                .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &source_status_route)
+                .expect("query-peer source-status route state after predecessor claim release"),
+            "later query followup should keep the source-status route active after successor publication completes"
+        );
+
+        successor.close().await.expect("close successor app");
+    }
+
+    #[tokio::test]
+    async fn released_predecessor_fixed_bind_claim_source_followup_completes_successor_facade_publication_without_query_republication()
+     {
+        struct ProcessFacadeClaimReset;
+
+        impl Drop for ProcessFacadeClaimReset {
+            fn drop(&mut self) {
+                clear_process_facade_claim_for_tests();
+            }
+        }
+
+        clear_process_facade_claim_for_tests();
+        let _claim_reset = ProcessFacadeClaimReset;
+
+        let tmp = tempdir().expect("create temp dir");
+        let root = tmp.path().join("root-a");
+        fs::create_dir_all(&root).expect("create root-a");
+        let bind_addr = reserve_bind_addr();
+        let listener_resource = api::config::ApiListenerResource {
+            resource_id: "listener-a".to_string(),
+            bind_addr: bind_addr.clone(),
+        };
+
+        let (passwd_path_1, shadow_path_1) = write_auth_files(&tmp);
+        let predecessor = FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &root)],
+                    host_object_grants: vec![granted_mount_root(
+                        "node-d-predecessor::root-a",
+                        &root,
+                    )],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path: passwd_path_1,
+                        shadow_path: shadow_path_1,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-d-fixed-bind-predecessor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init predecessor app");
+        *predecessor.pending_facade.lock().await = Some(PendingFacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec![listener_resource.resource_id.clone()],
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: listener_resource.resource_id.clone(),
+                resource_ids: vec![listener_resource.resource_id.clone()],
+            }],
+            group_ids: Vec::new(),
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            resolved: predecessor
+                .config
+                .api
+                .resolve_for_candidate_ids(std::slice::from_ref(&listener_resource.resource_id))
+                .expect("resolve predecessor facade config"),
+        });
+        match predecessor.try_spawn_pending_facade().await {
+            Ok(true) => {}
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Ok(false) => panic!("predecessor fixed-bind facade should claim the listener"),
+            Err(err) => panic!("spawn predecessor facade: {err}"),
+        }
+
+        let (passwd_path_2, shadow_path_2) = write_auth_files(&tmp);
+        let successor = FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &root)],
+                    host_object_grants: vec![granted_mount_root(
+                        "node-d-successor::root-a",
+                        &root,
+                    )],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path: passwd_path_2,
+                        shadow_path: shadow_path_2,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-d-fixed-bind-successor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init successor app");
+        let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+
+        successor
+            .on_control_frame(&[
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::FACADE_RUNTIME_UNIT_ID,
+                    facade_control_stream_route(),
+                    &[("listener-a", &["listener-a"])],
+                    2,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    source_status_route.clone(),
+                    &[("listener-a", &["listener-a"])],
+                    2,
+                ),
+            ])
+            .await
+            .expect("initial successor facade/query wave should stay pending");
+
+        assert!(
+            successor.pending_facade.lock().await.is_some(),
+            "successor facade should remain pending while the predecessor still owns the fixed bind"
+        );
+        assert!(
+            !successor.api_control_gate.is_ready(),
+            "successor must remain not-ready until the predecessor claim is released and publication completes"
+        );
+        assert!(
+            !successor
+                .facade_gate
+                .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &source_status_route)
+                .expect("query-peer source-status route state while predecessor owns claim"),
+            "barrier must suppress facade-dependent query publication while the predecessor owns the fixed bind"
+        );
+
+        predecessor.close().await.expect("close predecessor app");
+
+        successor
+            .on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("root-a", &["node-d-successor::root-a"])],
+                3,
+            )])
+            .await
+            .expect("later source followup after predecessor claim release should settle");
+
+        let claim = {
+            let guard = match process_facade_claim_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard
+                .get(&bind_addr)
+                .cloned()
+                .expect("successor should claim the released fixed bind on the later source followup")
+        };
+        assert_eq!(
+            claim.owner_instance_id, successor.instance_id,
+            "successor should take over the fixed bind once the predecessor releases it"
+        );
+        assert!(
+            successor.pending_facade.lock().await.is_none(),
+            "later source followup should complete successor facade publication once the predecessor claim is released"
+        );
+        assert!(
+            successor.api_task.lock().await.is_some(),
+            "successor should activate its facade handle after the predecessor releases the fixed bind"
+        );
+        assert!(
+            successor.api_control_gate.is_ready(),
+            "successor should become ready once the released fixed bind can be claimed on a source-only followup"
+        );
+        assert!(
+            !successor
+                .facade_gate
+                .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &source_status_route)
+                .expect("query-peer source-status route state after source-only followup"),
+            "source-only followup should not republish query-peer source-status without a matching query followup"
+        );
+
+        successor.close().await.expect("close successor app");
+    }
+
+
+    #[tokio::test]
+    async fn fixed_bind_handoff_releases_predecessor_once_successor_facade_exposure_is_confirmed()
+    {
+        struct ProcessFacadeClaimReset;
+
+        impl Drop for ProcessFacadeClaimReset {
+            fn drop(&mut self) {
+                clear_process_facade_claim_for_tests();
+            }
+        }
+
+        clear_process_facade_claim_for_tests();
+        let _claim_reset = ProcessFacadeClaimReset;
+
+        let tmp = tempdir().expect("create temp dir");
+        let root = tmp.path().join("root-a");
+        fs::create_dir_all(&root).expect("create root-a");
+        let bind_addr = reserve_bind_addr();
+        let listener_resource = api::config::ApiListenerResource {
+            resource_id: "listener-a".to_string(),
+            bind_addr: bind_addr.clone(),
+        };
+
+        let (passwd_path_1, shadow_path_1) = write_auth_files(&tmp);
+        let predecessor = FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &root)],
+                    host_object_grants: vec![granted_mount_root("node-d-predecessor::root-a", &root)],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig { passwd_path: passwd_path_1, shadow_path: shadow_path_1, ..api::ApiAuthConfig::default() },
+                },
+            },
+            NodeId("node-d-fixed-bind-predecessor".into()),
+            Some(Arc::new(NoopBoundary)),
+        ).expect("init predecessor app");
+        *predecessor.pending_facade.lock().await = Some(PendingFacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec![listener_resource.resource_id.clone()],
+            bound_scopes: vec![RuntimeBoundScope { scope_id: listener_resource.resource_id.clone(), resource_ids: vec![listener_resource.resource_id.clone()] }],
+            group_ids: Vec::new(),
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            resolved: predecessor.config.api.resolve_for_candidate_ids(std::slice::from_ref(&listener_resource.resource_id)).expect("resolve predecessor facade config"),
+        });
+        match predecessor.try_spawn_pending_facade().await {
+            Ok(true) => {}
+            Err(CnxError::InvalidInput(msg)) if msg.contains("fs-meta api bind failed: Operation not permitted") => { return; }
+            Ok(false) => panic!("predecessor fixed-bind facade should claim the listener"),
+            Err(err) => panic!("spawn predecessor facade: {err}"),
+        }
+
+        let (passwd_path_2, shadow_path_2) = write_auth_files(&tmp);
+        let successor = FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &root)],
+                    host_object_grants: vec![granted_mount_root("node-d-successor::root-a", &root)],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig { passwd_path: passwd_path_2, shadow_path: shadow_path_2, ..api::ApiAuthConfig::default() },
+                },
+            },
+            NodeId("node-d-fixed-bind-successor".into()),
+            Some(Arc::new(NoopBoundary)),
+        ).expect("init successor app");
+
+        successor.on_control_frame(&[
+            activate_envelope_with_route_key_and_scope_rows(execution_units::FACADE_RUNTIME_UNIT_ID, facade_control_stream_route(), &[("listener-a", &["listener-a"])], 2),
+            activate_envelope_with_route_key_and_scope_rows(execution_units::SOURCE_RUNTIME_UNIT_ID, format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL), &[("root-a", &["node-d-successor::root-a"])], 2),
+        ]).await.expect("initial successor facade/source wave should settle");
+
+        assert!(successor.pending_facade.lock().await.is_some());
+        assert!(!successor.api_control_gate.is_ready());
+        let claim_before = {
+            let guard = match process_facade_claim_cell().lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            guard.get(&bind_addr).cloned().expect("predecessor should still own claim before later deactivate")
+        };
+        assert_eq!(claim_before.owner_instance_id, predecessor.instance_id);
+
+        successor.on_control_frame(&[trusted_exposure_confirmed_envelope(
+            execution_units::FACADE_RUNTIME_UNIT_ID,
+            2,
+        )]).await.expect("successor facade exposure confirmation should settle");
+
+        let claim_after = {
+            let guard = match process_facade_claim_cell().lock() { Ok(g) => g, Err(p) => p.into_inner() };
+            guard.get(&bind_addr).cloned().expect("successor should own claim after facade exposure confirmation enables coarse fixed-bind handoff")
+        };
+        assert_eq!(claim_after.owner_instance_id, successor.instance_id);
+        assert!(successor.api_task.lock().await.is_some());
+        assert!(successor.api_control_gate.is_ready());
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn released_externally_occupied_fixed_bind_requires_later_source_followup_to_complete_successor_facade_publication()
+     {
+        struct ProcessFacadeClaimReset;
+
+        impl Drop for ProcessFacadeClaimReset {
+            fn drop(&mut self) {
+                clear_process_facade_claim_for_tests();
+            }
+        }
+
+        clear_process_facade_claim_for_tests();
+        let _claim_reset = ProcessFacadeClaimReset;
+
+        let tmp = tempdir().expect("create temp dir");
+        let root = tmp.path().join("root-a");
+        fs::create_dir_all(&root).expect("create root-a");
+        let predecessor_listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind predecessor listener");
+        let bind_addr = predecessor_listener
+            .local_addr()
+            .expect("predecessor listener local addr")
+            .to_string();
+        let listener_resource = api::config::ApiListenerResource {
+            resource_id: "listener-a".to_string(),
+            bind_addr: bind_addr.clone(),
+        };
+
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let successor = FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &root)],
+                    host_object_grants: vec![granted_mount_root(
+                        "node-d-successor::root-a",
+                        &root,
+                    )],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path,
+                        shadow_path,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-d-fixed-bind-successor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init successor app");
+        let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+
+        successor
+            .on_control_frame(&[
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::FACADE_RUNTIME_UNIT_ID,
+                    facade_control_stream_route(),
+                    &[("listener-a", &["listener-a"])],
+                    2,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    source_status_route.clone(),
+                    &[("listener-a", &["listener-a"])],
+                    2,
+                ),
+            ])
+            .await
+            .expect("initial successor facade/query wave should stay pending under external fixed-bind occupancy");
+
+        let pending_status = facade_pending_status(&successor);
+        if pending_status
+            .last_error
+            .as_deref()
+            .is_some_and(|msg| msg.contains("fs-meta api bind failed: Operation not permitted"))
+        {
+            drop(predecessor_listener);
+            successor.close().await.expect("close successor app");
+            return;
+        }
+
+        assert!(
+            successor.pending_facade.lock().await.is_some(),
+            "successor facade should remain pending while an external predecessor still occupies the fixed bind"
+        );
+        assert_eq!(
+            pending_status.reason,
+            FacadePendingReason::RetryingAfterError,
+            "external fixed-bind occupancy should be treated as a pending handoff instead of aborting successor publication"
+        );
+        assert!(
+            pending_status
+                .last_error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("fs-meta api bind failed")),
+            "pending status should preserve the external fixed-bind bind failure: {:?}",
+            pending_status.last_error
+        );
+        assert!(
+            successor
+                .pending_fixed_bind_claim_release_followup
+                .load(Ordering::Acquire),
+            "external fixed-bind occupancy should arm a later followup once the predecessor releases the listener"
+        );
+        assert!(
+            !successor.api_control_gate.is_ready(),
+            "successor must remain not-ready until the external predecessor releases the fixed bind and publication completes"
+        );
+        assert!(
+            !successor
+                .facade_gate
+                .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &source_status_route)
+                .expect("query-peer source-status route state while predecessor listener is occupied"),
+            "barrier must suppress facade-dependent query publication while an external predecessor still occupies the fixed bind"
+        );
+
+        drop(predecessor_listener);
+
+        successor
+            .on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("root-a", &["node-d-successor::root-a"])],
+                3,
+            )])
+            .await
+            .expect("later source followup after external fixed-bind release should settle");
+
+        let claim = {
+            let guard = match process_facade_claim_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard
+                .get(&bind_addr)
+                .cloned()
+                .expect("successor should claim the released fixed bind on the later source followup")
+        };
+        assert_eq!(
+            claim.owner_instance_id, successor.instance_id,
+            "successor should take over the fixed bind once the external predecessor releases it"
+        );
+        assert!(
+            successor.pending_facade.lock().await.is_none(),
+            "later source followup should complete successor facade publication once the external predecessor releases the fixed bind"
+        );
+        assert!(
+            successor.api_task.lock().await.is_some(),
+            "successor should activate its facade handle after the external predecessor releases the fixed bind"
+        );
+        assert!(
+            successor.api_control_gate.is_ready(),
+            "successor should become ready once the released fixed bind can be claimed on a source-only followup"
+        );
+        assert!(
+            !successor
+                .facade_gate
+                .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &source_status_route)
+                .expect("query-peer source-status route state after source-only followup"),
+            "source-only followup should not republish query-peer source-status without a matching query followup"
+        );
+
+        successor.close().await.expect("close successor app");
     }
 
     #[tokio::test]

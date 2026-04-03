@@ -6207,6 +6207,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_rescan_source_to_fresh_sink_replays_baseline_entries_for_each_primary_root() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_micros();
+        let base = std::env::temp_dir().join(format!("fs-meta-manual-rescan-fresh-sink-{unique}"));
+        let nfs1 = base.join("nfs1");
+        let nfs2 = base.join("nfs2");
+        let subdir = "force-find-stress";
+        std::fs::create_dir_all(nfs1.join(subdir)).expect("create nfs1 dir");
+        std::fs::create_dir_all(nfs2.join(subdir)).expect("create nfs2 dir");
+        std::fs::write(nfs1.join(subdir).join("seed.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join(subdir).join("seed.txt"), b"b").expect("seed nfs2");
+
+        let mut cfg = SourceConfig::default();
+        let mut root_a = RootSpec::new("nfs1", nfs1.clone());
+        root_a.watch = false;
+        let mut root_b = RootSpec::new("nfs2", nfs2.clone());
+        root_b.watch = false;
+        cfg.roots = vec![root_a, root_b];
+        cfg.host_object_grants = vec![
+            test_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone(), true),
+            test_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone(), true),
+        ];
+
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg.clone())
+            .expect("init sink");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+        let query_dir = b"/force-find-stress";
+        let query_root = b"/force-find-stress";
+
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < initial_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => sink.send(&batch).await.expect("apply initial batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let nfs1_ready = selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_root);
+            let nfs2_ready = selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_root);
+            if nfs1_ready && nfs2_ready {
+                break;
+            }
+        }
+
+        assert!(
+            selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_root),
+            "nfs1 initial materialization should exist"
+        );
+        assert!(
+            selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_root),
+            "nfs2 initial materialization should exist"
+        );
+
+        let fresh_sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
+            .expect("init fresh sink");
+
+        source
+            .publish_manual_rescan_signal()
+            .await
+            .expect("publish manual rescan signal");
+
+        let rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < rescan_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => fresh_sink.send(&batch).await.expect("apply rescan batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let nfs1_ready = selected_group_tree_contains_path(&fresh_sink, "nfs1", query_dir, query_root);
+            let nfs2_ready = selected_group_tree_contains_path(&fresh_sink, "nfs2", query_dir, query_root);
+            if nfs1_ready && nfs2_ready {
+                break;
+            }
+        }
+
+        assert!(
+            selected_group_tree_contains_path(&fresh_sink, "nfs1", query_dir, query_root),
+            "manual rescan should rematerialize baseline nfs1 entries into a fresh sink after sink state loss"
+        );
+        assert!(
+            selected_group_tree_contains_path(&fresh_sink, "nfs2", query_dir, query_root),
+            "manual rescan should rematerialize baseline nfs2 entries into a fresh sink after sink state loss"
+        );
+
+        source.close().await.expect("close source");
+        sink.close().await.expect("close original sink");
+        fresh_sink.close().await.expect("close fresh sink");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
     async fn manual_rescan_source_to_sink_materializes_new_entries_for_each_primary_root() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

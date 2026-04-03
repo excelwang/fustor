@@ -93,3 +93,16 @@ path = "fs-meta/tests/specs_fs_meta_domain.rs"
 [[test]]
 name = "fs_meta_api_e2e"
 path = "fs-meta/tests/fs_meta_api_e2e.rs"
+
+[patch.crates-io]
+capanix-app-sdk = { path = "../capanix/crates/app-sdk" }
+capanix-config = { path = "../capanix/crates/config" }
+capanix-daemon = { path = "../capanix/crates/daemon" }
+capanix-host-adapter-fs = { path = "../capanix/crates/host-adapter-fs" }
+capanix-host-fs-types = { path = "../capanix/crates/host-fs-types" }
+capanix-kernel = { path = "../capanix/crates/kernel" }
+capanix-kernel-api = { path = "../capanix/crates/kernel-api" }
+capanix-route-proto = { path = "../capanix/crates/route-proto" }
+capanix-runtime-api = { path = "../capanix/crates/runtime-api" }
+capanix-unit-entry-macros = { path = "../capanix/crates/unit-entry-macros" }
+capanix-unit-sidecar = { path = "../capanix/crates/unit-sidecar" }

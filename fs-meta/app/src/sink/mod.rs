@@ -18,11 +18,14 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use capanix_app_sdk::runtime::{
-    ControlEnvelope, EventMetadata, NodeId, RecvOpts, RouteKey, in_memory_state_boundary,
+    ControlEnvelope, EventMetadata, NodeId, RecvOpts, RouteKey, StateCellHandle,
+    StateCellReadRequest, StateCellWriteRequest, StateClass, in_memory_state_boundary,
 };
 use capanix_app_sdk::{CnxError, Event, Result};
 use capanix_host_adapter_fs::HostAdapter;
-use capanix_runtime_entry_sdk::advanced::boundary::{ChannelIoSubset, StateBoundary};
+use capanix_runtime_entry_sdk::advanced::boundary::{
+    BoundaryContext, ChannelIoSubset, StateBoundary,
+};
 use capanix_runtime_entry_sdk::control::{RuntimeBoundScope, RuntimeHostGrantState};
 use tokio_util::sync::CancellationToken;
 
@@ -238,6 +241,50 @@ fn accumulate_status_snapshot(
 
 const VISIBILITY_LAG_RETENTION_US: u64 = 31 * 24 * 60 * 60 * 1_000_000;
 const VISIBILITY_LAG_MAX_SAMPLES: usize = 200_000;
+const SINK_STATE_SCHEMA_REV: u64 = 1;
+
+fn sink_state_handle(scope: &str) -> StateCellHandle {
+    StateCellHandle {
+        cell_id: format!("fs-meta.sink-state.{scope}"),
+        schema_rev: SINK_STATE_SCHEMA_REV,
+        state_class: StateClass::Authoritative,
+    }
+}
+
+fn sink_state_boundary_bridge(scope: &str) -> BoundaryContext {
+    BoundaryContext::for_unit(scope)
+}
+
+fn is_statecell_not_found(err: &CnxError) -> bool {
+    match err {
+        CnxError::InvalidInput(msg) => msg.contains("statecell not found"),
+        _ => false,
+    }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn encode_instant_age_ms(instant: Option<Instant>, now: Instant) -> Option<u64> {
+    instant
+        .and_then(|value| now.checked_duration_since(value))
+        .map(duration_millis_u64)
+}
+
+fn decode_instant_age_ms(age_ms: Option<u64>) -> Option<Instant> {
+    age_ms.map(|age| Instant::now() - Duration::from_millis(age))
+}
+
+fn encode_instant_remaining_ms(instant: Option<Instant>, now: Instant) -> Option<u64> {
+    instant
+        .and_then(|value| value.checked_duration_since(now))
+        .map(duration_millis_u64)
+}
+
+fn decode_instant_remaining_ms(remaining_ms: Option<u64>) -> Option<Instant> {
+    remaining_ms.map(|remaining| Instant::now() + Duration::from_millis(remaining))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VisibilityLagOp {
@@ -439,6 +486,244 @@ impl GroupSinkState {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedFileMetaNode {
+    path: Vec<u8>,
+    size: u64,
+    modified_time_us: u64,
+    created_time_us: u64,
+    is_dir: bool,
+    source: crate::SyncTrack,
+    monitoring_attested: bool,
+    last_confirmed_age_ms: Option<u64>,
+    suspect_remaining_ms: Option<u64>,
+    blind_spot: bool,
+    is_tombstoned: bool,
+    tombstone_remaining_ms: Option<u64>,
+    last_seen_epoch: u64,
+    subtree_last_write_significant_change_age_ms: Option<u64>,
+}
+
+impl PersistedFileMetaNode {
+    fn from_live(path: &[u8], node: &tree::FileMetaNode, now: Instant) -> Self {
+        Self {
+            path: path.to_vec(),
+            size: node.size,
+            modified_time_us: node.modified_time_us,
+            created_time_us: node.created_time_us,
+            is_dir: node.is_dir,
+            source: node.source.clone(),
+            monitoring_attested: node.monitoring_attested,
+            last_confirmed_age_ms: encode_instant_age_ms(node.last_confirmed_at, now),
+            suspect_remaining_ms: encode_instant_remaining_ms(node.suspect_until, now),
+            blind_spot: node.blind_spot,
+            is_tombstoned: node.is_tombstoned,
+            tombstone_remaining_ms: encode_instant_remaining_ms(node.tombstone_expires_at, now),
+            last_seen_epoch: node.last_seen_epoch,
+            subtree_last_write_significant_change_age_ms: encode_instant_age_ms(
+                node.subtree_last_write_significant_change_at,
+                now,
+            ),
+        }
+    }
+
+    fn into_live(self) -> tree::FileMetaNode {
+        tree::FileMetaNode {
+            size: self.size,
+            modified_time_us: self.modified_time_us,
+            created_time_us: self.created_time_us,
+            is_dir: self.is_dir,
+            source: self.source,
+            monitoring_attested: self.monitoring_attested,
+            last_confirmed_at: decode_instant_age_ms(self.last_confirmed_age_ms),
+            suspect_until: decode_instant_remaining_ms(self.suspect_remaining_ms),
+            blind_spot: self.blind_spot,
+            is_tombstoned: self.is_tombstoned,
+            tombstone_expires_at: decode_instant_remaining_ms(self.tombstone_remaining_ms),
+            last_seen_epoch: self.last_seen_epoch,
+            subtree_last_write_significant_change_at: decode_instant_age_ms(
+                self.subtree_last_write_significant_change_age_ms,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedGroupSinkState {
+    group_id: String,
+    primary_object_ref: String,
+    overflow_pending_audit: bool,
+    audit_epoch_completed: bool,
+    initial_audit_completed: bool,
+    materialized_revision: u64,
+    sentinel_health: BTreeMap<String, String>,
+    shadow_time_high_us: u64,
+    epoch_state_active: Option<u64>,
+    completed_epochs: u64,
+    audit_start_age_ms: Option<u64>,
+    last_coverage_recovered_age_ms: Option<u64>,
+    nodes: Vec<PersistedFileMetaNode>,
+}
+
+impl PersistedGroupSinkState {
+    fn from_live(group_id: &str, group: &GroupSinkState) -> Self {
+        let now = Instant::now();
+        Self {
+            group_id: group_id.to_string(),
+            primary_object_ref: group.primary_object_ref.clone(),
+            overflow_pending_audit: group.overflow_pending_audit,
+            audit_epoch_completed: group.audit_epoch_completed,
+            initial_audit_completed: group.initial_audit_completed,
+            materialized_revision: group.materialized_revision,
+            sentinel_health: group.sentinel_health.clone(),
+            shadow_time_high_us: group.clock.shadow_time_high_us,
+            epoch_state_active: match group.epoch_manager.state {
+                epoch::EpochState::Idle => None,
+                epoch::EpochState::Active(epoch_id) => Some(epoch_id),
+            },
+            completed_epochs: group.epoch_manager.completed_epochs,
+            audit_start_age_ms: encode_instant_age_ms(group.epoch_manager.audit_start_time, now),
+            last_coverage_recovered_age_ms: encode_instant_age_ms(
+                group.last_coverage_recovered_at,
+                now,
+            ),
+            nodes: group
+                .tree
+                .iter()
+                .map(|(path, node)| PersistedFileMetaNode::from_live(path, node, now))
+                .collect(),
+        }
+    }
+
+    fn into_live(self, tombstone_policy: TombstonePolicy) -> GroupSinkState {
+        let mut tree = MaterializedTree::new();
+        for node in self.nodes {
+            let path = node.path.clone();
+            tree.insert(path, node.into_live());
+        }
+        let mut epoch_manager = EpochManager::new();
+        epoch_manager.completed_epochs = self.completed_epochs;
+        epoch_manager.state = self
+            .epoch_state_active
+            .map(epoch::EpochState::Active)
+            .unwrap_or(epoch::EpochState::Idle);
+        epoch_manager.audit_start_time = decode_instant_age_ms(self.audit_start_age_ms);
+        let mut restored = GroupSinkState {
+            tree,
+            clock: SinkClock {
+                shadow_time_high_us: self.shadow_time_high_us,
+            },
+            epoch_manager,
+            tombstone_policy,
+            primary_object_ref: self.primary_object_ref,
+            overflow_pending_audit: self.overflow_pending_audit,
+            audit_epoch_completed: self.audit_epoch_completed,
+            initial_audit_completed: self.initial_audit_completed,
+            last_coverage_recovered_at: decode_instant_age_ms(
+                self.last_coverage_recovered_age_ms,
+            ),
+            materialized_revision: self.materialized_revision,
+            sentinel_health: self.sentinel_health,
+        };
+        restored.refresh_initial_audit_completed();
+        restored
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedSinkState {
+    scope: String,
+    persisted_at_us: u64,
+    groups: Vec<PersistedGroupSinkState>,
+}
+
+#[derive(Clone)]
+struct SinkStateSnapshotCell {
+    scope: Arc<str>,
+    handle: StateCellHandle,
+    state_boundary: Arc<dyn StateBoundary>,
+}
+
+impl SinkStateSnapshotCell {
+    fn from_state_boundary(
+        scope: &str,
+        state_boundary: Arc<dyn StateBoundary>,
+    ) -> std::io::Result<(Self, Option<PersistedSinkState>)> {
+        let handle = sink_state_handle(scope);
+        let loaded = match crate::runtime_app::block_on_shared_runtime(state_boundary.statecell_read(
+            sink_state_boundary_bridge(scope),
+            StateCellReadRequest {
+                handle: handle.clone(),
+            },
+        )) {
+            Ok(resp) => {
+                if resp.status != "ok" {
+                    return Err(std::io::Error::other(format!(
+                        "statecell_read failed for sink state scope={scope}: status={}",
+                        resp.status
+                    )));
+                }
+                if resp.payload.is_empty() {
+                    None
+                } else {
+                    let decoded: PersistedSinkState =
+                        rmp_serde::from_slice(&resp.payload).map_err(|err| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("decode sink state snapshot failed: {err}"),
+                            )
+                        })?;
+                    if decoded.scope != scope {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "sink state snapshot scope mismatch: expected {scope}, got {}",
+                                decoded.scope
+                            ),
+                        ));
+                    }
+                    Some(decoded)
+                }
+            }
+            Err(err) if is_statecell_not_found(&err) => None,
+            Err(err) => {
+                return Err(std::io::Error::other(format!(
+                    "statecell_read failed for sink state scope={scope}: {err}"
+                )));
+            }
+        };
+        Ok((
+            Self {
+                scope: Arc::<str>::from(scope),
+                handle,
+                state_boundary,
+            },
+            loaded,
+        ))
+    }
+
+    fn persist(&self, snapshot: &PersistedSinkState) -> Result<()> {
+        let payload = rmp_serde::to_vec_named(snapshot).map_err(|err| {
+            CnxError::Internal(format!("encode sink state snapshot failed: {err}"))
+        })?;
+        let response = crate::runtime_app::block_on_shared_runtime(self.state_boundary.statecell_write(
+            sink_state_boundary_bridge(&self.scope),
+            StateCellWriteRequest {
+                handle: self.handle.clone(),
+                payload,
+                lease_epoch: Some(snapshot.persisted_at_us.max(1)),
+            },
+        ))?;
+        if response.status != "committed" && response.status != "ok" {
+            return Err(CnxError::Internal(format!(
+                "statecell_write returned non-committed status for sink state scope={}: {}",
+                self.scope, response.status
+            )));
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct SinkState {
     pub(crate) groups: BTreeMap<String, GroupSinkState>,
     pub(crate) group_by_object_ref: HashMap<String, String>,
@@ -458,6 +743,27 @@ impl SinkState {
         };
         state.reconcile_host_object_grants(&source_cfg.roots, &source_cfg.host_object_grants, None);
         state
+    }
+
+    fn apply_persisted_snapshot(&mut self, snapshot: PersistedSinkState) {
+        for persisted in snapshot.groups {
+            let group_id = persisted.group_id.clone();
+            if let Some(group) = self.groups.get_mut(&group_id) {
+                *group = persisted.into_live(self.tombstone_policy);
+            }
+        }
+    }
+
+    fn to_persisted_snapshot(&self, scope: &str) -> PersistedSinkState {
+        PersistedSinkState {
+            scope: scope.to_string(),
+            persisted_at_us: now_us(),
+            groups: self
+                .groups
+                .iter()
+                .map(|(group_id, group)| PersistedGroupSinkState::from_live(group_id, group))
+                .collect(),
+        }
     }
 
     pub(crate) fn reconcile_host_object_grants(
@@ -541,17 +847,25 @@ impl SinkState {
 struct SinkStateCell {
     inner: Arc<RwLock<SinkState>>,
     commit_boundary: CommitBoundary,
+    snapshot_cell: Option<SinkStateSnapshotCell>,
 }
 
 impl SinkStateCell {
     fn new(
         source_cfg: &SourceConfig,
         commit_boundary: CommitBoundary,
+        snapshot_cell: Option<SinkStateSnapshotCell>,
+        persisted_snapshot: Option<PersistedSinkState>,
         record_bootstrap: bool,
     ) -> Self {
+        let mut state = SinkState::new(source_cfg);
+        if let Some(snapshot) = persisted_snapshot {
+            state.apply_persisted_snapshot(snapshot);
+        }
         let cell = Self {
-            inner: Arc::new(RwLock::new(SinkState::new(source_cfg))),
+            inner: Arc::new(RwLock::new(state)),
             commit_boundary,
+            snapshot_cell,
         };
         if record_bootstrap {
             cell.record_authoritative_commit(
@@ -580,6 +894,14 @@ impl SinkStateCell {
 
     fn record_authoritative_commit(&self, op: &str, detail: String) {
         self.commit_boundary.record(op, detail);
+    }
+
+    fn persist_snapshot(&self) -> Result<()> {
+        let Some(snapshot_cell) = &self.snapshot_cell else {
+            return Ok(());
+        };
+        let snapshot = self.read()?.to_persisted_snapshot(SINK_RUNTIME_UNIT_ID);
+        snapshot_cell.persist(&snapshot)
     }
 
     #[cfg(test)]
@@ -665,8 +987,15 @@ impl SinkFileMeta {
         source_cfg: SourceConfig,
         defer_authority_read: bool,
     ) -> Result<Self> {
+        let (snapshot_cell, persisted_snapshot) = SinkStateSnapshotCell::from_state_boundary(
+            SINK_RUNTIME_UNIT_ID,
+            state_boundary.clone(),
+        )
+        .map_err(|err| {
+            CnxError::InvalidInput(format!("sink statecell snapshot init failed: {err}"))
+        })?;
         let authority = if defer_authority_read {
-            AuthorityJournal::deferred(SINK_RUNTIME_UNIT_ID, state_boundary)
+            AuthorityJournal::deferred(SINK_RUNTIME_UNIT_ID, state_boundary.clone())
         } else {
             AuthorityJournal::from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary).map_err(
                 |err| {
@@ -677,6 +1006,8 @@ impl SinkFileMeta {
         let state = SinkStateCell::new(
             &source_cfg,
             CommitBoundary::new(authority),
+            Some(snapshot_cell),
+            persisted_snapshot,
             !defer_authority_read,
         );
         let root_specs = Arc::new(RwLock::new(source_cfg.roots.clone()));
@@ -2672,6 +3003,7 @@ impl SinkFileMeta {
                 data_events
             ),
         );
+        self.state.persist_snapshot()?;
 
         if !pending_lag_samples.is_empty() {
             lock_or_recover(
@@ -2862,6 +3194,7 @@ impl SinkFileMeta {
             );
             log::info!("Final group sentinel markers: {}", sentinel_markers);
         }
+        self.state.persist_snapshot()?;
         Ok(())
     }
 }
@@ -4098,6 +4431,93 @@ mod tests {
             snapshot.groups[0].initial_audit_completed,
             "materialized root should unlock initial audit readiness after audit completion"
         );
+    }
+
+    #[tokio::test]
+    async fn sink_reopen_with_same_state_boundary_preserves_materialized_state_and_initial_audit() {
+        let state_boundary = in_memory_state_boundary();
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![RootSpec::new("root-a", "/mnt/nfs1")];
+        cfg.host_object_grants = vec![granted_mount_root(
+            "node-a::exp",
+            "node-a",
+            "10.0.0.11",
+            "/mnt/nfs1",
+            true,
+        )];
+
+        let sink = SinkFileMeta::with_boundaries_and_state(
+            NodeId("node-a".to_string()),
+            None,
+            state_boundary.clone(),
+            cfg.clone(),
+        )
+        .expect("init sink");
+        sink.send(&[
+            mk_source_event(
+                "node-a::exp",
+                mk_record(b"/ready.txt", "ready.txt", 1, EventKind::Update),
+            ),
+            mk_control_event(
+                "node-a::exp",
+                ControlEvent::EpochStart {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                2,
+            ),
+            mk_control_event(
+                "node-a::exp",
+                ControlEvent::EpochEnd {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                3,
+            ),
+        ])
+        .await
+        .expect("materialize and complete initial audit");
+        let snapshot_before = sink.status_snapshot().expect("sink status before reopen");
+        assert!(
+            snapshot_before
+                .groups
+                .iter()
+                .find(|group| group.group_id == "root-a")
+                .is_some_and(|group| group.initial_audit_completed),
+            "precondition: root-a should be trusted before reopen"
+        );
+        let events_before = sink
+            .materialized_query(&default_materialized_request())
+            .expect("query before reopen");
+        let response_before = decode_tree_payload(&events_before[0]);
+        assert!(payload_contains_path(&response_before, b"/ready.txt"));
+        sink.close().await.expect("close sink before reopen");
+
+        let reopened = SinkFileMeta::with_boundaries_and_state(
+            NodeId("node-a".to_string()),
+            None,
+            state_boundary,
+            cfg,
+        )
+        .expect("reopen sink with same state boundary");
+        let snapshot_after = reopened.status_snapshot().expect("sink status after reopen");
+        assert!(
+            snapshot_after
+                .groups
+                .iter()
+                .find(|group| group.group_id == "root-a")
+                .is_some_and(|group| group.initial_audit_completed),
+            "reopened sink should preserve initial audit completion from the shared state boundary"
+        );
+        let events_after = reopened
+            .materialized_query(&default_materialized_request())
+            .expect("query after reopen");
+        let response_after = decode_tree_payload(&events_after[0]);
+        assert!(
+            payload_contains_path(&response_after, b"/ready.txt"),
+            "reopened sink should preserve the previously materialized tree payload"
+        );
+        reopened.close().await.expect("close reopened sink");
     }
 
     #[tokio::test]

@@ -91,6 +91,12 @@ fn fs_meta_release_upgrade_peer_source_control_completion_real_nfs() {
 
 #[test]
 #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_release_upgrade_facade_claim_continuity_real_nfs() {
+    test_release_upgrade::run_facade_claim_continuity_after_upgrade().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
 fn fs_meta_release_upgrade_roots_persist_real_nfs() {
     test_release_upgrade::run_roots_persist_across_upgrade().unwrap();
 }

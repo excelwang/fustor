@@ -186,6 +186,34 @@ fn unexport_dir_path(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn error_indicates_stale_file_handle(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(116)
+        || err
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("stale file handle")
+}
+
+fn remove_stale_lab_root(root: &Path) -> Result<(), String> {
+    match fs::remove_dir_all(root) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) if error_indicates_stale_file_handle(&err) => {
+            let output = sudo_output(["rm", "-rf", root.to_string_lossy().as_ref()])?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "remove stale lab root {} failed after stale file handle fallback with status {}",
+                    root.display(),
+                    output.status
+                ))
+            }
+        }
+        Err(err) => Err(format!("remove stale lab root {} failed: {err}", root.display())),
+    }
+}
+
 fn cleanup_stale_lab_plan(plan: &StaleLabCleanupPlan) -> Result<(), String> {
     let mut errors = Vec::new();
     for target in &plan.mount_targets {
@@ -205,13 +233,8 @@ fn cleanup_stale_lab_plan(plan: &StaleLabCleanupPlan) -> Result<(), String> {
             }
         }
     }
-    if let Err(err) = fs::remove_dir_all(&plan.root) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            errors.push(format!(
-                "remove stale lab root {} failed: {err}",
-                plan.root.display()
-            ));
-        }
+    if let Err(err) = remove_stale_lab_root(&plan.root) {
+        errors.push(err);
     }
     if errors.is_empty() {
         Ok(())
@@ -806,6 +829,19 @@ mod tests {
         );
         assert_eq!(plans[1].root, PathBuf::from("/tmp/.tmpdef456"));
         assert!(plans[1].mount_targets.is_empty());
+    }
+
+    #[test]
+    fn error_indicates_stale_file_handle_accepts_raw_os_error_116() {
+        let err = std::io::Error::from_raw_os_error(116);
+        assert!(error_indicates_stale_file_handle(&err));
+    }
+
+    #[test]
+    fn remove_stale_lab_root_tolerates_missing_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("missing-root");
+        assert!(remove_stale_lab_root(&missing).is_ok());
     }
 
     #[test]

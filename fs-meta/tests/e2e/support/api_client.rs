@@ -6,7 +6,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-const RECONNECT_RETRY_WINDOW: Duration = Duration::from_secs(30);
+const RECONNECT_RETRY_WINDOW: Duration = Duration::from_secs(90);
 const RECONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const HTTP_TIMEOUT_DEFAULT: Duration = Duration::from_secs(45);
 const HTTP_TIMEOUT_FORCE_FIND: Duration = Duration::from_secs(75);
@@ -497,7 +497,7 @@ impl OperatorSession {
                         saw_reauthable_error = true;
                         last_err = Some(format!("{base_url}: {err}"));
                     }
-                    Err(err) if is_transport_error(&err) => {
+                    Err(err) if is_transport_error(&err) || is_retryable_query_unavailable_error(&err) => {
                         saw_reauthable_error = true;
                         last_err = Some(format!("{base_url}: {err}"));
                     }
@@ -641,6 +641,13 @@ pub fn is_transport_error(err: &str) -> bool {
         || err.contains("failed to connect")
 }
 
+pub fn is_retryable_query_unavailable_error(err: &str) -> bool {
+    err.contains("http 503 failed")
+        && (err.contains("\"code\":\"NOT_READY\"")
+            || err.contains("trusted-materialized reads remain unavailable")
+            || err.contains("runtime control initializes the app"))
+}
+
 pub fn extract_token(login: Value) -> Result<String, String> {
     login
         .get("token")
@@ -666,15 +673,26 @@ fn login_first_available(
     username: &str,
     password: &str,
 ) -> Result<(FsMetaApiClient, String), String> {
+    let deadline = std::time::Instant::now() + RECONNECT_RETRY_WINDOW;
     let mut last_err = String::new();
-    for base in base_urls {
-        let client = FsMetaApiClient::new(base.clone())?;
-        match client.login(username, password) {
-            Ok(login) => return Ok((client, extract_token(login)?)),
-            Err(err) => last_err = format!("{base}: {err}"),
+    loop {
+        let mut saw_transport_error = false;
+        for base in base_urls {
+            let client = FsMetaApiClient::new(base.clone())?;
+            match client.login(username, password) {
+                Ok(login) => return Ok((client, extract_token(login)?)),
+                Err(err) if is_transport_error(&err) => {
+                    saw_transport_error = true;
+                    last_err = format!("{base}: {err}");
+                }
+                Err(err) => return Err(format!("{base}: {err}")),
+            }
         }
+        if !saw_transport_error || std::time::Instant::now() >= deadline {
+            return Err(format!("no reachable facade base URL: {last_err}"));
+        }
+        std::thread::sleep(RECONNECT_RETRY_INTERVAL);
     }
-    Err(format!("no reachable facade base URL: {last_err}"))
 }
 
 fn provision_query_api_key(
@@ -699,4 +717,53 @@ fn unique_suffix() -> String {
         .map(|duration| duration.as_micros())
         .unwrap_or_default();
     format!("{}-{micros}", std::process::id())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn login_first_available_retries_transient_transport_error_for_same_base_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind flaky login listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_bg = request_count.clone();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept login request");
+                request_count_bg.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0_u8; 4096];
+                let _ = stream.read(&mut buf);
+                if attempt == 0 {
+                    drop(stream);
+                    continue;
+                }
+                let body = r#"{"token":"test-token"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write login response");
+                stream.flush().expect("flush login response");
+            }
+        });
+
+        let base_urls = vec![format!("http://{}", addr)];
+        let (client, token) = login_first_available(&base_urls, "operator", "operator123")
+            .expect("login should survive one transient transport flap on the same facade");
+
+        assert_eq!(client.base_url(), format!("http://{}", addr));
+        assert_eq!(token, "test-token");
+        assert!(request_count.load(Ordering::SeqCst) >= 2);
+        server.join().expect("join flaky login server");
+    }
 }

@@ -39,6 +39,8 @@ use crate::runtime::routes::{
     METHOD_SOURCE_STATUS, ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SOURCE_ROOTS_CONTROL,
     ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
 };
+#[cfg(test)]
+use crate::runtime::routes::source_rescan_route_key_for;
 use crate::runtime::seam::exchange_host_adapter;
 use crate::sink::SinkStatusSnapshot;
 use crate::source::config::{GrantedMountRoot, RootSelector, RootSpec};
@@ -120,6 +122,13 @@ pub(crate) struct RootsPutPauseHook {
 
 #[cfg(test)]
 #[derive(Clone)]
+pub(crate) struct RescanPauseHook {
+    pub entered: std::sync::Arc<Notify>,
+    pub release: std::sync::Arc<Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
 pub(crate) struct StatusPauseHook {
     pub entered: std::sync::Arc<Notify>,
     pub release: std::sync::Arc<Notify>,
@@ -138,6 +147,12 @@ fn roots_put_pause_hook_cell() -> &'static StdMutex<Option<RootsPutPauseHook>> {
 }
 
 #[cfg(test)]
+fn rescan_pause_hook_cell() -> &'static StdMutex<Option<RescanPauseHook>> {
+    static CELL: OnceLock<StdMutex<Option<RescanPauseHook>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
 fn status_pause_hook_cell() -> &'static StdMutex<Option<StatusPauseHook>> {
     static CELL: OnceLock<StdMutex<Option<StatusPauseHook>>> = OnceLock::new();
     CELL.get_or_init(|| StdMutex::new(None))
@@ -152,6 +167,15 @@ fn status_route_trace_hook_cell() -> &'static StdMutex<Option<StatusRouteTraceHo
 #[cfg(test)]
 pub(crate) fn install_roots_put_pause_hook(hook: RootsPutPauseHook) {
     let mut guard = match roots_put_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn install_rescan_pause_hook(hook: RescanPauseHook) {
+    let mut guard = match rescan_pause_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -191,6 +215,15 @@ pub(crate) fn clear_roots_put_pause_hook() {
 }
 
 #[cfg(test)]
+pub(crate) fn clear_rescan_pause_hook() {
+    let mut guard = match rescan_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
 pub(crate) fn clear_status_pause_hook() {
     let mut guard = match status_pause_hook_cell().lock() {
         Ok(guard) => guard,
@@ -217,6 +250,27 @@ pub(crate) fn clear_status_route_trace_capture() {
 async fn maybe_pause_roots_put_after_previous_source_roots() {
     let hook = {
         let guard = match roots_put_pause_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        hook.entered.notify_waiters();
+        release.await;
+    }
+}
+
+#[cfg(test)]
+async fn maybe_pause_rescan_before_return() {
+    let hook = {
+        let guard = match rescan_pause_hook_cell().lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -1138,6 +1192,7 @@ pub async fn rescan(
     headers: HeaderMap,
 ) -> Result<Json<RescanResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
+    let _facade_request_guard = state.control_gate.begin_facade_request();
     if let Some(boundary) = state.runtime_boundary.as_ref() {
         eprintln!(
             "fs_meta_api: rescan via runtime_boundary node={}",
@@ -1180,7 +1235,11 @@ pub async fn rescan(
                     "fs_meta_api: rescan control send tolerated stale drained pid route={} err={}",
                     ROUTE_KEY_SOURCE_RESCAN_CONTROL, err
                 );
-                state.source.trigger_rescan_when_ready().await?;
+                state.source.publish_manual_rescan_signal().await.map_err(|signal_err| {
+                    ApiError::internal(format!(
+                        "manual rescan signal publish failed after stale drained control pid: {signal_err}"
+                    ))
+                })?;
             }
             Err(err) => {
                 return Err(ApiError::internal(format!(
@@ -1195,6 +1254,8 @@ pub async fn rescan(
         );
         state.source.trigger_rescan_when_ready().await?;
     }
+    #[cfg(test)]
+    maybe_pause_rescan_before_return().await;
     Ok(Json(RescanResponse { accepted: true }))
 }
 
@@ -2036,6 +2097,7 @@ mod tests {
     use crate::api::facade_status::shared_facade_pending_status_cell;
     use crate::query::api::ProjectionPolicy;
     use crate::runtime::routes::METHOD_SINK_STATUS;
+    use crate::state::cell::SignalCell;
     use crate::sink::SinkFileMeta;
     use crate::source::FSMetaSource;
     use crate::source::SourceStatusSnapshot;
@@ -2049,7 +2111,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::HeaderValue;
     use capanix_app_sdk::CnxError;
-    use capanix_app_sdk::runtime::NodeId;
+    use capanix_app_sdk::runtime::{NodeId, in_memory_state_boundary};
     use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex as StdMutex, RwLock};
@@ -2061,7 +2123,7 @@ mod tests {
 
     struct DeniedControlRouteBoundary {
         sent_routes: Arc<StdMutex<Vec<String>>>,
-        denied_route: String,
+        denied_routes: BTreeSet<String>,
     }
 
     struct DelayedSourceStatusCollectBoundary {
@@ -2156,7 +2218,7 @@ mod tests {
             };
             sent.push(route.clone());
             drop(sent);
-            if route == self.denied_route {
+            if self.denied_routes.contains(&route) {
                 return Err(CnxError::AccessDenied(
                     "pid Pid(4) is drained/fenced and cannot obtain new grant attachments".into(),
                 ));
@@ -3112,7 +3174,10 @@ mod tests {
         let sent_routes = Arc::new(StdMutex::new(Vec::new()));
         let boundary = Arc::new(DeniedControlRouteBoundary {
             sent_routes: sent_routes.clone(),
-            denied_route: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            denied_routes: BTreeSet::from([format!(
+                "{}.stream",
+                ROUTE_KEY_SOURCE_ROOTS_CONTROL
+            )]),
         });
         let headers = management_headers(auth.as_ref());
         let state = ApiState {
@@ -3216,15 +3281,28 @@ mod tests {
             })
             .expect("auth"),
         );
-        let mut root = RootSpec::new("nfs1", &nfs1);
-        root.scan = false;
+        let root = RootSpec::new("nfs1", &nfs1);
         let source_cfg = SourceConfig {
             roots: vec![root],
             host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
             ..SourceConfig::default()
         };
+        let state_boundary = in_memory_state_boundary();
+        let signal = SignalCell::from_state_boundary(
+            crate::runtime::execution_units::SOURCE_RUNTIME_UNIT_ID,
+            "manual_rescan",
+            state_boundary.clone(),
+        )
+        .expect("construct manual rescan signal cell");
+        let signal_offset = signal.current_seq();
         let source_runtime = Arc::new(
-            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+            FSMetaSource::with_boundaries_and_state(
+                source_cfg.clone(),
+                NodeId("node-a".into()),
+                None,
+                state_boundary,
+            )
+            .expect("source"),
         );
         let source = Arc::new(SourceFacade::local(source_runtime.clone()));
         let sink = Arc::new(SinkFacade::local(Arc::new(
@@ -3234,7 +3312,10 @@ mod tests {
         let sent_routes = Arc::new(StdMutex::new(Vec::new()));
         let boundary = Arc::new(DeniedControlRouteBoundary {
             sent_routes: sent_routes.clone(),
-            denied_route: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            denied_routes: BTreeSet::from([
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                format!("{}.req", source_rescan_route_key_for("node-a")),
+            ]),
         });
         let headers = management_headers(auth.as_ref());
         let state = ApiState {
@@ -3254,19 +3335,14 @@ mod tests {
 
         let response = rescan(State(state), headers)
             .await
-            .expect("rescan should tolerate a stale drained control pid and fall back locally");
+            .expect("rescan should tolerate a stale drained control pid by falling back to the signal carrier");
         assert!(response.0.accepted);
-
-        let status = source_runtime.status_snapshot();
-        assert!(
-            status
-                .concrete_roots
-                .iter()
-                .any(|entry| entry.rescan_pending
-                    && entry.last_rescan_reason.as_deref() == Some("manual")),
-            "local source should mark a manual rescan pending after stale drained control send fallback: {:?}",
-            status.concrete_roots
-        );
+        let (_next_offset, updates) = signal
+            .watch_since(signal_offset)
+            .await
+            .expect("watch signal updates");
+        assert_eq!(updates.len(), 1, "manual rescan signal should emit exactly one update");
+        assert_eq!(updates[0].requested_by, "node-a");
 
         let sent_routes = match sent_routes.lock() {
             Ok(guard) => guard.clone(),

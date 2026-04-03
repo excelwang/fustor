@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct CpuSampleSummary {
@@ -91,37 +91,37 @@ fn sample_many(
     let sample_count = (duration.as_secs_f64() / sample_interval.as_secs_f64()).ceil() as usize;
     let mut out = BTreeMap::<String, Vec<f64>>::new();
     for _ in 0..sample_count.max(1) {
-        let start = Instant::now();
+        let proc_before = pids_by_node
+            .iter()
+            .map(|(node, pids)| Ok((node.clone(), read_process_jiffies(pids)?)))
+            .collect::<Result<BTreeMap<_, _>, String>>()?;
+        let total_before = read_total_jiffies()?;
+        thread::sleep(sample_interval);
+        let total_after = read_total_jiffies()?;
         for (node, pids) in pids_by_node {
-            out.entry(node.clone())
-                .or_default()
-                .push(sample_total_percent(pids)?);
-        }
-        let elapsed = start.elapsed();
-        if elapsed < sample_interval {
-            thread::sleep(sample_interval - elapsed);
+            let proc_after = read_process_jiffies(pids)?;
+            let proc_before_node = proc_before.get(node).copied().unwrap_or(0);
+            out.entry(node.clone()).or_default().push(sample_percent(
+                proc_before_node,
+                proc_after,
+                total_before,
+                total_after,
+            ));
         }
     }
     Ok(out)
 }
 
-fn sample_total_percent(pids: &[u32]) -> Result<f64, String> {
-    let clk_tck = clock_ticks_per_second()? as f64;
-    let proc1 = read_process_jiffies(pids)?;
-    let total1 = read_total_jiffies()?;
-    thread::sleep(Duration::from_millis(200));
-    let proc2 = read_process_jiffies(pids)?;
-    let total2 = read_total_jiffies()?;
-    let proc_delta = (proc2.saturating_sub(proc1)) as f64;
-    let total_delta = (total2.saturating_sub(total1)) as f64;
+fn sample_percent(proc_before: u64, proc_after: u64, total_before: u64, total_after: u64) -> f64 {
+    let proc_delta = (proc_after.saturating_sub(proc_before)) as f64;
+    let total_delta = (total_after.saturating_sub(total_before)) as f64;
     if total_delta <= 0.0 {
-        return Ok(0.0);
+        return 0.0;
     }
     let cpu_count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1) as f64;
-    let _ = clk_tck;
-    Ok((proc_delta / total_delta) * cpu_count * 100.0)
+    (proc_delta / total_delta) * cpu_count * 100.0
 }
 
 fn read_process_jiffies(pids: &[u32]) -> Result<u64, String> {
@@ -169,20 +169,30 @@ fn read_total_jiffies() -> Result<u64, String> {
     Ok(total)
 }
 
-fn clock_ticks_per_second() -> Result<u64, String> {
-    let output = std::process::Command::new("getconf")
-        .arg("CLK_TCK")
-        .output()
-        .map_err(|e| format!("run getconf CLK_TCK failed: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "getconf CLK_TCK failed with status {}",
-            output.status
-        ));
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_many_does_not_serially_spend_one_full_window_per_node() {
+        let pid = std::process::id();
+        let pids_by_node = BTreeMap::from([
+            ("node-a".to_string(), vec![pid]),
+            ("node-b".to_string(), vec![pid]),
+        ]);
+        let interval = Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        let samples = sample_many(&pids_by_node, interval, interval)
+            .expect("sample_many should read live /proc data for the current process pid");
+        let elapsed = start.elapsed();
+
+        assert_eq!(samples.get("node-a").map(Vec::len), Some(1));
+        assert_eq!(samples.get("node-b").map(Vec::len), Some(1));
+        assert!(
+            elapsed < Duration::from_millis(85),
+            "sample_many should spend roughly one window per sample across all nodes; elapsed={elapsed:?}"
+        );
     }
-    let raw = String::from_utf8(output.stdout)
-        .map_err(|e| format!("decode getconf CLK_TCK failed: {e}"))?;
-    raw.trim()
-        .parse::<u64>()
-        .map_err(|e| format!("parse CLK_TCK failed: {e}"))
 }

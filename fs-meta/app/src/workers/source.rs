@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RuntimeWorkerBinding};
 use capanix_app_sdk::{CnxError, Event, Result};
@@ -21,6 +21,7 @@ use crate::runtime::orchestration::{
 use crate::runtime::routes::ROUTE_KEY_EVENTS;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
 use crate::source::{FSMetaSource, SourceStatusSnapshot};
+use crate::state::cell::SignalCell;
 use crate::workers::sink::SinkFacade;
 use crate::workers::source_ipc::{
     SourceWorkerRequest, SourceWorkerResponse, decode_request, decode_response, encode_request,
@@ -39,6 +40,7 @@ const SOURCE_WORKER_CLOSE_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(
 const SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
 const SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_WORKER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const SOURCE_WORKER_NONBLOCKING_OBSERVABILITY_CACHE_TTL: Duration = Duration::from_secs(1);
 const SOURCE_WORKER_DEGRADED_STATE: &str = "degraded_worker_unreachable";
 const SOURCE_WORKER_DEGRADED_ROOT_KEY: &str = "source-worker";
 
@@ -90,6 +92,11 @@ fn can_retry_update_logical_roots(err: &CnxError) -> bool {
     ) || is_retryable_worker_bridge_peer_error(err)
         || matches!(
             err,
+            CnxError::ProtocolViolation(message)
+                if message.contains("unexpected correlation_id in reply batch")
+        )
+        || matches!(
+            err,
             CnxError::AccessDenied(message)
                 | CnxError::PeerError(message)
                 | CnxError::Internal(message)
@@ -124,7 +131,7 @@ fn source_control_signals_require_post_ack_schedule_refresh(
 ) -> bool {
     signals
         .iter()
-        .any(|signal| !matches!(signal, SourceControlSignal::RuntimeHostGrantChange { .. }))
+        .any(|signal| matches!(signal, SourceControlSignal::Activate { .. }))
 }
 
 fn source_control_signals_can_use_primed_schedule_timeout_fallback(
@@ -655,6 +662,7 @@ impl Drop for SourceStatusTraceGuard {
 #[derive(Debug, Clone, Default)]
 struct SourceWorkerSnapshotCache {
     lifecycle_state: Option<String>,
+    last_live_observability_snapshot_at: Option<Instant>,
     host_object_grants_version: Option<u64>,
     grants: Option<Vec<GrantedMountRoot>>,
     logical_roots: Option<Vec<RootSpec>>,
@@ -687,6 +695,7 @@ pub struct SourceWorkerClientHandle {
     worker_factory: RuntimeWorkerClientFactory,
     worker_binding: RuntimeWorkerBinding,
     _shared: Arc<SharedSourceWorkerHandleState>,
+    manual_rescan_signal: SignalCell,
     cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
     retained_control_state: Arc<tokio::sync::Mutex<RetainedSourceWorkerControlState>>,
     control_state_replay_required: Arc<std::sync::atomic::AtomicBool>,
@@ -821,6 +830,12 @@ pub(crate) struct SourceWorkerObservabilityErrorHook {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SourceWorkerObservabilityCallCountHook {
+    pub count: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
 pub(crate) struct SourceWorkerScheduledGroupsErrorHook {
     pub err: CnxError,
 }
@@ -929,6 +944,14 @@ fn source_worker_status_error_hook_cell() -> &'static Mutex<Option<SourceWorkerS
 fn source_worker_observability_error_hook_cell()
 -> &'static Mutex<Option<SourceWorkerObservabilityErrorHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerObservabilityErrorHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn source_worker_observability_call_count_hook_cell()
+-> &'static Mutex<Option<SourceWorkerObservabilityCallCountHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerObservabilityCallCountHook>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
@@ -1193,6 +1216,17 @@ pub(crate) fn install_source_worker_observability_error_hook(
 }
 
 #[cfg(test)]
+pub(crate) fn install_source_worker_observability_call_count_hook(
+    hook: SourceWorkerObservabilityCallCountHook,
+) {
+    let mut guard = match source_worker_observability_call_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn install_source_worker_scheduled_groups_error_hook(
     hook: SourceWorkerScheduledGroupsErrorHook,
 ) {
@@ -1255,6 +1289,15 @@ pub(crate) fn clear_source_worker_observability_error_hook() {
 }
 
 #[cfg(test)]
+pub(crate) fn clear_source_worker_observability_call_count_hook() {
+    let mut guard = match source_worker_observability_call_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
 pub(crate) fn clear_source_worker_scheduled_groups_error_hook() {
     let mut guard = match source_worker_scheduled_groups_error_hook_cell().lock() {
         Ok(guard) => guard,
@@ -1288,6 +1331,17 @@ fn take_source_worker_observability_error_hook() -> Option<CnxError> {
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.take().map(|hook| hook.err)
+}
+
+#[cfg(test)]
+fn record_source_worker_observability_rpc_attempt() {
+    let guard = match source_worker_observability_call_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(hook) = guard.as_ref() {
+        hook.count.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -1542,11 +1596,20 @@ impl SourceWorkerClientHandle {
                 shared
             }
         };
+        let manual_rescan_signal = SignalCell::from_state_boundary(
+            crate::runtime::execution_units::SOURCE_RUNTIME_UNIT_ID,
+            "manual_rescan",
+            worker_factory.state_boundary(),
+        )
+        .map_err(|err| {
+            CnxError::InvalidInput(format!("source manual-rescan signal init failed: {err}"))
+        })?;
         Ok(Self {
             _shared: shared.clone(),
             node_id,
             worker_factory,
             worker_binding,
+            manual_rescan_signal,
             cache: shared.cache.clone(),
             retained_control_state: shared.retained_control_state.clone(),
             control_state_replay_required: shared.control_state_replay_required.clone(),
@@ -1666,6 +1729,7 @@ impl SourceWorkerClientHandle {
     fn update_cached_observability_snapshot(&self, snapshot: &SourceObservabilitySnapshot) {
         self.with_cache_mut(|cache| {
             cache.lifecycle_state = Some(snapshot.lifecycle_state.clone());
+            cache.last_live_observability_snapshot_at = Some(Instant::now());
             cache.host_object_grants_version = Some(snapshot.host_object_grants_version);
             cache.grants = Some(snapshot.grants.clone());
             cache.logical_roots = Some(snapshot.logical_roots.clone());
@@ -1997,6 +2061,8 @@ impl SourceWorkerClientHandle {
             }
             let rpc_result = self
                 .with_started_retry(|client| async move {
+                    #[cfg(test)]
+                    record_source_worker_observability_rpc_attempt();
                     #[cfg(test)]
                     if let Some(err) = take_source_worker_observability_error_hook() {
                         return Err(err);
@@ -2570,23 +2636,13 @@ impl SourceWorkerClientHandle {
     }
 
     pub async fn publish_manual_rescan_signal(&self) -> Result<()> {
-        let _inflight = self.begin_control_op();
-        self.with_started_retry(|client| async move {
-            match Self::call_worker(
-                &client,
-                SourceWorkerRequest::PublishManualRescanSignal,
-                SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-            )
-            .await?
-            {
-                SourceWorkerResponse::Ack => Ok(()),
-                other => Err(CnxError::ProtocolViolation(format!(
-                    "unexpected source worker response for publish_manual_rescan_signal: {:?}",
-                    other
-                ))),
-            }
-        })
-        .await
+        self.manual_rescan_signal
+            .emit(&self.node_id.0)
+            .await
+            .map(|_| ())
+            .map_err(|err| {
+                CnxError::Internal(format!("publish manual rescan signal failed: {err}"))
+            })
     }
 
     pub async fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
@@ -2856,6 +2912,21 @@ impl SourceWorkerClientHandle {
             }
             return Ok(snapshot);
         };
+        if let Some(snapshot) = self.with_cache_mut(|cache| {
+            cache
+                .last_live_observability_snapshot_at
+                .filter(|last| last.elapsed() < SOURCE_WORKER_NONBLOCKING_OBSERVABILITY_CACHE_TTL)
+                .and_then(|_| build_cached_worker_observability_snapshot(cache))
+        }) {
+            if debug_control_scope_capture_enabled() {
+                eprintln!(
+                    "fs_meta_source_worker_client: observability_snapshot cache_fallback node={} reason=recent_live_cache {}",
+                    self.node_id.0,
+                    summarize_source_observability_snapshot(&snapshot)
+                );
+            }
+            return Ok(snapshot);
+        }
         let trace_id = next_source_status_trace_id();
         let mut trace_guard =
             SourceStatusTraceGuard::new(self.node_id.0.clone(), trace_id, "before_rpc_await");
@@ -2941,6 +3012,79 @@ fn scheduled_groups_by_node(
     }
     let stable_host_ref = stable_host_ref_for_node_id(node_id, grants);
     std::collections::BTreeMap::from([(stable_host_ref, groups.into_iter().collect::<Vec<_>>())])
+}
+
+fn build_cached_worker_observability_snapshot(
+    cache: &SourceWorkerSnapshotCache,
+) -> Option<SourceObservabilitySnapshot> {
+    Some(SourceObservabilitySnapshot {
+        lifecycle_state: cache.lifecycle_state.clone()?,
+        host_object_grants_version: cache.host_object_grants_version.unwrap_or_default(),
+        grants: cache.grants.clone().unwrap_or_default(),
+        logical_roots: cache.logical_roots.clone().unwrap_or_default(),
+        status: cache.status.clone().unwrap_or_default(),
+        source_primary_by_group: cache.source_primary_by_group.clone().unwrap_or_default(),
+        last_force_find_runner_by_group: cache
+            .last_force_find_runner_by_group
+            .clone()
+            .unwrap_or_default(),
+        force_find_inflight_groups: cache.force_find_inflight_groups.clone().unwrap_or_default(),
+        scheduled_source_groups_by_node: cache
+            .scheduled_source_groups_by_node
+            .clone()
+            .unwrap_or_default(),
+        scheduled_scan_groups_by_node: cache
+            .scheduled_scan_groups_by_node
+            .clone()
+            .unwrap_or_default(),
+        last_control_frame_signals_by_node: cache
+            .last_control_frame_signals_by_node
+            .clone()
+            .unwrap_or_default(),
+        published_batches_by_node: cache.published_batches_by_node.clone().unwrap_or_default(),
+        published_events_by_node: cache.published_events_by_node.clone().unwrap_or_default(),
+        published_control_events_by_node: cache
+            .published_control_events_by_node
+            .clone()
+            .unwrap_or_default(),
+        published_data_events_by_node: cache
+            .published_data_events_by_node
+            .clone()
+            .unwrap_or_default(),
+        last_published_at_us_by_node: cache
+            .last_published_at_us_by_node
+            .clone()
+            .unwrap_or_default(),
+        last_published_origins_by_node: cache
+            .last_published_origins_by_node
+            .clone()
+            .unwrap_or_default(),
+        published_origin_counts_by_node: cache
+            .published_origin_counts_by_node
+            .clone()
+            .unwrap_or_default(),
+        published_path_capture_target: cache.published_path_capture_target.clone(),
+        enqueued_path_origin_counts_by_node: cache
+            .enqueued_path_origin_counts_by_node
+            .clone()
+            .unwrap_or_default(),
+        pending_path_origin_counts_by_node: cache
+            .pending_path_origin_counts_by_node
+            .clone()
+            .unwrap_or_default(),
+        yielded_path_origin_counts_by_node: cache
+            .yielded_path_origin_counts_by_node
+            .clone()
+            .unwrap_or_default(),
+        summarized_path_origin_counts_by_node: cache
+            .summarized_path_origin_counts_by_node
+            .clone()
+            .unwrap_or_default(),
+        published_path_origin_counts_by_node: cache
+            .published_path_origin_counts_by_node
+            .clone()
+            .unwrap_or_default(),
+    })
 }
 
 fn build_degraded_worker_observability_snapshot(
@@ -3442,6 +3586,7 @@ mod tests {
     use crate::ControlEvent;
     use crate::FileMetaRecord;
     use crate::query::models::QueryNode;
+    use crate::sink::SinkFileMeta;
     use crate::query::path::is_under_query_path;
     use crate::query::path::root_file_name_bytes;
     use crate::query::request::{
@@ -3507,6 +3652,14 @@ mod tests {
     impl Drop for SourceWorkerObservabilityErrorHookReset {
         fn drop(&mut self) {
             clear_source_worker_observability_error_hook();
+        }
+    }
+
+    struct SourceWorkerObservabilityCallCountHookReset;
+
+    impl Drop for SourceWorkerObservabilityCallCountHookReset {
+        fn drop(&mut self) {
+            clear_source_worker_observability_call_count_hook();
         }
     }
 
@@ -3895,6 +4048,29 @@ mod tests {
         )
     }
 
+    fn selected_group_tree_contains_path(
+        sink: &SinkFileMeta,
+        group_id: &str,
+        query_path: &[u8],
+        expected_path: &[u8],
+    ) -> bool {
+        let events = sink
+            .materialized_query(&selected_group_request(query_path, group_id))
+            .expect("selected-group materialized query");
+        events.iter().any(|event| {
+            let payload = rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes())
+                .expect("decode selected-group materialized payload");
+            let MaterializedQueryPayload::Tree(response) = payload else {
+                return false;
+            };
+            (response.root.exists && response.root.path.as_slice() == expected_path)
+                || response
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path.as_slice() == expected_path)
+        })
+    }
+
     fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<QueryNode>> {
         let mut selected = None::<QueryNode>;
         for event in &events {
@@ -4006,6 +4182,7 @@ mod tests {
     fn degraded_worker_observability_uses_cached_snapshot() {
         let cache = SourceWorkerSnapshotCache {
             lifecycle_state: Some("ready".to_string()),
+            last_live_observability_snapshot_at: None,
             host_object_grants_version: Some(7),
             grants: Some(vec![GrantedMountRoot {
                 object_ref: "obj-a".to_string(),
@@ -4177,6 +4354,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn post_ack_schedule_refresh_is_skipped_for_pure_host_grant_change_retries() {
+        let signals = vec![SourceControlSignal::RuntimeHostGrantChange {
+            changed: RuntimeHostGrantChange {
+                version: 7,
+                grants: Vec::new(),
+            },
+            envelope: ControlEnvelope::Frame(ControlFrame {
+                kind: "test.host-grant-change".to_string(),
+                payload: Vec::new(),
+            }),
+        }];
+
+        assert!(
+            !source_control_signals_require_post_ack_schedule_refresh(&signals),
+            "pure host-grant retry batches must stay grant-only and skip post-ack scheduled-group refresh work",
+        );
+    }
+
+    #[test]
+    fn post_ack_schedule_refresh_is_skipped_for_cleanup_only_deactivate_tails() {
+        let signals = vec![
+            SourceControlSignal::Deactivate {
+                unit: SourceRuntimeUnit::Source,
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                generation: 5,
+                envelope: ControlEnvelope::Frame(ControlFrame {
+                    kind: "test.cleanup-only.source".to_string(),
+                    payload: Vec::new(),
+                }),
+            },
+            SourceControlSignal::Deactivate {
+                unit: SourceRuntimeUnit::Scan,
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                generation: 5,
+                envelope: ControlEnvelope::Frame(ControlFrame {
+                    kind: "test.cleanup-only.scan".to_string(),
+                    payload: Vec::new(),
+                }),
+            },
+        ];
+
+        assert!(
+            !source_control_signals_require_post_ack_schedule_refresh(&signals),
+            "cleanup-only deactivate tails must stay local and skip post-ack scheduled-group refresh work",
+        );
+    }
+
+    #[test]
+    fn post_ack_schedule_refresh_stays_enabled_for_activate_waves() {
+        let signals = vec![SourceControlSignal::Activate {
+            unit: SourceRuntimeUnit::Source,
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            generation: 5,
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: "nfs1".to_string(),
+                resource_ids: vec!["node-a::nfs1".to_string()],
+            }],
+            envelope: ControlEnvelope::Frame(ControlFrame {
+                kind: "test.activate".to_string(),
+                payload: Vec::new(),
+            }),
+        }];
+
+        assert!(
+            source_control_signals_require_post_ack_schedule_refresh(&signals),
+            "activate waves must keep driving post-ack scheduled-group refresh so stale shared clients are still discarded on replay-owned continuity gaps",
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn external_source_worker_start_converges_on_fresh_handle() {
         let tmp = tempdir().expect("create temp dir");
@@ -4217,6 +4464,161 @@ mod tests {
             .expect("start source worker");
 
         client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn publish_manual_rescan_signal_succeeds_without_started_worker_and_updates_signal_cell() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![worker_watch_scan_root("nfs1", &nfs1)],
+            host_object_grants: vec![worker_source_export(
+                "node-a::nfs1",
+                "node-a",
+                "10.0.0.11",
+                nfs1.clone(),
+            )],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = worker_socket_tempdir();
+        let factory = RuntimeWorkerClientFactory::new(
+            boundary.clone(),
+            boundary.clone(),
+            state_boundary.clone(),
+        );
+        let client = SourceWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client");
+
+        let signal = SignalCell::from_state_boundary(
+            crate::runtime::execution_units::SOURCE_RUNTIME_UNIT_ID,
+            "manual_rescan",
+            state_boundary,
+        )
+        .expect("construct manual rescan signal cell");
+        let offset = signal.current_seq();
+
+        client
+            .publish_manual_rescan_signal()
+            .await
+            .expect("publish manual rescan signal without started worker");
+
+        let (_next, updates) = signal
+            .watch_since(offset)
+            .await
+            .expect("watch signal updates");
+        assert_eq!(updates.len(), 1, "manual rescan signal should emit exactly one update");
+        assert_eq!(updates[0].requested_by, "node-a");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn external_source_worker_manual_rescan_replays_baseline_batches_for_fresh_sink() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b").expect("seed nfs2");
+
+        let cfg = SourceConfig {
+            roots: {
+                let mut root1 = RootSpec::new("nfs1", &nfs1);
+                root1.watch = true;
+                root1.scan = true;
+                let mut root2 = RootSpec::new("nfs2", &nfs2);
+                root2.watch = true;
+                root2.scan = true;
+                vec![root1, root2]
+            },
+            host_object_grants: vec![
+                worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+                worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = worker_socket_tempdir();
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = SourceWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            cfg.clone(),
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg.clone())
+            .expect("init sink");
+        let query_dir = b"/force-find-stress";
+        let query_root = b"/force-find-stress";
+
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < initial_deadline {
+            match recv_loopback_events(&boundary, 250).await {
+                Ok(batch) => sink.send(&batch).await.expect("apply initial batch"),
+                Err(CnxError::Timeout) => continue,
+                Err(err) => panic!("initial publish recv failed: {err}"),
+            }
+            let nfs1_ready = selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_root);
+            let nfs2_ready = selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_root);
+            if nfs1_ready && nfs2_ready {
+                break;
+            }
+        }
+
+        assert!(selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_root));
+        assert!(selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_root));
+
+        let fresh_sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
+            .expect("init fresh sink");
+
+        tokio::time::timeout(Duration::from_secs(8), client.publish_manual_rescan_signal())
+            .await
+            .expect("manual rescan publish timed out")
+            .expect("publish manual rescan");
+
+        let replay_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < replay_deadline {
+            match recv_loopback_events(&boundary, 250).await {
+                Ok(batch) => fresh_sink.send(&batch).await.expect("apply replay batch"),
+                Err(CnxError::Timeout) => continue,
+                Err(err) => panic!("baseline replay recv failed: {err}"),
+            }
+            let nfs1_ready = selected_group_tree_contains_path(&fresh_sink, "nfs1", query_dir, query_root);
+            let nfs2_ready = selected_group_tree_contains_path(&fresh_sink, "nfs2", query_dir, query_root);
+            if nfs1_ready && nfs2_ready {
+                break;
+            }
+        }
+
+        assert!(
+            selected_group_tree_contains_path(&fresh_sink, "nfs1", query_dir, query_root),
+            "manual rescan should replay baseline nfs1 entries for a fresh sink"
+        );
+        assert!(
+            selected_group_tree_contains_path(&fresh_sink, "nfs2", query_dir, query_root),
+            "manual rescan should replay baseline nfs2 entries for a fresh sink"
+        );
+
+        client.close().await.expect("close source worker");
+        sink.close().await.expect("close sink");
+        fresh_sink.close().await.expect("close fresh sink");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4784,6 +5186,134 @@ mod tests {
         assert!(
             snapshot.status.degraded_roots.is_empty(),
             "live observability snapshot after stale-pid retry should not degrade: {:?}",
+            snapshot.status.degraded_roots
+        );
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn observability_snapshot_nonblocking_retries_bound_route_unexpected_correlation_protocol_violation() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                worker_watch_scan_root("nfs1", &nfs1),
+                worker_watch_scan_root("nfs2", &nfs2),
+            ],
+            host_object_grants: vec![
+                worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = worker_socket_tempdir();
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        client
+            .on_control_frame(vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: ROUTE_KEY_QUERY.to_string(),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                    ],
+                }))
+                .expect("encode source activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: ROUTE_KEY_QUERY.to_string(),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                    ],
+                }))
+                .expect("encode source-scan activate"),
+            ])
+            .await
+            .expect("apply source+scan control");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        loop {
+            let source_groups = client
+                .scheduled_source_group_ids()
+                .await
+                .expect("scheduled source groups")
+                .unwrap_or_default();
+            let scan_groups = client
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scheduled scan groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for initial source/scan schedule before correlation-mismatch observability retry: source={source_groups:?} scan={scan_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let _reset = SourceWorkerObservabilityErrorHookReset;
+        install_source_worker_observability_error_hook(SourceWorkerObservabilityErrorHook {
+            err: CnxError::ProtocolViolation(
+                "bound route protocol violation: unexpected correlation_id in reply batch (11)"
+                    .to_string(),
+            ),
+        });
+
+        let snapshot = client.observability_snapshot_nonblocking().await;
+        let expected = vec!["nfs1".to_string(), "nfs2".to_string()];
+        assert_ne!(
+            snapshot.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
+            "observability_snapshot_nonblocking should retry a transient bound-route correlation mismatch and reach the live worker"
+        );
+        assert_eq!(
+            snapshot.scheduled_source_groups_by_node.get("node-d"),
+            Some(&expected),
+            "live observability snapshot should preserve scheduled source groups after correlation-mismatch retry: {:?}",
+            snapshot.scheduled_source_groups_by_node
+        );
+        assert_eq!(
+            snapshot.scheduled_scan_groups_by_node.get("node-d"),
+            Some(&expected),
+            "live observability snapshot should preserve scheduled scan groups after correlation-mismatch retry: {:?}",
+            snapshot.scheduled_scan_groups_by_node
+        );
+        assert!(
+            snapshot.status.degraded_roots.is_empty(),
+            "live observability snapshot after correlation-mismatch retry should not degrade: {:?}",
             snapshot.status.degraded_roots
         );
 

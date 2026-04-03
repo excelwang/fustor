@@ -49,6 +49,26 @@ fn can_retry_on_control_frame(err: &CnxError) -> bool {
         )
 }
 
+fn is_restart_deferred_retire_pending_deactivate_batch(
+    envelopes: &[ControlEnvelope],
+) -> bool {
+    let Ok(signals) = sink_control_signals_from_envelopes(envelopes) else {
+        return false;
+    };
+    !signals.is_empty()
+        && signals.iter().all(|signal| {
+            matches!(
+                signal,
+                SinkControlSignal::Deactivate { envelope, .. }
+                    if matches!(
+                        capanix_runtime_entry_sdk::control::decode_runtime_exec_control(envelope),
+                        Ok(Some(capanix_runtime_entry_sdk::control::RuntimeExecControl::Deactivate(deactivate)))
+                            if deactivate.reason == "restart_deferred_retire_pending"
+                    )
+            )
+        })
+}
+
 fn is_retryable_worker_bridge_transport_error_message(message: &str) -> bool {
     message.contains("transport closed")
         && (message.contains("Connection reset by peer")
@@ -321,6 +341,13 @@ pub(crate) struct SinkWorkerControlFrameErrorHook {
 }
 
 #[cfg(test)]
+pub(crate) struct SinkWorkerControlFrameErrorQueueHook {
+    pub errs: std::collections::VecDeque<CnxError>,
+    pub sticky_worker_instance_id: Option<u64>,
+    pub sticky_peer_err: Option<String>,
+}
+
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct SinkWorkerControlFramePauseHook {
     pub entered: Arc<tokio::sync::Notify>,
@@ -364,6 +391,14 @@ fn sink_worker_update_roots_hook_cell() -> &'static Mutex<Option<SinkWorkerUpdat
 fn sink_worker_control_frame_error_hook_cell()
 -> &'static Mutex<Option<SinkWorkerControlFrameErrorHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerControlFrameErrorHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn sink_worker_control_frame_error_queue_hook_cell()
+-> &'static Mutex<Option<SinkWorkerControlFrameErrorQueueHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerControlFrameErrorQueueHook>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
@@ -452,6 +487,17 @@ pub(crate) fn install_sink_worker_control_frame_error_hook(hook: SinkWorkerContr
 }
 
 #[cfg(test)]
+pub(crate) fn install_sink_worker_control_frame_error_queue_hook(
+    hook: SinkWorkerControlFrameErrorQueueHook,
+) {
+    let mut guard = match sink_worker_control_frame_error_queue_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn install_sink_worker_control_frame_pause_hook(hook: SinkWorkerControlFramePauseHook) {
     let mut guard = match sink_worker_control_frame_pause_hook_cell().lock() {
         Ok(guard) => guard,
@@ -507,6 +553,12 @@ pub(crate) fn clear_sink_worker_control_frame_error_hook() {
         Err(poisoned) => poisoned.into_inner(),
     };
     *guard = None;
+    drop(guard);
+    let mut queued = match sink_worker_control_frame_error_queue_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *queued = None;
 }
 
 #[cfg(test)]
@@ -582,7 +634,31 @@ fn take_sink_worker_status_nonblocking_cache_fallback_hook() -> bool {
 }
 
 #[cfg(test)]
-fn take_sink_worker_control_frame_error_hook() -> Option<CnxError> {
+fn take_sink_worker_control_frame_error_hook(
+    current_worker_instance_id: u64,
+) -> Option<CnxError> {
+    {
+        let mut guard = match sink_worker_control_frame_error_queue_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(hook) = guard.as_mut() {
+            if hook.sticky_worker_instance_id == Some(current_worker_instance_id)
+                && let Some(err) = hook.sticky_peer_err.clone()
+            {
+                return Some(CnxError::PeerError(err));
+            }
+            if let Some(err) = hook.errs.pop_front() {
+                if hook.errs.is_empty() && hook.sticky_peer_err.is_none() {
+                    *guard = None;
+                }
+                return Some(err);
+            }
+            if hook.errs.is_empty() && hook.sticky_peer_err.is_none() {
+                *guard = None;
+            }
+        }
+    }
     let mut guard = match sink_worker_control_frame_error_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -1452,6 +1528,7 @@ impl SinkWorkerClientHandle {
             if attempt_timeout.is_zero() {
                 return Err(CnxError::Timeout);
             }
+            let current_worker_instance_id = self.shared_worker().await.0;
             let rpc_result = match tokio::time::timeout(
                 attempt_timeout,
                 self.with_started_retry(|client| {
@@ -1460,7 +1537,9 @@ impl SinkWorkerClientHandle {
                         #[cfg(test)]
                         maybe_pause_before_on_control_frame_rpc().await;
                         #[cfg(test)]
-                        if let Some(err) = take_sink_worker_control_frame_error_hook() {
+                        if let Some(err) =
+                            take_sink_worker_control_frame_error_hook(current_worker_instance_id)
+                        {
                             return Err(err);
                         }
                         Self::call_worker(
@@ -1500,6 +1579,14 @@ impl SinkWorkerClientHandle {
                 Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
+                    if is_restart_deferred_retire_pending_deactivate_batch(&envelopes) {
+                        self.reset_shared_worker_client_for_retry().await?;
+                        eprintln!(
+                            "fs_meta_sink_worker_client: on_control_frame fail-fast node={} err={} lane=restart_deferred_retire_pending_events_deactivate",
+                            self.node_id.0, err
+                        );
+                        return Err(err);
+                    }
                     self.reset_shared_worker_client_for_retry().await?;
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -2982,7 +3069,7 @@ mod tests {
         });
 
         sink.on_control_frame(vec![
-            encode_runtime_exec_control(&RuntimeExecControl::Deactivate(RuntimeExecDeactivate {
+            encode_runtime_exec_control(&capanix_runtime_entry_sdk::control::RuntimeExecControl::Deactivate(RuntimeExecDeactivate {
                 route_key: ROUTE_KEY_EVENTS.to_string(),
                 unit_id: "runtime.exec.sink".to_string(),
                 lease: None,
@@ -3318,6 +3405,131 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_restart_deferred_retire_pending_events_deactivate_fails_fast_after_repeated_bridge_reset_errors()
+    {
+        struct SinkWorkerControlFrameErrorQueueHookReset;
+
+        impl Drop for SinkWorkerControlFrameErrorQueueHookReset {
+            fn drop(&mut self) {
+                clear_sink_worker_control_frame_error_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![sink_worker_root("nfs1", &nfs1)],
+            host_object_grants: vec![
+                sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let sink = SinkWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+            .await
+            .expect("sink worker start timed out")
+            .expect("start sink worker");
+
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+                unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                ],
+            }))
+            .expect("encode initial sink events activate"),
+        ])
+        .await
+        .expect("initial sink events wave should succeed");
+
+        let _reset = SinkWorkerControlFrameErrorQueueHookReset;
+        install_sink_worker_control_frame_error_queue_hook(
+            SinkWorkerControlFrameErrorQueueHook {
+                errs: std::collections::VecDeque::from(vec![
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge stopped".to_string(),
+                    ),
+                    CnxError::Internal(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                    CnxError::Internal(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                    CnxError::Internal(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                ]),
+                sticky_worker_instance_id: None,
+                sticky_peer_err: Some(
+                    "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                        .to_string(),
+                ),
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let err = sink
+            .on_control_frame_with_timeouts_for_tests(
+                vec![
+                    encode_runtime_exec_control(&capanix_runtime_entry_sdk::control::RuntimeExecControl::Deactivate(
+                        RuntimeExecDeactivate {
+                            route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+                            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
+                                .to_string(),
+                            lease: None,
+                            generation: 3,
+                            reason: "restart_deferred_retire_pending".to_string(),
+                        },
+                    ))
+                    .expect("encode sink events deactivate"),
+                ],
+                Duration::from_millis(250),
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err(
+                "single restart_deferred_retire_pending events deactivate should fail fast once bridge resets keep repeating",
+            );
+
+        assert!(
+            !matches!(err, CnxError::Timeout),
+            "bridge-reset fail-close lane should return the bridge transport error instead of exhausting the whole local timeout budget: {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "bridge-reset fail-close lane should fail fast instead of spending the full local timeout budget: elapsed={:?} err={err:?}",
+            started.elapsed()
+        );
+
+        sink.close().await.expect("close sink worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn status_snapshot_retries_stale_drained_fenced_pid_errors() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
@@ -3457,6 +3669,186 @@ mod tests {
             .expect("scheduled_group_ids should retry stale drained/fenced pid errors and reach the live sink worker");
 
         assert_eq!(scheduled, Some(expected_groups));
+
+        sink.close().await.expect("close sink worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_restart_deferred_retire_pending_cleanup_batch_fails_fast_after_repeated_bridge_reset_errors()
+    {
+        struct SinkWorkerControlFrameErrorQueueHookReset;
+
+        impl Drop for SinkWorkerControlFrameErrorQueueHookReset {
+            fn drop(&mut self) {
+                clear_sink_worker_control_frame_error_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![sink_worker_root("nfs1", &nfs1)],
+            host_object_grants: vec![
+                sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let sink = SinkWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+            .await
+            .expect("sink worker start timed out")
+            .expect("start sink worker");
+
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+                unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                ],
+            }))
+            .expect("encode initial sink events activate"),
+        ])
+        .await
+        .expect("initial sink events wave should succeed");
+
+        let _reset = SinkWorkerControlFrameErrorQueueHookReset;
+        install_sink_worker_control_frame_error_queue_hook(
+            SinkWorkerControlFrameErrorQueueHook {
+                errs: std::collections::VecDeque::from(vec![
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge stopped".to_string(),
+                    ),
+                    CnxError::Internal(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                    CnxError::Internal(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                    CnxError::Internal(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                ]),
+                sticky_worker_instance_id: None,
+                sticky_peer_err: Some(
+                    "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                        .to_string(),
+                ),
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let err = sink
+            .on_control_frame_with_timeouts_for_tests(
+                vec![
+                    encode_runtime_exec_control(&capanix_runtime_entry_sdk::control::RuntimeExecControl::Deactivate(
+                        RuntimeExecDeactivate {
+                            route_key: "materialized-find.node_c:v1.req".to_string(),
+                            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
+                                .to_string(),
+                            lease: None,
+                            generation: 3,
+                            reason: "restart_deferred_retire_pending".to_string(),
+                        },
+                    ))
+                    .expect("encode node-c query deactivate"),
+                    encode_runtime_exec_control(&capanix_runtime_entry_sdk::control::RuntimeExecControl::Deactivate(
+                        RuntimeExecDeactivate {
+                            route_key: "materialized-find.node_d:v1.req".to_string(),
+                            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
+                                .to_string(),
+                            lease: None,
+                            generation: 3,
+                            reason: "restart_deferred_retire_pending".to_string(),
+                        },
+                    ))
+                    .expect("encode node-d query deactivate"),
+                    encode_runtime_exec_control(&capanix_runtime_entry_sdk::control::RuntimeExecControl::Deactivate(
+                        RuntimeExecDeactivate {
+                            route_key: "materialized-find:v1.req".to_string(),
+                            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
+                                .to_string(),
+                            lease: None,
+                            generation: 3,
+                            reason: "restart_deferred_retire_pending".to_string(),
+                        },
+                    ))
+                    .expect("encode aggregate query deactivate"),
+                    encode_runtime_exec_control(&capanix_runtime_entry_sdk::control::RuntimeExecControl::Deactivate(
+                        RuntimeExecDeactivate {
+                            route_key: "on-demand-force-find:v1.on-demand-force-find.req".to_string(),
+                            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
+                                .to_string(),
+                            lease: None,
+                            generation: 3,
+                            reason: "restart_deferred_retire_pending".to_string(),
+                        },
+                    ))
+                    .expect("encode force-find query deactivate"),
+                    encode_runtime_exec_control(&capanix_runtime_entry_sdk::control::RuntimeExecControl::Deactivate(
+                        RuntimeExecDeactivate {
+                            route_key: "sink-logical-roots-control:v1.stream".to_string(),
+                            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
+                                .to_string(),
+                            lease: None,
+                            generation: 3,
+                            reason: "restart_deferred_retire_pending".to_string(),
+                        },
+                    ))
+                    .expect("encode sink roots control deactivate"),
+                    encode_runtime_exec_control(&capanix_runtime_entry_sdk::control::RuntimeExecControl::Deactivate(
+                        RuntimeExecDeactivate {
+                            route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+                            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
+                                .to_string(),
+                            lease: None,
+                            generation: 3,
+                            reason: "restart_deferred_retire_pending".to_string(),
+                        },
+                    ))
+                    .expect("encode events deactivate"),
+                ],
+                Duration::from_millis(250),
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err(
+                "multi-envelope restart_deferred_retire_pending cleanup batch should fail fast once bridge resets keep repeating",
+            );
+
+        assert!(
+            !matches!(err, CnxError::Timeout),
+            "bridge-reset retained cleanup batch should return the bridge transport error instead of exhausting the whole local timeout budget: {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "bridge-reset retained cleanup batch should fail fast instead of spending the full local timeout budget: elapsed={:?} err={err:?}",
+            started.elapsed()
+        );
 
         sink.close().await.expect("close sink worker");
     }
@@ -3908,7 +4300,7 @@ mod tests {
         let sink_wave = |generation| {
             let mut signals = vec![
                 encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
-                    route_key: format!("{}.stream", ROUTE_KEY_EVENTS),
+                    route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
                     unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
                     lease: None,
                     generation,
@@ -4205,7 +4597,7 @@ mod tests {
         let sink_wave = |generation| {
             let mut signals = vec![
                 encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
-                    route_key: format!("{}.stream", ROUTE_KEY_EVENTS),
+                    route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
                     unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
                     lease: None,
                     generation,
@@ -4299,9 +4691,9 @@ mod tests {
             async move {
                 predecessor
                     .on_control_frame(vec![
-                        encode_runtime_exec_control(&RuntimeExecControl::Deactivate(
+                        encode_runtime_exec_control(&capanix_runtime_entry_sdk::control::RuntimeExecControl::Deactivate(
                             RuntimeExecDeactivate {
-                                route_key: format!("{}.stream", ROUTE_KEY_EVENTS),
+                                route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
                                 unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
                                     .to_string(),
                                 lease: None,

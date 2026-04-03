@@ -85,7 +85,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 false,
             )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
-            run_roots_matrix(&harness.client, &mut session, &harness.lab)?;
+            run_roots_matrix(&mut session, &harness.lab)?;
             eprintln!("[fs-meta-api-matrix] step=query-matrix");
             run_query_matrix(&harness.cluster, &mut session, &harness.lab)?;
             let metrics = session.bound_route_metrics()?;
@@ -113,7 +113,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 false,
             )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
-            run_roots_matrix(&harness.client, &mut session, &harness.lab)?;
+            run_roots_matrix(&mut session, &harness.lab)?;
             eprintln!("[fs-meta-api-matrix] step=query-matrix");
             run_query_baseline_phase(&harness.cluster, &mut session, &harness.lab)?;
             let metrics = session.bound_route_metrics()?;
@@ -920,7 +920,6 @@ fn run_status_and_grants_checks(
 }
 
 fn run_roots_matrix(
-    client: &FsMetaApiClient,
     session: &mut OperatorSession,
     lab: &NfsLab,
 ) -> Result<(), String> {
@@ -934,7 +933,7 @@ fn run_roots_matrix(
         return Err(format!("expected 3 roots from release doc, got {current}"));
     }
 
-    let empty_preview = client.preview_roots_raw(session.token(), &json!([]))?;
+    let empty_preview = session.client().preview_roots_raw(session.token(), &json!([]))?;
     assert_status(empty_preview.status, 200, "empty roots preview")?;
     if empty_preview
         .body
@@ -950,7 +949,7 @@ fn run_roots_matrix(
     }
 
     let roots = baseline_roots(lab);
-    let preview = client.preview_roots_raw(session.token(), &roots_payload(&roots))?;
+    let preview = session.client().preview_roots_raw(session.token(), &roots_payload(&roots))?;
     assert_status(preview.status, 200, "baseline roots preview")?;
     if preview
         .body
@@ -975,7 +974,7 @@ fn run_roots_matrix(
     }
 
     assert_error(
-        client.preview_roots_raw(
+        session.client().preview_roots_raw(
             session.token(),
             &json!([{
                 "id": "",
@@ -989,7 +988,7 @@ fn run_roots_matrix(
         "roots[].id must not be empty",
     )?;
     assert_error(
-        client.preview_roots_raw(
+        session.client().preview_roots_raw(
             session.token(),
             &json!([{
                 "id": "bad-subpath",
@@ -1003,7 +1002,7 @@ fn run_roots_matrix(
         "subpath_scope",
     )?;
     assert_error(
-        client.preview_roots_raw(
+        session.client().preview_roots_raw(
             session.token(),
             &json!([{
                 "id": "missing-selector",
@@ -1017,7 +1016,7 @@ fn run_roots_matrix(
         "selector",
     )?;
     assert_error(
-        client.preview_roots_raw(
+        session.client().preview_roots_raw(
             session.token(),
             &json!([{
                 "id": "no-watch-scan",
@@ -1031,7 +1030,7 @@ fn run_roots_matrix(
         "watch",
     )?;
     assert_error(
-        client.preview_roots_raw(
+        session.client().preview_roots_raw(
             session.token(),
             &json!([{
                 "id": "legacy-path",
@@ -1046,7 +1045,7 @@ fn run_roots_matrix(
         "roots[].path is forbidden",
     )?;
     assert_error(
-        client.preview_roots_raw(
+        session.client().preview_roots_raw(
             session.token(),
             &json!([{
                 "id": "legacy-source-locator",
@@ -1061,7 +1060,7 @@ fn run_roots_matrix(
         "roots[].source_locator is forbidden",
     )?;
     assert_error(
-        client.update_roots_raw(
+        session.client().update_roots_raw(
             session.token(),
             &json!([
                 {
@@ -1086,7 +1085,7 @@ fn run_roots_matrix(
 
     eprintln!("[fs-meta-api-matrix] substep=single-root-apply");
     let single_root = vec![root_spec("nfs1", &lab.export_source("nfs1"))];
-    let put = client.update_roots_raw(session.token(), &roots_payload(&single_root))?;
+    let put = session.client().update_roots_raw(session.token(), &roots_payload(&single_root))?;
     assert_status(put.status, 200, "single-root apply")?;
     if put.body.get("roots_count").and_then(Value::as_u64) != Some(1) {
         return Err(format!("single-root apply did not converge: {}", put.body));
@@ -1104,7 +1103,7 @@ fn run_roots_matrix(
     })?;
 
     eprintln!("[fs-meta-api-matrix] substep=restore-roots");
-    let restore = client.update_roots_raw(session.token(), &roots_payload(&roots))?;
+    let restore = session.client().update_roots_raw(session.token(), &roots_payload(&roots))?;
     assert_status(restore.status, 200, "restore roots")?;
     session.rescan()?;
     wait_until(Duration::from_secs(30), "restore baseline roots", || {

@@ -10,8 +10,9 @@ pub mod types;
 pub use config::{ApiAuthConfig, ApiConfig, BootstrapAdminConfig, BootstrapManagementConfig};
 #[cfg(test)]
 pub(crate) use handlers::{
-    RootsPutPauseHook, StatusPauseHook, clear_roots_put_pause_hook, clear_status_pause_hook,
-    clear_status_route_trace_capture, install_roots_put_pause_hook, install_status_pause_hook,
+    RescanPauseHook, RootsPutPauseHook, StatusPauseHook, clear_rescan_pause_hook,
+    clear_roots_put_pause_hook, clear_status_pause_hook, clear_status_route_trace_capture,
+    install_rescan_pause_hook, install_roots_put_pause_hook, install_status_pause_hook,
     install_status_route_trace_capture,
 };
 pub use server::ApiServerHandle;
