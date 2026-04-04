@@ -467,6 +467,7 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
             let tree = harness.session.tree(&[
                 ("path", "/force-find-stress".to_string()),
                 ("recursive", "true".to_string()),
+                ("read_class", "materialized".to_string()),
             ])?;
             nfs1_nodes = group_total_nodes(&tree, "nfs1");
             nfs2_nodes = group_total_nodes(&tree, "nfs2");
@@ -474,6 +475,7 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
                 ("path", "/".to_string()),
                 ("recursive", "true".to_string()),
                 ("group", "nfs2".to_string()),
+                ("read_class", "materialized".to_string()),
             ])?;
             (
                 nfs2_selected_root_exists,
@@ -491,6 +493,7 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
                 ("path", "/force-find-stress".to_string()),
                 ("recursive", "true".to_string()),
                 ("group", "nfs2".to_string()),
+                ("read_class", "materialized".to_string()),
             ])?;
             (
                 nfs2_selected_force_find_exists,

@@ -524,7 +524,7 @@ fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
         Duration::from_secs(120),
     )?;
     harness.session = OperatorSession::login_many(
-        vec![ready_base.clone()],
+        harness.candidate_base_urls.clone(),
         "operator",
         "operator123",
     )?;

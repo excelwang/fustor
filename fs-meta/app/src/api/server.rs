@@ -254,6 +254,10 @@ fn router(state: ApiState) -> Result<Router> {
         state.force_find_inflight.clone(),
     )
     .layer(middleware::from_fn_with_state(
+        state.control_gate.clone(),
+        projection_request_facade_guard,
+    ))
+    .layer(middleware::from_fn_with_state(
         state.auth.clone(),
         query_api_key_guard,
     ));
@@ -309,6 +313,29 @@ fn request_counts_toward_control_drain(method: &Method, path: &str) -> bool {
         (&Method::PUT, "/api/fs-meta/v1/monitoring/roots")
             | (&Method::POST, "/api/fs-meta/v1/query-api-keys")
     ) || (matches!(method, &Method::DELETE) && path.starts_with("/api/fs-meta/v1/query-api-keys/"))
+}
+fn request_counts_toward_facade_request_drain(method: &Method, path: &str) -> bool {
+    matches!(method, &Method::GET)
+        && matches!(
+            path,
+            "/api/fs-meta/v1/tree"
+                | "/api/fs-meta/v1/stats"
+                | "/api/fs-meta/v1/on-demand-force-find"
+                | "/api/fs-meta/v1/bound-route-metrics"
+        )
+}
+
+async fn projection_request_facade_guard(
+    State(control_gate): State<Arc<ApiControlGate>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let _facade_request_guard = request_counts_toward_facade_request_drain(
+        request.method(),
+        request.uri().path(),
+    )
+    .then(|| control_gate.begin_facade_request());
+    next.run(request).await
 }
 
 async fn request_control_readiness_guard(
@@ -378,6 +405,9 @@ async fn query_api_key_guard(
 mod tests {
     use super::*;
 
+    use axum::body::Body;
+    use tokio::sync::Notify;
+    use tower::ServiceExt;
     #[test]
     fn request_control_drain_counts_only_management_writes() {
         for (method, path) in [
@@ -435,6 +465,94 @@ mod tests {
                 "{method} {path} should not require control readiness"
             );
         }
+    }
+    #[test]
+    fn projection_requests_count_toward_facade_request_drain() {
+        for (method, path) in [
+            (Method::GET, "/api/fs-meta/v1/tree"),
+            (Method::GET, "/api/fs-meta/v1/stats"),
+            (Method::GET, "/api/fs-meta/v1/on-demand-force-find"),
+            (Method::GET, "/api/fs-meta/v1/bound-route-metrics"),
+        ] {
+            assert!(
+                request_counts_toward_facade_request_drain(&method, path),
+                "{method} {path} should count toward facade request drain"
+            );
+        }
+
+        for (method, path) in [
+            (Method::POST, "/api/fs-meta/v1/session/login"),
+            (Method::GET, "/api/fs-meta/v1/status"),
+            (Method::POST, "/api/fs-meta/v1/index/rescan"),
+            (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
+        ] {
+            assert!(
+                !request_counts_toward_facade_request_drain(&method, path),
+                "{method} {path} should not count toward facade request drain"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn projection_request_facade_guard_holds_drain_until_tree_response_finishes() {
+        let control_gate = Arc::new(ApiControlGate::new(true));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = Router::new()
+            .route(
+                "/api/fs-meta/v1/tree",
+                get({
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    move || {
+                        let entered = entered.clone();
+                        let release = release.clone();
+                        async move {
+                            entered.notify_waiters();
+                            release.notified().await;
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .with_state(control_gate.clone())
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                projection_request_facade_guard,
+            ));
+
+        let response_task = tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/fs-meta/v1/tree")
+                    .body(Body::empty())
+                    .expect("build tree request"),
+            )
+            .await
+            .expect("route tree request")
+        });
+
+        entered.notified().await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                control_gate.wait_for_facade_request_drain(),
+            )
+            .await
+            .is_err(),
+            "projection tree request should keep facade drain blocked while response is still in flight"
+        );
+
+        release.notify_waiters();
+        let response = tokio::time::timeout(Duration::from_secs(2), response_task)
+            .await
+            .expect("tree response should settle")
+            .expect("join tree response task");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(1), control_gate.wait_for_facade_request_drain())
+            .await
+            .expect("facade drain should clear after tree response settles");
     }
 
     #[tokio::test(flavor = "current_thread")]

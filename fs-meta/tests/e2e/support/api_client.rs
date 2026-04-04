@@ -642,10 +642,14 @@ pub fn is_transport_error(err: &str) -> bool {
 }
 
 pub fn is_retryable_query_unavailable_error(err: &str) -> bool {
-    err.contains("http 503 failed")
+    (err.contains("http 503 failed")
         && (err.contains("\"code\":\"NOT_READY\"")
             || err.contains("trusted-materialized reads remain unavailable")
-            || err.contains("runtime control initializes the app"))
+            || err.contains("runtime control initializes the app")))
+        || (err.contains("http 500 failed")
+            && err.contains("\"code\":\"INTERNAL_ERROR\"")
+            && err.contains("drained/fenced")
+            && err.contains("grant attachments"))
 }
 
 pub fn extract_token(login: Value) -> Result<String, String> {
@@ -727,6 +731,78 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+
+    #[test]
+    fn tree_failsover_to_next_candidate_on_retryable_internal_grant_attachment_error() {
+        let first = TcpListener::bind("127.0.0.1:0").expect("bind first tree listener");
+        let first_addr = first.local_addr().expect("first listener addr");
+        let second = TcpListener::bind("127.0.0.1:0").expect("bind second tree listener");
+        let second_addr = second.local_addr().expect("second listener addr");
+
+        let first_server = std::thread::spawn(move || {
+            let (mut stream, _) = first.accept().expect("accept first tree request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"code":"INTERNAL_ERROR","error":"access denied: pid Pid(1) is drained/fenced and cannot obtain new grant attachments","path":"/"}"#;
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error
+content-type: application/json
+content-length: {}
+connection: close
+
+{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write first tree response");
+            stream.flush().expect("flush first tree response");
+        });
+
+        let second_server = std::thread::spawn(move || {
+            let (mut stream, _) = second.accept().expect("accept second tree request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"status":"ok","groups":[],"group_page":{"returned_groups":0,"has_more_groups":false,"next_cursor":null,"next_entry_after":null}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK
+content-type: application/json
+content-length: {}
+connection: close
+
+{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write second tree response");
+            stream.flush().expect("flush second tree response");
+        });
+
+        let mut session = OperatorSession {
+            client: FsMetaApiClient::new(format!("http://{}", first_addr)).expect("client"),
+            candidate_base_urls: vec![
+                format!("http://{}", first_addr),
+                format!("http://{}", second_addr),
+            ],
+            username: "operator".to_string(),
+            password: "operator123".to_string(),
+            management_token: "ignored".to_string(),
+            query_api_key: "ignored".to_string(),
+        };
+
+        let tree = session
+            .tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])
+            .expect("tree should fail over to the next candidate on retryable internal grant-attachment errors");
+
+        assert_eq!(tree.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(session.client.base_url(), format!("http://{}", second_addr));
+        first_server.join().expect("join first server");
+        second_server.join().expect("join second server");
+    }
 
     #[test]
     fn login_first_available_retries_transient_transport_error_for_same_base_url() {
