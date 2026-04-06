@@ -3584,7 +3584,6 @@ mod tests {
     use crate::ControlEvent;
     use crate::FileMetaRecord;
     use crate::query::models::QueryNode;
-    use crate::sink::SinkFileMeta;
     use crate::query::path::is_under_query_path;
     use crate::query::path::root_file_name_bytes;
     use crate::query::request::{
@@ -3597,6 +3596,7 @@ mod tests {
         ROUTE_KEY_QUERY, ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
         ROUTE_KEY_SOURCE_ROOTS_CONTROL,
     };
+    use crate::sink::SinkFileMeta;
     use crate::workers::sink::SinkWorkerClientHandle;
     #[cfg(target_os = "linux")]
     mod real_nfs_lab {
@@ -4473,7 +4473,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn publish_manual_rescan_signal_succeeds_without_started_worker_and_updates_signal_cell() {
+    async fn publish_manual_rescan_signal_succeeds_without_started_worker_and_updates_signal_cell()
+    {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -4521,7 +4522,11 @@ mod tests {
             .watch_since(offset)
             .await
             .expect("watch signal updates");
-        assert_eq!(updates.len(), 1, "manual rescan signal should emit exactly one update");
+        assert_eq!(
+            updates.len(),
+            1,
+            "manual rescan signal should emit exactly one update"
+        );
         assert_eq!(updates[0].requested_by, "node-a");
     }
 
@@ -4581,23 +4586,32 @@ mod tests {
                 Err(CnxError::Timeout) => continue,
                 Err(err) => panic!("initial publish recv failed: {err}"),
             }
-            let nfs1_ready = selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_root);
-            let nfs2_ready = selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_root);
+            let nfs1_ready =
+                selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_root);
+            let nfs2_ready =
+                selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_root);
             if nfs1_ready && nfs2_ready {
                 break;
             }
         }
 
-        assert!(selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_root));
-        assert!(selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_root));
+        assert!(selected_group_tree_contains_path(
+            &sink, "nfs1", query_dir, query_root
+        ));
+        assert!(selected_group_tree_contains_path(
+            &sink, "nfs2", query_dir, query_root
+        ));
 
         let fresh_sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
             .expect("init fresh sink");
 
-        tokio::time::timeout(Duration::from_secs(8), client.publish_manual_rescan_signal())
-            .await
-            .expect("manual rescan publish timed out")
-            .expect("publish manual rescan");
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            client.publish_manual_rescan_signal(),
+        )
+        .await
+        .expect("manual rescan publish timed out")
+        .expect("publish manual rescan");
 
         let replay_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < replay_deadline {
@@ -4606,8 +4620,10 @@ mod tests {
                 Err(CnxError::Timeout) => continue,
                 Err(err) => panic!("baseline replay recv failed: {err}"),
             }
-            let nfs1_ready = selected_group_tree_contains_path(&fresh_sink, "nfs1", query_dir, query_root);
-            let nfs2_ready = selected_group_tree_contains_path(&fresh_sink, "nfs2", query_dir, query_root);
+            let nfs1_ready =
+                selected_group_tree_contains_path(&fresh_sink, "nfs1", query_dir, query_root);
+            let nfs2_ready =
+                selected_group_tree_contains_path(&fresh_sink, "nfs2", query_dir, query_root);
             if nfs1_ready && nfs2_ready {
                 break;
             }
@@ -5199,7 +5215,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn observability_snapshot_nonblocking_retries_bound_route_unexpected_correlation_protocol_violation() {
+    async fn observability_snapshot_nonblocking_retries_bound_route_unexpected_correlation_protocol_violation()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -9054,7 +9071,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn fs_source_selected_real_source_route_reacquires_worker_client_after_sticky_peer_early_eof_on_generation_two_wave() {
+    async fn fs_source_selected_real_source_route_reacquires_worker_client_after_sticky_peer_early_eof_on_generation_two_wave()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");

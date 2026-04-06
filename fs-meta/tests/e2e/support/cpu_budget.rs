@@ -169,8 +169,6 @@ fn read_total_jiffies() -> Result<u64, String> {
     Ok(total)
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

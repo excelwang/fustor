@@ -539,8 +539,7 @@ fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
     let steady_cpu = measure_steady_cpu(&harness.cluster, &harness.app_id)?;
     eprintln!(
         "[fs-meta-api-upgrade] cpu-budget baseline_pids={:?} steady_pids={:?}",
-        harness.baseline_cpu,
-        steady_cpu
+        harness.baseline_cpu, steady_cpu
     );
     let summary = measure_cpu_budget(
         &harness.baseline_cpu,
@@ -550,9 +549,7 @@ fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
     )?;
     eprintln!(
         "[fs-meta-api-upgrade] cpu-budget summary mean={:?} p95={:?} cluster_mean={:.2}",
-        summary.per_node_mean_delta,
-        summary.per_node_p95_delta,
-        summary.cluster_mean_delta
+        summary.per_node_mean_delta, summary.per_node_p95_delta, summary.cluster_mean_delta
     );
     stop.store(true, Ordering::Relaxed);
     let _ = worker.join();

@@ -210,7 +210,10 @@ fn remove_stale_lab_root(root: &Path) -> Result<(), String> {
                 ))
             }
         }
-        Err(err) => Err(format!("remove stale lab root {} failed: {err}", root.display())),
+        Err(err) => Err(format!(
+            "remove stale lab root {} failed: {err}",
+            root.display()
+        )),
     }
 }
 

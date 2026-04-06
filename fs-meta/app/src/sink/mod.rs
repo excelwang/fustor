@@ -619,9 +619,7 @@ impl PersistedGroupSinkState {
             overflow_pending_audit: self.overflow_pending_audit,
             audit_epoch_completed: self.audit_epoch_completed,
             initial_audit_completed: self.initial_audit_completed,
-            last_coverage_recovered_at: decode_instant_age_ms(
-                self.last_coverage_recovered_age_ms,
-            ),
+            last_coverage_recovered_at: decode_instant_age_ms(self.last_coverage_recovered_age_ms),
             materialized_revision: self.materialized_revision,
             sentinel_health: self.sentinel_health,
         };
@@ -650,48 +648,49 @@ impl SinkStateSnapshotCell {
         state_boundary: Arc<dyn StateBoundary>,
     ) -> std::io::Result<(Self, Option<PersistedSinkState>)> {
         let handle = sink_state_handle(scope);
-        let loaded = match crate::runtime_app::block_on_shared_runtime(state_boundary.statecell_read(
-            sink_state_boundary_bridge(scope),
-            StateCellReadRequest {
-                handle: handle.clone(),
-            },
-        )) {
-            Ok(resp) => {
-                if resp.status != "ok" {
+        let loaded =
+            match crate::runtime_app::block_on_shared_runtime(state_boundary.statecell_read(
+                sink_state_boundary_bridge(scope),
+                StateCellReadRequest {
+                    handle: handle.clone(),
+                },
+            )) {
+                Ok(resp) => {
+                    if resp.status != "ok" {
+                        return Err(std::io::Error::other(format!(
+                            "statecell_read failed for sink state scope={scope}: status={}",
+                            resp.status
+                        )));
+                    }
+                    if resp.payload.is_empty() {
+                        None
+                    } else {
+                        let decoded: PersistedSinkState = rmp_serde::from_slice(&resp.payload)
+                            .map_err(|err| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("decode sink state snapshot failed: {err}"),
+                                )
+                            })?;
+                        if decoded.scope != scope {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "sink state snapshot scope mismatch: expected {scope}, got {}",
+                                    decoded.scope
+                                ),
+                            ));
+                        }
+                        Some(decoded)
+                    }
+                }
+                Err(err) if is_statecell_not_found(&err) => None,
+                Err(err) => {
                     return Err(std::io::Error::other(format!(
-                        "statecell_read failed for sink state scope={scope}: status={}",
-                        resp.status
+                        "statecell_read failed for sink state scope={scope}: {err}"
                     )));
                 }
-                if resp.payload.is_empty() {
-                    None
-                } else {
-                    let decoded: PersistedSinkState =
-                        rmp_serde::from_slice(&resp.payload).map_err(|err| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("decode sink state snapshot failed: {err}"),
-                            )
-                        })?;
-                    if decoded.scope != scope {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "sink state snapshot scope mismatch: expected {scope}, got {}",
-                                decoded.scope
-                            ),
-                        ));
-                    }
-                    Some(decoded)
-                }
-            }
-            Err(err) if is_statecell_not_found(&err) => None,
-            Err(err) => {
-                return Err(std::io::Error::other(format!(
-                    "statecell_read failed for sink state scope={scope}: {err}"
-                )));
-            }
-        };
+            };
         Ok((
             Self {
                 scope: Arc::<str>::from(scope),
@@ -706,14 +705,15 @@ impl SinkStateSnapshotCell {
         let payload = rmp_serde::to_vec_named(snapshot).map_err(|err| {
             CnxError::Internal(format!("encode sink state snapshot failed: {err}"))
         })?;
-        let response = crate::runtime_app::block_on_shared_runtime(self.state_boundary.statecell_write(
-            sink_state_boundary_bridge(&self.scope),
-            StateCellWriteRequest {
-                handle: self.handle.clone(),
-                payload,
-                lease_epoch: Some(snapshot.persisted_at_us.max(1)),
-            },
-        ))?;
+        let response =
+            crate::runtime_app::block_on_shared_runtime(self.state_boundary.statecell_write(
+                sink_state_boundary_bridge(&self.scope),
+                StateCellWriteRequest {
+                    handle: self.handle.clone(),
+                    payload,
+                    lease_epoch: Some(snapshot.persisted_at_us.max(1)),
+                },
+            ))?;
         if response.status != "committed" && response.status != "ok" {
             return Err(CnxError::Internal(format!(
                 "statecell_write returned non-committed status for sink state scope={}: {}",
@@ -4500,7 +4500,9 @@ mod tests {
             cfg,
         )
         .expect("reopen sink with same state boundary");
-        let snapshot_after = reopened.status_snapshot().expect("sink status after reopen");
+        let snapshot_after = reopened
+            .status_snapshot()
+            .expect("sink status after reopen");
         assert!(
             snapshot_after
                 .groups

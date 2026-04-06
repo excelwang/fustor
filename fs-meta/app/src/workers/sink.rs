@@ -49,9 +49,7 @@ fn can_retry_on_control_frame(err: &CnxError) -> bool {
         )
 }
 
-fn is_restart_deferred_retire_pending_deactivate_batch(
-    envelopes: &[ControlEnvelope],
-) -> bool {
+fn is_restart_deferred_retire_pending_deactivate_batch(envelopes: &[ControlEnvelope]) -> bool {
     let Ok(signals) = sink_control_signals_from_envelopes(envelopes) else {
         return false;
     };
@@ -179,6 +177,66 @@ fn summarize_sink_status_snapshot(snapshot: &SinkStatusSnapshot) -> String {
         summarize_groups_by_node(&snapshot.stream_applied_origin_counts_by_node),
         snapshot.stream_last_applied_at_us_by_node
     )
+}
+
+fn host_ref_matches_node_id(host_ref: &str, node_id: &NodeId) -> bool {
+    host_ref == node_id.0
+        || node_id
+            .0
+            .strip_prefix(host_ref)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+}
+
+fn stable_host_ref_for_node_id(node_id: &NodeId, grants: &[GrantedMountRoot]) -> String {
+    let host_refs = grants
+        .iter()
+        .filter(|grant| host_ref_matches_node_id(&grant.host_ref, node_id))
+        .map(|grant| grant.host_ref.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    match host_refs.len() {
+        1 => host_refs
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| node_id.0.clone()),
+        _ => node_id.0.clone(),
+    }
+}
+
+fn normalize_node_groups_key(
+    groups_by_node: &mut std::collections::BTreeMap<String, Vec<String>>,
+    from_node_id: &str,
+    stable_host_ref: &str,
+) {
+    if from_node_id == stable_host_ref {
+        return;
+    }
+    let Some(groups) = groups_by_node.remove(from_node_id) else {
+        return;
+    };
+    let entry = groups_by_node
+        .entry(stable_host_ref.to_string())
+        .or_default();
+    entry.extend(groups);
+    entry.sort();
+    entry.dedup();
+}
+
+fn normalize_sink_status_snapshot_node_keys(
+    snapshot: &mut SinkStatusSnapshot,
+    node_id: &NodeId,
+    grants: &[GrantedMountRoot],
+) {
+    let stable_host_ref = stable_host_ref_for_node_id(node_id, grants);
+    normalize_node_groups_key(
+        &mut snapshot.scheduled_groups_by_node,
+        &node_id.0,
+        &stable_host_ref,
+    );
+    normalize_node_groups_key(
+        &mut snapshot.last_control_frame_signals_by_node,
+        &node_id.0,
+        &stable_host_ref,
+    );
 }
 
 fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<QueryNode>> {
@@ -634,9 +692,7 @@ fn take_sink_worker_status_nonblocking_cache_fallback_hook() -> bool {
 }
 
 #[cfg(test)]
-fn take_sink_worker_control_frame_error_hook(
-    current_worker_instance_id: u64,
-) -> Option<CnxError> {
+fn take_sink_worker_control_frame_error_hook(current_worker_instance_id: u64) -> Option<CnxError> {
     {
         let mut guard = match sink_worker_control_frame_error_queue_hook_cell().lock() {
             Ok(guard) => guard,
@@ -1094,9 +1150,16 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
-        let snapshot = self
+        let mut snapshot = self
             .status_snapshot_with_timeout(Duration::from_secs(5))
             .await?;
+        let grants = self
+            .config
+            .lock()
+            .map_err(|_| CnxError::Internal("sink worker config lock poisoned".into()))?
+            .host_object_grants
+            .clone();
+        normalize_sink_status_snapshot_node_keys(&mut snapshot, &self.node_id, &grants);
         if debug_control_scope_capture_enabled() {
             eprintln!(
                 "fs_meta_sink_worker_client: status_snapshot reply node={} {}",
@@ -1137,7 +1200,14 @@ impl SinkWorkerClientHandle {
                 .status_snapshot_with_timeout(Duration::from_secs(5))
                 .await
             {
-                Ok(snapshot) => {
+                Ok(mut snapshot) => {
+                    let grants = self
+                        .config
+                        .lock()
+                        .map_err(|_| CnxError::Internal("sink worker config lock poisoned".into()))?
+                        .host_object_grants
+                        .clone();
+                    normalize_sink_status_snapshot_node_keys(&mut snapshot, &self.node_id, &grants);
                     if debug_control_scope_capture_enabled() {
                         eprintln!(
                             "fs_meta_sink_worker_client: status_snapshot reply node={} {}",
@@ -1846,6 +1916,16 @@ impl SinkFacade {
             client
                 .wait_for_control_ops_to_drain(SINK_WORKER_CLOSE_DRAIN_TIMEOUT)
                 .await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn shutdown_shared_worker_for_tests(&self, timeout: Duration) -> Result<()> {
+        match self {
+            Self::Local(_) => Err(CnxError::InvalidInput(
+                "shutdown_shared_worker_for_tests requires worker-backed sink facade".into(),
+            )),
+            Self::Worker(client) => client.shutdown_shared_worker_for_tests(timeout).await,
         }
     }
 }
@@ -3406,7 +3486,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn single_restart_deferred_retire_pending_events_deactivate_fails_fast_after_repeated_bridge_reset_errors()
-    {
+     {
         struct SinkWorkerControlFrameErrorQueueHookReset;
 
         impl Drop for SinkWorkerControlFrameErrorQueueHookReset {
@@ -3675,7 +3755,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn multi_restart_deferred_retire_pending_cleanup_batch_fails_fast_after_repeated_bridge_reset_errors()
-    {
+     {
         struct SinkWorkerControlFrameErrorQueueHookReset;
 
         impl Drop for SinkWorkerControlFrameErrorQueueHookReset {
@@ -4691,16 +4771,21 @@ mod tests {
             async move {
                 predecessor
                     .on_control_frame(vec![
-                        encode_runtime_exec_control(&capanix_runtime_entry_sdk::control::RuntimeExecControl::Deactivate(
-                            RuntimeExecDeactivate {
-                                route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
-                                unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
-                                    .to_string(),
-                                lease: None,
-                                generation: 3,
-                                reason: "restart_deferred_retire_pending".to_string(),
-                            },
-                        ))
+                        encode_runtime_exec_control(
+                            &capanix_runtime_entry_sdk::control::RuntimeExecControl::Deactivate(
+                                RuntimeExecDeactivate {
+                                    route_key: format!(
+                                        "{}.stream",
+                                        crate::runtime::routes::ROUTE_KEY_EVENTS
+                                    ),
+                                    unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
+                                        .to_string(),
+                                    lease: None,
+                                    generation: 3,
+                                    reason: "restart_deferred_retire_pending".to_string(),
+                                },
+                            ),
+                        )
                         .expect("encode sink events deactivate"),
                     ])
                     .await

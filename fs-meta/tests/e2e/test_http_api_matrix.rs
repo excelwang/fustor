@@ -919,10 +919,7 @@ fn run_status_and_grants_checks(
     Ok(())
 }
 
-fn run_roots_matrix(
-    session: &mut OperatorSession,
-    lab: &NfsLab,
-) -> Result<(), String> {
+fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), String> {
     eprintln!("[fs-meta-api-matrix] substep=monitoring-roots-current");
     let current = session.monitoring_roots()?;
     let current_rows = current
@@ -933,7 +930,9 @@ fn run_roots_matrix(
         return Err(format!("expected 3 roots from release doc, got {current}"));
     }
 
-    let empty_preview = session.client().preview_roots_raw(session.token(), &json!([]))?;
+    let empty_preview = session
+        .client()
+        .preview_roots_raw(session.token(), &json!([]))?;
     assert_status(empty_preview.status, 200, "empty roots preview")?;
     if empty_preview
         .body
@@ -949,7 +948,9 @@ fn run_roots_matrix(
     }
 
     let roots = baseline_roots(lab);
-    let preview = session.client().preview_roots_raw(session.token(), &roots_payload(&roots))?;
+    let preview = session
+        .client()
+        .preview_roots_raw(session.token(), &roots_payload(&roots))?;
     assert_status(preview.status, 200, "baseline roots preview")?;
     if preview
         .body
@@ -1085,7 +1086,9 @@ fn run_roots_matrix(
 
     eprintln!("[fs-meta-api-matrix] substep=single-root-apply");
     let single_root = vec![root_spec("nfs1", &lab.export_source("nfs1"))];
-    let put = session.client().update_roots_raw(session.token(), &roots_payload(&single_root))?;
+    let put = session
+        .client()
+        .update_roots_raw(session.token(), &roots_payload(&single_root))?;
     assert_status(put.status, 200, "single-root apply")?;
     if put.body.get("roots_count").and_then(Value::as_u64) != Some(1) {
         return Err(format!("single-root apply did not converge: {}", put.body));
@@ -1103,7 +1106,9 @@ fn run_roots_matrix(
     })?;
 
     eprintln!("[fs-meta-api-matrix] substep=restore-roots");
-    let restore = session.client().update_roots_raw(session.token(), &roots_payload(&roots))?;
+    let restore = session
+        .client()
+        .update_roots_raw(session.token(), &roots_payload(&roots))?;
     assert_status(restore.status, 200, "restore roots")?;
     session.rescan()?;
     wait_until(Duration::from_secs(30), "restore baseline roots", || {

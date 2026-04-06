@@ -10,6 +10,7 @@ const RECONNECT_RETRY_WINDOW: Duration = Duration::from_secs(90);
 const RECONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const HTTP_TIMEOUT_DEFAULT: Duration = Duration::from_secs(45);
 const HTTP_TIMEOUT_FORCE_FIND: Duration = Duration::from_secs(75);
+const HTTP_TIMEOUT_PROJECTION: Duration = Duration::from_secs(75);
 
 #[derive(Debug, Clone)]
 pub struct ApiResponse {
@@ -262,6 +263,7 @@ impl FsMetaApiClient {
 
     fn request_timeout(&self, path: &str) -> Duration {
         match path {
+            "/tree" | "/stats" => HTTP_TIMEOUT_PROJECTION,
             "/on-demand-force-find" => HTTP_TIMEOUT_FORCE_FIND,
             _ => HTTP_TIMEOUT_DEFAULT,
         }
@@ -314,7 +316,11 @@ impl OperatorSession {
             return Err("no facade base URLs provided".into());
         }
         let (client, token) = login_first_available(&candidate_base_urls, &username, &password)?;
-        let query_api_key = provision_query_api_key(&client, &token, &username)?;
+        let (client, query_api_key) = provision_query_api_key_first_available(
+            &prioritize_base_urls(client.base_url(), &candidate_base_urls),
+            &token,
+            &username,
+        )?;
         Ok(Self {
             client,
             candidate_base_urls,
@@ -334,7 +340,11 @@ impl OperatorSession {
         let password = password.into();
         let primary_base_url = client.base_url.clone();
         let token = extract_token(client.login(&username, &password)?)?;
-        let query_api_key = provision_query_api_key(&client, &token, &username)?;
+        let (client, query_api_key) = provision_query_api_key_first_available(
+            std::slice::from_ref(&primary_base_url),
+            &token,
+            &username,
+        )?;
         Ok(Self {
             client,
             candidate_base_urls: vec![primary_base_url],
@@ -359,8 +369,13 @@ impl OperatorSession {
 
     pub fn relogin(&mut self) -> Result<(), String> {
         self.management_token = extract_token(self.client.login(&self.username, &self.password)?)?;
-        self.query_api_key =
-            provision_query_api_key(&self.client, &self.management_token, &self.username)?;
+        let (client, query_api_key) = provision_query_api_key_first_available(
+            std::slice::from_ref(&self.client.base_url),
+            &self.management_token,
+            &self.username,
+        )?;
+        self.client = client;
+        self.query_api_key = query_api_key;
         Ok(())
     }
 
@@ -497,7 +512,10 @@ impl OperatorSession {
                         saw_reauthable_error = true;
                         last_err = Some(format!("{base_url}: {err}"));
                     }
-                    Err(err) if is_transport_error(&err) || is_retryable_query_unavailable_error(&err) => {
+                    Err(err)
+                        if is_transport_error(&err)
+                            || is_retryable_query_unavailable_error(&err) =>
+                    {
                         saw_reauthable_error = true;
                         last_err = Some(format!("{base_url}: {err}"));
                     }
@@ -525,7 +543,11 @@ impl OperatorSession {
             };
             match attempt {
                 Ok((client, token)) => {
-                    let query_api_key = provision_query_api_key(&client, &token, &self.username)?;
+                    let (client, query_api_key) = provision_query_api_key_first_available(
+                        &prioritize_base_urls(client.base_url(), &self.candidate_base_urls),
+                        &token,
+                        &self.username,
+                    )?;
                     self.client = client;
                     self.management_token = token;
                     self.query_api_key = query_api_key;
@@ -699,7 +721,22 @@ fn login_first_available(
     }
 }
 
-fn provision_query_api_key(
+fn prioritize_base_urls(current: &str, base_urls: &[String]) -> Vec<String> {
+    let mut ordered = Vec::new();
+    let current = current.trim_end_matches('/').to_string();
+    if !current.is_empty() {
+        ordered.push(current);
+    }
+    for base_url in base_urls {
+        let normalized = base_url.trim_end_matches('/').to_string();
+        if !normalized.is_empty() && !ordered.contains(&normalized) {
+            ordered.push(normalized);
+        }
+    }
+    ordered
+}
+
+fn provision_query_api_key_with_client(
     client: &FsMetaApiClient,
     management_token: &str,
     username: &str,
@@ -715,6 +752,35 @@ fn provision_query_api_key(
         .ok_or_else(|| format!("query api key response missing api_key: {created}"))
 }
 
+fn provision_query_api_key_first_available(
+    base_urls: &[String],
+    management_token: &str,
+    username: &str,
+) -> Result<(FsMetaApiClient, String), String> {
+    let deadline = std::time::Instant::now() + RECONNECT_RETRY_WINDOW;
+    let mut last_err = String::new();
+    loop {
+        let mut saw_transport_error = false;
+        for base in base_urls {
+            let client = FsMetaApiClient::new(base.clone())?;
+            match provision_query_api_key_with_client(&client, management_token, username) {
+                Ok(query_api_key) => return Ok((client, query_api_key)),
+                Err(err) if is_transport_error(&err) => {
+                    saw_transport_error = true;
+                    last_err = format!("{base}: {err}");
+                }
+                Err(err) => return Err(format!("{base}: {err}")),
+            }
+        }
+        if !saw_transport_error || std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "no reachable facade base URL for query api key provision: {last_err}"
+            ));
+        }
+        std::thread::sleep(RECONNECT_RETRY_INTERVAL);
+    }
+}
+
 fn unique_suffix() -> String {
     let micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -723,15 +789,25 @@ fn unique_suffix() -> String {
     format!("{}-{micros}", std::process::id())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
+    #[test]
+    fn tree_and_stats_timeouts_are_not_shorter_than_materialized_query_budget() {
+        assert!(
+            HTTP_TIMEOUT_PROJECTION >= Duration::from_secs(60),
+            "projection requests must not time out before the server-side tree/stats query budget"
+        );
+        assert!(
+            HTTP_TIMEOUT_PROJECTION >= HTTP_TIMEOUT_DEFAULT,
+            "projection requests should allow at least as much time as ordinary management requests"
+        );
+    }
 
     #[test]
     fn tree_failsover_to_next_candidate_on_retryable_internal_grant_attachment_error() {
@@ -802,6 +878,80 @@ connection: close
         assert_eq!(session.client.base_url(), format!("http://{}", second_addr));
         first_server.join().expect("join first server");
         second_server.join().expect("join second server");
+    }
+
+    #[test]
+    fn login_many_fails_over_query_api_key_provision_after_transient_transport_error() {
+        let first = TcpListener::bind("127.0.0.1:0").expect("bind first facade listener");
+        let first_addr = first.local_addr().expect("first listener addr");
+        let second = TcpListener::bind("127.0.0.1:0").expect("bind second facade listener");
+        let second_addr = second.local_addr().expect("second listener addr");
+
+        let first_server = std::thread::spawn(move || {
+            let (mut stream, _) = first.accept().expect("accept first login request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let login_body = r#"{"token":"shared-token"}"#;
+            let login_response = format!(
+                "HTTP/1.1 200 OK
+content-type: application/json
+content-length: {}
+connection: close
+
+{}",
+                login_body.len(),
+                login_body
+            );
+            stream
+                .write_all(login_response.as_bytes())
+                .expect("write first login response");
+            stream.flush().expect("flush first login response");
+
+            let (mut stream, _) = first.accept().expect("accept first query-api-key request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            drop(stream);
+        });
+
+        let second_server = std::thread::spawn(move || {
+            let (mut stream, _) = second
+                .accept()
+                .expect("accept second query-api-key request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"api_key":"query-key-2"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK
+content-type: application/json
+content-length: {}
+connection: close
+
+{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write second query-api-key response");
+            stream.flush().expect("flush second query-api-key response");
+        });
+
+        let session = OperatorSession::login_many(
+            vec![
+                format!("http://{}", first_addr),
+                format!("http://{}", second_addr),
+            ],
+            "operator",
+            "operator123",
+        )
+        .expect(
+            "login_many should fail over query-api-key provisioning after a transient transport error",
+        );
+
+        assert_eq!(session.client.base_url(), format!("http://{}", second_addr));
+        assert_eq!(session.query_api_key(), "query-key-2");
+        first_server.join().expect("join first facade server");
+        second_server.join().expect("join second facade server");
     }
 
     #[test]

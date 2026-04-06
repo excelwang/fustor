@@ -35,12 +35,12 @@ use crate::runtime::execution_units;
 use crate::runtime::orchestration::encode_logical_roots_control_payload;
 use crate::runtime::orchestration::encode_manual_rescan_envelope;
 use crate::runtime::routes::ROUTE_KEY_SOURCE_RESCAN_CONTROL;
+#[cfg(test)]
+use crate::runtime::routes::source_rescan_route_key_for;
 use crate::runtime::routes::{
     METHOD_SOURCE_STATUS, ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SOURCE_ROOTS_CONTROL,
     ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
 };
-#[cfg(test)]
-use crate::runtime::routes::source_rescan_route_key_for;
 use crate::runtime::seam::exchange_host_adapter;
 use crate::sink::SinkStatusSnapshot;
 use crate::source::config::{GrantedMountRoot, RootSelector, RootSpec};
@@ -2097,13 +2097,13 @@ mod tests {
     use crate::api::facade_status::shared_facade_pending_status_cell;
     use crate::query::api::ProjectionPolicy;
     use crate::runtime::routes::METHOD_SINK_STATUS;
-    use crate::state::cell::SignalCell;
     use crate::sink::SinkFileMeta;
     use crate::source::FSMetaSource;
     use crate::source::SourceStatusSnapshot;
     use crate::source::config::GrantedMountRoot;
     use crate::source::config::SourceConfig;
     use crate::source::{SourceConcreteRootHealthSnapshot, SourceLogicalRootHealthSnapshot};
+    use crate::state::cell::SignalCell;
     use crate::workers::sink::SinkFacade;
     use crate::workers::source::SourceFacade;
     use crate::workers::source::SourceObservabilitySnapshot;
@@ -3174,10 +3174,7 @@ mod tests {
         let sent_routes = Arc::new(StdMutex::new(Vec::new()));
         let boundary = Arc::new(DeniedControlRouteBoundary {
             sent_routes: sent_routes.clone(),
-            denied_routes: BTreeSet::from([format!(
-                "{}.stream",
-                ROUTE_KEY_SOURCE_ROOTS_CONTROL
-            )]),
+            denied_routes: BTreeSet::from([format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL)]),
         });
         let headers = management_headers(auth.as_ref());
         let state = ApiState {
@@ -3341,7 +3338,11 @@ mod tests {
             .watch_since(signal_offset)
             .await
             .expect("watch signal updates");
-        assert_eq!(updates.len(), 1, "manual rescan signal should emit exactly one update");
+        assert_eq!(
+            updates.len(),
+            1,
+            "manual rescan signal should emit exactly one update"
+        );
         assert_eq!(updates[0].requested_by, "node-a");
 
         let sent_routes = match sent_routes.lock() {

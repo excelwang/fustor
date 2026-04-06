@@ -36,6 +36,7 @@ struct SourceWorkerState {
     source: Option<Arc<FSMetaSource>>,
     pending_init: Option<(NodeId, SourceConfig)>,
     pump_task: Option<JoinHandle<()>>,
+    pump_boundary: Option<Arc<StdMutex<Arc<dyn ChannelIoSubset>>>>,
     last_control_frame_signals: Vec<String>,
     published_stats: Arc<StdMutex<PublishedBatchStats>>,
 }
@@ -304,6 +305,31 @@ fn lock_publish_stats<'a>(
     }
 }
 
+fn replace_pump_boundary_target(
+    target: &Arc<StdMutex<Arc<dyn ChannelIoSubset>>>,
+    boundary: Arc<dyn ChannelIoSubset>,
+) {
+    match target.lock() {
+        Ok(mut guard) => *guard = boundary,
+        Err(poisoned) => {
+            log::warn!("source worker pump boundary lock poisoned; recovering state");
+            *poisoned.into_inner() = boundary;
+        }
+    }
+}
+
+fn clone_pump_boundary_target(
+    target: &Arc<StdMutex<Arc<dyn ChannelIoSubset>>>,
+) -> Arc<dyn ChannelIoSubset> {
+    match target.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => {
+            log::warn!("source worker pump boundary lock poisoned; recovering state");
+            poisoned.into_inner().clone()
+        }
+    }
+}
+
 fn published_path_origin_counts_for_target(
     batch: &[Event],
     path_capture_target: Option<&[u8]>,
@@ -431,6 +457,7 @@ async fn stop_source_runtime_with_timeouts(
         }
     }
     state.source = None;
+    state.pump_boundary = None;
     state.last_control_frame_signals.clear();
 }
 
@@ -445,7 +472,7 @@ async fn stop_source_runtime(state: &mut SourceWorkerState) {
 
 fn start_source_pump_with_stream<S>(
     stream: S,
-    boundary: Arc<dyn ChannelIoSubset>,
+    boundary: Arc<StdMutex<Arc<dyn ChannelIoSubset>>>,
     published_stats: Arc<StdMutex<PublishedBatchStats>>,
 ) -> JoinHandle<()>
 where
@@ -478,6 +505,7 @@ where
                     summarize_published_batch_path_counts(&batch, &target),
                 );
             }
+            let boundary = clone_pump_boundary_target(&boundary);
             if let Err(err) = boundary
                 .channel_send(
                     BoundaryContext::default(),
@@ -510,6 +538,40 @@ where
 
 fn bootstrap_not_ready() -> CnxError {
     CnxError::NotReady("worker not initialized".into())
+}
+
+fn source_worker_runtime_ready_for_ping(state: &SourceWorkerState) -> bool {
+    state.source.is_some()
+        && state
+            .pump_task
+            .as_ref()
+            .is_some_and(|task| !tokio::task::JoinHandle::is_finished(task))
+}
+
+fn request_requires_live_publish_pump(request: &SourceWorkerRequest) -> bool {
+    matches!(
+        request,
+        SourceWorkerRequest::UpdateLogicalRoots { .. }
+            | SourceWorkerRequest::PublishManualRescanSignal
+            | SourceWorkerRequest::TriggerRescanWhenReady
+            | SourceWorkerRequest::ObservabilitySnapshot
+            | SourceWorkerRequest::OnControlFrame { .. }
+    )
+}
+
+async fn fail_closed_if_publish_pump_dead(
+    state: &mut SourceWorkerState,
+    request_label: &str,
+) -> bool {
+    if state.source.is_some() && !source_worker_runtime_ready_for_ping(state) {
+        eprintln!(
+            "fs_meta_source_worker_server: fail_closed request={} reason=publish_pump_dead",
+            request_label
+        );
+        stop_source_runtime(state).await;
+        return true;
+    }
+    false
 }
 
 fn last_control_frame_signals_by_node(
@@ -755,6 +817,11 @@ async fn bootstrap_start_source_runtime(
     eprintln!("fs_meta_source_worker_server: bootstrap_start endpoints begin");
     source.start_runtime_endpoints(boundary.clone()).await?;
     eprintln!("fs_meta_source_worker_server: bootstrap_start endpoints ok");
+    let pump_boundary = state
+        .pump_boundary
+        .get_or_insert_with(|| Arc::new(StdMutex::new(boundary.clone())))
+        .clone();
+    replace_pump_boundary_target(&pump_boundary, boundary);
     if state.pump_task.is_none() {
         let source = source.clone();
         eprintln!("fs_meta_source_worker_server: bootstrap_start pub begin");
@@ -762,7 +829,7 @@ async fn bootstrap_start_source_runtime(
         eprintln!("fs_meta_source_worker_server: bootstrap_start pub ok");
         state.pump_task = Some(start_source_pump_with_stream(
             stream,
-            boundary,
+            pump_boundary,
             state.published_stats.clone(),
         ));
         eprintln!("fs_meta_source_worker_server: bootstrap_start pump ok");
@@ -1077,6 +1144,7 @@ pub fn run_source_worker_server(
         source: None,
         pending_init: None,
         pump_task: None,
+        pump_boundary: None,
         last_control_frame_signals: Vec::new(),
         published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
     }));
@@ -1106,7 +1174,16 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
         );
         let action = {
             let mut guard = self.state.lock().await;
-            plan_worker_request(request, &mut guard)
+            if request_requires_live_publish_pump(&request)
+                && fail_closed_if_publish_pump_dead(&mut guard, request_label).await
+            {
+                SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::Error("worker not initialized".into()),
+                    false,
+                )
+            } else {
+                plan_worker_request(request, &mut guard)
+            }
         };
         let (response, stop) = execute_worker_action(action).await;
         eprintln!(
@@ -1130,8 +1207,12 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
             envelopes.len()
         );
         let source = {
-            let guard = self.state.lock().await;
-            guard.source.clone()
+            let mut guard = self.state.lock().await;
+            if fail_closed_if_publish_pump_dead(&mut guard, "runtime_control").await {
+                None
+            } else {
+                guard.source.clone()
+            }
         };
         let Some(source) = source else {
             return Err(CnxError::NotReady(
@@ -1190,11 +1271,14 @@ impl TypedWorkerBootstrapSession<SourceConfig> for SourceWorkerSession {
 
     async fn on_ping(&mut self, _context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
         eprintln!("fs_meta_source_worker_server: on_ping begin");
-        let guard = self.state.lock().await;
-        if guard.source.is_some() {
+        let mut guard = self.state.lock().await;
+        if source_worker_runtime_ready_for_ping(&guard) {
             eprintln!("fs_meta_source_worker_server: on_ping ok");
             Ok(())
         } else {
+            if guard.source.is_some() {
+                stop_source_runtime(&mut guard).await;
+            }
             eprintln!("fs_meta_source_worker_server: on_ping not_ready");
             Err(bootstrap_not_ready())
         }
@@ -1210,9 +1294,10 @@ impl TypedWorkerBootstrapSession<SourceConfig> for SourceWorkerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use capanix_app_sdk::raw::ChannelBoundary;
     use capanix_app_sdk::runtime::{
-        KernelResultEnvelope, StateCellReadRequest, StateCellWatchRequest, StateCellWriteRequest,
-        in_memory_state_boundary,
+        KernelResultEnvelope, LogLevel, StateCellReadRequest, StateCellWatchRequest,
+        StateCellWriteRequest, in_memory_state_boundary,
     };
     use capanix_runtime_entry_sdk::control::{
         RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, encode_runtime_exec_control,
@@ -1235,6 +1320,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ChannelIoSubset for NoopBoundary {}
+
+    impl ChannelBoundary for NoopBoundary {
+        fn log(&self, _ctx: BoundaryContext, _level: LogLevel, _msg: &str) {}
+    }
+
+    impl StateBoundary for NoopBoundary {}
 
     #[derive(Default)]
     struct TerminatingRecvBoundary {
@@ -1333,6 +1424,150 @@ mod tests {
             _request: ChannelSendRequest,
         ) -> Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct SentBatchSummary {
+        route: String,
+        origins: std::collections::BTreeMap<String, u64>,
+        control_events: u64,
+        data_events: u64,
+    }
+
+    #[derive(Default)]
+    struct PublishCaptureBoundary {
+        recv_counts: StdMutex<std::collections::BTreeMap<String, usize>>,
+        sent_batches: StdMutex<Vec<SentBatchSummary>>,
+    }
+
+    impl PublishCaptureBoundary {
+        fn sent_data_events_for_route(&self, route: &str) -> u64 {
+            self.sent_batches
+                .lock()
+                .expect("sent_data_events_for_route lock")
+                .iter()
+                .filter(|batch| batch.route == route)
+                .map(|batch| batch.data_events)
+                .sum()
+        }
+
+        fn sent_origin_counts_for_route(
+            &self,
+            route: &str,
+        ) -> std::collections::BTreeMap<String, u64> {
+            let mut counts = std::collections::BTreeMap::new();
+            for batch in self
+                .sent_batches
+                .lock()
+                .expect("sent_origin_counts_for_route lock")
+                .iter()
+                .filter(|batch| batch.route == route)
+            {
+                for (origin, count) in &batch.origins {
+                    *counts.entry(origin.clone()).or_default() += *count;
+                }
+            }
+            counts
+        }
+
+        fn recv_counts_snapshot(&self) -> std::collections::BTreeMap<String, usize> {
+            self.recv_counts
+                .lock()
+                .expect("recv_counts_snapshot lock")
+                .clone()
+        }
+
+        fn sent_batches_snapshot(&self) -> Vec<SentBatchSummary> {
+            self.sent_batches
+                .lock()
+                .expect("sent_batches_snapshot lock")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for PublishCaptureBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> Result<Vec<Event>> {
+            let route = request.channel_key.0;
+            *self
+                .recv_counts
+                .lock()
+                .expect("channel_recv recv_counts lock")
+                .entry(route)
+                .or_default() += 1;
+            Err(CnxError::Timeout)
+        }
+
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> Result<()> {
+            let mut origins = std::collections::BTreeMap::<String, u64>::new();
+            let mut control_events = 0_u64;
+            let mut data_events = 0_u64;
+            for event in &request.events {
+                *origins
+                    .entry(event.metadata().origin_id.0.clone())
+                    .or_default() += 1;
+                if rmp_serde::from_slice::<crate::ControlEvent>(event.payload_bytes()).is_ok() {
+                    control_events += 1;
+                } else {
+                    data_events += 1;
+                }
+            }
+            self.sent_batches
+                .lock()
+                .expect("channel_send sent_batches lock")
+                .push(SentBatchSummary {
+                    route: request.channel_key.0,
+                    origins,
+                    control_events,
+                    data_events,
+                });
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingPublishBoundary {
+        send_count: StdMutex<u64>,
+    }
+
+    impl FailingPublishBoundary {
+        fn send_count(&self) -> u64 {
+            *self.send_count.lock().expect("send_count lock")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for FailingPublishBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            _request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> Result<Vec<Event>> {
+            Err(CnxError::Timeout)
+        }
+
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            _request: ChannelSendRequest,
+        ) -> Result<()> {
+            let mut guard = self
+                .send_count
+                .lock()
+                .expect("channel_send send_count lock");
+            *guard += 1;
+            Err(CnxError::PeerError(
+                "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof".to_string(),
+            ))
         }
     }
 
@@ -1453,6 +1688,7 @@ mod tests {
             source: None,
             pending_init: Some((NodeId("node-a-29775285406139598021591041".to_string()), cfg)),
             pump_task: None,
+            pump_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
@@ -1589,6 +1825,7 @@ mod tests {
             source: None,
             pending_init: Some((NodeId("node-a-boot-fenced".to_string()), cfg)),
             pump_task: None,
+            pump_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
@@ -1626,6 +1863,7 @@ mod tests {
             source: None,
             pending_init: Some((NodeId("node-a-bootstrap-restart".to_string()), cfg)),
             pump_task: None,
+            pump_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
@@ -1722,6 +1960,472 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+
+        stop_source_runtime(&mut state).await;
+    }
+
+    #[tokio::test]
+    async fn ping_reports_not_ready_after_publish_pump_dies_and_primary_roots_turn_output_closed() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("seed.txt"), b"a").expect("seed nfs1 data");
+        std::fs::write(nfs2.join("seed.txt"), b"b").expect("seed nfs2 data");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                test_watch_scan_root("nfs1", nfs1.clone()),
+                test_watch_scan_root("nfs2", nfs2.clone()),
+            ],
+            host_object_grants: vec![
+                test_export("node-a::nfs1", nfs1.clone()),
+                test_export("node-a::nfs2", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+
+        let failing_boundary = Arc::new(FailingPublishBoundary::default());
+        let mut state = SourceWorkerState {
+            source: None,
+            pending_init: Some((NodeId("node-a-ping-output-closed".to_string()), cfg)),
+            pump_task: None,
+            pump_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        };
+
+        bootstrap_start_source_runtime(
+            &mut state,
+            failing_boundary.clone(),
+            in_memory_state_boundary(),
+        )
+        .await
+        .expect("bootstrap start source runtime");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut manual_rescan_sent = false;
+        loop {
+            let pump_finished = state
+                .pump_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished);
+            if pump_finished && !manual_rescan_sent {
+                state
+                    .source
+                    .as_ref()
+                    .expect("source after bootstrap")
+                    .publish_manual_rescan_signal()
+                    .await
+                    .expect("publish manual rescan after pump exit");
+                manual_rescan_sent = true;
+            }
+            let statuses = state
+                .source
+                .as_ref()
+                .expect("source after bootstrap")
+                .status_snapshot()
+                .concrete_roots;
+            let any_primary_closed = statuses
+                .iter()
+                .filter(|root| root.is_group_primary)
+                .filter(|root| {
+                    root.object_ref == "node-a::nfs1" || root.object_ref == "node-a::nfs2"
+                })
+                .any(|root| root.status == "output_closed");
+            if pump_finished && any_primary_closed && failing_boundary.send_count() > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "publish pump should fail closed and drive primary roots into output_closed after sidecar early-eof send errors: send_count={} manual_rescan_sent={} statuses={statuses:?}",
+                failing_boundary.send_count(),
+                manual_rescan_sent,
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            !source_worker_runtime_ready_for_ping(&state),
+            "ping readiness must fail closed once the publish pump is dead and primary roots are output_closed",
+        );
+
+        stop_source_runtime(&mut state).await;
+    }
+
+    #[tokio::test]
+    async fn on_control_frame_fails_closed_after_publish_pump_dies_and_primary_roots_turn_output_closed()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("seed.txt"), b"a").expect("seed nfs1 data");
+        std::fs::write(nfs2.join("seed.txt"), b"b").expect("seed nfs2 data");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                test_watch_scan_root("nfs1", nfs1.clone()),
+                test_watch_scan_root("nfs2", nfs2.clone()),
+            ],
+            host_object_grants: vec![
+                test_export("node-a::nfs1", nfs1.clone()),
+                test_export("node-a::nfs2", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+
+        let failing_boundary = Arc::new(FailingPublishBoundary::default());
+        let mut state = SourceWorkerState {
+            source: None,
+            pending_init: Some((NodeId("node-a-control-output-closed".to_string()), cfg)),
+            pump_task: None,
+            pump_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        };
+
+        bootstrap_start_source_runtime(
+            &mut state,
+            failing_boundary.clone(),
+            in_memory_state_boundary(),
+        )
+        .await
+        .expect("bootstrap start source runtime");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut manual_rescan_sent = false;
+        loop {
+            let pump_finished = state
+                .pump_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished);
+            if pump_finished && !manual_rescan_sent {
+                state
+                    .source
+                    .as_ref()
+                    .expect("source after bootstrap")
+                    .publish_manual_rescan_signal()
+                    .await
+                    .expect("publish manual rescan after pump exit");
+                manual_rescan_sent = true;
+            }
+            let statuses = state
+                .source
+                .as_ref()
+                .expect("source after bootstrap")
+                .status_snapshot()
+                .concrete_roots;
+            let any_primary_closed = statuses
+                .iter()
+                .filter(|root| root.is_group_primary)
+                .filter(|root| {
+                    root.object_ref == "node-a::nfs1" || root.object_ref == "node-a::nfs2"
+                })
+                .any(|root| root.status == "output_closed");
+            if pump_finished && any_primary_closed && failing_boundary.send_count() > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "publish pump should fail closed before follow-up control-frame check: send_count={} manual_rescan_sent={} statuses={statuses:?}",
+                failing_boundary.send_count(),
+                manual_rescan_sent,
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let state = Arc::new(Mutex::new(state));
+        let mut session = SourceWorkerSession {
+            state: state.clone(),
+        };
+        let boundary = Arc::new(NoopBoundary);
+        let context =
+            WorkerSessionContext::new(boundary.clone(), boundary.clone(), boundary.clone());
+        let response = session
+            .handle_request(
+                SourceWorkerRequest::OnControlFrame {
+                    envelopes: vec![
+                        encode_runtime_exec_control(&RuntimeExecControl::Activate(
+                            RuntimeExecActivate {
+                                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                                lease: None,
+                                generation: 2,
+                                expires_at_ms: 1,
+                                bound_scopes: vec![
+                                    RuntimeBoundScope {
+                                        scope_id: "nfs1".to_string(),
+                                        resource_ids: vec!["node-a::nfs1".to_string()],
+                                    },
+                                    RuntimeBoundScope {
+                                        scope_id: "nfs2".to_string(),
+                                        resource_ids: vec!["node-a::nfs2".to_string()],
+                                    },
+                                ],
+                            },
+                        ))
+                        .expect("encode source activate"),
+                    ],
+                },
+                &context,
+            )
+            .await
+            .expect("handle follow-up control frame after pump failure");
+
+        let WorkerLoopControl::Continue(SourceWorkerResponse::Error(message)) = response else {
+            panic!(
+                "follow-up control frame must fail closed once the publish pump is dead and primary roots are output_closed"
+            );
+        };
+        assert_eq!(
+            message, "worker not initialized",
+            "follow-up control frame should return worker-not-initialized so the client replays Start instead of preserving stale schedules"
+        );
+
+        let guard = state.lock().await;
+        assert!(
+            guard.source.is_none(),
+            "fail-closed control frame should stop the dead source runtime before later retries"
+        );
+        assert!(
+            guard.pump_task.is_none(),
+            "fail-closed control frame should clear the dead publish pump task before later retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn observability_snapshot_fails_closed_after_publish_pump_dies_and_primary_roots_turn_output_closed()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("seed.txt"), b"a").expect("seed nfs1 data");
+        std::fs::write(nfs2.join("seed.txt"), b"b").expect("seed nfs2 data");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                test_watch_scan_root("nfs1", nfs1.clone()),
+                test_watch_scan_root("nfs2", nfs2.clone()),
+            ],
+            host_object_grants: vec![
+                test_export("node-a::nfs1", nfs1.clone()),
+                test_export("node-a::nfs2", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+
+        let failing_boundary = Arc::new(FailingPublishBoundary::default());
+        let mut state = SourceWorkerState {
+            source: None,
+            pending_init: Some((
+                NodeId("node-a-observability-output-closed".to_string()),
+                cfg,
+            )),
+            pump_task: None,
+            pump_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        };
+
+        bootstrap_start_source_runtime(
+            &mut state,
+            failing_boundary.clone(),
+            in_memory_state_boundary(),
+        )
+        .await
+        .expect("bootstrap start source runtime");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut manual_rescan_sent = false;
+        loop {
+            let pump_finished = state
+                .pump_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished);
+            if pump_finished && !manual_rescan_sent {
+                state
+                    .source
+                    .as_ref()
+                    .expect("source after bootstrap")
+                    .publish_manual_rescan_signal()
+                    .await
+                    .expect("publish manual rescan after pump exit");
+                manual_rescan_sent = true;
+            }
+            let statuses = state
+                .source
+                .as_ref()
+                .expect("source after bootstrap")
+                .status_snapshot()
+                .concrete_roots;
+            let any_primary_closed = statuses
+                .iter()
+                .filter(|root| root.is_group_primary)
+                .filter(|root| {
+                    root.object_ref == "node-a::nfs1" || root.object_ref == "node-a::nfs2"
+                })
+                .any(|root| root.status == "output_closed");
+            if pump_finished && any_primary_closed && failing_boundary.send_count() > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "publish pump should fail closed before observability snapshot check: send_count={} manual_rescan_sent={} statuses={statuses:?}",
+                failing_boundary.send_count(),
+                manual_rescan_sent,
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let state = Arc::new(Mutex::new(state));
+        let mut session = SourceWorkerSession {
+            state: state.clone(),
+        };
+        let boundary = Arc::new(NoopBoundary);
+        let context =
+            WorkerSessionContext::new(boundary.clone(), boundary.clone(), boundary.clone());
+        let response = session
+            .handle_request(SourceWorkerRequest::ObservabilitySnapshot, &context)
+            .await
+            .expect("handle observability snapshot after pump failure");
+
+        let WorkerLoopControl::Continue(SourceWorkerResponse::Error(message)) = response else {
+            panic!(
+                "observability snapshot must fail closed once the publish pump is dead and primary roots are output_closed"
+            );
+        };
+        assert_eq!(
+            message, "worker not initialized",
+            "observability snapshot should return worker-not-initialized so status/readiness callers replay Start instead of consuming stale scheduled-group evidence"
+        );
+
+        let guard = state.lock().await;
+        assert!(
+            guard.source.is_none(),
+            "fail-closed observability snapshot should stop the dead source runtime before later retries"
+        );
+        assert!(
+            guard.pump_task.is_none(),
+            "fail-closed observability snapshot should clear the dead publish pump task before later retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_start_rebinds_publish_pump_to_latest_boundary_when_previous_pump_is_alive() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("initial.txt"), b"a").expect("seed nfs1 data");
+        std::fs::write(nfs2.join("initial.txt"), b"b").expect("seed nfs2 data");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                test_watch_scan_root("nfs1", nfs1.clone()),
+                test_watch_scan_root("nfs2", nfs2.clone()),
+            ],
+            host_object_grants: vec![
+                test_export("node-a::nfs1", nfs1.clone()),
+                test_export("node-a::nfs2", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+
+        let mut state = SourceWorkerState {
+            source: None,
+            pending_init: Some((NodeId("node-a-bootstrap-publish-rebind".to_string()), cfg)),
+            pump_task: None,
+            pump_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        };
+
+        let event_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+        let first_boundary = Arc::new(PublishCaptureBoundary::default());
+        bootstrap_start_source_runtime(
+            &mut state,
+            first_boundary.clone(),
+            in_memory_state_boundary(),
+        )
+        .await
+        .expect("first bootstrap start source runtime");
+
+        let first_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let counts = first_boundary.sent_origin_counts_for_route(&event_route);
+            if ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| counts.get(*origin).copied().unwrap_or(0) > 0)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < first_deadline,
+                "first bootstrap should publish initial data for both primary roots before rebind check: sent={:?}",
+                first_boundary.sent_batches_snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pump_task = state
+            .pump_task
+            .as_ref()
+            .expect("source worker pump task should exist after first bootstrap");
+        assert!(
+            !pump_task.is_finished(),
+            "publish pump must stay alive so second bootstrap exercises a live pump rebind"
+        );
+
+        let second_boundary = Arc::new(PublishCaptureBoundary::default());
+        bootstrap_start_source_runtime(
+            &mut state,
+            second_boundary.clone(),
+            in_memory_state_boundary(),
+        )
+        .await
+        .expect("second bootstrap start source runtime");
+
+        std::fs::write(nfs1.join("after-rebind.txt"), b"aa").expect("write nfs1 rebind data");
+        std::fs::write(nfs2.join("after-rebind.txt"), b"bb").expect("write nfs2 rebind data");
+        state
+            .source
+            .as_ref()
+            .expect("source after second bootstrap")
+            .publish_manual_rescan_signal()
+            .await
+            .expect("publish manual rescan after second bootstrap");
+
+        let second_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            let counts = second_boundary.sent_origin_counts_for_route(&event_route);
+            if ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| counts.get(*origin).copied().unwrap_or(0) > 0)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < second_deadline,
+                "second bootstrap must rebind the live publish pump to the replacement boundary; first_sent={:?} second_sent={:?} first_recv={:?} second_recv={:?}",
+                first_boundary.sent_batches_snapshot(),
+                second_boundary.sent_batches_snapshot(),
+                first_boundary.recv_counts_snapshot(),
+                second_boundary.recv_counts_snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            second_boundary.sent_data_events_for_route(&event_route) > 0,
+            "replacement boundary should receive published data after second bootstrap: sent={:?}",
+            second_boundary.sent_batches_snapshot()
+        );
 
         stop_source_runtime(&mut state).await;
     }
@@ -1976,6 +2680,7 @@ mod tests {
             source: Some(Arc::new(source)),
             pending_init: None,
             pump_task: None,
+            pump_boundary: None,
             last_control_frame_signals: vec!["tick unit=runtime.exec.scan".to_string()],
             published_stats,
         };

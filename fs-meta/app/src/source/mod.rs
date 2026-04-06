@@ -6247,8 +6247,10 @@ mod tests {
                 Ok(None) => break,
                 Err(_) => continue,
             }
-            let nfs1_ready = selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_root);
-            let nfs2_ready = selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_root);
+            let nfs1_ready =
+                selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_root);
+            let nfs2_ready =
+                selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_root);
             if nfs1_ready && nfs2_ready {
                 break;
             }
@@ -6278,8 +6280,10 @@ mod tests {
                 Ok(None) => break,
                 Err(_) => continue,
             }
-            let nfs1_ready = selected_group_tree_contains_path(&fresh_sink, "nfs1", query_dir, query_root);
-            let nfs2_ready = selected_group_tree_contains_path(&fresh_sink, "nfs2", query_dir, query_root);
+            let nfs1_ready =
+                selected_group_tree_contains_path(&fresh_sink, "nfs1", query_dir, query_root);
+            let nfs2_ready =
+                selected_group_tree_contains_path(&fresh_sink, "nfs2", query_dir, query_root);
             if nfs1_ready && nfs2_ready {
                 break;
             }
