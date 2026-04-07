@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>fs-meta + capanix 重构目标与进展</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    body {
+      margin: 0;
+      height: 100vh;
+      font-family: 'IBM Plex Sans', 'Microsoft YaHei', sans-serif;
+      background: linear-gradient(180deg, #e8eef5 0%, #dde6f0 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #root {
+      width: 100%;
+      height: 100%;
+      max-width: 1600px;
+      background: #f5f8fc;
+      border: 1px solid #cbd5e1;
+      overflow: hidden;
+    }
+
+    .grid-bg {
+      background-image:
+        linear-gradient(rgba(148, 163, 184, 0.10) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(148, 163, 184, 0.10) 1px, transparent 1px);
+      background-size: 28px 28px;
+    }
+
+    .slide-enter {
+      animation: fadeIn 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 999px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useEffect, useState } = React;
+
+    const IconBase = ({ children, size = 18, className = "", ...props }) => (
+      <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+           className={className} {...props}>
+        {children}
+      </svg>
+    );
+
+    const Database = (props) => (
+      <IconBase {...props}>
+        <ellipse cx="12" cy="5" rx="9" ry="3" />
+        <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
+        <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+      </IconBase>
+    );
+
+    const Network = (props) => (
+      <IconBase {...props}>
+        <rect x="16" y="16" width="6" height="6" rx="1" />
+        <rect x="2" y="16" width="6" height="6" rx="1" />
+        <rect x="9" y="2" width="6" height="6" rx="1" />
+        <path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3" />
+        <path d="M12 12V8" />
+      </IconBase>
+    );
+
+    const Layers = (props) => (
+      <IconBase {...props}>
+        <polygon points="12 2 2 7 12 12 22 7 12 2" />
+        <polyline points="2 17 12 22 22 17" />
+        <polyline points="2 12 12 17 22 12" />
+      </IconBase>
+    );
+
+    const Shield = (props) => (
+      <IconBase {...props}>
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+        <path d="m9 12 2 2 4-4" />
+      </IconBase>
+    );
+
+    const Clock = (props) => (
+      <IconBase {...props}>
+        <circle cx="12" cy="12" r="10" />
+        <path d="M12 6v6l4 2" />
+      </IconBase>
+    );
+
+    const Activity = (props) => (
+      <IconBase {...props}>
+        <path d="M22 12h-4l-3 7-6-14-3 7H2" />
+      </IconBase>
+    );
+
+    const ChevronLeft = (props) => (
+      <IconBase {...props}>
+        <path d="M15 18l-6-6 6-6" />
+      </IconBase>
+    );
+
+    const ChevronRight = (props) => (
+      <IconBase {...props}>
+        <path d="M9 18l6-6-6-6" />
+      </IconBase>
+    );
+
+    const toneMap = {
+      blue: {
+        panel: "border-blue-200 bg-blue-50/90",
+        title: "text-blue-900",
+        text: "text-blue-700",
+        chip: "border-blue-200 bg-blue-100 text-blue-700",
+        icon: <Database size={16} />,
+      },
+      emerald: {
+        panel: "border-emerald-200 bg-emerald-50/90",
+        title: "text-emerald-900",
+        text: "text-emerald-700",
+        chip: "border-emerald-200 bg-emerald-100 text-emerald-700",
+        icon: <Shield size={16} />,
+      },
+      violet: {
+        panel: "border-violet-200 bg-violet-50/90",
+        title: "text-violet-900",
+        text: "text-violet-700",
+        chip: "border-violet-200 bg-violet-100 text-violet-700",
+        icon: <Network size={16} />,
+      },
+      amber: {
+        panel: "border-amber-200 bg-amber-50/90",
+        title: "text-amber-900",
+        text: "text-amber-700",
+        chip: "border-amber-200 bg-amber-100 text-amber-700",
+        icon: <Layers size={16} />,
+      },
+      slate: {
+        panel: "border-slate-200 bg-slate-50/90",
+        title: "text-slate-900",
+        text: "text-slate-600",
+        chip: "border-slate-200 bg-slate-100 text-slate-600",
+        icon: <Clock size={16} />,
+      },
+    };
+
+    const StatCard = ({ label, value, hint, tone = "blue" }) => {
+      const tones = {
+        blue: "from-blue-50 to-cyan-50 border-blue-200 text-blue-700",
+        emerald: "from-emerald-50 to-green-50 border-emerald-200 text-emerald-700",
+        amber: "from-amber-50 to-orange-50 border-amber-200 text-amber-700",
+        violet: "from-violet-50 to-fuchsia-50 border-violet-200 text-violet-700",
+      };
+      return (
+        <div className={`rounded-lg border bg-gradient-to-br p-3 ${tones[tone]}`}>
+          <div className="text-[11px] font-semibold uppercase tracking-[0.18em] opacity-80">{label}</div>
+          <div className="mt-1.5 text-[1.65rem] font-bold leading-none">{value}</div>
+          <div className="mt-1 text-xs text-slate-500">{hint}</div>
+        </div>
+      );
+    };
+
+    const ExampleBox = ({ title, lines, tone = "slate" }) => {
+      const tones = {
+        slate: "border-slate-200 bg-slate-900 text-slate-100",
+        blue: "border-blue-200 bg-blue-950 text-blue-50",
+        emerald: "border-emerald-200 bg-emerald-950 text-emerald-50",
+        amber: "border-amber-200 bg-amber-950 text-amber-50",
+      };
+      return (
+        <div className={`rounded-lg border ${tones[tone]} overflow-hidden`}>
+          <div className="border-b border-white/10 px-4 py-2 text-xs font-semibold tracking-wide text-white/80">{title}</div>
+          <pre className="overflow-x-auto px-4 py-3 text-[11px] leading-6" style={{ fontFamily: "'IBM Plex Mono', monospace" }}><code>{lines.join("\n")}</code></pre>
+        </div>
+      );
+    };
+
+    const DiagramShell = ({ children }) => (
+      <div className="grid-bg h-full min-h-[360px] overflow-hidden rounded-lg border border-slate-300 bg-white p-4">
+        {children}
+      </div>
+    );
+
+    const SectionBox = ({ title, subtitle, items, tone = "blue" }) => {
+      const toneDef = toneMap[tone];
+      return (
+        <div className={`rounded-lg border p-4 ${toneDef.panel}`}>
+          <div className={`flex items-center gap-2 text-lg font-semibold ${toneDef.title}`}>
+            {toneDef.icon}
+            <span>{title}</span>
+          </div>
+          <div className={`mt-1 text-xs ${toneDef.text}`}>{subtitle}</div>
+          <div className="mt-4 space-y-3">
+            {items.map((item) => (
+              <div key={item} className="rounded-lg border border-white/80 bg-white/96 px-4 py-3 text-sm leading-6 text-slate-700">
+                {item}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    };
+
+    const FlowChip = ({ title, subtitle, tone = "slate" }) => {
+      const toneDef = toneMap[tone];
+      return (
+        <div className={`rounded-lg border px-4 py-3 text-center ${toneDef.chip}`}>
+          <div className="text-sm font-semibold">{title}</div>
+          {subtitle && <div className="mt-1 text-xs opacity-90">{subtitle}</div>}
+        </div>
+      );
+    };
+
+    const ArrowCol = ({ label = "→", sublabel = "" }) => (
+      <div className="flex h-full flex-col items-center justify-center gap-3 text-slate-400">
+        <div className="text-4xl font-light leading-none">{label}</div>
+        {sublabel && <div className="rounded-full border border-slate-200 bg-white px-3 py-1 text-[11px] font-semibold text-slate-500">{sublabel}</div>}
+      </div>
+    );
+
+    const ProgressBar = ({ label, value, max, tone = "blue", note }) => {
+      const palette = {
+        blue: ["bg-blue-500", "bg-blue-100 text-blue-700"],
+        emerald: ["bg-emerald-500", "bg-emerald-100 text-emerald-700"],
+        amber: ["bg-amber-500", "bg-amber-100 text-amber-700"],
+        violet: ["bg-violet-500", "bg-violet-100 text-violet-700"],
+      };
+      const width = `${Math.max(8, (value / max) * 100)}%`;
+      return (
+        <div className="rounded-lg border border-slate-300 bg-white p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-sm font-semibold text-slate-900">{label}</div>
+            <div className={`rounded-full px-3 py-1 text-xs font-semibold ${palette[tone][1]}`}>{value}/{max}</div>
+          </div>
+          <div className="mt-3 h-3 overflow-hidden rounded-full bg-slate-100">
+            <div className={`h-full rounded-full ${palette[tone][0]}`} style={{ width }} />
+          </div>
+          <div className="mt-2 text-xs text-slate-500">{note}</div>
+        </div>
+      );
+    };
+
+    const ResponsibilityCard = ({ title, count, tone, summary, status, greens = [] }) => {
+      const toneDef = toneMap[tone];
+      return (
+        <div className={`rounded-lg border p-4 ${toneDef.panel}`}>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className={`text-base font-semibold ${toneDef.title}`}>{title}</div>
+              <div className={`mt-1 text-xs ${toneDef.text}`}>{summary}</div>
+            </div>
+            <div className={`rounded-full border px-3 py-1 text-xs font-semibold ${toneDef.chip}`}>{count}</div>
+          </div>
+          <div className="mt-3 rounded-lg border border-white/90 bg-white/96 px-4 py-3 text-sm text-slate-700">
+            {status}
+          </div>
+          {greens.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {greens.map((item) => (
+                <div key={item} className="rounded-md border border-emerald-200 bg-emerald-100 px-3 py-1 text-[11px] font-semibold text-emerald-700">
+                  {item}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    };
+
+    const ScenarioMiniCard = ({ label, legacy, modern, tone = "blue" }) => {
+      const theme = {
+        blue: "border-blue-200 bg-blue-50/90 text-blue-900",
+        emerald: "border-emerald-200 bg-emerald-50/90 text-emerald-900",
+        violet: "border-violet-200 bg-violet-50/90 text-violet-900",
+      }[tone];
+      return (
+        <div className={`rounded-lg border p-4 ${theme}`}>
+          <div className="text-sm font-semibold">{label}</div>
+          <div className="mt-3 grid gap-3">
+            <div className="rounded-lg border border-white/90 bg-white/95 px-4 py-3">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-amber-500">旧方案</div>
+              <div className="mt-2 text-sm leading-6 text-slate-700">{legacy}</div>
+            </div>
+            <div className="rounded-lg border border-white/90 bg-white/95 px-4 py-3">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-emerald-500">当前设计</div>
+              <div className="mt-2 text-sm leading-6 text-slate-700">{modern}</div>
+            </div>
+          </div>
+        </div>
+      );
+    };
+
+    const SideNoteCard = ({ title, lines, tone = "slate" }) => {
+      const palette = {
+        slate: "border-slate-300 bg-white",
+        blue: "border-blue-200 bg-blue-50/70",
+        emerald: "border-emerald-200 bg-emerald-50/70",
+        violet: "border-violet-200 bg-violet-50/70",
+        amber: "border-amber-200 bg-amber-50/70",
+      };
+      return (
+        <div className={`rounded-lg border p-4 ${palette[tone]}`}>
+          <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-400">{title}</div>
+          <div className="mt-3 space-y-2">
+            {lines.map((line) => (
+              <div key={line} className="rounded-lg border border-white/90 bg-white/95 px-4 py-3 text-sm leading-6 text-slate-700">
+                {line}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    };
+
+    const GoalsDiagram = () => (
+      <DiagramShell>
+        <div className="grid h-full min-h-0 grid-rows-[1fr_auto] gap-4">
+          <div className="grid h-full min-h-0 grid-cols-[1fr_88px_1.12fr] gap-4">
+            <SectionBox
+              title="前身：宽平台内聚"
+              subtitle="Agent / Fusion / Extensions / Management 全在产品层"
+              tone="amber"
+              items={[
+                "平台机制、业务语义、配置热重载都塞在同一产品里。",
+                "scope 很宽，但 session / leader / readiness 直接影响在线查询。",
+              ]}
+            />
+
+            <ArrowCol label="→" sublabel="能力外移" />
+
+            <div className="grid h-full min-h-0 grid-rows-[1fr_1fr] gap-4">
+              <SectionBox
+                title="当前：fs-meta 产品面"
+                subtitle="单一 app 边界 · 单域 authority · 稳定产品 API"
+                tone="blue"
+                items={[
+                  "对外只保留一个 `fs-meta` 产品边界，不再做多 view / 多 helper 拼装。",
+                  "truth / observation / trusted-materialized 变成显式产品合同。",
+                ]}
+              />
+
+              <SectionBox
+                title="平台：capanix 机制面"
+                subtitle="bind/run · route · grant · runtime ABI · release-generation"
+                tone="violet"
+                items={[
+                  "通用运行机制交给 `capanix`：worker 托管、route 收敛、grant 附着、generation cutover。",
+                  "目标不是做更大平台，而是做更清晰的单域产品 + 更稳的平台分层。",
+                ]}
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-4 gap-3">
+            <FlowChip title="Single App Boundary" subtitle="对外一个产品面" tone="blue" />
+            <FlowChip title="3 Worker Roles" subtitle="facade / source / sink" tone="violet" />
+            <FlowChip title="Online Scope Mutation" subtitle="runtime grants + roots" tone="emerald" />
+            <FlowChip title="Release-Generation Cutover" subtitle="升级先追平后切换" tone="amber" />
+          </div>
+        </div>
+      </DiagramShell>
+    );
+
+    const AvailabilityDiagram = () => (
+      <DiagramShell>
+        <div className="grid h-full min-h-0 grid-rows-[auto_1fr_auto] gap-4">
+          <div className="rounded-lg border border-slate-300 bg-white px-4 py-3 text-sm text-slate-700">
+            当前设计不是单纯把进程做成“更能活”，而是把原本会直接打成 <span className="font-semibold text-slate-900">503 / timeout / 服务空窗</span> 的变更窗口，尽量改造成 <span className="font-semibold text-slate-900">旧版本继续服务 + 新版本后台补齐 + 达标后再切换</span>。
+          </div>
+
+          <div className="grid min-h-0 grid-cols-3 gap-4">
+            <ScenarioMiniCard
+              label="新 NFS 上线"
+              legacy="改 YAML + reload，新源还要走 session / snapshot / queue drain，查询面可能直接进入 not-ready / 503。"
+              modern="先把新数据源登记成可用资源，再在线加入监控范围；新增范围在后台补齐，不把旧服务拖下水。"
+              tone="blue"
+            />
+
+            <ScenarioMiniCard
+              label="旧 NFS 退役"
+              legacy="心跳丢失、session 消失或 leader 切换，很容易把“少一个源”扩大成“整个 view reset / 503”。"
+              modern="按受影响的数据范围做有界回收；单个范围的问题单独处理，不把整服务一起拉下来。"
+              tone="emerald"
+            />
+
+            <ScenarioMiniCard
+              label="自身升级"
+              legacy="有 reload / upgrade，但没有 old/new generation 并存与可信切换合同，用户侧常感知为 timeout / 503。"
+              modern="新版本先在后台补齐目录和状态；旧版本继续对外服务，等新版本准备好后再切换。"
+              tone="violet"
+            />
+          </div>
+
+          <div className="grid grid-cols-3 gap-3">
+            <FlowChip title="旧版本先服务" subtitle="先稳住对外查询" tone="blue" />
+            <FlowChip title="新范围后台补齐" subtitle="先补数据，再开服务" tone="emerald" />
+            <FlowChip title="切换后不回跳" subtitle="旧版本不能再抢回入口" tone="violet" />
+          </div>
+        </div>
+      </DiagramShell>
+    );
+
+    const ProgressSimpleDiagram = () => (
+      <DiagramShell>
+        <div className="grid h-full min-h-0 grid-rows-[auto_1fr_auto] gap-4">
+          <div className="grid grid-cols-3 gap-4">
+            <ProgressBar
+              label="正式计分板"
+              value={21}
+              max={24}
+              tone="emerald"
+              note="authoritative full-suite 已更新为 21/24 = 87.5%。"
+            />
+            <ProgressBar
+              label="剩余失败"
+              value={3}
+              max={24}
+              tone="amber"
+              note="当前只剩 3 条正式失败项。"
+            />
+            <ProgressBar
+              label="职责簇"
+              value={4}
+              max={4}
+              tone="blue"
+              note="接入查询、范围落位、在线变更、升级切换四大责任面。"
+            />
+          </div>
+
+          <div className="grid min-h-0 grid-cols-3 gap-4">
+            <ResponsibilityCard
+              title="接入与查询"
+              count="API"
+              tone="blue"
+              summary="登录、授权、运行状态、监控范围、目录树与统计查询"
+              status="查询基线相关场景大体站住，但正式失败集里仍保留 `matrix_real`。"
+            />
+            <ResponsibilityCard
+              title="数据源变更"
+              count="OPS"
+              tone="emerald"
+              summary="新数据源接入、旧数据源退役、可见性收缩、故障切换"
+              status="数据源退役已见成效，但正式失败集里仍保留 `sink_failover`。"
+            />
+            <ResponsibilityCard
+              title="升级连续性"
+              count="UPG"
+              tone="amber"
+              summary="升级切换、查询连续性、资源保持、性能预算"
+              status="升级连续性整体明显前进，但正式失败集里仍保留 `cpu_budget`。"
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div className="rounded-lg border border-slate-300 bg-white px-4 py-3">
+              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">最近变化</div>
+              <div className="mt-2 space-y-2 text-sm text-slate-700">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-2.5">
+                  最近两条 closure 把“卡住 / 超时”的问题收敛成了更干净的 fail-closed。
+                </div>
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-2.5">
+                  这意味着升级与查询切换不再依赖“拖时间碰运气”，而是按明确门槛拒绝半成功状态。
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-blue-200 bg-blue-50/90 px-4 py-3">
+              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-blue-500">剩余 3 条</div>
+              <div className="mt-2 space-y-2 text-sm text-slate-700">
+                <div className="rounded-lg border border-white/90 bg-white/95 px-4 py-2.5">
+                  `fs_meta_http_api_matrix_real_nfs`
+                </div>
+                <div className="rounded-lg border border-white/90 bg-white/95 px-4 py-2.5">
+                  `fs_meta_operational_sink_failover_real_nfs`
+                </div>
+                <div className="rounded-lg border border-white/90 bg-white/95 px-4 py-2.5">
+                  `fs_meta_release_upgrade_cpu_budget_real_nfs`
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </DiagramShell>
+    );
+
+    const appendixRows = [
+      ["1", "fs_meta_http_api_matrix_real_nfs", "全量接入与查询矩阵", "5", "登录、状态、监控范围、目录树/统计、实时查询"],
+      ["2", "fs_meta_http_api_matrix_query_baseline_real_nfs", "基线查询矩阵", "4", "基线目录树、统计、分页、查询参数"],
+      ["3", "fs_meta_http_api_matrix_live_only_rescan_real_nfs", "实时发现先行", "2", "先发现新增内容，再等待物化结果追平"],
+      ["4", "activation_scope_capture_preserved_layout_distributed", "分布式范围保持", "2", "多节点下执行范围是否保持稳定"],
+      ["5", "activation_scope_capture_nfs2_visibility_contracted_to_node_a", "可见性收缩到节点", "1", "范围收缩后是否只保留目标节点执行"],
+      ["6", "activation_scope_capture_force_find_preserved_pre_force_find", "实时探测前后保持", "2", "实时探测前后执行范围是否漂移"],
+      ["7", "fs_meta_operational_scenarios_real_nfs", "实时探测冒烟", "1", "基础实时探测链路"],
+      ["8", "fs_meta_operational_force_find_execution_semantics_real_nfs", "探测执行轮转与兜底", "2", "轮转执行、失败回退"],
+      ["9", "fs_meta_operational_new_nfs_join_real_nfs", "新数据源接入", "1", "新增 NFS 纳入监控范围"],
+      ["10", "fs_meta_operational_root_path_modify_real_nfs", "监控路径修改", "1", "在线修改监控子路径"],
+      ["11", "fs_meta_operational_visibility_change_and_sink_selection_real_nfs", "可见性收缩与接管变化", "1", "范围缩减后接管位置变化"],
+      ["12", "fs_meta_operational_sink_failover_real_nfs", "索引承担方切换", "1", "索引承担方故障切换"],
+      ["13", "fs_meta_operational_facade_failover_and_resource_switch_real_nfs", "入口资源切换", "1", "入口切换后仍可登录与查询"],
+      ["14", "fs_meta_operational_nfs_retire_real_nfs", "数据源退役", "2", "先接入再退役，验证清退后不残留"],
+      ["15", "fs_meta_release_upgrade_real_nfs", "升级冒烟", "1", "升级到第二代并完成基本切换"],
+      ["16", "fs_meta_release_upgrade_peer_source_control_completion_real_nfs", "升级后采集侧收敛", "1", "升级后采集侧控制收敛"],
+      ["17", "fs_meta_release_upgrade_facade_claim_continuity_real_nfs", "升级后入口连续性", "2", "升级后入口接管不断档"],
+      ["18", "fs_meta_release_upgrade_roots_persist_real_nfs", "升级后监控范围保持", "2", "升级前后的监控范围保持"],
+      ["19", "fs_meta_release_upgrade_tree_stats_stable_real_nfs", "升级后查询稳定", "2", "升级后目录树与统计继续可查"],
+      ["20", "fs_meta_release_upgrade_tree_materialization_real_nfs", "升级后目录树重建", "3", "升级后重扫并恢复主要目录树"],
+      ["21", "fs_meta_release_upgrade_sink_control_roles_real_nfs", "升级后索引角色收敛", "2", "升级后索引承担方收敛"],
+      ["22", "fs_meta_release_upgrade_source_control_roles_real_nfs", "升级后采集角色收敛", "2", "升级后采集承担方收敛"],
+      ["23", "fs_meta_release_upgrade_window_join_real_nfs", "升级窗口加源", "2", "边升级边纳入新数据源"],
+      ["24", "fs_meta_release_upgrade_cpu_budget_real_nfs", "升级窗口资源预算", "4", "升级、收敛、轻载采样与预算校验"],
+    ];
+
+    const AppendixTable = () => (
+      <div className="h-full overflow-auto border border-slate-300 bg-white">
+        <table className="w-full border-collapse text-sm">
+          <thead className="sticky top-0 bg-slate-100">
+            <tr>
+              <th className="border border-slate-300 px-3 py-2 text-left font-semibold text-slate-700">序号</th>
+              <th className="border border-slate-300 px-3 py-2 text-left font-semibold text-slate-700">E2E 名称</th>
+              <th className="border border-slate-300 px-3 py-2 text-left font-semibold text-slate-700">汇交管理场景</th>
+              <th className="border border-slate-300 px-3 py-2 text-center font-semibold text-slate-700">用例数</th>
+              <th className="border border-slate-300 px-3 py-2 text-left font-semibold text-slate-700">主要检查内容</th>
+            </tr>
+          </thead>
+          <tbody>
+            {appendixRows.map((row) => (
+              <tr key={row[0]} className="odd:bg-white even:bg-slate-50">
+                <td className="border border-slate-300 px-3 py-2 align-top text-slate-700">{row[0]}</td>
+                <td className="border border-slate-300 px-3 py-2 align-top text-slate-900" style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: "12px" }}>{row[1]}</td>
+                <td className="border border-slate-300 px-3 py-2 align-top text-slate-700">{row[2]}</td>
+                <td className="border border-slate-300 px-3 py-2 align-top text-center text-slate-700">{row[3]}</td>
+                <td className="border border-slate-300 px-3 py-2 align-top text-slate-700">{row[4]}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+
+    const slides = [
+      {
+        id: 1,
+        tag: "P1",
+        title: "目标：让数据汇交服务在变更过程中尽量不停机",
+        lead: "这次重构最重要的目标，不是换语言，也不是做更复杂的平台，而是让数据源上线、下线、系统升级这些日常管理动作尽量不把汇交查询服务打成整站不可用。",
+        stats: [
+          { label: "change scenes", value: "3", hint: "数据源上线 / 下线 / 系统升级", tone: "blue" },
+          { label: "service rule", value: "1", hint: "旧服务先稳住，再切新服务", tone: "emerald" },
+          { label: "fresh path", value: "1", hint: "必要时先提供实时探测结果", tone: "violet" },
+        ],
+        bullets: [
+          "新增数据源时，目标是“新范围后台追平”，不是“先把老服务一起打断”。",
+          "退役数据源时，目标是“只收回受影响范围”，不是“整个查询服务 reset”。",
+          "系统升级时，目标是“上一版先继续服务，下一版追平后再切换”。",
+        ],
+        note: {
+          title: "管理口径",
+          tone: "emerald",
+          lines: [
+            "先保服务，再做切换",
+            "先保可查，再补齐新范围",
+            "先显式拒绝，不冒充成功",
+          ],
+        },
+        diagram: <AvailabilityDiagram />,
+      },
+      {
+        id: 2,
+        tag: "P2",
+        title: "进展：关键汇交管理场景已经开始收口",
+        lead: "最新官方结果已经收束到 21/24 = 87.5%。可以把当前进展理解为三件事：查询基线更稳了，数据源变更更平稳了，升级切换的问题面已经压缩到只剩 3 条正式失败项。",
+        stats: [
+          { label: "all e2e", value: "24", hint: "真实 NFS 责任面", tone: "blue" },
+          { label: "official", value: "21/24", hint: "最新正式计分板", tone: "emerald" },
+          { label: "remaining", value: "3", hint: "剩余正式失败项", tone: "amber" },
+        ],
+        bullets: [
+          "正式结果已从 18/24 前进到 21/24，说明主套件已经有实质进展。",
+          "剩余失败集只剩 3 条：`matrix_real`、`sink_failover`、`cpu_budget`。",
+          "这意味着当前问题面已经从“整体不稳”收缩成少数几个明确的收尾场景。",
+        ],
+        note: {
+          title: "当前判断",
+          tone: "violet",
+          lines: [
+            "suite 已明显前进，不再停留在旧的 18/24 口径",
+            "接下来优先追剩余 3 条 first flaker / hard flaker",
+            "目标是把正式失败集继续压缩到 0 或更小尾部",
+          ],
+        },
+        diagram: <ProgressSimpleDiagram />,
+      },
+      {
+        id: 3,
+        tag: "A1",
+        title: "附录：24 条 E2E 清单",
+        tableOnly: true,
+        diagram: <AppendixTable />,
+      },
+    ];
+
+    const App = () => {
+      const [index, setIndex] = useState(0);
+      const slide = slides[index];
+
+      useEffect(() => {
+        const onKeyDown = (event) => {
+          if (event.key === "ArrowRight" || event.key === "PageDown") {
+            setIndex((v) => Math.min(slides.length - 1, v + 1));
+          }
+          if (event.key === "ArrowLeft" || event.key === "PageUp") {
+            setIndex((v) => Math.max(0, v - 1));
+          }
+        };
+        window.addEventListener("keydown", onKeyDown);
+        return () => window.removeEventListener("keydown", onKeyDown);
+      }, []);
+
+      return (
+        <div className="flex h-full flex-col">
+          <main className="min-h-0 flex-1 overflow-hidden px-6 py-5">
+            <section className="slide-enter flex h-full min-h-0 flex-col gap-4 overflow-hidden">
+              {slide.tableOnly ? (
+                <div className="min-h-0 flex-1">
+                  {slide.diagram}
+                </div>
+              ) : (
+                <>
+                  <div className="shrink-0 border border-slate-300 bg-white px-5 py-4">
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="min-w-0">
+                        <h2 className="text-[1.42rem] font-bold tracking-tight text-slate-900">{slide.title}</h2>
+                        <p className="mt-2 max-w-5xl text-[0.95rem] leading-6 text-slate-600">{slide.lead}</p>
+                      </div>
+                      <div className="shrink-0 rounded-full border border-slate-200 bg-slate-50 px-4 py-2 text-sm font-medium text-slate-600">
+                        {slide.tag} · Page {index + 1} / {slides.length}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid min-h-0 flex-1 grid-cols-[1.52fr_0.78fr] gap-3 overflow-hidden">
+                    <div className="min-h-0 border border-slate-300 bg-white p-4">
+                      <div className="h-full min-h-0">
+                        {slide.diagram}
+                      </div>
+                    </div>
+
+                    <div className="flex min-h-0 flex-col gap-4 overflow-hidden">
+                      <div className="border border-slate-300 bg-white p-4">
+                        <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-400">Key Points</div>
+                        <div className="mt-3 space-y-2">
+                          {slide.bullets.map((bullet, i) => (
+                            <div key={i} className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-2.5 text-sm leading-6 text-slate-700">
+                              <span className="mr-2 font-semibold text-slate-900">{i + 1}.</span>
+                              {bullet}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      {slide.note && <SideNoteCard {...slide.note} />}
+                    </div>
+                  </div>
+                </>
+              )}
+
+              <div className="grid shrink-0 grid-cols-[1fr_auto] items-center gap-4 border border-slate-300 bg-white px-4 py-2.5">
+                <div className="flex items-center gap-2 overflow-x-auto">
+                  {slides.map((item, i) => (
+                    <button
+                      key={item.id}
+                      onClick={() => setIndex(i)}
+                      className={`shrink-0 rounded-full border px-3 py-2 text-xs font-semibold transition-all ${
+                        i === index
+                          ? "border-blue-300 bg-blue-50 text-blue-700"
+                          : "border-slate-200 bg-slate-50 text-slate-500 hover:border-slate-300 hover:text-slate-700"
+                      }`}
+                    >
+                      {item.tag}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => setIndex((v) => Math.max(0, v - 1))}
+                    disabled={index === 0}
+                    className="flex items-center gap-2 rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 disabled:opacity-35"
+                  >
+                    <ChevronLeft size={16} />
+                    上一页
+                  </button>
+                  <button
+                    onClick={() => setIndex((v) => Math.min(slides.length - 1, v + 1))}
+                    disabled={index === slides.length - 1}
+                    className="flex items-center gap-2 rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 disabled:opacity-35"
+                  >
+                    下一页
+                    <ChevronRight size={16} />
+                  </button>
+                </div>
+              </div>
+            </section>
+          </main>
+        </div>
+      );
+    };
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

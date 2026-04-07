@@ -17,14 +17,19 @@ pub fn materialized_query_observation_evidence(
         .map(|group| (group.group_id.as_str(), group))
         .collect::<BTreeMap<_, _>>();
 
-    let mut candidate_groups = source_status
+    let concrete_candidate_groups = source_status
         .concrete_roots
         .iter()
         .filter(|root| root.active && root.is_group_primary && root.scan_enabled)
         .map(|root| root.logical_root_id.clone())
         .collect::<BTreeSet<_>>();
+    let mut candidate_groups = concrete_candidate_groups.clone();
     for root in &source_status.logical_roots {
-        if root.matched_grants > 0 && root.active_members > 0 {
+        if root.matched_grants > 0
+            && root.active_members > 0
+            && (concrete_candidate_groups.is_empty()
+                || concrete_candidate_groups.contains(&root.root_id))
+        {
             candidate_groups.insert(root.root_id.clone());
         }
     }

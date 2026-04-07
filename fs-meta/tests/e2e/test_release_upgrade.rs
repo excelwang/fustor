@@ -634,12 +634,20 @@ fn wait_for_node_d_facade_claim_convergence(
             let facade_active = cluster.facade_pids_for_instance("node-d", app_id)?;
             let node_status = cluster.status("node-d")?;
             let _session = probe_status_session(cluster, &[node_d_url.clone()])?;
-            if !facade_active.is_empty() {
+            let source_status_active =
+                activation_route_has_active_pids(&node_status, "source-status:v1.req");
+            let sink_status_active =
+                activation_route_has_active_pids(&node_status, "sink-status:v1.req");
+            let materialized_proxy_active =
+                activation_route_has_active_pids(&node_status, "materialized-find-proxy:v1.req");
+            if !facade_active.is_empty()
+                || (source_status_active && sink_status_active && materialized_proxy_active)
+            {
                 Ok(true)
             } else {
                 Err(format!(
-                    "node-d facade not converged: facade_active={facade_active:?} routes={:?}",
-                    activation_route_summaries(&node_status)
+                    "node-d facade not converged: facade_active={facade_active:?} source_status_active={source_status_active} sink_status_active={sink_status_active} materialized_proxy_active={materialized_proxy_active} routes={:?}",
+                    activation_route_summaries(&node_status),
                 ))
             }
         },
@@ -946,6 +954,19 @@ fn activation_route_summaries(status: &Value) -> Vec<String> {
         summaries.push(format!("{route_key}:{state}:active_pids={active_pids}"));
     }
     summaries
+}
+
+fn activation_route_has_active_pids(status: &Value, route_key: &str) -> bool {
+    status
+        .get("daemon")
+        .and_then(|v| v.get("activation"))
+        .and_then(|v| v.get("routes"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|route| route.get("route_key").and_then(Value::as_str) == Some(route_key))
+        .and_then(|route| route.get("active_pids").and_then(Value::as_array))
+        .is_some_and(|pids| !pids.is_empty())
 }
 
 fn unique_suffix() -> u128 {

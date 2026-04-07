@@ -298,6 +298,8 @@ pub struct SinkWorkerClientHandle {
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
     scheduled_groups_cache: Arc<Mutex<Option<std::collections::BTreeSet<String>>>>,
+    retained_control_state: Arc<tokio::sync::Mutex<RetainedSinkWorkerControlState>>,
+    control_state_replay_required: Arc<AtomicUsize>,
     control_ops_inflight: Arc<AtomicUsize>,
 }
 
@@ -307,12 +309,20 @@ struct SharedSinkWorkerHandleState {
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
     scheduled_groups_cache: Arc<Mutex<Option<std::collections::BTreeSet<String>>>>,
+    retained_control_state: Arc<tokio::sync::Mutex<RetainedSinkWorkerControlState>>,
+    control_state_replay_required: Arc<AtomicUsize>,
     control_ops_inflight: Arc<AtomicUsize>,
 }
 
 struct SharedSinkWorkerClient {
     instance_id: u64,
     client: Arc<TypedRuntimeWorkerClient<SinkWorkerRpc, SourceConfig>>,
+}
+
+#[derive(Default, Clone)]
+struct RetainedSinkWorkerControlState {
+    latest_host_grant_change: Option<SinkControlSignal>,
+    active_by_route: std::collections::BTreeMap<(String, String), SinkControlSignal>,
 }
 
 struct InflightControlOpGuard {
@@ -818,6 +828,10 @@ impl SinkWorkerClientHandle {
                     logical_roots_cache: Arc::new(Mutex::new(config.roots.clone())),
                     status_cache: Arc::new(Mutex::new(SinkStatusSnapshot::default())),
                     scheduled_groups_cache: Arc::new(Mutex::new(None)),
+                    retained_control_state: Arc::new(tokio::sync::Mutex::new(
+                        RetainedSinkWorkerControlState::default(),
+                    )),
+                    control_state_replay_required: Arc::new(AtomicUsize::new(0)),
                     control_ops_inflight: Arc::new(AtomicUsize::new(0)),
                 });
                 registry.insert(key, Arc::downgrade(&shared));
@@ -834,6 +848,8 @@ impl SinkWorkerClientHandle {
             logical_roots_cache: shared.logical_roots_cache.clone(),
             status_cache: shared.status_cache.clone(),
             scheduled_groups_cache: shared.scheduled_groups_cache.clone(),
+            retained_control_state: shared.retained_control_state.clone(),
+            control_state_replay_required: shared.control_state_replay_required.clone(),
             control_ops_inflight: shared.control_ops_inflight.clone(),
         })
     }
@@ -1022,6 +1038,8 @@ impl SinkWorkerClientHandle {
             *guard = replacement;
             stale
         };
+        self.control_state_replay_required
+            .store(1, Ordering::Release);
         tokio::spawn(async move {
             let _ = stale_client.shutdown(Duration::from_millis(250)).await;
         });
@@ -1032,6 +1050,67 @@ impl SinkWorkerClientHandle {
         #[cfg(test)]
         notify_sink_worker_retry_reset();
         self.reconnect_shared_worker_client().await
+    }
+
+    async fn retain_control_signals(&self, signals: &[SinkControlSignal]) {
+        let mut retained = self.retained_control_state.lock().await;
+        for signal in signals {
+            match signal {
+                SinkControlSignal::RuntimeHostGrantChange { .. } => {
+                    retained.latest_host_grant_change = Some(signal.clone());
+                }
+                SinkControlSignal::Activate {
+                    unit, route_key, ..
+                } => {
+                    retained
+                        .active_by_route
+                        .insert((unit.unit_id().to_string(), route_key.clone()), signal.clone());
+                }
+                SinkControlSignal::Deactivate {
+                    unit, route_key, ..
+                } => {
+                    retained
+                        .active_by_route
+                        .remove(&(unit.unit_id().to_string(), route_key.clone()));
+                }
+                SinkControlSignal::Tick { .. } | SinkControlSignal::Passthrough(_) => {}
+            }
+        }
+    }
+
+    async fn replay_retained_control_state_if_needed(&self) -> Result<()> {
+        if self
+            .control_state_replay_required
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let envelopes = {
+            let retained = self.retained_control_state.lock().await;
+            let mut envelopes = Vec::new();
+            if let Some(host_grant_change) = retained.latest_host_grant_change.as_ref() {
+                envelopes.push(host_grant_change.envelope());
+            }
+            envelopes.extend(retained.active_by_route.values().map(SinkControlSignal::envelope));
+            envelopes
+        };
+        if envelopes.is_empty() {
+            return Ok(());
+        }
+        if let Err(err) = self
+            .on_control_frame_with_timeouts(
+                envelopes,
+                SINK_WORKER_CONTROL_TOTAL_TIMEOUT,
+                SINK_WORKER_CONTROL_RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.control_state_replay_required
+                .store(1, Ordering::Release);
+            return Err(err);
+        }
+        Ok(())
     }
 
     async fn client(&self) -> Result<TypedWorkerClient<SinkWorkerRpc>> {
@@ -1150,6 +1229,7 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+        self.replay_retained_control_state_if_needed().await?;
         let mut snapshot = self
             .status_snapshot_with_timeout(Duration::from_secs(5))
             .await?;
@@ -1172,6 +1252,15 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
+        fn snapshot_looks_stale_empty(snapshot: &SinkStatusSnapshot) -> bool {
+            snapshot.scheduled_groups_by_node.is_empty()
+                && snapshot.groups.iter().all(|group| {
+                    !group.initial_audit_completed
+                        && group.live_nodes == 0
+                        && group.total_nodes == 0
+                })
+        }
+
         #[cfg(test)]
         if take_sink_worker_status_nonblocking_cache_fallback_hook() {
             let snapshot = self.cached_status_snapshot()?;
@@ -1186,6 +1275,37 @@ impl SinkWorkerClientHandle {
         }
         if self.control_op_inflight() {
             let snapshot = self.cached_status_snapshot()?;
+            if snapshot_looks_stale_empty(&snapshot) {
+                if self.existing_client().await?.is_some() {
+                    if let Ok(mut live_snapshot) = self
+                        .status_snapshot_with_timeout(Duration::from_millis(250))
+                        .await
+                    {
+                        let grants = self
+                            .config
+                            .lock()
+                            .map_err(|_| {
+                                CnxError::Internal("sink worker config lock poisoned".into())
+                            })?
+                            .host_object_grants
+                            .clone();
+                        normalize_sink_status_snapshot_node_keys(
+                            &mut live_snapshot,
+                            &self.node_id,
+                            &grants,
+                        );
+                        self.update_cached_status_snapshot(live_snapshot.clone())?;
+                        if debug_control_scope_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_sink_worker_client: status_snapshot short_probe node={} reason=control_inflight {}",
+                                self.node_id.0,
+                                summarize_sink_status_snapshot(&live_snapshot)
+                            );
+                        }
+                        return Ok(live_snapshot);
+                    }
+                }
+            }
             if debug_control_scope_capture_enabled() {
                 eprintln!(
                     "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=control_inflight {}",
@@ -1196,10 +1316,12 @@ impl SinkWorkerClientHandle {
             return Ok(snapshot);
         }
         match self.existing_client().await? {
-            Some(_) => match self
-                .status_snapshot_with_timeout(Duration::from_secs(5))
-                .await
-            {
+            Some(_) => {
+                self.replay_retained_control_state_if_needed().await?;
+                match self
+                    .status_snapshot_with_timeout(Duration::from_secs(5))
+                    .await
+                {
                 Ok(mut snapshot) => {
                     let grants = self
                         .config
@@ -1218,7 +1340,7 @@ impl SinkWorkerClientHandle {
                     self.update_cached_status_snapshot(snapshot.clone())?;
                     Ok(snapshot)
                 }
-                Err(err) => {
+                    Err(err) => {
                     let snapshot = self.cached_status_snapshot()?;
                     if debug_control_scope_capture_enabled() {
                         eprintln!(
@@ -1229,8 +1351,9 @@ impl SinkWorkerClientHandle {
                         );
                     }
                     Ok(snapshot)
+                    }
                 }
-            },
+            }
             None => {
                 let snapshot = self.cached_status_snapshot()?;
                 if debug_control_scope_capture_enabled() {
@@ -1253,6 +1376,7 @@ impl SinkWorkerClientHandle {
             if attempt_timeout.is_zero() {
                 return Err(CnxError::Timeout);
             }
+            self.replay_retained_control_state_if_needed().await?;
             let rpc_result = self
                 .with_started_retry(|client| async move {
                     #[cfg(test)]
@@ -1284,6 +1408,7 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
+        self.replay_retained_control_state_if_needed().await?;
         match self.scheduled_group_ids_with_timeout().await? {
             SinkWorkerResponse::ScheduledGroupIds(groups) => {
                 let groups = groups.map(|groups| {
@@ -1396,6 +1521,7 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn materialized_query(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
+        self.replay_retained_control_state_if_needed().await?;
         self.with_started_retry(|client| {
             let request = request.clone();
             async move {
@@ -1427,19 +1553,22 @@ impl SinkWorkerClientHandle {
             return Ok(Vec::new());
         }
         match self.existing_client().await? {
-            Some(client) => match Self::call_worker(
-                &client,
-                SinkWorkerRequest::MaterializedQuery { request },
-                SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
-            )
-            .await?
-            {
-                SinkWorkerResponse::Events(events) => Ok(events),
-                other => Err(CnxError::ProtocolViolation(format!(
-                    "unexpected sink worker response for materialized query: {:?}",
-                    other
-                ))),
-            },
+            Some(client) => {
+                self.replay_retained_control_state_if_needed().await?;
+                match Self::call_worker(
+                    &client,
+                    SinkWorkerRequest::MaterializedQuery { request },
+                    SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
+                )
+                .await?
+                {
+                    SinkWorkerResponse::Events(events) => Ok(events),
+                    other => Err(CnxError::ProtocolViolation(format!(
+                        "unexpected sink worker response for materialized query: {:?}",
+                        other
+                    ))),
+                }
+            }
             None => Ok(Vec::new()),
         }
     }
@@ -1572,21 +1701,22 @@ impl SinkWorkerClientHandle {
         rpc_timeout: Duration,
     ) -> Result<()> {
         let _inflight = self.begin_control_op();
+        let decoded_signals = sink_control_signals_from_envelopes(&envelopes).ok();
         eprintln!(
             "fs_meta_sink_worker_client: on_control_frame begin node={} envelopes={}",
             self.node_id.0,
             envelopes.len()
         );
         if debug_control_scope_capture_enabled() {
-            match sink_control_signals_from_envelopes(&envelopes) {
-                Ok(signals) => eprintln!(
+            match decoded_signals.as_ref() {
+                Some(signals) => eprintln!(
                     "fs_meta_sink_worker_client: on_control_frame summary node={} signals={:?}",
                     self.node_id.0,
-                    summarize_sink_control_signals(&signals)
+                    summarize_sink_control_signals(signals)
                 ),
-                Err(err) => eprintln!(
+                None => eprintln!(
                     "fs_meta_sink_worker_client: on_control_frame summary node={} decode_err={}",
-                    self.node_id.0, err
+                    self.node_id.0, "decode failed"
                 ),
             }
         }
@@ -1630,6 +1760,9 @@ impl SinkWorkerClientHandle {
             };
             match rpc_result {
                 Ok(SinkWorkerResponse::Ack) => {
+                    if let Some(signals) = decoded_signals.as_ref() {
+                        self.retain_control_signals(signals).await;
+                    }
                     eprintln!(
                         "fs_meta_sink_worker_client: on_control_frame done node={} ok=true",
                         self.node_id.0
@@ -2887,6 +3020,183 @@ mod tests {
         sink.close().await.expect("close sink worker");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn external_sink_worker_internal_materialized_route_serves_local_owner_payload_while_control_inflight()
+    {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
+
+        let cfg = SourceConfig {
+            roots: vec![sink_worker_root("nfs1", &nfs1)],
+            host_object_grants: vec![sink_worker_export(
+                "node-a::nfs1",
+                "node-a",
+                "10.0.0.11",
+                nfs1.clone(),
+            )],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let sink = SinkWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+            .await
+            .expect("sink worker start timed out")
+            .expect("start sink worker");
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+            }))
+            .expect("encode sink activate"),
+        ])
+        .await
+        .expect("activate sink group");
+
+        let selected_dir = b"/force-find-stress";
+        let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while tokio::time::Instant::now() < materialized_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let ready = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(selected_dir, "nfs1"))
+                    .await
+                    .expect("query nfs1"),
+                selected_dir,
+            )
+            .expect("decode nfs1")
+            .is_some();
+            if ready {
+                break;
+            }
+        }
+
+        let adapter = exchange_host_adapter_from_channel_boundary(
+            boundary.clone(),
+            NodeId("node-d".to_string()),
+            default_route_bindings(),
+        );
+        let route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY)
+            .expect("resolve internal sink query route");
+        let reply_route = format!("{}:reply", route.0);
+        let baseline = adapter
+            .call_collect(
+                ROUTE_TOKEN_FS_META_INTERNAL,
+                METHOD_SINK_QUERY,
+                Bytes::from(
+                    rmp_serde::to_vec(&selected_group_request(selected_dir, "nfs1"))
+                        .expect("encode baseline internal query"),
+                ),
+                Duration::from_secs(5),
+                Duration::from_millis(250),
+            )
+            .await
+            .expect("baseline direct internal sink-query route should complete");
+        assert!(
+            decode_exact_query_node(baseline, selected_dir)
+                .expect("decode baseline internal query")
+                .is_some(),
+            "baseline direct internal sink-query route should return the owner materialized subtree"
+        );
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _reset = SinkWorkerControlFramePauseHookReset;
+        install_sink_worker_control_frame_pause_hook(SinkWorkerControlFramePauseHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let inflight_control = tokio::spawn({
+            let sink = sink.clone();
+            async move {
+                sink.on_control_frame_with_timeouts_for_tests(
+                    vec![
+                        encode_runtime_exec_control(&RuntimeExecControl::Activate(
+                            RuntimeExecActivate {
+                                route_key: ROUTE_KEY_QUERY.to_string(),
+                                unit_id: "runtime.exec.sink".to_string(),
+                                lease: None,
+                                generation: 2,
+                                expires_at_ms: 1,
+                                bound_scopes: vec![bound_scope_with_resources(
+                                    "nfs1",
+                                    &["node-a::nfs1"],
+                                )],
+                            },
+                        ))
+                        .expect("encode second-wave sink activate"),
+                    ],
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("sink control should reach pause point");
+
+        let inflight_events = tokio::time::timeout(
+            Duration::from_millis(800),
+            adapter.call_collect(
+                ROUTE_TOKEN_FS_META_INTERNAL,
+                METHOD_SINK_QUERY,
+                Bytes::from(
+                    rmp_serde::to_vec(&selected_group_request(selected_dir, "nfs1"))
+                        .expect("encode inflight internal query"),
+                ),
+                Duration::from_secs(5),
+                Duration::from_millis(250),
+            ),
+        )
+        .await
+        .expect("direct internal sink-query route should still settle while sink control is in flight")
+        .expect("inflight direct internal sink-query route");
+
+        assert!(
+            decode_exact_query_node(inflight_events, selected_dir)
+                .expect("decode inflight internal query")
+                .is_some(),
+            "direct internal sink-query route during sink control inflight must still return the owner materialized subtree; request_send_batches={} request_recv_batches={} reply_send_batches={} reply_recv_batches={}",
+            boundary.send_batch_count(&route.0),
+            boundary.recv_batch_count(&route.0),
+            boundary.send_batch_count(&reply_route),
+            boundary.recv_batch_count(&reply_route),
+        );
+
+        release.notify_waiters();
+        let _ = inflight_control.await.expect("join inflight control");
+
+        source.close().await.expect("close source");
+        sink.close().await.expect("close sink worker");
+    }
+
     struct SinkWorkerUpdateRootsHookReset;
 
     impl Drop for SinkWorkerUpdateRootsHookReset {
@@ -3003,6 +3313,274 @@ mod tests {
             "materialized_query_nonblocking must not dispatch a worker rpc while sink worker control is already in flight"
         );
 
+        sink.close().await.expect("close sink worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn status_snapshot_nonblocking_does_not_return_stale_empty_cache_after_materialization_when_control_is_marked_inflight()
+    {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
+
+        let cfg = SourceConfig {
+            roots: vec![sink_worker_root("nfs1", &nfs1)],
+            host_object_grants: vec![sink_worker_export(
+                "node-d::nfs1",
+                "node-d",
+                "10.0.0.41",
+                nfs1.clone(),
+            )],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-d".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let sink = SinkWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+            .await
+            .expect("sink worker start timed out")
+            .expect("start sink worker");
+
+        let primed = sink
+            .status_snapshot()
+            .await
+            .expect("prime initial empty cached status snapshot");
+        assert!(
+            primed.scheduled_groups_by_node.is_empty(),
+            "precondition: initial cached snapshot should start empty"
+        );
+
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-d::nfs1"])],
+            }))
+            .expect("encode sink activate"),
+        ])
+        .await
+        .expect("activate sink query route");
+
+        let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < materialized_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let ready = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1")
+            .is_some();
+            if ready {
+                break;
+            }
+        }
+
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1 after materialization"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1 after materialization")
+            .is_some(),
+            "precondition: owner-local materialized query should already see the ready subtree"
+        );
+
+        let _inflight = sink.begin_control_op();
+        let snapshot = sink
+            .status_snapshot_nonblocking()
+            .await
+            .expect("status_snapshot_nonblocking during synthetic control inflight");
+
+        assert_eq!(
+            snapshot.scheduled_groups_by_node.get("node-d"),
+            Some(&vec!["nfs1".to_string()]),
+            "status_snapshot_nonblocking must not regress to the stale empty pre-activate cache after the sink already materialized nfs1"
+        );
+        assert!(
+            snapshot
+                .groups
+                .iter()
+                .find(|group| group.group_id == "nfs1")
+                .is_some_and(|group| group.initial_audit_completed && group.live_nodes > 0),
+            "status_snapshot_nonblocking must keep the ready materialized group visible even while control is merely marked inflight: {snapshot:?}"
+        );
+
+        source.close().await.expect("close source");
+        sink.close().await.expect("close sink worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn materialized_query_still_reads_local_payload_while_control_inflight() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
+
+        let cfg = SourceConfig {
+            roots: vec![sink_worker_root("nfs1", &nfs1)],
+            host_object_grants: vec![sink_worker_export(
+                "node-d::nfs1",
+                "node-d",
+                "10.0.0.41",
+                nfs1.clone(),
+            )],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-d".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let sink = SinkWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+            .await
+            .expect("sink worker start timed out")
+            .expect("start sink worker");
+
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-d::nfs1"])],
+            }))
+            .expect("encode sink activate"),
+        ])
+        .await
+        .expect("activate sink query route");
+
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < initial_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => sink.send(batch).await.expect("apply initial batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let ready = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1")
+            .is_some();
+            if ready {
+                break;
+            }
+        }
+
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1 after initial"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1 after initial")
+            .is_some(),
+            "initial materialization should exist before sink control pauses"
+        );
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _reset = SinkWorkerControlFramePauseHookReset;
+        install_sink_worker_control_frame_pause_hook(SinkWorkerControlFramePauseHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let inflight_control = tokio::spawn({
+            let sink = sink.clone();
+            async move {
+                sink.on_control_frame_with_timeouts_for_tests(
+                    vec![
+                        encode_runtime_exec_control(&RuntimeExecControl::Activate(
+                            RuntimeExecActivate {
+                                route_key: ROUTE_KEY_QUERY.to_string(),
+                                unit_id: "runtime.exec.sink".to_string(),
+                                lease: None,
+                                generation: 3,
+                                expires_at_ms: 1,
+                                bound_scopes: vec![bound_scope_with_resources(
+                                    "nfs1",
+                                    &["node-d::nfs1"],
+                                )],
+                            },
+                        ))
+                        .expect("encode second-wave sink activate"),
+                    ],
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("sink control should reach pause point");
+
+        let query = tokio::time::timeout(
+            Duration::from_millis(800),
+            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1")),
+        )
+        .await;
+
+        release.notify_waiters();
+        let _ = inflight_control.await.expect("join inflight control");
+
+        let events = query
+            .expect(
+                "blocking materialized_query should still settle while sink control is in flight",
+            )
+            .expect("blocking materialized_query during control inflight");
+        assert!(
+            decode_exact_query_node(events, b"/force-find-stress")
+                .expect("decode query during inflight")
+                .is_some(),
+            "blocking materialized_query during sink control inflight must still return the last local materialized payload"
+        );
+
+        source.close().await.expect("close source");
         sink.close().await.expect("close sink worker");
     }
 
@@ -4012,6 +4590,7 @@ mod tests {
 
         sink.close().await.expect("close sink worker");
     }
+
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn update_logical_roots_reacquires_worker_client_after_transport_closes_mid_handoff() {

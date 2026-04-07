@@ -772,6 +772,12 @@ impl SinkState {
         grants: &[GrantedMountRoot],
         allowed_groups: Option<&BTreeSet<String>>,
     ) {
+        // Runtime scope can transiently collapse to an empty set during route/facade
+        // turnover. Preserve the last materialized group state across that empty window
+        // so a later re-activate does not recreate every group from scratch.
+        if allowed_groups.is_some_and(|groups| groups.is_empty()) {
+            return;
+        }
         let tombstone_policy = self.tombstone_policy;
         let mut groups = BTreeMap::<String, GroupSinkState>::new();
         let mut group_by_object_ref = HashMap::<String, String>::new();
@@ -3904,6 +3910,130 @@ mod tests {
         assert_eq!(
             origins,
             std::collections::BTreeSet::from(["root-a".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn deactivate_then_reactivate_preserves_ready_materialized_group_state() {
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![
+            RootSpec::new("root-a", "/mnt/nfs1"),
+            RootSpec::new("root-b", "/mnt/nfs2"),
+        ];
+        cfg.host_object_grants = vec![
+            granted_mount_root("node-a::exp-a", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+            granted_mount_root("node-b::exp-b", "node-b", "10.0.0.12", "/mnt/nfs2", true),
+        ];
+        let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
+            .expect("init sink");
+
+        let activate_both =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope("root-a"), bound_scope("root-b")],
+            }))
+            .expect("encode activate both");
+        sink.on_control_frame(&[activate_both])
+            .await
+            .expect("activate both should pass");
+
+        sink.send(&[
+            mk_source_event(
+                "node-a::exp-a",
+                mk_record(b"/ready-a.txt", "ready-a.txt", 1, EventKind::Update),
+            ),
+            mk_control_event(
+                "node-a::exp-a",
+                ControlEvent::EpochStart {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                2,
+            ),
+            mk_control_event(
+                "node-a::exp-a",
+                ControlEvent::EpochEnd {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                3,
+            ),
+            mk_source_event(
+                "node-b::exp-b",
+                mk_record(b"/ready-b.txt", "ready-b.txt", 4, EventKind::Update),
+            ),
+            mk_control_event(
+                "node-b::exp-b",
+                ControlEvent::EpochStart {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                5,
+            ),
+            mk_control_event(
+                "node-b::exp-b",
+                ControlEvent::EpochEnd {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                6,
+            ),
+        ])
+        .await
+        .expect("seed ready materialized state");
+
+        let snapshot_before = sink.status_snapshot().expect("sink status before deactivate");
+        assert!(snapshot_before.groups.iter().all(|group| group.initial_audit_completed));
+        let revisions_before = snapshot_before
+            .groups
+            .iter()
+            .map(|group| (group.group_id.clone(), group.materialized_revision))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        let deactivate =
+            encode_runtime_exec_control(&RuntimeExecControl::Deactivate(RuntimeExecDeactivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 2,
+                reason: "test".to_string(),
+            }))
+            .expect("encode deactivate");
+        sink.on_control_frame(&[deactivate])
+            .await
+            .expect("deactivate should pass");
+
+        let reactivate_both =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 3,
+                expires_at_ms: 3,
+                bound_scopes: vec![bound_scope("root-a"), bound_scope("root-b")],
+            }))
+            .expect("encode reactivate both");
+        sink.on_control_frame(&[reactivate_both])
+            .await
+            .expect("reactivate both should pass");
+
+        let snapshot_after = sink.status_snapshot().expect("sink status after reactivate");
+        assert!(
+            snapshot_after.groups.iter().all(|group| group.initial_audit_completed),
+            "deactivate/reactivate continuity must not regress ready groups back to initial_audit_completed=false: {snapshot_after:?}"
+        );
+        let revisions_after = snapshot_after
+            .groups
+            .iter()
+            .map(|group| (group.group_id.clone(), group.materialized_revision))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            revisions_after, revisions_before,
+            "deactivate/reactivate continuity must preserve materialized revision instead of recreating groups from scratch"
         );
     }
 

@@ -1350,6 +1350,7 @@ struct SinkHolderSnapshot {
     node_name: String,
     active_pids: BTreeSet<u32>,
     bound_scopes: BTreeSet<String>,
+    runtime_lease_tokens: BTreeSet<u64>,
 }
 
 fn current_sink_holder_for_scope(
@@ -1445,6 +1446,17 @@ fn sink_holder_snapshot_from_status(
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
+    let runtime_lease_tokens = status
+        .get("daemon")
+        .and_then(|v| v.get("managed_processes"))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row.get("instance_id").and_then(Value::as_str) == Some(instance_id))
+                .filter_map(|row| row.get("runtime_lease_token").and_then(Value::as_u64))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
     let routes = status
         .get("daemon")
         .and_then(|v| v.get("activation"))
@@ -1518,6 +1530,7 @@ fn sink_holder_snapshot_from_status(
         node_name: node_name.to_string(),
         active_pids,
         bound_scopes,
+        runtime_lease_tokens,
     }
 }
 
@@ -1528,7 +1541,9 @@ fn sink_failover_successor_elected(
     matches!(
         after,
         Some(after)
-            if after.node_name != before.node_name || after.active_pids != before.active_pids
+            if after.node_name != before.node_name
+                || after.active_pids != before.active_pids
+                || after.runtime_lease_tokens != before.runtime_lease_tokens
     )
 }
 
@@ -2239,11 +2254,13 @@ fn sink_holder_selection_ignores_nodes_without_target_scope() {
             node_name: "node-a".to_string(),
             active_pids: BTreeSet::from([1]),
             bound_scopes: BTreeSet::from(["nfs2".to_string()]),
+            runtime_lease_tokens: BTreeSet::from([1]),
         },
         SinkHolderSnapshot {
             node_name: "node-b".to_string(),
             active_pids: BTreeSet::from([2]),
             bound_scopes: BTreeSet::from(["nfs3".to_string()]),
+            runtime_lease_tokens: BTreeSet::from([1]),
         },
     ];
 
@@ -2260,11 +2277,13 @@ fn sink_failover_holder_selection_is_scoped_to_failover_group() {
             node_name: "node-a".to_string(),
             active_pids: BTreeSet::from([1]),
             bound_scopes: BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+            runtime_lease_tokens: BTreeSet::from([1]),
         },
         SinkHolderSnapshot {
             node_name: "node-b".to_string(),
             active_pids: BTreeSet::from([2]),
             bound_scopes: BTreeSet::from(["nfs3".to_string()]),
+            runtime_lease_tokens: BTreeSet::from([1]),
         },
     ];
     assert_eq!(
@@ -2277,11 +2296,13 @@ fn sink_failover_holder_selection_is_scoped_to_failover_group() {
             node_name: "node-b".to_string(),
             active_pids: BTreeSet::from([2]),
             bound_scopes: BTreeSet::from(["nfs3".to_string()]),
+            runtime_lease_tokens: BTreeSet::from([1]),
         },
         SinkHolderSnapshot {
             node_name: "node-c".to_string(),
             active_pids: BTreeSet::from([3]),
             bound_scopes: BTreeSet::from(["nfs2".to_string()]),
+            runtime_lease_tokens: BTreeSet::from([1]),
         },
     ];
     assert_eq!(
@@ -2296,11 +2317,13 @@ fn sink_failover_successor_election_accepts_same_node_with_new_pid_set() {
         node_name: "node-a".to_string(),
         active_pids: BTreeSet::from([1]),
         bound_scopes: BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        runtime_lease_tokens: BTreeSet::from([1]),
     };
     let after = SinkHolderSnapshot {
         node_name: "node-a".to_string(),
         active_pids: BTreeSet::from([9]),
         bound_scopes: BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        runtime_lease_tokens: BTreeSet::from([2]),
     };
 
     assert!(
@@ -2310,11 +2333,33 @@ fn sink_failover_successor_election_accepts_same_node_with_new_pid_set() {
 }
 
 #[test]
+fn sink_failover_successor_election_accepts_same_node_with_new_lease_token_even_when_pid_is_reused()
+{
+    let before = SinkHolderSnapshot {
+        node_name: "node-a".to_string(),
+        active_pids: BTreeSet::from([2]),
+        bound_scopes: BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        runtime_lease_tokens: BTreeSet::from([1]),
+    };
+    let after = SinkHolderSnapshot {
+        node_name: "node-a".to_string(),
+        active_pids: BTreeSet::from([2]),
+        bound_scopes: BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        runtime_lease_tokens: BTreeSet::from([2]),
+    };
+
+    assert!(
+        sink_failover_successor_elected(&before, Some(&after)),
+        "same-node restarted sink with a reused pid must still count as successor when its runtime lease token changes"
+    );
+}
+
+#[test]
 fn sink_holder_snapshot_ignores_undelivered_route_level_active_pids() {
     let status = json!({
         "daemon": {
             "managed_processes": [
-                { "instance_id": "app-1", "pid": 1 }
+                { "instance_id": "app-1", "pid": 1, "runtime_lease_token": 1 }
             ],
             "activation": {
                 "routes": [
@@ -2349,6 +2394,7 @@ fn sink_holder_snapshot_ignores_undelivered_route_level_active_pids() {
         snapshot.bound_scopes.is_empty(),
         "pending sink activation must not contribute live holder scopes: {snapshot:?}"
     );
+    assert_eq!(snapshot.runtime_lease_tokens, BTreeSet::from([1]));
 }
 
 #[test]
@@ -2356,7 +2402,7 @@ fn sink_holder_snapshot_accepts_delivered_route_level_active_pids() {
     let status = json!({
         "daemon": {
             "managed_processes": [
-                { "instance_id": "app-1", "pid": 1 }
+                { "instance_id": "app-1", "pid": 1, "runtime_lease_token": 7 }
             ],
             "activation": {
                 "routes": [
@@ -2385,4 +2431,5 @@ fn sink_holder_snapshot_accepts_delivered_route_level_active_pids() {
     let snapshot = sink_holder_snapshot_from_status(&status, "app-1", "node-a");
     assert_eq!(snapshot.active_pids, BTreeSet::from([1]));
     assert_eq!(snapshot.bound_scopes, BTreeSet::from(["nfs2".to_string()]));
+    assert_eq!(snapshot.runtime_lease_tokens, BTreeSet::from([7]));
 }
