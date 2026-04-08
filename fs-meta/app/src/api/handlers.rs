@@ -122,6 +122,13 @@ pub(crate) struct RootsPutPauseHook {
 
 #[cfg(test)]
 #[derive(Clone)]
+pub(crate) struct RootsPutBeforeResponseHook {
+    pub entered: std::sync::Arc<Notify>,
+    pub release: std::sync::Arc<Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
 pub(crate) struct RescanPauseHook {
     pub entered: std::sync::Arc<Notify>,
     pub release: std::sync::Arc<Notify>,
@@ -147,6 +154,12 @@ fn roots_put_pause_hook_cell() -> &'static StdMutex<Option<RootsPutPauseHook>> {
 }
 
 #[cfg(test)]
+fn roots_put_before_response_hook_cell() -> &'static StdMutex<Option<RootsPutBeforeResponseHook>> {
+    static CELL: OnceLock<StdMutex<Option<RootsPutBeforeResponseHook>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
 fn rescan_pause_hook_cell() -> &'static StdMutex<Option<RescanPauseHook>> {
     static CELL: OnceLock<StdMutex<Option<RescanPauseHook>>> = OnceLock::new();
     CELL.get_or_init(|| StdMutex::new(None))
@@ -167,6 +180,15 @@ fn status_route_trace_hook_cell() -> &'static StdMutex<Option<StatusRouteTraceHo
 #[cfg(test)]
 pub(crate) fn install_roots_put_pause_hook(hook: RootsPutPauseHook) {
     let mut guard = match roots_put_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn install_roots_put_before_response_hook(hook: RootsPutBeforeResponseHook) {
+    let mut guard = match roots_put_before_response_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -215,6 +237,15 @@ pub(crate) fn clear_roots_put_pause_hook() {
 }
 
 #[cfg(test)]
+pub(crate) fn clear_roots_put_before_response_hook() {
+    let mut guard = match roots_put_before_response_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
 pub(crate) fn clear_rescan_pause_hook() {
     let mut guard = match rescan_pause_hook_cell().lock() {
         Ok(guard) => guard,
@@ -250,6 +281,27 @@ pub(crate) fn clear_status_route_trace_capture() {
 async fn maybe_pause_roots_put_after_previous_source_roots() {
     let hook = {
         let guard = match roots_put_pause_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        hook.entered.notify_waiters();
+        release.await;
+    }
+}
+
+#[cfg(test)]
+async fn maybe_pause_roots_put_before_response() {
+    let hook = {
+        let guard = match roots_put_before_response_hook_cell().lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -1174,16 +1226,11 @@ pub async fn roots_put(
     }
     refresh_policy_from_host_object_grants(&state.projection_policy, &grants);
     eprintln!("fs_meta_api: roots_put policy refresh ok");
+    #[cfg(test)]
+    maybe_pause_roots_put_before_response().await;
 
     Ok(Json(RootsUpdateResponse {
-        roots_count: state
-            .source
-            .logical_roots_snapshot()
-            .await
-            .map_err(|err| {
-                ApiError::internal(format!("source logical roots snapshot failed: {err}"))
-            })?
-            .len(),
+        roots_count: roots.len(),
     }))
 }
 

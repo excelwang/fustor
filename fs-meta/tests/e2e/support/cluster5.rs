@@ -727,11 +727,19 @@ impl Cluster5 {
         unit_id: &str,
     ) -> Result<BTreeSet<u32>, String> {
         let status = self.status(node_name)?;
-        Ok(unit_active_pids_for_instance_from_status(
+        let mut pids = unit_active_pids_for_instance_from_status(
             &status,
             instance_id,
             unit_id,
-        ))
+        );
+        if pids.is_empty() {
+            let node = self.node(node_name)?;
+            pids.extend(
+                unit_active_pids_from_registry_fallback(&node.home_dir, &status, instance_id, unit_id)
+                    .map_err(|err| format!("read registry fallback failed for {node_name}: {err}"))?,
+            );
+        }
+        Ok(pids)
     }
 
     pub fn facade_pids_for_instance(
@@ -1995,6 +2003,65 @@ fn unit_active_pids_for_instance_from_status(
     out
 }
 
+fn route_mentions_unit_in_activated_state(status: &Value, unit_id: &str) -> bool {
+    status
+        .get("daemon")
+        .and_then(|v| v.get("activation"))
+        .and_then(|v| v.get("routes"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|route| {
+            route
+                .get("apps")
+                .and_then(Value::as_array)
+                .is_some_and(|apps| {
+                    apps.iter().any(|row| {
+                        row.get("unit_ids")
+                            .and_then(Value::as_array)
+                            .is_some_and(|units| {
+                                units.iter().any(|v| v.as_str() == Some(unit_id))
+                            })
+                            && row.get("delivered").and_then(Value::as_bool) == Some(true)
+                            && row.get("gate").and_then(Value::as_str) == Some("activated")
+                            && row.get("op").and_then(Value::as_str) == Some("activate")
+                    })
+                })
+        })
+}
+
+fn unit_active_pids_from_registry_fallback(
+    node_home_dir: &Path,
+    status: &Value,
+    instance_id: &str,
+    unit_id: &str,
+) -> Result<BTreeSet<u32>, std::io::Error> {
+    if !route_mentions_unit_in_activated_state(status, unit_id) {
+        return Ok(BTreeSet::new());
+    }
+    let registry_path = node_home_dir.join("registry.json");
+    let raw = fs::read_to_string(&registry_path)?;
+    let json = serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({}));
+    let current = json
+        .get("current_entries")
+        .and_then(|v| v.get(instance_id))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let admitted = current
+        .get("state_carrier_admission")
+        .and_then(|v| v.get(unit_id))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !admitted {
+        return Ok(BTreeSet::new());
+    }
+    Ok(current
+        .get("pid")
+        .and_then(Value::as_u64)
+        .map(|pid| BTreeSet::from([pid as u32]))
+        .unwrap_or_default())
+}
+
 fn signed_auth_for_payload_bytes(
     command_bytes: Vec<u8>,
     scopes: &[&str],
@@ -2253,6 +2320,195 @@ mod tests {
         assert_eq!(
             unit_active_pids_for_instance_from_status(&status, "app-1", "runtime.exec.source"),
             BTreeSet::from([1]),
+        );
+    }
+
+    #[test]
+    fn registry_fallback_promotes_current_sink_pid_when_route_is_activated_but_active_pids_are_empty()
+    {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let registry_path = tmp.path().join("registry.json");
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec(&json!({
+                "current_entries": {
+                    "app-1": {
+                        "pid": 2,
+                        "state_carrier_admission": {
+                            "runtime.exec.sink": true
+                        }
+                    }
+                }
+            }))
+            .expect("encode registry json"),
+        )
+        .expect("write registry json");
+
+        let status = json!({
+            "daemon": {
+                "managed_processes": [
+                    { "instance_id": "app-1", "pid": 2 }
+                ],
+                "activation": {
+                    "routes": [
+                        {
+                            "route_key": "fs-meta.events:v1.stream",
+                            "state": "activated",
+                            "active_pids": [],
+                            "apps": [
+                                {
+                                    "pid": 1,
+                                    "unit_ids": ["runtime.exec.sink"],
+                                    "delivered": true,
+                                    "gate": "activated",
+                                    "op": "activate"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            unit_active_pids_for_instance_from_status(&status, "app-1", "runtime.exec.sink"),
+            BTreeSet::new(),
+            "precondition: status-only helper should miss the current sink pid when route-level active_pids are empty"
+        );
+        assert_eq!(
+            unit_active_pids_from_registry_fallback(
+                tmp.path(),
+                &status,
+                "app-1",
+                "runtime.exec.sink"
+            )
+            .expect("registry fallback"),
+            BTreeSet::from([2]),
+            "registry fallback should recover the current sink pid when the route is activated and the current registry entry admits runtime.exec.sink"
+        );
+    }
+
+    #[test]
+    fn registry_fallback_skips_units_without_activated_route_or_admission() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let registry_path = tmp.path().join("registry.json");
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec(&json!({
+                "current_entries": {
+                    "app-1": {
+                        "pid": 2,
+                        "state_carrier_admission": {
+                            "runtime.exec.sink": false
+                        }
+                    }
+                }
+            }))
+            .expect("encode registry json"),
+        )
+        .expect("write registry json");
+
+        let status = json!({
+            "daemon": {
+                "managed_processes": [
+                    { "instance_id": "app-1", "pid": 2 }
+                ],
+                "activation": {
+                    "routes": [
+                        {
+                            "route_key": "fs-meta.events:v1.stream",
+                            "state": "bound",
+                            "active_pids": [],
+                            "apps": [
+                                {
+                                    "pid": 1,
+                                    "unit_ids": ["runtime.exec.sink"],
+                                    "delivered": true,
+                                    "gate": "activated",
+                                    "op": "activate"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert!(
+            unit_active_pids_from_registry_fallback(
+                tmp.path(),
+                &status,
+                "app-1",
+                "runtime.exec.sink"
+            )
+            .expect("registry fallback")
+            .is_empty(),
+            "registry fallback must stay disabled unless the route is already activated and the current registry entry admits that unit"
+        );
+    }
+
+    #[test]
+    fn registry_fallback_promotes_current_sink_pid_when_route_rows_are_activated_but_route_state_is_only_bound()
+    {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let registry_path = tmp.path().join("registry.json");
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec(&json!({
+                "current_entries": {
+                    "app-1": {
+                        "pid": 2,
+                        "state_carrier_admission": {
+                            "runtime.exec.sink": true
+                        }
+                    }
+                }
+            }))
+            .expect("encode registry json"),
+        )
+        .expect("write registry json");
+
+        let status = json!({
+            "daemon": {
+                "managed_processes": [
+                    { "instance_id": "app-1", "pid": 2 }
+                ],
+                "activation": {
+                    "routes": [
+                        {
+                            "route_key": "fs-meta.events:v1.stream",
+                            "state": "bound",
+                            "active_pids": [],
+                            "apps": [
+                                {
+                                    "pid": 1,
+                                    "unit_ids": ["runtime.exec.sink"],
+                                    "delivered": true,
+                                    "gate": "activated",
+                                    "op": "activate"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            unit_active_pids_for_instance_from_status(&status, "app-1", "runtime.exec.sink"),
+            BTreeSet::new(),
+            "precondition: status-only helper should still miss the current sink pid when route-level active_pids are empty"
+        );
+        assert_eq!(
+            unit_active_pids_from_registry_fallback(
+                tmp.path(),
+                &status,
+                "app-1",
+                "runtime.exec.sink"
+            )
+            .expect("registry fallback"),
+            BTreeSet::from([2]),
+            "registry fallback should recover the current sink pid when the app row is already delivered+activated, even if the top-level route state still reads bound"
         );
     }
 

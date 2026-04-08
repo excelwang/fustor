@@ -801,6 +801,11 @@ pub(crate) struct SourceWorkerUpdateRootsErrorHook {
 }
 
 #[cfg(test)]
+pub(crate) struct SourceWorkerLogicalRootsSnapshotHook {
+    pub roots: Vec<RootSpec>,
+}
+
+#[cfg(test)]
 pub(crate) struct SourceWorkerControlFrameErrorHook {
     pub err: CnxError,
 }
@@ -913,6 +918,14 @@ fn source_worker_control_frame_pause_hook_cell()
 fn source_worker_update_roots_error_hook_cell()
 -> &'static Mutex<Option<SourceWorkerUpdateRootsErrorHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerUpdateRootsErrorHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn source_worker_logical_roots_snapshot_hook_cell()
+-> &'static Mutex<Option<SourceWorkerLogicalRootsSnapshotHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerLogicalRootsSnapshotHook>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
@@ -1174,6 +1187,17 @@ pub(crate) fn install_source_worker_update_roots_error_hook(
 }
 
 #[cfg(test)]
+pub(crate) fn install_source_worker_logical_roots_snapshot_hook(
+    hook: SourceWorkerLogicalRootsSnapshotHook,
+) {
+    let mut guard = match source_worker_logical_roots_snapshot_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn install_source_worker_control_frame_error_hook(
     hook: SourceWorkerControlFrameErrorHook,
 ) {
@@ -1256,6 +1280,15 @@ pub(crate) fn clear_source_worker_update_roots_error_hook() {
 }
 
 #[cfg(test)]
+pub(crate) fn clear_source_worker_logical_roots_snapshot_hook() {
+    let mut guard = match source_worker_logical_roots_snapshot_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
 pub(crate) fn clear_source_worker_control_frame_error_hook() {
     let mut guard = match source_worker_control_frame_error_hook_cell().lock() {
         Ok(guard) => guard,
@@ -1322,6 +1355,15 @@ fn take_source_worker_status_error_hook() -> Option<CnxError> {
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.take().map(|hook| hook.err)
+}
+
+#[cfg(test)]
+fn source_worker_logical_roots_snapshot_hook() -> Option<Vec<RootSpec>> {
+    let guard = match source_worker_logical_roots_snapshot_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.as_ref().map(|hook| hook.roots.clone())
 }
 
 #[cfg(test)]
@@ -2264,6 +2306,10 @@ impl SourceWorkerClientHandle {
     }
 
     pub async fn logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
+        #[cfg(test)]
+        if let Some(roots) = source_worker_logical_roots_snapshot_hook() {
+            return Ok(roots);
+        }
         let Some(client) = self.existing_client().await? else {
             return self.cached_logical_roots_snapshot();
         };
@@ -7037,6 +7083,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn update_logical_roots_contraction_drops_removed_roots_from_snapshot_immediately() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        let nfs3 = tmp.path().join("nfs3");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        std::fs::create_dir_all(&nfs3).expect("create nfs3 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                worker_source_root("nfs1", &nfs1),
+                worker_source_root("nfs2", &nfs2),
+                worker_source_root("nfs3", &nfs3),
+            ],
+            host_object_grants: vec![
+                worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+                worker_source_export("node-d::nfs3", "node-d", "10.0.0.43", nfs3.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = worker_socket_tempdir();
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let initial_roots = client
+            .logical_roots_snapshot()
+            .await
+            .expect("initial logical roots snapshot");
+        assert_eq!(
+            initial_roots
+                .iter()
+                .map(|root| root.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nfs1", "nfs2", "nfs3"],
+            "fixture must start with all three logical roots present"
+        );
+
+        client
+            .update_logical_roots(vec![worker_source_root("nfs1", &nfs1)])
+            .await
+            .expect("shrink logical roots to single root");
+
+        let roots = client
+            .logical_roots_snapshot()
+            .await
+            .expect("logical roots snapshot after contraction");
+        assert_eq!(
+            roots.iter().map(|root| root.id.as_str()).collect::<Vec<_>>(),
+            vec!["nfs1"],
+            "source worker logical_roots_snapshot must drop removed roots immediately after contraction"
+        );
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn on_control_frame_retries_stale_drained_fenced_pid_errors() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
@@ -9471,6 +9591,15 @@ mod tests {
         assert_on_control_frame_retries_bridge_reset_peer_error(
             CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
             "on_control_frame should retry a peer bridge-stopped error and reach the live worker",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn on_control_frame_retries_timeout_errors_after_first_wave_succeeded() {
+        assert_on_control_frame_retries_bridge_reset_peer_error(
+            CnxError::Timeout,
+            "on_control_frame should retry a timeout error and reach the live worker",
         )
         .await;
     }

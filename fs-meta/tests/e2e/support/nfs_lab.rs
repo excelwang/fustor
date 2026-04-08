@@ -271,11 +271,17 @@ fn output_stderr_string(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_ascii_lowercase()
 }
 
+fn output_stdout_string(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).to_ascii_lowercase()
+}
+
 fn output_indicates_absent_mount(output: &std::process::Output) -> bool {
     let stderr = output_stderr_string(output);
-    stderr.contains("no mount point specified")
-        || stderr.contains("not mounted")
-        || stderr.contains("not a mountpoint")
+    let stdout = output_stdout_string(output);
+    let combined = format!("{stderr}\n{stdout}");
+    combined.contains("no mount point specified")
+        || combined.contains("not mounted")
+        || combined.contains("not a mountpoint")
 }
 
 fn output_indicates_absent_export(output: &std::process::Output) -> bool {
@@ -853,6 +859,27 @@ mod tests {
             status: ExitStatus::from_raw(32 << 8),
             stdout: Vec::new(),
             stderr: b"umount: /tmp/lab/mounts/node-a/nfs1: no mount point specified.\n".to_vec(),
+        };
+        assert!(output_indicates_absent_mount(&output));
+    }
+
+    #[test]
+    fn output_indicates_absent_mount_accepts_stdout_only_shape() {
+        let output = std::process::Output {
+            status: ExitStatus::from_raw(32 << 8),
+            stdout: b"umount: /tmp/lab/mounts/node-a/nfs1: not mounted.\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert!(output_indicates_absent_mount(&output));
+    }
+
+    #[test]
+    fn output_indicates_absent_mount_accepts_crlf_shape() {
+        let output = std::process::Output {
+            status: ExitStatus::from_raw(32 << 8),
+            stdout: Vec::new(),
+            stderr: b"umount: /tmp/lab/mounts/node-a/nfs1: no mount point specified.\r\n"
+                .to_vec(),
         };
         assert!(output_indicates_absent_mount(&output));
     }

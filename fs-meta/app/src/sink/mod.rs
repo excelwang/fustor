@@ -4713,4 +4713,65 @@ mod tests {
             "tombstone-only tree must not expose entries"
         );
     }
+
+    #[tokio::test]
+    async fn initial_audit_completion_clears_when_group_regresses_to_structural_root_only() {
+        let sink = build_single_group_sink();
+        sink.send(&[
+            mk_source_event(
+                "node-a::exp",
+                mk_record(b"/ready.txt", "ready.txt", 1, EventKind::Update),
+            ),
+            mk_control_event(
+                "node-a::exp",
+                ControlEvent::EpochStart {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                2,
+            ),
+            mk_control_event(
+                "node-a::exp",
+                ControlEvent::EpochEnd {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                3,
+            ),
+        ])
+        .await
+        .expect("materialize and complete initial audit");
+
+        let snapshot_ready = sink.status_snapshot().expect("sink status after ready");
+        assert!(
+            snapshot_ready.groups[0].initial_audit_completed,
+            "precondition: group should be ready after materializing /ready.txt"
+        );
+        assert!(
+            snapshot_ready.groups[0].total_nodes > 0,
+            "precondition: ready group should have live materialized nodes"
+        );
+
+        sink.send(&[mk_source_event(
+            "node-a::exp",
+            mk_record(b"/ready.txt", "ready.txt", 4, EventKind::Delete),
+        )])
+        .await
+        .expect("delete only materialized child");
+
+        let snapshot_after_delete = sink.status_snapshot().expect("sink status after delete");
+        assert!(
+            !snapshot_after_delete.groups[0].initial_audit_completed,
+            "deleting the only live child must clear initial audit readiness instead of treating a structural-root-only tree as ready: {snapshot_after_delete:?}"
+        );
+
+        let events = sink
+            .materialized_query(&default_materialized_request())
+            .expect("query response after delete");
+        let response = decode_tree_payload(&events[0]);
+        assert!(
+            !response.root.exists,
+            "structural-root-only tree must not keep reporting a live root after the only child is deleted"
+        );
+    }
 }

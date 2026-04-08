@@ -1427,7 +1427,19 @@ fn sink_holder_snapshot_for_node(
     app_id: &str,
 ) -> Result<SinkHolderSnapshot, String> {
     let status = cluster.status(node_name)?;
-    Ok(sink_holder_snapshot_from_status(&status, app_id, node_name))
+    let mut snapshot = sink_holder_snapshot_from_status(&status, app_id, node_name);
+    if snapshot.active_pids.is_empty() && !snapshot.bound_scopes.is_empty() {
+        let node = cluster.node(node_name)?;
+        snapshot.active_pids.extend(
+            sink_holder_active_pids_from_registry_fallback(
+                &node.home_dir,
+                app_id,
+                &snapshot,
+            )
+            .map_err(|err| format!("read sink holder registry fallback failed for {node_name}: {err}"))?,
+        );
+    }
+    Ok(snapshot)
 }
 
 fn sink_holder_snapshot_from_status(
@@ -1545,6 +1557,37 @@ fn sink_failover_successor_elected(
                 || after.active_pids != before.active_pids
                 || after.runtime_lease_tokens != before.runtime_lease_tokens
     )
+}
+
+fn sink_holder_active_pids_from_registry_fallback(
+    node_home_dir: &Path,
+    instance_id: &str,
+    snapshot: &SinkHolderSnapshot,
+) -> Result<BTreeSet<u32>, std::io::Error> {
+    if !snapshot.active_pids.is_empty() || snapshot.bound_scopes.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let registry_path = node_home_dir.join("registry.json");
+    let raw = std::fs::read_to_string(&registry_path)?;
+    let json = serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({}));
+    let current = json
+        .get("current_entries")
+        .and_then(|v| v.get(instance_id))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let admitted = current
+        .get("state_carrier_admission")
+        .and_then(|v| v.get("runtime.exec.sink"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !admitted {
+        return Ok(BTreeSet::new());
+    }
+    Ok(current
+        .get("pid")
+        .and_then(Value::as_u64)
+        .map(|pid| BTreeSet::from([pid as u32]))
+        .unwrap_or_default())
 }
 
 fn current_facade_holders(cluster: &Cluster5, app_id: &str) -> Result<Vec<(String, u32)>, String> {
@@ -2432,4 +2475,119 @@ fn sink_holder_snapshot_accepts_delivered_route_level_active_pids() {
     assert_eq!(snapshot.active_pids, BTreeSet::from([1]));
     assert_eq!(snapshot.bound_scopes, BTreeSet::from(["nfs2".to_string()]));
     assert_eq!(snapshot.runtime_lease_tokens, BTreeSet::from([7]));
+}
+
+#[test]
+fn sink_holder_registry_fallback_promotes_current_sink_pid_when_route_is_activated_but_active_pids_are_empty()
+ {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let registry_path = tmp.path().join("registry.json");
+    std::fs::write(
+        &registry_path,
+        serde_json::to_vec(&json!({
+            "current_entries": {
+                "app-1": {
+                    "pid": 2,
+                    "state_carrier_admission": {
+                        "runtime.exec.sink": true
+                    }
+                }
+            }
+        }))
+        .expect("encode registry json"),
+    )
+    .expect("write registry json");
+
+    let status = json!({
+        "daemon": {
+            "managed_processes": [
+                { "instance_id": "app-1", "pid": 2, "runtime_lease_token": 7 }
+            ],
+            "activation": {
+                "routes": [
+                    {
+                        "route_key": "fs-meta.events:v1.stream",
+                        "active_pids": [],
+                        "apps": [
+                            {
+                                "unit_ids": ["runtime.exec.sink"],
+                                "bound_scopes_by_unit": {
+                                    "runtime.exec.sink": [
+                                        { "scope_id": "nfs2" }
+                                    ]
+                                },
+                                "delivered": true,
+                                "gate": "activated",
+                                "op": "activate"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    });
+
+    let snapshot = sink_holder_snapshot_from_status(&status, "app-1", "node-a");
+    assert!(
+        snapshot.active_pids.is_empty(),
+        "precondition: status-only helper should miss the current sink pid when route-level active_pids are empty: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.bound_scopes,
+        BTreeSet::from(["nfs2".to_string()]),
+        "activated sink route should still expose the scoped holder target"
+    );
+    assert_eq!(
+        sink_holder_active_pids_from_registry_fallback(tmp.path(), "app-1", &snapshot)
+            .expect("registry fallback"),
+        BTreeSet::from([2]),
+        "registry fallback should recover the current sink pid when the current registry entry admits runtime.exec.sink"
+    );
+}
+
+#[test]
+fn sink_holder_registry_fallback_skips_snapshots_without_scopes_or_admission() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let registry_path = tmp.path().join("registry.json");
+    std::fs::write(
+        &registry_path,
+        serde_json::to_vec(&json!({
+            "current_entries": {
+                "app-1": {
+                    "pid": 2,
+                    "state_carrier_admission": {
+                        "runtime.exec.sink": false
+                    }
+                }
+            }
+        }))
+        .expect("encode registry json"),
+    )
+    .expect("write registry json");
+
+    let scoped_snapshot = SinkHolderSnapshot {
+        node_name: "node-a".to_string(),
+        active_pids: BTreeSet::new(),
+        bound_scopes: BTreeSet::from(["nfs2".to_string()]),
+        runtime_lease_tokens: BTreeSet::from([1]),
+    };
+    assert!(
+        sink_holder_active_pids_from_registry_fallback(tmp.path(), "app-1", &scoped_snapshot)
+            .expect("registry fallback")
+            .is_empty(),
+        "registry fallback must skip snapshots whose current registry entry does not admit runtime.exec.sink"
+    );
+
+    let unscoped_snapshot = SinkHolderSnapshot {
+        node_name: "node-a".to_string(),
+        active_pids: BTreeSet::new(),
+        bound_scopes: BTreeSet::new(),
+        runtime_lease_tokens: BTreeSet::from([1]),
+    };
+    assert!(
+        sink_holder_active_pids_from_registry_fallback(tmp.path(), "app-1", &unscoped_snapshot)
+            .expect("registry fallback")
+            .is_empty(),
+        "registry fallback must skip snapshots that do not already prove an activated scoped sink route"
+    );
 }

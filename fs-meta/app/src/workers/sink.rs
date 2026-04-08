@@ -951,7 +951,7 @@ impl SinkWorkerClientHandle {
         Ok(())
     }
 
-    fn cached_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+    pub(crate) fn cached_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
         self.status_cache
             .lock()
             .map(|guard| guard.clone())
@@ -1914,6 +1914,13 @@ impl SinkFacade {
         match self {
             Self::Local(sink) => sink.status_snapshot(),
             Self::Worker(client) => client.status_snapshot_nonblocking().await,
+        }
+    }
+
+    pub fn cached_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+        match self {
+            Self::Local(sink) => sink.status_snapshot(),
+            Self::Worker(client) => client.cached_status_snapshot(),
         }
     }
 
@@ -3674,15 +3681,27 @@ mod tests {
         let nfs2 = tmp.path().join("nfs2");
         std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
         std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 force-find dir");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 force-find dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a")
+            .expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b")
+            .expect("seed nfs2");
 
         let cfg = SourceConfig {
-            roots: vec![sink_worker_root("nfs1", &nfs1)],
+            roots: vec![
+                sink_worker_root("nfs1", &nfs1),
+                sink_worker_root("nfs2", &nfs2),
+            ],
             host_object_grants: vec![
                 sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
                 sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
             ],
             ..SourceConfig::default()
         };
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-d".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
@@ -3718,6 +3737,57 @@ mod tests {
         .await
         .expect("first sink control wave should succeed");
 
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < initial_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => sink.send(batch).await.expect("apply initial batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let nfs1_ready = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1")
+            .is_some();
+            let nfs2_ready = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                    .await
+                    .expect("query nfs2"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs2")
+            .is_some();
+            if nfs1_ready && nfs2_ready {
+                break;
+            }
+        }
+
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1 after initial"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1 after initial")
+            .is_some(),
+            "precondition: nfs1 initial materialization should exist before stale drained/fenced retry"
+        );
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                    .await
+                    .expect("query nfs2 after initial"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs2 after initial")
+            .is_some(),
+            "precondition: nfs2 initial materialization should exist before stale drained/fenced retry"
+        );
+
         let _reset = SinkWorkerControlFrameErrorHookReset;
         install_sink_worker_control_frame_error_hook(SinkWorkerControlFrameErrorHook {
             err: CnxError::AccessDenied(
@@ -3741,6 +3811,30 @@ mod tests {
             "on_control_frame should retry a stale drained/fenced pid error after the first sink wave already succeeded",
         );
 
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1 after drained/fenced retry"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1 after drained/fenced retry")
+            .is_some(),
+            "stale drained/fenced retry must preserve nfs1 materialized payload"
+        );
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                    .await
+                    .expect("query nfs2 after drained/fenced retry"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs2 after drained/fenced retry")
+            .is_some(),
+            "stale drained/fenced retry must preserve nfs2 materialized payload"
+        );
+
+        source.close().await.expect("close source");
         sink.close().await.expect("close sink worker");
     }
 
@@ -4927,15 +5021,27 @@ mod tests {
         let nfs2 = tmp.path().join("nfs2");
         std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
         std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 force-find dir");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 force-find dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a")
+            .expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b")
+            .expect("seed nfs2");
 
         let cfg = SourceConfig {
-            roots: vec![sink_worker_root("nfs1", &nfs1)],
+            roots: vec![
+                sink_worker_root("nfs1", &nfs1),
+                sink_worker_root("nfs2", &nfs2),
+            ],
             host_object_grants: vec![
                 sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
                 sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
             ],
             ..SourceConfig::default()
         };
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-d".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
@@ -5040,6 +5146,61 @@ mod tests {
             .await
             .expect("first exact-shaped sink nine-wave should succeed");
 
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < initial_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => client.send(batch).await.expect("apply initial batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let nfs1_ready = decode_exact_query_node(
+                client
+                    .materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1")
+            .is_some();
+            let nfs2_ready = decode_exact_query_node(
+                client
+                    .materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                    .await
+                    .expect("query nfs2"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs2")
+            .is_some();
+            if nfs1_ready && nfs2_ready {
+                break;
+            }
+        }
+
+        assert!(
+            decode_exact_query_node(
+                client
+                    .materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1 after initial"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1 after initial")
+            .is_some(),
+            "precondition: nfs1 initial materialization should exist before worker restart"
+        );
+        assert!(
+            decode_exact_query_node(
+                client
+                    .materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                    .await
+                    .expect("query nfs2 after initial"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs2 after initial")
+            .is_some(),
+            "precondition: nfs2 initial materialization should exist before worker restart"
+        );
+
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let _reset = SinkWorkerControlFramePauseHookReset;
@@ -5085,6 +5246,32 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
+        assert!(
+            decode_exact_query_node(
+                client
+                    .materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1 after second wave restart"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1 after second wave restart")
+            .is_some(),
+            "second exact-shaped sink nine-wave restart must preserve nfs1 materialized payload"
+        );
+        assert!(
+            decode_exact_query_node(
+                client
+                    .materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                    .await
+                    .expect("query nfs2 after second wave restart"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs2 after second wave restart")
+            .is_some(),
+            "second exact-shaped sink nine-wave restart must preserve nfs2 materialized payload"
+        );
+
+        source.close().await.expect("close source");
         client.close().await.expect("close sink worker");
     }
 
