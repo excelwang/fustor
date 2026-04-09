@@ -1960,6 +1960,25 @@ fn selected_group_empty_ready_tree_requires_proxy_fallback(
         && selected_group_materialized_tree_payload_is_empty(policy, events, group_id)
 }
 
+fn selected_group_empty_ready_tree_requires_primary_owner_reroute(
+    policy: &ProjectionPolicy,
+    params: &InternalQueryRequest,
+    selected_group_sink_status: Option<&SinkStatusSnapshot>,
+    group_id: &str,
+    events: &[Event],
+) -> bool {
+    matches!(params.op, QueryOp::Tree)
+        && params
+            .tree_options
+            .as_ref()
+            .is_some_and(|options| options.read_class == ReadClass::TrustedMaterialized)
+        && selected_group_sink_status_reports_live_materialized_group(
+            selected_group_sink_status,
+            group_id,
+        )
+        && selected_group_materialized_tree_payload_is_empty(policy, events, group_id)
+}
+
 fn sink_primary_owner_node_for_group(
     sink_status: Option<&SinkStatusSnapshot>,
     group_id: &str,
@@ -1986,15 +2005,26 @@ fn trusted_materialized_unavailable_selected_group_tree_error(group_id: &str) ->
     ))
 }
 
+fn trusted_materialized_unavailable_selected_group_stats_error(group_id: &str) -> CnxError {
+    CnxError::NotReady(format!(
+        "trusted-materialized selected-group stats remained unavailable despite ready sink status for group {group_id}"
+    ))
+}
+
 fn selected_group_owner_attempt_timeout(deadline: tokio::time::Instant) -> Duration {
     let remaining = deadline
         .checked_duration_since(tokio::time::Instant::now())
         .unwrap_or_default();
+    if remaining.is_zero() {
+        return Duration::ZERO;
+    }
+    let owner_min_budget = std::cmp::min(remaining, TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET);
     let proxy_reserve = std::cmp::max(
         remaining.checked_div(2).unwrap_or_default(),
         std::cmp::min(remaining, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET),
     );
-    remaining.saturating_sub(proxy_reserve)
+    let capped_proxy_reserve = std::cmp::min(proxy_reserve, remaining.saturating_sub(owner_min_budget));
+    remaining.saturating_sub(capped_proxy_reserve)
 }
 
 async fn query_materialized_events_via_generic_proxy(
@@ -2132,7 +2162,43 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                             group_id,
                             &events,
                         );
+                    let requires_primary_owner_reroute =
+                        selected_group_empty_ready_tree_requires_primary_owner_reroute(
+                            policy,
+                            &params,
+                            selected_group_sink_status.as_ref(),
+                            group_id,
+                            &events,
+                        );
                     if !requires_proxy_fallback {
+                        if requires_primary_owner_reroute
+                            && let Some(primary_node_id) =
+                                sink_primary_owner_node_for_group(
+                                    selected_group_sink_status.as_ref(),
+                                    group_id,
+                                )
+                                .filter(|primary_node_id| *primary_node_id != *origin_id)
+                        {
+                            let remaining = deadline
+                                .checked_duration_since(tokio::time::Instant::now())
+                                .unwrap_or_default();
+                            if !remaining.is_zero() {
+                                let primary_events = route_materialized_events_via_node(
+                                    boundary.clone(),
+                                    primary_node_id,
+                                    params.clone(),
+                                    remaining,
+                                )
+                                .await?;
+                                if !selected_group_materialized_tree_payload_is_empty(
+                                    policy,
+                                    &primary_events,
+                                    group_id,
+                                ) {
+                                    return Ok(primary_events);
+                                }
+                            }
+                        }
                         if allow_empty_owner_retry
                             && selected_group_sink_status_reports_live_materialized_group(
                                 selected_group_sink_status.as_ref(),
@@ -2291,7 +2357,43 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                                 group_id,
                                 &events,
                             );
+                        let requires_primary_owner_reroute =
+                            selected_group_empty_ready_tree_requires_primary_owner_reroute(
+                                policy,
+                                &params,
+                                selected_group_sink_status.as_ref(),
+                                group_id,
+                                &events,
+                            );
                         if !requires_proxy_fallback {
+                            if requires_primary_owner_reroute
+                                && let Some(primary_node_id) =
+                                    sink_primary_owner_node_for_group(
+                                        selected_group_sink_status.as_ref(),
+                                        group_id,
+                                    )
+                                    .filter(|primary_node_id| *primary_node_id != node_id)
+                            {
+                                let remaining = deadline
+                                    .checked_duration_since(tokio::time::Instant::now())
+                                    .unwrap_or_default();
+                                if !remaining.is_zero() {
+                                    let primary_events = route_materialized_events_via_node(
+                                        boundary.clone(),
+                                        primary_node_id,
+                                        params.clone(),
+                                        remaining,
+                                    )
+                                    .await?;
+                                    if !selected_group_materialized_tree_payload_is_empty(
+                                        policy,
+                                        &primary_events,
+                                        group_id,
+                                    ) {
+                                        return Ok(primary_events);
+                                    }
+                                }
+                            }
                             if allow_empty_owner_retry
                                 && selected_group_sink_status_reports_live_materialized_group(
                                     selected_group_sink_status.as_ref(),
@@ -2444,13 +2546,46 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                         if remaining.is_zero() {
                             return Err(CnxError::Timeout);
                         }
-                        return query_materialized_events_via_generic_proxy(
+                        let proxy_events = query_materialized_events_via_generic_proxy(
                             boundary.clone(),
                             origin_id.clone(),
                             params.clone(),
                             remaining,
                         )
-                        .await;
+                        .await?;
+                        if selected_group_empty_ready_tree_requires_primary_owner_reroute(
+                            policy,
+                            &params,
+                            selected_group_sink_status.as_ref(),
+                            group_id,
+                            &proxy_events,
+                        ) && let Some(primary_node_id) = sink_primary_owner_node_for_group(
+                            selected_group_sink_status.as_ref(),
+                            group_id,
+                        )
+                        .filter(|primary_node_id| *primary_node_id != node_id)
+                        {
+                            let remaining = deadline
+                                .checked_duration_since(tokio::time::Instant::now())
+                                .unwrap_or_default();
+                            if !remaining.is_zero() {
+                                let primary_events = route_materialized_events_via_node(
+                                    boundary.clone(),
+                                    primary_node_id,
+                                    params.clone(),
+                                    remaining,
+                                )
+                                .await?;
+                                if !selected_group_materialized_tree_payload_is_empty(
+                                    policy,
+                                    &primary_events,
+                                    group_id,
+                                ) {
+                                    return Ok(primary_events);
+                                }
+                            }
+                        }
+                        return Ok(proxy_events);
                     }
                     Err(err) => return Err(err),
                 }
@@ -3927,7 +4062,7 @@ async fn build_tree_pit_session(
                                     proxy_retry_timeout,
                                 )
                                 .await
-                                && let Ok(proxy_response) =
+                                && let Ok(mut proxy_response) =
                                     decode_materialized_selected_group_response(
                                         &proxy_events,
                                         policy,
@@ -3935,6 +4070,17 @@ async fn build_tree_pit_session(
                                         &params.path,
                                     )
                             {
+                                if trusted_materialized_tree_payload_is_empty(&proxy_response)
+                                    && let Some(richer_response) =
+                                        decode_richer_same_path_materialized_selected_group_response(
+                                            &proxy_events,
+                                            policy,
+                                            &group_key,
+                                            &params.path,
+                                        )
+                                {
+                                    proxy_response = richer_response;
+                                }
                                 if debug_materialized_route_capture_enabled() {
                                     eprintln!(
                                         "fs_meta_query_api: pit_group_stage proxy_fallback_decode group={} root_exists={} entries={} has_children={}",
@@ -4822,6 +4968,23 @@ async fn collect_materialized_stats_groups(
             }
         };
         let targeted = decode_stats_groups(events, policy, Some(&group_id), read_class);
+        if read_class == ReadClass::TrustedMaterialized
+            && (params.path.is_empty() || params.path == b"/")
+            && selected_group_sink_status_reports_live_materialized_group(
+                request_sink_status,
+                &group_id,
+            )
+            && targeted
+                .get(&group_id)
+                .and_then(|group| group.get("data"))
+                .and_then(|data| data.get("total_nodes"))
+                .and_then(|value| value.as_u64())
+                == Some(0)
+        {
+            return Err(trusted_materialized_unavailable_selected_group_stats_error(
+                &group_id,
+            ));
+        }
         groups.insert(
             group_id.clone(),
             targeted
@@ -11692,6 +11855,229 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn selected_group_materialized_route_reroutes_to_sink_primary_object_ref_when_scheduled_owner_returns_empty_non_root_tree_for_ready_group()
+    {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let node_a_root = tmp.path().join("node-a");
+        let node_b_root = tmp.path().join("node-b");
+        fs::create_dir_all(node_a_root.join("nested")).expect("create node-a dir");
+        fs::create_dir_all(node_b_root.join("nested")).expect("create node-b dir");
+        let grants = vec![
+            GrantedMountRoot {
+                object_ref: "node-a::nfs4".to_string(),
+                host_ref: "node-a".to_string(),
+                host_ip: "10.0.0.1".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: std::collections::BTreeMap::new(),
+                mount_point: node_a_root.clone(),
+                fs_source: "nfs".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: Vec::new(),
+                interfaces: Vec::new(),
+                active: true,
+            },
+            GrantedMountRoot {
+                object_ref: "node-b::nfs4".to_string(),
+                host_ref: "node-b".to_string(),
+                host_ip: "10.0.0.2".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: std::collections::BTreeMap::new(),
+                mount_point: node_b_root.clone(),
+                fs_source: "nfs".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: Vec::new(),
+                interfaces: Vec::new(),
+                active: true,
+            },
+        ];
+        let source = source_facade_with_group("nfs4", &grants);
+        let sink = sink_facade_with_group(&grants);
+        let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+        let proxy_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
+            .expect("resolve sink-query-proxy route");
+        let node_a_route = sink_query_request_route_for("node-a");
+        let node_b_route = sink_query_request_route_for("node-b");
+
+        let mut stale_owner_endpoint = ManagedEndpointTask::spawn(
+            boundary.clone(),
+            node_b_route.clone(),
+            "test-stale-scheduled-owner-non-root-sink-query-endpoint",
+            CancellationToken::new(),
+            move |requests| async move {
+                let mut responses = Vec::new();
+                for req in requests {
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                        .expect("decode node-b query request");
+                    let group_id = params
+                        .scope
+                        .selected_group
+                        .clone()
+                        .expect("selected group for node-b request");
+                    responses.push(mk_event_with_correlation(
+                        &group_id,
+                        req.metadata()
+                            .correlation_id
+                            .expect("node-b request correlation"),
+                        empty_materialized_tree_payload_for_test(&params.scope.path),
+                    ));
+                }
+                responses
+            },
+        );
+        let mut primary_owner_endpoint = ManagedEndpointTask::spawn(
+            boundary.clone(),
+            node_a_route.clone(),
+            "test-primary-owner-non-root-sink-query-endpoint",
+            CancellationToken::new(),
+            move |requests| async move {
+                let mut responses = Vec::new();
+                for req in requests {
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                        .expect("decode node-a query request");
+                    let group_id = params
+                        .scope
+                        .selected_group
+                        .clone()
+                        .expect("selected group for node-a request");
+                    responses.push(mk_event_with_correlation(
+                        &group_id,
+                        req.metadata()
+                            .correlation_id
+                            .expect("node-a request correlation"),
+                        real_materialized_tree_payload_with_entries_for_test(
+                            &params.scope.path,
+                            &[b"/nested/peer.txt"],
+                        ),
+                    ));
+                }
+                responses
+            },
+        );
+        let mut proxy_endpoint = ManagedEndpointTask::spawn(
+            boundary.clone(),
+            proxy_route.clone(),
+            "test-empty-generic-proxy-non-root-sink-query-endpoint",
+            CancellationToken::new(),
+            move |requests| async move {
+                let mut responses = Vec::new();
+                for req in requests {
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                        .expect("decode proxy query request");
+                    let group_id = params
+                        .scope
+                        .selected_group
+                        .clone()
+                        .expect("selected group for proxy request");
+                    responses.push(mk_event_with_correlation(
+                        &group_id,
+                        req.metadata()
+                            .correlation_id
+                            .expect("proxy request correlation"),
+                        empty_materialized_tree_payload_for_test(&params.scope.path),
+                    ));
+                }
+                responses
+            },
+        );
+
+        let state = test_api_state_for_route_source(
+            source,
+            sink,
+            boundary.clone(),
+            NodeId("node-d".to_string()),
+        );
+        let selected_group_sink_status = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs4".to_string()],
+            )]),
+            groups: vec![crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs4".to_string(),
+                primary_object_ref: "node-a::nfs4".to_string(),
+                total_nodes: 7,
+                live_nodes: 6,
+                tombstoned_count: 1,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 1,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: true,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            }],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let result = query_materialized_events_with_selected_group_owner_snapshot(
+            &state,
+            &ProjectionPolicy::default(),
+            build_materialized_tree_request(
+                b"/nested",
+                true,
+                Some(1),
+                ReadClass::TrustedMaterialized,
+                Some("nfs4".to_string()),
+            ),
+            Duration::from_millis(1200),
+            Some(selected_group_sink_status),
+            true,
+            false,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "trusted-materialized selected-group route should reroute to the sink primary owner when the scheduled owner returns an empty non-root tree but sink status still reports a different ready primary; node_b_calls={} node_a_calls={} proxy_calls={} err={:?}",
+            boundary.send_batch_count(&node_b_route.0),
+            boundary.send_batch_count(&node_a_route.0),
+            boundary.send_batch_count(&proxy_route.0),
+            result.as_ref().err(),
+        );
+        let payload = decode_materialized_selected_group_response(
+            &result.expect("selected-group primary-owner reroute result"),
+            &ProjectionPolicy::default(),
+            "nfs4",
+            b"/nested",
+        )
+        .expect("decode selected-group primary-owner reroute response");
+        assert!(
+            payload.root.exists,
+            "ready sink status with a different primary_object_ref must not settle an empty scheduled-owner tree when the primary owner can still materialize `/nested`"
+        );
+        assert_eq!(
+            payload.entries.len(),
+            1,
+            "primary owner reroute should preserve the non-root subtree entry payload"
+        );
+        assert_eq!(
+            boundary.send_batch_count(&node_b_route.0),
+            1,
+            "stale scheduled owner should still be attempted first"
+        );
+        assert_eq!(
+            boundary.send_batch_count(&node_a_route.0),
+            1,
+            "sink primary object ref should receive one rerouted selected-group request for the non-root subtree"
+        );
+        assert_eq!(
+            boundary.send_batch_count(&proxy_route.0),
+            0,
+            "generic proxy should not be needed when the sink primary owner can satisfy the non-root reroute"
+        );
+
+        stale_owner_endpoint.shutdown(Duration::from_secs(2)).await;
+        primary_owner_endpoint.shutdown(Duration::from_secs(2)).await;
+        proxy_endpoint.shutdown(Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_stats_trusted_materialized_keeps_request_sink_snapshot_when_selected_group_stats_route_would_otherwise_drift()
     {
         let tmp = tempfile::tempdir().expect("create tempdir");
@@ -11974,6 +12360,122 @@ mod tests {
         source_status_endpoint.shutdown(Duration::from_secs(2)).await;
         primary_owner_endpoint.shutdown(Duration::from_secs(2)).await;
         stale_owner_endpoint.shutdown(Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_materialized_stats_groups_trusted_fails_closed_when_ready_root_stats_settle_zero()
+    {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let node_a_root = tmp.path().join("node-a");
+        fs::create_dir_all(node_a_root.join("layout-a")).expect("create node-a dir");
+        let grants = vec![GrantedMountRoot {
+            object_ref: "node-a::nfs4".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_a_root.clone(),
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        }];
+        let source = source_facade_with_group("nfs4", &grants);
+        let sink = sink_facade_with_group(&grants);
+        let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+        let node_a_route = sink_query_request_route_for("node-a");
+        let mut owner_endpoint = ManagedEndpointTask::spawn(
+            boundary.clone(),
+            node_a_route.clone(),
+            "test-trusted-root-zero-stats-owner-endpoint",
+            CancellationToken::new(),
+            move |requests| async move {
+                let mut responses = Vec::new();
+                for req in requests {
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                        .expect("decode node-a stats request");
+                    let group_id = params
+                        .scope
+                        .selected_group
+                        .clone()
+                        .expect("selected group for node-a stats request");
+                    let payload = rmp_serde::to_vec_named(&MaterializedQueryPayload::Stats(
+                        SubtreeStats::default(),
+                    ))
+                    .expect("encode zero stats payload");
+                    responses.push(mk_event_with_correlation(
+                        &group_id,
+                        req.metadata()
+                            .correlation_id
+                            .expect("node-a stats request correlation"),
+                        payload,
+                    ));
+                }
+                responses
+            },
+        );
+
+        let state = test_api_state_for_route_source(
+            source,
+            sink,
+            boundary,
+            NodeId("node-d".to_string()),
+        );
+        let request_sink_status = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs4".to_string()],
+            )]),
+            groups: vec![crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs4".to_string(),
+                primary_object_ref: "node-a::nfs4".to_string(),
+                total_nodes: 7,
+                live_nodes: 6,
+                tombstoned_count: 1,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 1,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: true,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            }],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let err = collect_materialized_stats_groups(
+            &state,
+            &ProjectionPolicy::default(),
+            &NormalizedApiParams {
+                path: b"/".to_vec(),
+                group: Some("nfs4".to_string()),
+                recursive: true,
+                max_depth: None,
+                pit_id: None,
+                group_order: GroupOrder::GroupKey,
+                group_page_size: None,
+                group_after: None,
+                entry_page_size: None,
+                entry_after: None,
+                read_class: Some(ReadClass::TrustedMaterialized),
+            },
+            ReadClass::TrustedMaterialized,
+            Some(&request_sink_status),
+        )
+        .await
+        .expect_err("trusted root stats must fail closed when a ready group settles zero stats");
+
+        assert!(
+            matches!(err, CnxError::NotReady(_)),
+            "trusted root stats with ready sink truth must fail closed as NotReady instead of rendering ok zero stats: {err:?}"
+        );
+
+        owner_endpoint.shutdown(Duration::from_secs(2)).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -18058,6 +18560,300 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_tree_pit_session_trusted_materialized_preserves_richer_later_ranked_non_root_proxy_payload_after_owner_timeout()
+    {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let root_a = tmp.path().join("node-a-nfs1");
+        let root_b = tmp.path().join("node-a-nfs2");
+        let root_c = tmp.path().join("node-b-nfs3");
+        fs::create_dir_all(&root_a).expect("create node-a nfs1 dir");
+        fs::create_dir_all(&root_b).expect("create node-a nfs2 dir");
+        fs::create_dir_all(&root_c).expect("create node-b nfs3 dir");
+        let grants = vec![
+            GrantedMountRoot {
+                object_ref: "node-a::nfs1".to_string(),
+                host_ref: "node-a".to_string(),
+                host_ip: "10.0.0.1".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: std::collections::BTreeMap::new(),
+                mount_point: root_a,
+                fs_source: "nfs1".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: Vec::new(),
+                interfaces: Vec::new(),
+                active: true,
+            },
+            GrantedMountRoot {
+                object_ref: "node-a::nfs2".to_string(),
+                host_ref: "node-a".to_string(),
+                host_ip: "10.0.0.2".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: std::collections::BTreeMap::new(),
+                mount_point: root_b,
+                fs_source: "nfs2".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: Vec::new(),
+                interfaces: Vec::new(),
+                active: true,
+            },
+            GrantedMountRoot {
+                object_ref: "node-b::nfs3".to_string(),
+                host_ref: "node-b".to_string(),
+                host_ip: "10.0.0.3".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: std::collections::BTreeMap::new(),
+                mount_point: root_c,
+                fs_source: "nfs3".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: Vec::new(),
+                interfaces: Vec::new(),
+                active: true,
+            },
+        ];
+        let source = source_facade_with_roots(
+            vec![
+                RootSpec::new("nfs1", "/unused"),
+                RootSpec::new("nfs2", "/unused"),
+                RootSpec::new("nfs3", "/unused"),
+            ],
+            &grants,
+        );
+        let sink = sink_facade_with_group(&grants);
+        let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+        let sink_status_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("resolve sink-status route");
+        let sink_status_payload = rmp_serde::to_vec_named(&SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([
+                ("node-a".to_string(), vec!["nfs1".to_string(), "nfs2".to_string()]),
+                ("node-b".to_string(), vec!["nfs3".to_string()]),
+            ]),
+            groups: vec![
+                sink_group_status("nfs1", true),
+                sink_group_status("nfs2", true),
+                sink_group_status("nfs3", true),
+            ],
+            ..SinkStatusSnapshot::default()
+        })
+        .expect("encode sink-status payload");
+        let mut sink_status_endpoint = ManagedEndpointTask::spawn(
+            boundary.clone(),
+            sink_status_route.clone(),
+            "test-trusted-later-ranked-non-root-proxy-rich-ready-sink-status-endpoint",
+            CancellationToken::new(),
+            move |requests| {
+                let sink_status_payload = sink_status_payload.clone();
+                async move {
+                    requests
+                        .into_iter()
+                        .map(|req| {
+                            mk_event_with_correlation(
+                                "node-d",
+                                req.metadata()
+                                    .correlation_id
+                                    .expect("sink-status request correlation"),
+                                sink_status_payload.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }
+            },
+        );
+        let proxy_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
+            .expect("resolve sink-query-proxy route");
+        let mut proxy_endpoint = ManagedEndpointTask::spawn(
+            boundary.clone(),
+            proxy_route.clone(),
+            "test-trusted-later-ranked-non-root-proxy-rich-then-empty-endpoint",
+            CancellationToken::new(),
+            move |requests| async move {
+                let mut responses = Vec::new();
+                for req in requests {
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                        .expect("decode proxy query request");
+                    let Some(group_id) = params.scope.selected_group.clone() else {
+                        continue;
+                    };
+                    let correlation = req
+                        .metadata()
+                        .correlation_id
+                        .expect("proxy request correlation");
+                    if group_id == "nfs3" {
+                        responses.push(Event::new(
+                            EventMetadata {
+                                origin_id: NodeId(group_id.clone()),
+                                timestamp_us: 1,
+                                logical_ts: None,
+                                correlation_id: Some(correlation),
+                                ingress_auth: None,
+                                trace: None,
+                            },
+                            Bytes::from(real_materialized_tree_payload_with_entries_for_test(
+                                &params.scope.path,
+                                &[b"/data/a.txt", b"/data/b.txt"],
+                            )),
+                        ));
+                        responses.push(Event::new(
+                            EventMetadata {
+                                origin_id: NodeId(group_id.clone()),
+                                timestamp_us: 2,
+                                logical_ts: None,
+                                correlation_id: Some(correlation),
+                                ingress_auth: None,
+                                trace: None,
+                            },
+                            Bytes::from(real_materialized_tree_payload_with_entries_for_test(
+                                &params.scope.path,
+                                &[b"/data/a.txt", b"/data/b.txt"],
+                            )),
+                        ));
+                        responses.push(Event::new(
+                            EventMetadata {
+                                origin_id: NodeId(group_id.clone()),
+                                timestamp_us: 3,
+                                logical_ts: None,
+                                correlation_id: Some(correlation),
+                                ingress_auth: None,
+                                trace: None,
+                            },
+                            Bytes::from(empty_materialized_tree_payload_for_test(&params.scope.path)),
+                        ));
+                    } else {
+                        responses.push(mk_event_with_correlation(
+                            &group_id,
+                            correlation,
+                            real_materialized_tree_payload_with_entries_for_test(
+                                &params.scope.path,
+                                &[b"/data/a.txt", b"/data/b.txt"],
+                            ),
+                        ));
+                    }
+                }
+                responses
+            },
+        );
+        let owner_a_route = sink_query_request_route_for("node-a");
+        let mut owner_a_endpoint = ManagedEndpointTask::spawn(
+            boundary.clone(),
+            owner_a_route.clone(),
+            "test-trusted-later-ranked-non-root-proxy-rich-owner-a-endpoint",
+            CancellationToken::new(),
+            move |requests| async move {
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                            .expect("decode owner-a query request");
+                        let group_id = params
+                            .scope
+                            .selected_group
+                            .clone()
+                            .expect("selected group for owner-a request");
+                        mk_event_with_correlation(
+                            &group_id,
+                            req.metadata()
+                                .correlation_id
+                                .expect("owner-a request correlation"),
+                            real_materialized_tree_payload_with_entries_for_test(
+                                &params.scope.path,
+                                &[b"/data/a.txt", b"/data/b.txt"],
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+        );
+        let owner_b_route = sink_query_request_route_for("node-b");
+        let mut owner_b_endpoint = ManagedEndpointTask::spawn(
+            boundary.clone(),
+            owner_b_route.clone(),
+            "test-trusted-later-ranked-non-root-proxy-rich-owner-b-timeout-endpoint",
+            CancellationToken::new(),
+            move |_requests| async move {
+                tokio::time::sleep(Duration::from_millis(3_000)).await;
+                Vec::<Event>::new()
+            },
+        );
+        let state =
+            test_api_state_for_route_source(source, sink, boundary, NodeId("node-d".to_string()));
+        let params = NormalizedApiParams {
+            path: b"/data".to_vec(),
+            group: None,
+            recursive: false,
+            max_depth: None,
+            pit_id: None,
+            group_order: GroupOrder::GroupKey,
+            group_page_size: Some(3),
+            group_after: None,
+            entry_page_size: Some(ENTRY_PAGE_SIZE_DEFAULT),
+            entry_after: None,
+            read_class: Some(ReadClass::TrustedMaterialized),
+        };
+        let request_sink_status = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([
+                ("node-a".to_string(), vec!["nfs1".to_string(), "nfs2".to_string()]),
+                ("node-b".to_string(), vec!["nfs3".to_string()]),
+            ]),
+            groups: vec![
+                sink_group_status("nfs1", true),
+                sink_group_status("nfs2", true),
+                sink_group_status("nfs3", true),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let session = tokio::time::timeout(
+            Duration::from_secs(6),
+            build_tree_pit_session(
+                &state,
+                &ProjectionPolicy::default(),
+                &params,
+                Duration::from_millis(3400),
+                ObservationStatus::trusted_materialized(),
+                Some(&request_sink_status),
+            ),
+        )
+        .await
+        .expect("trusted later-ranked non-root proxy rich fallback should settle within the PIT budget")
+        .expect("build tree pit session");
+
+        assert_eq!(session.groups.len(), 3);
+        let group_roots = session
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.group.clone(),
+                    group.root
+                        .as_ref()
+                        .map(|root| (root.exists, root.path.clone(), group.entries.len())),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            group_roots,
+            vec![
+                ("nfs1".to_string(), Some((true, b"/data".to_vec(), 2))),
+                ("nfs2".to_string(), Some((true, b"/data".to_vec(), 2))),
+                ("nfs3".to_string(), Some((true, b"/data".to_vec(), 2))),
+            ],
+            "trusted later-ranked non-root proxy fallback must preserve a richer same-batch payload instead of letting a later empty root overwrite it after owner timeout: {group_roots:?}"
+        );
+
+        sink_status_endpoint.shutdown(Duration::from_secs(2)).await;
+        proxy_endpoint.shutdown(Duration::from_secs(2)).await;
+        owner_a_endpoint.shutdown(Duration::from_secs(2)).await;
+        owner_b_endpoint.shutdown(Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn build_tree_pit_session_trusted_materialized_preserves_richer_first_ranked_exact_file_payload_when_same_batch_also_contains_empty_root()
     {
         let tmp = tempfile::tempdir().expect("create tempdir");
@@ -20802,6 +21598,303 @@ mod tests {
             owner_a_calls.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "first-ranked non-root trusted subtree should retry the owner once before accepting later groups"
+        );
+
+        sink_status_endpoint.shutdown(Duration::from_secs(2)).await;
+        proxy_endpoint.shutdown(Duration::from_secs(2)).await;
+        owner_a_endpoint.shutdown(Duration::from_secs(2)).await;
+        owner_b_endpoint.shutdown(Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_tree_pit_session_trusted_materialized_retries_empty_first_ranked_group_for_non_root_subtree_with_max_depth_once()
+    {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let root_a = tmp.path().join("node-a-nfs1");
+        let root_b = tmp.path().join("node-a-nfs2");
+        let root_c = tmp.path().join("node-b-nfs3");
+        fs::create_dir_all(&root_a).expect("create node-a nfs1 dir");
+        fs::create_dir_all(&root_b).expect("create node-a nfs2 dir");
+        fs::create_dir_all(&root_c).expect("create node-b nfs3 dir");
+        let grants = vec![
+            GrantedMountRoot {
+                object_ref: "node-a::nfs1".to_string(),
+                host_ref: "node-a".to_string(),
+                host_ip: "10.0.0.1".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: std::collections::BTreeMap::new(),
+                mount_point: root_a,
+                fs_source: "nfs1".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: Vec::new(),
+                interfaces: Vec::new(),
+                active: true,
+            },
+            GrantedMountRoot {
+                object_ref: "node-a::nfs2".to_string(),
+                host_ref: "node-a".to_string(),
+                host_ip: "10.0.0.2".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: std::collections::BTreeMap::new(),
+                mount_point: root_b,
+                fs_source: "nfs2".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: Vec::new(),
+                interfaces: Vec::new(),
+                active: true,
+            },
+            GrantedMountRoot {
+                object_ref: "node-b::nfs3".to_string(),
+                host_ref: "node-b".to_string(),
+                host_ip: "10.0.0.3".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: std::collections::BTreeMap::new(),
+                mount_point: root_c,
+                fs_source: "nfs3".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: Vec::new(),
+                interfaces: Vec::new(),
+                active: true,
+            },
+        ];
+        let source = source_facade_with_roots(
+            vec![
+                RootSpec::new("nfs1", "/unused"),
+                RootSpec::new("nfs2", "/unused"),
+                RootSpec::new("nfs3", "/unused"),
+            ],
+            &grants,
+        );
+        let sink = sink_facade_with_group(&grants);
+        let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+        let sink_status_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("resolve sink-status route");
+        let sink_status_payload = rmp_serde::to_vec_named(&SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([
+                ("node-a".to_string(), vec!["nfs1".to_string(), "nfs2".to_string()]),
+                ("node-b".to_string(), vec!["nfs3".to_string()]),
+            ]),
+            groups: vec![
+                sink_group_status("nfs1", true),
+                sink_group_status("nfs2", true),
+                sink_group_status("nfs3", true),
+            ],
+            ..SinkStatusSnapshot::default()
+        })
+        .expect("encode sink-status payload");
+        let mut sink_status_endpoint = ManagedEndpointTask::spawn(
+            boundary.clone(),
+            sink_status_route.clone(),
+            "test-trusted-subtree-max-depth-ready-sink-status-endpoint",
+            CancellationToken::new(),
+            move |requests| {
+                let sink_status_payload = sink_status_payload.clone();
+                async move {
+                    requests
+                        .into_iter()
+                        .map(|req| {
+                            mk_event_with_correlation(
+                                "node-d",
+                                req.metadata()
+                                    .correlation_id
+                                    .expect("sink-status request correlation"),
+                                sink_status_payload.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }
+            },
+        );
+        let proxy_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
+            .expect("resolve sink-query-proxy route");
+        let mut proxy_endpoint = ManagedEndpointTask::spawn(
+            boundary.clone(),
+            proxy_route.clone(),
+            "test-trusted-subtree-max-depth-proxy-endpoint",
+            CancellationToken::new(),
+            move |requests| async move {
+                requests
+                    .into_iter()
+                    .filter_map(|req| {
+                        let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                            .expect("decode proxy query request");
+                        let group_id = params.scope.selected_group?;
+                        let payload = if group_id == "nfs1" {
+                            real_materialized_tree_payload_with_entries_for_test(
+                                &params.scope.path,
+                                &[b"/nested/child"],
+                            )
+                        } else if group_id == "nfs2" {
+                            real_materialized_tree_payload_with_entries_for_test(
+                                &params.scope.path,
+                                &[b"/nested/peer.txt"],
+                            )
+                        } else {
+                            empty_materialized_tree_payload_for_test(&params.scope.path)
+                        };
+                        Some(mk_event_with_correlation(
+                            &group_id,
+                            req.metadata()
+                                .correlation_id
+                                .expect("proxy request correlation"),
+                            payload,
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            },
+        );
+        let owner_a_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner_a_calls_for_handler = owner_a_calls.clone();
+        let owner_a_route = sink_query_request_route_for("node-a");
+        let mut owner_a_endpoint = ManagedEndpointTask::spawn(
+            boundary.clone(),
+            owner_a_route.clone(),
+            "test-trusted-subtree-max-depth-owner-a-endpoint",
+            CancellationToken::new(),
+            move |requests| {
+                let owner_a_calls = owner_a_calls_for_handler.clone();
+                async move {
+                    let mut responses = Vec::new();
+                    for req in requests {
+                        let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                            .expect("decode owner-a query request");
+                        let group_id = params
+                            .scope
+                            .selected_group
+                            .clone()
+                            .expect("selected group for owner-a request");
+                        let nth = owner_a_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let payload = if group_id == "nfs1" && nth == 0 {
+                            empty_materialized_tree_payload_for_test(&params.scope.path)
+                        } else if group_id == "nfs1" {
+                            real_materialized_tree_payload_with_entries_for_test(
+                                &params.scope.path,
+                                &[b"/nested/child"],
+                            )
+                        } else {
+                            real_materialized_tree_payload_with_entries_for_test(
+                                &params.scope.path,
+                                &[b"/nested/peer.txt"],
+                            )
+                        };
+                        responses.push(mk_event_with_correlation(
+                            &group_id,
+                            req.metadata()
+                                .correlation_id
+                                .expect("owner-a request correlation"),
+                            payload,
+                        ));
+                    }
+                    responses
+                }
+            },
+        );
+        let owner_b_route = sink_query_request_route_for("node-b");
+        let mut owner_b_endpoint = ManagedEndpointTask::spawn(
+            boundary.clone(),
+            owner_b_route.clone(),
+            "test-trusted-subtree-max-depth-owner-b-endpoint",
+            CancellationToken::new(),
+            move |requests| async move {
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                            .expect("decode owner-b query request");
+                        let group_id = params
+                            .scope
+                            .selected_group
+                            .clone()
+                            .expect("selected group for owner-b request");
+                        mk_event_with_correlation(
+                            &group_id,
+                            req.metadata()
+                                .correlation_id
+                                .expect("owner-b request correlation"),
+                            empty_materialized_tree_payload_for_test(&params.scope.path),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+        );
+        let state =
+            test_api_state_for_route_source(source, sink, boundary, NodeId("node-d".to_string()));
+        let params = NormalizedApiParams {
+            path: b"/nested".to_vec(),
+            group: None,
+            recursive: true,
+            max_depth: Some(1),
+            pit_id: None,
+            group_order: GroupOrder::GroupKey,
+            group_page_size: Some(3),
+            group_after: None,
+            entry_page_size: Some(ENTRY_PAGE_SIZE_DEFAULT),
+            entry_after: None,
+            read_class: Some(ReadClass::TrustedMaterialized),
+        };
+        let request_sink_status = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([
+                ("node-a".to_string(), vec!["nfs1".to_string(), "nfs2".to_string()]),
+                ("node-b".to_string(), vec!["nfs3".to_string()]),
+            ]),
+            groups: vec![
+                sink_group_status("nfs1", true),
+                sink_group_status("nfs2", true),
+                sink_group_status("nfs3", true),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let session = tokio::time::timeout(
+            Duration::from_secs(6),
+            build_tree_pit_session(
+                &state,
+                &ProjectionPolicy::default(),
+                &params,
+                Duration::from_millis(3400),
+                ObservationStatus::trusted_materialized(),
+                Some(&request_sink_status),
+            ),
+        )
+        .await
+        .expect("trusted non-root max-depth subtree retry should settle within the PIT budget")
+        .expect("build tree pit session");
+
+        assert_eq!(session.groups.len(), 3);
+        let group_roots = session
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.group.clone(),
+                    group
+                        .root
+                        .as_ref()
+                        .map(|root| (root.exists, root.path.clone(), group.entries.len())),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            group_roots,
+            vec![
+                ("nfs1".to_string(), Some((true, b"/nested".to_vec(), 1))),
+                ("nfs2".to_string(), Some((true, b"/nested".to_vec(), 1))),
+                ("nfs3".to_string(), Some((false, b"/nested".to_vec(), 0))),
+            ],
+            "trusted-ready non-root max-depth subtree should retry a transient empty first-ranked owner result instead of settling an empty root: {group_roots:?}"
+        );
+        assert_eq!(
+            owner_a_calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "first-ranked max-depth trusted subtree should retry the owner once before accepting later groups"
         );
 
         sink_status_endpoint.shutdown(Duration::from_secs(2)).await;

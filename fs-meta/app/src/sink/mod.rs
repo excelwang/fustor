@@ -4184,6 +4184,222 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alternating_scope_wobble_preserves_ready_materialized_state_for_all_groups() {
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![
+            RootSpec::new("root-a", "/mnt/nfs1"),
+            RootSpec::new("root-b", "/mnt/nfs2"),
+        ];
+        cfg.host_object_grants = vec![
+            granted_mount_root("node-a::exp-a", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+            granted_mount_root("node-b::exp-b", "node-b", "10.0.0.12", "/mnt/nfs2", true),
+        ];
+        let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
+            .expect("init sink");
+
+        let activate_both =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("root-a", &["node-a::exp-a"]),
+                    bound_scope_with_resources("root-b", &["node-b::exp-b"]),
+                ],
+            }))
+            .expect("encode activate both");
+        sink.on_control_frame(&[activate_both])
+            .await
+            .expect("activate both should pass");
+
+        sink.ingest_stream_events(&[
+            mk_control_event(
+                "node-a::exp-a",
+                ControlEvent::EpochStart {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                1,
+            ),
+            mk_source_event(
+                "node-a::exp-a",
+                mk_record(b"/ready-a.txt", "ready-a.txt", 2, EventKind::Update),
+            ),
+            mk_control_event(
+                "node-a::exp-a",
+                ControlEvent::EpochEnd {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                3,
+            ),
+            mk_control_event(
+                "node-b::exp-b",
+                ControlEvent::EpochStart {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                4,
+            ),
+            mk_source_event(
+                "node-b::exp-b",
+                mk_record(b"/ready-b.txt", "ready-b.txt", 5, EventKind::Update),
+            ),
+            mk_control_event(
+                "node-b::exp-b",
+                ControlEvent::EpochEnd {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                6,
+            ),
+        ])
+        .expect("seed ready stream-applied state for both groups");
+
+        let snapshot_before = sink.status_snapshot().expect("status before alternating wobble");
+        let before_groups = snapshot_before
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.group_id.clone(),
+                    (
+                        group.initial_audit_completed,
+                        group.live_nodes,
+                        group.materialized_revision,
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            before_groups.get("root-a").map(|row| row.0),
+            Some(true),
+            "precondition: root-a must be ready before alternating scope wobble: {snapshot_before:?}"
+        );
+        assert_eq!(
+            before_groups.get("root-b").map(|row| row.0),
+            Some(true),
+            "precondition: root-b must be ready before alternating scope wobble: {snapshot_before:?}"
+        );
+        assert!(
+            before_groups.get("root-a").is_some_and(|row| row.1 > 0),
+            "precondition: root-a must have live materialized nodes before alternating scope wobble: {snapshot_before:?}"
+        );
+        assert!(
+            before_groups.get("root-b").is_some_and(|row| row.1 > 0),
+            "precondition: root-b must have live materialized nodes before alternating scope wobble: {snapshot_before:?}"
+        );
+
+        let activate_root_a_only =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 2,
+                bound_scopes: vec![bound_scope_with_resources("root-a", &["node-a::exp-a"])],
+            }))
+            .expect("encode activate root-a only");
+        sink.on_control_frame(&[activate_root_a_only])
+            .await
+            .expect("activate root-a only should pass");
+
+        let reactivate_both =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 3,
+                expires_at_ms: 3,
+                bound_scopes: vec![
+                    bound_scope_with_resources("root-a", &["node-a::exp-a"]),
+                    bound_scope_with_resources("root-b", &["node-b::exp-b"]),
+                ],
+            }))
+            .expect("encode reactivate both");
+        sink.on_control_frame(&[reactivate_both])
+            .await
+            .expect("reactivate both should pass");
+
+        let activate_root_b_only =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 4,
+                expires_at_ms: 4,
+                bound_scopes: vec![bound_scope_with_resources("root-b", &["node-b::exp-b"])],
+            }))
+            .expect("encode activate root-b only");
+        sink.on_control_frame(&[activate_root_b_only])
+            .await
+            .expect("activate root-b only should pass");
+
+        let reactivate_both_again =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 5,
+                expires_at_ms: 5,
+                bound_scopes: vec![
+                    bound_scope_with_resources("root-a", &["node-a::exp-a"]),
+                    bound_scope_with_resources("root-b", &["node-b::exp-b"]),
+                ],
+            }))
+            .expect("encode reactivate both again");
+        sink.on_control_frame(&[reactivate_both_again])
+            .await
+            .expect("reactivate both again should pass");
+
+        let snapshot_after = sink.status_snapshot().expect("status after alternating wobble");
+        let after_groups = snapshot_after
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.group_id.clone(),
+                    (
+                        group.initial_audit_completed,
+                        group.live_nodes,
+                        group.materialized_revision,
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            after_groups.get("root-a").map(|row| row.0),
+            Some(true),
+            "ready root-a must stay ready across alternating single-group runtime scope wobble instead of regressing to initial_audit_completed=false: {snapshot_after:?}"
+        );
+        assert_eq!(
+            after_groups.get("root-b").map(|row| row.0),
+            Some(true),
+            "ready root-b must stay ready across alternating single-group runtime scope wobble instead of regressing to initial_audit_completed=false: {snapshot_after:?}"
+        );
+        assert!(
+            after_groups.get("root-a").is_some_and(|row| row.1 > 0),
+            "ready root-a must keep live materialized nodes across alternating scope wobble instead of regressing to live_nodes=0: {snapshot_after:?}"
+        );
+        assert!(
+            after_groups.get("root-b").is_some_and(|row| row.1 > 0),
+            "ready root-b must keep live materialized nodes across alternating scope wobble instead of regressing to live_nodes=0: {snapshot_after:?}"
+        );
+        assert_eq!(
+            after_groups.get("root-a").map(|row| row.2),
+            before_groups.get("root-a").map(|row| row.2),
+            "root-a materialized revision must survive alternating scope wobble instead of resetting from scratch: {snapshot_after:?}"
+        );
+        assert_eq!(
+            after_groups.get("root-b").map(|row| row.2),
+            before_groups.get("root-b").map(|row| row.2),
+            "root-b materialized revision must survive alternating scope wobble instead of resetting from scratch: {snapshot_after:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn logical_roots_window_missing_group_does_not_reset_ready_state_on_readd() {
         let mut cfg = SourceConfig::default();
         cfg.roots = vec![

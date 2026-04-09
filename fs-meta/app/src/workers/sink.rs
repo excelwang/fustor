@@ -1261,6 +1261,44 @@ impl SinkWorkerClientHandle {
                 })
         }
 
+        fn snapshot_looks_partially_stale_split(snapshot: &SinkStatusSnapshot) -> bool {
+            let scheduled_groups = snapshot
+                .scheduled_groups_by_node
+                .values()
+                .flat_map(|groups| groups.iter().cloned())
+                .collect::<std::collections::BTreeSet<_>>();
+            if scheduled_groups.is_empty() {
+                return false;
+            }
+            let groups_by_id = snapshot
+                .groups
+                .iter()
+                .map(|group| (group.group_id.as_str(), group))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let mut any_ready = false;
+            let mut any_zero = false;
+            for group_id in scheduled_groups {
+                match groups_by_id.get(group_id.as_str()) {
+                    Some(group)
+                        if !group.initial_audit_completed
+                            && group.live_nodes == 0
+                            && group.total_nodes == 0 =>
+                    {
+                        any_zero = true;
+                    }
+                    Some(group)
+                        if group.initial_audit_completed
+                            || group.live_nodes > 0
+                            || group.total_nodes > 0 =>
+                    {
+                        any_ready = true;
+                    }
+                    Some(_) | None => {}
+                }
+            }
+            any_ready && any_zero
+        }
+
         #[cfg(test)]
         if take_sink_worker_status_nonblocking_cache_fallback_hook() {
             let snapshot = self.cached_status_snapshot()?;
@@ -1275,7 +1313,9 @@ impl SinkWorkerClientHandle {
         }
         if self.control_op_inflight() {
             let snapshot = self.cached_status_snapshot()?;
-            if snapshot_looks_stale_empty(&snapshot) {
+            if snapshot_looks_stale_empty(&snapshot)
+                || snapshot_looks_partially_stale_split(&snapshot)
+            {
                 if self.existing_client().await?.is_some() {
                     if let Ok(mut live_snapshot) = self
                         .status_snapshot_with_timeout(Duration::from_millis(250))
@@ -1339,31 +1379,58 @@ impl SinkWorkerClientHandle {
                     }
                     self.update_cached_status_snapshot(snapshot.clone())?;
                     Ok(snapshot)
-                }
+                    }
                     Err(err) => {
                     let snapshot = self.cached_status_snapshot()?;
-                    if debug_control_scope_capture_enabled() {
-                        eprintln!(
-                            "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=worker_unavailable err={} {}",
-                            self.node_id.0,
-                            err,
-                            summarize_sink_status_snapshot(&snapshot)
-                        );
+                    if snapshot_looks_stale_empty(&snapshot)
+                        || snapshot_looks_partially_stale_split(&snapshot)
+                    {
+                        if debug_control_scope_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=worker_unavailable_stale_cache err={} {}",
+                                self.node_id.0,
+                                err,
+                                summarize_sink_status_snapshot(&snapshot)
+                            );
+                        }
+                        Err(err)
+                    } else {
+                        if debug_control_scope_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=worker_unavailable err={} {}",
+                                self.node_id.0,
+                                err,
+                                summarize_sink_status_snapshot(&snapshot)
+                            );
+                        }
+                        Ok(snapshot)
                     }
-                    Ok(snapshot)
                     }
                 }
             }
             None => {
                 let snapshot = self.cached_status_snapshot()?;
-                if debug_control_scope_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=not_started {}",
-                        self.node_id.0,
-                        summarize_sink_status_snapshot(&snapshot)
-                    );
+                if snapshot_looks_stale_empty(&snapshot)
+                    || snapshot_looks_partially_stale_split(&snapshot)
+                {
+                    if debug_control_scope_capture_enabled() {
+                        eprintln!(
+                            "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=not_started_stale_cache {}",
+                            self.node_id.0,
+                            summarize_sink_status_snapshot(&snapshot)
+                        );
+                    }
+                    Err(CnxError::Timeout)
+                } else {
+                    if debug_control_scope_capture_enabled() {
+                        eprintln!(
+                            "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=not_started {}",
+                            self.node_id.0,
+                            summarize_sink_status_snapshot(&snapshot)
+                        );
+                    }
+                    Ok(snapshot)
                 }
-                Ok(snapshot)
             }
         }
     }
@@ -3434,8 +3501,257 @@ mod tests {
                 .groups
                 .iter()
                 .find(|group| group.group_id == "nfs1")
-                .is_some_and(|group| group.initial_audit_completed && group.live_nodes > 0),
-            "status_snapshot_nonblocking must keep the ready materialized group visible even while control is merely marked inflight: {snapshot:?}"
+                .is_some_and(|group| group.live_nodes > 0 && group.total_nodes > 0),
+            "status_snapshot_nonblocking must keep the materialized group visible instead of regressing to a stale empty cache while control is merely marked inflight: {snapshot:?}"
+        );
+
+        source.close().await.expect("close source");
+        sink.close().await.expect("close sink worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache_when_control_is_marked_inflight()
+    {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed-a.txt"), b"a")
+            .expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed-b.txt"), b"b")
+            .expect("seed nfs2");
+
+        let cfg = SourceConfig {
+            roots: vec![sink_worker_root("nfs1", &nfs1), sink_worker_root("nfs2", &nfs2)],
+            host_object_grants: vec![
+                sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-d".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let sink = SinkWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+            .await
+            .expect("sink worker start timed out")
+            .expect("start sink worker");
+
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                ],
+            }))
+            .expect("encode sink activate"),
+        ])
+        .await
+        .expect("apply sink control before nonblocking status");
+
+        let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while tokio::time::Instant::now() < materialized_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let snapshot = sink.status_snapshot().await.expect("live sink snapshot");
+            let both_ready = snapshot
+                .groups
+                .iter()
+                .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
+                .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            if both_ready {
+                break;
+            }
+        }
+
+        let live_snapshot = sink.status_snapshot().await.expect("snapshot after materialization");
+        assert!(
+            live_snapshot
+                .groups
+                .iter()
+                .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
+                .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            "precondition: both nfs1 and nfs2 must be ready before seeding a split stale cache: {live_snapshot:?}"
+        );
+
+        let mut stale_snapshot = live_snapshot.clone();
+        stale_snapshot.scheduled_groups_by_node =
+            std::collections::BTreeMap::from([(
+                "node-d".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]);
+        for group in &mut stale_snapshot.groups {
+            if group.group_id == "nfs1" {
+                group.initial_audit_completed = false;
+                group.live_nodes = 0;
+                group.total_nodes = 0;
+                group.shadow_time_us = 0;
+            }
+        }
+        sink.update_cached_status_snapshot(stale_snapshot.clone())
+            .expect("seed split stale cache");
+
+        let _inflight = sink.begin_control_op();
+        let snapshot = sink
+            .status_snapshot_nonblocking()
+            .await
+            .expect("status_snapshot_nonblocking during synthetic control inflight");
+
+        assert!(
+            snapshot
+                .groups
+                .iter()
+                .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
+                .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            "status_snapshot_nonblocking must not return a partially stale split cache where one scheduled group regressed to zero while another stayed ready: stale={stale_snapshot:?} live={live_snapshot:?} returned={snapshot:?}"
+        );
+
+        source.close().await.expect("close source");
+        sink.close().await.expect("close sink worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache_when_worker_unavailable()
+    {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed-a.txt"), b"a")
+            .expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed-b.txt"), b"b")
+            .expect("seed nfs2");
+
+        let cfg = SourceConfig {
+            roots: vec![sink_worker_root("nfs1", &nfs1), sink_worker_root("nfs2", &nfs2)],
+            host_object_grants: vec![
+                sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-d".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let sink = SinkWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+            .await
+            .expect("sink worker start timed out")
+            .expect("start sink worker");
+
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                ],
+            }))
+            .expect("encode sink activate"),
+        ])
+        .await
+        .expect("apply sink control before nonblocking status");
+
+        let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while tokio::time::Instant::now() < materialized_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let snapshot = sink.status_snapshot().await.expect("live sink snapshot");
+            let both_ready = snapshot
+                .groups
+                .iter()
+                .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
+                .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            if both_ready {
+                break;
+            }
+        }
+
+        let live_snapshot = sink.status_snapshot().await.expect("snapshot after materialization");
+        assert!(
+            live_snapshot
+                .groups
+                .iter()
+                .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
+                .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            "precondition: both nfs1 and nfs2 must be ready before seeding a split stale cache: {live_snapshot:?}"
+        );
+
+        let mut stale_snapshot = live_snapshot.clone();
+        stale_snapshot.scheduled_groups_by_node =
+            std::collections::BTreeMap::from([(
+                "node-d".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]);
+        for group in &mut stale_snapshot.groups {
+            if group.group_id == "nfs1" {
+                group.initial_audit_completed = false;
+                group.live_nodes = 0;
+                group.total_nodes = 0;
+                group.shadow_time_us = 0;
+                group.materialized_revision = 1;
+            }
+        }
+        sink.update_cached_status_snapshot(stale_snapshot.clone())
+            .expect("seed split stale cache");
+
+        let _reset = SinkWorkerStatusErrorHookReset;
+        install_sink_worker_status_error_hook(SinkWorkerStatusErrorHook {
+            err: CnxError::Internal("synthetic non-retryable sink status failure".to_string()),
+        });
+
+        let err = sink
+            .status_snapshot_nonblocking()
+            .await
+            .expect_err("status_snapshot_nonblocking must not return a partially stale split cache when the live worker status call failed");
+
+        assert!(
+            matches!(err, CnxError::Internal(ref message) if message.contains("synthetic non-retryable sink status failure")),
+            "worker-unavailable path should propagate the live status error instead of returning a contradictory split cached snapshot: {err:?}"
         );
 
         source.close().await.expect("close source");
@@ -4781,6 +5097,250 @@ mod tests {
         );
 
         client.close().await.expect("close sink worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn update_logical_roots_does_not_clear_cached_ready_status_for_surviving_groups() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed-a.txt"), b"a")
+            .expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed-b.txt"), b"b")
+            .expect("seed nfs2");
+
+        let cfg = SourceConfig {
+            roots: vec![sink_worker_root("nfs1", &nfs1), sink_worker_root("nfs2", &nfs2)],
+            host_object_grants: vec![
+                sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-d".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SinkWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg,
+                external_sink_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct sink worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.ensure_started())
+            .await
+            .expect("sink worker start timed out")
+            .expect("start sink worker");
+
+        client
+            .on_control_frame(vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: ROUTE_KEY_QUERY.to_string(),
+                    unit_id: "runtime.exec.sink".to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                    ],
+                }))
+                .expect("encode sink activate"),
+            ])
+            .await
+            .expect("apply sink control");
+
+        let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while tokio::time::Instant::now() < materialized_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => client.send(batch).await.expect("apply source batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let snapshot = client.status_snapshot().await.expect("live sink snapshot");
+            let both_ready = snapshot
+                .groups
+                .iter()
+                .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
+                .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            if both_ready {
+                break;
+            }
+        }
+
+        let primed_snapshot = client
+            .status_snapshot()
+            .await
+            .expect("primed live sink status snapshot");
+        assert!(
+            primed_snapshot
+                .groups
+                .iter()
+                .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
+                .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            "precondition: both groups must be ready before worker roots update: {primed_snapshot:?}"
+        );
+
+        client
+            .update_logical_roots(
+                vec![sink_worker_root("nfs1", &nfs1), sink_worker_root("nfs2", &nfs2)],
+                vec![
+                    sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                    sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+                ],
+            )
+            .await
+            .expect("worker update_logical_roots");
+
+        let cached = client
+            .cached_status_snapshot()
+            .expect("cached status after update_logical_roots");
+        assert!(
+            cached
+                .groups
+                .iter()
+                .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
+                .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            "update_logical_roots must not clear the cached ready sink status for surviving groups: before={primed_snapshot:?} after={cached:?}"
+        );
+
+        source.close().await.expect("close source");
+        client.close().await.expect("close sink worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache_when_worker_not_started()
+    {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed-a.txt"), b"a")
+            .expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed-b.txt"), b"b")
+            .expect("seed nfs2");
+
+        let cfg = SourceConfig {
+            roots: vec![sink_worker_root("nfs1", &nfs1), sink_worker_root("nfs2", &nfs2)],
+            host_object_grants: vec![
+                sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-d".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let sink = SinkWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+            .await
+            .expect("sink worker start timed out")
+            .expect("start sink worker");
+
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                ],
+            }))
+            .expect("encode sink activate"),
+        ])
+        .await
+        .expect("apply sink control before nonblocking status");
+
+        let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while tokio::time::Instant::now() < materialized_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let snapshot = sink.status_snapshot().await.expect("live sink snapshot");
+            let both_ready = snapshot
+                .groups
+                .iter()
+                .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
+                .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            if both_ready {
+                break;
+            }
+        }
+
+        let live_snapshot = sink.status_snapshot().await.expect("snapshot after materialization");
+        assert!(
+            live_snapshot
+                .groups
+                .iter()
+                .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
+                .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            "precondition: both nfs1 and nfs2 must be ready before seeding a split stale cache: {live_snapshot:?}"
+        );
+
+        let mut stale_snapshot = live_snapshot.clone();
+        stale_snapshot.scheduled_groups_by_node =
+            std::collections::BTreeMap::from([(
+                "node-d".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]);
+        for group in &mut stale_snapshot.groups {
+            if group.group_id == "nfs1" {
+                group.initial_audit_completed = false;
+                group.live_nodes = 0;
+                group.total_nodes = 0;
+                group.shadow_time_us = 0;
+                group.materialized_revision = 1;
+            }
+        }
+        sink.update_cached_status_snapshot(stale_snapshot.clone())
+            .expect("seed split stale cache");
+
+        sink.shutdown_shared_worker_for_tests(Duration::from_secs(2))
+            .await
+            .expect("shutdown worker to force not-started cache path");
+
+        let err = sink
+            .status_snapshot_nonblocking()
+            .await
+            .expect_err("status_snapshot_nonblocking must not return a partially stale split cache when no live worker is available");
+
+        assert!(
+            matches!(err, CnxError::Timeout | CnxError::TransportClosed(_) | CnxError::ProtocolViolation(_) | CnxError::Internal(_)),
+            "not-started path should fail closed instead of returning a contradictory split cached snapshot: {err:?}"
+        );
+
+        source.close().await.expect("close source");
+        sink.close().await.expect("close sink worker");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
