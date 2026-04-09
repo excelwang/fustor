@@ -11,6 +11,7 @@ use fs_meta::{RootSelector, RootSpec};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1229,6 +1230,146 @@ fn install_baseline_resources(
     Ok(())
 }
 
+fn assert_baseline_mounts_live(lab: &NfsLab) {
+    for (node_name, export_name) in [
+        ("node-a", "nfs1"),
+        ("node-b", "nfs1"),
+        ("node-c", "nfs1"),
+        ("node-a", "nfs2"),
+        ("node-c", "nfs2"),
+        ("node-d", "nfs2"),
+        ("node-b", "nfs3"),
+        ("node-d", "nfs3"),
+        ("node-e", "nfs3"),
+    ] {
+        let mount_path = lab
+            .mount_path(node_name, export_name)
+            .unwrap_or_else(|| panic!("missing mount path for {node_name}/{export_name}"));
+        assert!(
+            mount_path.exists(),
+            "mount path vanished for {node_name}/{export_name}: {}",
+            mount_path.display()
+        );
+        let status = Command::new("mountpoint")
+            .arg("-q")
+            .arg(&mount_path)
+            .status()
+            .expect("run mountpoint");
+        assert!(
+            status.success(),
+            "mount path is no longer an active mount for {node_name}/{export_name}: {}",
+            mount_path.display()
+        );
+        assert!(
+            mount_path.join("root.txt").exists(),
+            "mounted export content is not visible for {node_name}/{export_name}: {}",
+            mount_path.display()
+        );
+    }
+}
+
+#[test]
+fn install_baseline_resources_keeps_real_nfs_mounts_live_through_initial_release() {
+    if let Some(reason) = skip_unless_real_nfs_enabled() {
+        eprintln!("[fs-meta-api-matrix] skipped: {reason}");
+        return;
+    }
+
+    let mut lab = NfsLab::start().expect("start NFS lab");
+    seed_baseline_content(&lab).expect("seed baseline content");
+    let cluster = Cluster5::start().expect("start cluster");
+    let app_id = format!("fs-meta-api-matrix-mount-liveness-{}", unique_suffix());
+    let facade_resource_id = format!("fs-meta-tcp-listener-{app_id}");
+    let facade_addrs = reserve_http_addrs(1).expect("reserve facade addrs");
+    install_baseline_resources(&cluster, &mut lab, &facade_resource_id, &facade_addrs)
+        .expect("install baseline resources");
+
+    let roots = baseline_roots(&lab);
+    let release = cluster
+        .build_fs_meta_release(&app_id, &facade_resource_id, roots, 1, true)
+        .expect("build release");
+    cluster
+        .apply_release("node-a", release)
+        .expect("apply release");
+
+    assert_baseline_mounts_live(&lab);
+}
+
+#[test]
+fn matrix_harness_keeps_real_nfs_mounts_live_through_initial_rescan() {
+    if let Some(reason) = skip_unless_real_nfs_enabled() {
+        eprintln!("[fs-meta-api-matrix] skipped: {reason}");
+        return;
+    }
+
+    let harness = build_matrix_harness("fs-meta-api-matrix-mount-rescan");
+    let harness = harness.expect("build matrix harness");
+    let mut session = OperatorSession::login_many(
+        harness.candidate_base_urls.clone(),
+        "operator",
+        "operator123",
+    )
+    .expect("login many");
+    session.rescan().expect("initial rescan");
+
+    assert_baseline_mounts_live(&harness.lab);
+}
+
+#[test]
+fn baseline_tree_materialization_wait_keeps_real_nfs_mounts_live() {
+    if let Some(reason) = skip_unless_real_nfs_enabled() {
+        eprintln!("[fs-meta-api-matrix] skipped: {reason}");
+        return;
+    }
+
+    let harness = build_matrix_harness("fs-meta-api-matrix-wait-liveness");
+    let harness = harness.expect("build matrix harness");
+    let mut session = OperatorSession::login_many(
+        harness.candidate_base_urls.clone(),
+        "operator",
+        "operator123",
+    )
+    .expect("login many");
+    session.rescan().expect("initial rescan");
+
+    let mut last_rescan_at = std::time::Instant::now();
+    wait_until(
+        Duration::from_secs(90),
+        "baseline tree materializes without losing active mounts",
+        || {
+            if last_rescan_at.elapsed() >= Duration::from_secs(10) {
+                session.rescan()?;
+                last_rescan_at = std::time::Instant::now();
+            }
+
+            assert_baseline_mounts_live(&harness.lab);
+
+            let tree = session
+                .tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])
+                .unwrap_or_else(|err| json!({ "tree_error": err }));
+            let ready = tree
+                .get("groups")
+                .and_then(Value::as_array)
+                .map(|groups| {
+                    groups.len() >= 3
+                        && group_total_nodes(&tree, "nfs1") > 0
+                        && group_total_nodes(&tree, "nfs2") > 0
+                        && group_total_nodes(&tree, "nfs3") > 0
+                })
+                .unwrap_or(false);
+            if ready {
+                Ok(true)
+            } else {
+                let status = session
+                    .status()
+                    .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+                Err(format!("tree={tree}; status={status}"))
+            }
+        },
+    )
+    .expect("baseline tree wait should preserve active mounts");
+}
+
 fn baseline_roots(lab: &NfsLab) -> Vec<RootSpec> {
     vec![
         root_spec("nfs1", &lab.export_source("nfs1")),
@@ -1496,11 +1637,7 @@ fn mounts_by_fs_source(grants: &Value) -> Result<BTreeMap<String, Vec<PathBuf>>,
 }
 
 fn normalize_mount_candidate_for_group(group_id: &str, path: &std::path::Path) -> PathBuf {
-    if path.exists() {
-        return path.to_path_buf();
-    }
     path.ancestors()
-        .skip(1)
         .find(|ancestor| {
             ancestor.exists()
                 && ancestor
@@ -1526,6 +1663,15 @@ fn representative_mount_for_group(group_id: &str, paths: &[PathBuf]) -> Option<P
     candidates.into_iter().next()
 }
 
+fn local_existing_path_for_fs_source(fs_source: &str) -> Option<PathBuf> {
+    let (_, path) = fs_source.split_once(':')?;
+    if !path.starts_with('/') {
+        return None;
+    }
+    let path = PathBuf::from(path);
+    path.exists().then_some(path)
+}
+
 fn group_mount_pairs_for_roots(
     grants: &Value,
     roots: &[(&str, &str)],
@@ -1537,6 +1683,7 @@ fn group_mount_pairs_for_roots(
             mount_map
                 .get(*fs_source)
                 .and_then(|paths| representative_mount_for_group(group_id, paths))
+                .or_else(|| local_existing_path_for_fs_source(fs_source))
                 .map(|path| (group_id.to_string(), path))
                 .ok_or_else(|| format!("missing representative mount for fs_source {fs_source}"))
         })
@@ -1585,6 +1732,49 @@ fn group_mount_pairs_for_roots_recovers_existing_group_root_from_missing_nested_
     let pairs = group_mount_pairs_for_roots(&grants, &[("nfs3", "nfs3-source")]).expect("pairs");
 
     assert_eq!(pairs, vec![("nfs3".to_string(), root_mount)]);
+}
+
+#[test]
+fn group_mount_pairs_for_roots_recovers_existing_group_root_from_existing_nested_child_mount() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root_mount = temp.path().join("mounts/node-a/nfs1");
+    let nested_child = root_mount.join("nested/child");
+    std::fs::create_dir_all(&nested_child).expect("create nested child");
+    let grants = json!({
+        "grants": [
+            {
+                "fs_source": "nfs1-source",
+                "mount_point": nested_child.display().to_string()
+            }
+        ]
+    });
+
+    let pairs = group_mount_pairs_for_roots(&grants, &[("nfs1", "nfs1-source")]).expect("pairs");
+
+    assert_eq!(pairs, vec![("nfs1".to_string(), root_mount)]);
+}
+
+#[test]
+fn group_mount_pairs_for_roots_prefers_runtime_mount_over_local_export_source_when_both_exist() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let export_root = temp.path().join("exports/nfs1");
+    let mount_root = temp.path().join("mounts/node-a/nfs1");
+    std::fs::create_dir_all(&export_root).expect("create export root");
+    std::fs::create_dir_all(&mount_root).expect("create mount root");
+    std::fs::write(export_root.join("root.txt"), "hello\n").expect("write export file");
+    let fs_source = format!("127.0.0.1:{}", export_root.display());
+    let grants = json!({
+        "grants": [
+            {
+                "fs_source": fs_source,
+                "mount_point": mount_root.display().to_string()
+            }
+        ]
+    });
+
+    let pairs = group_mount_pairs_for_roots(&grants, &[("nfs1", fs_source.as_str())]).expect("pairs");
+
+    assert_eq!(pairs, vec![("nfs1".to_string(), mount_root)]);
 }
 
 fn normalize_tree_like_json(value: &mut Value) {

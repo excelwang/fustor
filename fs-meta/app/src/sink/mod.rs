@@ -726,6 +726,7 @@ impl SinkStateSnapshotCell {
 
 pub(crate) struct SinkState {
     pub(crate) groups: BTreeMap<String, GroupSinkState>,
+    retained_groups: BTreeMap<String, GroupSinkState>,
     pub(crate) group_by_object_ref: HashMap<String, String>,
     pub(crate) tombstone_policy: TombstonePolicy,
 }
@@ -738,6 +739,7 @@ impl SinkState {
         };
         let mut state = Self {
             groups: BTreeMap::new(),
+            retained_groups: BTreeMap::new(),
             group_by_object_ref: HashMap::new(),
             tombstone_policy,
         };
@@ -781,12 +783,14 @@ impl SinkState {
         let tombstone_policy = self.tombstone_policy;
         let mut groups = BTreeMap::<String, GroupSinkState>::new();
         let mut group_by_object_ref = HashMap::<String, String>::new();
+        let configured_root_ids = roots
+            .iter()
+            .map(|root| root.id.clone())
+            .collect::<BTreeSet<_>>();
 
         let mut previous_groups = std::mem::take(&mut self.groups);
+        let mut retained_groups = std::mem::take(&mut self.retained_groups);
         for root in roots {
-            if allowed_groups.is_some_and(|groups| !groups.contains(&root.id)) {
-                continue;
-            }
             let members = grants
                 .iter()
                 .filter(|grant| root.selector.matches(grant))
@@ -811,14 +815,21 @@ impl SinkState {
                 .unwrap_or_else(|| "unassigned".to_string());
             let mut group = previous_groups
                 .remove(&root.id)
+                .or_else(|| retained_groups.remove(&root.id))
                 .unwrap_or_else(|| GroupSinkState::new(primary.clone(), tombstone_policy));
-            group.primary_object_ref = primary;
-            for member_id in &member_ids {
-                group_by_object_ref.insert(member_id.clone(), root.id.clone());
+            group.primary_object_ref = primary.clone();
+            if allowed_groups.is_some_and(|groups| !groups.contains(&root.id)) {
+                retained_groups.insert(root.id.clone(), group);
+                continue;
+            }
+            for member_id in member_ids {
+                group_by_object_ref.insert(member_id, root.id.clone());
             }
             groups.insert(root.id.clone(), group);
         }
+        retained_groups.retain(|group_id, _| configured_root_ids.contains(group_id));
         self.groups = groups;
+        self.retained_groups = retained_groups;
         self.group_by_object_ref = group_by_object_ref;
     }
 
@@ -4034,6 +4045,261 @@ mod tests {
         assert_eq!(
             revisions_after, revisions_before,
             "deactivate/reactivate continuity must preserve materialized revision instead of recreating groups from scratch"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_wobble_does_not_reset_ready_group_state_after_stream_apply() {
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![
+            RootSpec::new("root-a", "/mnt/nfs1"),
+            RootSpec::new("root-b", "/mnt/nfs2"),
+        ];
+        cfg.host_object_grants = vec![
+            granted_mount_root("node-a::exp-a", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+            granted_mount_root("node-b::exp-b", "node-b", "10.0.0.12", "/mnt/nfs2", true),
+        ];
+        let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
+            .expect("init sink");
+
+        let activate_both =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("root-a", &["node-a::exp-a"]),
+                    bound_scope_with_resources("root-b", &["node-b::exp-b"]),
+                ],
+            }))
+            .expect("encode activate both");
+        sink.on_control_frame(&[activate_both])
+            .await
+            .expect("activate both should pass");
+
+        sink.ingest_stream_events(&[
+            mk_control_event(
+                "node-b::exp-b",
+                ControlEvent::EpochStart {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                1,
+            ),
+            mk_source_event(
+                "node-b::exp-b",
+                mk_record(b"/ready-b.txt", "ready-b.txt", 2, EventKind::Update),
+            ),
+            mk_control_event(
+                "node-b::exp-b",
+                ControlEvent::EpochEnd {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                3,
+            ),
+        ])
+        .expect("seed stream-applied ready state for root-b");
+
+        let snapshot_before = sink.status_snapshot().expect("status before scope wobble");
+        let root_b_before = snapshot_before
+            .groups
+            .iter()
+            .find(|group| group.group_id == "root-b")
+            .expect("root-b group before scope wobble");
+        assert!(
+            root_b_before.initial_audit_completed,
+            "precondition: root-b must be ready before scope wobble"
+        );
+        assert!(
+            root_b_before.live_nodes > 0,
+            "precondition: root-b must have live materialized nodes before scope wobble"
+        );
+        assert!(
+            root_b_before.materialized_revision > 1,
+            "precondition: root-b must have advanced materialized revision before scope wobble"
+        );
+        let applied_origin_counts = snapshot_before
+            .stream_applied_origin_counts_by_node
+            .get("node-a")
+            .expect("stream-applied origin counts for local sink node");
+        assert!(
+            applied_origin_counts
+                .iter()
+                .any(|entry| entry.starts_with("node-b::exp-b=")),
+            "precondition: stream-applied origin counts must include root-b source origin before scope wobble: {snapshot_before:?}"
+        );
+
+        let activate_root_a_only =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 2,
+                bound_scopes: vec![bound_scope_with_resources("root-a", &["node-a::exp-a"])],
+            }))
+            .expect("encode activate root-a only");
+        sink.on_control_frame(&[activate_root_a_only])
+            .await
+            .expect("activate root-a only should pass");
+
+        let reactivate_both =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 3,
+                expires_at_ms: 3,
+                bound_scopes: vec![
+                    bound_scope_with_resources("root-a", &["node-a::exp-a"]),
+                    bound_scope_with_resources("root-b", &["node-b::exp-b"]),
+                ],
+            }))
+            .expect("encode reactivate both");
+        sink.on_control_frame(&[reactivate_both])
+            .await
+            .expect("reactivate both should pass");
+
+        let snapshot_after = sink.status_snapshot().expect("status after scope wobble");
+        let root_b_after = snapshot_after
+            .groups
+            .iter()
+            .find(|group| group.group_id == "root-b")
+            .expect("root-b group after scope wobble");
+        assert!(
+            root_b_after.initial_audit_completed,
+            "ready root-b must stay ready across a non-empty scope wobble instead of regressing to initial_audit_completed=false: {snapshot_after:?}"
+        );
+        assert!(
+            root_b_after.live_nodes > 0,
+            "ready root-b must keep live materialized nodes across a non-empty scope wobble instead of regressing to live_nodes=0: {snapshot_after:?}"
+        );
+        assert_eq!(
+            root_b_after.materialized_revision, root_b_before.materialized_revision,
+            "ready root-b must preserve materialized revision across a non-empty scope wobble instead of resetting to revision 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn logical_roots_window_missing_group_does_not_reset_ready_state_on_readd() {
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![
+            RootSpec::new("root-a", "/mnt/nfs1"),
+            RootSpec::new("root-b", "/mnt/nfs2"),
+        ];
+        let host_object_grants = vec![
+            granted_mount_root("node-a::exp-a", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+            granted_mount_root("node-b::exp-b", "node-b", "10.0.0.12", "/mnt/nfs2", true),
+        ];
+        cfg.host_object_grants = host_object_grants.clone();
+        let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
+            .expect("init sink");
+
+        let activate_both =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("root-a", &["node-a::exp-a"]),
+                    bound_scope_with_resources("root-b", &["node-b::exp-b"]),
+                ],
+            }))
+            .expect("encode activate both");
+        sink.on_control_frame(&[activate_both])
+            .await
+            .expect("activate both should pass");
+
+        sink.ingest_stream_events(&[
+            mk_control_event(
+                "node-b::exp-b",
+                ControlEvent::EpochStart {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                1,
+            ),
+            mk_source_event(
+                "node-b::exp-b",
+                mk_record(b"/ready-b.txt", "ready-b.txt", 2, EventKind::Update),
+            ),
+            mk_control_event(
+                "node-b::exp-b",
+                ControlEvent::EpochEnd {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                3,
+            ),
+        ])
+        .expect("seed stream-applied ready state for root-b");
+
+        let snapshot_before = sink
+            .status_snapshot()
+            .expect("status before logical-roots window wobble");
+        let root_b_before = snapshot_before
+            .groups
+            .iter()
+            .find(|group| group.group_id == "root-b")
+            .expect("root-b group before logical-roots window wobble");
+        assert!(
+            root_b_before.initial_audit_completed,
+            "precondition: root-b must be ready before logical-roots window wobble"
+        );
+        assert!(
+            root_b_before.live_nodes > 0,
+            "precondition: root-b must have live materialized nodes before logical-roots window wobble"
+        );
+        assert!(
+            root_b_before.materialized_revision > 1,
+            "precondition: root-b must have advanced materialized revision before logical-roots window wobble"
+        );
+        let applied_origin_counts = snapshot_before
+            .stream_applied_origin_counts_by_node
+            .get("node-a")
+            .expect("stream-applied origin counts for local sink node");
+        assert!(
+            applied_origin_counts
+                .iter()
+                .any(|entry| entry.starts_with("node-b::exp-b=")),
+            "precondition: stream-applied origin counts must include root-b source origin before logical-roots window wobble: {snapshot_before:?}"
+        );
+
+        sink.update_logical_roots(vec![RootSpec::new("root-a", "/mnt/nfs1")], &host_object_grants)
+            .expect("temporary logical-roots window omitting root-b");
+        sink.update_logical_roots(
+            vec![
+                RootSpec::new("root-a", "/mnt/nfs1"),
+                RootSpec::new("root-b", "/mnt/nfs2"),
+            ],
+            &host_object_grants,
+        )
+        .expect("logical-roots window restore should re-add root-b");
+
+        let snapshot_after = sink
+            .status_snapshot()
+            .expect("status after logical-roots window wobble");
+        let root_b_after = snapshot_after
+            .groups
+            .iter()
+            .find(|group| group.group_id == "root-b")
+            .expect("root-b group after logical-roots window wobble");
+        assert!(
+            root_b_after.initial_audit_completed,
+            "ready root-b must stay ready across temporary logical-roots omission instead of regressing to initial_audit_completed=false: {snapshot_after:?}"
+        );
+        assert!(
+            root_b_after.live_nodes > 0,
+            "ready root-b must keep live materialized nodes across temporary logical-roots omission instead of regressing to live_nodes=0: {snapshot_after:?}"
+        );
+        assert_eq!(
+            root_b_after.materialized_revision, root_b_before.materialized_revision,
+            "ready root-b must preserve materialized revision across temporary logical-roots omission instead of resetting to revision 1"
         );
     }
 

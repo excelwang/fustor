@@ -53,6 +53,18 @@ fn shutdown_blocking_join_inflight() -> usize {
 }
 
 impl ApiServerHandle {
+    pub(crate) fn is_running(&self) -> bool {
+        match self.join.as_ref() {
+            Some(ApiServerJoin::Thread(join)) => !join.is_finished(),
+            None => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_for_tests(&self) {
+        self.shutdown.cancel();
+    }
+
     pub async fn shutdown(mut self, timeout: Duration) {
         eprintln!("fs_meta_api_server: shutdown requested");
         self.shutdown.cancel();

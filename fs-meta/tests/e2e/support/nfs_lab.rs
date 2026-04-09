@@ -16,6 +16,7 @@ const NFS_LAB_COMPONENT: &str = "nfs-lab";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StaleLabCleanupPlan {
+    cleanup_roots: Vec<PathBuf>,
     root: PathBuf,
     mount_targets: Vec<PathBuf>,
 }
@@ -99,11 +100,48 @@ fn discover_candidate_lab_roots_under(base_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
+fn canonicalize_existing_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn cleanup_plan_root_identity(root: &Path) -> PathBuf {
+    if root
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == NFS_LAB_COMPONENT)
+        && root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".tmp"))
+    {
+        return PathBuf::from(NFS_LAB_COMPONENT).join(
+            root.file_name()
+                .expect("tmp lab root must have basename"),
+        );
+    }
+    canonicalize_existing_path(root)
+}
+
+fn preferred_cleanup_root(cleanup_roots: &[PathBuf]) -> PathBuf {
+    let preferred_parent = nfs_lab_parent_dir();
+    let mut roots = cleanup_roots.to_vec();
+    roots.sort();
+    roots.dedup();
+    roots
+        .iter()
+        .find(|root| root.starts_with(&preferred_parent))
+        .cloned()
+        .or_else(|| roots.into_iter().next())
+        .expect("cleanup plan must have at least one root")
+}
+
 fn stale_lab_cleanup_plans_from_mountinfo(
     mountinfo: &str,
     filesystem_roots: &[PathBuf],
 ) -> Vec<StaleLabCleanupPlan> {
     let mut mounts_by_root = BTreeMap::<PathBuf, Vec<PathBuf>>::new();
+    let mut cleanup_roots_by_root = BTreeMap::<PathBuf, Vec<PathBuf>>::new();
     for line in mountinfo.lines() {
         let Some(raw_target) = line.split_whitespace().nth(4) else {
             continue;
@@ -112,7 +150,15 @@ fn stale_lab_cleanup_plans_from_mountinfo(
         let Some(root) = nfs_lab_root_for_mount_target(&target) else {
             continue;
         };
-        mounts_by_root.entry(root).or_default().push(target);
+        let canonical_root = cleanup_plan_root_identity(&root);
+        mounts_by_root
+            .entry(canonical_root.clone())
+            .or_default()
+            .push(target);
+        cleanup_roots_by_root
+            .entry(canonical_root)
+            .or_default()
+            .push(root);
     }
     for targets in mounts_by_root.values_mut() {
         targets.sort_by(|a, b| {
@@ -120,20 +166,45 @@ fn stale_lab_cleanup_plans_from_mountinfo(
             let depth_b = b.components().count();
             depth_b.cmp(&depth_a).then_with(|| a.cmp(b))
         });
+        let mut seen = Vec::<PathBuf>::new();
+        targets.retain(|target| {
+            let canonical_target = canonicalize_existing_path(target);
+            if seen.iter().any(|existing| existing == &canonical_target) {
+                false
+            } else {
+                seen.push(canonical_target);
+                true
+            }
+        });
     }
     let mut roots = mounts_by_root.keys().cloned().collect::<Vec<_>>();
     for root in filesystem_roots {
-        if !roots.iter().any(|existing| existing == root) {
-            roots.push(root.clone());
+        let canonical_root = cleanup_plan_root_identity(root);
+        cleanup_roots_by_root
+            .entry(canonical_root.clone())
+            .or_default()
+            .push(root.clone());
+        if !roots.iter().any(|existing| existing == &canonical_root) {
+            roots.push(canonical_root);
         }
     }
     roots.sort();
     roots.dedup();
     roots
         .into_iter()
-        .map(|root| StaleLabCleanupPlan {
-            mount_targets: mounts_by_root.remove(&root).unwrap_or_default(),
-            root,
+        .map(|root_key| {
+            let mut cleanup_roots = cleanup_roots_by_root.remove(&root_key).unwrap_or_default();
+            let root = preferred_cleanup_root(&cleanup_roots);
+            if !cleanup_roots.iter().any(|candidate| candidate == &root) {
+                cleanup_roots.push(root.clone());
+            }
+            cleanup_roots.sort();
+            cleanup_roots.dedup();
+            StaleLabCleanupPlan {
+                cleanup_roots,
+                mount_targets: mounts_by_root.remove(&root_key).unwrap_or_default(),
+                root,
+            }
         })
         .collect()
 }
@@ -224,16 +295,9 @@ fn cleanup_stale_lab_plan(plan: &StaleLabCleanupPlan) -> Result<(), String> {
             errors.push(err);
         }
     }
-    let exports_dir = plan.root.join("exports");
-    if let Ok(entries) = fs::read_dir(&exports_dir) {
-        for dir in entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
-        {
-            if let Err(err) = unexport_dir_path(&dir) {
-                errors.push(err);
-            }
+    for dir in stale_lab_export_dirs_for_cleanup(plan) {
+        if let Err(err) = unexport_dir_path(&dir) {
+            errors.push(err);
         }
     }
     if let Err(err) = remove_stale_lab_root(&plan.root) {
@@ -247,6 +311,19 @@ fn cleanup_stale_lab_plan(plan: &StaleLabCleanupPlan) -> Result<(), String> {
             &errors,
         ))
     }
+}
+
+fn stale_lab_export_dirs_for_cleanup(plan: &StaleLabCleanupPlan) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for root in &plan.cleanup_roots {
+        let exports_dir = root.join("exports");
+        if let Ok(entries) = fs::read_dir(&exports_dir) {
+            dirs.extend(entries.flatten().map(|entry| entry.path()).filter(|path| path.is_dir()));
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 fn cleanup_stale_labs_before_start() -> Result<(), String> {
@@ -838,6 +915,159 @@ mod tests {
         );
         assert_eq!(plans[1].root, PathBuf::from("/tmp/.tmpdef456"));
         assert!(plans[1].mount_targets.is_empty());
+    }
+
+    #[test]
+    fn stale_lab_cleanup_plans_merge_alias_roots_into_one_plan() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_root = temp.path().join(".tmpreal123");
+        fs::create_dir_all(real_root.join("mounts/node-a"))
+            .expect("create real root mounts");
+        fs::create_dir_all(real_root.join("exports")).expect("create real root exports");
+        fs::write(lab_marker_path(&real_root), b"marker\n").expect("write marker");
+
+        let alias_parent = temp.path().join("alias-parent");
+        fs::create_dir_all(&alias_parent).expect("create alias parent");
+        let alias_root = alias_parent.join(".tmpreal123");
+        std::os::unix::fs::symlink(&real_root, &alias_root).expect("symlink alias root");
+
+        let mountinfo = format!(
+            "101 100 0:42 / {} rw,relatime - nfs4 127.0.0.1:{}/exports/nfs1 rw\n\
+             102 100 0:43 / {} rw,relatime - nfs4 127.0.0.1:{}/exports/nfs2 rw\n",
+            real_root.join("mounts/node-a/nfs1").display(),
+            real_root.display(),
+            alias_root.join("mounts/node-b/nfs2").display(),
+            alias_root.display(),
+        );
+        let filesystem_roots = vec![alias_root.clone()];
+
+        let plans = stale_lab_cleanup_plans_from_mountinfo(&mountinfo, &filesystem_roots);
+        assert_eq!(
+            plans.len(),
+            1,
+            "alias and canonical lab roots must collapse into one cleanup plan"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&plans[0].root).expect("canonicalize plan root"),
+            std::fs::canonicalize(&real_root).expect("canonicalize real root"),
+            "cleanup root must resolve to the same canonical lab root"
+        );
+        assert_eq!(
+            plans[0].mount_targets.len(),
+            2,
+            "merged alias cleanup plan must retain both distinct mount targets"
+        );
+    }
+
+    #[test]
+    fn stale_lab_cleanup_plans_merge_workspace_alias_roots_into_one_plan() {
+        let workspace_root = crate::path_support::workspace_root();
+        let workspace_root_str = workspace_root.display().to_string();
+        let alias_root_str = if let Some(rest) = workspace_root_str.strip_prefix("/root/repo/") {
+            format!("/data/repo/{rest}")
+        } else if let Some(rest) = workspace_root_str.strip_prefix("/data/repo/") {
+            format!("/root/repo/{rest}")
+        } else {
+            format!("/data/repo-alias{}", workspace_root_str)
+        };
+        let real_root = workspace_root
+            .join(".tmp")
+            .join("fs-meta-e2e")
+            .join("nfs-lab")
+            .join(".tmpalias123");
+        let alias_root = PathBuf::from(alias_root_str)
+            .join(".tmp")
+            .join("fs-meta-e2e")
+            .join("nfs-lab")
+            .join(".tmpalias123");
+        let mountinfo = format!(
+            "101 100 0:42 / {} rw,relatime - nfs4 127.0.0.1:{}/exports/nfs1 rw\n",
+            real_root.join("mounts/node-a/nfs1").display(),
+            real_root.display(),
+        );
+
+        let plans = stale_lab_cleanup_plans_from_mountinfo(&mountinfo, &[alias_root.clone()]);
+        assert_eq!(
+            plans.len(),
+            1,
+            "workspace-root and /data alias views of the same lab root must collapse into one cleanup plan"
+        );
+        assert_eq!(
+            plans[0].root,
+            real_root,
+            "cleanup should prefer the current workspace-root view as the plan root"
+        );
+        assert!(
+            plans[0].cleanup_roots.contains(&alias_root),
+            "cleanup plan must retain the alias cleanup root so export cleanup can still cover both path spellings"
+        );
+    }
+
+    #[test]
+    fn stale_lab_cleanup_plans_dedupe_duplicate_mount_targets_across_alias_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_root = temp.path().join(".tmpreal123");
+        fs::create_dir_all(real_root.join("mounts/node-a/nfs1"))
+            .expect("create real root mounts");
+        fs::create_dir_all(real_root.join("exports")).expect("create real root exports");
+        fs::write(lab_marker_path(&real_root), b"marker\n").expect("write marker");
+
+        let alias_parent = temp.path().join("alias-parent");
+        fs::create_dir_all(&alias_parent).expect("create alias parent");
+        let alias_root = alias_parent.join(".tmpreal123");
+        std::os::unix::fs::symlink(&real_root, &alias_root).expect("symlink alias root");
+
+        let mountinfo = format!(
+            "101 100 0:42 / {} rw,relatime - nfs4 127.0.0.1:{}/exports/nfs1 rw\n\
+             102 100 0:42 / {} rw,relatime - nfs4 127.0.0.1:{}/exports/nfs1 rw\n",
+            real_root.join("mounts/node-a/nfs1").display(),
+            real_root.display(),
+            alias_root.join("mounts/node-a/nfs1").display(),
+            alias_root.display(),
+        );
+
+        let plans = stale_lab_cleanup_plans_from_mountinfo(&mountinfo, &[]);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].mount_targets.len(),
+            1,
+            "cleanup plan must collapse alias and canonical views of the same mount target"
+        );
+    }
+
+    #[test]
+    fn stale_lab_export_dirs_for_cleanup_include_alias_and_canonical_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_root = temp.path().join(".tmpreal123");
+        fs::create_dir_all(real_root.join("mounts/node-a")).expect("create real root mounts");
+        fs::create_dir_all(real_root.join("exports/nfs1")).expect("create real export");
+        fs::write(lab_marker_path(&real_root), b"marker\n").expect("write marker");
+
+        let alias_parent = temp.path().join("alias-parent");
+        fs::create_dir_all(&alias_parent).expect("create alias parent");
+        let alias_root = alias_parent.join(".tmpreal123");
+        std::os::unix::fs::symlink(&real_root, &alias_root).expect("symlink alias root");
+
+        let mountinfo = format!(
+            "101 100 0:42 / {} rw,relatime - nfs4 127.0.0.1:{}/exports/nfs1 rw\n",
+            real_root.join("mounts/node-a/nfs1").display(),
+            real_root.display(),
+        );
+        let plans = stale_lab_cleanup_plans_from_mountinfo(&mountinfo, std::slice::from_ref(&alias_root));
+        let plan = plans.first().expect("cleanup plan");
+
+        let mut export_dirs = stale_lab_export_dirs_for_cleanup(&plan);
+        export_dirs.sort();
+        let mut expected = vec![
+            alias_root.join("exports/nfs1"),
+            real_root.join("exports/nfs1"),
+        ];
+        expected.sort();
+        assert_eq!(
+            export_dirs,
+            expected,
+            "stale export cleanup must preserve both alias and canonical export path strings"
+        );
     }
 
     #[test]
