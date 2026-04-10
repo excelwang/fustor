@@ -1504,6 +1504,12 @@ impl RunningNode {
             cmd.env_remove("CAPANIX_ADMIN_SK_B64");
             cmd.env_remove("DATANIX_ADMIN_SK_B64");
         }
+        if let Ok(value) = std::env::var("CAPANIX_DEBUG_WORKER_CONTROL") {
+            cmd.env("CAPANIX_DEBUG_WORKER_CONTROL", value);
+        }
+        if let Ok(value) = std::env::var("DATANIX_DEBUG_WORKER_CONTROL") {
+            cmd.env("DATANIX_DEBUG_WORKER_CONTROL", value);
+        }
         configure_test_child_runtime(&mut cmd);
         let child = cmd.spawn().map_err(|e| format!("spawn capanixd: {e}"))?;
         Ok(Self {

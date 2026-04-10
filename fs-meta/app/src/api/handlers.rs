@@ -484,58 +484,96 @@ pub async fn status(
     if state.source.is_worker() || state.sink.is_worker() {
         let active_candidate_groups =
             snapshot_scoped_active_facade_candidate_groups(&local_source, &local_sink);
-        let local_observation_evidence = candidate_group_observation_evidence(
-            &local_source.status,
-            &local_sink,
-            &active_candidate_groups,
-        );
-        let local_observation_status = evaluate_observation_status(
-            &local_observation_evidence,
-            ObservationTrustPolicy::candidate_generation(),
-        );
         record_status_route_trace(
             trace_id,
             format!(
-                "status.local.gate candidates={} source_scan={} source_degraded={} initial_audit={} overflow_pending={} sink_groups={} state={:?} reasons={}",
+                "status.local.gate candidates={} source_scan={} source_degraded={} initial_audit={} overflow_pending={} sink_groups={}{}",
                 summarize_sorted_set(&active_candidate_groups),
-                summarize_sorted_set(&local_observation_evidence.candidate_groups),
-                summarize_sorted_set(&local_observation_evidence.degraded_groups),
-                summarize_sorted_set(&local_observation_evidence.initial_audit_groups),
-                summarize_sorted_set(&local_observation_evidence.overflow_pending_groups),
+                summarize_sorted_set(&active_candidate_groups),
+                summarize_sorted_set(
+                    &candidate_group_observation_evidence(
+                        &local_source.status,
+                        &local_sink,
+                        &active_candidate_groups,
+                    )
+                    .degraded_groups
+                ),
+                summarize_sorted_set(
+                    &candidate_group_observation_evidence(
+                        &local_source.status,
+                        &local_sink,
+                        &active_candidate_groups,
+                    )
+                    .initial_audit_groups
+                ),
+                summarize_sorted_set(
+                    &candidate_group_observation_evidence(
+                        &local_source.status,
+                        &local_sink,
+                        &active_candidate_groups,
+                    )
+                    .overflow_pending_groups
+                ),
                 summarize_candidate_sink_group_state(&local_sink, &active_candidate_groups),
-                local_observation_status.state,
-                local_observation_status.reasons.join(" ; "),
+                if active_candidate_groups.is_empty() {
+                    " state=SkippedNoCandidateGroups".to_string()
+                } else {
+                    let local_observation_status = evaluate_observation_status(
+                        &candidate_group_observation_evidence(
+                            &local_source.status,
+                            &local_sink,
+                            &active_candidate_groups,
+                        ),
+                        ObservationTrustPolicy::candidate_generation(),
+                    );
+                    format!(
+                        " state={:?} reasons={}",
+                        local_observation_status.state,
+                        local_observation_status.reasons.join(" ; ")
+                    )
+                }
             ),
         );
-        if local_observation_status.state != ObservationState::TrustedMaterialized {
-            return Err(ApiError::service_unavailable(format!(
-                "status pending until active facade observation becomes trusted-materialized: {}",
-                trusted_materialized_not_ready_message(&local_observation_status)
-            )));
-        }
-        let source_status = state.source.status_snapshot().await.map_err(|err| {
-            ApiError::service_unavailable(format!(
-                "status pending until active facade observation becomes trusted-materialized: source status failed: {err}"
-            ))
-        })?;
-        let sink_status = state.sink.status_snapshot().await.map_err(|err| {
-            ApiError::service_unavailable(format!(
-                "status pending until active facade observation becomes trusted-materialized: sink status failed: {err}"
-            ))
-        })?;
-        let observation_status = evaluate_observation_status(
-            &candidate_group_observation_evidence(
-                &source_status,
-                &sink_status,
+        if !active_candidate_groups.is_empty() {
+            let local_observation_evidence = candidate_group_observation_evidence(
+                &local_source.status,
+                &local_sink,
                 &active_candidate_groups,
-            ),
-            ObservationTrustPolicy::candidate_generation(),
-        );
-        if observation_status.state != ObservationState::TrustedMaterialized {
-            return Err(ApiError::service_unavailable(format!(
-                "status pending until active facade observation becomes trusted-materialized: {}",
-                trusted_materialized_not_ready_message(&observation_status)
-            )));
+            );
+            let local_observation_status = evaluate_observation_status(
+                &local_observation_evidence,
+                ObservationTrustPolicy::candidate_generation(),
+            );
+            if local_observation_status.state != ObservationState::TrustedMaterialized {
+                return Err(ApiError::service_unavailable(format!(
+                    "status pending until active facade observation becomes trusted-materialized: {}",
+                    trusted_materialized_not_ready_message(&local_observation_status)
+                )));
+            }
+            let source_status = state.source.status_snapshot().await.map_err(|err| {
+                ApiError::service_unavailable(format!(
+                    "status pending until active facade observation becomes trusted-materialized: source status failed: {err}"
+                ))
+            })?;
+            let sink_status = state.sink.status_snapshot().await.map_err(|err| {
+                ApiError::service_unavailable(format!(
+                    "status pending until active facade observation becomes trusted-materialized: sink status failed: {err}"
+                ))
+            })?;
+            let observation_status = evaluate_observation_status(
+                &candidate_group_observation_evidence(
+                    &source_status,
+                    &sink_status,
+                    &active_candidate_groups,
+                ),
+                ObservationTrustPolicy::candidate_generation(),
+            );
+            if observation_status.state != ObservationState::TrustedMaterialized {
+                return Err(ApiError::service_unavailable(format!(
+                    "status pending until active facade observation becomes trusted-materialized: {}",
+                    trusted_materialized_not_ready_message(&observation_status)
+                )));
+            }
         }
     }
     let _facade_request_guard = state.control_gate.begin_facade_request();
@@ -723,6 +761,9 @@ fn snapshot_scoped_active_facade_candidate_groups(
         .collect::<BTreeSet<_>>();
     if !source_groups.is_empty() && !sink_groups.is_empty() {
         return source_groups.intersection(&sink_groups).cloned().collect();
+    }
+    if !source_groups.is_empty() && sink_groups.is_empty() {
+        return BTreeSet::new();
     }
     if !source_groups.is_empty() {
         return source_groups;
@@ -3183,6 +3224,40 @@ mod tests {
             }],
             ..SinkStatusSnapshot::default()
         }
+    }
+
+    #[test]
+    fn snapshot_scoped_active_facade_candidate_groups_ignores_source_only_groups_without_local_sink_schedule()
+     {
+        let local_source = local_source_snapshot();
+        let local_sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::new(),
+            groups: vec![crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs1".to_string(),
+                primary_object_ref: "obj-a".to_string(),
+                total_nodes: 1,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 11,
+                shadow_lag_us: 12,
+                overflow_pending_audit: false,
+                initial_audit_completed: false,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            }],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let candidate_groups =
+            snapshot_scoped_active_facade_candidate_groups(&local_source, &local_sink);
+
+        assert!(
+            candidate_groups.is_empty(),
+            "source-only scheduled groups without any local sink schedule must not become active facade observation candidates: {candidate_groups:?}"
+        );
     }
 
     #[tokio::test]

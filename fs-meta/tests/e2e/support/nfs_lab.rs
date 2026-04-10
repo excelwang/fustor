@@ -228,21 +228,11 @@ fn stale_lab_cleanup_plans() -> Result<Vec<StaleLabCleanupPlan>, String> {
 
 fn cleanup_stale_lab_mount_target(target: &Path) -> Result<(), String> {
     let output = sudo_output(["umount", target.to_string_lossy().as_ref()])?;
-    if !output.status.success() {
-        if output_indicates_absent_mount(&output) {
-            return Ok(());
-        }
-        let fallback = sudo_output(["umount", "-f", "-l", target.to_string_lossy().as_ref()])?;
-        if !fallback.status.success() && !output_indicates_absent_mount(&fallback) {
-            return Err(format!(
-                "umount {} failed with status {}; fallback umount -f -l failed with status {}",
-                target.display(),
-                output.status,
-                fallback.status
-            ));
-        }
+    if output.status.success() || output_indicates_absent_mount(&output) {
+        return Ok(());
     }
-    Ok(())
+    let fallback = sudo_output(["umount", "-f", "-l", target.to_string_lossy().as_ref()])?;
+    interpret_umount_outputs(target, &output, Some(&fallback))
 }
 
 fn unexport_dir_path(dir: &Path) -> Result<(), String> {
@@ -271,21 +261,34 @@ fn remove_stale_lab_root(root: &Path) -> Result<(), String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) if error_indicates_stale_file_handle(&err) => {
             let output = sudo_output(["rm", "-rf", root.to_string_lossy().as_ref()])?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "remove stale lab root {} failed after stale file handle fallback with status {}",
-                    root.display(),
-                    output.status
-                ))
-            }
+            interpret_remove_stale_lab_root_fallback(root, &output)
         }
         Err(err) => Err(format!(
             "remove stale lab root {} failed: {err}",
             root.display()
         )),
     }
+}
+
+fn stale_lab_root_cleanup_completed(root: &Path) -> bool {
+    !root.exists()
+        || (!lab_marker_path(root).exists()
+            && !root.join("mounts").exists()
+            && !root.join("exports").exists())
+}
+
+fn interpret_remove_stale_lab_root_fallback(
+    root: &Path,
+    output: &std::process::Output,
+) -> Result<(), String> {
+    if output.status.success() || stale_lab_root_cleanup_completed(root) {
+        return Ok(());
+    }
+    Err(format!(
+        "remove stale lab root {} failed after stale file handle fallback with status {}",
+        root.display(),
+        output.status
+    ))
 }
 
 fn cleanup_stale_lab_plan(plan: &StaleLabCleanupPlan) -> Result<(), String> {
@@ -359,6 +362,30 @@ fn output_indicates_absent_mount(output: &std::process::Output) -> bool {
     combined.contains("no mount point specified")
         || combined.contains("not mounted")
         || combined.contains("not a mountpoint")
+}
+
+fn interpret_umount_outputs(
+    path: &Path,
+    primary: &std::process::Output,
+    fallback: Option<&std::process::Output>,
+) -> Result<(), String> {
+    if primary.status.success() || output_indicates_absent_mount(primary) {
+        return Ok(());
+    }
+    if let Some(fallback) = fallback {
+        if fallback.status.success() || output_indicates_absent_mount(fallback) {
+            return Ok(());
+        }
+    }
+    let fallback_status = fallback
+        .map(|output| output.status.to_string())
+        .unwrap_or_else(|| "<not-run>".to_string());
+    Err(format!(
+        "umount {} failed with status {}; fallback umount -f -l failed with status {}",
+        path.display(),
+        primary.status,
+        fallback_status
+    ))
 }
 
 fn output_indicates_absent_export(output: &std::process::Output) -> bool {
@@ -645,19 +672,12 @@ impl NfsLab {
         else {
             return Ok(());
         };
-        let status = sudo_status(["umount", path.to_string_lossy().as_ref()])?;
-        if !status.success() {
-            let fallback = sudo_status(["umount", "-f", "-l", path.to_string_lossy().as_ref()])?;
-            if !fallback.success() {
-                return Err(format!(
-                    "umount {} failed with status {}; fallback umount -f -l failed with status {}",
-                    path.display(),
-                    status,
-                    fallback
-                ));
-            }
+        let output = sudo_output(["umount", path.to_string_lossy().as_ref()])?;
+        if output.status.success() || output_indicates_absent_mount(&output) {
+            return Ok(());
         }
-        Ok(())
+        let fallback = sudo_output(["umount", "-f", "-l", path.to_string_lossy().as_ref()])?;
+        interpret_umount_outputs(&path, &output, Some(&fallback))
     }
 
     pub fn mount_path(&self, node_name: &str, export_name: &str) -> Option<PathBuf> {
@@ -1084,6 +1104,51 @@ mod tests {
     }
 
     #[test]
+    fn interpret_remove_stale_lab_root_fallback_treats_missing_path_after_failed_rm_as_success() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("missing-root");
+        let output = std::process::Output {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"rm: cannot remove '/tmp/lab/missing-root': No such file or directory\n"
+                .to_vec(),
+        };
+        assert!(interpret_remove_stale_lab_root_fallback(&missing, &output).is_ok());
+    }
+
+    #[test]
+    fn interpret_remove_stale_lab_root_fallback_treats_non_lab_residual_dir_as_success() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("leftover.txt"), b"x").expect("leftover file");
+        let output = std::process::Output {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"rm: cannot remove '/tmp/lab/root': Device or resource busy\n".to_vec(),
+        };
+        assert!(interpret_remove_stale_lab_root_fallback(&root, &output).is_ok());
+    }
+
+    #[test]
+    fn interpret_remove_stale_lab_root_fallback_preserves_real_failure_when_path_still_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(root.join("mounts")).expect("create mounts");
+        fs::create_dir_all(root.join("exports")).expect("create exports");
+        fs::write(lab_marker_path(&root), b"marker\n").expect("marker");
+        let output = std::process::Output {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"rm: cannot remove '/tmp/lab/root': Permission denied\n".to_vec(),
+        };
+        let err =
+            interpret_remove_stale_lab_root_fallback(&root, &output).expect_err("should fail");
+        assert!(err.contains("failed after stale file handle fallback"));
+    }
+
+    #[test]
     fn output_indicates_absent_mount_accepts_no_mount_point_shape() {
         let output = std::process::Output {
             status: ExitStatus::from_raw(32 << 8),
@@ -1112,6 +1177,41 @@ mod tests {
                 .to_vec(),
         };
         assert!(output_indicates_absent_mount(&output));
+    }
+
+    #[test]
+    fn interpret_umount_outputs_treats_absent_mount_primary_as_success() {
+        let primary = std::process::Output {
+            status: ExitStatus::from_raw(32 << 8),
+            stdout: Vec::new(),
+            stderr: b"umount: /tmp/lab/mounts/node-a/nfs1: no mount point specified.\n".to_vec(),
+        };
+        assert!(
+            interpret_umount_outputs(Path::new("/tmp/lab/mounts/node-a/nfs1"), &primary, None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn interpret_umount_outputs_treats_absent_mount_fallback_as_success() {
+        let primary = std::process::Output {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"umount: /tmp/lab/mounts/node-a/nfs1: busy\n".to_vec(),
+        };
+        let fallback = std::process::Output {
+            status: ExitStatus::from_raw(32 << 8),
+            stdout: b"umount: /tmp/lab/mounts/node-a/nfs1: not mounted.\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert!(
+            interpret_umount_outputs(
+                Path::new("/tmp/lab/mounts/node-a/nfs1"),
+                &primary,
+                Some(&fallback)
+            )
+            .is_ok()
+        );
     }
 
     #[test]

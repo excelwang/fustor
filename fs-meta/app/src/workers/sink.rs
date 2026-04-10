@@ -4598,6 +4598,183 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_restart_deferred_retire_pending_events_deactivate_retries_stale_drained_fenced_pid_error_after_first_wave_succeeded()
+     {
+        struct SinkWorkerControlFrameErrorQueueHookReset;
+
+        impl Drop for SinkWorkerControlFrameErrorQueueHookReset {
+            fn drop(&mut self) {
+                clear_sink_worker_control_frame_error_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 force-find dir");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 force-find dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a")
+            .expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b")
+            .expect("seed nfs2");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                sink_worker_root("nfs1", &nfs1),
+                sink_worker_root("nfs2", &nfs2),
+            ],
+            host_object_grants: vec![
+                sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-d".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let sink = SinkWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+            .await
+            .expect("sink worker start timed out")
+            .expect("start sink worker");
+
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                ],
+            }))
+            .expect("encode sink activate"),
+        ])
+        .await
+        .expect("first sink control wave should succeed");
+
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < initial_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => sink.send(batch).await.expect("apply initial batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let nfs1_ready = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1")
+            .is_some();
+            let nfs2_ready = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                    .await
+                    .expect("query nfs2"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs2")
+            .is_some();
+            if nfs1_ready && nfs2_ready {
+                break;
+            }
+        }
+
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1 after initial"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1 after initial")
+            .is_some(),
+            "precondition: nfs1 initial materialization should exist before restart_deferred_retire_pending retry"
+        );
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                    .await
+                    .expect("query nfs2 after initial"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs2 after initial")
+            .is_some(),
+            "precondition: nfs2 initial materialization should exist before restart_deferred_retire_pending retry"
+        );
+
+        let _reset = SinkWorkerControlFrameErrorQueueHookReset;
+        install_sink_worker_control_frame_error_queue_hook(SinkWorkerControlFrameErrorQueueHook {
+            errs: std::collections::VecDeque::from(vec![CnxError::AccessDenied(
+                "sink worker unavailable: pid Pid(1) is drained/fenced and cannot obtain new grant attachments"
+                    .to_string(),
+            )]),
+            sticky_worker_instance_id: None,
+            sticky_peer_err: None,
+        });
+
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&capanix_runtime_entry_sdk::control::RuntimeExecControl::Deactivate(
+                RuntimeExecDeactivate {
+                    route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+                    unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 3,
+                    reason: "restart_deferred_retire_pending".to_string(),
+                },
+            ))
+            .expect("encode sink events deactivate"),
+        ])
+        .await
+        .expect(
+            "single restart_deferred_retire_pending events deactivate should retry a stale drained/fenced pid error and reach the live sink worker",
+        );
+
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1 after restart_deferred_retire_pending retry"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1 after restart_deferred_retire_pending retry")
+            .is_some(),
+            "restart_deferred_retire_pending retry must preserve nfs1 materialized payload"
+        );
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                    .await
+                    .expect("query nfs2 after restart_deferred_retire_pending retry"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs2 after restart_deferred_retire_pending retry")
+            .is_some(),
+            "restart_deferred_retire_pending retry must preserve nfs2 materialized payload"
+        );
+
+        source.close().await.expect("close source");
+        sink.close().await.expect("close sink worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn status_snapshot_retries_stale_drained_fenced_pid_errors() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");

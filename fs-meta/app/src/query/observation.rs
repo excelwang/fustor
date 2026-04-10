@@ -16,6 +16,11 @@ pub fn materialized_query_observation_evidence(
         .iter()
         .map(|group| (group.group_id.as_str(), group))
         .collect::<BTreeMap<_, _>>();
+    let scheduled_groups = sink_status
+        .scheduled_groups_by_node
+        .values()
+        .flat_map(|groups| groups.iter().cloned())
+        .collect::<BTreeSet<_>>();
 
     let concrete_candidate_groups = source_status
         .concrete_roots
@@ -27,7 +32,7 @@ pub fn materialized_query_observation_evidence(
     for root in &source_status.logical_roots {
         if root.matched_grants > 0
             && root.active_members > 0
-            && (concrete_candidate_groups.is_empty()
+            && ((concrete_candidate_groups.is_empty() && scheduled_groups.contains(&root.root_id))
                 || concrete_candidate_groups.contains(&root.root_id))
         {
             candidate_groups.insert(root.root_id.clone());
@@ -114,5 +119,155 @@ pub fn candidate_group_observation_evidence(
         initial_audit_groups,
         degraded_groups,
         overflow_pending_groups,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sink::SinkGroupStatusSnapshot;
+    use crate::source::{SourceConcreteRootHealthSnapshot, SourceLogicalRootHealthSnapshot};
+
+    fn concrete_root(logical_root_id: &str, is_group_primary: bool) -> SourceConcreteRootHealthSnapshot {
+        SourceConcreteRootHealthSnapshot {
+            root_key: format!("{logical_root_id}@test"),
+            logical_root_id: logical_root_id.to_string(),
+            object_ref: format!("node-x::{logical_root_id}"),
+            status: "running".to_string(),
+            coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            watch_enabled: true,
+            scan_enabled: true,
+            is_group_primary,
+            active: true,
+            watch_lru_capacity: 65536,
+            audit_interval_ms: 300000,
+            overflow_count: 0,
+            overflow_pending: false,
+            rescan_pending: false,
+            last_rescan_reason: None,
+            last_error: None,
+            last_audit_started_at_us: None,
+            last_audit_completed_at_us: None,
+            last_audit_duration_ms: None,
+            emitted_batch_count: 0,
+            emitted_event_count: 0,
+            emitted_control_event_count: 0,
+            emitted_data_event_count: 0,
+            emitted_path_capture_target: None,
+            emitted_path_event_count: 0,
+            last_emitted_at_us: None,
+            last_emitted_origins: Vec::new(),
+            forwarded_batch_count: 0,
+            forwarded_event_count: 0,
+            forwarded_path_event_count: 0,
+            last_forwarded_at_us: None,
+            last_forwarded_origins: Vec::new(),
+            current_revision: None,
+            current_stream_generation: None,
+            candidate_revision: None,
+            candidate_stream_generation: None,
+            candidate_status: None,
+            draining_revision: None,
+            draining_stream_generation: None,
+            draining_status: None,
+        }
+    }
+
+    fn sink_group(group_id: &str) -> SinkGroupStatusSnapshot {
+        SinkGroupStatusSnapshot {
+            group_id: group_id.to_string(),
+            primary_object_ref: "unassigned".to_string(),
+            total_nodes: 0,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_audit: false,
+            initial_audit_completed: false,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn materialized_query_observation_evidence_ignores_logical_only_groups_without_local_sink_schedule()
+     {
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![
+                SourceLogicalRootHealthSnapshot {
+                    root_id: "nfs1".to_string(),
+                    status: "ready".to_string(),
+                    active_members: 3,
+                    matched_grants: 3,
+                    coverage_mode: "realtime_hotset_plus_audit".to_string(),
+                },
+                SourceLogicalRootHealthSnapshot {
+                    root_id: "nfs2".to_string(),
+                    status: "ready".to_string(),
+                    active_members: 3,
+                    matched_grants: 3,
+                    coverage_mode: "realtime_hotset_plus_audit".to_string(),
+                },
+            ],
+            concrete_roots: vec![
+                concrete_root("nfs1", false),
+                concrete_root("nfs2", false),
+            ],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![sink_group("nfs1"), sink_group("nfs2")],
+            scheduled_groups_by_node: BTreeMap::new(),
+            ..SinkStatusSnapshot::default()
+        };
+
+        let evidence = materialized_query_observation_evidence(&source_status, &sink_status);
+        assert!(
+            evidence.candidate_groups.is_empty(),
+            "logical-only groups without any local sink schedule must not keep package-local materialized observation untrusted: {evidence:?}"
+        );
+        assert!(
+            evidence.initial_audit_groups.is_empty(),
+            "logical-only groups without any local sink schedule must not be reported as initial-audit blockers: {evidence:?}"
+        );
+    }
+
+    #[test]
+    fn materialized_query_observation_evidence_keeps_logical_only_groups_when_local_sink_schedule_exists()
+     {
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            }],
+            concrete_roots: vec![concrete_root("nfs1", false)],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![sink_group("nfs1")],
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-d".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..SinkStatusSnapshot::default()
+        };
+
+        let evidence = materialized_query_observation_evidence(&source_status, &sink_status);
+        assert_eq!(
+            evidence.candidate_groups,
+            BTreeSet::from(["nfs1".to_string()]),
+            "logical-only groups should still count when local sink scheduling exists: {evidence:?}"
+        );
+        assert_eq!(
+            evidence.initial_audit_groups,
+            BTreeSet::from(["nfs1".to_string()]),
+            "scheduled logical-only groups must still block on initial audit until materialized: {evidence:?}"
+        );
     }
 }
