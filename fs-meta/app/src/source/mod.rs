@@ -237,6 +237,78 @@ fn host_ref_matches_node_id(host_ref: &str, node_id: &NodeId) -> bool {
             .is_some_and(|suffix| suffix.starts_with('-'))
 }
 
+fn runtime_scope_resource_matches_logical_root(resource_id: &str, logical_root_id: &str) -> bool {
+    resource_id == logical_root_id
+        || resource_id
+            .rsplit_once("::")
+            .is_some_and(|(_, tail)| tail == logical_root_id)
+}
+
+fn runtime_managed_local_resource_ids_for_root(
+    root: &RootSpec,
+    active_rows: &[RuntimeBoundScope],
+) -> BTreeSet<String> {
+    let mut object_refs = BTreeSet::new();
+    for row in active_rows {
+        let row_matches_root = row.scope_id == root.id
+            || row
+                .resource_ids
+                .iter()
+                .any(|resource_id| runtime_scope_resource_matches_logical_root(resource_id, &root.id));
+        if !row_matches_root {
+            continue;
+        }
+        for resource_id in &row.resource_ids {
+            if runtime_scope_resource_matches_logical_root(resource_id, &root.id)
+                || row.scope_id == root.id
+            {
+                object_refs.insert(resource_id.clone());
+            }
+        }
+    }
+    object_refs
+}
+
+fn synthesize_runtime_managed_local_grants(
+    roots: &[RootSpec],
+    node_id: &NodeId,
+    host_object_grants: &[GrantedMountRoot],
+    source_rows: &[RuntimeBoundScope],
+    scan_rows: &[RuntimeBoundScope],
+) -> Vec<GrantedMountRoot> {
+    let mut grants = Vec::new();
+    for root in roots {
+        if host_object_grants.iter().any(|grant| {
+            host_ref_matches_node_id(&grant.host_ref, node_id) && root.selector.matches(grant)
+        }) {
+            continue;
+        }
+        let Some(mount_point) = root.selected_mount_point() else {
+            continue;
+        };
+        let mut object_refs = runtime_managed_local_resource_ids_for_root(root, source_rows);
+        object_refs.extend(runtime_managed_local_resource_ids_for_root(root, scan_rows));
+        for object_ref in object_refs {
+            grants.push(GrantedMountRoot {
+                object_ref,
+                host_ref: node_id.0.clone(),
+                host_ip: node_id.0.clone(),
+                host_name: Some(node_id.0.clone()),
+                site: None,
+                zone: None,
+                host_labels: Default::default(),
+                mount_point: mount_point.to_path_buf(),
+                fs_source: mount_point.display().to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: Vec::new(),
+                interfaces: vec!["posix-fs".to_string(), "inotify".to_string()],
+                active: true,
+            });
+        }
+    }
+    grants
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SourceLogicalRootHealthSnapshot {
     pub root_id: String,
@@ -1011,8 +1083,8 @@ impl FSMetaSource {
         let groups = match self.unit_control.unit_state(unit.unit_id())? {
             Some((true, rows)) => {
                 let active_groups = rows
-                    .into_iter()
-                    .map(|row| row.scope_id)
+                    .iter()
+                    .map(|row| row.scope_id.clone())
                     .collect::<BTreeSet<_>>();
                 let logical_roots = self.logical_roots_snapshot();
                 let host_object_grants = self.host_object_grants_snapshot();
@@ -1026,7 +1098,7 @@ impl FSMetaSource {
                         host_object_grants.iter().any(|grant| {
                             host_ref_matches_node_id(&grant.host_ref, &self.node_id)
                                 && root.selector.matches(grant)
-                        })
+                        }) || !runtime_managed_local_resource_ids_for_root(root, &rows).is_empty()
                     })
                     .map(|root| root.id.clone())
                     .collect::<BTreeSet<_>>();
@@ -1051,6 +1123,22 @@ impl FSMetaSource {
     async fn refresh_runtime_roots(&self, trigger_rescan: bool) -> Result<()> {
         let root_specs = self.logical_roots_snapshot();
         let host_object_grants = self.host_object_grants_snapshot();
+        let source_rows = match self.unit_control.unit_state(SourceRuntimeUnit::Source.unit_id())? {
+            Some((true, rows)) => rows,
+            Some((false, _)) | None => Vec::new(),
+        };
+        let scan_rows = match self.unit_control.unit_state(SourceRuntimeUnit::Scan.unit_id())? {
+            Some((true, rows)) => rows,
+            Some((false, _)) | None => Vec::new(),
+        };
+        let mut effective_host_object_grants = host_object_grants.clone();
+        effective_host_object_grants.extend(synthesize_runtime_managed_local_grants(
+            &root_specs,
+            &self.node_id,
+            &host_object_grants,
+            &source_rows,
+            &scan_rows,
+        ));
         let source_groups = self.scheduled_group_ids(SourceRuntimeUnit::Source)?;
         let scan_groups = self.scheduled_group_ids(SourceRuntimeUnit::Scan)?;
         let desired = Self::build_root_runtimes(
@@ -1058,7 +1146,7 @@ impl FSMetaSource {
             &self.node_id,
             self.boundary.clone(),
             &root_specs,
-            &host_object_grants,
+            &effective_host_object_grants,
             source_groups.as_ref(),
             scan_groups.as_ref(),
         );
@@ -2655,8 +2743,9 @@ impl FSMetaSource {
     }
 
     pub async fn trigger_rescan_when_ready(&self) {
-        self.wait_for_group_primary_scan_roots_ready().await;
-        self.trigger_rescan();
+        if self.wait_for_group_primary_scan_roots_ready().await {
+            self.trigger_rescan();
+        }
     }
 
     /// Trigger an overflow diagnostic signal. Intended for tests simulating IN_Q_OVERFLOW recovery-path.
@@ -2936,7 +3025,7 @@ impl FSMetaSource {
         .clone()
     }
 
-    async fn wait_for_group_primary_scan_roots_ready(&self) {
+    async fn wait_for_group_primary_scan_roots_ready(&self) -> bool {
         let expected = lock_or_recover(
             &self.state_cell.roots,
             "source.wait_for_group_primary_scan_roots_ready.roots",
@@ -2946,13 +3035,13 @@ impl FSMetaSource {
         .map(Self::root_runtime_key)
         .collect::<Vec<_>>();
         if expected.is_empty() {
-            return;
+            return true;
         }
 
         let deadline = tokio::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
         loop {
             if self.shutdown.is_cancelled() {
-                return;
+                return false;
             }
 
             let ready = {
@@ -2968,14 +3057,14 @@ impl FSMetaSource {
                 })
             };
             if ready {
-                return;
+                return true;
             }
             if tokio::time::Instant::now() >= deadline {
                 log::debug!(
                     "source-fs-meta: timed out waiting for primary scan roots before rescan: {:?}",
                     expected
                 );
-                return;
+                return false;
             }
             tokio::time::sleep(RESCAN_READY_POLL_INTERVAL).await;
         }
@@ -4503,7 +4592,10 @@ mod tests {
     use crate::ControlEvent;
     use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
     use crate::runtime::execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID;
-    use crate::runtime::routes::{ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_ROOTS_CONTROL};
+    use crate::runtime::routes::{
+        ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
+        ROUTE_KEY_SOURCE_ROOTS_CONTROL,
+    };
     use crate::sink::SinkFileMeta;
     use capanix_app_sdk::runtime::ControlEnvelope;
     use capanix_runtime_entry_sdk::advanced::boundary::BoundaryContext;
@@ -5677,6 +5769,525 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn runtime_managed_local_resource_ids_without_grant_change_build_primary_scan_roots_for_watch_scan_refresh()
+     {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_micros();
+        let base = std::env::temp_dir()
+            .join(format!("fs-meta-runtime-managed-watch-scan-zero-grant-{unique}"));
+        let nfs1 = base.join("nfs1");
+        let nfs2 = base.join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![
+            RootSpec::new("nfs1", nfs1.clone()),
+            RootSpec::new("nfs2", nfs2.clone()),
+        ];
+        cfg.host_object_grants = Vec::new();
+        let source = FSMetaSource::with_boundaries(
+            cfg,
+            NodeId("node-c-29776225407437800789245953".to_string()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init runtime-managed source");
+
+        source
+            .on_control_frame(&[
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: METHOD_SOURCE_ROOTS_CONTROL.to_string(),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: METHOD_SOURCE_RESCAN.to_string(),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode scan activate"),
+            ])
+            .await
+            .expect("apply runtime-managed watch-scan activate without host grant change");
+
+        let expected_groups = BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let expected_primary_scan_roots = BTreeSet::from([
+            ("nfs1".to_string(), "nfs1".to_string(), nfs1.clone()),
+            ("nfs2".to_string(), "nfs2".to_string(), nfs2.clone()),
+        ]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_active = match source
+                .unit_control
+                .unit_state(SOURCE_RUNTIME_UNIT_ID)
+                .expect("source unit state")
+            {
+                Some((true, rows)) => rows.into_iter().map(|row| row.scope_id).collect::<BTreeSet<_>>(),
+                Some((false, _)) | None => BTreeSet::new(),
+            };
+            let scan_active = match source
+                .unit_control
+                .unit_state(SOURCE_SCAN_RUNTIME_UNIT_ID)
+                .expect("scan unit state")
+            {
+                Some((true, rows)) => rows.into_iter().map(|row| row.scope_id).collect::<BTreeSet<_>>(),
+                Some((false, _)) | None => BTreeSet::new(),
+            };
+            let primary_scan_roots = lock_or_recover(
+                &source.state_cell.roots,
+                "test.runtime_managed_local_resource_ids_without_grant_change_build_primary_scan_roots.roots",
+            )
+            .iter()
+            .filter(|root| root.is_group_primary && root.spec.scan)
+            .map(|root| {
+                (
+                    root.logical_root_id.clone(),
+                    root.object_ref.clone(),
+                    root.monitor_path.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+            if source_active == expected_groups
+                && scan_active == expected_groups
+                && primary_scan_roots == expected_primary_scan_roots
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "runtime-managed zero-grant watch-scan activate should still build local primary scan roots from active local resource ids once unit scopes converge: source={source_active:?} scan={scan_active:?} primary_scan_roots={primary_scan_roots:?}",
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        source.close().await.expect("close source");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn runtime_managed_watch_scan_zero_grant_trigger_rescan_when_ready_publishes_baseline_data()
+    {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_micros();
+        let base =
+            std::env::temp_dir().join(format!("fs-meta-runtime-managed-watch-scan-publish-{unique}"));
+        let nfs1 = base.join("nfs1");
+        let nfs2 = base.join("nfs2");
+        std::fs::create_dir_all(nfs1.join("data")).expect("create nfs1 data dir");
+        std::fs::create_dir_all(nfs2.join("data")).expect("create nfs2 data dir");
+        std::fs::write(nfs1.join("data").join("a.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join("data").join("b.txt"), b"b").expect("seed nfs2");
+
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![
+            RootSpec::new("nfs1", nfs1.clone()),
+            RootSpec::new("nfs2", nfs2.clone()),
+        ];
+        cfg.host_object_grants = Vec::new();
+        let source =
+            FSMetaSource::with_boundaries(cfg, NodeId("node-c-local-sink-status-helper".into()), None)
+                .expect("init runtime-managed source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let source_wave = |generation| {
+            vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source roots activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source rescan activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source scan activate"),
+            ]
+        };
+
+        source
+            .on_control_frame(&source_wave(2))
+            .await
+            .expect("apply runtime-managed watch-scan activate without host grant change");
+        source.trigger_rescan_when_ready().await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut counts = BTreeMap::<String, usize>::new();
+        while tokio::time::Instant::now() < deadline {
+            let next = tokio::time::timeout(Duration::from_millis(250), stream.next()).await;
+            let Ok(Some(batch)) = next else {
+                continue;
+            };
+            for event in batch {
+                let Ok(record) = rmp_serde::from_slice::<crate::FileMetaRecord>(event.payload_bytes())
+                else {
+                    continue;
+                };
+                if is_under_query_path(&record.path, b"/data") {
+                    *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+                }
+            }
+            if counts.len() >= 2 {
+                break;
+            }
+        }
+
+        source.close().await.expect("close source");
+        let _ = std::fs::remove_dir_all(base);
+
+        assert!(
+            counts.len() >= 2,
+            "runtime-managed zero-grant watch-scan trigger_rescan_when_ready must publish baseline /data for both local roots after runtime-managed activate scopes converge: {counts:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_managed_watch_scan_zero_grant_republishes_baseline_after_cleanup_tail() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_micros();
+        let base = std::env::temp_dir()
+            .join(format!("fs-meta-runtime-managed-watch-scan-republish-{unique}"));
+        let nfs1 = base.join("nfs1");
+        let nfs2 = base.join("nfs2");
+        std::fs::create_dir_all(nfs1.join("data")).expect("create nfs1 data dir");
+        std::fs::create_dir_all(nfs2.join("data")).expect("create nfs2 data dir");
+        std::fs::write(nfs1.join("data").join("a.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join("data").join("b.txt"), b"b").expect("seed nfs2");
+
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![
+            RootSpec::new("nfs1", nfs1.clone()),
+            RootSpec::new("nfs2", nfs2.clone()),
+        ];
+        cfg.host_object_grants = Vec::new();
+        let source = FSMetaSource::with_boundaries(
+            cfg,
+            NodeId("node-c-peer-cleanup-tail-sink-status".into()),
+            None,
+        )
+        .expect("init runtime-managed source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let source_wave = |generation| {
+            vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source roots activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source rescan activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source scan activate"),
+            ]
+        };
+        let cleanup_tail = vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Deactivate(
+                RuntimeExecDeactivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 3,
+                    reason: "restart_deferred_retire_pending".to_string(),
+                },
+            ))
+            .expect("encode source roots deactivate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Deactivate(
+                RuntimeExecDeactivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 3,
+                    reason: "restart_deferred_retire_pending".to_string(),
+                },
+            ))
+            .expect("encode source rescan-control deactivate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Deactivate(
+                RuntimeExecDeactivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 3,
+                    reason: "restart_deferred_retire_pending".to_string(),
+                },
+            ))
+            .expect("encode source rescan deactivate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Deactivate(
+                RuntimeExecDeactivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 3,
+                    reason: "restart_deferred_retire_pending".to_string(),
+                },
+            ))
+            .expect("encode source scan deactivate"),
+        ];
+
+        source
+            .on_control_frame(&source_wave(2))
+            .await
+            .expect("apply initial runtime-managed watch-scan activate");
+        assert_eq!(
+            source
+                .scheduled_source_group_ids()
+                .expect("source groups after initial activate"),
+            Some(BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])),
+        );
+        assert_eq!(
+            source
+                .scheduled_scan_group_ids()
+                .expect("scan groups after initial activate"),
+            Some(BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])),
+        );
+        source.trigger_rescan_when_ready().await;
+
+        let baseline_target = b"/data";
+        let baseline_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut baseline_counts = BTreeMap::<String, usize>::new();
+        while tokio::time::Instant::now() < baseline_deadline {
+            let next = tokio::time::timeout(Duration::from_millis(250), stream.next()).await;
+            let Ok(Some(batch)) = next else {
+                continue;
+            };
+            for event in batch {
+                let Ok(record) =
+                    rmp_serde::from_slice::<crate::FileMetaRecord>(event.payload_bytes())
+                else {
+                    continue;
+                };
+                if is_under_query_path(&record.path, baseline_target) {
+                    *baseline_counts
+                        .entry(event.metadata().origin_id.0.clone())
+                        .or_default() += 1;
+                }
+            }
+            if baseline_counts.len() >= 2 {
+                break;
+            }
+        }
+        assert!(
+            baseline_counts.len() >= 2,
+            "initial runtime-managed watch-scan trigger_rescan_when_ready must publish baseline /data for both local roots before cleanup tail: {baseline_counts:?}",
+        );
+        while tokio::time::timeout(Duration::from_millis(50), stream.next())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {}
+
+        source
+            .on_control_frame(&cleanup_tail)
+            .await
+            .expect("apply cleanup-only watch-scan tail");
+        source
+            .on_control_frame(&source_wave(4))
+            .await
+            .expect("apply later runtime-managed watch-scan recovery");
+        assert_eq!(
+            source
+                .scheduled_source_group_ids()
+                .expect("source groups after later recovery"),
+            Some(BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])),
+        );
+        assert_eq!(
+            source
+                .scheduled_scan_group_ids()
+                .expect("scan groups after later recovery"),
+            Some(BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])),
+        );
+        source.trigger_rescan_when_ready().await;
+
+        let republish_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut republish_counts = BTreeMap::<String, usize>::new();
+        while tokio::time::Instant::now() < republish_deadline {
+            let next = tokio::time::timeout(Duration::from_millis(250), stream.next()).await;
+            let Ok(Some(batch)) = next else {
+                continue;
+            };
+            for event in batch {
+                let Ok(record) =
+                    rmp_serde::from_slice::<crate::FileMetaRecord>(event.payload_bytes())
+                else {
+                    continue;
+                };
+                if is_under_query_path(&record.path, baseline_target) {
+                    *republish_counts
+                        .entry(event.metadata().origin_id.0.clone())
+                        .or_default() += 1;
+                }
+            }
+            if republish_counts.len() >= 2 {
+                break;
+            }
+        }
+
+        source.close().await.expect("close source");
+        let _ = std::fs::remove_dir_all(base);
+
+        assert!(
+            republish_counts.len() >= 2,
+            "later runtime-managed watch-scan recovery must republish baseline /data for both local roots after cleanup tail instead of leaving post-recovery publishes empty: baseline_counts={baseline_counts:?} republish_counts={republish_counts:?}",
+        );
+    }
+
     #[test]
     fn logical_root_fanout_can_group_by_host_ip_descriptor() {
         let mut cfg = SourceConfig::default();
@@ -5909,6 +6520,42 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(75));
         let reason = rx.try_recv().expect("primary should receive manual rescan");
         assert!(matches!(reason, RescanReason::Manual));
+    }
+
+    #[tokio::test]
+    async fn trigger_rescan_when_ready_does_not_fire_before_primary_root_running() {
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+        cfg.host_object_grants = vec![test_export(
+            "node-a::exp1",
+            "node-a",
+            "10.0.0.11",
+            "/mnt/nfs1",
+            true,
+        )];
+        let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let primary_root = lock_or_recover(
+            &source.state_cell.roots,
+            "test.trigger_rescan_when_ready_timeout.roots",
+        )
+        .iter()
+        .find(|root| root.is_group_primary)
+        .cloned()
+        .expect("primary root exists");
+        let mut rx = primary_root.rescan_tx.subscribe();
+
+        tokio::time::timeout(Duration::from_secs(6), source.trigger_rescan_when_ready())
+            .await
+            .expect("trigger_rescan_when_ready should settle even if primary root never becomes running");
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "trigger_rescan_when_ready must not fire a manual rescan before the primary scan root is running"
+        );
     }
 
     #[test]

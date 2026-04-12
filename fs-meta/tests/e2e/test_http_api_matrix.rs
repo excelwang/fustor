@@ -1663,6 +1663,13 @@ fn representative_mount_for_group(group_id: &str, paths: &[PathBuf]) -> Option<P
     candidates.into_iter().next()
 }
 
+fn path_has_visible_entries(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path)
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_some()
+}
+
 fn local_existing_path_for_fs_source(fs_source: &str) -> Option<PathBuf> {
     let (_, path) = fs_source.split_once(':')?;
     if !path.starts_with('/') {
@@ -1680,12 +1687,26 @@ fn group_mount_pairs_for_roots(
     roots
         .iter()
         .map(|(group_id, fs_source)| {
-            mount_map
+            let local_existing = local_existing_path_for_fs_source(fs_source);
+            let candidate = mount_map
                 .get(*fs_source)
                 .and_then(|paths| representative_mount_for_group(group_id, paths))
-                .or_else(|| local_existing_path_for_fs_source(fs_source))
-                .map(|path| (group_id.to_string(), path))
-                .ok_or_else(|| format!("missing representative mount for fs_source {fs_source}"))
+                .or_else(|| local_existing.clone())
+                .ok_or_else(|| format!("missing representative mount for fs_source {fs_source}"))?;
+            let chosen = match local_existing {
+                Some(local)
+                    if candidate.exists()
+                        && candidate.is_dir()
+                        && !path_has_visible_entries(&candidate)
+                        && local.exists()
+                        && local.is_dir()
+                        && path_has_visible_entries(&local) =>
+                {
+                    local
+                }
+                _ => candidate,
+            };
+            Ok((group_id.to_string(), chosen))
         })
         .collect()
 }
@@ -1762,6 +1783,7 @@ fn group_mount_pairs_for_roots_prefers_runtime_mount_over_local_export_source_wh
     std::fs::create_dir_all(&export_root).expect("create export root");
     std::fs::create_dir_all(&mount_root).expect("create mount root");
     std::fs::write(export_root.join("root.txt"), "hello\n").expect("write export file");
+    std::fs::write(mount_root.join("root.txt"), "mounted\n").expect("write mount file");
     let fs_source = format!("127.0.0.1:{}", export_root.display());
     let grants = json!({
         "grants": [
@@ -1775,6 +1797,30 @@ fn group_mount_pairs_for_roots_prefers_runtime_mount_over_local_export_source_wh
     let pairs = group_mount_pairs_for_roots(&grants, &[("nfs1", fs_source.as_str())]).expect("pairs");
 
     assert_eq!(pairs, vec![("nfs1".to_string(), mount_root)]);
+}
+
+#[test]
+fn group_mount_pairs_for_roots_prefers_local_export_source_over_empty_runtime_mount() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let export_root = temp.path().join("exports/nfs1");
+    let mount_root = temp.path().join("mounts/node-a/nfs1");
+    std::fs::create_dir_all(&export_root).expect("create export root");
+    std::fs::create_dir_all(&mount_root).expect("create mount root");
+    std::fs::write(export_root.join("root.txt"), "hello\n").expect("write export file");
+    let fs_source = format!("127.0.0.1:{}", export_root.display());
+    let grants = json!({
+        "grants": [
+            {
+                "fs_source": fs_source,
+                "mount_point": mount_root.display().to_string()
+            }
+        ]
+    });
+
+    let pairs =
+        group_mount_pairs_for_roots(&grants, &[("nfs1", fs_source.as_str())]).expect("pairs");
+
+    assert_eq!(pairs, vec![("nfs1".to_string(), export_root)]);
 }
 
 fn normalize_tree_like_json(value: &mut Value) {

@@ -1055,7 +1055,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn stale_lab_export_dirs_for_cleanup_include_alias_and_canonical_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
         let real_root = temp.path().join(".tmpreal123");

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
@@ -20,7 +20,8 @@ use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryNode, Su
 use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::execution_units;
 use crate::runtime::orchestration::{
-    FacadeControlSignal, FacadeRuntimeUnit, SinkControlSignal, SourceControlSignal,
+    FacadeControlSignal, FacadeRuntimeUnit, SinkControlSignal, SinkRuntimeUnit,
+    SourceControlSignal,
     split_app_control_signals,
 };
 use crate::runtime::routes::{
@@ -49,7 +50,9 @@ use capanix_runtime_entry_sdk::advanced::boundary::{
     ChannelBoundary, ChannelIoSubset, StateBoundary, boundary_handles,
 };
 use capanix_runtime_entry_sdk::control::{
-    RuntimeBoundScope, RuntimeExecControl, decode_runtime_exec_control,
+    RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate,
+    RuntimeUnitTick, decode_runtime_exec_control, encode_runtime_exec_control,
+    encode_runtime_unit_tick,
 };
 use capanix_runtime_entry_sdk::worker_runtime::RuntimeWorkerClientFactory;
 use capanix_runtime_entry_sdk::{RuntimeBootstrapContext, RuntimeLoadedServiceApp};
@@ -124,6 +127,80 @@ impl ProcessFacadeClaim {
     fn matches_pending(&self, pending: &PendingFacadeActivation) -> bool {
         self.bind_addr == pending.resolved.bind_addr
     }
+}
+
+fn source_signal_generation(signal: &SourceControlSignal) -> u64 {
+    match signal {
+        SourceControlSignal::Activate { generation, .. }
+        | SourceControlSignal::Deactivate { generation, .. }
+        | SourceControlSignal::Tick { generation, .. } => *generation,
+        SourceControlSignal::RuntimeHostGrantChange { .. }
+        | SourceControlSignal::ManualRescan { .. }
+        | SourceControlSignal::Passthrough(_) => 0,
+    }
+}
+
+fn facade_signal_generation(signal: &FacadeControlSignal) -> u64 {
+    match signal {
+        FacadeControlSignal::Activate { generation, .. }
+        | FacadeControlSignal::Deactivate { generation, .. }
+        | FacadeControlSignal::Tick { generation, .. }
+        | FacadeControlSignal::ExposureConfirmed { generation, .. } => *generation,
+        FacadeControlSignal::RuntimeHostGrantChange { .. } | FacadeControlSignal::Passthrough => 0,
+    }
+}
+
+fn facade_publication_signal_is_sink_status_activate(signal: &FacadeControlSignal) -> bool {
+    matches!(
+        signal,
+        FacadeControlSignal::Activate { unit, route_key, .. }
+            if matches!(unit, FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer)
+                && route_key == &format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
+    )
+}
+
+fn sink_status_snapshot_has_ready_scheduled_groups(
+    snapshot: &crate::sink::SinkStatusSnapshot,
+) -> bool {
+    let scheduled_groups = snapshot
+        .scheduled_groups_by_node
+        .values()
+        .flat_map(|groups| groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    if scheduled_groups.is_empty() {
+        return false;
+    }
+    let ready_groups = snapshot
+        .groups
+        .iter()
+        .filter(|group| group.initial_audit_completed)
+        .map(|group| group.group_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    scheduled_groups.is_subset(&ready_groups)
+}
+
+fn current_generation_sink_replay_tick(
+    source_signals: &[SourceControlSignal],
+    facade_signals: &[FacadeControlSignal],
+) -> Option<SinkControlSignal> {
+    let generation = source_signals
+        .iter()
+        .map(source_signal_generation)
+        .chain(facade_signals.iter().map(facade_signal_generation))
+        .find(|generation| *generation > 0)?;
+    let route_key = format!("{}.stream", ROUTE_KEY_EVENTS);
+    Some(SinkControlSignal::Tick {
+        unit: SinkRuntimeUnit::Sink,
+        route_key: route_key.clone(),
+        generation,
+        envelope: encode_runtime_unit_tick(&RuntimeUnitTick {
+            route_key,
+            unit_id: execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+            generation,
+            at_ms: 1,
+        })
+        .expect("encode synthetic sink replay tick"),
+    })
 }
 
 #[derive(Clone)]
@@ -390,6 +467,23 @@ fn summarize_sink_status_endpoint(snapshot: &crate::sink::SinkStatusSnapshot) ->
         summarize_groups_by_node(&snapshot.stream_applied_origin_counts_by_node),
         summarize_groups_by_node(&snapshot.stream_applied_path_origin_counts_by_node),
         summarize_counts_by_node(&snapshot.stream_last_applied_at_us_by_node),
+    )
+}
+
+fn summarize_source_observability_endpoint(
+    snapshot: &crate::workers::source::SourceObservabilitySnapshot,
+) -> String {
+    format!(
+        "scheduled_source_groups={:?} scheduled_scan_groups={:?} published_batches={:?} published_events={:?} published_control_events={:?} published_data_events={:?} last_published_at_us={:?} published_origin_counts={:?} published_path_origin_counts={:?}",
+        summarize_groups_by_node(&snapshot.scheduled_source_groups_by_node),
+        summarize_groups_by_node(&snapshot.scheduled_scan_groups_by_node),
+        summarize_counts_by_node(&snapshot.published_batches_by_node),
+        summarize_counts_by_node(&snapshot.published_events_by_node),
+        summarize_counts_by_node(&snapshot.published_control_events_by_node),
+        summarize_counts_by_node(&snapshot.published_data_events_by_node),
+        summarize_counts_by_node(&snapshot.last_published_at_us_by_node),
+        summarize_groups_by_node(&snapshot.published_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.published_path_origin_counts_by_node),
     )
 }
 
@@ -697,6 +791,11 @@ fn is_per_peer_sink_query_request_route(route_key: &str) -> bool {
 
 fn is_retryable_worker_control_reset(err: &CnxError) -> bool {
     matches!(err, CnxError::TransportClosed(_) | CnxError::Timeout)
+        || matches!(
+            err,
+            CnxError::PeerError(message) | CnxError::Internal(message)
+                if message.contains("operation timed out")
+        )
         || matches!(
             err,
             CnxError::PeerError(message)
@@ -1130,6 +1229,20 @@ struct SourceApplyPauseHook {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+struct LocalSinkStatusRepublishProbePauseHook {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct LocalSinkStatusRepublishRetriggerPauseHook {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
 fn facade_shutdown_start_hook_cell() -> &'static StdMutex<Option<FacadeShutdownStartHook>> {
     static CELL: OnceLock<StdMutex<Option<FacadeShutdownStartHook>>> = OnceLock::new();
     CELL.get_or_init(|| StdMutex::new(None))
@@ -1358,6 +1471,104 @@ async fn maybe_pause_before_source_apply() {
     }
 }
 
+#[cfg(test)]
+fn local_sink_status_republish_probe_pause_hook_cell()
+-> &'static StdMutex<Option<LocalSinkStatusRepublishProbePauseHook>> {
+    static CELL: OnceLock<StdMutex<Option<LocalSinkStatusRepublishProbePauseHook>>> =
+        OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn install_local_sink_status_republish_probe_pause_hook(
+    hook: LocalSinkStatusRepublishProbePauseHook,
+) {
+    let mut guard = match local_sink_status_republish_probe_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+fn clear_local_sink_status_republish_probe_pause_hook() {
+    let mut guard = match local_sink_status_republish_probe_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+async fn maybe_pause_before_local_sink_status_republish_probe() {
+    let hook = {
+        let guard = match local_sink_status_republish_probe_pause_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        hook.entered.notify_waiters();
+        release.await;
+    }
+}
+
+#[cfg(test)]
+fn local_sink_status_republish_retrigger_pause_hook_cell()
+-> &'static StdMutex<Option<LocalSinkStatusRepublishRetriggerPauseHook>> {
+    static CELL: OnceLock<StdMutex<Option<LocalSinkStatusRepublishRetriggerPauseHook>>> =
+        OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn install_local_sink_status_republish_retrigger_pause_hook(
+    hook: LocalSinkStatusRepublishRetriggerPauseHook,
+) {
+    let mut guard = match local_sink_status_republish_retrigger_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+fn clear_local_sink_status_republish_retrigger_pause_hook() {
+    let mut guard = match local_sink_status_republish_retrigger_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+async fn maybe_pause_after_local_sink_status_republish_retrigger() {
+    let hook = {
+        let guard = match local_sink_status_republish_retrigger_pause_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        hook.entered.notify_waiters();
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        release.await;
+    }
+}
+
 pub struct FSMetaApp {
     instance_id: u64,
     config: FSMetaConfig,
@@ -1381,7 +1592,7 @@ pub struct FSMetaApp {
     shared_control_frame_serial: Arc<Mutex<()>>,
     facade_pending_status: SharedFacadePendingStatusCell,
     facade_gate: RuntimeUnitGate,
-    mirrored_query_peer_routes: Mutex<std::collections::BTreeMap<String, u64>>,
+    mirrored_query_peer_routes: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
     control_initialized: AtomicBool,
     retained_source_control_state: Mutex<RetainedSourceControlState>,
     source_state_replay_required: AtomicBool,
@@ -1408,6 +1619,462 @@ struct RetainedSinkControlState {
 }
 
 impl FSMetaApp {
+    fn sink_status_snapshot_summary_is_empty(
+        snapshot: &crate::sink::SinkStatusSnapshot,
+    ) -> bool {
+        snapshot.groups.is_empty() && snapshot.scheduled_groups_by_node.is_empty()
+    }
+
+    fn sink_status_snapshot_has_convergence_evidence(
+        snapshot: &crate::sink::SinkStatusSnapshot,
+    ) -> bool {
+        !snapshot.received_batches_by_node.is_empty()
+            || !snapshot.received_events_by_node.is_empty()
+            || !snapshot.received_origin_counts_by_node.is_empty()
+            || !snapshot.stream_received_batches_by_node.is_empty()
+            || !snapshot.stream_received_events_by_node.is_empty()
+            || !snapshot.stream_received_origin_counts_by_node.is_empty()
+            || !snapshot.stream_received_path_origin_counts_by_node.is_empty()
+            || !snapshot.stream_ready_origin_counts_by_node.is_empty()
+            || !snapshot.stream_ready_path_origin_counts_by_node.is_empty()
+            || !snapshot.stream_deferred_origin_counts_by_node.is_empty()
+            || !snapshot.stream_dropped_origin_counts_by_node.is_empty()
+            || !snapshot.stream_applied_batches_by_node.is_empty()
+            || !snapshot.stream_applied_events_by_node.is_empty()
+            || !snapshot.stream_applied_control_events_by_node.is_empty()
+            || !snapshot.stream_applied_data_events_by_node.is_empty()
+            || !snapshot.stream_applied_origin_counts_by_node.is_empty()
+            || !snapshot.stream_applied_path_origin_counts_by_node.is_empty()
+            || !snapshot.stream_last_applied_at_us_by_node.is_empty()
+    }
+
+    async fn wait_for_sink_status_republish_readiness_after_recovery(
+        &self,
+        source_to_sink_convergence_pretriggered: bool,
+    ) -> Result<Option<std::collections::BTreeSet<String>>> {
+        let summarize_cached_sink_status_after_scope_convergence_timeout = |app: &Self| {
+            app.sink
+                .cached_status_snapshot()
+                .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+                .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"))
+        };
+        let mut triggered_rescan_when_ready = source_to_sink_convergence_pretriggered;
+        let mut post_replay_rescan_retry_pending = false;
+        let mut retried_after_post_recovery_sink_timeout = false;
+        let mut manual_rescan_requested_after_post_recovery_sink_timeout = false;
+        loop {
+            let scope_convergence_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let converged_groups = loop {
+                if post_replay_rescan_retry_pending {
+                    self.source.trigger_rescan_when_ready().await?;
+                    triggered_rescan_when_ready = true;
+                    post_replay_rescan_retry_pending = false;
+                }
+                let source_groups = self
+                    .source
+                    .scheduled_source_group_ids()
+                    .await?
+                    .unwrap_or_default();
+                let scan_groups = self
+                    .source
+                    .scheduled_scan_group_ids()
+                    .await?
+                    .unwrap_or_default();
+                let sink_groups = self.sink.scheduled_group_ids().await?.unwrap_or_default();
+                if !source_groups.is_empty()
+                    && source_groups == scan_groups
+                    && source_groups == sink_groups
+                {
+                    break sink_groups;
+                }
+                if !triggered_rescan_when_ready {
+                    self.source.trigger_rescan_when_ready().await?;
+                    triggered_rescan_when_ready = true;
+                }
+                if tokio::time::Instant::now() >= scope_convergence_deadline {
+                    return Err(CnxError::Internal(format!(
+                        "runtime scope convergence not observed after retained replay: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+
+            let sink_readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match tokio::time::timeout(
+                    Duration::from_millis(250),
+                    self.sink.status_snapshot(),
+                )
+                .await
+                {
+                    Ok(Ok(snapshot)) => {
+                        let ready_groups = snapshot
+                            .groups
+                            .iter()
+                            .filter(|group| group.initial_audit_completed)
+                            .map(|group| group.group_id.clone())
+                            .collect::<std::collections::BTreeSet<_>>();
+                        if ready_groups == converged_groups {
+                            return Ok(None);
+                        }
+                        if tokio::time::Instant::now() >= sink_readiness_deadline {
+                            return Err(CnxError::Internal(format!(
+                                "sink status readiness not restored after retained replay once runtime scope converged: {}",
+                                summarize_sink_status_endpoint(&snapshot)
+                            )));
+                        }
+                    }
+                    Ok(Err(err))
+                        if matches!(err, CnxError::Timeout)
+                            && !retried_after_post_recovery_sink_timeout
+                            && tokio::time::Instant::now() < sink_readiness_deadline =>
+                    {
+                        // A later source-only recovery can converge route scopes from primed
+                        // cached groups before the post-recovery rescan has actually
+                        // rematerialized baseline source publication. Request one explicit
+                        // manual rescan before the final source->sink retry so sink readiness
+                        // wait does not return on a scheduled-only zero-state sink.
+                        if !manual_rescan_requested_after_post_recovery_sink_timeout {
+                            self.source.publish_manual_rescan_signal().await?;
+                            manual_rescan_requested_after_post_recovery_sink_timeout = true;
+                        }
+                        retried_after_post_recovery_sink_timeout = true;
+                        post_replay_rescan_retry_pending = true;
+                        break;
+                    }
+                    Ok(Err(_err)) if tokio::time::Instant::now() < sink_readiness_deadline => {}
+                    Ok(Err(err)) if matches!(err, CnxError::Timeout) => {
+                        if self
+                            .sink
+                            .cached_status_snapshot()
+                            .ok()
+                            .is_some_and(|snapshot| {
+                                Self::sink_status_snapshot_summary_is_empty(&snapshot)
+                            })
+                        {
+                            return Ok(Some(converged_groups));
+                        }
+                        return Err(CnxError::Internal(format!(
+                            "sink status readiness not restored after retained replay once runtime scope converged: groups={:?} raw_timeout=true {}",
+                            converged_groups,
+                            summarize_cached_sink_status_after_scope_convergence_timeout(self)
+                        )));
+                    }
+                    Ok(Err(err)) => return Err(err),
+                    Err(_)
+                        if !retried_after_post_recovery_sink_timeout
+                            && tokio::time::Instant::now() < sink_readiness_deadline =>
+                    {
+                        if !manual_rescan_requested_after_post_recovery_sink_timeout {
+                            self.source.publish_manual_rescan_signal().await?;
+                            manual_rescan_requested_after_post_recovery_sink_timeout = true;
+                        }
+                        retried_after_post_recovery_sink_timeout = true;
+                        post_replay_rescan_retry_pending = true;
+                        break;
+                    }
+                    Err(_) if tokio::time::Instant::now() < sink_readiness_deadline => {}
+                    Err(_) => {
+                        if self
+                            .sink
+                            .cached_status_snapshot()
+                            .ok()
+                            .is_some_and(|snapshot| {
+                                Self::sink_status_snapshot_summary_is_empty(&snapshot)
+                            })
+                        {
+                            return Ok(Some(converged_groups));
+                        }
+                        return Err(CnxError::Internal(format!(
+                            "sink status readiness not restored after retained replay once runtime scope converged: groups={:?} raw_timeout=true {}",
+                            converged_groups,
+                            summarize_cached_sink_status_after_scope_convergence_timeout(self)
+                        )));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    async fn wait_for_local_sink_status_republish_after_recovery_from_parts(
+        source: Arc<SourceFacade>,
+        sink: Arc<SinkFacade>,
+        expected_groups: &std::collections::BTreeSet<String>,
+        post_return_sink_replay_signals: &[SinkControlSignal],
+    ) -> Result<()> {
+        let summarize_cached_sink_status = |sink: &Arc<SinkFacade>| {
+            sink.cached_status_snapshot()
+                .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+                .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"))
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut post_return_source_to_sink_convergence_retrigger_pending = true;
+        let mut post_return_source_to_sink_convergence_retrigger_count = 0usize;
+        let mut post_return_manual_rescan_republished = false;
+        let mut post_return_sink_replay_pending = false;
+        let mut first_sink_probe_pending = true;
+        loop {
+            let source_groups = source
+                .scheduled_source_group_ids()
+                .await?
+                .unwrap_or_default();
+            let scan_groups = source.scheduled_scan_group_ids().await?.unwrap_or_default();
+            let sink_groups = sink.scheduled_group_ids().await?.unwrap_or_default();
+            let runtime_scope_converged = source_groups == *expected_groups
+                && scan_groups == *expected_groups
+                && sink_groups == *expected_groups;
+            if !runtime_scope_converged {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            if let Ok(snapshot) = sink.cached_status_snapshot() {
+                let ready_groups = snapshot
+                    .groups
+                    .iter()
+                    .filter(|group| group.initial_audit_completed)
+                    .map(|group| group.group_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>();
+                if ready_groups == *expected_groups {
+                    return Ok(());
+                }
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(CnxError::Internal(format!(
+                    "local sink status republish not restored after retained replay once runtime scope converged: expected_groups={expected_groups:?} {}",
+                    summarize_cached_sink_status(&sink)
+                )));
+            }
+            if post_return_source_to_sink_convergence_retrigger_pending {
+                source.trigger_rescan_when_ready().await?;
+                #[cfg(test)]
+                maybe_pause_after_local_sink_status_republish_retrigger().await;
+                post_return_source_to_sink_convergence_retrigger_pending = false;
+                post_return_source_to_sink_convergence_retrigger_count += 1;
+            }
+            #[cfg(test)]
+            if first_sink_probe_pending {
+                maybe_pause_before_local_sink_status_republish_probe().await;
+                first_sink_probe_pending = false;
+            }
+            if post_return_sink_replay_pending {
+                sink.apply_orchestration_signals(post_return_sink_replay_signals)
+                    .await?;
+                post_return_sink_replay_pending = false;
+            }
+            match tokio::time::timeout(
+                remaining.min(Duration::from_millis(350)),
+                sink.status_snapshot_nonblocking(),
+            )
+            .await
+            {
+                Ok(Ok(snapshot)) => {
+                    let ready_groups = snapshot
+                        .groups
+                        .iter()
+                        .filter(|group| group.initial_audit_completed)
+                        .map(|group| group.group_id.clone())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if ready_groups == *expected_groups {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(_)) | Err(_) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(CnxError::Internal(format!(
+                    "local sink status republish not restored after retained replay once runtime scope converged: expected_groups={expected_groups:?} {}",
+                    summarize_cached_sink_status(&sink)
+                )));
+            }
+            if !post_return_manual_rescan_republished {
+                // Retained sink replay can leave the local sink status lane effectively fresh
+                // again. Force one baseline replay pass, then allow one more direct
+                // source->sink retrigger so the helper waits on a real rematerialization
+                // instead of timing out against an empty-but-scheduled local summary.
+                source.publish_manual_rescan_signal().await?;
+                post_return_manual_rescan_republished = true;
+                post_return_sink_replay_pending = !post_return_sink_replay_signals.is_empty();
+                if post_return_source_to_sink_convergence_retrigger_count < 2 {
+                    source.trigger_rescan_when_ready().await?;
+                    #[cfg(test)]
+                    maybe_pause_after_local_sink_status_republish_retrigger().await;
+                    post_return_source_to_sink_convergence_retrigger_count += 1;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_for_local_sink_status_republish_after_recovery(
+        &self,
+        expected_groups: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        let post_return_sink_replay_signals =
+            self.current_generation_retained_sink_replay_signals_for_local_republish()
+                .await;
+        Self::wait_for_local_sink_status_republish_after_recovery_from_parts(
+            self.source.clone(),
+            self.sink.clone(),
+            expected_groups,
+            &post_return_sink_replay_signals,
+        )
+        .await
+    }
+
+    async fn current_generation_retained_sink_replay_signals_for_local_republish(
+        &self,
+    ) -> Vec<SinkControlSignal> {
+        let generation = self
+            .retained_sink_control_state
+            .lock()
+            .await
+            .active_by_route
+            .values()
+            .filter_map(|signal| match signal {
+                SinkControlSignal::Activate { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .max();
+        let Some(generation) = generation else {
+            return Vec::new();
+        };
+        let route_key = format!("{}.stream", ROUTE_KEY_EVENTS);
+        let tick = SinkControlSignal::Tick {
+            unit: SinkRuntimeUnit::Sink,
+            route_key: route_key.clone(),
+            generation,
+            envelope: encode_runtime_unit_tick(&RuntimeUnitTick {
+                route_key,
+                unit_id: execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                generation,
+                at_ms: 1,
+            })
+            .expect("encode deferred local sink-status replay tick"),
+        };
+        self.sink_signals_with_replay(std::slice::from_ref(&tick))
+            .await
+    }
+
+    async fn apply_deferred_sink_owned_query_peer_publication_signal_from_parts(
+        facade_gate: RuntimeUnitGate,
+        mirrored_query_peer_routes: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
+        signal: FacadeControlSignal,
+    ) -> Result<()> {
+        let FacadeControlSignal::Activate {
+            unit,
+            route_key,
+            generation,
+            bound_scopes,
+        } = signal
+        else {
+            return Ok(());
+        };
+        if !matches!(unit, FacadeRuntimeUnit::QueryPeer)
+            || !facade_route_key_matches(unit, &route_key)
+        {
+            return Ok(());
+        }
+        let accepted =
+            facade_gate.apply_activate(unit.unit_id(), &route_key, generation, &bound_scopes)?;
+        if !accepted {
+            return Ok(());
+        }
+        if is_dual_lane_internal_query_route(&route_key) {
+            let query_active = facade_gate
+                .unit_state(execution_units::QUERY_RUNTIME_UNIT_ID)?
+                .map(|(active, _)| active)
+                .unwrap_or(false);
+            let mut mirrored = mirrored_query_peer_routes.lock().await;
+            if mirrored.contains_key(&route_key) || !query_active {
+                facade_gate.apply_activate(
+                    execution_units::QUERY_RUNTIME_UNIT_ID,
+                    &route_key,
+                    generation,
+                    &bound_scopes,
+                )?;
+                mirrored.insert(route_key, generation);
+            }
+        }
+        Ok(())
+    }
+
+    async fn suppress_deferred_sink_owned_query_peer_publication_signals(
+        &self,
+        signals: &[FacadeControlSignal],
+    ) -> Result<()> {
+        for signal in signals {
+            let FacadeControlSignal::Activate {
+                unit,
+                route_key,
+                ..
+            } = signal
+            else {
+                continue;
+            };
+            if !matches!(unit, FacadeRuntimeUnit::QueryPeer)
+                || !Self::facade_publication_signal_is_sink_owned_query_peer_activate(signal)
+            {
+                continue;
+            }
+            self.facade_gate
+                .clear_route(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, route_key)?;
+            if is_dual_lane_internal_query_route(route_key) {
+                self.facade_gate
+                    .clear_route(execution_units::QUERY_RUNTIME_UNIT_ID, route_key)?;
+                self.mirrored_query_peer_routes.lock().await.remove(route_key);
+            }
+        }
+        Ok(())
+    }
+
+    fn spawn_deferred_sink_owned_query_peer_publication_after_local_sink_status_ready(
+        source: Arc<SourceFacade>,
+        sink: Arc<SinkFacade>,
+        expected_groups: std::collections::BTreeSet<String>,
+        post_return_sink_replay_signals: Vec<SinkControlSignal>,
+        deferred_signals: Vec<FacadeControlSignal>,
+        facade_gate: RuntimeUnitGate,
+        mirrored_query_peer_routes: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
+        api_control_gate: Arc<ApiControlGate>,
+        control_ready_after_republish: bool,
+    ) {
+        tokio::spawn(async move {
+            if let Err(err) = Self::wait_for_local_sink_status_republish_after_recovery_from_parts(
+                source,
+                sink,
+                &expected_groups,
+                &post_return_sink_replay_signals,
+            )
+            .await
+            {
+                eprintln!(
+                    "fs_meta_runtime_app: deferred local sink-status republish wait failed err={}",
+                    err
+                );
+                return;
+            }
+            for signal in deferred_signals {
+                if let Err(err) =
+                    Self::apply_deferred_sink_owned_query_peer_publication_signal_from_parts(
+                        facade_gate.clone(),
+                        mirrored_query_peer_routes.clone(),
+                        signal,
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "fs_meta_runtime_app: deferred sink-owned peer publication failed err={}",
+                        err
+                    );
+                    return;
+                }
+            }
+            api_control_gate.set_ready(control_ready_after_republish);
+        });
+    }
+
     pub fn new<C>(config: C, node_id: NodeId) -> Result<Self>
     where
         C: Into<FSMetaConfig>,
@@ -1603,7 +2270,7 @@ impl FSMetaApp {
                     execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
                 ],
             ),
-            mirrored_query_peer_routes: Mutex::new(std::collections::BTreeMap::new()),
+            mirrored_query_peer_routes: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             control_initialized: AtomicBool::new(false),
             retained_source_control_state: Mutex::new(RetainedSourceControlState::default()),
             source_state_replay_required: AtomicBool::new(false),
@@ -2466,10 +3133,11 @@ impl FSMetaApp {
                                                             ) {
                                                                 events.clear();
                                                                 fail_closed_after_bridge_gap = true;
-                                                            }
-                                                        }
-                                                    }
-                                                }
+            }
+        }
+    }
+
+}
                                                 Err(err) => {
                                                     eprintln!(
                                                         "fs_meta_runtime_app: sink query proxy bridge encode failed err={}",
@@ -3462,6 +4130,21 @@ impl FSMetaApp {
         )
     }
 
+    fn facade_publication_signal_is_sink_owned_query_peer_activate(
+        signal: &FacadeControlSignal,
+    ) -> bool {
+        matches!(
+            signal,
+            FacadeControlSignal::Activate {
+                unit: FacadeRuntimeUnit::QueryPeer,
+                route_key,
+                ..
+            } if route_key == &format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
+                || route_key == &format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
+                || is_per_peer_sink_query_request_route(route_key)
+        )
+    }
+
     async fn record_suppressed_public_query_activate(
         &self,
         unit: FacadeRuntimeUnit,
@@ -4249,7 +4932,17 @@ impl FSMetaApp {
 
         let mut desired = self.retained_sink_control_state.lock().await.clone();
         Self::apply_sink_signals_to_state(&mut desired, sink_signals);
+        let replay_generation = sink_signals.iter().find_map(|signal| match signal {
+            SinkControlSignal::Tick { generation, .. } => Some(*generation),
+            _ => None,
+        });
         let mut replayed = Self::sink_signals_from_state(&desired);
+        if let Some(generation) = replay_generation {
+            replayed = replayed
+                .iter()
+                .map(|signal| Self::rebase_sink_signal_generation(signal, generation))
+                .collect();
+        }
         replayed.extend(
             sink_signals
                 .iter()
@@ -4272,14 +4965,18 @@ impl FSMetaApp {
             match signal {
                 SinkControlSignal::Activate {
                     unit, route_key, ..
-                }
-                | SinkControlSignal::Deactivate {
-                    unit, route_key, ..
                 } => {
                     state.active_by_route.insert(
                         (unit.unit_id().to_string(), route_key.clone()),
                         signal.clone(),
                     );
+                }
+                SinkControlSignal::Deactivate {
+                    unit, route_key, ..
+                } => {
+                    state
+                        .active_by_route
+                        .remove(&(unit.unit_id().to_string(), route_key.clone()));
                 }
                 SinkControlSignal::RuntimeHostGrantChange { .. } => {
                     state.latest_host_grant_change = Some(signal.clone());
@@ -4289,14 +4986,74 @@ impl FSMetaApp {
         }
     }
 
-    fn sink_signals_from_state(state: &RetainedSinkControlState) -> Vec<SinkControlSignal> {
-        let mut merged = Vec::new();
-        if let Some(changed) = state.latest_host_grant_change.clone() {
-            merged.push(changed);
-        }
-        merged.extend(state.active_by_route.values().cloned());
-        merged
+fn sink_signals_from_state(state: &RetainedSinkControlState) -> Vec<SinkControlSignal> {
+    let mut merged = Vec::new();
+    if let Some(changed) = state.latest_host_grant_change.clone() {
+        merged.push(changed);
     }
+    merged.extend(state.active_by_route.values().cloned());
+    merged
+}
+
+fn rebase_sink_signal_generation(signal: &SinkControlSignal, generation: u64) -> SinkControlSignal {
+    match signal {
+        SinkControlSignal::Activate {
+            unit,
+            route_key,
+            bound_scopes,
+            ..
+        } => SinkControlSignal::Activate {
+            unit: *unit,
+            route_key: route_key.clone(),
+            generation,
+            bound_scopes: bound_scopes.clone(),
+            envelope: encode_runtime_exec_control(&RuntimeExecControl::Activate(
+                RuntimeExecActivate {
+                    route_key: route_key.clone(),
+                    unit_id: unit.unit_id().to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: bound_scopes.clone(),
+                },
+            ))
+            .expect("encode rebased sink activate"),
+        },
+        SinkControlSignal::Deactivate {
+            unit,
+            route_key,
+            envelope,
+            ..
+        } => {
+            let mut reason = "restart_deferred_retire_pending".to_string();
+            let mut lease = None;
+            if let Ok(Some(RuntimeExecControl::Deactivate(decoded))) =
+                decode_runtime_exec_control(envelope)
+            {
+                reason = decoded.reason;
+                lease = decoded.lease;
+            }
+            SinkControlSignal::Deactivate {
+                unit: *unit,
+                route_key: route_key.clone(),
+                generation,
+                envelope: encode_runtime_exec_control(&RuntimeExecControl::Deactivate(
+                    RuntimeExecDeactivate {
+                        route_key: route_key.clone(),
+                        unit_id: unit.unit_id().to_string(),
+                        lease,
+                        generation,
+                        reason,
+                    },
+                ))
+                .expect("encode rebased sink deactivate"),
+            }
+        }
+        SinkControlSignal::RuntimeHostGrantChange { .. }
+        | SinkControlSignal::Tick { .. }
+        | SinkControlSignal::Passthrough(_) => signal.clone(),
+    }
+}
 
     fn sink_signal_is_cleanup_only_query_request_route(signal: &SinkControlSignal) -> bool {
         matches!(
@@ -4348,7 +5105,7 @@ impl FSMetaApp {
             Some(SinkControlSignal::Activate {
                 generation: retained_generation,
                 ..
-            }) if *retained_generation == generation
+            }) if generation >= *retained_generation
         )
     }
 
@@ -4506,6 +5263,10 @@ impl FSMetaApp {
                 .await
             {
                 Ok(()) => {
+                    if replay_retained_state {
+                        self.record_retained_sink_control_state(&effective_sink_signals)
+                            .await;
+                    }
                     if replay_retained_state && self.control_initialized.load(Ordering::Acquire) {
                         self.sink_state_replay_required
                             .store(false, Ordering::Release);
@@ -5275,6 +6036,11 @@ impl FSMetaApp {
             facade_signals
                 .into_iter()
                 .partition(Self::facade_signal_updates_facade_claim);
+        let sink_status_publication_present = facade_publication_signals
+            .iter()
+            .any(facade_publication_signal_is_sink_status_activate);
+        let mut pretriggered_source_to_sink_convergence = false;
+        let mut deferred_initial_source_to_sink_convergence = false;
         for signal in facade_claim_signals {
             self.apply_facade_signal(signal).await?;
         }
@@ -5289,6 +6055,16 @@ impl FSMetaApp {
         }
         if !source_signals.is_empty() {
             if source_cleanup_only_while_uninitialized {
+                if !self
+                    .retained_sink_control_state
+                    .lock()
+                    .await
+                    .active_by_route
+                    .is_empty()
+                {
+                    self.sink_state_replay_required
+                        .store(true, Ordering::Release);
+                }
                 eprintln!(
                     "fs_meta_runtime_app: on_control_frame source cleanup-only followup left runtime uninitialized"
                 );
@@ -5314,6 +6090,26 @@ impl FSMetaApp {
                 eprintln!(
                     "fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals ok"
                 );
+                if !control_initialized_at_entry && sink_signals.is_empty() {
+                    let retained_sink_routes_present = !self
+                        .retained_sink_control_state
+                        .lock()
+                        .await
+                        .active_by_route
+                        .is_empty();
+                    if retained_sink_routes_present {
+                        if sink_status_publication_present {
+                            self.source.trigger_rescan_when_ready().await?;
+                            pretriggered_source_to_sink_convergence = true;
+                        }
+                        // A later source-only recovery can reopen the runtime before the sink
+                        // worker has replayed its retained control state into the current
+                        // generation. Keep the sink replay armed so peer status/query routes do
+                        // not resume against a zero-state sink snapshot.
+                        self.sink_state_replay_required
+                            .store(true, Ordering::Release);
+                    }
+                }
             }
         } else if self.source_state_replay_required.load(Ordering::Acquire)
             && !source_cleanup_only_while_uninitialized
@@ -5323,6 +6119,7 @@ impl FSMetaApp {
             self.apply_source_signals_with_recovery(&[], false).await?;
             eprintln!("fs_meta_runtime_app: on_control_frame source.replay_retained ok");
         }
+        let mut replayed_sink_state_after_uninitialized_source_recovery = false;
         if !sink_signals.is_empty() {
             if sink_query_cleanup_only_while_uninitialized {
                 eprintln!(
@@ -5349,16 +6146,55 @@ impl FSMetaApp {
                 eprintln!(
                     "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals ok"
                 );
+                if !control_initialized_at_entry && !source_signals.is_empty() {
+                    deferred_initial_source_to_sink_convergence = true;
+                }
             }
         } else if self.sink_state_replay_required.load(Ordering::Acquire)
             && !source_cleanup_only_while_uninitialized
             && !sink_cleanup_only_while_uninitialized
         {
             eprintln!("fs_meta_runtime_app: on_control_frame sink.replay_retained begin");
-            self.apply_sink_signals_with_recovery(&[], true, false)
+            let replay_signals = current_generation_sink_replay_tick(
+                &source_signals,
+                &facade_publication_signals,
+            )
+            .into_iter()
+            .collect::<Vec<_>>();
+            self.apply_sink_signals_with_recovery(&replay_signals, true, false)
                 .await?;
             eprintln!("fs_meta_runtime_app: on_control_frame sink.replay_retained ok");
+            replayed_sink_state_after_uninitialized_source_recovery =
+                !control_initialized_at_entry;
         }
+        let mut defer_api_control_gate_reopen_until_sink_status_ready = None;
+        let deferred_local_sink_replay_signals =
+            if replayed_sink_state_after_uninitialized_source_recovery
+                && sink_status_publication_present
+            {
+                self.current_generation_retained_sink_replay_signals_for_local_republish()
+                    .await
+            } else {
+                Vec::new()
+            };
+        if replayed_sink_state_after_uninitialized_source_recovery && sink_status_publication_present
+        {
+            defer_api_control_gate_reopen_until_sink_status_ready = self
+                .wait_for_sink_status_republish_readiness_after_recovery(
+                    pretriggered_source_to_sink_convergence,
+                )
+                .await?;
+        }
+        let (deferred_sink_owned_query_peer_publication_signals, facade_publication_signals): (
+            Vec<_>,
+            Vec<_>,
+        ) = if defer_api_control_gate_reopen_until_sink_status_ready.is_some() {
+            facade_publication_signals
+                .into_iter()
+                .partition(Self::facade_publication_signal_is_sink_owned_query_peer_activate)
+        } else {
+            (Vec::new(), facade_publication_signals)
+        };
         let query_publication_followup_present = facade_publication_signals
             .iter()
             .any(Self::facade_publication_signal_is_query_activate);
@@ -5376,9 +6212,39 @@ impl FSMetaApp {
         if !sink_cleanup_only_while_uninitialized {
             self.ensure_runtime_proxy_endpoints_started().await?;
         }
+        if deferred_initial_source_to_sink_convergence {
+            let source = self.source.clone();
+            tokio::spawn(async move {
+                if let Err(err) = source.trigger_rescan_when_ready().await {
+                    eprintln!(
+                        "fs_meta_runtime_app: deferred initial source->sink convergence trigger failed err={}",
+                        err
+                    );
+                }
+            });
+        }
         if request_sensitive && !sink_cleanup_only_while_uninitialized {
-            self.api_control_gate
-                .set_ready(self.facade_publication_ready().await);
+            if let Some(expected_groups) = defer_api_control_gate_reopen_until_sink_status_ready {
+                self.suppress_deferred_sink_owned_query_peer_publication_signals(
+                    &deferred_sink_owned_query_peer_publication_signals,
+                )
+                .await?;
+                let control_ready_after_republish = self.facade_publication_ready().await;
+                Self::spawn_deferred_sink_owned_query_peer_publication_after_local_sink_status_ready(
+                    self.source.clone(),
+                    self.sink.clone(),
+                    expected_groups,
+                    deferred_local_sink_replay_signals,
+                    deferred_sink_owned_query_peer_publication_signals,
+                    self.facade_gate.clone(),
+                    self.mirrored_query_peer_routes.clone(),
+                    self.api_control_gate.clone(),
+                    control_ready_after_republish,
+                );
+            } else {
+                self.api_control_gate
+                    .set_ready(self.facade_publication_ready().await);
+            }
         }
         eprintln!("fs_meta_runtime_app: on_control_frame done");
         Ok(())
@@ -5807,6 +6673,28 @@ mod tests {
         } else {
             excerpts.join("\n---\n")
         }
+    }
+
+    #[test]
+    fn runtime_test_worker_module_path_prefers_newer_debug_deps_cdylib_over_stale_top_level_debug_cdylib(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let lib_name = fs_meta_runtime_lib_filename();
+        let stale = tmp.path().join("target/debug").join(lib_name);
+        let fresh = tmp.path().join("target/debug/deps").join(lib_name);
+        std::fs::create_dir_all(stale.parent().expect("stale parent")).expect("create stale dir");
+        std::fs::create_dir_all(fresh.parent().expect("fresh parent")).expect("create fresh dir");
+        std::fs::write(&stale, b"stale").expect("write stale module");
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&fresh, b"fresh").expect("write fresh module");
+
+        let resolved = resolve_runtime_test_worker_module_path_from_workspace_root(tmp.path())
+            .expect("resolve worker module path");
+
+        assert_eq!(
+            resolved, fresh,
+            "runtime_app external-worker tests must select the freshest built fs-meta cdylib instead of a stale top-level debug artifact"
+        );
     }
 
     #[test]
@@ -6756,6 +7644,47 @@ mod tests {
         }
     }
 
+    fn runtime_test_worker_module_path_candidates(root: &Path, lib_name: &str) -> [PathBuf; 4] {
+        [
+            root.join("target/debug").join(lib_name),
+            root.join("target/debug/deps").join(lib_name),
+            root.join(".target/debug").join(lib_name),
+            root.join(".target/debug/deps").join(lib_name),
+        ]
+    }
+
+    fn newest_existing_runtime_test_worker_module_path(
+        candidates: impl IntoIterator<Item = PathBuf>,
+    ) -> Option<PathBuf> {
+        let mut best: Option<(std::time::SystemTime, usize, PathBuf)> = None;
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            let Ok(metadata) = std::fs::metadata(&candidate) else {
+                continue;
+            };
+            let modified = metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let replace = match best.as_ref() {
+                None => true,
+                Some((best_modified, best_index, _)) => {
+                    modified > *best_modified
+                        || (modified == *best_modified && index < *best_index)
+                }
+            };
+            if replace {
+                best = Some((modified, index, candidate));
+            }
+        }
+        best.map(|(_, _, path)| path)
+    }
+
+    fn resolve_runtime_test_worker_module_path_from_workspace_root(root: &Path) -> Option<PathBuf> {
+        newest_existing_runtime_test_worker_module_path(runtime_test_worker_module_path_candidates(
+            root,
+            fs_meta_runtime_lib_filename(),
+        ))
+    }
+
     fn runtime_test_worker_module_path() -> PathBuf {
         static BIN: OnceLock<PathBuf> = OnceLock::new();
         BIN.get_or_init(|| {
@@ -6767,23 +7696,12 @@ mod tests {
                     }
                 }
             }
-            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(Path::parent)
-                .expect("workspace root")
-                .to_path_buf();
-            let lib_name = fs_meta_runtime_lib_filename();
-            for candidate in [
-                root.join("target/debug").join(lib_name),
-                root.join("target/debug/deps").join(lib_name),
-                root.join(".target/debug").join(lib_name),
-                root.join(".target/debug/deps").join(lib_name),
-            ] {
-                if candidate.exists() {
-                    return candidate;
-                }
-            }
-            panic!("fs-meta worker module not found; set CAPANIX_FS_META_APP_BINARY");
+            resolve_runtime_test_worker_module_path_from_workspace_root(
+                &fs_meta_runtime_workspace_root(),
+            )
+            .unwrap_or_else(|| {
+                panic!("fs-meta worker module not found; set CAPANIX_FS_META_APP_BINARY")
+            })
         })
         .clone()
     }
@@ -10038,6 +10956,22 @@ mod tests {
     impl Drop for SourceApplyPauseHookReset {
         fn drop(&mut self) {
             clear_source_apply_pause_hook();
+        }
+    }
+
+    struct LocalSinkStatusRepublishProbePauseHookReset;
+
+    impl Drop for LocalSinkStatusRepublishProbePauseHookReset {
+        fn drop(&mut self) {
+            clear_local_sink_status_republish_probe_pause_hook();
+        }
+    }
+
+    struct LocalSinkStatusRepublishRetriggerPauseHookReset;
+
+    impl Drop for LocalSinkStatusRepublishRetriggerPauseHookReset {
+        fn drop(&mut self) {
+            clear_local_sink_status_republish_retrigger_pause_hook();
         }
     }
 
@@ -31560,6 +32494,7 @@ mod tests {
         use std::collections::VecDeque;
 
         struct SourceControlErrorHookReset;
+        struct SourceWorkerControlFrameErrorQueueHookReset;
         struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
 
         impl Drop for SourceControlErrorHookReset {
@@ -31571,6 +32506,12 @@ mod tests {
         impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
             fn drop(&mut self) {
                 crate::workers::source::clear_source_worker_scheduled_groups_refresh_error_queue_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerControlFrameErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_queue_hook();
             }
         }
 
@@ -32017,9 +32958,16 @@ mod tests {
         use std::collections::VecDeque;
 
         struct SourceControlErrorHookReset;
+        struct SourceWorkerControlFrameErrorQueueHookReset;
         struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
 
         impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerControlFrameErrorQueueHookReset {
             fn drop(&mut self) {
                 crate::workers::source::clear_source_worker_control_frame_error_hook();
             }
@@ -32478,6 +33426,418 @@ mod tests {
             tree.status().is_success() || tree.status().is_server_error(),
             "public /tree must settle after replayed mixed peer-source recovery instead of timing out or dropping the connection: {}",
             tree.status()
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn route_peer_turnover_keeps_facade_and_query_routes_live_during_replayed_peer_source_timeout_cleanup_tail()
+     {
+        use std::collections::VecDeque;
+
+        struct SourceControlErrorHookReset;
+        struct SourceWorkerControlFrameErrorQueueHookReset;
+        struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerControlFrameErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_queue_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_scheduled_groups_refresh_error_queue_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let nfs1_source = nfs1.display().to_string();
+        let nfs2_source = nfs2.display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![
+                            worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                            worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                        ],
+                        host_object_grants: Vec::new(),
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("node-d-peer-turnover-timeout-cleanup-tail".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let source_client = match &*app.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        app.on_control_frame(&[host_object_grants_changed_rows_envelope(
+            1,
+            &[
+                (
+                    "node-d::nfs1",
+                    "node-d",
+                    "10.0.0.41",
+                    nfs1.to_string_lossy().as_ref(),
+                    &nfs1_source,
+                    true,
+                ),
+                (
+                    "node-d::nfs2",
+                    "node-d",
+                    "10.0.0.42",
+                    nfs2.to_string_lossy().as_ref(),
+                    &nfs2_source,
+                    true,
+                ),
+            ],
+        )])
+        .await
+        .expect("apply peer runtime host grants changed");
+
+        let mixed_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-d::nfs1"]), ("nfs2", &["node-d::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-d::nfs1"]), ("nfs2", &["node-d::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-d::nfs1"]), ("nfs2", &["node-d::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-d::nfs1"]), ("nfs2", &["node-d::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_QUERY),
+                    &[("nfs1", &["listener-a"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::FACADE_RUNTIME_UNIT_ID,
+                    facade_control_stream_route(),
+                    &[("nfs1", &["listener-a"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    &[("nfs1", &["listener-a"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    &[("nfs1", &["listener-a"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    &[("nfs1", &["listener-a"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    &[("nfs1", &["listener-a"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    &[("nfs1", &["listener-a"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    &[("nfs1", &["listener-a"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    &[("nfs1", &["listener-a"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    &[("nfs1", &["listener-a"])],
+                    generation,
+                ),
+            ]
+        };
+
+        app.on_control_frame(&mixed_wave(2))
+            .await
+            .expect("initial multi-root route-peer control wave should succeed");
+
+        let login = Client::new()
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_QUERY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                3,
+            ),
+        ])
+        .await
+        .expect("route-peer and facade deactivates should complete");
+
+        app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            &[("nfs1", &["node-d::nfs1"]), ("nfs2", &["node-d::nfs2"])],
+            3,
+        )])
+        .await
+        .expect("first source-only followup should still succeed before the timeout seam");
+
+        let previous_instance_id = source_client.worker_instance_id_for_tests().await;
+        let _source_error_reset = SourceWorkerControlFrameErrorQueueHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_queue_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorQueueHook {
+                errs: VecDeque::from([
+                    CnxError::Timeout,
+                    CnxError::Timeout,
+                    CnxError::Timeout,
+                ]),
+                sticky_worker_instance_id: Some(previous_instance_id),
+                sticky_peer_err: Some("operation timed out".to_string()),
+            },
+        );
+
+        let err = app
+            .on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["node-d::nfs1"]), ("nfs2", &["node-d::nfs2"])],
+                4,
+            )])
+            .await
+            .expect_err(
+                "second source-only followup should fail with timeout before cleanup-tail recovery",
+            );
+        assert!(
+            matches!(err, CnxError::Timeout) || err.to_string().contains("timed out"),
+            "timed source-only followup should surface timeout: {err}"
+        );
+        assert!(
+            !app.control_initialized(),
+            "timed source-only followup should leave runtime uninitialized before cleanup-only tails",
+        );
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_QUERY),
+                4,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                4,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                4,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                4,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                4,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                4,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                4,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                4,
+            ),
+        ])
+        .await
+        .expect(
+            "cleanup-only facade/query followup should settle while runtime remains uninitialized after timed source-only followup",
+        );
+
+        let _refresh_reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+        crate::workers::source::install_source_worker_scheduled_groups_refresh_error_queue_hook(
+            crate::workers::source::SourceWorkerScheduledGroupsRefreshErrorQueueHook {
+                errs: VecDeque::from([CnxError::Timeout]),
+                sticky_worker_instance_id: Some(previous_instance_id),
+                sticky_peer_err: None,
+            },
+        );
+
+        app.on_control_frame(&mixed_wave(5))
+            .await
+            .expect(
+                "later mixed route-peer recovery should settle after source timeout fail-close and cleanup-only tails",
+            );
+
+        let status = Client::new()
+            .get(format!("http://{bind_addr}/api/fs-meta/v1/status"))
+            .send()
+            .await
+            .expect("status request after replayed mixed recovery");
+        assert_ne!(
+            status.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "later mixed route-peer recovery must not leave /status at 503 after source timeout cleanup tail"
         );
 
         app.close().await.expect("close app");
@@ -35195,6 +36555,8 @@ mod tests {
         let nfs2 = tmp.path().join("nfs2");
         fs::create_dir_all(&nfs1).expect("create nfs1 dir");
         fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        fs::write(nfs1.join("ready-a.txt"), b"a").expect("seed nfs1");
+        fs::write(nfs2.join("ready-b.txt"), b"b").expect("seed nfs2");
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_root = worker_socket_tempdir();
@@ -35436,25 +36798,25 @@ mod tests {
         later.extend([
             activate_envelope_with_route_key_and_scope_rows(
                 execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-                source_status_route,
+                source_status_route.clone(),
                 &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
                 4,
             ),
             activate_envelope_with_route_key_and_scope_rows(
                 execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-                source_find_route,
+                source_find_route.clone(),
                 &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
                 4,
             ),
             activate_envelope_with_route_key_and_scope_rows(
                 execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-                sink_status_route,
+                sink_status_route.clone(),
                 &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
                 4,
             ),
             activate_envelope_with_route_key_and_scope_rows(
                 execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-                sink_query_proxy_route,
+                sink_query_proxy_route.clone(),
                 &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
                 4,
             ),
@@ -35491,7 +36853,584 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "exploratory cleanup-tail sink-status seam; superseded by observation-root red"]
+    async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_groups_after_cleanup_only_source_tail()
+     {
+        struct SourceControlErrorHookReset;
+        struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+        struct SourceWorkerTriggerRescanWhenReadyCallCountHookReset;
+        struct SinkWorkerControlFramePauseHookReset;
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_scheduled_groups_refresh_error_queue_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerTriggerRescanWhenReadyCallCountHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_trigger_rescan_when_ready_call_count_hook();
+            }
+        }
+
+        impl Drop for SinkWorkerControlFramePauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_pause_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        fs::write(nfs1.join("ready-a.txt"), b"a").expect("seed nfs1");
+        fs::write(nfs2.join("ready-b.txt"), b"b").expect("seed nfs2");
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![
+                            worker_watch_scan_root("nfs1", &nfs1),
+                            worker_watch_scan_root("nfs2", &nfs2),
+                        ],
+                        host_object_grants: Vec::new(),
+                        ..SourceConfig::default()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("node-c-local-sink-status-helper".into()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        let source_client = match &*app.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let sink_wave = |generation| {
+            let root_scopes = &[("nfs1", &["nfs1"][..]), ("nfs2", &["nfs2"][..])];
+            vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+            ]
+        };
+        let initial_trigger_rescan_count = Arc::new(AtomicUsize::new(0));
+        let _trigger_rescan_reset = SourceWorkerTriggerRescanWhenReadyCallCountHookReset;
+        crate::workers::source::install_source_worker_trigger_rescan_when_ready_call_count_hook(
+            crate::workers::source::SourceWorkerTriggerRescanWhenReadyCallCountHook {
+                count: initial_trigger_rescan_count.clone(),
+            },
+        );
+
+        let mut initial = source_wave(2);
+        initial.extend(sink_wave(2));
+        app.on_control_frame(&initial)
+            .await
+            .expect("initial local source/sink wave should succeed");
+        let initial_ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout(
+                Duration::from_millis(350),
+                app.sink.status_snapshot_nonblocking(),
+            )
+            .await
+            {
+                Ok(Ok(snapshot)) => {
+                    let ready_groups = snapshot
+                        .groups
+                        .iter()
+                        .filter(|group| group.initial_audit_completed)
+                        .map(|group| group.group_id.clone())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if ready_groups
+                        == std::collections::BTreeSet::from([
+                            "nfs1".to_string(),
+                            "nfs2".to_string(),
+                        ])
+                    {
+                        break;
+                    }
+                }
+                Ok(Err(_)) | Err(_) => {}
+            }
+            if tokio::time::Instant::now() >= initial_ready_deadline {
+                app.source
+                    .trigger_rescan_when_ready()
+                    .await
+                    .expect("direct trigger_rescan_when_ready after failed deferred initial trigger");
+                let direct_trigger_deadline =
+                    tokio::time::Instant::now() + Duration::from_secs(2);
+                let mut direct_trigger_restored_ready = false;
+                let mut latest_source_observability = app.source.observability_snapshot_nonblocking().await;
+                let mut latest_cached_sink_status = app
+                    .sink
+                    .cached_status_snapshot()
+                    .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+                    .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"));
+                while tokio::time::Instant::now() < direct_trigger_deadline {
+                    latest_source_observability =
+                        app.source.observability_snapshot_nonblocking().await;
+                    latest_cached_sink_status = app
+                        .sink
+                        .cached_status_snapshot()
+                        .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+                        .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"));
+                    if latest_source_observability
+                        .published_batches_by_node
+                        .values()
+                        .copied()
+                        .sum::<u64>()
+                        > 0
+                    {
+                        direct_trigger_restored_ready = true;
+                        break;
+                    }
+                    match tokio::time::timeout(
+                        Duration::from_millis(200),
+                        app.sink.status_snapshot_nonblocking(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(snapshot)) => {
+                            let ready_groups = snapshot
+                                .groups
+                                .iter()
+                                .filter(|group| group.initial_audit_completed)
+                                .map(|group| group.group_id.clone())
+                                .collect::<std::collections::BTreeSet<_>>();
+                            if ready_groups
+                                == std::collections::BTreeSet::from([
+                                    "nfs1".to_string(),
+                                    "nfs2".to_string(),
+                                ])
+                            {
+                                direct_trigger_restored_ready = true;
+                                break;
+                            }
+                        }
+                        Ok(Err(_)) | Err(_) => {}
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                let source_groups = app
+                    .source
+                    .scheduled_source_group_ids()
+                    .await
+                    .expect("source groups before cleanup-tail precondition failure")
+                    .unwrap_or_default();
+                let scan_groups = app
+                    .source
+                    .scheduled_scan_group_ids()
+                    .await
+                    .expect("scan groups before cleanup-tail precondition failure")
+                    .unwrap_or_default();
+                let sink_groups = app
+                    .sink
+                    .scheduled_group_ids()
+                    .await
+                    .expect("sink groups before cleanup-tail precondition failure")
+                    .unwrap_or_default();
+                let cached_sink_status = app
+                    .sink
+                    .cached_status_snapshot()
+                    .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+                    .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"));
+                let source_observability = summarize_source_observability_endpoint(
+                    &latest_source_observability,
+                );
+                let initial_trigger_count =
+                    initial_trigger_rescan_count.load(Ordering::SeqCst);
+                panic!(
+                    "precondition: cleanup-only source-tail republish seam requires the local sink to materialize both nfs1/nfs2 before the fail-closed recovery begins; initial_trigger_count={initial_trigger_count} direct_trigger_restored_ready={direct_trigger_restored_ready} source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?} cached_sink_status_before_direct_trigger={cached_sink_status} cached_sink_status_after_direct_trigger={latest_cached_sink_status} source_observability={source_observability}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let _source_error_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated source cleanup-tail failure".to_string(),
+                ),
+            },
+        );
+        app.on_control_frame(&[deactivate_envelope_with_route_key_reason_and_lease(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            3,
+            "restart_deferred_retire_pending",
+            7,
+            11,
+            22,
+        )])
+        .await
+        .expect("source-only deactivate should fail-close into uninitialized replay-required recovery");
+        crate::workers::source::clear_source_worker_control_frame_error_hook();
+        assert!(!app.control_initialized());
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key_reason_and_lease(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                3,
+                "restart_deferred_retire_pending",
+                7,
+                11,
+                22,
+            ),
+            deactivate_envelope_with_route_key_reason_and_lease(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                3,
+                "restart_deferred_retire_pending",
+                7,
+                11,
+                22,
+            ),
+            deactivate_envelope_with_route_key_reason_and_lease(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                3,
+                "restart_deferred_retire_pending",
+                7,
+                11,
+                22,
+            ),
+        ])
+        .await
+        .expect("cleanup-only source tail should settle while runtime remains uninitialized");
+
+        let previous_instance_id = source_client.worker_instance_id_for_tests().await;
+        let _refresh_reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+        crate::workers::source::install_source_worker_scheduled_groups_refresh_error_queue_hook(
+            crate::workers::source::SourceWorkerScheduledGroupsRefreshErrorQueueHook {
+                errs: std::iter::repeat_with(|| CnxError::Timeout)
+                    .take(64)
+                    .collect(),
+                sticky_worker_instance_id: Some(previous_instance_id),
+                sticky_peer_err: None,
+            },
+        );
+        let trigger_rescan_count = initial_trigger_rescan_count.clone();
+
+        let later = source_wave(4);
+        tokio::time::timeout(Duration::from_secs(5), app.on_control_frame(&later))
+            .await
+            .expect("later source-only recovery should settle after the cleanup-only tail")
+            .expect("later source-only recovery should not exhaust runtime-app source recovery");
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let post_return_sink_replay_signals = app
+            .current_generation_retained_sink_replay_signals_for_local_republish()
+            .await;
+        let post_return_replay_generations = post_return_sink_replay_signals
+            .iter()
+            .filter_map(|signal| match signal {
+                SinkControlSignal::Activate { generation, .. }
+                | SinkControlSignal::Deactivate { generation, .. }
+                | SinkControlSignal::Tick { generation, .. } => Some(*generation),
+                SinkControlSignal::RuntimeHostGrantChange { .. }
+                | SinkControlSignal::Passthrough(_) => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            !post_return_replay_generations.is_empty(),
+            "direct local sink-status republish helper must retain a current-generation sink replay wave after later source-only recovery",
+        );
+        assert_eq!(
+            post_return_replay_generations,
+            std::collections::BTreeSet::from([4_u64]),
+            "direct local sink-status republish helper must rebuild its post-return retained sink replay wave from the later source-only recovery generation instead of replaying stale retained generations: {post_return_sink_replay_signals:?}",
+        );
+        let trigger_count_before_helper = trigger_rescan_count.load(Ordering::SeqCst);
+        let gather_helper_stall_context = || async {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups while local sink-status republish helper is stalled")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups while local sink-status republish helper is stalled")
+                .unwrap_or_default();
+            let sink_groups = app
+                .sink
+                .scheduled_group_ids()
+                .await
+                .expect("sink groups while local sink-status republish helper is stalled")
+                .unwrap_or_default();
+            let cached_sink_status_summary = app
+                .sink
+                .cached_status_snapshot()
+                .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+                .unwrap_or_else(|cached_err| format!("cached_sink_status_unavailable err={cached_err}"));
+            let blocking_sink_status_summary =
+                match tokio::time::timeout(Duration::from_secs(2), app.sink.status_snapshot()).await
+                {
+                    Ok(Ok(snapshot)) => summarize_sink_status_endpoint(&snapshot),
+                    Ok(Err(snapshot_err)) => format!("blocking_status_err={snapshot_err}"),
+                    Err(_) => "blocking_status_timeout".to_string(),
+                };
+            let source_observability_summary =
+                summarize_source_observability_endpoint(
+                    &app.source.observability_snapshot_nonblocking().await,
+                );
+            (
+                source_groups,
+                scan_groups,
+                sink_groups,
+                cached_sink_status_summary,
+                blocking_sink_status_summary,
+                source_observability_summary,
+            )
+        };
+        let post_return_retrigger_entered = Arc::new(Notify::new());
+        let post_return_retrigger_release = Arc::new(Notify::new());
+        let _post_return_retrigger_reset = LocalSinkStatusRepublishRetriggerPauseHookReset;
+        install_local_sink_status_republish_retrigger_pause_hook(
+            LocalSinkStatusRepublishRetriggerPauseHook {
+                entered: post_return_retrigger_entered.clone(),
+                release: post_return_retrigger_release.clone(),
+            },
+        );
+        let helper_probe_entered = Arc::new(Notify::new());
+        let helper_probe_release = Arc::new(Notify::new());
+        let _probe_pause_reset = LocalSinkStatusRepublishProbePauseHookReset;
+        install_local_sink_status_republish_probe_pause_hook(
+            LocalSinkStatusRepublishProbePauseHook {
+                entered: helper_probe_entered.clone(),
+                release: helper_probe_release.clone(),
+            },
+        );
+        let sink_replay_entered = Arc::new(Notify::new());
+        let sink_replay_release = Arc::new(Notify::new());
+        let _sink_pause_reset = SinkWorkerControlFramePauseHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: sink_replay_entered.clone(),
+                release: sink_replay_release.clone(),
+            },
+        );
+        let post_return_retrigger_wait = post_return_retrigger_entered.notified();
+        let helper_probe_wait = helper_probe_entered.notified();
+        let sink_replay_wait = sink_replay_entered.notified();
+        let helper_task = tokio::spawn({
+            let source = app.source.clone();
+            let sink = app.sink.clone();
+            let expected_groups = expected_groups.clone();
+            let post_return_sink_replay_signals = post_return_sink_replay_signals.clone();
+            async move {
+                FSMetaApp::wait_for_local_sink_status_republish_after_recovery_from_parts(
+                    source,
+                    sink,
+                    &expected_groups,
+                    &post_return_sink_replay_signals,
+                )
+                .await
+            }
+        });
+        if tokio::time::timeout(Duration::from_secs(2), post_return_retrigger_wait)
+            .await
+            .is_err()
+        {
+            let (
+                source_groups,
+                scan_groups,
+                sink_groups,
+                cached_sink_status_summary,
+                blocking_sink_status_summary,
+                source_observability_summary,
+            ) = gather_helper_stall_context().await;
+            let trigger_count_now = trigger_rescan_count.load(Ordering::SeqCst);
+            panic!(
+                "direct local sink-status republish helper did not reach its post-return source->sink retrigger point after later source-only recovery returned; trigger_count_before_helper={trigger_count_before_helper} trigger_count_now={trigger_count_now} helper_task_finished={} source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary}",
+                helper_task.is_finished(),
+            );
+        }
+        let trigger_count_when_helper_reached_retrigger =
+            trigger_rescan_count.load(Ordering::SeqCst);
+        assert!(
+            trigger_count_when_helper_reached_retrigger > trigger_count_before_helper,
+            "direct local sink-status republish helper must re-arm source->sink convergence before it reaches its post-return retrigger point after later source-only recovery returned; trigger_count_before_helper={trigger_count_before_helper} trigger_count_when_helper_reached_retrigger={trigger_count_when_helper_reached_retrigger}"
+        );
+        post_return_retrigger_release.notify_waiters();
+        if tokio::time::timeout(Duration::from_secs(2), helper_probe_wait)
+            .await
+            .is_err()
+        {
+            let (
+                source_groups,
+                scan_groups,
+                sink_groups,
+                cached_sink_status_summary,
+                blocking_sink_status_summary,
+                source_observability_summary,
+            ) = gather_helper_stall_context().await;
+            let trigger_count_now = trigger_rescan_count.load(Ordering::SeqCst);
+            panic!(
+                "direct local sink-status republish helper reached its post-return retrigger point but did not reach the first sink-side probe after later source-only recovery returned; trigger_count_before_helper={trigger_count_before_helper} trigger_count_when_helper_reached_retrigger={trigger_count_when_helper_reached_retrigger} trigger_count_now={trigger_count_now} helper_task_finished={} source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary}",
+                helper_task.is_finished(),
+            );
+        }
+        let trigger_count_when_helper_reached_first_sink_probe =
+            trigger_rescan_count.load(Ordering::SeqCst);
+        assert!(
+            trigger_count_when_helper_reached_first_sink_probe
+                >= trigger_count_when_helper_reached_retrigger,
+            "direct local sink-status republish helper must not lose its post-return source->sink retrigger before it reaches the first sink-side probe; trigger_count_when_helper_reached_retrigger={trigger_count_when_helper_reached_retrigger} trigger_count_when_helper_reached_first_sink_probe={trigger_count_when_helper_reached_first_sink_probe}"
+        );
+        helper_probe_release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), sink_replay_wait)
+            .await
+            .expect(
+                "direct local sink-status republish helper must replay the retained sink control wave after post-return source->sink convergence before it can republish local sink status",
+            );
+        sink_replay_release.notify_waiters();
+        let helper_result = tokio::time::timeout(Duration::from_secs(5), helper_task)
+            .await
+            .expect("direct local sink-status republish helper should settle after later source-only recovery")
+            .expect("join direct local sink-status republish helper task");
+        let trigger_count_after_helper = trigger_rescan_count.load(Ordering::SeqCst);
+
+        if let Err(err) = helper_result {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups after helper failure")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups after helper failure")
+                .unwrap_or_default();
+            let sink_groups = app
+                .sink
+                .scheduled_group_ids()
+                .await
+                .expect("sink groups after helper failure")
+                .unwrap_or_default();
+            let cached_sink_status_summary = app
+                .sink
+                .cached_status_snapshot()
+                .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+                .unwrap_or_else(|cached_err| {
+                    format!("cached_sink_status_unavailable err={cached_err}")
+                });
+            let blocking_sink_status_summary = match tokio::time::timeout(
+                Duration::from_secs(2),
+                app.sink.status_snapshot(),
+            )
+            .await
+            {
+                Ok(Ok(snapshot)) => summarize_sink_status_endpoint(&snapshot),
+                Ok(Err(snapshot_err)) => format!("blocking_status_err={snapshot_err}"),
+                Err(_) => "blocking_status_timeout".to_string(),
+            };
+            let source_observability_summary =
+                summarize_source_observability_endpoint(
+                    &app.source.observability_snapshot_nonblocking().await,
+                );
+            panic!(
+                "direct local sink-status republish helper must restore ready groups once post-return source->sink convergence has been retriggered; err={err}; trigger_count_before_helper={trigger_count_before_helper} trigger_count_after_helper={trigger_count_after_helper} source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary}"
+            );
+        }
+
+        assert!(
+            trigger_count_after_helper <= trigger_count_before_helper + 2,
+            "direct local sink-status republish helper may spend one extra direct retrigger after the manual-rescan fallback, but it must not loop forever; trigger_count_before_helper={trigger_count_before_helper} trigger_count_after_helper={trigger_count_after_helper}"
+        );
+
+        let local_sink_snapshot = app
+            .sink
+            .status_snapshot_nonblocking()
+            .await
+            .expect("local sink status should be ready after direct helper completion");
+        let local_ready_groups = local_sink_snapshot
+            .groups
+            .iter()
+            .filter(|group| group.initial_audit_completed)
+            .map(|group| group.group_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            local_ready_groups,
+            std::collections::BTreeSet::from(["nfs1", "nfs2"]),
+            "direct local sink-status republish helper must restore local sink readiness after later source-only recovery: {local_sink_snapshot:?}"
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_before_later_node_c_four_envelope_source_reactivation()
      {
         struct SourceControlErrorHookReset;
@@ -35521,6 +37460,8 @@ mod tests {
         let nfs2 = tmp.path().join("nfs2");
         fs::create_dir_all(&nfs1).expect("create nfs1 dir");
         fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        fs::write(nfs1.join("ready-a.txt"), b"a").expect("seed nfs1");
+        fs::write(nfs2.join("ready-b.txt"), b"b").expect("seed nfs2");
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_root = worker_socket_tempdir();
@@ -35772,25 +37713,25 @@ mod tests {
         later.extend([
             activate_envelope_with_route_key_and_scope_rows(
                 execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-                source_status_route,
+                source_status_route.clone(),
                 &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
                 4,
             ),
             activate_envelope_with_route_key_and_scope_rows(
                 execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-                source_find_route,
+                source_find_route.clone(),
                 &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
                 4,
             ),
             activate_envelope_with_route_key_and_scope_rows(
                 execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-                sink_status_route,
+                sink_status_route.clone(),
                 &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
                 4,
             ),
             activate_envelope_with_route_key_and_scope_rows(
                 execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-                sink_query_proxy_route,
+                sink_query_proxy_route.clone(),
                 &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
                 4,
             ),
@@ -35803,6 +37744,25 @@ mod tests {
             .expect(
                 "later node-c four-envelope source reactivation should not exhaust runtime-app source recovery after the cleanup-only tail",
             );
+
+        let local_sink_snapshot = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.sink.status_snapshot_nonblocking(),
+        )
+        .await
+        .expect("local sink status must settle promptly after later node-c four-envelope source reactivation")
+        .expect("local sink status should be republished before peer sink-status route resumes");
+        let local_ready_groups = local_sink_snapshot
+            .groups
+            .iter()
+            .filter(|group| group.initial_audit_completed)
+            .map(|group| group.group_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            local_ready_groups,
+            std::collections::BTreeSet::from(["nfs1", "nfs2"]),
+            "later node-c four-envelope source reactivation must restore local sink-status readiness before peer sink-status resumes: {local_sink_snapshot:?}"
+        );
 
         let sink_status_events = internal_sink_status_request_with_timeout(
             boundary.clone(),
@@ -35836,10 +37796,570 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_only_sink_status_route_triggers_source_rescan_before_sink_readiness_check_after_cleanup_only_source_tail()
+     {
+        struct SourceControlErrorHookReset;
+        struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+        struct SourceWorkerControlFramePauseHookReset;
+        struct SourceWorkerTriggerRescanWhenReadyCallCountHookReset;
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_scheduled_groups_refresh_error_queue_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerControlFramePauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_pause_hook();
+            }
+        }
+
+        impl Drop for SourceWorkerTriggerRescanWhenReadyCallCountHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_trigger_rescan_when_ready_call_count_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![
+                            worker_watch_scan_root("nfs1", &nfs1),
+                            worker_watch_scan_root("nfs2", &nfs2),
+                        ],
+                        host_object_grants: Vec::new(),
+                        ..SourceConfig::default()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("node-c-peer-cleanup-tail-sink-status".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        let source_client = match &*app.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let sink_wave = |generation| {
+            let root_scopes = &[("nfs1", &["nfs1"][..]), ("nfs2", &["nfs2"][..])];
+            vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+            ]
+        };
+        let sink_status_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
+        let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+        let source_find_route = format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL);
+        let sink_query_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
+
+        let mut initial = source_wave(2);
+        initial.extend(sink_wave(2));
+        initial.extend([
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_find_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_status_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_query_proxy_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                2,
+            ),
+        ]);
+        app.on_control_frame(&initial)
+            .await
+            .expect("initial peer source/status wave should succeed");
+
+        let _source_error_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated peer source cleanup-tail failure".to_string(),
+                ),
+            },
+        );
+
+        app.on_control_frame(&[deactivate_envelope_with_route_key_reason_and_lease(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            3,
+            "restart_deferred_retire_pending",
+            7,
+            11,
+            22,
+        )])
+        .await
+        .expect("peer source-only deactivate should fail-close into uninitialized replay-required recovery");
+        crate::workers::source::clear_source_worker_control_frame_error_hook();
+        assert!(!app.control_initialized());
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let cleanup_task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[
+                    deactivate_envelope_with_route_key_reason_and_lease(
+                        execution_units::SOURCE_RUNTIME_UNIT_ID,
+                        format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                        3,
+                        "restart_deferred_retire_pending",
+                        7,
+                        11,
+                        22,
+                    ),
+                    deactivate_envelope_with_route_key_reason_and_lease(
+                        execution_units::SOURCE_RUNTIME_UNIT_ID,
+                        format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                        3,
+                        "restart_deferred_retire_pending",
+                        7,
+                        11,
+                        22,
+                    ),
+                    deactivate_envelope_with_route_key_reason_and_lease(
+                        execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                        format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                        3,
+                        "restart_deferred_retire_pending",
+                        7,
+                        11,
+                        22,
+                    ),
+                ])
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_millis(600), entered.notified())
+            .await
+            .expect_err("cleanup-only source tail must stay cleanup-only and must not re-enter source worker");
+        release.notify_waiters();
+        cleanup_task
+            .await
+            .expect("join cleanup-only source tail")
+            .expect("cleanup-only source tail should settle while runtime remains uninitialized");
+        crate::workers::source::clear_source_worker_control_frame_pause_hook();
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_find_route.clone(),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route.clone(),
+                3,
+            ),
+        ])
+        .await
+        .expect("query-peer source cleanup routes should deactivate while runtime stays uninitialized");
+
+        let previous_instance_id = source_client.worker_instance_id_for_tests().await;
+        let _refresh_reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+        crate::workers::source::install_source_worker_scheduled_groups_refresh_error_queue_hook(
+            crate::workers::source::SourceWorkerScheduledGroupsRefreshErrorQueueHook {
+                errs: std::iter::repeat_with(|| CnxError::Timeout)
+                    .take(64)
+                    .collect(),
+                sticky_worker_instance_id: Some(previous_instance_id),
+                sticky_peer_err: None,
+            },
+        );
+        let trigger_rescan_count = Arc::new(AtomicUsize::new(0));
+        let _trigger_rescan_reset = SourceWorkerTriggerRescanWhenReadyCallCountHookReset;
+        crate::workers::source::install_source_worker_trigger_rescan_when_ready_call_count_hook(
+            crate::workers::source::SourceWorkerTriggerRescanWhenReadyCallCountHook {
+                count: trigger_rescan_count.clone(),
+            },
+        );
+        let post_return_retrigger_entered = Arc::new(Notify::new());
+        let post_return_retrigger_release = Arc::new(Notify::new());
+        let _post_return_retrigger_reset = LocalSinkStatusRepublishRetriggerPauseHookReset;
+        install_local_sink_status_republish_retrigger_pause_hook(
+            LocalSinkStatusRepublishRetriggerPauseHook {
+                entered: post_return_retrigger_entered.clone(),
+                release: post_return_retrigger_release.clone(),
+            },
+        );
+        let mut later = source_wave(4);
+        later.extend([
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                4,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_find_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                4,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_status_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                4,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                sink_query_proxy_route.clone(),
+                &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+                4,
+            ),
+        ]);
+        let later_task = tokio::spawn({
+            let app = app.clone();
+            async move { app.on_control_frame(&later).await }
+        });
+        let later_result = tokio::time::timeout(Duration::from_secs(5), later_task)
+            .await
+            .expect(
+                "later node-c four-envelope source reactivation should settle after the cleanup-only tail",
+            )
+            .expect("join later node-c four-envelope source reactivation");
+
+        match later_result {
+            Ok(()) => {
+                assert!(
+                    trigger_rescan_count.load(Ordering::SeqCst) >= 1,
+                    "runtime-app later source-only recovery must trigger source->sink convergence before republishing sink status"
+                );
+            }
+            Err(err) => {
+                let trigger_count = trigger_rescan_count.load(Ordering::SeqCst);
+                if trigger_count == 0 {
+                    panic!(
+                        "runtime-app checked sink readiness after later source-only recovery without ever triggering source->sink convergence: {err}"
+                    );
+                }
+                let source_groups = app
+                    .source
+                    .scheduled_source_group_ids()
+                    .await
+                    .expect("source groups after later source-only recovery")
+                    .unwrap_or_default();
+                let scan_groups = app
+                    .source
+                    .scheduled_scan_group_ids()
+                    .await
+                    .expect("scan groups after later source-only recovery")
+                    .unwrap_or_default();
+                let sink_groups = app
+                    .sink
+                    .scheduled_group_ids()
+                    .await
+                    .expect("sink groups after later source-only recovery")
+                    .unwrap_or_default();
+                if source_groups.is_empty()
+                    || source_groups != scan_groups
+                    || source_groups != sink_groups
+                {
+                    assert!(
+                        err.to_string()
+                            .contains("runtime scope convergence not observed after retained replay"),
+                        "runtime-app triggered source->sink convergence {trigger_count} time(s) but still collapsed missing runtime scope convergence into a sink-readiness failure: {err}; source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
+                    );
+                    app.close().await.expect("close app");
+                    return;
+                }
+                if err.to_string().contains(
+                    "source convergence evidence not observed after retained replay"
+                ) {
+                    panic!(
+                        "runtime-app triggered source->sink convergence {trigger_count} time(s) and observed runtime scope convergence source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}, but still kept waiting for nonexistent source publish evidence: {err}"
+                    );
+                }
+                if err.to_string().contains(
+                    "sink status readiness not restored after retained replay once runtime scope converged"
+                ) {
+                    let source_status_active = app
+                        .facade_gate
+                        .route_active(
+                            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                            &source_status_route,
+                        )
+                        .expect("query-peer source-status route state after later source-only recovery error");
+                    let source_find_active = app
+                        .facade_gate
+                        .route_active(
+                            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                            &source_find_route,
+                        )
+                        .expect("query-peer source-find route state after later source-only recovery error");
+                    let sink_status_active = app
+                        .facade_gate
+                        .route_active(
+                            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                            &sink_status_route,
+                        )
+                        .expect("query-peer sink-status route state after later source-only recovery error");
+                    let sink_query_proxy_active = app
+                        .facade_gate
+                        .route_active(
+                            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                            &sink_query_proxy_route,
+                        )
+                        .expect("query-peer sink-query-proxy route state after later source-only recovery error");
+                    if !source_status_active || !source_find_active {
+                        panic!(
+                            "later source-only recovery may keep source-owned peer routes live while sink readiness is still restoring; source_status_active={source_status_active} source_find_active={source_find_active} err={err}"
+                        );
+                    }
+                    assert!(
+                        !sink_status_active && !sink_query_proxy_active,
+                        "later source-only recovery must keep sink-owned peer routes suppressed until local sink status republish succeeds; sink_status_active={sink_status_active} sink_query_proxy_active={sink_query_proxy_active} err={err}"
+                    );
+                    app.close().await.expect("close app");
+                    return;
+                }
+                if matches!(err, CnxError::Timeout) {
+                    if trigger_count < 2 {
+                        panic!(
+                            "runtime-app must retrigger source->sink convergence after a post-recovery sink timeout once runtime scope has already converged; triggers={trigger_count} source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
+                        );
+                    }
+                    panic!(
+                        "runtime-app retriggered source->sink convergence {trigger_count} time(s) after runtime scope convergence but still exhausted sink readiness on a raw timeout: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
+                    );
+                }
+                panic!(
+                    "runtime-app triggered source->sink convergence {trigger_count} time(s) but returned an unexpected recovery error after runtime scope convergence source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}: {err}"
+                );
+            }
+        }
+
+        let trigger_count_after_return = trigger_rescan_count.load(Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), post_return_retrigger_entered.notified())
+            .await
+            .expect(
+                "runtime-app must spawn a deferred post-return local sink-status republish helper that reaches its post-return source->sink retrigger after later source-only recovery returned",
+            );
+        post_return_retrigger_release.notify_waiters();
+        let local_sink_snapshot = tokio::time::timeout(
+            Duration::from_secs(2),
+            app.sink.status_snapshot_nonblocking(),
+        )
+        .await;
+        let trigger_count_after_local_wait = trigger_rescan_count.load(Ordering::SeqCst);
+        let local_sink_snapshot = match local_sink_snapshot {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(err)) => {
+                let sink_groups_after_local_wait = app
+                    .sink
+                    .scheduled_group_ids()
+                    .await
+                    .expect("sink groups while local sink status republish remains unavailable")
+                    .unwrap_or_default();
+                let cached_sink_status_summary = app
+                    .sink
+                    .cached_status_snapshot()
+                    .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+                    .unwrap_or_else(|cached_err| {
+                        format!("cached_sink_status_unavailable err={cached_err}")
+                    });
+                let blocking_sink_status_summary = match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    app.sink.status_snapshot(),
+                )
+                .await
+                {
+                    Ok(Ok(snapshot)) => summarize_sink_status_endpoint(&snapshot),
+                    Ok(Err(snapshot_err)) => format!("blocking_status_err={snapshot_err}"),
+                    Err(_) => "blocking_status_timeout".to_string(),
+                };
+                let source_observability_summary = summarize_source_observability_endpoint(
+                    &app.source.observability_snapshot_nonblocking().await,
+                );
+                let sink_status_active = app
+                    .facade_gate
+                    .route_active(
+                        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                        &sink_status_route,
+                    )
+                    .expect("query-peer sink-status route state while local sink status republish remains unavailable");
+                let sink_query_proxy_active = app
+                    .facade_gate
+                    .route_active(
+                        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                        &sink_query_proxy_route,
+                    )
+                    .expect("query-peer sink-query-proxy route state while local sink status republish remains unavailable");
+                assert!(
+                    !sink_status_active && !sink_query_proxy_active,
+                    "runtime-app must keep sink-owned peer routes suppressed while post-return local sink-status republish is still unavailable; sink_status_active={sink_status_active} sink_query_proxy_active={sink_query_proxy_active} sink_groups_after_local_wait={sink_groups_after_local_wait:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary} err={err}"
+                );
+                panic!(
+                    "runtime-app kept sink-owned peer routes suppressed after later source-only recovery returned, but local sink status still failed before republish: trigger_count_after_return={trigger_count_after_return} trigger_count_after_local_wait={trigger_count_after_local_wait} sink_groups_after_local_wait={sink_groups_after_local_wait:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary} err={err}"
+                );
+            }
+            Err(_) => {
+                let sink_groups_after_local_wait = app
+                    .sink
+                    .scheduled_group_ids()
+                    .await
+                    .expect("sink groups while local sink status republish timed out")
+                    .unwrap_or_default();
+                let cached_sink_status_summary = app
+                    .sink
+                    .cached_status_snapshot()
+                    .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+                    .unwrap_or_else(|cached_err| {
+                        format!("cached_sink_status_unavailable err={cached_err}")
+                    });
+                let blocking_sink_status_summary = match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    app.sink.status_snapshot(),
+                )
+                .await
+                {
+                    Ok(Ok(snapshot)) => summarize_sink_status_endpoint(&snapshot),
+                    Ok(Err(snapshot_err)) => format!("blocking_status_err={snapshot_err}"),
+                    Err(_) => "blocking_status_timeout".to_string(),
+                };
+                let source_observability_summary = summarize_source_observability_endpoint(
+                    &app.source.observability_snapshot_nonblocking().await,
+                );
+                let sink_status_active = app
+                    .facade_gate
+                    .route_active(
+                        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                        &sink_status_route,
+                    )
+                    .expect("query-peer sink-status route state while local sink status republish timed out");
+                let sink_query_proxy_active = app
+                    .facade_gate
+                    .route_active(
+                        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                        &sink_query_proxy_route,
+                    )
+                    .expect("query-peer sink-query-proxy route state while local sink status republish timed out");
+                assert!(
+                    !sink_status_active && !sink_query_proxy_active,
+                    "runtime-app must keep sink-owned peer routes suppressed while post-return local sink-status republish timed out; sink_status_active={sink_status_active} sink_query_proxy_active={sink_query_proxy_active} sink_groups_after_local_wait={sink_groups_after_local_wait:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary}"
+                );
+                panic!(
+                    "runtime-app kept sink-owned peer routes suppressed after later source-only recovery returned, but local sink status still did not republish within the bounded wait: trigger_count_after_return={trigger_count_after_return} trigger_count_after_local_wait={trigger_count_after_local_wait} sink_groups_after_local_wait={sink_groups_after_local_wait:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary}"
+                );
+            }
+        };
+        let local_ready_groups = local_sink_snapshot
+            .groups
+            .iter()
+            .filter(|group| group.initial_audit_completed)
+            .map(|group| group.group_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            local_ready_groups,
+            std::collections::BTreeSet::from(["nfs1", "nfs2"]),
+            "runtime-app must restore local sink-status readiness after later source-only recovery returned: {local_sink_snapshot:?}"
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cleanup_only_sink_query_tail_preserves_retained_sink_activate_before_later_node_a_mixed_recovery()
      {
         struct SinkWorkerControlFramePauseHookReset;
         struct SourceControlErrorHookReset;
+        struct SinkWorkerControlFrameErrorQueueHookReset;
+        struct SinkWorkerRetryResetHookReset;
 
         impl Drop for SinkWorkerControlFramePauseHookReset {
             fn drop(&mut self) {
@@ -35850,6 +38370,18 @@ mod tests {
         impl Drop for SourceControlErrorHookReset {
             fn drop(&mut self) {
                 crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SinkWorkerControlFrameErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SinkWorkerRetryResetHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_retry_reset_hook();
             }
         }
 
@@ -36105,6 +38637,293 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cleanup_only_sink_query_tail_later_node_a_mixed_recovery_settles_after_repeated_sink_bridge_resets()
+     {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SinkWorkerControlFramePauseHookReset;
+        struct SourceControlErrorHookReset;
+        struct SinkWorkerControlFrameErrorQueueHookReset;
+        struct SinkWorkerRetryResetHookReset;
+
+        impl Drop for SinkWorkerControlFramePauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_pause_hook();
+            }
+        }
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SinkWorkerControlFrameErrorQueueHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_error_hook();
+            }
+        }
+
+        impl Drop for SinkWorkerRetryResetHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_retry_reset_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1_dir = tmp.path().join("nfs1");
+        let nfs2_dir = tmp.path().join("nfs2");
+        fs::create_dir_all(nfs1_dir.join("force-find-stress")).expect("create nfs1 dir");
+        fs::create_dir_all(nfs2_dir.join("force-find-stress")).expect("create nfs2 dir");
+        fs::write(nfs1_dir.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
+        fs::write(nfs2_dir.join("force-find-stress").join("seed.txt"), b"b").expect("seed nfs2");
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![
+                            worker_watch_scan_root("nfs1", &nfs1_dir),
+                            worker_watch_scan_root("nfs2", &nfs2_dir),
+                        ],
+                        host_object_grants: vec![
+                            worker_export("node-a::nfs1", "node-a", "127.0.0.1", nfs1_dir.clone()),
+                            worker_export("node-a::nfs2", "node-a", "127.0.0.2", nfs2_dir.clone()),
+                        ],
+                        ..SourceConfig::default()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("node-a".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let sink_wave = |generation| {
+            let root_scopes = &[("nfs1", &["node-a::nfs1"][..]), ("nfs2", &["node-a::nfs2"][..])];
+            let mut signals = vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_QUERY),
+                    root_scopes,
+                    generation,
+                ),
+            ];
+            for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+                signals.push(activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    sink_query_request_route_for(node_id).0,
+                    root_scopes,
+                    generation,
+                ));
+            }
+            signals
+        };
+
+        let mut initial = source_wave(2);
+        initial.extend(sink_wave(2));
+        app.on_control_frame(&initial)
+            .await
+            .expect("initial source/sink wave should succeed");
+
+        let sink_events_route = (
+            execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+        );
+
+        let _source_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated source apply failure before sink replay".to_string(),
+                ),
+            },
+        );
+
+        let mut followup = source_wave(3);
+        followup.extend(sink_wave(3));
+        app.on_control_frame(&followup)
+            .await
+            .expect_err("follow-up full wave should fail in source.apply before sink replay");
+        crate::workers::source::clear_source_worker_control_frame_error_hook();
+        assert!(!app.control_initialized());
+        match app
+            .retained_sink_control_state
+            .lock()
+            .await
+            .active_by_route
+            .get(&sink_events_route)
+        {
+            Some(SinkControlSignal::Activate { generation, .. }) => assert_eq!(*generation, 3),
+            other => panic!(
+                "expected retained sink activate for {sink_events_route:?} after failed full wave: {other:?}"
+            ),
+        }
+
+        let cleanup_routes = [
+            sink_query_request_route_for("node-a").0,
+            sink_query_request_route_for("node-b").0,
+            sink_query_request_route_for("node-c").0,
+            sink_query_request_route_for("node-d").0,
+            sink_query_request_route_for("node-e").0,
+            format!("{}.req", ROUTE_KEY_QUERY),
+            format!("{}.req", ROUTE_KEY_FORCE_FIND),
+            format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+        ];
+        for route_key in cleanup_routes {
+            app.on_control_frame(&[deactivate_envelope_with_route_key_reason_and_lease(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                route_key,
+                3,
+                "restart_deferred_retire_pending",
+                7,
+                11,
+                22,
+            )])
+            .await
+            .expect("sink cleanup-only query tail should complete");
+            assert!(!app.control_initialized());
+        }
+
+        let reset_count = Arc::new(AtomicUsize::new(0));
+        let _retry_reset = SinkWorkerRetryResetHookReset;
+        crate::workers::sink::install_sink_worker_retry_reset_hook(
+            crate::workers::sink::SinkWorkerRetryResetHook {
+                reset_count: reset_count.clone(),
+            },
+        );
+        let _sink_error_reset = SinkWorkerControlFrameErrorQueueHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_error_queue_hook(
+            crate::workers::sink::SinkWorkerControlFrameErrorQueueHook {
+                errs: std::collections::VecDeque::from(vec![
+                    CnxError::Internal(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                            .to_string(),
+                    ),
+                    CnxError::Internal(
+                        "transport closed: sidecar control bridge closed: internal error: ipc read len: Connection reset by peer (os error 104)"
+                            .to_string(),
+                    ),
+                ]),
+                sticky_worker_instance_id: None,
+                sticky_peer_err: None,
+            },
+        );
+
+        let mut later = source_wave(4);
+        later.extend(sink_wave(4));
+        tokio::time::timeout(Duration::from_secs(5), app.on_control_frame(&later))
+            .await
+            .expect(
+                "later node-a mixed recovery should settle after cleanup-only sink query tail plus repeated sink bridge resets",
+            )
+            .expect(
+                "later node-a mixed recovery should not exhaust runtime-app recovery after cleanup-only sink query tail plus repeated sink bridge resets",
+            );
+
+        assert!(
+            reset_count.load(Ordering::SeqCst) >= 1,
+            "later node-a mixed recovery should reset the shared sink worker client after repeated sink bridge resets",
+        );
+
+        let expected_groups = std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let sink_groups = app
+                .sink
+                .scheduled_group_ids()
+                .await
+                .expect("sink groups after later node-a mixed recovery")
+                .unwrap_or_default();
+            let snapshot = app
+                .sink
+                .status_snapshot()
+                .await
+                .expect("sink status snapshot after later node-a mixed recovery");
+            let ready_groups = snapshot
+                .groups
+                .iter()
+                .filter(|group| group.initial_audit_completed)
+                .map(|group| group.group_id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            if sink_groups == expected_groups && ready_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < readiness_deadline,
+                "later node-a mixed recovery after cleanup-only sink query tail plus repeated sink bridge resets must restore sink scheduling and readiness: sink={sink_groups:?} ready={ready_groups:?} snapshot={snapshot:?}",
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn source_cleanup_only_followup_does_not_replay_retained_sink_state_while_runtime_uninitialized()
      {
         struct SinkWorkerControlFramePauseHookReset;
@@ -36310,6 +39129,335 @@ mod tests {
             .expect("join source cleanup-only followup")
             .expect("source cleanup-only followup should settle while runtime remains uninitialized");
         assert!(!app.control_initialized());
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn source_cleanup_only_and_query_peer_cleanup_tails_preserve_sink_convergence_before_later_source_recovery()
+     {
+        struct SinkWorkerControlFramePauseHookReset;
+        struct SourceControlErrorHookReset;
+
+        impl Drop for SinkWorkerControlFramePauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_pause_hook();
+            }
+        }
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1_dir = tmp.path().join("nfs1");
+        let nfs2_dir = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1_dir).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2_dir).expect("create nfs2 dir");
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![
+                            worker_watch_scan_root("nfs1", &nfs1_dir),
+                            worker_watch_scan_root("nfs2", &nfs2_dir),
+                        ],
+                        host_object_grants: vec![
+                            worker_export("node-a::nfs1", "node-a", "127.0.0.1", nfs1_dir.clone()),
+                            worker_export("node-a::nfs2", "node-a", "127.0.0.2", nfs2_dir.clone()),
+                        ],
+                        ..SourceConfig::default()
+                    },
+                    ..FSMetaConfig::default()
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("node-a".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        let source_wave = |generation| {
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                    generation,
+                ),
+            ]
+        };
+        let sink_wave = |generation| {
+            let root_scopes = &[("nfs1", &["node-a::nfs1"][..]), ("nfs2", &["node-a::nfs2"][..])];
+            let mut signals = vec![
+                activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_EVENTS),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                    root_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_QUERY),
+                    root_scopes,
+                    generation,
+                ),
+            ];
+            for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+                signals.push(activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    sink_query_request_route_for(node_id).0,
+                    root_scopes,
+                    generation,
+                ));
+            }
+            signals
+        };
+        let query_peer_wave = |generation| {
+            let listener_scopes = &[("nfs1", &["listener-a"][..]), ("nfs2", &["listener-a"][..])];
+            vec![
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    listener_scopes,
+                    generation,
+                ),
+            ]
+        };
+
+        let mut initial = source_wave(2);
+        initial.extend(sink_wave(2));
+        initial.extend(query_peer_wave(2));
+        app.on_control_frame(&initial)
+            .await
+            .expect("initial source/sink/query-peer wave should succeed");
+
+        let sink_events_route = (
+            execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+        );
+
+        let _source_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated source apply failure before sink replay".to_string(),
+                ),
+            },
+        );
+
+        let mut followup = source_wave(3);
+        followup.extend(sink_wave(3));
+        followup.extend(query_peer_wave(3));
+        app.on_control_frame(&followup)
+            .await
+            .expect_err("follow-up mixed wave should fail in source.apply before sink replay");
+        crate::workers::source::clear_source_worker_control_frame_error_hook();
+        assert!(!app.control_initialized());
+        match app
+            .retained_sink_control_state
+            .lock()
+            .await
+            .active_by_route
+            .get(&sink_events_route)
+        {
+            Some(SinkControlSignal::Activate { generation, .. }) => assert_eq!(*generation, 3),
+            other => panic!(
+                "expected retained sink activate for {sink_events_route:?} after failed mixed wave: {other:?}"
+            ),
+        }
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = SinkWorkerControlFramePauseHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let cleanup_task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[
+                    deactivate_envelope_with_route_key_reason_and_lease(
+                        execution_units::SOURCE_RUNTIME_UNIT_ID,
+                        format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                        3,
+                        "restart_deferred_retire_pending",
+                        7,
+                        11,
+                        22,
+                    ),
+                    deactivate_envelope_with_route_key_reason_and_lease(
+                        execution_units::SOURCE_RUNTIME_UNIT_ID,
+                        format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                        3,
+                        "restart_deferred_retire_pending",
+                        7,
+                        11,
+                        22,
+                    ),
+                    deactivate_envelope_with_route_key_reason_and_lease(
+                        execution_units::SOURCE_RUNTIME_UNIT_ID,
+                        format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                        3,
+                        "restart_deferred_retire_pending",
+                        7,
+                        11,
+                        22,
+                    ),
+                    deactivate_envelope_with_route_key_reason_and_lease(
+                        execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                        format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                        3,
+                        "restart_deferred_retire_pending",
+                        7,
+                        11,
+                        22,
+                    ),
+                ])
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_millis(600), entered.notified())
+            .await
+            .expect_err(
+                "source cleanup-only tails while runtime stays uninitialized must not replay retained sink state or re-enter sink worker",
+            );
+        release.notify_waiters();
+        cleanup_task
+            .await
+            .expect("join source cleanup-only tails")
+            .expect("source cleanup-only tails should settle while runtime remains uninitialized");
+        assert!(!app.control_initialized());
+        crate::workers::sink::clear_sink_worker_control_frame_pause_hook();
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                3,
+            ),
+        ])
+        .await
+        .expect("query-peer source cleanup tails should complete while runtime stays uninitialized");
+        assert!(!app.control_initialized());
+
+        let mut later = source_wave(4);
+        later.extend(query_peer_wave(4));
+        tokio::time::timeout(Duration::from_secs(5), app.on_control_frame(&later))
+            .await
+            .expect(
+                "later source+query-peer recovery should settle after source cleanup-only and query-peer cleanup tails",
+            )
+            .expect(
+                "later source+query-peer recovery should restore runtime after source cleanup-only and query-peer cleanup tails",
+            );
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let sink_groups = app
+                .sink
+                .scheduled_group_ids()
+                .await
+                .expect("sink groups after later source+query-peer recovery")
+                .unwrap_or_default();
+            let snapshot = app
+                .sink
+                .status_snapshot()
+                .await
+                .expect("sink status snapshot after later source+query-peer recovery");
+            let ready_groups = snapshot
+                .groups
+                .iter()
+                .filter(|group| group.initial_audit_completed)
+                .map(|group| group.group_id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            if sink_groups == expected_groups && ready_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < readiness_deadline,
+                "later source+query-peer recovery must restore sink scheduling and readiness after source cleanup-only/query-peer cleanup tails: sink={sink_groups:?} ready={ready_groups:?} snapshot={snapshot:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         app.close().await.expect("close app");
     }
