@@ -70,6 +70,9 @@ async fn public_trusted_exact_file_path_b64_keeps_first_request_materialized_own
     let sink_status_route = default_route_bindings()
         .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
         .expect("resolve sink-status route");
+    let proxy_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
+        .expect("resolve sink-query-proxy route");
     let owner_route_a = sink_query_request_route_for("node-a");
     let owner_route_b = sink_query_request_route_for("node-b");
     let file_path = b"/nested/child/deep.txt".to_vec();
@@ -317,6 +320,39 @@ async fn public_trusted_exact_file_path_b64_keeps_first_request_materialized_own
             responses
         },
     );
+    let mut proxy_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        proxy_route.clone(),
+        "test-public-exact-file-path-b64-proxy-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            let mut responses = Vec::new();
+            for req in requests {
+                let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                    .expect("decode proxy query request");
+                let group_id = params
+                    .scope
+                    .selected_group
+                    .clone()
+                    .expect("selected group for proxy request");
+                let payload = if group_id == "nfs1" {
+                    real_materialized_exact_file_payload_for_test(
+                        &params.scope.path,
+                        10,
+                        1775979979238478,
+                    )
+                } else {
+                    empty_materialized_tree_payload_for_test(&params.scope.path)
+                };
+                responses.push(mk_event_with_correlation(
+                    &group_id,
+                    req.metadata().correlation_id.expect("proxy correlation"),
+                    payload,
+                ));
+            }
+            responses
+        },
+    );
     let mut owner_b_endpoint = ManagedEndpointTask::spawn(
         boundary.clone(),
         owner_route_b.clone(),
@@ -368,7 +404,14 @@ async fn public_trusted_exact_file_path_b64_keeps_first_request_materialized_own
         .oneshot(first_req)
         .await
         .expect("serve first tree request");
-    assert_eq!(first_resp.status(), StatusCode::OK);
+    assert_eq!(
+        first_resp.status(),
+        StatusCode::OK,
+        "first trusted exact-file request should stay 200 before path_b64 replay; owner_a_send_batches={} owner_b_send_batches={} proxy_send_batches={}",
+        boundary.send_batch_count(&owner_route_a.0),
+        boundary.send_batch_count(&owner_route_b.0),
+        boundary.send_batch_count(&proxy_route.0),
+    );
     let first_body = to_bytes(first_resp.into_body(), 1024 * 1024)
         .await
         .expect("first response body");
@@ -387,7 +430,14 @@ async fn public_trusted_exact_file_path_b64_keeps_first_request_materialized_own
         .oneshot(second_req)
         .await
         .expect("serve second tree request");
-    assert_eq!(second_resp.status(), StatusCode::OK);
+    assert_eq!(
+        second_resp.status(),
+        StatusCode::OK,
+        "trusted exact-file path_b64 replay should stay 200 after ready owner drift; owner_a_send_batches={} owner_b_send_batches={} proxy_send_batches={}",
+        boundary.send_batch_count(&owner_route_a.0),
+        boundary.send_batch_count(&owner_route_b.0),
+        boundary.send_batch_count(&proxy_route.0),
+    );
     let second_body = to_bytes(second_resp.into_body(), 1024 * 1024)
         .await
         .expect("second response body");
@@ -434,6 +484,7 @@ async fn public_trusted_exact_file_path_b64_keeps_first_request_materialized_own
         .shutdown(Duration::from_secs(2))
         .await;
     sink_status_endpoint.shutdown(Duration::from_secs(2)).await;
+    proxy_endpoint.shutdown(Duration::from_secs(2)).await;
     owner_a_endpoint.shutdown(Duration::from_secs(2)).await;
     owner_b_endpoint.shutdown(Duration::from_secs(2)).await;
     let _ = file_path;

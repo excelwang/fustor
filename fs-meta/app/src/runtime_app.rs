@@ -546,6 +546,27 @@ fn selected_group_empty_materialized_reply(
     )))
 }
 
+fn explicit_empty_sink_status_reply(
+    origin_id: &NodeId,
+    correlation_id: Option<u64>,
+) -> Result<Event> {
+    let payload =
+        rmp_serde::to_vec_named(&crate::sink::SinkStatusSnapshot::default()).map_err(|err| {
+            CnxError::Internal(format!("encode empty sink-status payload failed: {err}"))
+        })?;
+    Ok(Event::new(
+        EventMetadata {
+            origin_id: origin_id.clone(),
+            timestamp_us: now_us(),
+            logical_ts: None,
+            correlation_id,
+            ingress_auth: None,
+            trace: None,
+        },
+        bytes::Bytes::from(payload),
+    ))
+}
+
 fn selected_group_bridge_eligible_from_sink_status(
     request: &InternalQueryRequest,
     snapshot: &crate::sink::SinkStatusSnapshot,
@@ -2798,7 +2819,9 @@ impl FSMetaApp {
                 let api_task = self.api_task.clone();
                 let pending_facade = self.pending_facade.clone();
                 let facade_pending_status = self.facade_pending_status.clone();
+                let facade_gate = self.facade_gate.clone();
                 let sink = self.sink.clone();
+                let route_key = route.0.clone();
                 eprintln!(
                     "fs_meta_runtime_app: spawning sink status endpoint route={}",
                     route.0
@@ -2817,7 +2840,9 @@ impl FSMetaApp {
                         let api_task = api_task.clone();
                         let pending_facade = pending_facade.clone();
                         let facade_pending_status = facade_pending_status.clone();
+                        let facade_gate = facade_gate.clone();
                         let sink = sink.clone();
+                        let route_key = route_key.clone();
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
@@ -2838,6 +2863,22 @@ impl FSMetaApp {
                                 }
                                 #[cfg(test)]
                                 maybe_pause_runtime_proxy_request("sink_status").await;
+                                if !internal_query_route_still_active(&facade_gate, &route_key) {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: sink status endpoint unavailable reason=route_deactivated_after_pause route={}",
+                                        route_key
+                                    );
+                                    match explicit_empty_sink_status_reply(
+                                        &req.metadata().origin_id,
+                                        req.metadata().correlation_id,
+                                    ) {
+                                        Ok(event) => responses.push(event),
+                                        Err(err) => eprintln!(
+                                            "fs_meta_runtime_app: sink status endpoint deactivated empty reply encode failed: {err}"
+                                        ),
+                                    }
+                                    continue;
+                                }
                                 if !api_control_gate.is_ready() && !continuity_window {
                                     eprintln!(
                                         "fs_meta_runtime_app: sink status endpoint unavailable reason=control_not_ready_after_pause"
@@ -2865,6 +2906,25 @@ impl FSMetaApp {
                                         }
                                     }
                                     Err(err) => {
+                                        if !internal_query_route_still_active(
+                                            &facade_gate,
+                                            &route_key,
+                                        ) {
+                                            eprintln!(
+                                                "fs_meta_runtime_app: sink status endpoint fail-closed after route deactivate route={} err={}",
+                                                route_key, err
+                                            );
+                                            match explicit_empty_sink_status_reply(
+                                                &req.metadata().origin_id,
+                                                req.metadata().correlation_id,
+                                            ) {
+                                                Ok(event) => responses.push(event),
+                                                Err(reply_err) => eprintln!(
+                                                    "fs_meta_runtime_app: sink status endpoint deactivated empty reply encode failed: {reply_err}"
+                                                ),
+                                            }
+                                            continue;
+                                        }
                                         eprintln!(
                                             "fs_meta_runtime_app: sink status endpoint failed err={}",
                                             err
@@ -5991,6 +6051,11 @@ impl FSMetaApp {
             || (!self.source_state_replay_required.load(Ordering::Acquire)
                 && !self.sink_state_replay_required.load(Ordering::Acquire));
         let _serial_guard = self.control_frame_serial.lock().await;
+        let _shared_serial_guard = if requires_shared_serial {
+            Some(self.shared_control_frame_serial.lock().await)
+        } else {
+            None
+        };
         let _lease_guard = match (
             requires_shared_serial,
             self.control_frame_lease_path.as_deref(),
@@ -6017,11 +6082,6 @@ impl FSMetaApp {
                 )
             }
             _ => None,
-        };
-        let _shared_serial_guard = if requires_shared_serial {
-            Some(self.shared_control_frame_serial.lock().await)
-        } else {
-            None
         };
         let control_initialized_at_entry = self.control_initialized();
         #[cfg(test)]
@@ -6659,7 +6719,6 @@ impl RuntimeBoundaryApp for FSMetaRuntimeApp {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests;

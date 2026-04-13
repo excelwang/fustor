@@ -167,9 +167,12 @@ fn source_control_signals_prefer_short_existing_client_attempt(
 fn source_control_signals_require_post_ack_schedule_refresh(
     signals: &[SourceControlSignal],
 ) -> bool {
-    signals
-        .iter()
-        .any(|signal| matches!(signal, SourceControlSignal::Activate { .. }))
+    signals.iter().any(|signal| {
+        matches!(
+            signal,
+            SourceControlSignal::Activate { bound_scopes, .. } if !bound_scopes.is_empty()
+        )
+    })
 }
 
 fn source_control_signals_can_use_primed_schedule_timeout_fallback(
@@ -178,7 +181,10 @@ fn source_control_signals_can_use_primed_schedule_timeout_fallback(
     let mut saw_activate = false;
     for signal in signals {
         match signal {
-            SourceControlSignal::Activate { .. } => saw_activate = true,
+            SourceControlSignal::Activate { bound_scopes, .. } if !bound_scopes.is_empty() => {
+                saw_activate = true;
+            }
+            SourceControlSignal::Activate { .. } => {}
             SourceControlSignal::RuntimeHostGrantChange { .. }
             | SourceControlSignal::Tick { .. }
             | SourceControlSignal::ManualRescan { .. }
@@ -218,8 +224,9 @@ fn primed_schedule_cache_covers_signals(
             signal,
             SourceControlSignal::Activate {
                 unit: SourceRuntimeUnit::Source,
+                bound_scopes,
                 ..
-            }
+            } if !bound_scopes.is_empty()
         )
     });
     let needs_scan_groups = signals.iter().any(|signal| {
@@ -227,8 +234,9 @@ fn primed_schedule_cache_covers_signals(
             signal,
             SourceControlSignal::Activate {
                 unit: SourceRuntimeUnit::Scan,
+                bound_scopes,
                 ..
-            }
+            } if !bound_scopes.is_empty()
         )
     });
     (!needs_source_groups || has_source_groups) && (!needs_scan_groups || has_scan_groups)
@@ -775,6 +783,11 @@ struct SharedSourceWorkerHandleState {
     start_serial: Arc<tokio::sync::Mutex<()>>,
     control_ops_inflight: Arc<AtomicUsize>,
     control_ops_serial: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct ScheduledGroupsRefreshFailure {
+    err: CnxError,
+    recovered_live_worker_during_refresh: bool,
 }
 
 struct SharedSourceWorkerClient {
@@ -2157,17 +2170,23 @@ impl SourceWorkerClientHandle {
     async fn refresh_cached_scheduled_groups_from_live_worker_until(
         &self,
         deadline: std::time::Instant,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), ScheduledGroupsRefreshFailure> {
         eprintln!(
             "fs_meta_source_worker_client: refresh_cached_scheduled_groups begin node={}",
             self.node_id.0
         );
         let replay_required_recovery = self.control_state_replay_required.load(Ordering::Acquire);
+        let mut recovered_live_worker_during_refresh = false;
         let deadline = clip_retry_deadline(deadline, SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT);
         loop {
             let worker = self.worker_client().await;
             let ensure_started_result = match tokio::time::timeout(
-                Self::schedule_refresh_call_timeout(deadline)?,
+                Self::schedule_refresh_call_timeout(deadline).map_err(|err| {
+                    ScheduledGroupsRefreshFailure {
+                        err,
+                        recovered_live_worker_during_refresh,
+                    }
+                })?,
                 worker.ensure_started(),
             )
             .await
@@ -2184,8 +2203,18 @@ impl SourceWorkerClientHandle {
                         "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry ensure_started node={} err={}",
                         self.node_id.0, err
                     );
-                    self.reconnect_shared_worker_client().await?;
-                    Self::sleep_retry_backoff_with_deadline(deadline).await?;
+                    self.reconnect_shared_worker_client().await.map_err(|err| {
+                        ScheduledGroupsRefreshFailure {
+                            err,
+                            recovered_live_worker_during_refresh,
+                        }
+                    })?;
+                    Self::sleep_retry_backoff_with_deadline(deadline)
+                        .await
+                        .map_err(|err| ScheduledGroupsRefreshFailure {
+                            err,
+                            recovered_live_worker_during_refresh,
+                        })?;
                     continue;
                 }
                 Err(err) => {
@@ -2193,11 +2222,21 @@ impl SourceWorkerClientHandle {
                         "fs_meta_source_worker_client: refresh_cached_scheduled_groups err ensure_started node={} err={}",
                         self.node_id.0, err
                     );
-                    return Err(err);
+                    return Err(ScheduledGroupsRefreshFailure {
+                        err,
+                        recovered_live_worker_during_refresh,
+                    });
                 }
             }
             self.replay_retained_control_state_if_needed_for_refresh_until(deadline)
-                .await?;
+                .await
+                .map_err(|err| ScheduledGroupsRefreshFailure {
+                    err,
+                    recovered_live_worker_during_refresh,
+                })?;
+            if replay_required_recovery {
+                recovered_live_worker_during_refresh = true;
+            }
             let worker = self.worker_client().await;
             let client = match worker.client().await {
                 Ok(client) => client,
@@ -2208,8 +2247,18 @@ impl SourceWorkerClientHandle {
                         "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry client node={} err={}",
                         self.node_id.0, err
                     );
-                    self.reconnect_shared_worker_client().await?;
-                    Self::sleep_retry_backoff_with_deadline(deadline).await?;
+                    self.reconnect_shared_worker_client().await.map_err(|err| {
+                        ScheduledGroupsRefreshFailure {
+                            err,
+                            recovered_live_worker_during_refresh,
+                        }
+                    })?;
+                    Self::sleep_retry_backoff_with_deadline(deadline)
+                        .await
+                        .map_err(|err| ScheduledGroupsRefreshFailure {
+                            err,
+                            recovered_live_worker_during_refresh,
+                        })?;
                     continue;
                 }
                 Err(err) => {
@@ -2217,13 +2266,21 @@ impl SourceWorkerClientHandle {
                         "fs_meta_source_worker_client: refresh_cached_scheduled_groups err client node={} err={}",
                         self.node_id.0, err
                     );
-                    return Err(err);
+                    return Err(ScheduledGroupsRefreshFailure {
+                        err,
+                        recovered_live_worker_during_refresh,
+                    });
                 }
             };
             let grants = match Self::call_worker(
                 &client,
                 SourceWorkerRequest::HostObjectGrantsSnapshot,
-                Self::schedule_refresh_call_timeout(deadline)?,
+                Self::schedule_refresh_call_timeout(deadline).map_err(|err| {
+                    ScheduledGroupsRefreshFailure {
+                        err,
+                        recovered_live_worker_during_refresh,
+                    }
+                })?,
             )
             .await
             {
@@ -2234,13 +2291,21 @@ impl SourceWorkerClientHandle {
                     grants
                 }
                 Ok(other) => {
-                    return Err(CnxError::ProtocolViolation(format!(
-                        "unexpected source worker response for scheduled groups host grants refresh: {:?}",
-                        other
-                    )));
+                    return Err(ScheduledGroupsRefreshFailure {
+                        err: CnxError::ProtocolViolation(format!(
+                            "unexpected source worker response for scheduled groups host grants refresh: {:?}",
+                            other
+                        )),
+                        recovered_live_worker_during_refresh,
+                    });
                 }
                 Err(err) if can_use_cached_host_object_grants_snapshot(&err) => {
-                    self.cached_host_object_grants_snapshot()?
+                    self.cached_host_object_grants_snapshot().map_err(|err| {
+                        ScheduledGroupsRefreshFailure {
+                            err,
+                            recovered_live_worker_during_refresh,
+                        }
+                    })?
                 }
                 Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
@@ -2249,8 +2314,18 @@ impl SourceWorkerClientHandle {
                         "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry grants node={} err={}",
                         self.node_id.0, err
                     );
-                    self.reconnect_shared_worker_client().await?;
-                    Self::sleep_retry_backoff_with_deadline(deadline).await?;
+                    self.reconnect_shared_worker_client().await.map_err(|err| {
+                        ScheduledGroupsRefreshFailure {
+                            err,
+                            recovered_live_worker_during_refresh,
+                        }
+                    })?;
+                    Self::sleep_retry_backoff_with_deadline(deadline)
+                        .await
+                        .map_err(|err| ScheduledGroupsRefreshFailure {
+                            err,
+                            recovered_live_worker_during_refresh,
+                        })?;
                     continue;
                 }
                 Err(err) => {
@@ -2258,7 +2333,10 @@ impl SourceWorkerClientHandle {
                         "fs_meta_source_worker_client: refresh_cached_scheduled_groups err grants node={} err={}",
                         self.node_id.0, err
                     );
-                    return Err(err);
+                    return Err(ScheduledGroupsRefreshFailure {
+                        err,
+                        recovered_live_worker_during_refresh,
+                    });
                 }
             };
             let stable_host_ref = {
@@ -2302,11 +2380,26 @@ impl SourceWorkerClientHandle {
                         // still has not become live enough to answer scheduled-group refresh RPCs.
                         // Recover by rotating to another live worker candidate instead of
                         // exhausting the replay-required path on the same stalled instance.
-                        self.reconnect_shared_worker_client().await?;
+                        self.reconnect_shared_worker_client().await.map_err(|err| {
+                            ScheduledGroupsRefreshFailure {
+                                err,
+                                recovered_live_worker_during_refresh,
+                            }
+                        })?;
                     } else {
-                        self.reconnect_shared_worker_client().await?;
+                        self.reconnect_shared_worker_client().await.map_err(|err| {
+                            ScheduledGroupsRefreshFailure {
+                                err,
+                                recovered_live_worker_during_refresh,
+                            }
+                        })?;
                     }
-                    Self::sleep_retry_backoff_with_deadline(deadline).await?;
+                    Self::sleep_retry_backoff_with_deadline(deadline)
+                        .await
+                        .map_err(|err| ScheduledGroupsRefreshFailure {
+                            err,
+                            recovered_live_worker_during_refresh,
+                        })?;
                     continue;
                 }
                 Err(err) => {
@@ -2314,7 +2407,10 @@ impl SourceWorkerClientHandle {
                         "fs_meta_source_worker_client: refresh_cached_scheduled_groups err schedule node={} err={}",
                         self.node_id.0, err
                     );
-                    return Err(err);
+                    return Err(ScheduledGroupsRefreshFailure {
+                        err,
+                        recovered_live_worker_during_refresh,
+                    });
                 }
             };
             let cache_empty = self.with_cache_mut(|cache| {
@@ -2332,7 +2428,12 @@ impl SourceWorkerClientHandle {
                 && cache_empty
                 && std::time::Instant::now() < deadline
             {
-                Self::sleep_retry_backoff_with_deadline(deadline).await?;
+                Self::sleep_retry_backoff_with_deadline(deadline)
+                    .await
+                    .map_err(|err| ScheduledGroupsRefreshFailure {
+                        err,
+                        recovered_live_worker_during_refresh,
+                    })?;
                 continue;
             }
             self.with_cache_mut(|cache| {
@@ -3229,17 +3330,22 @@ impl SourceWorkerClientHandle {
                     if should_refresh_cached_schedule {
                         let replay_required_before_refresh =
                             self.control_state_replay_required.load(Ordering::Acquire);
-                        if let Err(err) = self
+                        if let Err(failure) = self
                             .refresh_cached_scheduled_groups_from_live_worker_until(deadline)
                             .await
                         {
+                            let ScheduledGroupsRefreshFailure {
+                                err,
+                                recovered_live_worker_during_refresh,
+                            } = failure;
                             let can_fail_closed_from_primed_cache = matches!(
                                 err,
                                 CnxError::Timeout
                             ) && decoded_signals
                                 .as_ref()
                                 .is_some_and(|signals| {
-                                    !replay_required_before_refresh
+                                    (!replay_required_before_refresh
+                                        || recovered_live_worker_during_refresh)
                                         && source_control_signals_can_use_primed_schedule_timeout_fallback(
                                             signals,
                                         ) && self.with_cache_mut(|cache| {
@@ -3257,6 +3363,7 @@ impl SourceWorkerClientHandle {
                                 );
                             } else if replay_required_before_refresh
                                 && matches!(err, CnxError::Timeout)
+                                && !recovered_live_worker_during_refresh
                             {
                                 eprintln!(
                                     "fs_meta_source_worker_client: refresh_cached_scheduled_groups replay-required fail-closed node={} err={}",

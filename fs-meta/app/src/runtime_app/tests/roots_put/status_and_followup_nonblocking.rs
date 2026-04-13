@@ -253,10 +253,10 @@ async fn initialized_source_followup_does_not_wait_for_inflight_internal_source_
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let _pause_reset = RuntimeProxyRequestPauseHookReset {
-        label: "sink_query_proxy",
+        label: "source_status",
     };
     install_runtime_proxy_request_pause_hook(
-        "sink_query_proxy",
+        "source_status",
         RuntimeProxyRequestPauseHook {
             entered: entered.clone(),
             release: release.clone(),
