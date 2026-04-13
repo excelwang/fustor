@@ -4960,9 +4960,13 @@ impl FSMetaApp {
                     .store(false, Ordering::Release);
                 return Ok(());
             }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             match self
                 .source
-                .apply_orchestration_signals(&effective_source_signals)
+                .apply_orchestration_signals_with_total_timeout(
+                    &effective_source_signals,
+                    remaining,
+                )
                 .await
             {
                 Ok(()) => {

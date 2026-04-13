@@ -189,6 +189,21 @@ fn source_control_signals_can_use_primed_schedule_timeout_fallback(
     saw_activate
 }
 
+fn source_control_signals_are_generation_one_activate_only(
+    signals: &[SourceControlSignal],
+) -> bool {
+    let mut saw_activate = false;
+    for signal in signals {
+        match signal {
+            SourceControlSignal::Activate { generation, .. } if *generation == 1 => {
+                saw_activate = true;
+            }
+            _ => return false,
+        }
+    }
+    saw_activate
+}
+
 fn primed_schedule_cache_covers_signals(
     cache: &SourceWorkerSnapshotCache,
     node_id: &NodeId,
@@ -1913,6 +1928,36 @@ impl SourceWorkerClientHandle {
         }
     }
 
+    async fn generation_one_activate_wave_matches_retained_state(
+        &self,
+        signals: &[SourceControlSignal],
+    ) -> bool {
+        if !source_control_signals_are_generation_one_activate_only(signals) {
+            return false;
+        }
+        let retained = self.retained_control_state.lock().await;
+        !retained.active_by_route.is_empty()
+            && signals.iter().all(|signal| match signal {
+                SourceControlSignal::Activate {
+                    unit,
+                    route_key,
+                    bound_scopes,
+                    ..
+                } => retained
+                    .active_by_route
+                    .get(&(unit.unit_id().to_string(), route_key.clone()))
+                    .is_some_and(|retained_signal| match retained_signal {
+                        SourceControlSignal::Activate {
+                            generation,
+                            bound_scopes: retained_bound_scopes,
+                            ..
+                        } => *generation == 1 && retained_bound_scopes == bound_scopes,
+                        _ => false,
+                    }),
+                _ => false,
+            })
+    }
+
     async fn replay_retained_control_state_if_needed_for_refresh_until(
         &self,
         deadline: std::time::Instant,
@@ -1988,6 +2033,17 @@ impl SourceWorkerClientHandle {
                         "unexpected source worker response while replaying retained control state: {:?}",
                         other
                     )));
+                }
+                Err(err)
+                    if fail_fast_generation_one_activate_replay
+                        && (matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
+                            || is_retryable_worker_bridge_peer_error(&err)) =>
+                {
+                    eprintln!(
+                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={} fail_fast_generation_one_activate_replay=true",
+                        self.node_id.0, err
+                    );
+                    return Err(err);
                 }
                 Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
@@ -2846,6 +2902,39 @@ impl SourceWorkerClientHandle {
             match rpc_result {
                 Ok(response) => return Ok(response),
                 Err(err)
+                    if fail_fast_generation_one_activate_replay
+                        && (matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
+                            || is_retryable_worker_bridge_peer_error(&err)) =>
+                {
+                    eprintln!(
+                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={} fail_fast_generation_one_activate_replay=true",
+                        self.node_id.0, err
+                    );
+                    return Err(err);
+                }
+                Err(err)
+                    if fail_fast_generation_one_activate_replay
+                        && (matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
+                            || is_retryable_worker_bridge_peer_error(&err)) =>
+                {
+                    eprintln!(
+                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={} fail_fast_generation_one_activate_replay=true",
+                        self.node_id.0, err
+                    );
+                    return Err(err);
+                }
+                Err(err)
+                    if fail_fast_generation_one_activate_replay
+                        && (matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
+                            || is_retryable_worker_bridge_peer_error(&err)) =>
+                {
+                    eprintln!(
+                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={} fail_fast_generation_one_activate_replay=true",
+                        self.node_id.0, err
+                    );
+                    return Err(err);
+                }
+                Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
                     self.reconnect_shared_worker_client().await?;
@@ -3057,6 +3146,12 @@ impl SourceWorkerClientHandle {
         #[cfg(test)]
         notify_source_worker_control_frame_started();
         let decoded_signals = source_control_signals_from_envelopes(&envelopes).ok();
+        let fail_fast_generation_one_activate_replay = if let Some(signals) = decoded_signals.as_ref() {
+            self.generation_one_activate_wave_matches_retained_state(signals)
+                .await
+        } else {
+            false
+        };
         eprintln!(
             "fs_meta_source_worker_client: on_control_frame begin node={} envelopes={}",
             self.node_id.0,
@@ -3623,6 +3718,51 @@ impl SourceFacade {
                     .map(SourceControlSignal::envelope)
                     .collect::<Vec<_>>();
                 client.on_control_frame(envelopes).await
+            }
+        }
+    }
+
+    pub(crate) async fn apply_orchestration_signals_with_total_timeout(
+        &self,
+        signals: &[SourceControlSignal],
+        total_timeout: Duration,
+    ) -> Result<()> {
+        if total_timeout.is_zero() {
+            return Err(CnxError::Timeout);
+        }
+        // runtime_app owns the outer recovery loop for local source recovery.
+        // Keep each nested source-client control attempt short so retryable resets
+        // return to the caller instead of burning the full nested client budget.
+        let single_attempt_total_timeout =
+            std::cmp::min(total_timeout, SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT);
+        match self {
+            Self::Local(source) => {
+                match tokio::time::timeout(
+                    single_attempt_total_timeout,
+                    source.apply_orchestration_signals(signals),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(CnxError::Timeout),
+                }
+            }
+            Self::Worker(client) => {
+                let envelopes = signals
+                    .iter()
+                    .map(SourceControlSignal::envelope)
+                    .collect::<Vec<_>>();
+                let rpc_timeout = std::cmp::min(
+                    SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                    single_attempt_total_timeout,
+                );
+                client
+                    .on_control_frame_with_timeouts(
+                        envelopes,
+                        single_attempt_total_timeout,
+                        rpc_timeout,
+                    )
+                    .await
             }
         }
     }
