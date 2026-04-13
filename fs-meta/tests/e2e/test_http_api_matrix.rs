@@ -1695,12 +1695,12 @@ fn group_mount_pairs_for_roots(
                 .ok_or_else(|| format!("missing representative mount for fs_source {fs_source}"))?;
             let chosen = match local_existing {
                 Some(local)
-                    if candidate.exists()
-                        && candidate.is_dir()
-                        && !path_has_visible_entries(&candidate)
-                        && local.exists()
+                    if local.exists()
                         && local.is_dir()
-                        && path_has_visible_entries(&local) =>
+                        && path_has_visible_entries(&local)
+                        && (!candidate.exists()
+                            || !candidate.is_dir()
+                            || !path_has_visible_entries(&candidate)) =>
                 {
                     local
                 }
@@ -1813,6 +1813,29 @@ fn group_mount_pairs_for_roots_prefers_local_export_source_over_empty_runtime_mo
             {
                 "fs_source": fs_source,
                 "mount_point": mount_root.display().to_string()
+            }
+        ]
+    });
+
+    let pairs =
+        group_mount_pairs_for_roots(&grants, &[("nfs1", fs_source.as_str())]).expect("pairs");
+
+    assert_eq!(pairs, vec![("nfs1".to_string(), export_root)]);
+}
+
+#[test]
+fn group_mount_pairs_for_roots_prefers_local_export_source_over_missing_runtime_mount() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let export_root = temp.path().join("exports/nfs1");
+    let missing_mount_root = temp.path().join("mounts/node-a/nfs1");
+    std::fs::create_dir_all(&export_root).expect("create export root");
+    std::fs::write(export_root.join("root.txt"), "hello\n").expect("write export file");
+    let fs_source = format!("127.0.0.1:{}", export_root.display());
+    let grants = json!({
+        "grants": [
+            {
+                "fs_source": fs_source,
+                "mount_point": missing_mount_root.display().to_string()
             }
         ]
     });

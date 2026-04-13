@@ -12,6 +12,7 @@
 6. [L3-RUNTIME/WORKFLOWS.md](./L3-RUNTIME/WORKFLOWS.md)：部署、登录、grants、roots、rescan 工作流。
 7. [L3-RUNTIME/OBSERVATION_CUTOVER.md](./L3-RUNTIME/OBSERVATION_CUTOVER.md)：cutover / observation eligibility / stale fencing 运行时流程。
 8. [L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md](./L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md)：worker bootstrap / transport supervision / source-side scan unit realization。
+9. [L3-GOVERNANCE/TEST_CODE_ORGANIZATION.md](./L3-GOVERNANCE/TEST_CODE_ORGANIZATION.md)：formal test topology、owner-layer red-test 落点与 mega-file 拆分治理。
 
 ## Traceability Conventions
 
@@ -24,7 +25,7 @@
 
 1. 产品部署文档：`../docs/PRODUCT_DEPLOYMENT.md`
 2. 用户示例配置：`../docs/examples/`
-3. 工程治理与规格校验规则：`../docs/ENGINEERING_GOVERNANCE.md`
+3. 非 formal 的工程治理与规格校验规则：`../docs/ENGINEERING_GOVERNANCE.md`
 4. contract-test / regression yaml 与 release 示例：`../testdata/specs/`
 5. 可运行 fixture apps / manifests / runtime artifacts：`../fixtures/`
 6. 规格校验脚本：`../scripts/validate_specs.sh`

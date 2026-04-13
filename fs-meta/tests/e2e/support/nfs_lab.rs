@@ -228,7 +228,7 @@ fn stale_lab_cleanup_plans() -> Result<Vec<StaleLabCleanupPlan>, String> {
 
 fn cleanup_stale_lab_mount_target(target: &Path) -> Result<(), String> {
     let output = sudo_output(["umount", target.to_string_lossy().as_ref()])?;
-    if output.status.success() || output_indicates_absent_mount(&output) {
+    if interpret_umount_outputs(target, &output, None).is_ok() {
         return Ok(());
     }
     let fallback = sudo_output(["umount", "-f", "-l", target.to_string_lossy().as_ref()])?;
@@ -364,18 +364,38 @@ fn output_indicates_absent_mount(output: &std::process::Output) -> bool {
         || combined.contains("not a mountpoint")
 }
 
-fn interpret_umount_outputs(
+fn mountinfo_lists_target(mountinfo: &str, target: &Path) -> bool {
+    mountinfo.lines().any(|line| {
+        line.split_whitespace()
+            .nth(4)
+            .map(decode_mountinfo_path)
+            .is_some_and(|path| path == target)
+    })
+}
+
+fn interpret_umount_outputs_with_mountinfo(
     path: &Path,
     primary: &std::process::Output,
     fallback: Option<&std::process::Output>,
+    mountinfo: &str,
 ) -> Result<(), String> {
     if primary.status.success() || output_indicates_absent_mount(primary) {
-        return Ok(());
+        if !mountinfo_lists_target(mountinfo, path) {
+            return Ok(());
+        }
     }
     if let Some(fallback) = fallback {
         if fallback.status.success() || output_indicates_absent_mount(fallback) {
-            return Ok(());
+            if !mountinfo_lists_target(mountinfo, path) {
+                return Ok(());
+            }
         }
+    }
+    if mountinfo_lists_target(mountinfo, path) {
+        return Err(format!(
+            "umount {} reported completion but mount still present in /proc/self/mountinfo",
+            path.display()
+        ));
     }
     let fallback_status = fallback
         .map(|output| output.status.to_string())
@@ -386,6 +406,16 @@ fn interpret_umount_outputs(
         primary.status,
         fallback_status
     ))
+}
+
+fn interpret_umount_outputs(
+    path: &Path,
+    primary: &std::process::Output,
+    fallback: Option<&std::process::Output>,
+) -> Result<(), String> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("read /proc/self/mountinfo failed: {e}"))?;
+    interpret_umount_outputs_with_mountinfo(path, primary, fallback, &mountinfo)
 }
 
 fn output_indicates_absent_export(output: &std::process::Output) -> bool {
@@ -673,7 +703,7 @@ impl NfsLab {
             return Ok(());
         };
         let output = sudo_output(["umount", path.to_string_lossy().as_ref()])?;
-        if output.status.success() || output_indicates_absent_mount(&output) {
+        if interpret_umount_outputs(&path, &output, None).is_ok() {
             return Ok(());
         }
         let fallback = sudo_output(["umount", "-f", "-l", path.to_string_lossy().as_ref()])?;
@@ -1186,8 +1216,13 @@ mod tests {
             stderr: b"umount: /tmp/lab/mounts/node-a/nfs1: no mount point specified.\n".to_vec(),
         };
         assert!(
-            interpret_umount_outputs(Path::new("/tmp/lab/mounts/node-a/nfs1"), &primary, None)
-                .is_ok()
+            interpret_umount_outputs_with_mountinfo(
+                Path::new("/tmp/lab/mounts/node-a/nfs1"),
+                &primary,
+                None,
+                "",
+            )
+            .is_ok()
         );
     }
 
@@ -1204,13 +1239,50 @@ mod tests {
             stderr: Vec::new(),
         };
         assert!(
-            interpret_umount_outputs(
+            interpret_umount_outputs_with_mountinfo(
                 Path::new("/tmp/lab/mounts/node-a/nfs1"),
                 &primary,
-                Some(&fallback)
+                Some(&fallback),
+                "",
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn interpret_umount_outputs_fails_when_primary_reports_absent_but_mountinfo_still_lists_target()
+     {
+        let path = Path::new("/tmp/lab/mounts/node-a/nfs1");
+        let primary = std::process::Output {
+            status: ExitStatus::from_raw(32 << 8),
+            stdout: Vec::new(),
+            stderr: b"umount: /tmp/lab/mounts/node-a/nfs1: no mount point specified.\n".to_vec(),
+        };
+        let mountinfo = "101 100 0:42 / /tmp/lab/mounts/node-a/nfs1 rw,relatime - nfs4 127.0.0.1:/tmp/lab/exports/nfs1 rw\n";
+        let err = interpret_umount_outputs_with_mountinfo(path, &primary, None, mountinfo)
+            .expect_err("stale mountinfo entry must fail closed");
+        assert!(err.contains("mount still present"), "{err}");
+    }
+
+    #[test]
+    fn interpret_umount_outputs_fails_when_fallback_reports_absent_but_mountinfo_still_lists_target()
+     {
+        let path = Path::new("/tmp/lab/mounts/node-a/nfs1");
+        let primary = std::process::Output {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"umount: /tmp/lab/mounts/node-a/nfs1: busy\n".to_vec(),
+        };
+        let fallback = std::process::Output {
+            status: ExitStatus::from_raw(32 << 8),
+            stdout: b"umount: /tmp/lab/mounts/node-a/nfs1: not mounted.\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        let mountinfo = "101 100 0:42 / /tmp/lab/mounts/node-a/nfs1 rw,relatime - nfs4 127.0.0.1:/tmp/lab/exports/nfs1 rw\n";
+        let err =
+            interpret_umount_outputs_with_mountinfo(path, &primary, Some(&fallback), mountinfo)
+                .expect_err("stale mountinfo entry after fallback must fail closed");
+        assert!(err.contains("mount still present"), "{err}");
     }
 
     #[test]

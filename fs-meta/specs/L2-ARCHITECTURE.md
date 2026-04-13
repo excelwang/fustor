@@ -163,8 +163,9 @@ version: 3.0.0
 
 ## ARCHITECTURE.GOVERNANCE_REFERENCE
 
-1. Repo topology, crate ownership, dependency rules, and validation workflow are engineering-governance material rather than formal runtime architecture.
-2. Those constraints live in `fs-meta/docs/ENGINEERING_GOVERNANCE.md`; formal architecture keeps only product/runtime ownership, externally relevant package boundaries, and interaction seams that materially affect fs-meta domain semantics.
+1. Repo topology, crate ownership, dependency rules, and validation workflow remain engineering-governance material rather than formal runtime architecture.
+2. Repo-wide test topology, owner-layer red-test placement, and mega-file decomposition rules are formalized in `specs/L3-GOVERNANCE/TEST_CODE_ORGANIZATION.md` because they materially affect fs-meta verification authority and repair flow.
+3. Remaining non-formal repository/package/dependency governance lives in `fs-meta/docs/ENGINEERING_GOVERNANCE.md`; formal architecture keeps only product/runtime ownership, externally relevant package boundaries, and interaction seams that materially affect fs-meta domain semantics.
 
 ## ARCHITECTURE.WORKER_ROLE_TO_ARTIFACT_MAP
 

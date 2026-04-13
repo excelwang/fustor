@@ -1492,7 +1492,8 @@ fn sink_holder_snapshot_from_status(
                     .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();
-        let mut route_has_delivered_sink_activation = false;
+        let mut latest_sink_rows_by_pid = BTreeMap::new();
+        let mut pidless_sink_rows = Vec::new();
         for row in apps {
             let active_unit = row
                 .get("unit_ids")
@@ -1505,6 +1506,17 @@ fn sink_holder_snapshot_from_status(
             if !active_unit {
                 continue;
             }
+            if let Some(pid) = row.get("pid").and_then(Value::as_u64).map(|v| v as u32) {
+                latest_sink_rows_by_pid.insert(pid, row);
+            } else {
+                pidless_sink_rows.push(row);
+            }
+        }
+        let mut route_has_delivered_sink_activation = false;
+        for row in latest_sink_rows_by_pid
+            .into_values()
+            .chain(pidless_sink_rows.into_iter())
+        {
             if row.get("delivered").and_then(Value::as_bool) != Some(true) {
                 continue;
             }
@@ -2474,6 +2486,62 @@ fn sink_holder_snapshot_accepts_delivered_route_level_active_pids() {
     let snapshot = sink_holder_snapshot_from_status(&status, "app-1", "node-a");
     assert_eq!(snapshot.active_pids, BTreeSet::from([1]));
     assert_eq!(snapshot.bound_scopes, BTreeSet::from(["nfs2".to_string()]));
+    assert_eq!(snapshot.runtime_lease_tokens, BTreeSet::from([7]));
+}
+
+#[test]
+fn sink_holder_snapshot_ignores_stale_activated_scope_after_later_deactivate_for_same_pid() {
+    let status = json!({
+        "daemon": {
+            "managed_processes": [
+                { "instance_id": "app-1", "pid": 2, "runtime_lease_token": 7 }
+            ],
+            "activation": {
+                "routes": [
+                    {
+                        "route_key": "sink-status:v1.req",
+                        "active_pids": [],
+                        "apps": [
+                            {
+                                "pid": 2,
+                                "unit_ids": ["runtime.exec.sink"],
+                                "bound_scopes_by_unit": {
+                                    "runtime.exec.sink": [
+                                        { "scope_id": "nfs2" }
+                                    ]
+                                },
+                                "delivered": true,
+                                "gate": "activated",
+                                "op": "activate"
+                            },
+                            {
+                                "pid": 2,
+                                "unit_ids": ["runtime.exec.sink"],
+                                "bound_scopes_by_unit": {
+                                    "runtime.exec.sink": [
+                                        { "scope_id": "nfs2" }
+                                    ]
+                                },
+                                "delivered": true,
+                                "gate": "activated",
+                                "op": "deactivate"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    });
+
+    let snapshot = sink_holder_snapshot_from_status(&status, "app-1", "node-a");
+    assert!(
+        snapshot.active_pids.is_empty(),
+        "later deactivate for the same managed sink pid must clear stale holder pid truth: {snapshot:?}"
+    );
+    assert!(
+        snapshot.bound_scopes.is_empty(),
+        "later deactivate for the same managed sink pid must clear stale holder scopes: {snapshot:?}"
+    );
     assert_eq!(snapshot.runtime_lease_tokens, BTreeSet::from([7]));
 }
 

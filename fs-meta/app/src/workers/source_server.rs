@@ -31,6 +31,7 @@ const SOURCE_WORKER_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SOURCE_WORKER_STOP_ABORT_TIMEOUT: Duration = Duration::from_millis(250);
 const SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const SOURCE_WORKER_UPDATE_ROOTS_FENCED_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct SourceWorkerState {
     source: Option<Arc<FSMetaSource>>,
@@ -88,6 +89,15 @@ fn is_transient_statecell_fenced_init_error(err: &CnxError) -> bool {
     matches!(err, CnxError::InvalidInput(message)
         if message.contains("statecell")
             && message.contains("status=fenced"))
+}
+
+fn is_transient_logical_roots_fenced_write_error(err: &CnxError) -> bool {
+    matches!(
+        err,
+        CnxError::Internal(message)
+            if message.contains("statecell_write returned non-committed status for logical roots")
+                && message.contains("fenced")
+    )
 }
 
 fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
@@ -1107,17 +1117,31 @@ async fn execute_worker_action(action: SourceWorkerAction) -> (SourceWorkerRespo
                 "fs_meta_source_worker_server: update_logical_roots begin roots={}",
                 roots.len()
             );
-            match source.update_logical_roots(roots).await {
-                Ok(_) => {
-                    eprintln!("fs_meta_source_worker_server: update_logical_roots ok");
-                    (SourceWorkerResponse::Ack, false)
-                }
-                Err(err) => {
-                    eprintln!(
-                        "fs_meta_source_worker_server: update_logical_roots err={}",
-                        err
-                    );
-                    (classify_source_worker_error(err), false)
+            let deadline =
+                tokio::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_FENCED_RETRY_TIMEOUT;
+            loop {
+                match source.update_logical_roots(roots.clone()).await {
+                    Ok(_) => {
+                        eprintln!("fs_meta_source_worker_server: update_logical_roots ok");
+                        return (SourceWorkerResponse::Ack, false);
+                    }
+                    Err(err)
+                        if is_transient_logical_roots_fenced_write_error(&err)
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        eprintln!(
+                            "fs_meta_source_worker_server: update_logical_roots retry err={}",
+                            err
+                        );
+                        tokio::time::sleep(SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_BACKOFF).await;
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "fs_meta_source_worker_server: update_logical_roots err={}",
+                            err
+                        );
+                        return (classify_source_worker_error(err), false);
+                    }
                 }
             }
         }
@@ -1715,6 +1739,91 @@ mod tests {
             ctx: BoundaryContext,
             request: StateCellWriteRequest,
         ) -> Result<KernelResultEnvelope> {
+            self.inner.statecell_write(ctx, request).await
+        }
+
+        async fn statecell_watch(
+            &self,
+            ctx: BoundaryContext,
+            request: StateCellWatchRequest,
+        ) -> Result<KernelResultEnvelope> {
+            self.inner.statecell_watch(ctx, request).await
+        }
+    }
+
+    struct FencedThenOkLogicalRootsWriteBoundary {
+        inner: Arc<dyn StateBoundary>,
+        logical_roots_writes_to_passthrough_before_fence: AtomicUsize,
+        logical_roots_fenced_writes_remaining: AtomicUsize,
+    }
+
+    impl FencedThenOkLogicalRootsWriteBoundary {
+        fn new(
+            inner: Arc<dyn StateBoundary>,
+            logical_roots_writes_to_passthrough_before_fence: usize,
+            logical_roots_fenced_writes_remaining: usize,
+        ) -> Self {
+            Self {
+                inner,
+                logical_roots_writes_to_passthrough_before_fence: AtomicUsize::new(
+                    logical_roots_writes_to_passthrough_before_fence,
+                ),
+                logical_roots_fenced_writes_remaining: AtomicUsize::new(
+                    logical_roots_fenced_writes_remaining,
+                ),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateBoundary for FencedThenOkLogicalRootsWriteBoundary {
+        async fn statecell_read(
+            &self,
+            ctx: BoundaryContext,
+            request: StateCellReadRequest,
+        ) -> Result<KernelResultEnvelope> {
+            self.inner.statecell_read(ctx, request).await
+        }
+
+        async fn statecell_write(
+            &self,
+            ctx: BoundaryContext,
+            request: StateCellWriteRequest,
+        ) -> Result<KernelResultEnvelope> {
+            if request.handle.cell_id == "fs-meta.logical-roots.runtime.exec.source"
+            {
+                let passthrough_before_fence = self
+                    .logical_roots_writes_to_passthrough_before_fence
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        if remaining > 0 {
+                            Some(remaining - 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .is_ok();
+                if !passthrough_before_fence
+                    && self
+                        .logical_roots_fenced_writes_remaining
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                            if remaining > 0 {
+                                Some(remaining - 1)
+                            } else {
+                                None
+                            }
+                        })
+                        .is_ok()
+                {
+                    return Ok(KernelResultEnvelope {
+                        correlation_id: None,
+                        status: "fenced".to_string(),
+                        payload: Vec::new(),
+                        diagnostics: Some(
+                            "runtime state carrier fenced stale caller on statecell_write".to_string(),
+                        ),
+                    });
+                }
+            }
             self.inner.statecell_write(ctx, request).await
         }
 
@@ -2423,6 +2532,92 @@ mod tests {
             state.source.is_some(),
             "bootstrap start should initialize source after transient fenced authority read recovers",
         );
+    }
+
+    #[tokio::test]
+    async fn update_logical_roots_retries_transient_fenced_logical_roots_statecell_write() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_watch_scan_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![
+                test_export("node-a::nfs1", nfs1.clone()),
+                test_export("node-a::nfs2", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+
+        let state = Arc::new(Mutex::new(SourceWorkerState {
+            source: None,
+            pending_init: None,
+            pump_task: None,
+            pump_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        }));
+        let mut session = SourceWorkerSession {
+            state: state.clone(),
+        };
+        let boundary = Arc::new(LoopbackPublishBoundary::default());
+        let state_boundary: Arc<dyn StateBoundary> = Arc::new(
+            FencedThenOkLogicalRootsWriteBoundary::new(in_memory_state_boundary(), 1, 1),
+        );
+        let context = WorkerSessionContext::new(
+            boundary.clone(),
+            boundary.clone(),
+            state_boundary,
+        );
+
+        session
+            .on_init(
+                NodeId("node-a-update-roots-fenced-write".to_string()),
+                cfg,
+                &context,
+            )
+            .await
+            .expect("init source worker session");
+        session
+            .on_start(&context)
+            .await
+            .expect("start source worker session");
+
+        let response = session
+            .handle_request(
+                SourceWorkerRequest::UpdateLogicalRoots {
+                    roots: vec![
+                        test_watch_scan_root("nfs1", nfs1),
+                        test_watch_scan_root("nfs2", nfs2),
+                    ],
+                },
+                &context,
+            )
+            .await
+            .expect("handle update logical roots request");
+
+        let WorkerLoopControl::Continue(SourceWorkerResponse::Ack) = response else {
+            panic!(
+                "update_logical_roots should recover when logical-roots statecell_write is transiently fenced during the same source worker session"
+            );
+        };
+
+        let roots = session
+            .handle_request(SourceWorkerRequest::LogicalRootsSnapshot, &context)
+            .await
+            .expect("logical roots snapshot after fenced write retry");
+        let WorkerLoopControl::Continue(SourceWorkerResponse::LogicalRoots(roots)) = roots else {
+            panic!("logical roots snapshot should succeed after fenced write retry");
+        };
+        assert_eq!(
+            roots.into_iter().map(|root| root.id).collect::<Vec<_>>(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+            "logical roots should reflect the post-retry update after transient fenced statecell_write recovery",
+        );
+
+        session.on_close(&context).await.expect("close source worker session");
     }
 
     #[tokio::test]

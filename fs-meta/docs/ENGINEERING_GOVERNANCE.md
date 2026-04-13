@@ -5,10 +5,11 @@
 ## ENGINEERING_GOVERNANCE.REPOSITORY_TOPOLOGY
 
 1. `fs-meta/specs/` 是唯一的 formal fs-meta specification tree；`specs/app/` 和 `specs/cli/` 不再作为并列 authority roots。
-2. Formal specs 仅限 `L0-GLOSSARY`、`L0-VISION`、`L1-CONTRACTS`、`L2-ARCHITECTURE` 和 `L3-RUNTIME/*`。
-3. 产品与操作文档位于 `fs-meta/docs/`；部署示例位于 `fs-meta/docs/examples/`。
-4. contract-test fixtures、release 示例和 regression 材料位于 `fs-meta/testdata/specs/`；它们不是 formal specs。
-5. Runnable fixture apps、fixture manifests 和 runtime artifacts 位于 `fs-meta/fixtures/`；它们是测试与示例材料，不是 formal specs。
+2. Formal specs 仅限 `L0-GLOSSARY`、`L0-VISION`、`L1-CONTRACTS`、`L2-ARCHITECTURE`、`L3-RUNTIME/*` 和 `L3-GOVERNANCE/*`。
+3. 测试代码组织方式、owner-layer red-test 落点和 mega-file 拆分治理已提升为 formal authority，位于 `fs-meta/specs/L3-GOVERNANCE/TEST_CODE_ORGANIZATION.md`。
+4. 产品与操作文档位于 `fs-meta/docs/`；部署示例位于 `fs-meta/docs/examples/`。
+5. contract-test fixtures、release 示例和 regression 材料位于 `fs-meta/testdata/specs/`；它们不是 formal specs。
+6. Runnable fixture apps、fixture manifests 和 runtime artifacts 位于 `fs-meta/fixtures/`；它们是测试与示例材料，不是 formal specs。
 
 ## ENGINEERING_GOVERNANCE.CRATE_OWNERSHIP
 
