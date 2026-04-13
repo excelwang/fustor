@@ -2035,17 +2035,6 @@ impl SourceWorkerClientHandle {
                     )));
                 }
                 Err(err)
-                    if fail_fast_generation_one_activate_replay
-                        && (matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
-                            || is_retryable_worker_bridge_peer_error(&err)) =>
-                {
-                    eprintln!(
-                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={} fail_fast_generation_one_activate_replay=true",
-                        self.node_id.0, err
-                    );
-                    return Err(err);
-                }
-                Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
                     self.reconnect_shared_worker_client().await?;
@@ -2902,39 +2891,6 @@ impl SourceWorkerClientHandle {
             match rpc_result {
                 Ok(response) => return Ok(response),
                 Err(err)
-                    if fail_fast_generation_one_activate_replay
-                        && (matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
-                            || is_retryable_worker_bridge_peer_error(&err)) =>
-                {
-                    eprintln!(
-                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={} fail_fast_generation_one_activate_replay=true",
-                        self.node_id.0, err
-                    );
-                    return Err(err);
-                }
-                Err(err)
-                    if fail_fast_generation_one_activate_replay
-                        && (matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
-                            || is_retryable_worker_bridge_peer_error(&err)) =>
-                {
-                    eprintln!(
-                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={} fail_fast_generation_one_activate_replay=true",
-                        self.node_id.0, err
-                    );
-                    return Err(err);
-                }
-                Err(err)
-                    if fail_fast_generation_one_activate_replay
-                        && (matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
-                            || is_retryable_worker_bridge_peer_error(&err)) =>
-                {
-                    eprintln!(
-                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={} fail_fast_generation_one_activate_replay=true",
-                        self.node_id.0, err
-                    );
-                    return Err(err);
-                }
-                Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
                     self.reconnect_shared_worker_client().await?;
@@ -3152,6 +3108,8 @@ impl SourceWorkerClientHandle {
         } else {
             false
         };
+        let fail_fast_on_control_frame_bridge_reset = fail_fast_generation_one_activate_replay
+            || is_restart_deferred_retire_pending_deactivate_batch(&envelopes);
         eprintln!(
             "fs_meta_source_worker_client: on_control_frame begin node={} envelopes={}",
             self.node_id.0,
@@ -3328,6 +3286,17 @@ impl SourceWorkerClientHandle {
                         "unexpected source worker response for on_control_frame: {:?}",
                         other
                     )));
+                }
+                Err(err)
+                    if fail_fast_on_control_frame_bridge_reset
+                        && (matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
+                            || is_retryable_worker_bridge_peer_error(&err)) =>
+                {
+                    eprintln!(
+                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={} fail_fast_on_control_frame_bridge_reset=true",
+                        self.node_id.0, err
+                    );
+                    return Err(err);
                 }
                 Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
