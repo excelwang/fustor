@@ -29,7 +29,7 @@ use crate::runtime::routes::{
     ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_INTERNAL,
     ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SINK_STATUS_INTERNAL,
     ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META,
-    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
+    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, sink_query_route_bindings_for,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::workers::sink::{SinkFacade, SinkWorkerClientHandle};
@@ -177,6 +177,27 @@ fn sink_status_snapshot_has_ready_scheduled_groups(
         .map(|group| group.group_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     scheduled_groups.is_subset(&ready_groups)
+}
+
+fn sink_status_snapshot_ready_for_expected_groups(
+    snapshot: &crate::sink::SinkStatusSnapshot,
+    expected_groups: &std::collections::BTreeSet<String>,
+) -> bool {
+    if expected_groups.is_empty() {
+        return false;
+    }
+    let scheduled_groups = snapshot
+        .scheduled_groups_by_node
+        .values()
+        .flat_map(|groups| groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let ready_groups = snapshot
+        .groups
+        .iter()
+        .filter(|group| group.initial_audit_completed)
+        .map(|group| group.group_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    expected_groups.is_subset(&scheduled_groups) && expected_groups.is_subset(&ready_groups)
 }
 
 fn current_generation_sink_replay_tick(
@@ -550,10 +571,17 @@ fn explicit_empty_sink_status_reply(
     origin_id: &NodeId,
     correlation_id: Option<u64>,
 ) -> Result<Event> {
-    let payload =
-        rmp_serde::to_vec_named(&crate::sink::SinkStatusSnapshot::default()).map_err(|err| {
-            CnxError::Internal(format!("encode empty sink-status payload failed: {err}"))
-        })?;
+    let snapshot = crate::sink::SinkStatusSnapshot::default();
+    sink_status_reply(&snapshot, origin_id, correlation_id)
+}
+
+fn sink_status_reply(
+    snapshot: &crate::sink::SinkStatusSnapshot,
+    origin_id: &NodeId,
+    correlation_id: Option<u64>,
+) -> Result<Event> {
+    let payload = rmp_serde::to_vec_named(snapshot)
+        .map_err(|err| CnxError::Internal(format!("encode sink-status payload failed: {err}")))?;
     Ok(Event::new(
         EventMetadata {
             origin_id: origin_id.clone(),
@@ -586,6 +614,77 @@ fn selected_group_bridge_eligible_from_sink_status(
                     && group.initial_audit_completed
                     && group.total_nodes > 0))
     })
+}
+
+fn node_id_from_object_ref(object_ref: &str) -> Option<NodeId> {
+    object_ref
+        .split_once("::")
+        .map(|(node_id, _)| NodeId(node_id.to_string()))
+}
+
+fn scheduled_sink_owner_node_for_group(
+    snapshot: &crate::sink::SinkStatusSnapshot,
+    group_id: &str,
+) -> Option<NodeId> {
+    let mut scheduled_nodes = snapshot
+        .scheduled_groups_by_node
+        .iter()
+        .filter(|(_, groups)| groups.iter().any(|group| group == group_id))
+        .map(|(node_id, _)| NodeId(node_id.clone()))
+        .collect::<Vec<_>>();
+    scheduled_nodes.sort_by(|a, b| a.0.cmp(&b.0));
+    scheduled_nodes.dedup_by(|a, b| a.0 == b.0);
+
+    if let Some(primary_node) = snapshot
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .and_then(|group| node_id_from_object_ref(&group.primary_object_ref))
+    {
+        if scheduled_nodes.is_empty() || scheduled_nodes.iter().any(|node| node.0 == primary_node.0)
+        {
+            return Some(primary_node);
+        }
+    }
+
+    scheduled_nodes.into_iter().next()
+}
+
+fn selected_group_sink_query_bridge_snapshot<'a>(
+    request: &InternalQueryRequest,
+    live_snapshot: Option<&'a crate::sink::SinkStatusSnapshot>,
+    cached_snapshot: Option<&'a crate::sink::SinkStatusSnapshot>,
+) -> Option<&'a crate::sink::SinkStatusSnapshot> {
+    if let Some(snapshot) = live_snapshot
+        && selected_group_bridge_eligible_from_sink_status(request, snapshot)
+    {
+        return Some(snapshot);
+    }
+    if let Some(snapshot) = cached_snapshot
+        && selected_group_bridge_eligible_from_sink_status(request, snapshot)
+    {
+        return Some(snapshot);
+    }
+    live_snapshot.or(cached_snapshot)
+}
+
+fn selected_group_sink_query_bridge_bindings(
+    request: &InternalQueryRequest,
+    snapshot: Option<&crate::sink::SinkStatusSnapshot>,
+) -> Arc<capanix_host_adapter_fs::PostBindDispatchTable> {
+    let Some(selected_group) = request.scope.selected_group.as_deref() else {
+        return default_route_bindings();
+    };
+    let Some(snapshot) = snapshot else {
+        return default_route_bindings();
+    };
+    if !selected_group_bridge_eligible_from_sink_status(request, snapshot) {
+        return default_route_bindings();
+    }
+    if let Some(owner_node) = scheduled_sink_owner_node_for_group(snapshot, selected_group) {
+        return sink_query_route_bindings_for(&owner_node.0);
+    }
+    default_route_bindings()
 }
 
 fn selected_group_payload_has_materialized_data(
@@ -1323,6 +1422,11 @@ struct SourceApplyPauseHook {
 }
 
 #[cfg(test)]
+struct SourceApplyErrorQueueHook {
+    errs: std::collections::VecDeque<CnxError>,
+}
+
+#[cfg(test)]
 #[derive(Clone)]
 struct LocalSinkStatusRepublishProbePauseHook {
     entered: Arc<tokio::sync::Notify>,
@@ -1542,6 +1646,44 @@ fn clear_source_apply_pause_hook() {
         Err(poisoned) => poisoned.into_inner(),
     };
     *guard = None;
+}
+
+#[cfg(test)]
+fn source_apply_error_queue_hook_cell() -> &'static StdMutex<Option<SourceApplyErrorQueueHook>> {
+    static CELL: OnceLock<StdMutex<Option<SourceApplyErrorQueueHook>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn install_source_apply_error_queue_hook(hook: SourceApplyErrorQueueHook) {
+    let mut guard = match source_apply_error_queue_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+fn clear_source_apply_error_queue_hook() {
+    let mut guard = match source_apply_error_queue_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+fn take_source_apply_error_queue_hook() -> Option<CnxError> {
+    let mut guard = match source_apply_error_queue_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let hook = guard.as_mut()?;
+    let err = hook.errs.pop_front();
+    if hook.errs.is_empty() {
+        *guard = None;
+    }
+    err
 }
 
 #[cfg(test)]
@@ -1953,8 +2095,11 @@ impl FSMetaApp {
                 first_sink_probe_pending = false;
             }
             if post_return_sink_replay_pending {
-                sink.apply_orchestration_signals(post_return_sink_replay_signals)
-                    .await?;
+                sink.apply_orchestration_signals_with_total_timeout(
+                    post_return_sink_replay_signals,
+                    remaining,
+                )
+                .await?;
                 post_return_sink_replay_pending = false;
             }
             match tokio::time::timeout(
@@ -2113,8 +2258,6 @@ impl FSMetaApp {
             self.facade_gate
                 .clear_route(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, route_key)?;
             if is_dual_lane_internal_query_route(route_key) {
-                self.facade_gate
-                    .clear_route(execution_units::QUERY_RUNTIME_UNIT_ID, route_key)?;
                 self.mirrored_query_peer_routes
                     .lock()
                     .await
@@ -2891,18 +3034,15 @@ impl FSMetaApp {
                                             "fs_meta_runtime_app: sink status endpoint response {}",
                                             summarize_sink_status_endpoint(&snapshot)
                                         );
-                                        if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
-                                            responses.push(Event::new(
-                                                EventMetadata {
-                                                    origin_id: req.metadata().origin_id.clone(),
-                                                    timestamp_us: now_us(),
-                                                    logical_ts: None,
-                                                    correlation_id: req.metadata().correlation_id,
-                                                    ingress_auth: None,
-                                                    trace: None,
-                                                },
-                                                bytes::Bytes::from(payload),
-                                            ));
+                                        match sink_status_reply(
+                                            &snapshot,
+                                            &req.metadata().origin_id,
+                                            req.metadata().correlation_id,
+                                        ) {
+                                            Ok(event) => responses.push(event),
+                                            Err(err) => eprintln!(
+                                                "fs_meta_runtime_app: sink status endpoint reply encode failed: {err}"
+                                            ),
                                         }
                                     }
                                     Err(err) => {
@@ -2921,6 +3061,29 @@ impl FSMetaApp {
                                                 Ok(event) => responses.push(event),
                                                 Err(reply_err) => eprintln!(
                                                     "fs_meta_runtime_app: sink status endpoint deactivated empty reply encode failed: {reply_err}"
+                                                ),
+                                            }
+                                            continue;
+                                        }
+                                        if matches!(err, CnxError::Timeout)
+                                            && let Ok(cached_snapshot) = sink.cached_status_snapshot()
+                                            && sink_status_snapshot_has_ready_scheduled_groups(
+                                                &cached_snapshot,
+                                            )
+                                        {
+                                            eprintln!(
+                                                "fs_meta_runtime_app: sink status endpoint cached fallback err={} {}",
+                                                err,
+                                                summarize_sink_status_endpoint(&cached_snapshot)
+                                            );
+                                            match sink_status_reply(
+                                                &cached_snapshot,
+                                                &req.metadata().origin_id,
+                                                req.metadata().correlation_id,
+                                            ) {
+                                                Ok(event) => responses.push(event),
+                                                Err(reply_err) => eprintln!(
+                                                    "fs_meta_runtime_app: sink status endpoint cached fallback encode failed: {reply_err}"
                                                 ),
                                             }
                                             continue;
@@ -3122,11 +3285,7 @@ impl FSMetaApp {
                     move |requests| {
                         let route_key = route_key.clone();
                         let facade_gate = facade_gate.clone();
-                        let adapter = crate::runtime::seam::exchange_host_adapter(
-                            boundary_for_calls.clone(),
-                            node_id.clone(),
-                            crate::runtime::routes::default_route_bindings(),
-                        );
+                        let boundary_for_calls = boundary_for_calls.clone();
                         let sink = sink.clone();
                         let source = source.clone();
                         let node_id = node_id.clone();
@@ -3209,13 +3368,20 @@ impl FSMetaApp {
                                                 }
                                             }
                                         }
-                                        let local_selected_group_bridge_eligible = sink
-                                            .status_snapshot_nonblocking()
-                                            .await
-                                            .ok()
+                                        let live_local_sink_status_snapshot =
+                                            sink.status_snapshot_nonblocking().await.ok();
+                                        let cached_local_sink_status_snapshot =
+                                            sink.cached_status_snapshot().ok();
+                                        let bridge_sink_status_snapshot =
+                                            selected_group_sink_query_bridge_snapshot(
+                                                &params,
+                                                live_local_sink_status_snapshot.as_ref(),
+                                                cached_local_sink_status_snapshot.as_ref(),
+                                            );
+                                        let local_selected_group_bridge_eligible = bridge_sink_status_snapshot
                                             .map(|snapshot| {
                                                 selected_group_bridge_eligible_from_sink_status(
-                                                    &params, &snapshot,
+                                                    &params, snapshot,
                                                 )
                                             })
                                             .unwrap_or(true);
@@ -3238,8 +3404,16 @@ impl FSMetaApp {
                                         if should_bridge {
                                             match rmp_serde::to_vec(&params) {
                                                 Ok(payload) => {
+                                                    let bridge_adapter = crate::runtime::seam::exchange_host_adapter(
+                                                        boundary_for_calls.clone(),
+                                                        node_id.clone(),
+                                                        selected_group_sink_query_bridge_bindings(
+                                                            &params,
+                                                            bridge_sink_status_snapshot,
+                                                        ),
+                                                    );
                                                     match capanix_host_adapter_fs::HostAdapter::call_collect(
-                                                        &adapter,
+                                                        &bridge_adapter,
                                                         ROUTE_TOKEN_FS_META_INTERNAL,
                                                         METHOD_SINK_QUERY,
                                                         bytes::Bytes::from(payload),
@@ -4996,10 +5170,12 @@ impl FSMetaApp {
         let filtered_source_signals = self
             .filter_shared_source_route_deactivates(source_signals)
             .await;
-        let defer_retained_state_until_success = fail_closed_in_generation_cutover_lane
+        let fail_closed_restart_deferred_retire_pending = fail_closed_in_generation_cutover_lane
+            && !filtered_source_signals.is_empty()
             && filtered_source_signals
                 .iter()
                 .all(Self::source_signal_is_restart_deferred_retire_pending);
+        let defer_retained_state_until_success = fail_closed_restart_deferred_retire_pending;
         if !defer_retained_state_until_success {
             self.record_retained_source_control_state(&filtered_source_signals)
                 .await;
@@ -5009,10 +5185,6 @@ impl FSMetaApp {
             let effective_source_signals = self
                 .source_signals_with_replay(&filtered_source_signals)
                 .await;
-            let fail_closed_restart_deferred_retire_pending = fail_closed_in_generation_cutover_lane
-                && effective_source_signals
-                    .iter()
-                    .all(Self::source_signal_is_restart_deferred_retire_pending);
             if effective_source_signals.is_empty() {
                 self.record_shared_source_route_claims(&effective_source_signals)
                     .await;
@@ -5021,14 +5193,26 @@ impl FSMetaApp {
                 return Ok(());
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match self
+            #[cfg(test)]
+            let source_apply_result = if let Some(err) = take_source_apply_error_queue_hook() {
+                Err(err)
+            } else {
+                self.source
+                    .apply_orchestration_signals_with_total_timeout(
+                        &effective_source_signals,
+                        remaining,
+                    )
+                    .await
+            };
+            #[cfg(not(test))]
+            let source_apply_result = self
                 .source
                 .apply_orchestration_signals_with_total_timeout(
                     &effective_source_signals,
                     remaining,
                 )
-                .await
-            {
+                .await;
+            match source_apply_result {
                 Ok(()) => {
                     if defer_retained_state_until_success {
                         self.record_retained_source_control_state(&filtered_source_signals)
@@ -5415,9 +5599,10 @@ impl FSMetaApp {
                     fail_closed_in_generation_cutover_lane
                 );
             }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             match self
                 .sink
-                .apply_orchestration_signals(&effective_sink_signals)
+                .apply_orchestration_signals_with_total_timeout(&effective_sink_signals, remaining)
                 .await
             {
                 Ok(()) => {
@@ -5454,7 +5639,8 @@ impl FSMetaApp {
                         err
                     );
                     if replay_retained_state {
-                        self.reinitialize_after_control_reset().await?;
+                        self.reinitialize_after_control_reset_with_deadline(deadline)
+                            .await?;
                     } else {
                         self.sink.ensure_started().await?;
                     }
@@ -6211,7 +6397,7 @@ impl FSMetaApp {
             .iter()
             .any(facade_publication_signal_is_sink_status_activate);
         let mut pretriggered_source_to_sink_convergence = false;
-        let mut deferred_initial_source_to_sink_convergence = false;
+        let mut mixed_recovery_expected_sink_groups = None;
         for signal in facade_claim_signals {
             self.apply_facade_signal(signal).await?;
         }
@@ -6318,7 +6504,16 @@ impl FSMetaApp {
                     "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals ok"
                 );
                 if !control_initialized_at_entry && !source_signals.is_empty() {
-                    deferred_initial_source_to_sink_convergence = true;
+                    let expected_groups = Self::runtime_scoped_facade_group_ids(
+                        &self.source,
+                        &self.sink,
+                    )
+                    .await?
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>();
+                    if !expected_groups.is_empty() {
+                        mixed_recovery_expected_sink_groups = Some(expected_groups);
+                    }
                 }
             }
         } else if self.sink_state_replay_required.load(Ordering::Acquire)
@@ -6348,11 +6543,49 @@ impl FSMetaApp {
         if replayed_sink_state_after_uninitialized_source_recovery
             && sink_status_publication_present
         {
-            defer_api_control_gate_reopen_until_sink_status_ready = self
-                .wait_for_sink_status_republish_readiness_after_recovery(
-                    pretriggered_source_to_sink_convergence,
-                )
-                .await?;
+            let source_led_uninitialized_mixed_recovery =
+                !source_signals.is_empty() && sink_signals.is_empty();
+            if source_led_uninitialized_mixed_recovery {
+                let expected_groups = Self::runtime_scoped_facade_group_ids(&self.source, &self.sink)
+                    .await?
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>();
+                if !expected_groups.is_empty() {
+                    let cached_sink_status_ready = self
+                        .sink
+                        .cached_status_snapshot()
+                        .ok()
+                        .is_some_and(|snapshot| {
+                            sink_status_snapshot_ready_for_expected_groups(
+                                &snapshot,
+                                &expected_groups,
+                            )
+                        });
+                    if cached_sink_status_ready {
+                        eprintln!(
+                            "fs_meta_runtime_app: skipping deferred sink-status republish wait after source-led uninitialized mixed recovery groups={expected_groups:?}"
+                        );
+                    } else {
+                        eprintln!(
+                            "fs_meta_runtime_app: deferring sink-status republish wait after source-led uninitialized mixed recovery groups={expected_groups:?}"
+                        );
+                        defer_api_control_gate_reopen_until_sink_status_ready =
+                            Some(expected_groups);
+                    }
+                } else {
+                    defer_api_control_gate_reopen_until_sink_status_ready = self
+                        .wait_for_sink_status_republish_readiness_after_recovery(
+                            pretriggered_source_to_sink_convergence,
+                        )
+                        .await?;
+                }
+            } else {
+                defer_api_control_gate_reopen_until_sink_status_ready = self
+                    .wait_for_sink_status_republish_readiness_after_recovery(
+                        pretriggered_source_to_sink_convergence,
+                    )
+                    .await?;
+            }
         }
         let (deferred_sink_owned_query_peer_publication_signals, facade_publication_signals): (
             Vec<_>,
@@ -6381,16 +6614,9 @@ impl FSMetaApp {
         if !sink_cleanup_only_while_uninitialized {
             self.ensure_runtime_proxy_endpoints_started().await?;
         }
-        if deferred_initial_source_to_sink_convergence {
-            let source = self.source.clone();
-            tokio::spawn(async move {
-                if let Err(err) = source.trigger_rescan_when_ready().await {
-                    eprintln!(
-                        "fs_meta_runtime_app: deferred initial source->sink convergence trigger failed err={}",
-                        err
-                    );
-                }
-            });
+        if let Some(expected_groups) = mixed_recovery_expected_sink_groups.as_ref() {
+            self.wait_for_local_sink_status_republish_after_recovery(expected_groups)
+                .await?;
         }
         if request_sensitive && !sink_cleanup_only_while_uninitialized {
             if let Some(expected_groups) = defer_api_control_gate_reopen_until_sink_status_ready {
@@ -6399,6 +6625,7 @@ impl FSMetaApp {
                 )
                 .await?;
                 let control_ready_after_republish = self.facade_publication_ready().await;
+                self.api_control_gate.set_ready(control_ready_after_republish);
                 Self::spawn_deferred_sink_owned_query_peer_publication_after_local_sink_status_ready(
                     self.source.clone(),
                     self.sink.clone(),

@@ -800,6 +800,10 @@ impl Cluster5 {
         Ok(self.node(node_name)?.child.id())
     }
 
+    pub fn daemon_host_descendant_pids(&self, node_name: &str) -> Result<BTreeSet<u32>, String> {
+        host_descendant_pids(self.daemon_pid(node_name)?)
+    }
+
     pub fn node(&self, node_name: &str) -> Result<&RunningNode, String> {
         self.nodes
             .iter()
@@ -876,6 +880,31 @@ fn scope_unit_intent_to_scope_worker_intent(doc: &Value) -> Result<Value, String
         "route_plans": doc.get("route_plans").cloned().unwrap_or_else(|| json!([])),
         "workers": workers,
     }))
+}
+
+fn host_descendant_pids(root_pid: u32) -> Result<BTreeSet<u32>, String> {
+    let mut descendants = BTreeSet::new();
+    let mut stack = vec![root_pid];
+    while let Some(pid) = stack.pop() {
+        let task_dir = PathBuf::from(format!("/proc/{pid}/task"));
+        let tasks = fs::read_dir(&task_dir)
+            .map_err(|e| format!("read {} failed: {e}", task_dir.display()))?;
+        for task in tasks.flatten() {
+            let children_path = task.path().join("children");
+            let Ok(raw) = fs::read_to_string(&children_path) else {
+                continue;
+            };
+            for child in raw
+                .split_whitespace()
+                .filter_map(|value| value.parse::<u32>().ok())
+            {
+                if descendants.insert(child) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    Ok(descendants)
 }
 
 fn repo_root() -> PathBuf {
@@ -1462,34 +1491,17 @@ fn build_cluster_config(
 }
 
 impl RunningNode {
-    fn start(
-        bin: &Path,
+    fn apply_child_env(
+        cmd: &mut Command,
+        home_dir: &Path,
         node: &NodeIdentity,
-        config_text: &str,
-        bind_addr: &str,
         include_node_key: bool,
         include_admin_key: bool,
-    ) -> Result<Self, String> {
-        let home_dir = tmp_dir(&format!("cluster-{}", node.name));
-        let config_path = home_dir.join("config.yaml");
-        fs::write(&config_path, config_text).map_err(|e| format!("write config: {e}"))?;
-        let stdout_log = home_dir.join("stdout.log");
-        let stderr_log = home_dir.join("stderr.log");
-        let stdout = File::create(&stdout_log).map_err(|e| format!("create stdout log: {e}"))?;
-        let stderr = File::create(&stderr_log).map_err(|e| format!("create stderr log: {e}"))?;
-        let mut cmd = Command::new(bin);
-        cmd.arg("--config")
-            .arg(&config_path)
-            .arg("--bind")
-            .arg(bind_addr)
-            .env("CAPANIX_HOME", &home_dir)
-            .env("DATANIX_HOME", &home_dir)
+    ) {
+        cmd.env("CAPANIX_HOME", home_dir)
+            .env("DATANIX_HOME", home_dir)
             .env("CAPANIX_TARGET_QUORUM_TIMEOUT_MS", "15000")
-            .env("DATANIX_TARGET_QUORUM_TIMEOUT_MS", "15000")
-            .env("RUST_LOG", "debug")
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr));
+            .env("DATANIX_TARGET_QUORUM_TIMEOUT_MS", "15000");
         if include_node_key {
             cmd.env("CAPANIX_NODE_SK_B64", &node.node_sk_b64);
             cmd.env("DATANIX_NODE_SK_B64", &node.node_sk_b64);
@@ -1510,6 +1522,38 @@ impl RunningNode {
         if let Ok(value) = std::env::var("DATANIX_DEBUG_WORKER_CONTROL") {
             cmd.env("DATANIX_DEBUG_WORKER_CONTROL", value);
         }
+    }
+
+    fn start(
+        bin: &Path,
+        node: &NodeIdentity,
+        config_text: &str,
+        bind_addr: &str,
+        include_node_key: bool,
+        include_admin_key: bool,
+    ) -> Result<Self, String> {
+        let home_dir = tmp_dir(&format!("cluster-{}", node.name));
+        let config_path = home_dir.join("config.yaml");
+        fs::write(&config_path, config_text).map_err(|e| format!("write config: {e}"))?;
+        let stdout_log = home_dir.join("stdout.log");
+        let stderr_log = home_dir.join("stderr.log");
+        let stdout = File::create(&stdout_log).map_err(|e| format!("create stdout log: {e}"))?;
+        let stderr = File::create(&stderr_log).map_err(|e| format!("create stderr log: {e}"))?;
+        let mut cmd = Command::new(bin);
+        cmd.arg("--config")
+            .arg(&config_path)
+            .arg("--bind")
+            .arg(bind_addr)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        Self::apply_child_env(
+            &mut cmd,
+            &home_dir,
+            node,
+            include_node_key,
+            include_admin_key,
+        );
         configure_test_child_runtime(&mut cmd);
         let child = cmd.spawn().map_err(|e| format!("spawn capanixd: {e}"))?;
         Ok(Self {
@@ -2602,5 +2646,57 @@ mod tests {
                 .next()
                 .is_none());
         });
+    }
+
+    #[test]
+    fn host_descendant_pids_collects_live_child_process_tree() {
+        let mut root = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30 & wait")
+            .spawn()
+            .expect("spawn shell with child sleep");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let descendants = loop {
+            let descendants = host_descendant_pids(root.id()).expect("collect descendants");
+            if !descendants.is_empty() {
+                break descendants;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected a live child descendant under the shell process"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+
+        assert!(
+            descendants.iter().all(|pid| *pid != root.id()),
+            "descendant helper must not report the root daemon pid itself"
+        );
+
+        let _ = root.kill();
+        let _ = root.wait();
+    }
+
+    #[test]
+    fn running_node_child_env_does_not_force_debug_logging() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let node = NodeIdentity {
+            name: "node-a".to_string(),
+            node_id: "node-a-id".to_string(),
+            node_sk_b64: "node-sk".to_string(),
+            node_pk_b64: "node-pk".to_string(),
+        };
+        let mut cmd = Command::new("env");
+        RunningNode::apply_child_env(&mut cmd, temp.path(), &node, true, true);
+
+        let rust_log = cmd
+            .get_envs()
+            .find_map(|(key, value)| (key == "RUST_LOG").then_some(value))
+            .flatten();
+        assert!(
+            rust_log.is_none(),
+            "real-NFS harness must not force capanixd into RUST_LOG=debug during cpu_budget steady sampling"
+        );
     }
 }

@@ -2251,6 +2251,1491 @@ async fn status_snapshot_restores_persisted_root_id_ready_state_after_retry_rese
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logical_root_retire_when_live_snapshot_reopens_replay_only_not_ready()
+ {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs2 = tmp.path().join("nfs2");
+    let nfs3 = tmp.path().join("nfs3");
+    let nfs4 = tmp.path().join("nfs4");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    std::fs::create_dir_all(&nfs3).expect("create nfs3 dir");
+    std::fs::create_dir_all(&nfs4).expect("create nfs4 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            sink_worker_root("nfs2", &nfs2),
+            sink_worker_root("nfs3", &nfs3),
+            sink_worker_root("nfs4", &nfs4),
+        ],
+        host_object_grants: vec![
+            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            sink_worker_export("node-d::nfs3", "node-d", "10.0.0.43", nfs3.clone()),
+            sink_worker_export("node-d::nfs4", "node-d", "10.0.0.44", nfs4.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                bound_scope_with_resources("nfs3", &["node-d::nfs3"]),
+                bound_scope_with_resources("nfs4", &["node-d::nfs4"]),
+            ],
+        }))
+        .expect("encode initial sink activate"),
+    ])
+    .await
+    .expect("apply initial sink control before retire");
+
+    let initial_ready_snapshot = SinkStatusSnapshot {
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs2".to_string(),
+                primary_object_ref: "node-d::nfs2".to_string(),
+                total_nodes: 4,
+                live_nodes: 4,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: true,
+                materialized_revision: 7,
+                estimated_heap_bytes: 1,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs3".to_string(),
+                primary_object_ref: "node-d::nfs3".to_string(),
+                total_nodes: 3,
+                live_nodes: 3,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: true,
+                materialized_revision: 6,
+                estimated_heap_bytes: 1,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs4".to_string(),
+                primary_object_ref: "node-d::nfs4".to_string(),
+                total_nodes: 5,
+                live_nodes: 5,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: true,
+                materialized_revision: 8,
+                estimated_heap_bytes: 1,
+            },
+        ],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            vec!["nfs2".to_string(), "nfs3".to_string(), "nfs4".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+    sink.update_cached_status_snapshot(initial_ready_snapshot.clone())
+        .expect("seed ready cached snapshot before retire");
+
+    sink.update_logical_roots(
+        vec![sink_worker_root("nfs2", &nfs2), sink_worker_root("nfs4", &nfs4)],
+        vec![
+            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            sink_worker_export("node-d::nfs4", "node-d", "10.0.0.44", nfs4.clone()),
+        ],
+    )
+    .await
+    .expect("retire nfs3 from logical roots before replay-required probe");
+
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                bound_scope_with_resources("nfs4", &["node-d::nfs4"]),
+            ],
+        }))
+        .expect("encode surviving sink activate"),
+    ])
+    .await
+    .expect("apply surviving sink control before replay-required probe");
+
+    let ready_snapshot = sink
+        .cached_status_snapshot()
+        .expect("cached status after logical-root retire");
+    let expected_groups = std::collections::BTreeSet::from([
+        "nfs2".to_string(),
+        "nfs4".to_string(),
+    ]);
+    let ready_groups = ready_snapshot
+        .groups
+        .iter()
+        .filter(|group| group.initial_audit_completed)
+        .map(|group| group.group_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        ready_groups, expected_groups,
+        "precondition: retire should leave only surviving ready groups cached before replay-required status probe: {ready_snapshot:?}"
+    );
+
+    let live_snapshot = SinkStatusSnapshot {
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs2".to_string(),
+                primary_object_ref: "node-d::nfs2".to_string(),
+                total_nodes: 4,
+                live_nodes: 4,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: false,
+                materialized_revision: 7,
+                estimated_heap_bytes: 1,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs4".to_string(),
+                primary_object_ref: "node-d::nfs4".to_string(),
+                total_nodes: 5,
+                live_nodes: 5,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: false,
+                materialized_revision: 8,
+                estimated_heap_bytes: 1,
+            },
+        ],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            vec!["nfs2".to_string(), "nfs4".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    sink.control_state_replay_required
+        .store(1, Ordering::Release);
+    let _status_snapshot_reset = SinkWorkerStatusSnapshotHookReset;
+    install_sink_worker_status_snapshot_hook(SinkWorkerStatusSnapshotHook {
+        snapshot: live_snapshot.clone(),
+    });
+
+    let snapshot = sink
+        .status_snapshot_nonblocking()
+        .await
+        .expect(
+            "status_snapshot_nonblocking should preserve the surviving ready cached groups instead of timing out when the retire-shaped live snapshot reopens replay-only not-ready",
+        );
+
+    let returned_ready_groups = snapshot
+        .groups
+        .iter()
+        .filter(|group| group.initial_audit_completed)
+        .map(|group| group.group_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        returned_ready_groups, expected_groups,
+        "status_snapshot_nonblocking must preserve the surviving ready groups after logical-root retire instead of timing out on a replay-only not-ready live snapshot: ready={ready_snapshot:?} live={live_snapshot:?} returned={snapshot:?}"
+    );
+
+    let cached_after = sink
+        .cached_status_snapshot()
+        .expect("cached status after replay-only not-ready live snapshot");
+    let cached_ready_groups = cached_after
+        .groups
+        .iter()
+        .filter(|group| group.initial_audit_completed)
+        .map(|group| group.group_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        cached_ready_groups, expected_groups,
+        "replay-only not-ready live snapshot after logical-root retire must not overwrite the surviving ready cached status: ready={ready_snapshot:?} live={live_snapshot:?} cached={cached_after:?}"
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logical_root_retire_and_same_instance_replay_completed_without_new_source_events()
+ {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs2 = tmp.path().join("nfs2");
+    let nfs3 = tmp.path().join("nfs3");
+    let nfs4 = tmp.path().join("nfs4");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    std::fs::create_dir_all(&nfs3).expect("create nfs3 dir");
+    std::fs::create_dir_all(&nfs4).expect("create nfs4 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            sink_worker_root("nfs2", &nfs2),
+            sink_worker_root("nfs3", &nfs3),
+            sink_worker_root("nfs4", &nfs4),
+        ],
+        host_object_grants: vec![
+            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            sink_worker_export("node-d::nfs3", "node-d", "10.0.0.43", nfs3.clone()),
+            sink_worker_export("node-d::nfs4", "node-d", "10.0.0.44", nfs4.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                bound_scope_with_resources("nfs3", &["node-d::nfs3"]),
+                bound_scope_with_resources("nfs4", &["node-d::nfs4"]),
+            ],
+        }))
+        .expect("encode initial sink activate"),
+    ])
+    .await
+    .expect("apply initial sink control before retire");
+
+    sink.send(vec![
+        mk_worker_sink_source_event(
+            "node-d::nfs2",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 1,
+                    ctime_us: 1,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                1,
+                false,
+            ),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs2",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            2,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs2",
+            mk_worker_sink_record(b"/ready-nfs2.txt", "ready-nfs2.txt", 3, EventKind::Update),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs2",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            4,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs3",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 5,
+                    ctime_us: 5,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                5,
+                false,
+            ),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs3",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            6,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs3",
+            mk_worker_sink_record(b"/ready-nfs3.txt", "ready-nfs3.txt", 7, EventKind::Update),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs3",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            8,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs4",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 9,
+                    ctime_us: 9,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                9,
+                false,
+            ),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs4",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            10,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs4",
+            mk_worker_sink_record(b"/ready-nfs4.txt", "ready-nfs4.txt", 11, EventKind::Update),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs4",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            12,
+        ),
+    ])
+    .await
+    .expect("apply ready events before retire");
+
+    let ready_snapshot = sink
+        .status_snapshot()
+        .await
+        .expect("ready snapshot before logical-root retire");
+    let ready_groups = ready_snapshot
+        .groups
+        .iter()
+        .filter(|group| group.initial_audit_completed)
+        .map(|group| group.group_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        ready_groups,
+        std::collections::BTreeSet::from([
+            "nfs2".to_string(),
+            "nfs3".to_string(),
+            "nfs4".to_string()
+        ]),
+        "precondition: nfs2/nfs3/nfs4 must all be ready before retire: {ready_snapshot:?}"
+    );
+
+    sink.update_logical_roots(
+        vec![sink_worker_root("nfs2", &nfs2), sink_worker_root("nfs4", &nfs4)],
+        vec![
+            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            sink_worker_export("node-d::nfs4", "node-d", "10.0.0.44", nfs4.clone()),
+        ],
+    )
+    .await
+    .expect("retire nfs3 from logical roots");
+
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                bound_scope_with_resources("nfs4", &["node-d::nfs4"]),
+            ],
+        }))
+        .expect("encode surviving sink activate"),
+    ])
+    .await
+    .expect("apply surviving sink control before replay completion");
+
+    sink.control_state_replay_required
+        .store(1, Ordering::Release);
+    sink.replay_retained_control_state_if_needed()
+        .await
+        .expect("complete same-instance retained replay for surviving groups");
+    sink.update_cached_status_snapshot(SinkStatusSnapshot::default())
+        .expect("clear cached status after replay completion");
+
+    let snapshot = tokio::time::timeout(
+        Duration::from_millis(350),
+        sink.status_snapshot_nonblocking(),
+    )
+    .await
+    .expect(
+        "status_snapshot_nonblocking after logical-root retire and replay completion must settle within the local sink-status probe budget",
+    )
+    .expect(
+        "status_snapshot_nonblocking after logical-root retire and replay completion should restore the surviving ready groups",
+    );
+
+    let returned_ready_groups = snapshot
+        .groups
+        .iter()
+        .filter(|group| group.initial_audit_completed)
+        .map(|group| group.group_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        returned_ready_groups,
+        std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
+        "status_snapshot_nonblocking must restore the surviving ready groups after logical-root retire and same-instance replay completion instead of timing out or reopening with not-ready groups: ready={ready_snapshot:?} returned={snapshot:?}"
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_snapshot_nonblocking_retries_single_control_inflight_retryable_status_probe_after_logical_root_retire_and_restores_surviving_ready_groups()
+ {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs2 = tmp.path().join("nfs2");
+    let nfs3 = tmp.path().join("nfs3");
+    let nfs4 = tmp.path().join("nfs4");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    std::fs::create_dir_all(&nfs3).expect("create nfs3 dir");
+    std::fs::create_dir_all(&nfs4).expect("create nfs4 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            sink_worker_root("nfs2", &nfs2),
+            sink_worker_root("nfs3", &nfs3),
+            sink_worker_root("nfs4", &nfs4),
+        ],
+        host_object_grants: vec![
+            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            sink_worker_export("node-d::nfs3", "node-d", "10.0.0.43", nfs3.clone()),
+            sink_worker_export("node-d::nfs4", "node-d", "10.0.0.44", nfs4.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                bound_scope_with_resources("nfs3", &["node-d::nfs3"]),
+                bound_scope_with_resources("nfs4", &["node-d::nfs4"]),
+            ],
+        }))
+        .expect("encode initial sink activate"),
+    ])
+    .await
+    .expect("apply initial sink control before retire");
+
+    sink.send(vec![
+        mk_worker_sink_source_event(
+            "node-d::nfs2",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 1,
+                    ctime_us: 1,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                1,
+                false,
+            ),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs2",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            2,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs2",
+            mk_worker_sink_record(b"/ready-nfs2.txt", "ready-nfs2.txt", 3, EventKind::Update),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs2",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            4,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs3",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 5,
+                    ctime_us: 5,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                5,
+                false,
+            ),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs3",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            6,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs3",
+            mk_worker_sink_record(b"/ready-nfs3.txt", "ready-nfs3.txt", 7, EventKind::Update),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs3",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            8,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs4",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 9,
+                    ctime_us: 9,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                9,
+                false,
+            ),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs4",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            10,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs4",
+            mk_worker_sink_record(b"/ready-nfs4.txt", "ready-nfs4.txt", 11, EventKind::Update),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs4",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            12,
+        ),
+    ])
+    .await
+    .expect("apply ready events before retire");
+
+    let ready_snapshot = sink
+        .status_snapshot()
+        .await
+        .expect("ready snapshot before logical-root retire");
+    assert_eq!(
+        ready_snapshot
+            .groups
+            .iter()
+            .filter(|group| group.initial_audit_completed)
+            .map(|group| group.group_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "nfs2".to_string(),
+            "nfs3".to_string(),
+            "nfs4".to_string()
+        ]),
+        "precondition: nfs2/nfs3/nfs4 must all be ready before retire: {ready_snapshot:?}"
+    );
+
+    sink.update_logical_roots(
+        vec![sink_worker_root("nfs2", &nfs2), sink_worker_root("nfs4", &nfs4)],
+        vec![
+            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            sink_worker_export("node-d::nfs4", "node-d", "10.0.0.44", nfs4.clone()),
+        ],
+    )
+    .await
+    .expect("retire nfs3 from logical roots");
+
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                bound_scope_with_resources("nfs4", &["node-d::nfs4"]),
+            ],
+        }))
+        .expect("encode surviving sink activate"),
+    ])
+    .await
+    .expect("apply surviving sink control before control-inflight status probe");
+
+    sink.update_cached_status_snapshot(SinkStatusSnapshot::default())
+        .expect("clear cached status before control-inflight retry probe");
+
+    let reset_count = Arc::new(AtomicUsize::new(0));
+    let _reset_hook = SinkWorkerRetryResetHookReset;
+    install_sink_worker_retry_reset_hook(SinkWorkerRetryResetHook {
+        reset_count: reset_count.clone(),
+    });
+    let _status_error_reset = SinkWorkerStatusErrorHookReset;
+    install_sink_worker_status_error_hook(SinkWorkerStatusErrorHook {
+        err: CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
+    });
+
+    let _inflight = sink.begin_control_op();
+    let snapshot = tokio::time::timeout(
+        Duration::from_millis(350),
+        sink.status_snapshot_nonblocking(),
+    )
+    .await
+    .expect(
+        "status_snapshot_nonblocking after logical-root retire should settle within the local sink-status probe budget even when the first control-inflight status probe hits one retryable bridge reset",
+    )
+    .expect(
+        "status_snapshot_nonblocking after logical-root retire should retry one control-inflight retryable bridge reset and restore the surviving ready groups",
+    );
+
+    assert!(
+        reset_count.load(Ordering::SeqCst) >= 1,
+        "control-inflight retryable status probe after logical-root retire must reset the shared sink worker client before publishing status",
+    );
+    assert_eq!(
+        snapshot
+            .groups
+            .iter()
+            .filter(|group| group.initial_audit_completed)
+            .map(|group| group.group_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
+        "status_snapshot_nonblocking must restore the surviving ready groups after logical-root retire instead of surfacing the first retryable control-inflight bridge reset as a timeout/error: ready={ready_snapshot:?} returned={snapshot:?}"
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_snapshot_nonblocking_retries_single_noninflight_retryable_status_probe_after_logical_root_retire_and_restores_surviving_ready_groups()
+ {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs2 = tmp.path().join("nfs2");
+    let nfs3 = tmp.path().join("nfs3");
+    let nfs4 = tmp.path().join("nfs4");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    std::fs::create_dir_all(&nfs3).expect("create nfs3 dir");
+    std::fs::create_dir_all(&nfs4).expect("create nfs4 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            sink_worker_root("nfs2", &nfs2),
+            sink_worker_root("nfs3", &nfs3),
+            sink_worker_root("nfs4", &nfs4),
+        ],
+        host_object_grants: vec![
+            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            sink_worker_export("node-d::nfs3", "node-d", "10.0.0.43", nfs3.clone()),
+            sink_worker_export("node-d::nfs4", "node-d", "10.0.0.44", nfs4.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                bound_scope_with_resources("nfs3", &["node-d::nfs3"]),
+                bound_scope_with_resources("nfs4", &["node-d::nfs4"]),
+            ],
+        }))
+        .expect("encode initial sink activate"),
+    ])
+    .await
+    .expect("apply initial sink control before retire");
+
+    sink.send(vec![
+        mk_worker_sink_source_event(
+            "node-d::nfs2",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 1,
+                    ctime_us: 1,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                1,
+                false,
+            ),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs2",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            2,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs2",
+            mk_worker_sink_record(b"/ready-nfs2.txt", "ready-nfs2.txt", 3, EventKind::Update),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs2",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            4,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs3",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 5,
+                    ctime_us: 5,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                5,
+                false,
+            ),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs3",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            6,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs3",
+            mk_worker_sink_record(b"/ready-nfs3.txt", "ready-nfs3.txt", 7, EventKind::Update),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs3",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            8,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs4",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 9,
+                    ctime_us: 9,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                9,
+                false,
+            ),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs4",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            10,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs4",
+            mk_worker_sink_record(b"/ready-nfs4.txt", "ready-nfs4.txt", 11, EventKind::Update),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs4",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            12,
+        ),
+    ])
+    .await
+    .expect("apply ready events before retire");
+
+    let ready_snapshot = sink
+        .status_snapshot()
+        .await
+        .expect("ready snapshot before logical-root retire");
+    assert_eq!(
+        ready_snapshot
+            .groups
+            .iter()
+            .filter(|group| group.initial_audit_completed)
+            .map(|group| group.group_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "nfs2".to_string(),
+            "nfs3".to_string(),
+            "nfs4".to_string()
+        ]),
+        "precondition: nfs2/nfs3/nfs4 must all be ready before retire: {ready_snapshot:?}"
+    );
+
+    sink.update_logical_roots(
+        vec![sink_worker_root("nfs2", &nfs2), sink_worker_root("nfs4", &nfs4)],
+        vec![
+            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            sink_worker_export("node-d::nfs4", "node-d", "10.0.0.44", nfs4.clone()),
+        ],
+    )
+    .await
+    .expect("retire nfs3 from logical roots");
+
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                bound_scope_with_resources("nfs4", &["node-d::nfs4"]),
+            ],
+        }))
+        .expect("encode surviving sink activate"),
+    ])
+    .await
+    .expect("apply surviving sink control before non-inflight status probe");
+
+    sink.update_cached_status_snapshot(SinkStatusSnapshot::default())
+        .expect("clear cached status before non-inflight retry probe");
+
+    let reset_count = Arc::new(AtomicUsize::new(0));
+    let _reset_hook = SinkWorkerRetryResetHookReset;
+    install_sink_worker_retry_reset_hook(SinkWorkerRetryResetHook {
+        reset_count: reset_count.clone(),
+    });
+    let _status_error_reset = SinkWorkerStatusErrorHookReset;
+    install_sink_worker_status_error_hook(SinkWorkerStatusErrorHook {
+        err: CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
+    });
+
+    let snapshot = tokio::time::timeout(
+        Duration::from_millis(350),
+        sink.status_snapshot_nonblocking(),
+    )
+    .await
+    .expect(
+        "status_snapshot_nonblocking after logical-root retire should settle within the local sink-status probe budget even when the first non-inflight status probe hits one retryable bridge reset",
+    )
+    .expect(
+        "status_snapshot_nonblocking after logical-root retire should retry one non-inflight retryable bridge reset and restore the surviving ready groups",
+    );
+
+    assert!(
+        reset_count.load(Ordering::SeqCst) >= 1,
+        "non-inflight retryable status probe after logical-root retire must reset the shared sink worker client before publishing status",
+    );
+    assert_eq!(
+        snapshot
+            .groups
+            .iter()
+            .filter(|group| group.initial_audit_completed)
+            .map(|group| group.group_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
+        "status_snapshot_nonblocking must restore the surviving ready groups after logical-root retire instead of surfacing the first retryable non-inflight bridge reset as a timeout/error: ready={ready_snapshot:?} returned={snapshot:?}"
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_snapshot_nonblocking_retries_ack_reply_after_retained_replay_and_restores_live_snapshot()
+{
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs1", &nfs1)],
+        host_object_grants: vec![sink_worker_export(
+            "node-d::nfs1",
+            "node-d",
+            "10.0.0.41",
+            nfs1.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-d::nfs1"])],
+        }))
+        .expect("encode sink activate"),
+    ])
+    .await
+    .expect("apply retained sink control before ack retry probe");
+
+    let live_snapshot = SinkStatusSnapshot {
+        live_nodes: 1,
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-d::nfs1".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_audit: false,
+            initial_audit_completed: true,
+            materialized_revision: 0,
+            estimated_heap_bytes: 0
+        }],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        ..Default::default()
+    };
+
+    let reset_count = Arc::new(AtomicUsize::new(0));
+    let _reset_hook = SinkWorkerRetryResetHookReset;
+    install_sink_worker_retry_reset_hook(SinkWorkerRetryResetHook {
+        reset_count: reset_count.clone(),
+    });
+    let _reply_reset = SinkWorkerStatusResponseQueueHookReset;
+    install_sink_worker_status_response_queue_hook(SinkWorkerStatusResponseQueueHook {
+        replies: std::collections::VecDeque::from([
+            Ok(SinkWorkerResponse::Ack),
+            Ok(SinkWorkerResponse::StatusSnapshot(live_snapshot.clone())),
+        ]),
+    });
+
+    sink.control_state_replay_required.store(1, Ordering::Release);
+
+    let snapshot = tokio::time::timeout(Duration::from_millis(500), sink.status_snapshot_nonblocking())
+        .await
+        .expect(
+            "status_snapshot_nonblocking after retained replay should settle within the local sink-status budget even when the first live status probe returns a typed Ack",
+        )
+        .expect(
+            "status_snapshot_nonblocking after retained replay should reset and retry instead of surfacing a typed Ack as a protocol violation",
+        );
+
+    assert!(
+        reset_count.load(Ordering::SeqCst) >= 1,
+        "a typed Ack on the first live status probe after retained replay must reset the shared sink worker client before publishing status",
+    );
+    assert_eq!(
+        snapshot.scheduled_groups_by_node.get("node-d"),
+        Some(&vec!["nfs1".to_string()]),
+        "status_snapshot_nonblocking must retry a typed Ack after retained replay and restore the live scheduled groups instead of surfacing a protocol violation: {snapshot:?}"
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logical_root_retire_when_live_snapshot_regresses_to_scheduled_zero_uninitialized_after_retry_reset()
+{
+    let tmp = tempdir().expect("create temp dir");
+    let nfs2 = tmp.path().join("nfs2");
+    let nfs3 = tmp.path().join("nfs3");
+    let nfs4 = tmp.path().join("nfs4");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    std::fs::create_dir_all(&nfs3).expect("create nfs3 dir");
+    std::fs::create_dir_all(&nfs4).expect("create nfs4 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            sink_worker_root("nfs2", &nfs2),
+            sink_worker_root("nfs3", &nfs3),
+            sink_worker_root("nfs4", &nfs4),
+        ],
+        host_object_grants: vec![
+            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            sink_worker_export("node-d::nfs3", "node-d", "10.0.0.43", nfs3.clone()),
+            sink_worker_export("node-d::nfs4", "node-d", "10.0.0.44", nfs4.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                bound_scope_with_resources("nfs3", &["node-d::nfs3"]),
+                bound_scope_with_resources("nfs4", &["node-d::nfs4"]),
+            ],
+        }))
+        .expect("encode initial sink activate"),
+    ])
+    .await
+    .expect("apply initial sink control before retire");
+
+    sink.send(vec![
+        mk_worker_sink_source_event(
+            "node-d::nfs2",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 1,
+                    ctime_us: 1,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                1,
+                false,
+            ),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs2",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            2,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs2",
+            mk_worker_sink_record(b"/ready-nfs2.txt", "ready-nfs2.txt", 3, EventKind::Update),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs2",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            4,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs3",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 5,
+                    ctime_us: 5,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                5,
+                false,
+            ),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs3",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            6,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs3",
+            mk_worker_sink_record(b"/ready-nfs3.txt", "ready-nfs3.txt", 7, EventKind::Update),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs3",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            8,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs4",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 9,
+                    ctime_us: 9,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                9,
+                false,
+            ),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs4",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            10,
+        ),
+        mk_worker_sink_source_event(
+            "node-d::nfs4",
+            mk_worker_sink_record(b"/ready-nfs4.txt", "ready-nfs4.txt", 11, EventKind::Update),
+        ),
+        mk_worker_sink_control_event(
+            "node-d::nfs4",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            12,
+        ),
+    ])
+    .await
+    .expect("apply ready events before retire");
+
+    let ready_snapshot = sink
+        .status_snapshot()
+        .await
+        .expect("ready snapshot before logical-root retire");
+    assert_eq!(
+        ready_snapshot
+            .groups
+            .iter()
+            .filter(|group| group.initial_audit_completed)
+            .map(|group| group.group_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "nfs2".to_string(),
+            "nfs3".to_string(),
+            "nfs4".to_string()
+        ]),
+        "precondition: nfs2/nfs3/nfs4 must all be ready before retire: {ready_snapshot:?}"
+    );
+
+    sink.update_logical_roots(
+        vec![sink_worker_root("nfs2", &nfs2), sink_worker_root("nfs4", &nfs4)],
+        vec![
+            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            sink_worker_export("node-d::nfs4", "node-d", "10.0.0.44", nfs4.clone()),
+        ],
+    )
+    .await
+    .expect("retire nfs3 from logical roots");
+
+    let cached_after_retire = sink
+        .cached_status_snapshot()
+        .expect("cached ready status after logical-root retire");
+    assert_eq!(
+        cached_after_retire
+            .groups
+            .iter()
+            .filter(|group| group.initial_audit_completed)
+            .map(|group| group.group_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
+        "precondition: logical-root retire must preserve the surviving ready cached groups before the zero/uninitialized live regression: {cached_after_retire:?}"
+    );
+
+    let reset_count = Arc::new(AtomicUsize::new(0));
+    let _reset_hook = SinkWorkerRetryResetHookReset;
+    install_sink_worker_retry_reset_hook(SinkWorkerRetryResetHook {
+        reset_count: reset_count.clone(),
+    });
+    let _status_error_reset = SinkWorkerStatusErrorHookReset;
+    install_sink_worker_status_error_hook(SinkWorkerStatusErrorHook {
+        err: CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
+    });
+    let _status_snapshot_reset = SinkWorkerStatusSnapshotHookReset;
+    let zero_snapshot = SinkStatusSnapshot {
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs2".to_string(),
+                primary_object_ref: "node-d::nfs2".to_string(),
+                total_nodes: 0,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: false,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs4".to_string(),
+                primary_object_ref: "node-d::nfs4".to_string(),
+                total_nodes: 0,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: false,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            },
+        ],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            vec!["nfs2".to_string(), "nfs4".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+    let install_zero_snapshot = tokio::spawn({
+        let reset_count = reset_count.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+            loop {
+                if reset_count.load(Ordering::SeqCst) > 0 {
+                    install_sink_worker_status_snapshot_hook(SinkWorkerStatusSnapshotHook {
+                        snapshot: zero_snapshot,
+                    });
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "retryable bridge-stopped status probe after logical-root retire should reset before the zero/uninitialized live snapshot is installed"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    });
+
+    let snapshot = tokio::time::timeout(
+        Duration::from_millis(350),
+        sink.status_snapshot_nonblocking(),
+    )
+    .await
+    .expect(
+        "status_snapshot_nonblocking after logical-root retire should settle within the local sink-status probe budget even when the first live status probe resets and the retried live snapshot regresses to scheduled zero/uninitialized",
+    )
+    .expect(
+        "status_snapshot_nonblocking after logical-root retire should preserve the surviving ready groups instead of timing out when the retried live snapshot regresses to scheduled zero/uninitialized",
+    );
+    install_zero_snapshot
+        .await
+        .expect("join zero/uninitialized snapshot installer");
+
+    assert_eq!(
+        snapshot
+            .groups
+            .iter()
+            .filter(|group| group.initial_audit_completed)
+            .map(|group| group.group_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
+        "status_snapshot_nonblocking after logical-root retire must preserve the surviving ready groups instead of timing out on a retried scheduled zero/uninitialized live snapshot: ready={ready_snapshot:?} cached={cached_after_retire:?} returned={snapshot:?}"
+    );
+    assert!(
+        reset_count.load(Ordering::SeqCst) >= 1,
+        "retryable bridge-stopped status probe after logical-root retire must reset the shared worker client before publishing status",
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_snapshot_does_not_report_replay_complete_when_live_snapshot_is_scheduled_zero_uninitialized()
  {
     let tmp = tempdir().expect("create temp dir");
@@ -2798,4 +4283,3 @@ async fn materialized_query_still_reads_local_payload_while_control_inflight() {
     source.close().await.expect("close source");
     sink.close().await.expect("close sink worker");
 }
-

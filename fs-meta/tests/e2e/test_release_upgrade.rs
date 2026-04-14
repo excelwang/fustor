@@ -7,7 +7,7 @@ use crate::support::nfs_lab::NfsLab;
 use crate::support::{reserve_http_addrs, skip_unless_real_nfs_enabled, wait_until};
 use fs_meta::{RootSelector, RootSpec};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{
@@ -751,15 +751,31 @@ fn measure_steady_cpu(
 ) -> Result<BTreeMap<String, Vec<u32>>, String> {
     let mut by_node = BTreeMap::new();
     for node_name in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
-        let mut pids = vec![cluster.daemon_pid(node_name)?];
-        pids.extend(
-            cluster
-                .managed_host_pids_for_instance(node_name, app_id)?
-                .into_iter(),
+        by_node.insert(
+            node_name.to_string(),
+            steady_cpu_sample_pids_for_node(
+                cluster.daemon_pid(node_name)?,
+                &cluster.managed_host_pids_for_instance(node_name, app_id)?,
+                &cluster.daemon_host_descendant_pids(node_name)?,
+            ),
         );
-        by_node.insert(node_name.to_string(), pids);
     }
     Ok(by_node)
+}
+
+fn steady_cpu_sample_pids_for_node(
+    daemon_pid: u32,
+    _managed_status_pids: &BTreeSet<u32>,
+    host_descendant_pids: &BTreeSet<u32>,
+) -> Vec<u32> {
+    let mut pids = BTreeSet::from([daemon_pid]);
+    pids.extend(
+        host_descendant_pids
+            .iter()
+            .copied()
+            .filter(|pid| *pid != daemon_pid),
+    );
+    pids.into_iter().collect()
 }
 
 fn spawn_light_polling(
@@ -951,7 +967,40 @@ fn activation_route_summaries(status: &Value) -> Vec<String> {
             .get("active_pids")
             .cloned()
             .unwrap_or_else(|| json!([]));
-        summaries.push(format!("{route_key}:{state}:active_pids={active_pids}"));
+        let route_publish_status = route
+            .get("route_publish_status")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let route_publish_reason = route
+            .get("route_publish_reason")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let trusted_exposure_reason = route
+            .get("trusted_exposure_reason")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let apps = route
+            .get("apps")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| {
+                        format!(
+                            "pid={:?}:op={:?}:gate={:?}:delivered={:?}:units={:?}:err={:?}",
+                            row.get("pid"),
+                            row.get("op"),
+                            row.get("gate"),
+                            row.get("delivered"),
+                            row.get("unit_ids"),
+                            row.get("error")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        summaries.push(format!(
+            "{route_key}:{state}:active_pids={active_pids}:publish={route_publish_status}:publish_reason={route_publish_reason}:trusted_reason={trusted_exposure_reason}:apps={apps:?}"
+        ));
     }
     summaries
 }
@@ -974,4 +1023,31 @@ fn unique_suffix() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steady_cpu_sample_pids_ignore_internal_managed_pids_in_favor_of_host_descendants() {
+        assert_eq!(
+            steady_cpu_sample_pids_for_node(
+                4100,
+                &BTreeSet::from([2, 3]),
+                &BTreeSet::from([4101, 4102]),
+            ),
+            vec![4100, 4101, 4102],
+            "cpu_budget steady sampling must stay on real host pids instead of internal supervisor pids like 2/3"
+        );
+    }
+
+    #[test]
+    fn steady_cpu_sample_pids_keep_only_daemon_when_no_host_descendants_exist() {
+        assert_eq!(
+            steady_cpu_sample_pids_for_node(4100, &BTreeSet::from([2]), &BTreeSet::new()),
+            vec![4100],
+            "when no host descendants are present, cpu_budget should sample the daemon host pid only rather than host /proc/2"
+        );
+    }
 }

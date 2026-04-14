@@ -24,6 +24,7 @@ use crate::workers::sink_ipc::{
 };
 
 const SINK_WORKER_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(15);
+const SINK_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const SINK_WORKER_CONTROL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
@@ -42,10 +43,13 @@ fn can_retry_on_control_frame(err: &CnxError) -> bool {
     ) || is_retryable_worker_bridge_peer_error(err)
         || matches!(
             err,
-            CnxError::AccessDenied(message) | CnxError::PeerError(message)
+            CnxError::AccessDenied(message)
+                | CnxError::PeerError(message)
+                | CnxError::Internal(message)
                 if message.contains("drained/fenced")
                     && message.contains("grant attachments")
                     || message.contains("invalid or revoked grant attachment token")
+                    || message.contains("missing route state for channel_buffer")
         )
 }
 
@@ -80,6 +84,21 @@ fn is_retryable_worker_bridge_peer_error(err: &CnxError) -> bool {
         err,
         CnxError::PeerError(message) | CnxError::Internal(message)
             if is_retryable_worker_bridge_transport_error_message(message)
+    )
+}
+
+fn is_retryable_worker_bridge_reset(err: &CnxError) -> bool {
+    matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
+        || is_retryable_worker_bridge_peer_error(err)
+}
+
+fn is_missing_channel_buffer_route_state(err: &CnxError) -> bool {
+    matches!(
+        err,
+        CnxError::AccessDenied(message)
+            | CnxError::PeerError(message)
+            | CnxError::Internal(message)
+            if message.contains("missing route state for channel_buffer")
     )
 }
 
@@ -189,6 +208,22 @@ fn scheduled_groups_from_snapshot(
         .collect::<std::collections::BTreeSet<_>>()
 }
 
+fn ready_groups_from_snapshot(snapshot: &SinkStatusSnapshot) -> std::collections::BTreeSet<String> {
+    snapshot
+        .groups
+        .iter()
+        .filter(|group| group.initial_audit_completed)
+        .map(|group| group.group_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+}
+
+fn ready_groups_cover_scheduled_groups(
+    snapshot: &SinkStatusSnapshot,
+    scheduled_groups: &std::collections::BTreeSet<String>,
+) -> bool {
+    !scheduled_groups.is_empty() && scheduled_groups.is_subset(&ready_groups_from_snapshot(snapshot))
+}
+
 fn sink_status_origin_entry_group_id(entry: &str) -> &str {
     let origin = entry
         .split_once('=')
@@ -220,16 +255,7 @@ fn snapshot_has_stream_group_evidence(
 
 fn snapshot_has_ready_scheduled_groups(snapshot: &SinkStatusSnapshot) -> bool {
     let scheduled_groups = scheduled_groups_from_snapshot(snapshot);
-    if scheduled_groups.is_empty() {
-        return false;
-    }
-    let ready_groups = snapshot
-        .groups
-        .iter()
-        .filter(|group| group.initial_audit_completed)
-        .map(|group| group.group_id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    scheduled_groups.is_subset(&ready_groups)
+    ready_groups_cover_scheduled_groups(snapshot, &scheduled_groups)
 }
 
 fn snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(
@@ -569,6 +595,11 @@ pub(crate) struct SinkWorkerStatusSnapshotHook {
 }
 
 #[cfg(test)]
+pub(crate) struct SinkWorkerStatusResponseQueueHook {
+    pub replies: std::collections::VecDeque<Result<SinkWorkerResponse>>,
+}
+
+#[cfg(test)]
 pub(crate) struct SinkWorkerScheduledGroupsErrorHook {
     pub err: CnxError,
 }
@@ -630,6 +661,14 @@ fn sink_worker_status_error_hook_cell() -> &'static Mutex<Option<SinkWorkerStatu
 #[cfg(test)]
 fn sink_worker_status_snapshot_hook_cell() -> &'static Mutex<Option<SinkWorkerStatusSnapshotHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerStatusSnapshotHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn sink_worker_status_response_queue_hook_cell()
+-> &'static Mutex<Option<SinkWorkerStatusResponseQueueHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerStatusResponseQueueHook>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
@@ -741,6 +780,17 @@ pub(crate) fn install_sink_worker_status_snapshot_hook(hook: SinkWorkerStatusSna
 }
 
 #[cfg(test)]
+pub(crate) fn install_sink_worker_status_response_queue_hook(
+    hook: SinkWorkerStatusResponseQueueHook,
+) {
+    let mut guard = match sink_worker_status_response_queue_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn install_sink_worker_scheduled_groups_error_hook(
     hook: SinkWorkerScheduledGroupsErrorHook,
 ) {
@@ -841,6 +891,15 @@ pub(crate) fn clear_sink_worker_status_snapshot_hook() {
 }
 
 #[cfg(test)]
+pub(crate) fn clear_sink_worker_status_response_queue_hook() {
+    let mut guard = match sink_worker_status_response_queue_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
 fn take_sink_worker_status_error_hook() -> Option<CnxError> {
     let mut guard = match sink_worker_status_error_hook_cell().lock() {
         Ok(guard) => guard,
@@ -856,6 +915,20 @@ fn take_sink_worker_status_snapshot_hook() -> Option<SinkStatusSnapshot> {
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.take().map(|hook| hook.snapshot)
+}
+
+#[cfg(test)]
+fn take_sink_worker_status_response_queue_hook() -> Option<Result<SinkWorkerResponse>> {
+    let mut guard = match sink_worker_status_response_queue_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let hook = guard.as_mut()?;
+    let reply = hook.replies.pop_front();
+    if hook.replies.is_empty() {
+        *guard = None;
+    }
+    reply
 }
 
 #[cfg(test)]
@@ -1183,6 +1256,70 @@ impl SinkWorkerClientHandle {
         Ok(())
     }
 
+    fn retain_cached_status_for_surviving_roots(
+        &self,
+        roots: &[crate::source::config::RootSpec],
+    ) -> Result<()> {
+        let surviving_groups = roots
+            .iter()
+            .map(|root| root.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        {
+            let mut guard = self.scheduled_groups_cache.lock().map_err(|_| {
+                CnxError::Internal("sink worker scheduled groups cache lock poisoned".into())
+            })?;
+            *guard = (!surviving_groups.is_empty()).then_some(surviving_groups.clone());
+        }
+
+        let filter_group_entries =
+            |entries_by_node: &mut std::collections::BTreeMap<String, Vec<String>>| {
+                entries_by_node.retain(|_, entries| {
+                    entries.retain(|entry| {
+                        surviving_groups.contains(sink_status_origin_entry_group_id(entry))
+                    });
+                    !entries.is_empty()
+                });
+            };
+
+        let mut guard = self
+            .status_cache
+            .lock()
+            .map_err(|_| CnxError::Internal("sink worker status cache lock poisoned".into()))?;
+        guard.groups.retain(|group| surviving_groups.contains(&group.group_id));
+        guard.scheduled_groups_by_node.retain(|_, groups| {
+            groups.retain(|group_id| surviving_groups.contains(group_id));
+            !groups.is_empty()
+        });
+        filter_group_entries(&mut guard.last_received_origins_by_node);
+        filter_group_entries(&mut guard.received_origin_counts_by_node);
+        filter_group_entries(&mut guard.stream_received_origin_counts_by_node);
+        filter_group_entries(&mut guard.stream_received_path_origin_counts_by_node);
+        filter_group_entries(&mut guard.stream_ready_origin_counts_by_node);
+        filter_group_entries(&mut guard.stream_ready_path_origin_counts_by_node);
+        filter_group_entries(&mut guard.stream_deferred_origin_counts_by_node);
+        filter_group_entries(&mut guard.stream_dropped_origin_counts_by_node);
+        filter_group_entries(&mut guard.stream_applied_origin_counts_by_node);
+        filter_group_entries(&mut guard.stream_applied_path_origin_counts_by_node);
+        guard.live_nodes = guard.groups.iter().map(|group| group.live_nodes).sum();
+        guard.tombstoned_count = guard.groups.iter().map(|group| group.tombstoned_count).sum();
+        guard.attested_count = guard.groups.iter().map(|group| group.attested_count).sum();
+        guard.suspect_count = guard.groups.iter().map(|group| group.suspect_count).sum();
+        guard.blind_spot_count = guard.groups.iter().map(|group| group.blind_spot_count).sum();
+        guard.shadow_time_us = guard
+            .groups
+            .iter()
+            .map(|group| group.shadow_time_us)
+            .max()
+            .unwrap_or(0);
+        guard.estimated_heap_bytes = guard
+            .groups
+            .iter()
+            .map(|group| group.estimated_heap_bytes)
+            .sum();
+        Ok(())
+    }
+
     async fn with_started_retry<T, F, Fut>(&self, op: F) -> Result<T>
     where
         F: Fn(TypedWorkerClient<SinkWorkerRpc>) -> Fut,
@@ -1219,7 +1356,9 @@ impl SinkWorkerClientHandle {
         result
     }
 
-    async fn reconnect_shared_worker_client(&self) -> Result<()> {
+    async fn replace_shared_worker_client(&self) -> Result<Arc<TypedRuntimeWorkerClient<SinkWorkerRpc, SourceConfig>>> {
+        #[cfg(test)]
+        notify_sink_worker_retry_reset();
         let replacement = SharedSinkWorkerClient {
             instance_id: next_shared_sink_worker_instance_id(),
             client: Arc::new(self.worker_factory.connect(
@@ -1236,14 +1375,19 @@ impl SinkWorkerClientHandle {
         };
         self.control_state_replay_required
             .store(1, Ordering::Release);
-        let _ = stale_client.shutdown(Duration::from_millis(250)).await;
+        Ok(stale_client)
+    }
+
+    async fn reconnect_shared_worker_client_detached(&self) -> Result<()> {
+        let stale_client = self.replace_shared_worker_client().await?;
+        tokio::spawn(async move {
+            let _ = stale_client.shutdown(Duration::from_millis(250)).await;
+        });
         Ok(())
     }
 
     async fn reset_shared_worker_client_for_retry(&self) -> Result<()> {
-        #[cfg(test)]
-        notify_sink_worker_retry_reset();
-        self.reconnect_shared_worker_client().await
+        self.reconnect_shared_worker_client_detached().await
     }
 
     async fn retain_control_signals(&self, signals: &[SinkControlSignal]) {
@@ -1385,7 +1529,7 @@ impl SinkWorkerClientHandle {
         .await?;
         self.update_cached_logical_roots(roots.clone())?;
         self.update_cached_runtime_config(&roots, &host_object_grants)?;
-        self.update_cached_status_snapshot(SinkStatusSnapshot::default())
+        self.retain_cached_status_for_surviving_roots(&roots)
     }
 
     pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
@@ -1548,7 +1692,7 @@ impl SinkWorkerClientHandle {
             {
                 if self.existing_client().await?.is_some() {
                     match self
-                        .status_snapshot_probe_once_with_timeout(Duration::from_millis(250))
+                        .status_snapshot_with_timeout(Duration::from_millis(350))
                         .await
                     {
                         Ok(mut live_snapshot) => {
@@ -1590,6 +1734,22 @@ impl SinkWorkerClientHandle {
                                 return Err(CnxError::Timeout);
                             }
                             if snapshot_looks_scheduled_zero_uninitialized(&live_snapshot) {
+                                let scheduled_groups =
+                                    scheduled_groups_from_snapshot(&live_snapshot);
+                                if ready_groups_cover_scheduled_groups(
+                                    &cached_snapshot,
+                                    &scheduled_groups,
+                                ) {
+                                    if debug_control_scope_capture_enabled() {
+                                        eprintln!(
+                                            "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=control_inflight_scheduled_zero_uninitialized live={} cached={}",
+                                            self.node_id.0,
+                                            summarize_sink_status_snapshot(&live_snapshot),
+                                            summarize_sink_status_snapshot(&cached_snapshot)
+                                        );
+                                    }
+                                    return Ok(cached_snapshot);
+                                }
                                 if debug_control_scope_capture_enabled() {
                                     eprintln!(
                                         "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_zero_scheduled_snapshot {}",
@@ -1704,7 +1864,6 @@ impl SinkWorkerClientHandle {
                 if snapshot_looks_stale_empty(&cached_snapshot) {
                     self.republish_cached_scheduled_groups_into_empty_status_summary()?;
                 }
-                self.replay_retained_control_state_if_needed().await?;
                 match self
                     .status_snapshot_with_timeout(Duration::from_secs(5))
                     .await
@@ -1757,6 +1916,23 @@ impl SinkWorkerClientHandle {
                         if replay_required
                             && snapshot_looks_scheduled_replay_only_not_ready(&snapshot)
                         {
+                            let scheduled_groups = scheduled_groups_from_snapshot(&snapshot);
+                            if ready_groups_cover_scheduled_groups(
+                                &cached_snapshot,
+                                &scheduled_groups,
+                            ) {
+                                self.control_state_replay_required
+                                    .store(1, Ordering::Release);
+                                if debug_control_scope_capture_enabled() {
+                                    eprintln!(
+                                        "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=replay_required_not_ready_without_stream_evidence live={} cached={}",
+                                        self.node_id.0,
+                                        summarize_sink_status_snapshot(&snapshot),
+                                        summarize_sink_status_snapshot(&cached_snapshot)
+                                    );
+                                }
+                                return Ok(cached_snapshot);
+                            }
                             self.control_state_replay_required
                                 .store(1, Ordering::Release);
                             if debug_control_scope_capture_enabled() {
@@ -1769,6 +1945,21 @@ impl SinkWorkerClientHandle {
                             return Err(CnxError::Timeout);
                         }
                         if snapshot_looks_scheduled_zero_uninitialized(&snapshot) {
+                            let scheduled_groups = scheduled_groups_from_snapshot(&snapshot);
+                            if ready_groups_cover_scheduled_groups(
+                                &cached_snapshot,
+                                &scheduled_groups,
+                            ) {
+                                if debug_control_scope_capture_enabled() {
+                                    eprintln!(
+                                        "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=scheduled_zero_uninitialized live={} cached={}",
+                                        self.node_id.0,
+                                        summarize_sink_status_snapshot(&snapshot),
+                                        summarize_sink_status_snapshot(&cached_snapshot)
+                                    );
+                                }
+                                return Ok(cached_snapshot);
+                            }
                             if debug_control_scope_capture_enabled() {
                                 eprintln!(
                                     "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=scheduled_zero_uninitialized {}",
@@ -1876,6 +2067,16 @@ impl SinkWorkerClientHandle {
         self.replay_retained_control_state_if_needed().await?;
         let client = self.client().await?;
         #[cfg(test)]
+        if let Some(reply) = take_sink_worker_status_response_queue_hook() {
+            return match reply? {
+                SinkWorkerResponse::StatusSnapshot(snapshot) => Ok(snapshot),
+                other => Err(CnxError::ProtocolViolation(format!(
+                    "unexpected sink worker response for status snapshot: {:?}",
+                    other
+                ))),
+            };
+        }
+        #[cfg(test)]
         if let Some(snapshot) = take_sink_worker_status_snapshot_hook() {
             return Ok(snapshot);
         }
@@ -1900,9 +2101,15 @@ impl SinkWorkerClientHandle {
             if attempt_timeout.is_zero() {
                 return Err(CnxError::Timeout);
             }
+            let replay_required_for_attempt =
+                self.control_state_replay_required.load(Ordering::Acquire) > 0;
             self.replay_retained_control_state_if_needed().await?;
             let rpc_result = self
                 .with_started_retry(|client| async move {
+                    #[cfg(test)]
+                    if let Some(reply) = take_sink_worker_status_response_queue_hook() {
+                        return reply;
+                    }
                     #[cfg(test)]
                     if let Some(snapshot) = take_sink_worker_status_snapshot_hook() {
                         return Ok(SinkWorkerResponse::StatusSnapshot(snapshot));
@@ -1916,12 +2123,17 @@ impl SinkWorkerClientHandle {
                 })
                 .await;
             match rpc_result {
+                Ok(SinkWorkerResponse::Ack)
+                    if replay_required_for_attempt && std::time::Instant::now() < deadline =>
+                {
+                    self.control_state_replay_required.store(1, Ordering::Release);
+                    self.reset_shared_worker_client_for_retry().await?;
+                }
                 Ok(response) => break response,
                 Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
                     self.reset_shared_worker_client_for_retry().await?;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(err) => return Err(err),
             }
@@ -2249,6 +2461,7 @@ impl SinkWorkerClientHandle {
             }
         }
         let deadline = std::time::Instant::now() + total_timeout;
+        let mut saw_missing_channel_buffer_route_state = false;
         loop {
             let now = std::time::Instant::now();
             let attempt_timeout =
@@ -2318,8 +2531,24 @@ impl SinkWorkerClientHandle {
                         );
                         return Err(err);
                     }
-                    self.reset_shared_worker_client_for_retry().await?;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if is_missing_channel_buffer_route_state(&err) {
+                        saw_missing_channel_buffer_route_state = true;
+                        self.reset_shared_worker_client_for_retry().await?;
+                        continue;
+                    }
+                    if saw_missing_channel_buffer_route_state && is_retryable_worker_bridge_reset(&err) {
+                        self.reconnect_shared_worker_client_detached().await?;
+                        eprintln!(
+                            "fs_meta_sink_worker_client: on_control_frame fail-fast node={} err={} lane=missing_channel_buffer_route_state_then_bridge_reset",
+                            self.node_id.0, err
+                        );
+                        return Err(err);
+                    }
+                    if is_retryable_worker_bridge_reset(&err) {
+                        self.reconnect_shared_worker_client_detached().await?;
+                    } else {
+                        self.reset_shared_worker_client_for_retry().await?;
+                    }
                 }
                 Err(err) => {
                     eprintln!(
@@ -2568,6 +2797,51 @@ impl SinkFacade {
                     .map(SinkControlSignal::envelope)
                     .collect::<Vec<_>>();
                 client.on_control_frame(envelopes).await
+            }
+        }
+    }
+
+    pub(crate) async fn apply_orchestration_signals_with_total_timeout(
+        &self,
+        signals: &[SinkControlSignal],
+        total_timeout: Duration,
+    ) -> Result<()> {
+        if total_timeout.is_zero() {
+            return Err(CnxError::Timeout);
+        }
+        // runtime_app owns the outer recovery loop for mixed source/sink recovery.
+        // Keep each nested sink-client control attempt short so retryable resets
+        // return to the caller instead of burning the full nested client budget.
+        let single_attempt_total_timeout =
+            std::cmp::min(total_timeout, SINK_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT);
+        match self {
+            Self::Local(sink) => {
+                match tokio::time::timeout(
+                    single_attempt_total_timeout,
+                    sink.apply_orchestration_signals(signals),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(CnxError::Timeout),
+                }
+            }
+            Self::Worker(client) => {
+                let envelopes = signals
+                    .iter()
+                    .map(SinkControlSignal::envelope)
+                    .collect::<Vec<_>>();
+                let rpc_timeout = std::cmp::min(
+                    SINK_WORKER_CONTROL_RPC_TIMEOUT,
+                    single_attempt_total_timeout,
+                );
+                client
+                    .on_control_frame_with_timeouts(
+                        envelopes,
+                        single_attempt_total_timeout,
+                        rpc_timeout,
+                    )
+                    .await
             }
         }
     }

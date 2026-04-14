@@ -86,6 +86,15 @@ fn is_retryable_worker_bridge_peer_error(err: &CnxError) -> bool {
     )
 }
 
+fn is_timeout_like_worker_control_reset(err: &CnxError) -> bool {
+    matches!(err, CnxError::Timeout)
+        || matches!(
+            err,
+            CnxError::PeerError(message) | CnxError::Internal(message)
+                if message.contains("operation timed out")
+        )
+}
+
 fn can_retry_update_logical_roots(err: &CnxError) -> bool {
     matches!(
         err,
@@ -118,6 +127,23 @@ fn can_retry_update_logical_roots(err: &CnxError) -> bool {
 
 fn can_retry_on_control_frame(err: &CnxError) -> bool {
     can_retry_update_logical_roots(err)
+}
+
+fn post_ack_schedule_refresh_exhaustion_error(err: &CnxError) -> Option<CnxError> {
+    let reason = match err {
+        CnxError::Timeout => "timeout",
+        CnxError::TransportClosed(_) | CnxError::ChannelClosed => "transport_closed",
+        CnxError::Internal(message) | CnxError::PeerError(message) | CnxError::AccessDenied(message)
+            if message.contains("missing route state for channel_buffer") =>
+        {
+            "missing_route_state"
+        }
+        other if can_retry_on_control_frame(other) => "retryable_reset",
+        _ => return None,
+    };
+    Some(CnxError::Internal(format!(
+        "source worker post-ack scheduled-groups refresh exhausted before scheduled groups converged ({reason})"
+    )))
 }
 
 fn can_retry_force_find(err: &CnxError) -> bool {
@@ -175,26 +201,6 @@ fn source_control_signals_require_post_ack_schedule_refresh(
     })
 }
 
-fn source_control_signals_can_use_primed_schedule_timeout_fallback(
-    signals: &[SourceControlSignal],
-) -> bool {
-    let mut saw_activate = false;
-    for signal in signals {
-        match signal {
-            SourceControlSignal::Activate { bound_scopes, .. } if !bound_scopes.is_empty() => {
-                saw_activate = true;
-            }
-            SourceControlSignal::Activate { .. } => {}
-            SourceControlSignal::RuntimeHostGrantChange { .. }
-            | SourceControlSignal::Tick { .. }
-            | SourceControlSignal::ManualRescan { .. }
-            | SourceControlSignal::Passthrough(_) => {}
-            SourceControlSignal::Deactivate { .. } => return false,
-        }
-    }
-    saw_activate
-}
-
 fn source_control_signals_are_generation_one_activate_only(
     signals: &[SourceControlSignal],
 ) -> bool {
@@ -208,38 +214,6 @@ fn source_control_signals_are_generation_one_activate_only(
         }
     }
     saw_activate
-}
-
-fn primed_schedule_cache_covers_signals(
-    cache: &SourceWorkerSnapshotCache,
-    node_id: &NodeId,
-    signals: &[SourceControlSignal],
-) -> bool {
-    let has_source_groups =
-        cached_local_scheduled_groups(node_id, &cache.scheduled_source_groups_by_node).is_some();
-    let has_scan_groups =
-        cached_local_scheduled_groups(node_id, &cache.scheduled_scan_groups_by_node).is_some();
-    let needs_source_groups = signals.iter().any(|signal| {
-        matches!(
-            signal,
-            SourceControlSignal::Activate {
-                unit: SourceRuntimeUnit::Source,
-                bound_scopes,
-                ..
-            } if !bound_scopes.is_empty()
-        )
-    });
-    let needs_scan_groups = signals.iter().any(|signal| {
-        matches!(
-            signal,
-            SourceControlSignal::Activate {
-                unit: SourceRuntimeUnit::Scan,
-                bound_scopes,
-                ..
-            } if !bound_scopes.is_empty()
-        )
-    });
-    (!needs_source_groups || has_source_groups) && (!needs_scan_groups || has_scan_groups)
 }
 
 fn debug_control_scope_capture_enabled() -> bool {
@@ -1867,7 +1841,9 @@ impl SourceWorkerClientHandle {
         self.shared_worker().await.0
     }
 
-    async fn reconnect_shared_worker_client(&self) -> Result<()> {
+    async fn replace_shared_worker_client(
+        &self,
+    ) -> Result<Arc<TypedRuntimeWorkerClient<SourceWorkerRpc, SourceConfig>>> {
         let replacement = SharedSourceWorkerClient {
             instance_id: next_shared_source_worker_instance_id(),
             client: Arc::new(self.worker_factory.connect(
@@ -1884,27 +1860,25 @@ impl SourceWorkerClientHandle {
         };
         self.control_state_replay_required
             .store(true, Ordering::Release);
+        Ok(stale_client)
+    }
+
+    async fn reconnect_shared_worker_client(&self) -> Result<()> {
+        let stale_client = self.replace_shared_worker_client().await?;
         let _ = stale_client.shutdown(Duration::from_millis(250)).await;
         Ok(())
     }
 
+    async fn reconnect_shared_worker_client_detached(&self) -> Result<()> {
+        let stale_client = self.replace_shared_worker_client().await?;
+        tokio::spawn(async move {
+            let _ = stale_client.shutdown(Duration::from_millis(250)).await;
+        });
+        Ok(())
+    }
+
     pub(crate) async fn reconnect_after_fail_closed_control_error(&self) -> Result<()> {
-        let replacement = SharedSourceWorkerClient {
-            instance_id: next_shared_source_worker_instance_id(),
-            client: Arc::new(self.worker_factory.connect(
-                self.node_id.clone(),
-                self.config.clone(),
-                self.worker_binding.clone(),
-            )?),
-        };
-        let stale_client = {
-            let mut guard = self._shared.worker.lock().await;
-            let stale = guard.client.clone();
-            *guard = replacement;
-            stale
-        };
-        self.control_state_replay_required
-            .store(true, Ordering::Release);
+        let stale_client = self.replace_shared_worker_client().await?;
         let _ = stale_client.shutdown(Duration::from_millis(250)).await;
         Ok(())
     }
@@ -3209,6 +3183,9 @@ impl SourceWorkerClientHandle {
         } else {
             false
         };
+        let generation_one_activate_only = decoded_signals.as_ref().is_some_and(|signals| {
+            source_control_signals_are_generation_one_activate_only(signals)
+        });
         let fail_fast_on_control_frame_bridge_reset = fail_fast_generation_one_activate_replay
             || is_restart_deferred_retire_pending_deactivate_batch(&envelopes);
         eprintln!(
@@ -3230,6 +3207,9 @@ impl SourceWorkerClientHandle {
             }
         }
         let deadline = std::time::Instant::now() + total_timeout;
+        let fail_fast_short_caller_budget_bridge_reset =
+            total_timeout <= SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT;
+        let mut saw_timeout_like_generation_one_reset = false;
         loop {
             let now = std::time::Instant::now();
             let worker = self.worker_client().await;
@@ -3338,30 +3318,7 @@ impl SourceWorkerClientHandle {
                                 err,
                                 recovered_live_worker_during_refresh,
                             } = failure;
-                            let can_fail_closed_from_primed_cache = matches!(
-                                err,
-                                CnxError::Timeout
-                            ) && decoded_signals
-                                .as_ref()
-                                .is_some_and(|signals| {
-                                    (!replay_required_before_refresh
-                                        || recovered_live_worker_during_refresh)
-                                        && source_control_signals_can_use_primed_schedule_timeout_fallback(
-                                            signals,
-                                        ) && self.with_cache_mut(|cache| {
-                                        primed_schedule_cache_covers_signals(
-                                            cache,
-                                            &self.node_id,
-                                            signals,
-                                        )
-                                    })
-                                });
-                            if can_fail_closed_from_primed_cache {
-                                eprintln!(
-                                    "fs_meta_source_worker_client: refresh_cached_scheduled_groups fail-closed node={} err={}",
-                                    self.node_id.0, err
-                                );
-                            } else if replay_required_before_refresh
+                            if replay_required_before_refresh
                                 && matches!(err, CnxError::Timeout)
                                 && !recovered_live_worker_during_refresh
                             {
@@ -3373,6 +3330,14 @@ impl SourceWorkerClientHandle {
                                     "source worker replay-required scheduled-groups refresh exhausted before a live worker recovered"
                                         .to_string(),
                                 ));
+                            } else if let Some(sharp_err) =
+                                post_ack_schedule_refresh_exhaustion_error(&err)
+                            {
+                                eprintln!(
+                                    "fs_meta_source_worker_client: refresh_cached_scheduled_groups fail-closed node={} err={}",
+                                    self.node_id.0, sharp_err
+                                );
+                                return Err(sharp_err);
                             } else {
                                 return Err(err);
                             }
@@ -3395,7 +3360,9 @@ impl SourceWorkerClientHandle {
                     )));
                 }
                 Err(err)
-                    if fail_fast_on_control_frame_bridge_reset
+                    if (fail_fast_on_control_frame_bridge_reset
+                        || (generation_one_activate_only
+                            && saw_timeout_like_generation_one_reset))
                         && (matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
                             || is_retryable_worker_bridge_peer_error(&err)) =>
                 {
@@ -3406,8 +3373,24 @@ impl SourceWorkerClientHandle {
                     return Err(err);
                 }
                 Err(err)
+                    if fail_fast_short_caller_budget_bridge_reset
+                        && (matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
+                            || is_retryable_worker_bridge_peer_error(&err)) =>
+                {
+                    eprintln!(
+                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={} fail_fast_short_caller_budget_bridge_reset=true",
+                        self.node_id.0, err
+                    );
+                    return Err(err);
+                }
+                Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
+                    if generation_one_activate_only && is_timeout_like_worker_control_reset(&err) {
+                        saw_timeout_like_generation_one_reset = true;
+                        self.reconnect_shared_worker_client_detached().await?;
+                        continue;
+                    }
                     self.reconnect_shared_worker_client().await?;
                     tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
                 }
