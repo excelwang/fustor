@@ -1431,12 +1431,10 @@ fn sink_holder_snapshot_for_node(
     if snapshot.active_pids.is_empty() && !snapshot.bound_scopes.is_empty() {
         let node = cluster.node(node_name)?;
         snapshot.active_pids.extend(
-            sink_holder_active_pids_from_registry_fallback(
-                &node.home_dir,
-                app_id,
-                &snapshot,
-            )
-            .map_err(|err| format!("read sink holder registry fallback failed for {node_name}: {err}"))?,
+            sink_holder_active_pids_from_registry_fallback(&node.home_dir, app_id, &snapshot)
+                .map_err(|err| {
+                    format!("read sink holder registry fallback failed for {node_name}: {err}")
+                })?,
         );
     }
     Ok(snapshot)
@@ -2546,8 +2544,8 @@ fn sink_holder_snapshot_ignores_stale_activated_scope_after_later_deactivate_for
 }
 
 #[test]
-fn sink_holder_registry_fallback_promotes_current_sink_pid_when_route_is_activated_but_active_pids_are_empty()
- {
+fn sink_holder_registry_fallback_promotes_current_sink_pid_when_route_is_activated_but_active_pids_are_empty(
+) {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let registry_path = tmp.path().join("registry.json");
     std::fs::write(

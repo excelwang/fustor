@@ -221,7 +221,8 @@ fn ready_groups_cover_scheduled_groups(
     snapshot: &SinkStatusSnapshot,
     scheduled_groups: &std::collections::BTreeSet<String>,
 ) -> bool {
-    !scheduled_groups.is_empty() && scheduled_groups.is_subset(&ready_groups_from_snapshot(snapshot))
+    !scheduled_groups.is_empty()
+        && scheduled_groups.is_subset(&ready_groups_from_snapshot(snapshot))
 }
 
 fn sink_status_origin_entry_group_id(entry: &str) -> &str {
@@ -485,6 +486,24 @@ struct SharedSinkWorkerClient {
 struct RetainedSinkWorkerControlState {
     latest_host_grant_change: Option<SinkControlSignal>,
     active_by_route: std::collections::BTreeMap<(String, String), SinkControlSignal>,
+}
+
+fn retained_scheduled_group_ids(
+    retained: &RetainedSinkWorkerControlState,
+) -> Option<std::collections::BTreeSet<String>> {
+    let groups = retained
+        .active_by_route
+        .values()
+        .filter_map(|signal| match signal {
+            SinkControlSignal::Activate { bound_scopes, .. } => Some(bound_scopes.as_slice()),
+            _ => None,
+        })
+        .flat_map(|bound_scopes| bound_scopes.iter())
+        .map(|scope| scope.scope_id.trim())
+        .filter(|scope_id| !scope_id.is_empty())
+        .map(|scope_id| scope_id.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    (!groups.is_empty()).then_some(groups)
 }
 
 struct InflightControlOpGuard {
@@ -1138,6 +1157,11 @@ impl SinkWorkerClientHandle {
         self.worker_client().await.existing_client().await
     }
 
+    async fn current_generation_tick_fast_path_eligible(&self) -> bool {
+        self.control_state_replay_required.load(Ordering::Acquire) == 0
+            && self.existing_client().await.ok().flatten().is_some()
+    }
+
     fn current_config(&self) -> Result<SourceConfig> {
         self.config
             .lock()
@@ -1224,15 +1248,22 @@ impl SinkWorkerClientHandle {
             })
     }
 
-    fn update_cached_scheduled_group_ids(
+    fn replace_cached_scheduled_group_ids(
         &self,
-        groups: &std::collections::BTreeSet<String>,
+        groups: Option<std::collections::BTreeSet<String>>,
     ) -> Result<()> {
         let mut guard = self.scheduled_groups_cache.lock().map_err(|_| {
             CnxError::Internal("sink worker scheduled groups cache lock poisoned".into())
         })?;
-        *guard = Some(groups.clone());
+        *guard = groups;
         Ok(())
+    }
+
+    fn update_cached_scheduled_group_ids(
+        &self,
+        groups: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        self.replace_cached_scheduled_group_ids(Some(groups.clone()))
     }
 
     fn republish_cached_scheduled_groups_into_empty_status_summary(&self) -> Result<()> {
@@ -1246,7 +1277,14 @@ impl SinkWorkerClientHandle {
             .status_cache
             .lock()
             .map_err(|_| CnxError::Internal("sink worker status cache lock poisoned".into()))?;
-        if !guard.groups.is_empty() || !guard.scheduled_groups_by_node.is_empty() {
+        if !guard.scheduled_groups_by_node.is_empty() {
+            return Ok(());
+        }
+        let zero_rows_only = !guard.groups.is_empty()
+            && guard.groups.iter().all(|group| {
+                !group.initial_audit_completed && group.live_nodes == 0 && group.total_nodes == 0
+            });
+        if !guard.groups.is_empty() && !zero_rows_only {
             return Ok(());
         }
         guard.scheduled_groups_by_node = std::collections::BTreeMap::from([(
@@ -1286,7 +1324,9 @@ impl SinkWorkerClientHandle {
             .status_cache
             .lock()
             .map_err(|_| CnxError::Internal("sink worker status cache lock poisoned".into()))?;
-        guard.groups.retain(|group| surviving_groups.contains(&group.group_id));
+        guard
+            .groups
+            .retain(|group| surviving_groups.contains(&group.group_id));
         guard.scheduled_groups_by_node.retain(|_, groups| {
             groups.retain(|group_id| surviving_groups.contains(group_id));
             !groups.is_empty()
@@ -1302,10 +1342,18 @@ impl SinkWorkerClientHandle {
         filter_group_entries(&mut guard.stream_applied_origin_counts_by_node);
         filter_group_entries(&mut guard.stream_applied_path_origin_counts_by_node);
         guard.live_nodes = guard.groups.iter().map(|group| group.live_nodes).sum();
-        guard.tombstoned_count = guard.groups.iter().map(|group| group.tombstoned_count).sum();
+        guard.tombstoned_count = guard
+            .groups
+            .iter()
+            .map(|group| group.tombstoned_count)
+            .sum();
         guard.attested_count = guard.groups.iter().map(|group| group.attested_count).sum();
         guard.suspect_count = guard.groups.iter().map(|group| group.suspect_count).sum();
-        guard.blind_spot_count = guard.groups.iter().map(|group| group.blind_spot_count).sum();
+        guard.blind_spot_count = guard
+            .groups
+            .iter()
+            .map(|group| group.blind_spot_count)
+            .sum();
         guard.shadow_time_us = guard
             .groups
             .iter()
@@ -1356,7 +1404,9 @@ impl SinkWorkerClientHandle {
         result
     }
 
-    async fn replace_shared_worker_client(&self) -> Result<Arc<TypedRuntimeWorkerClient<SinkWorkerRpc, SourceConfig>>> {
+    async fn replace_shared_worker_client(
+        &self,
+    ) -> Result<Arc<TypedRuntimeWorkerClient<SinkWorkerRpc, SourceConfig>>> {
         #[cfg(test)]
         notify_sink_worker_retry_reset();
         let replacement = SharedSinkWorkerClient {
@@ -1390,31 +1440,35 @@ impl SinkWorkerClientHandle {
         self.reconnect_shared_worker_client_detached().await
     }
 
-    async fn retain_control_signals(&self, signals: &[SinkControlSignal]) {
-        let mut retained = self.retained_control_state.lock().await;
-        for signal in signals {
-            match signal {
-                SinkControlSignal::RuntimeHostGrantChange { .. } => {
-                    retained.latest_host_grant_change = Some(signal.clone());
+    async fn retain_control_signals(&self, signals: &[SinkControlSignal]) -> Result<()> {
+        let scheduled_groups = {
+            let mut retained = self.retained_control_state.lock().await;
+            for signal in signals {
+                match signal {
+                    SinkControlSignal::RuntimeHostGrantChange { .. } => {
+                        retained.latest_host_grant_change = Some(signal.clone());
+                    }
+                    SinkControlSignal::Activate {
+                        unit, route_key, ..
+                    } => {
+                        retained.active_by_route.insert(
+                            (unit.unit_id().to_string(), route_key.clone()),
+                            signal.clone(),
+                        );
+                    }
+                    SinkControlSignal::Deactivate {
+                        unit, route_key, ..
+                    } => {
+                        retained
+                            .active_by_route
+                            .remove(&(unit.unit_id().to_string(), route_key.clone()));
+                    }
+                    SinkControlSignal::Tick { .. } | SinkControlSignal::Passthrough(_) => {}
                 }
-                SinkControlSignal::Activate {
-                    unit, route_key, ..
-                } => {
-                    retained.active_by_route.insert(
-                        (unit.unit_id().to_string(), route_key.clone()),
-                        signal.clone(),
-                    );
-                }
-                SinkControlSignal::Deactivate {
-                    unit, route_key, ..
-                } => {
-                    retained
-                        .active_by_route
-                        .remove(&(unit.unit_id().to_string(), route_key.clone()));
-                }
-                SinkControlSignal::Tick { .. } | SinkControlSignal::Passthrough(_) => {}
             }
-        }
+            retained_scheduled_group_ids(&retained)
+        };
+        self.replace_cached_scheduled_group_ids(scheduled_groups)
     }
 
     async fn replay_retained_control_state_if_needed(&self) -> Result<()> {
@@ -1890,6 +1944,20 @@ impl SinkWorkerClientHandle {
                                 summarize_sink_status_snapshot(&snapshot)
                             );
                         }
+                        if snapshot_looks_stale_empty(&snapshot)
+                            && snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(
+                                &cached_snapshot,
+                            )
+                        {
+                            if debug_control_scope_capture_enabled() {
+                                eprintln!(
+                                    "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=stale_empty_after_retry_reset cached={}",
+                                    self.node_id.0,
+                                    summarize_sink_status_snapshot(&cached_snapshot)
+                                );
+                            }
+                            return Ok(cached_snapshot);
+                        }
                         if snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(
                             &snapshot,
                         ) {
@@ -1995,11 +2063,19 @@ impl SinkWorkerClientHandle {
                     }
                     Err(err) => {
                         let snapshot = self.cached_status_snapshot()?;
-                        if snapshot_looks_stale_empty(&snapshot)
+                        if snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(&snapshot)
+                        {
+                            if debug_control_scope_capture_enabled() {
+                                eprintln!(
+                                    "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=worker_unavailable_missing_scheduled_group_rows_after_stream_evidence err={} {}",
+                                    self.node_id.0,
+                                    err,
+                                    summarize_sink_status_snapshot(&snapshot)
+                                );
+                            }
+                            Ok(snapshot)
+                        } else if snapshot_looks_stale_empty(&snapshot)
                             || snapshot_looks_scheduled_zero_uninitialized(&snapshot)
-                            || snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(
-                                &snapshot,
-                            )
                             || snapshot_looks_partially_stale_split(&snapshot)
                         {
                             if snapshot_looks_stale_empty(&snapshot) {
@@ -2126,7 +2202,8 @@ impl SinkWorkerClientHandle {
                 Ok(SinkWorkerResponse::Ack)
                     if replay_required_for_attempt && std::time::Instant::now() < deadline =>
                 {
-                    self.control_state_replay_required.store(1, Ordering::Release);
+                    self.control_state_replay_required
+                        .store(1, Ordering::Release);
                     self.reset_shared_worker_client_for_retry().await?;
                 }
                 Ok(response) => break response,
@@ -2502,7 +2579,7 @@ impl SinkWorkerClientHandle {
             match rpc_result {
                 Ok(SinkWorkerResponse::Ack) => {
                     if let Some(signals) = decoded_signals.as_ref() {
-                        self.retain_control_signals(signals).await;
+                        self.retain_control_signals(signals).await?;
                     }
                     eprintln!(
                         "fs_meta_sink_worker_client: on_control_frame done node={} ok=true",
@@ -2536,7 +2613,9 @@ impl SinkWorkerClientHandle {
                         self.reset_shared_worker_client_for_retry().await?;
                         continue;
                     }
-                    if saw_missing_channel_buffer_route_state && is_retryable_worker_bridge_reset(&err) {
+                    if saw_missing_channel_buffer_route_state
+                        && is_retryable_worker_bridge_reset(&err)
+                    {
                         self.reconnect_shared_worker_client_detached().await?;
                         eprintln!(
                             "fs_meta_sink_worker_client: on_control_frame fail-fast node={} err={} lane=missing_channel_buffer_route_state_then_bridge_reset",
@@ -2785,6 +2864,13 @@ impl SinkFacade {
         self.apply_orchestration_signals(&signals).await
     }
 
+    pub(crate) async fn current_generation_tick_fast_path_eligible(&self) -> bool {
+        match self {
+            Self::Local(_) => true,
+            Self::Worker(client) => client.current_generation_tick_fast_path_eligible().await,
+        }
+    }
+
     pub(crate) async fn apply_orchestration_signals(
         &self,
         signals: &[SinkControlSignal],
@@ -2812,8 +2898,10 @@ impl SinkFacade {
         // runtime_app owns the outer recovery loop for mixed source/sink recovery.
         // Keep each nested sink-client control attempt short so retryable resets
         // return to the caller instead of burning the full nested client budget.
-        let single_attempt_total_timeout =
-            std::cmp::min(total_timeout, SINK_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT);
+        let single_attempt_total_timeout = std::cmp::min(
+            total_timeout,
+            SINK_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT,
+        );
         match self {
             Self::Local(sink) => {
                 match tokio::time::timeout(

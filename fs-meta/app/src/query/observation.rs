@@ -128,7 +128,10 @@ mod tests {
     use crate::sink::SinkGroupStatusSnapshot;
     use crate::source::{SourceConcreteRootHealthSnapshot, SourceLogicalRootHealthSnapshot};
 
-    fn concrete_root(logical_root_id: &str, is_group_primary: bool) -> SourceConcreteRootHealthSnapshot {
+    fn concrete_root(
+        logical_root_id: &str,
+        is_group_primary: bool,
+    ) -> SourceConcreteRootHealthSnapshot {
         SourceConcreteRootHealthSnapshot {
             root_key: format!("{logical_root_id}@test"),
             logical_root_id: logical_root_id.to_string(),
@@ -212,10 +215,7 @@ mod tests {
                     coverage_mode: "realtime_hotset_plus_audit".to_string(),
                 },
             ],
-            concrete_roots: vec![
-                concrete_root("nfs1", false),
-                concrete_root("nfs2", false),
-            ],
+            concrete_roots: vec![concrete_root("nfs1", false), concrete_root("nfs2", false)],
             ..SourceStatusSnapshot::default()
         };
         let sink_status = SinkStatusSnapshot {

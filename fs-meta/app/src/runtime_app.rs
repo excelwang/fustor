@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
@@ -650,22 +652,58 @@ fn scheduled_sink_owner_node_for_group(
     scheduled_nodes.into_iter().next()
 }
 
+fn selected_group_bridge_readiness_rank(
+    request: &InternalQueryRequest,
+    snapshot: &crate::sink::SinkStatusSnapshot,
+) -> u8 {
+    let Some(selected_group) = request.scope.selected_group.as_deref() else {
+        return 0;
+    };
+    let trusted_root_tree_request = request.op == crate::query::QueryOp::Tree
+        && request.scope.path.as_slice() == b"/"
+        && request.tree_options.as_ref().is_some_and(|options| {
+            options.read_class == crate::query::ReadClass::TrustedMaterialized
+        });
+    snapshot
+        .groups
+        .iter()
+        .find(|group| group.group_id == selected_group)
+        .map(|group| {
+            if trusted_root_tree_request && group.initial_audit_completed && group.total_nodes > 0 {
+                2
+            } else if group.live_nodes > 0 {
+                1
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0)
+}
+
 fn selected_group_sink_query_bridge_snapshot<'a>(
     request: &InternalQueryRequest,
     live_snapshot: Option<&'a crate::sink::SinkStatusSnapshot>,
     cached_snapshot: Option<&'a crate::sink::SinkStatusSnapshot>,
 ) -> Option<&'a crate::sink::SinkStatusSnapshot> {
-    if let Some(snapshot) = live_snapshot
-        && selected_group_bridge_eligible_from_sink_status(request, snapshot)
-    {
-        return Some(snapshot);
+    let live_eligible = live_snapshot
+        .filter(|snapshot| selected_group_bridge_eligible_from_sink_status(request, snapshot));
+    let cached_eligible = cached_snapshot
+        .filter(|snapshot| selected_group_bridge_eligible_from_sink_status(request, snapshot));
+
+    match (live_eligible, cached_eligible) {
+        (Some(live), Some(cached)) if request.scope.selected_group.is_some() => {
+            if selected_group_bridge_readiness_rank(request, cached)
+                > selected_group_bridge_readiness_rank(request, live)
+            {
+                Some(cached)
+            } else {
+                Some(live)
+            }
+        }
+        (Some(live), _) => Some(live),
+        (_, Some(cached)) => Some(cached),
+        _ => live_snapshot.or(cached_snapshot),
     }
-    if let Some(snapshot) = cached_snapshot
-        && selected_group_bridge_eligible_from_sink_status(request, snapshot)
-    {
-        return Some(snapshot);
-    }
-    live_snapshot.or(cached_snapshot)
 }
 
 fn selected_group_sink_query_bridge_bindings(
@@ -1422,8 +1460,130 @@ struct SourceApplyPauseHook {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+struct SinkApplyPauseHook {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
 struct SourceApplyErrorQueueHook {
     errs: std::collections::VecDeque<CnxError>,
+}
+
+#[cfg(test)]
+fn source_apply_entry_count_hook_cell() -> &'static StdMutex<Option<Arc<AtomicUsize>>> {
+    static CELL: OnceLock<StdMutex<Option<Arc<AtomicUsize>>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn install_source_apply_entry_count_hook(count: Arc<AtomicUsize>) {
+    let mut guard = match source_apply_entry_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(count);
+}
+
+#[cfg(test)]
+fn clear_source_apply_entry_count_hook() {
+    let mut guard = match source_apply_entry_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+fn note_source_apply_entry_for_tests() {
+    let hook = {
+        let guard = match source_apply_entry_count_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(count) = hook {
+        count.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+fn sink_apply_entry_count_hook_cell() -> &'static StdMutex<Option<Arc<AtomicUsize>>> {
+    static CELL: OnceLock<StdMutex<Option<Arc<AtomicUsize>>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn install_sink_apply_entry_count_hook(count: Arc<AtomicUsize>) {
+    let mut guard = match sink_apply_entry_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(count);
+}
+
+#[cfg(test)]
+fn clear_sink_apply_entry_count_hook() {
+    let mut guard = match sink_apply_entry_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+fn note_sink_apply_entry_for_tests() {
+    let hook = {
+        let guard = match sink_apply_entry_count_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(count) = hook {
+        count.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+fn local_sink_status_republish_helper_entry_count_hook_cell(
+) -> &'static StdMutex<Option<Arc<AtomicUsize>>> {
+    static CELL: OnceLock<StdMutex<Option<Arc<AtomicUsize>>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn install_local_sink_status_republish_helper_entry_count_hook(count: Arc<AtomicUsize>) {
+    let mut guard = match local_sink_status_republish_helper_entry_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(count);
+}
+
+#[cfg(test)]
+fn clear_local_sink_status_republish_helper_entry_count_hook() {
+    let mut guard = match local_sink_status_republish_helper_entry_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+fn note_local_sink_status_republish_helper_entry_for_tests() {
+    let hook = {
+        let guard = match local_sink_status_republish_helper_entry_count_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(count) = hook {
+        count.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 #[cfg(test)]
@@ -1690,6 +1850,51 @@ fn take_source_apply_error_queue_hook() -> Option<CnxError> {
 async fn maybe_pause_before_source_apply() {
     let hook = {
         let guard = match source_apply_pause_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        hook.entered.notify_waiters();
+        release.await;
+    }
+}
+
+#[cfg(test)]
+fn sink_apply_pause_hook_cell() -> &'static StdMutex<Option<SinkApplyPauseHook>> {
+    static CELL: OnceLock<StdMutex<Option<SinkApplyPauseHook>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn install_sink_apply_pause_hook(hook: SinkApplyPauseHook) {
+    let mut guard = match sink_apply_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+fn clear_sink_apply_pause_hook() {
+    let mut guard = match sink_apply_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+async fn maybe_pause_before_sink_apply() {
+    let hook = {
+        let guard = match sink_apply_pause_hook_cell().lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -2039,6 +2244,8 @@ impl FSMetaApp {
         expected_groups: &std::collections::BTreeSet<String>,
         post_return_sink_replay_signals: &[SinkControlSignal],
     ) -> Result<()> {
+        #[cfg(test)]
+        note_local_sink_status_republish_helper_entry_for_tests();
         let summarize_cached_sink_status = |sink: &Arc<SinkFacade>| {
             sink.cached_status_snapshot()
                 .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
@@ -2120,6 +2327,26 @@ impl FSMetaApp {
                     }
                 }
                 Ok(Err(_)) | Err(_) => {}
+            }
+            let remaining_after_nonblocking_probe =
+                deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !remaining_after_nonblocking_probe.is_zero() {
+                match tokio::time::timeout(
+                    remaining_after_nonblocking_probe.min(Duration::from_millis(350)),
+                    sink.status_snapshot(),
+                )
+                .await
+                {
+                    Ok(Ok(snapshot))
+                        if sink_status_snapshot_ready_for_expected_groups(
+                            &snapshot,
+                            expected_groups,
+                        ) =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
+                }
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(CnxError::Internal(format!(
@@ -2703,7 +2930,7 @@ impl FSMetaApp {
             ));
         }
 
-        if !self.sink.is_worker() {
+        if self.sink.is_worker() {
             eprintln!("fs_meta_runtime_app: initialize_from_control sink.ensure_started begin");
             let ensure_started = self.sink.ensure_started();
             if let Some(deadline) = deadline {
@@ -3066,7 +3293,8 @@ impl FSMetaApp {
                                             continue;
                                         }
                                         if matches!(err, CnxError::Timeout)
-                                            && let Ok(cached_snapshot) = sink.cached_status_snapshot()
+                                            && let Ok(cached_snapshot) =
+                                                sink.cached_status_snapshot()
                                             && sink_status_snapshot_has_ready_scheduled_groups(
                                                 &cached_snapshot,
                                             )
@@ -3378,13 +3606,14 @@ impl FSMetaApp {
                                                 live_local_sink_status_snapshot.as_ref(),
                                                 cached_local_sink_status_snapshot.as_ref(),
                                             );
-                                        let local_selected_group_bridge_eligible = bridge_sink_status_snapshot
-                                            .map(|snapshot| {
-                                                selected_group_bridge_eligible_from_sink_status(
-                                                    &params, snapshot,
-                                                )
-                                            })
-                                            .unwrap_or(true);
+                                        let local_selected_group_bridge_eligible =
+                                            bridge_sink_status_snapshot
+                                                .map(|snapshot| {
+                                                    selected_group_bridge_eligible_from_sink_status(
+                                                        &params, snapshot,
+                                                    )
+                                                })
+                                                .unwrap_or(true);
                                         let should_bridge = should_bridge_selected_group_sink_query(
                                             &params,
                                             &events,
@@ -3463,8 +3692,7 @@ impl FSMetaApp {
             }
         }
     }
-
-}
+                                                }
                                                 Err(err) => {
                                                     eprintln!(
                                                         "fs_meta_runtime_app: sink query proxy bridge encode failed err={}",
@@ -5087,6 +5315,18 @@ impl FSMetaApp {
                 .all(|signal| matches!(signal, SourceControlSignal::RuntimeHostGrantChange { .. }))
     }
 
+    fn source_signals_are_transient_followup_only(source_signals: &[SourceControlSignal]) -> bool {
+        !source_signals.is_empty()
+            && source_signals.iter().all(|signal| {
+                matches!(
+                    signal,
+                    SourceControlSignal::Tick { .. }
+                        | SourceControlSignal::ManualRescan { .. }
+                        | SourceControlSignal::Passthrough(_)
+                )
+            })
+    }
+
     fn source_transient_followup_signals(
         source_signals: &[SourceControlSignal],
     ) -> Vec<SourceControlSignal> {
@@ -5165,11 +5405,22 @@ impl FSMetaApp {
     async fn apply_source_signals_with_recovery(
         &self,
         source_signals: &[SourceControlSignal],
+        control_initialized_at_entry: bool,
         fail_closed_in_generation_cutover_lane: bool,
     ) -> Result<()> {
         let filtered_source_signals = self
             .filter_shared_source_route_deactivates(source_signals)
             .await;
+        if control_initialized_at_entry
+            && self.control_initialized.load(Ordering::Acquire)
+            && !self.source_state_replay_required.load(Ordering::Acquire)
+            && !filtered_source_signals.is_empty()
+            && filtered_source_signals
+                .iter()
+                .all(|signal| matches!(signal, SourceControlSignal::Tick { .. }))
+        {
+            return Ok(());
+        }
         let fail_closed_restart_deferred_retire_pending = fail_closed_in_generation_cutover_lane
             && !filtered_source_signals.is_empty()
             && filtered_source_signals
@@ -5180,16 +5431,36 @@ impl FSMetaApp {
             self.record_retained_source_control_state(&filtered_source_signals)
                 .await;
         }
+        let replay_followup_signals = if self.source_state_replay_required.load(Ordering::Acquire)
+            && Self::source_signals_are_transient_followup_only(&filtered_source_signals)
+        {
+            let followups = Self::source_transient_followup_signals(&filtered_source_signals);
+            (!followups.is_empty()).then_some(followups)
+        } else {
+            None
+        };
+        let mut replay_followup_pending = replay_followup_signals.clone();
         let deadline = tokio::time::Instant::now() + SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT;
         loop {
-            let effective_source_signals = self
-                .source_signals_with_replay(&filtered_source_signals)
-                .await;
+            let replaying_retained_state_only =
+                self.source_state_replay_required.load(Ordering::Acquire)
+                    && replay_followup_pending.is_some();
+            let effective_source_signals = if replaying_retained_state_only {
+                self.source_signals_with_replay(&[]).await
+            } else if let Some(followups) = replay_followup_pending.clone() {
+                followups
+            } else {
+                self.source_signals_with_replay(&filtered_source_signals)
+                    .await
+            };
             if effective_source_signals.is_empty() {
                 self.record_shared_source_route_claims(&effective_source_signals)
                     .await;
                 self.source_state_replay_required
                     .store(false, Ordering::Release);
+                if replaying_retained_state_only && replay_followup_pending.is_some() {
+                    continue;
+                }
                 return Ok(());
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -5222,6 +5493,10 @@ impl FSMetaApp {
                         .await;
                     self.source_state_replay_required
                         .store(false, Ordering::Release);
+                    if replaying_retained_state_only {
+                        continue;
+                    }
+                    replay_followup_pending = None;
                     return Ok(());
                 }
                 Err(err) if fail_closed_restart_deferred_retire_pending => {
@@ -5564,6 +5839,16 @@ impl FSMetaApp {
                     .await,
             )
             .await;
+        if self.control_initialized.load(Ordering::Acquire)
+            && !self.sink_state_replay_required.load(Ordering::Acquire)
+            && self.sink.current_generation_tick_fast_path_eligible().await
+            && !filtered_sink_signals.is_empty()
+            && filtered_sink_signals
+                .iter()
+                .all(|signal| matches!(signal, SinkControlSignal::Tick { .. }))
+        {
+            return Ok(());
+        }
         self.record_retained_sink_control_state(&filtered_sink_signals)
             .await;
         let deadline = tokio::time::Instant::now() + SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT;
@@ -6270,6 +6555,12 @@ impl FSMetaApp {
             _ => None,
         };
         let control_initialized_at_entry = self.control_initialized();
+        let retained_sink_state_present_at_entry = !self
+            .retained_sink_control_state
+            .lock()
+            .await
+            .active_by_route
+            .is_empty();
         #[cfg(test)]
         notify_runtime_control_frame_started();
         let should_initialize_from_control =
@@ -6396,11 +6687,41 @@ impl FSMetaApp {
         let sink_status_publication_present = facade_publication_signals
             .iter()
             .any(facade_publication_signal_is_sink_status_activate);
+        let facade_claim_signals_present = !facade_claim_signals.is_empty();
         let mut pretriggered_source_to_sink_convergence = false;
         let mut mixed_recovery_expected_sink_groups = None;
         for signal in facade_claim_signals {
             self.apply_facade_signal(signal).await?;
         }
+        let ordinary_source_tick_only_steady_noop = control_initialized_at_entry
+            && self.control_initialized()
+            && !self.source_state_replay_required.load(Ordering::Acquire)
+            && !source_signals.is_empty()
+            && ((!facade_claim_signals_present && facade_publication_signals.is_empty())
+                || !sink_signals.is_empty())
+            && source_signals
+                .iter()
+                .all(|signal| matches!(signal, SourceControlSignal::Tick { .. }));
+        let sink_tick_fast_path_eligible =
+            self.sink.current_generation_tick_fast_path_eligible().await;
+        let ordinary_sink_tick_only_steady_noop = control_initialized_at_entry
+            && self.control_initialized()
+            && !self.sink_state_replay_required.load(Ordering::Acquire)
+            && sink_tick_fast_path_eligible
+            && !sink_signals.is_empty()
+            && sink_signals
+                .iter()
+                .all(|signal| matches!(signal, SinkControlSignal::Tick { .. }));
+        let sink_tick_recovery_requires_status_republish = control_initialized_at_entry
+            && retained_sink_state_present_at_entry
+            && !sink_tick_fast_path_eligible
+            && source_signals.is_empty()
+            && !facade_claim_signals_present
+            && facade_publication_signals.is_empty()
+            && !sink_signals.is_empty()
+            && sink_signals
+                .iter()
+                .all(|signal| matches!(signal, SinkControlSignal::Tick { .. }));
         if facade_cleanup_only_while_uninitialized {
             for signal in facade_publication_signals.drain(..) {
                 self.apply_facade_signal(signal).await?;
@@ -6409,6 +6730,49 @@ impl FSMetaApp {
                 "fs_meta_runtime_app: on_control_frame cleanup-only facade followup left runtime uninitialized"
             );
             return Ok(());
+        }
+        let apply_sink_before_initial_source_wave = !control_initialized_at_entry
+            && !retained_sink_state_present_at_entry
+            && !source_signals.is_empty()
+            && !sink_signals.is_empty()
+            && !source_cleanup_only_while_uninitialized
+            && !sink_query_cleanup_only_while_uninitialized
+            && !ordinary_source_tick_only_steady_noop
+            && !ordinary_sink_tick_only_steady_noop;
+        if apply_sink_before_initial_source_wave {
+            #[cfg(test)]
+            note_sink_apply_entry_for_tests();
+            #[cfg(test)]
+            maybe_pause_before_sink_apply().await;
+            eprintln!(
+                "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals begin"
+            );
+            if let Err(err) = self
+                .apply_sink_signals_with_recovery(
+                    &sink_signals,
+                    !sink_cleanup_only_while_uninitialized,
+                    fail_closed_in_generation_cutover_lane,
+                )
+                .await
+            {
+                eprintln!(
+                    "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals err={}",
+                    err
+                );
+                return Err(err);
+            }
+            eprintln!(
+                "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals ok"
+            );
+            if sink_tick_recovery_requires_status_republish {
+                if let Some(expected_groups) = self
+                    .wait_for_sink_status_republish_readiness_after_recovery(false)
+                    .await?
+                {
+                    self.wait_for_local_sink_status_republish_after_recovery(&expected_groups)
+                        .await?;
+                }
+            }
         }
         if !source_signals.is_empty() {
             if source_cleanup_only_while_uninitialized {
@@ -6425,7 +6789,10 @@ impl FSMetaApp {
                 eprintln!(
                     "fs_meta_runtime_app: on_control_frame source cleanup-only followup left runtime uninitialized"
                 );
+            } else if ordinary_source_tick_only_steady_noop {
             } else {
+                #[cfg(test)]
+                note_source_apply_entry_for_tests();
                 #[cfg(test)]
                 maybe_pause_before_source_apply().await;
                 eprintln!(
@@ -6434,6 +6801,7 @@ impl FSMetaApp {
                 if let Err(err) = self
                     .apply_source_signals_with_recovery(
                         &source_signals,
+                        control_initialized_at_entry,
                         fail_closed_in_source_generation_cutover_lane,
                     )
                     .await
@@ -6473,16 +6841,21 @@ impl FSMetaApp {
             && !sink_cleanup_only_while_uninitialized
         {
             eprintln!("fs_meta_runtime_app: on_control_frame source.replay_retained begin");
-            self.apply_source_signals_with_recovery(&[], false).await?;
+            self.apply_source_signals_with_recovery(&[], control_initialized_at_entry, false).await?;
             eprintln!("fs_meta_runtime_app: on_control_frame source.replay_retained ok");
         }
         let mut replayed_sink_state_after_uninitialized_source_recovery = false;
-        if !sink_signals.is_empty() {
+        if !sink_signals.is_empty() && !apply_sink_before_initial_source_wave {
             if sink_query_cleanup_only_while_uninitialized {
                 eprintln!(
                     "fs_meta_runtime_app: on_control_frame sink cleanup-only query followup left runtime uninitialized"
                 );
+            } else if ordinary_sink_tick_only_steady_noop {
             } else {
+                #[cfg(test)]
+                note_sink_apply_entry_for_tests();
+                #[cfg(test)]
+                maybe_pause_before_sink_apply().await;
                 eprintln!(
                     "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals begin"
                 );
@@ -6503,14 +6876,24 @@ impl FSMetaApp {
                 eprintln!(
                     "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals ok"
                 );
-                if !control_initialized_at_entry && !source_signals.is_empty() {
-                    let expected_groups = Self::runtime_scoped_facade_group_ids(
-                        &self.source,
-                        &self.sink,
-                    )
-                    .await?
-                    .into_iter()
-                    .collect::<std::collections::BTreeSet<_>>();
+                if sink_tick_recovery_requires_status_republish {
+                    if let Some(expected_groups) = self
+                        .wait_for_sink_status_republish_readiness_after_recovery(false)
+                        .await?
+                    {
+                        self.wait_for_local_sink_status_republish_after_recovery(&expected_groups)
+                            .await?;
+                    }
+                }
+                if !control_initialized_at_entry
+                    && retained_sink_state_present_at_entry
+                    && !source_signals.is_empty()
+                {
+                    let expected_groups =
+                        Self::runtime_scoped_facade_group_ids(&self.source, &self.sink)
+                            .await?
+                            .into_iter()
+                            .collect::<std::collections::BTreeSet<_>>();
                     if !expected_groups.is_empty() {
                         mixed_recovery_expected_sink_groups = Some(expected_groups);
                     }
@@ -6546,10 +6929,11 @@ impl FSMetaApp {
             let source_led_uninitialized_mixed_recovery =
                 !source_signals.is_empty() && sink_signals.is_empty();
             if source_led_uninitialized_mixed_recovery {
-                let expected_groups = Self::runtime_scoped_facade_group_ids(&self.source, &self.sink)
-                    .await?
-                    .into_iter()
-                    .collect::<std::collections::BTreeSet<_>>();
+                let expected_groups =
+                    Self::runtime_scoped_facade_group_ids(&self.source, &self.sink)
+                        .await?
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<_>>();
                 if !expected_groups.is_empty() {
                     let cached_sink_status_ready = self
                         .sink
@@ -6625,7 +7009,8 @@ impl FSMetaApp {
                 )
                 .await?;
                 let control_ready_after_republish = self.facade_publication_ready().await;
-                self.api_control_gate.set_ready(control_ready_after_republish);
+                self.api_control_gate
+                    .set_ready(control_ready_after_republish);
                 Self::spawn_deferred_sink_owned_query_peer_publication_after_local_sink_status_ready(
                     self.source.clone(),
                     self.sink.clone(),

@@ -865,12 +865,15 @@ impl TypedWorkerBootstrapSession<SinkWorkerInitConfig> for SinkWorkerSession {
 mod tests {
     use super::*;
     use crate::runtime::routes::{
-        METHOD_STREAM, ROUTE_TOKEN_FS_META_EVENTS, default_route_bindings,
+        METHOD_QUERY, METHOD_STREAM, ROUTE_KEY_QUERY, ROUTE_TOKEN_FS_META_EVENTS,
+        default_route_bindings,
     };
     use crate::source::config::{GrantedMountRoot, RootSpec};
     use capanix_runtime_entry_sdk::control::{
         RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, encode_runtime_exec_control,
     };
+    use tempfile::tempdir;
+    use tokio::sync::Notify;
 
     struct FailingBoundary;
 
@@ -896,6 +899,41 @@ mod tests {
             _ctx: capanix_runtime_entry_sdk::advanced::boundary::BoundaryContext,
             _request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
         ) -> capanix_app_sdk::Result<Vec<Event>> {
+            Err(CnxError::Timeout)
+        }
+    }
+
+    #[derive(Default)]
+    struct StreamRecvCountingBoundary {
+        recv_counts: StdMutex<std::collections::BTreeMap<String, usize>>,
+        notify: Notify,
+    }
+
+    impl StreamRecvCountingBoundary {
+        fn recv_count(&self, route: &str) -> usize {
+            self.recv_counts
+                .lock()
+                .expect("stream recv counting boundary lock")
+                .get(route)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for StreamRecvCountingBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: capanix_runtime_entry_sdk::advanced::boundary::BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            *self
+                .recv_counts
+                .lock()
+                .expect("stream recv counting boundary lock")
+                .entry(request.channel_key.0)
+                .or_default() += 1;
+            self.notify.notify_waiters();
             Err(CnxError::Timeout)
         }
     }
@@ -927,6 +965,109 @@ mod tests {
             interfaces: vec!["posix-fs".to_string(), "inotify".to_string()],
             active,
         }
+    }
+
+    fn bound_scope_with_resources(scope_id: &str, resource_ids: &[&str]) -> RuntimeBoundScope {
+        RuntimeBoundScope {
+            scope_id: scope_id.to_string(),
+            resource_ids: resource_ids.iter().map(|id| (*id).to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_on_control_frame_ack_waits_until_events_stream_enters_first_recv_after_deferred_authority_startup_for_local_split_primary_scope()
+    {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        let nfs3 = tmp.path().join("nfs3");
+        for dir in [&nfs1, &nfs2, &nfs3] {
+            std::fs::create_dir_all(dir.join("data")).expect("create data dir");
+        }
+
+        let node_id = NodeId("node-b".to_string());
+        let mut state = SinkWorkerState {
+            sink: None,
+            node_id: None,
+            pending_init: None,
+            endpoints_started: false,
+            send_tx: None,
+            last_control_frame_signals: Vec::new(),
+            received_stats: Arc::new(StdMutex::new(ReceivedBatchStats::default())),
+        };
+        bootstrap_init_sink_runtime(
+            node_id.clone(),
+            SinkWorkerInitConfig {
+                roots: vec![
+                    root("nfs1", &nfs1.display().to_string()),
+                    root("nfs2", &nfs2.display().to_string()),
+                    root("nfs3", &nfs3.display().to_string()),
+                ],
+                host_object_grants: vec![
+                    granted_mount_root("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone(), true),
+                    granted_mount_root("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone(), true),
+                    granted_mount_root("node-b::nfs3", "node-b", "10.0.0.13", nfs3.clone(), true),
+                ],
+                sink_tombstone_ttl_ms: 60_000,
+                sink_tombstone_tolerance_us: 0,
+            },
+            &mut state,
+        )
+        .await
+        .expect("bootstrap init sink runtime");
+
+        let boundary = Arc::new(StreamRecvCountingBoundary::default());
+        bootstrap_start_sink_runtime(
+            &mut state,
+            boundary.clone(),
+            capanix_app_sdk::runtime::in_memory_state_boundary(),
+        )
+        .expect("bootstrap start sink runtime");
+
+        let events_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM)
+            .expect("resolve events route")
+            .0;
+        let action = plan_worker_request(
+            SinkWorkerRequest::OnControlFrame {
+                envelopes: vec![
+                    encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                        route_key: ROUTE_KEY_QUERY.to_string(),
+                        unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                        lease: None,
+                        generation: 1,
+                        expires_at_ms: 1,
+                        bound_scopes: vec![bound_scope_with_resources("nfs3", &["node-b::nfs3"])],
+                    }))
+                    .expect("encode sink query activate"),
+                    encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                        route_key: events_route.clone(),
+                        unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                        lease: None,
+                        generation: 1,
+                        expires_at_ms: 1,
+                        bound_scopes: vec![bound_scope_with_resources("nfs3", &["node-b::nfs3"])],
+                    }))
+                    .expect("encode sink stream activate"),
+                ],
+            },
+            &mut state,
+        );
+
+        let (response, stop) = execute_worker_action(action).await;
+        assert!(!stop, "worker on_control_frame should not stop the session");
+        assert!(
+            matches!(response, SinkWorkerResponse::Ack),
+            "worker on_control_frame should still succeed in the narrow first-recv seam: {response:?}"
+        );
+        assert!(
+            boundary.recv_count(&events_route) > 0,
+            "worker-backed sink server on_control_frame must not Ack before the local events stream enters its first recv attempt after deferred-authority startup: route={} recv_count={}",
+            events_route,
+            boundary.recv_count(&events_route),
+        );
+
+        bootstrap_stop_sink_runtime(&mut state).await;
     }
 
     #[tokio::test]

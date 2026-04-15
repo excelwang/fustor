@@ -1790,8 +1790,7 @@ mod tests {
             ctx: BoundaryContext,
             request: StateCellWriteRequest,
         ) -> Result<KernelResultEnvelope> {
-            if request.handle.cell_id == "fs-meta.logical-roots.runtime.exec.source"
-            {
+            if request.handle.cell_id == "fs-meta.logical-roots.runtime.exec.source" {
                 let passthrough_before_fence = self
                     .logical_roots_writes_to_passthrough_before_fence
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
@@ -1819,7 +1818,8 @@ mod tests {
                         status: "fenced".to_string(),
                         payload: Vec::new(),
                         diagnostics: Some(
-                            "runtime state carrier fenced stale caller on statecell_write".to_string(),
+                            "runtime state carrier fenced stale caller on statecell_write"
+                                .to_string(),
                         ),
                     });
                 }
@@ -2129,7 +2129,10 @@ mod tests {
         ))
         .await;
         assert!(matches!(response, SourceWorkerResponse::Ack));
-        assert!(!stop, "source worker should stay alive after zero-grant watch-scan wave");
+        assert!(
+            !stop,
+            "source worker should stay alive after zero-grant watch-scan wave"
+        );
 
         let (response, stop) = execute_worker_action(plan_worker_request(
             SourceWorkerRequest::TriggerRescanWhenReady,
@@ -2166,7 +2169,7 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_rescan_when_ready_publishes_baseline_to_loopback_boundary_after_zero_grant_runtime_managed_watch_scan_wave()
-    {
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -2283,7 +2286,10 @@ mod tests {
         ))
         .await;
         assert!(matches!(response, SourceWorkerResponse::Ack));
-        assert!(!stop, "source worker should stay alive after zero-grant watch-scan wave");
+        assert!(
+            !stop,
+            "source worker should stay alive after zero-grant watch-scan wave"
+        );
 
         let (response, stop) = execute_worker_action(plan_worker_request(
             SourceWorkerRequest::TriggerRescanWhenReady,
@@ -2322,7 +2328,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_handle_request_populates_concrete_roots_after_zero_grant_runtime_managed_watch_scan_wave()
-    {
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -2352,8 +2358,11 @@ mod tests {
             state: state.clone(),
         };
         let boundary = Arc::new(LoopbackPublishBoundary::default());
-        let context =
-            WorkerSessionContext::new(boundary.clone(), boundary.clone(), in_memory_state_boundary());
+        let context = WorkerSessionContext::new(
+            boundary.clone(),
+            boundary.clone(),
+            in_memory_state_boundary(),
+        );
 
         session
             .on_init(
@@ -2465,7 +2474,8 @@ mod tests {
                 .handle_request(SourceWorkerRequest::StatusSnapshot, &context)
                 .await
                 .expect("handle status snapshot after zero-grant watch-scan wave");
-            let WorkerLoopControl::Continue(SourceWorkerResponse::StatusSnapshot(status)) = response
+            let WorkerLoopControl::Continue(SourceWorkerResponse::StatusSnapshot(status)) =
+                response
             else {
                 panic!("unexpected status snapshot response from source worker session");
             };
@@ -2479,9 +2489,7 @@ mod tests {
                 .iter()
                 .filter(|root| root.logical_root_id == "nfs1" || root.logical_root_id == "nfs2")
                 .all(|root| root.status == "running");
-            if logical_root_ids.contains("nfs1")
-                && logical_root_ids.contains("nfs2")
-                && all_running
+            if logical_root_ids.contains("nfs1") && logical_root_ids.contains("nfs2") && all_running
             {
                 break;
             }
@@ -2493,7 +2501,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
-        session.on_close(&context).await.expect("close source worker session");
+        session
+            .on_close(&context)
+            .await
+            .expect("close source worker session");
     }
 
     #[tokio::test]
@@ -2566,11 +2577,7 @@ mod tests {
         let state_boundary: Arc<dyn StateBoundary> = Arc::new(
             FencedThenOkLogicalRootsWriteBoundary::new(in_memory_state_boundary(), 1, 1),
         );
-        let context = WorkerSessionContext::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let context = WorkerSessionContext::new(boundary.clone(), boundary.clone(), state_boundary);
 
         session
             .on_init(
@@ -2617,7 +2624,10 @@ mod tests {
             "logical roots should reflect the post-retry update after transient fenced statecell_write recovery",
         );
 
-        session.on_close(&context).await.expect("close source worker session");
+        session
+            .on_close(&context)
+            .await
+            .expect("close source worker session");
     }
 
     #[tokio::test]

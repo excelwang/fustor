@@ -115,10 +115,8 @@ fn cleanup_plan_root_identity(root: &Path) -> PathBuf {
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with(".tmp"))
     {
-        return PathBuf::from(NFS_LAB_COMPONENT).join(
-            root.file_name()
-                .expect("tmp lab root must have basename"),
-        );
+        return PathBuf::from(NFS_LAB_COMPONENT)
+            .join(root.file_name().expect("tmp lab root must have basename"));
     }
     canonicalize_existing_path(root)
 }
@@ -321,7 +319,12 @@ fn stale_lab_export_dirs_for_cleanup(plan: &StaleLabCleanupPlan) -> Vec<PathBuf>
     for root in &plan.cleanup_roots {
         let exports_dir = root.join("exports");
         if let Ok(entries) = fs::read_dir(&exports_dir) {
-            dirs.extend(entries.flatten().map(|entry| entry.path()).filter(|path| path.is_dir()));
+            dirs.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir()),
+            );
         }
     }
     dirs.sort();
@@ -971,8 +974,7 @@ mod tests {
     fn stale_lab_cleanup_plans_merge_alias_roots_into_one_plan() {
         let temp = tempfile::tempdir().expect("tempdir");
         let real_root = temp.path().join(".tmpreal123");
-        fs::create_dir_all(real_root.join("mounts/node-a"))
-            .expect("create real root mounts");
+        fs::create_dir_all(real_root.join("mounts/node-a")).expect("create real root mounts");
         fs::create_dir_all(real_root.join("exports")).expect("create real root exports");
         fs::write(lab_marker_path(&real_root), b"marker\n").expect("write marker");
 
@@ -1043,8 +1045,7 @@ mod tests {
             "workspace-root and /data alias views of the same lab root must collapse into one cleanup plan"
         );
         assert_eq!(
-            plans[0].root,
-            real_root,
+            plans[0].root, real_root,
             "cleanup should prefer the current workspace-root view as the plan root"
         );
         assert!(
@@ -1057,8 +1058,7 @@ mod tests {
     fn stale_lab_cleanup_plans_dedupe_duplicate_mount_targets_across_alias_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
         let real_root = temp.path().join(".tmpreal123");
-        fs::create_dir_all(real_root.join("mounts/node-a/nfs1"))
-            .expect("create real root mounts");
+        fs::create_dir_all(real_root.join("mounts/node-a/nfs1")).expect("create real root mounts");
         fs::create_dir_all(real_root.join("exports")).expect("create real root exports");
         fs::write(lab_marker_path(&real_root), b"marker\n").expect("write marker");
 
@@ -1102,7 +1102,8 @@ mod tests {
             real_root.join("mounts/node-a/nfs1").display(),
             real_root.display(),
         );
-        let plans = stale_lab_cleanup_plans_from_mountinfo(&mountinfo, std::slice::from_ref(&alias_root));
+        let plans =
+            stale_lab_cleanup_plans_from_mountinfo(&mountinfo, std::slice::from_ref(&alias_root));
         let plan = plans.first().expect("cleanup plan");
 
         let mut export_dirs = stale_lab_export_dirs_for_cleanup(&plan);
@@ -1113,8 +1114,7 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(
-            export_dirs,
-            expected,
+            export_dirs, expected,
             "stale export cleanup must preserve both alias and canonical export path strings"
         );
     }
@@ -1202,8 +1202,7 @@ mod tests {
         let output = std::process::Output {
             status: ExitStatus::from_raw(32 << 8),
             stdout: Vec::new(),
-            stderr: b"umount: /tmp/lab/mounts/node-a/nfs1: no mount point specified.\r\n"
-                .to_vec(),
+            stderr: b"umount: /tmp/lab/mounts/node-a/nfs1: no mount point specified.\r\n".to_vec(),
         };
         assert!(output_indicates_absent_mount(&output));
     }
@@ -1215,15 +1214,13 @@ mod tests {
             stdout: Vec::new(),
             stderr: b"umount: /tmp/lab/mounts/node-a/nfs1: no mount point specified.\n".to_vec(),
         };
-        assert!(
-            interpret_umount_outputs_with_mountinfo(
-                Path::new("/tmp/lab/mounts/node-a/nfs1"),
-                &primary,
-                None,
-                "",
-            )
-            .is_ok()
-        );
+        assert!(interpret_umount_outputs_with_mountinfo(
+            Path::new("/tmp/lab/mounts/node-a/nfs1"),
+            &primary,
+            None,
+            "",
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1238,20 +1235,18 @@ mod tests {
             stdout: b"umount: /tmp/lab/mounts/node-a/nfs1: not mounted.\n".to_vec(),
             stderr: Vec::new(),
         };
-        assert!(
-            interpret_umount_outputs_with_mountinfo(
-                Path::new("/tmp/lab/mounts/node-a/nfs1"),
-                &primary,
-                Some(&fallback),
-                "",
-            )
-            .is_ok()
-        );
+        assert!(interpret_umount_outputs_with_mountinfo(
+            Path::new("/tmp/lab/mounts/node-a/nfs1"),
+            &primary,
+            Some(&fallback),
+            "",
+        )
+        .is_ok());
     }
 
     #[test]
     fn interpret_umount_outputs_fails_when_primary_reports_absent_but_mountinfo_still_lists_target()
-     {
+    {
         let path = Path::new("/tmp/lab/mounts/node-a/nfs1");
         let primary = std::process::Output {
             status: ExitStatus::from_raw(32 << 8),
@@ -1265,8 +1260,8 @@ mod tests {
     }
 
     #[test]
-    fn interpret_umount_outputs_fails_when_fallback_reports_absent_but_mountinfo_still_lists_target()
-     {
+    fn interpret_umount_outputs_fails_when_fallback_reports_absent_but_mountinfo_still_lists_target(
+    ) {
         let path = Path::new("/tmp/lab/mounts/node-a/nfs1");
         let primary = std::process::Output {
             status: ExitStatus::from_raw(1 << 8),

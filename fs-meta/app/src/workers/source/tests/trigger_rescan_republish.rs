@@ -2155,6 +2155,284 @@ macro_rules! define_trigger_rescan_republish_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generation_two_real_source_route_manual_rescan_publishes_baseline_for_each_split_primary_under_mixed_cluster_grants()
+    {
+        let tmp = tempdir().expect("create temp dir");
+        let node_a_nfs1 = tmp.path().join("node-a-nfs1");
+        let node_a_nfs2 = tmp.path().join("node-a-nfs2");
+        let node_b_nfs1 = tmp.path().join("node-b-nfs1");
+        let node_c_nfs1 = tmp.path().join("node-c-nfs1");
+        let node_c_nfs2 = tmp.path().join("node-c-nfs2");
+        let node_d_nfs2 = tmp.path().join("node-d-nfs2");
+        let node_b_nfs3 = tmp.path().join("node-b-nfs3");
+        let node_d_nfs3 = tmp.path().join("node-d-nfs3");
+        let node_e_nfs3 = tmp.path().join("node-e-nfs3");
+        for path in [
+            &node_a_nfs1,
+            &node_a_nfs2,
+            &node_b_nfs1,
+            &node_c_nfs1,
+            &node_c_nfs2,
+            &node_d_nfs2,
+            &node_b_nfs3,
+            &node_d_nfs3,
+            &node_e_nfs3,
+        ] {
+            std::fs::create_dir_all(path.join("data")).expect("create mount data dir");
+        }
+        std::fs::write(node_a_nfs1.join("data").join("a.txt"), b"a")
+            .expect("seed node-a nfs1");
+        std::fs::write(node_a_nfs2.join("data").join("b.txt"), b"b")
+            .expect("seed node-a nfs2");
+        std::fs::write(node_b_nfs3.join("data").join("c.txt"), b"c")
+            .expect("seed node-b nfs3");
+
+        let node_a_id = "node-a-29799407896396737569357825";
+        let node_b_id = "node-b-29799407896396737569357825";
+        let node_c_id = "node-c-29799407896396737569357825";
+        let node_d_id = "node-d-29799407896396737569357825";
+        let node_e_id = "node-e-29799407896396737569357825";
+        let nfs1_source = "127.0.0.1:/exports/nfs1";
+        let nfs2_source = "127.0.0.1:/exports/nfs2";
+        let nfs3_source = "127.0.0.1:/exports/nfs3";
+
+        let cfg = SourceConfig {
+            roots: vec![
+                worker_fs_source_watch_scan_root("nfs1", nfs1_source),
+                worker_fs_source_watch_scan_root("nfs2", nfs2_source),
+                worker_fs_source_watch_scan_root("nfs3", nfs3_source),
+            ],
+            host_object_grants: vec![
+                worker_source_export_with_fs_source(
+                    &format!("{node_a_id}::nfs1"),
+                    node_a_id,
+                    "10.0.0.11",
+                    node_a_nfs1.clone(),
+                    nfs1_source,
+                ),
+                worker_source_export_with_fs_source(
+                    &format!("{node_a_id}::nfs2"),
+                    node_a_id,
+                    "10.0.0.12",
+                    node_a_nfs2.clone(),
+                    nfs2_source,
+                ),
+                worker_source_export_with_fs_source(
+                    &format!("{node_b_id}::nfs1"),
+                    node_b_id,
+                    "10.0.0.21",
+                    node_b_nfs1.clone(),
+                    nfs1_source,
+                ),
+                worker_source_export_with_fs_source(
+                    &format!("{node_c_id}::nfs1"),
+                    node_c_id,
+                    "10.0.0.31",
+                    node_c_nfs1.clone(),
+                    nfs1_source,
+                ),
+                worker_source_export_with_fs_source(
+                    &format!("{node_c_id}::nfs2"),
+                    node_c_id,
+                    "10.0.0.32",
+                    node_c_nfs2.clone(),
+                    nfs2_source,
+                ),
+                worker_source_export_with_fs_source(
+                    &format!("{node_d_id}::nfs2"),
+                    node_d_id,
+                    "10.0.0.41",
+                    node_d_nfs2.clone(),
+                    nfs2_source,
+                ),
+                worker_source_export_with_fs_source(
+                    &format!("{node_b_id}::nfs3"),
+                    node_b_id,
+                    "10.0.0.23",
+                    node_b_nfs3.clone(),
+                    nfs3_source,
+                ),
+                worker_source_export_with_fs_source(
+                    &format!("{node_d_id}::nfs3"),
+                    node_d_id,
+                    "10.0.0.43",
+                    node_d_nfs3.clone(),
+                    nfs3_source,
+                ),
+                worker_source_export_with_fs_source(
+                    &format!("{node_e_id}::nfs3"),
+                    node_e_id,
+                    "10.0.0.53",
+                    node_e_nfs3.clone(),
+                    nfs3_source,
+                ),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = worker_socket_tempdir();
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = SourceWorkerClientHandle::new(
+            NodeId(node_a_id.to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let source_wave = |generation| {
+            vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["nfs1"]),
+                        bound_scope_with_resources("nfs2", &["nfs2"]),
+                        bound_scope_with_resources("nfs3", &["nfs3"]),
+                    ],
+                }))
+                .expect("encode source roots activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["nfs1"]),
+                        bound_scope_with_resources("nfs2", &["nfs2"]),
+                        bound_scope_with_resources("nfs3", &["nfs3"]),
+                    ],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["nfs1"]),
+                        bound_scope_with_resources("nfs2", &["nfs2"]),
+                        bound_scope_with_resources("nfs3", &["nfs3"]),
+                    ],
+                }))
+                .expect("encode source rescan activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["nfs1"]),
+                        bound_scope_with_resources("nfs2", &["nfs2"]),
+                        bound_scope_with_resources("nfs3", &["nfs3"]),
+                    ],
+                }))
+                .expect("encode source scan activate"),
+            ]
+        };
+
+        client
+            .on_control_frame(source_wave(2))
+            .await
+            .expect("mixed-cluster real source route wave should succeed");
+
+        let expected_primaries = std::collections::BTreeMap::from([
+            ("nfs1".to_string(), format!("{node_a_id}::nfs1")),
+            ("nfs2".to_string(), format!("{node_a_id}::nfs2")),
+            ("nfs3".to_string(), format!("{node_b_id}::nfs3")),
+        ]);
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let primaries = client
+                .source_primary_by_group_snapshot()
+                .await
+                .expect("source primary snapshot");
+            if primaries == expected_primaries {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "mixed-cluster real source route should elect split primaries before manual rescan: primaries={primaries:?}",
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        while recv_loopback_events(&boundary, 50).await.is_ok() {}
+
+        client
+            .publish_manual_rescan_signal()
+            .await
+            .expect("manual rescan publish should succeed");
+
+        let baseline_target = b"/data";
+        let expected_origins = [
+            format!("{node_a_id}::nfs1"),
+            format!("{node_a_id}::nfs2"),
+        ];
+        let republish_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut baseline_counts = std::collections::BTreeMap::<String, usize>::new();
+        let mut latest_snapshot = client
+            .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+            .await
+            .expect("observability snapshot before mixed-cluster manual-rescan wait");
+        loop {
+            latest_snapshot = client
+                .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+                .await
+                .expect("observability snapshot during mixed-cluster manual-rescan wait");
+            match recv_loopback_events(&boundary, 50).await {
+                Ok(batch) => record_path_data_counts(&mut baseline_counts, &batch, baseline_target),
+                Err(CnxError::Timeout) => {}
+                Err(err) => panic!("mixed-cluster manual rescan publish recv failed: {err}"),
+            }
+            if expected_origins
+                .iter()
+                .all(|origin| baseline_counts.get(origin).copied().unwrap_or(0) > 0)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < republish_deadline,
+                "manual rescan should publish baseline /data for node-a split-primary roots under mixed cluster grants instead of leaving them unpublished: baseline_counts={baseline_counts:?} primaries={:?} scheduled_source={:?} scheduled_scan={:?} published_batches={:?} published_events={:?} published_data={:?} concrete_roots={:?}",
+                latest_snapshot.source_primary_by_group,
+                latest_snapshot.scheduled_source_groups_by_node,
+                latest_snapshot.scheduled_scan_groups_by_node,
+                latest_snapshot.published_batches_by_node,
+                latest_snapshot.published_events_by_node,
+                latest_snapshot.published_data_events_by_node,
+                latest_snapshot
+                    .status
+                    .concrete_roots
+                    .iter()
+                    .map(|root| (
+                        root.logical_root_id.clone(),
+                        root.object_ref.clone(),
+                        root.is_group_primary,
+                        root.emitted_batch_count,
+                        root.emitted_data_event_count,
+                    ))
+                    .collect::<Vec<_>>(),
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        client.close().await.expect("close source worker");
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn generation_two_watch_scan_route_republishes_observability_after_fail_closed_roots_deactivate_then_cleanup_only_tail_without_runtime_host_grant_change()
     {
         struct SourceWorkerControlFrameErrorHookReset;

@@ -244,18 +244,89 @@ fn runtime_scope_resource_matches_logical_root(resource_id: &str, logical_root_i
             .is_some_and(|(_, tail)| tail == logical_root_id)
 }
 
+fn runtime_scope_row_matches_logical_root(
+    row: &RuntimeBoundScope,
+    logical_root_id: &str,
+) -> bool {
+    row.scope_id == logical_root_id
+        || row.resource_ids.iter().any(|resource_id| {
+            runtime_scope_resource_matches_logical_root(resource_id, logical_root_id)
+        })
+}
+
+fn runtime_scope_row_has_explicit_local_resource_id(
+    row: &RuntimeBoundScope,
+    logical_root_id: &str,
+    node_id: &NodeId,
+) -> bool {
+    row.resource_ids.iter().any(|resource_id| {
+        runtime_scope_resource_matches_logical_root(resource_id, logical_root_id)
+            && resource_id
+                .rsplit_once("::")
+                .is_some_and(|(host_ref, _)| host_ref_matches_node_id(host_ref, node_id))
+    })
+}
+
+fn runtime_scope_row_has_bare_logical_root_id(
+    row: &RuntimeBoundScope,
+    logical_root_id: &str,
+) -> bool {
+    row.scope_id == logical_root_id
+        || row
+            .resource_ids
+            .iter()
+            .any(|resource_id| resource_id == logical_root_id)
+}
+
+fn root_has_any_matching_grant(root: &RootSpec, host_object_grants: &[GrantedMountRoot]) -> bool {
+    host_object_grants
+        .iter()
+        .any(|grant| root.selector.matches(grant))
+}
+
+fn root_has_local_matching_grant(
+    root: &RootSpec,
+    node_id: &NodeId,
+    host_object_grants: &[GrantedMountRoot],
+) -> bool {
+    host_object_grants.iter().any(|grant| {
+        host_ref_matches_node_id(&grant.host_ref, node_id) && root.selector.matches(grant)
+    })
+}
+
+fn runtime_scope_rows_make_root_runnable_locally(
+    root: &RootSpec,
+    node_id: &NodeId,
+    host_object_grants: &[GrantedMountRoot],
+    active_rows: &[RuntimeBoundScope],
+) -> bool {
+    if root_has_local_matching_grant(root, node_id, host_object_grants) {
+        return true;
+    }
+
+    let mut saw_bare_logical_root_id = false;
+    for row in active_rows {
+        if !runtime_scope_row_matches_logical_root(row, &root.id) {
+            continue;
+        }
+        if runtime_scope_row_has_explicit_local_resource_id(row, &root.id, node_id) {
+            return true;
+        }
+        if runtime_scope_row_has_bare_logical_root_id(row, &root.id) {
+            saw_bare_logical_root_id = true;
+        }
+    }
+
+    saw_bare_logical_root_id && !root_has_any_matching_grant(root, host_object_grants)
+}
+
 fn runtime_managed_local_resource_ids_for_root(
     root: &RootSpec,
     active_rows: &[RuntimeBoundScope],
 ) -> BTreeSet<String> {
     let mut object_refs = BTreeSet::new();
     for row in active_rows {
-        let row_matches_root = row.scope_id == root.id
-            || row
-                .resource_ids
-                .iter()
-                .any(|resource_id| runtime_scope_resource_matches_logical_root(resource_id, &root.id));
-        if !row_matches_root {
+        if !runtime_scope_row_matches_logical_root(row, &root.id) {
             continue;
         }
         for resource_id in &row.resource_ids {
@@ -1095,10 +1166,12 @@ impl FSMetaSource {
                         SourceRuntimeUnit::Scan => root.scan,
                     })
                     .filter(|root| {
-                        host_object_grants.iter().any(|grant| {
-                            host_ref_matches_node_id(&grant.host_ref, &self.node_id)
-                                && root.selector.matches(grant)
-                        }) || !runtime_managed_local_resource_ids_for_root(root, &rows).is_empty()
+                        runtime_scope_rows_make_root_runnable_locally(
+                            root,
+                            &self.node_id,
+                            &host_object_grants,
+                            &rows,
+                        )
                     })
                     .map(|root| root.id.clone())
                     .collect::<BTreeSet<_>>();
@@ -1123,11 +1196,17 @@ impl FSMetaSource {
     async fn refresh_runtime_roots(&self, trigger_rescan: bool) -> Result<()> {
         let root_specs = self.logical_roots_snapshot();
         let host_object_grants = self.host_object_grants_snapshot();
-        let source_rows = match self.unit_control.unit_state(SourceRuntimeUnit::Source.unit_id())? {
+        let source_rows = match self
+            .unit_control
+            .unit_state(SourceRuntimeUnit::Source.unit_id())?
+        {
             Some((true, rows)) => rows,
             Some((false, _)) | None => Vec::new(),
         };
-        let scan_rows = match self.unit_control.unit_state(SourceRuntimeUnit::Scan.unit_id())? {
+        let scan_rows = match self
+            .unit_control
+            .unit_state(SourceRuntimeUnit::Scan.unit_id())?
+        {
             Some((true, rows)) => rows,
             Some((false, _)) | None => Vec::new(),
         };
@@ -1161,8 +1240,8 @@ impl FSMetaSource {
         let desired_signature = Self::runtime_topology_signature(&desired);
         let topology_changed = desired_signature != current_signature;
         Self::sync_object_runtime_health(&self.state_cell.fanout_health, &desired, &self.config);
-        *lock_or_recover(&self.state_cell.roots, "source.refresh_runtime_roots") = desired;
         if topology_changed {
+            *lock_or_recover(&self.state_cell.roots, "source.refresh_runtime_roots") = desired;
             let desired_roots =
                 lock_or_recover(&self.state_cell.roots, "source.refresh_runtime_roots.read")
                     .clone();

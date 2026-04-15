@@ -727,16 +727,17 @@ impl Cluster5 {
         unit_id: &str,
     ) -> Result<BTreeSet<u32>, String> {
         let status = self.status(node_name)?;
-        let mut pids = unit_active_pids_for_instance_from_status(
-            &status,
-            instance_id,
-            unit_id,
-        );
+        let mut pids = unit_active_pids_for_instance_from_status(&status, instance_id, unit_id);
         if pids.is_empty() {
             let node = self.node(node_name)?;
             pids.extend(
-                unit_active_pids_from_registry_fallback(&node.home_dir, &status, instance_id, unit_id)
-                    .map_err(|err| format!("read registry fallback failed for {node_name}: {err}"))?,
+                unit_active_pids_from_registry_fallback(
+                    &node.home_dir,
+                    &status,
+                    instance_id,
+                    unit_id,
+                )
+                .map_err(|err| format!("read registry fallback failed for {node_name}: {err}"))?,
             );
         }
         Ok(pids)
@@ -2069,9 +2070,7 @@ fn route_mentions_unit_in_activated_state(status: &Value, unit_id: &str) -> bool
                     apps.iter().any(|row| {
                         row.get("unit_ids")
                             .and_then(Value::as_array)
-                            .is_some_and(|units| {
-                                units.iter().any(|v| v.as_str() == Some(unit_id))
-                            })
+                            .is_some_and(|units| units.iter().any(|v| v.as_str() == Some(unit_id)))
                             && row.get("delivered").and_then(Value::as_bool) == Some(true)
                             && row.get("gate").and_then(Value::as_str) == Some("activated")
                             && row.get("op").and_then(Value::as_str) == Some("activate")
@@ -2374,8 +2373,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_fallback_promotes_current_sink_pid_when_route_is_activated_but_active_pids_are_empty()
-    {
+    fn registry_fallback_promotes_current_sink_pid_when_route_is_activated_but_active_pids_are_empty(
+    ) {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let registry_path = tmp.path().join("registry.json");
         std::fs::write(
@@ -2498,8 +2497,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_fallback_promotes_current_sink_pid_when_route_rows_are_activated_but_route_state_is_only_bound()
-    {
+    fn registry_fallback_promotes_current_sink_pid_when_route_rows_are_activated_but_route_state_is_only_bound(
+    ) {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let registry_path = tmp.path().join("registry.json");
         std::fs::write(

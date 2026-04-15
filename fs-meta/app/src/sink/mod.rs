@@ -11,11 +11,12 @@ pub(crate) mod query;
 pub(crate) mod tree;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_util::FutureExt;
 
 use capanix_app_sdk::runtime::{
     ControlEnvelope, EventMetadata, NodeId, RecvOpts, RouteKey, StateCellHandle,
@@ -27,6 +28,7 @@ use capanix_runtime_entry_sdk::advanced::boundary::{
     BoundaryContext, ChannelIoSubset, StateBoundary,
 };
 use capanix_runtime_entry_sdk::control::{RuntimeBoundScope, RuntimeHostGrantState};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -975,6 +977,39 @@ impl SinkStateCell {
 /// Concurrency model:
 /// - `send()` takes write lock on SinkState (exclusive)
 /// - `recv()` / `req()` + query handlers take read lock (shared)
+#[derive(Default)]
+struct StreamRecvObserver {
+    observed_epoch: AtomicU64,
+    notify: Notify,
+}
+
+impl StreamRecvObserver {
+    fn observed_epoch(&self) -> u64 {
+        self.observed_epoch.load(Ordering::Acquire)
+    }
+
+    fn mark_before_recv(&self) {
+        self.observed_epoch.fetch_add(1, Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait_for_epoch_after(&self, epoch: u64) {
+        if self.observed_epoch() > epoch {
+            return;
+        }
+        loop {
+            let notified = self.notify.notified();
+            if self.observed_epoch() > epoch {
+                return;
+            }
+            notified.await;
+            if self.observed_epoch() > epoch {
+                return;
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SinkFileMeta {
     node_id: NodeId,
@@ -986,11 +1021,65 @@ pub struct SinkFileMeta {
     pending_stream_events: Arc<Mutex<VecDeque<Event>>>,
     stream_receive_enabled: Arc<AtomicBool>,
     unit_control: Arc<RuntimeUnitGate>,
+    stream_recv_observer: Option<Arc<StreamRecvObserver>>,
+    stream_recv_ready_notify: Option<Arc<Notify>>,
     shutdown: CancellationToken,
     endpoint_tasks: Arc<Mutex<Vec<ManagedEndpointTask>>>,
 }
 
 impl SinkFileMeta {
+    fn stream_recv_epoch(&self) -> u64 {
+        self.stream_recv_observer
+            .as_ref()
+            .map(|observer| observer.observed_epoch())
+            .unwrap_or(0)
+    }
+
+    fn mark_before_stream_recv(&self) {
+        if let Some(observer) = self.stream_recv_observer.as_ref() {
+            observer.mark_before_recv();
+        }
+    }
+
+    fn notify_stream_recv_waiters(&self) {
+        if let Some(notify) = self.stream_recv_ready_notify.as_ref() {
+            notify.notify_waiters();
+        }
+    }
+
+    async fn wait_until_stream_can_receive(&self) {
+        let Some(notify) = self.stream_recv_ready_notify.clone() else {
+            return;
+        };
+        if self.should_receive_stream_events() {
+            return;
+        }
+        loop {
+            let notified = notify.notified();
+            if self.should_receive_stream_events() {
+                return;
+            }
+            notified.await;
+            if self.should_receive_stream_events() {
+                return;
+            }
+        }
+    }
+
+    async fn wait_until_stream_recv_observed_after_activation(
+        &self,
+        was_receivable: bool,
+        observed_epoch_before: u64,
+    ) {
+        if was_receivable || !self.should_receive_stream_events() {
+            return;
+        }
+        let Some(observer) = self.stream_recv_observer.clone() else {
+            return;
+        };
+        observer.wait_for_epoch_after(observed_epoch_before).await;
+    }
+
     pub(crate) fn debug_traced_route_state(&self, route_key: &str) -> Result<String> {
         let gate_generation = self
             .unit_control
@@ -1076,6 +1165,8 @@ impl SinkFileMeta {
         let stream_delivery_stats = Arc::new(Mutex::new(StreamDeliveryStats::default()));
         let pending_stream_events = Arc::new(Mutex::new(VecDeque::new()));
         let stream_receive_enabled = Arc::new(AtomicBool::new(false));
+        let stream_recv_observer = Arc::new(StreamRecvObserver::default());
+        let stream_recv_ready_notify = Arc::new(Notify::new());
         let unit_control = Arc::new(if boundary.is_some() {
             RuntimeUnitGate::new_runtime_managed("sink-file-meta", SINK_RUNTIME_UNITS)
         } else {
@@ -1091,6 +1182,8 @@ impl SinkFileMeta {
             pending_stream_events: pending_stream_events.clone(),
             stream_receive_enabled: stream_receive_enabled.clone(),
             unit_control: unit_control.clone(),
+            stream_recv_observer: Some(stream_recv_observer.clone()),
+            stream_recv_ready_notify: Some(stream_recv_ready_notify.clone()),
             shutdown: CancellationToken::new(),
             endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
         };
@@ -1164,6 +1257,8 @@ impl SinkFileMeta {
                                             stream_receive_enabled: query_stream_receive_enabled
                                                 .clone(),
                                             unit_control: query_unit_control.clone(),
+                                            stream_recv_observer: None,
+                                            stream_recv_ready_notify: None,
                                             shutdown: CancellationToken::new(),
                                             endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
                                         };
@@ -1306,6 +1401,8 @@ impl SinkFileMeta {
                                             stream_receive_enabled:
                                                 internal_query_stream_receive_enabled.clone(),
                                             unit_control: internal_query_unit_control.clone(),
+                                            stream_recv_observer: None,
+                                            stream_recv_ready_notify: None,
                                             shutdown: CancellationToken::new(),
                                             endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
                                         };
@@ -1469,18 +1566,27 @@ impl SinkFileMeta {
                     pending_stream_events: pending_stream_events.clone(),
                     stream_receive_enabled: stream_receive_enabled.clone(),
                     unit_control: stream_unit_control,
+                    stream_recv_observer: Some(stream_recv_observer.clone()),
+                    stream_recv_ready_notify: Some(stream_recv_ready_notify.clone()),
                     shutdown: CancellationToken::new(),
                     endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
                 });
                 let stream_sink_ready = stream_sink.clone();
+                let stream_sink_wait = stream_sink.clone();
+                let stream_sink_observe = stream_sink.clone();
                 let stream_sink_apply = stream_sink.clone();
-                let endpoint = ManagedEndpointTask::spawn_stream(
+                let endpoint = ManagedEndpointTask::spawn_stream_with_before_recv_and_wait(
                     sys,
                     route,
                     format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
                     SINK_RUNTIME_UNIT_ID,
                     sink.shutdown.clone(),
                     move || stream_sink_ready.should_receive_stream_events(),
+                    move || {
+                        let stream_sink_wait = stream_sink_wait.clone();
+                        async move { stream_sink_wait.wait_until_stream_can_receive().await }.boxed()
+                    },
+                    move || stream_sink_observe.mark_before_stream_recv(),
                     move |events| {
                         let stream_sink_apply = stream_sink_apply.clone();
                         async move {
@@ -1615,6 +1721,8 @@ impl SinkFileMeta {
                                         stream_receive_enabled: query_stream_receive_enabled
                                             .clone(),
                                         unit_control: query_unit_control.clone(),
+                                        stream_recv_observer: None,
+                                        stream_recv_ready_notify: None,
                                         shutdown: CancellationToken::new(),
                                         endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
                                     };
@@ -1745,6 +1853,8 @@ impl SinkFileMeta {
                                         stream_receive_enabled:
                                             internal_query_stream_receive_enabled.clone(),
                                         unit_control: internal_query_unit_control.clone(),
+                                        stream_recv_observer: None,
+                                        stream_recv_ready_notify: None,
                                         shutdown: CancellationToken::new(),
                                         endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
                                     };
@@ -1905,18 +2015,27 @@ impl SinkFileMeta {
                 pending_stream_events: self.pending_stream_events.clone(),
                 stream_receive_enabled: stream_receive_enabled,
                 unit_control: stream_unit_control,
+                stream_recv_observer: self.stream_recv_observer.clone(),
+                stream_recv_ready_notify: self.stream_recv_ready_notify.clone(),
                 shutdown: CancellationToken::new(),
                 endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
             });
             let stream_sink_ready = stream_sink.clone();
+            let stream_sink_wait = stream_sink.clone();
+            let stream_sink_observe = stream_sink.clone();
             let stream_sink_apply = stream_sink.clone();
-            let endpoint = ManagedEndpointTask::spawn_stream(
+            let endpoint = ManagedEndpointTask::spawn_stream_with_before_recv_and_wait(
                 boundary.clone(),
                 route,
                 format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
                 SINK_RUNTIME_UNIT_ID,
                 self.shutdown.clone(),
                 move || stream_sink_ready.should_receive_stream_events(),
+                move || {
+                    let stream_sink_wait = stream_sink_wait.clone();
+                    async move { stream_sink_wait.wait_until_stream_can_receive().await }.boxed()
+                },
+                move || stream_sink_observe.mark_before_stream_recv(),
                 move |events| {
                     let stream_sink_apply = stream_sink_apply.clone();
                     async move {
@@ -1957,6 +2076,8 @@ impl SinkFileMeta {
                 pending_stream_events: self.pending_stream_events.clone(),
                 stream_receive_enabled: roots_control_stream_receive_enabled,
                 unit_control: self.unit_control.clone(),
+                stream_recv_observer: None,
+                stream_recv_ready_notify: None,
                 shutdown: self.shutdown.clone(),
                 endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
             });
@@ -2074,18 +2195,27 @@ impl SinkFileMeta {
                 pending_stream_events: self.pending_stream_events.clone(),
                 stream_receive_enabled: self.stream_receive_enabled.clone(),
                 unit_control: stream_unit_control,
+                stream_recv_observer: self.stream_recv_observer.clone(),
+                stream_recv_ready_notify: self.stream_recv_ready_notify.clone(),
                 shutdown: self.shutdown.clone(),
                 endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
             });
             let stream_sink_ready = stream_sink.clone();
+            let stream_sink_wait = stream_sink.clone();
+            let stream_sink_observe = stream_sink.clone();
             let stream_sink_apply = stream_sink.clone();
-            let endpoint = ManagedEndpointTask::spawn_stream(
+            let endpoint = ManagedEndpointTask::spawn_stream_with_before_recv_and_wait(
                 boundary,
                 route,
                 format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
                 SINK_RUNTIME_UNIT_ID,
                 self.shutdown.clone(),
                 move || stream_sink_ready.should_receive_stream_events(),
+                move || {
+                    let stream_sink_wait = stream_sink_wait.clone();
+                    async move { stream_sink_wait.wait_until_stream_can_receive().await }.boxed()
+                },
+                move || stream_sink_observe.mark_before_stream_recv(),
                 move |events| {
                     let stream_sink_apply = stream_sink_apply.clone();
                     async move {
@@ -2298,6 +2428,9 @@ impl SinkFileMeta {
         let mut validated = 0usize;
         let mut pending_host_object_grants: Option<Vec<GrantedMountRoot>> = None;
         let mut refresh_runtime_groups = false;
+        let mut activated_events_stream_route = false;
+        let stream_recv_epoch_before = self.stream_recv_epoch();
+        let stream_receivable_before = self.should_receive_stream_events();
         eprintln!(
             "fs_meta_sink: apply_orchestration_signals count={} has_runtime_state={}",
             signals.len(),
@@ -2323,6 +2456,11 @@ impl SinkFileMeta {
                         );
                     }
                     self.apply_activate_signal(*unit, route_key, *generation, bound_scopes)?;
+                    if *unit == SinkRuntimeUnit::Sink
+                        && route_key == &format!("{}.{}", ROUTE_KEY_EVENTS, METHOD_STREAM)
+                    {
+                        activated_events_stream_route = true;
+                    }
                     validated += 1;
                     refresh_runtime_groups = true;
                 }
@@ -2407,6 +2545,14 @@ impl SinkFileMeta {
             let grants = self.logical_grants_snapshot()?;
             self.reconcile_runtime_groups(&grants)?;
             self.flush_buffered_stream_events()?;
+        }
+        self.notify_stream_recv_waiters();
+        if activated_events_stream_route {
+            self.wait_until_stream_recv_observed_after_activation(
+                stream_receivable_before,
+                stream_recv_epoch_before,
+            )
+            .await;
         }
         log::debug!("sink-file-meta accepted {} control envelope(s)", validated);
         Ok(())
@@ -2683,10 +2829,12 @@ impl SinkFileMeta {
 
     pub(crate) fn enable_stream_receive(&self) {
         self.stream_receive_enabled.store(true, Ordering::Release);
+        self.notify_stream_recv_waiters();
     }
 
     pub(crate) fn disable_stream_receive(&self) {
         self.stream_receive_enabled.store(false, Ordering::Release);
+        self.notify_stream_recv_waiters();
     }
 
     fn ingest_stream_events(&self, events: &[Event]) -> Result<()> {

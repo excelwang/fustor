@@ -13,6 +13,7 @@ use capanix_runtime_entry_sdk::advanced::boundary::{
     BoundaryContext, ChannelIoSubset, ChannelKey, ChannelRecvRequest, ChannelSendRequest,
 };
 use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::routes::ROUTE_KEY_SINK_QUERY_INTERNAL;
@@ -22,6 +23,48 @@ use crate::runtime::routes::sink_query_request_route_for;
 const ENDPOINT_READY_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 const ENDPOINT_RETRY_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const STREAM_STALE_RECV_GAP_RETRY_LIMIT: usize = 12;
+
+struct RecvEntryObservedBoundary<H> {
+    inner: Arc<dyn ChannelIoSubset>,
+    before_recv: Arc<H>,
+}
+
+#[async_trait::async_trait]
+impl<H> ChannelIoSubset for RecvEntryObservedBoundary<H>
+where
+    H: Fn() + Send + Sync + 'static,
+{
+    async fn channel_send(
+        &self,
+        ctx: BoundaryContext,
+        request: ChannelSendRequest,
+    ) -> capanix_app_sdk::Result<()> {
+        self.inner.channel_send(ctx, request).await
+    }
+
+    async fn channel_recv(
+        &self,
+        ctx: BoundaryContext,
+        request: ChannelRecvRequest,
+    ) -> capanix_app_sdk::Result<Vec<Event>> {
+        let mut inner = Box::pin(self.inner.channel_recv(ctx, request));
+        let before_recv = self.before_recv.clone();
+        let mut observed = false;
+        futures_util::future::poll_fn(move |cx| {
+            let poll = inner.as_mut().poll(cx);
+            if !observed {
+                observed = true;
+                (before_recv)();
+            }
+            poll
+        })
+        .await
+    }
+
+    fn channel_close(&self, ctx: BoundaryContext, channel: ChannelKey) -> capanix_app_sdk::Result<()> {
+        self.inner.channel_close(ctx, channel)
+    }
+}
 
 fn debug_source_status_lifecycle_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -391,6 +434,72 @@ impl ManagedEndpointTask {
         Fut: std::future::Future<Output = ()> + Send + 'static,
         G: Fn() -> bool + Send + Sync + 'static,
     {
+        Self::spawn_stream_with_before_recv_and_wait(
+            boundary,
+            route,
+            name,
+            unit_id,
+            shutdown,
+            should_recv,
+            || async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            .boxed(),
+            || {},
+            handler,
+        )
+    }
+
+    pub(crate) fn spawn_stream_with_before_recv<F, Fut, G, H>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        unit_id: impl Into<String>,
+        shutdown: CancellationToken,
+        should_recv: G,
+        before_recv: H,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+        G: Fn() -> bool + Send + Sync + 'static,
+        H: Fn() + Send + Sync + 'static,
+    {
+        Self::spawn_stream_with_before_recv_and_wait(
+            boundary,
+            route,
+            name,
+            unit_id,
+            shutdown,
+            should_recv,
+            || async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            .boxed(),
+            before_recv,
+            handler,
+        )
+    }
+
+    pub(crate) fn spawn_stream_with_before_recv_and_wait<F, Fut, G, W, H>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        unit_id: impl Into<String>,
+        shutdown: CancellationToken,
+        should_recv: G,
+        wait_until_receivable: W,
+        before_recv: H,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+        G: Fn() -> bool + Send + Sync + 'static,
+        W: Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static,
+        H: Fn() + Send + Sync + 'static,
+    {
         let name_owned = name.into();
         let route_key = route.0.clone();
         let unit_id = unit_id.into();
@@ -401,14 +510,22 @@ impl ManagedEndpointTask {
         let terminal_reason = Arc::new(StdMutex::new(None));
         let terminal_reason_for_runner = terminal_reason.clone();
         let should_recv = Arc::new(should_recv);
+        let wait_until_receivable = Arc::new(wait_until_receivable);
+        let before_recv = Arc::new(before_recv);
+        let boundary: Arc<dyn ChannelIoSubset> = Arc::new(RecvEntryObservedBoundary {
+            inner: boundary,
+            before_recv: before_recv.clone(),
+        });
         let handler = Arc::new(handler);
-        let runner = run_stream_loop(
+        let runner = run_stream_loop_with_wait(
             boundary,
             route,
             join_name,
             unit_id,
             shutdown_for_task,
             should_recv,
+            wait_until_receivable,
+            before_recv,
             handler,
             terminal_reason_for_runner.clone(),
         );
@@ -777,19 +894,59 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
     }
 }
 
-async fn run_stream_loop<F, Fut, G>(
+async fn run_stream_loop<F, Fut, G, H>(
     boundary: Arc<dyn ChannelIoSubset>,
     route: RouteKey,
     join_name: String,
     unit_id: String,
     shutdown_for_task: CancellationToken,
     should_recv: Arc<G>,
+    _before_recv: Arc<H>,
+    handler: Arc<F>,
+    terminal_reason: Arc<StdMutex<Option<String>>>,
+) where
+    F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + Sync + 'static,
+    G: Fn() -> bool + Send + Sync + 'static,
+    H: Fn() + Send + Sync + 'static,
+{
+    run_stream_loop_with_wait(
+        boundary,
+        route,
+        join_name,
+        unit_id,
+        shutdown_for_task,
+        should_recv,
+        Arc::new(|| {
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            .boxed()
+        }),
+        _before_recv,
+        handler,
+        terminal_reason,
+    )
+    .await
+}
+
+async fn run_stream_loop_with_wait<F, Fut, G, W, H>(
+    boundary: Arc<dyn ChannelIoSubset>,
+    route: RouteKey,
+    join_name: String,
+    unit_id: String,
+    shutdown_for_task: CancellationToken,
+    should_recv: Arc<G>,
+    wait_until_receivable: Arc<W>,
+    _before_recv: Arc<H>,
     handler: Arc<F>,
     terminal_reason: Arc<StdMutex<Option<String>>>,
 ) where
     F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
     G: Fn() -> bool + Send + Sync + 'static,
+    W: Fn() -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    H: Fn() + Send + Sync + 'static,
 {
     let ctx = BoundaryContext::for_unit(unit_id);
     let stream_channel = ChannelKey(route.0.clone());
@@ -803,7 +960,7 @@ async fn run_stream_loop<F, Fut, G>(
         }
         if !should_recv() {
             stale_recv_gap_count = 0;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            wait_until_receivable().await;
             continue;
         }
         if should_emit_endpoint_retry_log(&format!("recv_begin:{}:{}", stream_channel.0, join_name))
@@ -1537,6 +1694,7 @@ mod tests {
             "runtime.exec.sink".to_string(),
             CancellationToken::new(),
             Arc::new(|| true),
+            Arc::new(|| {}),
             Arc::new(|_events: Vec<Event>| std::future::ready(())),
             test_terminal_reason(),
         ));
@@ -1555,6 +1713,7 @@ mod tests {
             "runtime.exec.sink".to_string(),
             CancellationToken::new(),
             Arc::new(|| true),
+            Arc::new(|| {}),
             Arc::new(|_events: Vec<Event>| std::future::ready(())),
             test_terminal_reason(),
         ));
@@ -1579,6 +1738,7 @@ mod tests {
             "runtime.exec.sink".into(),
             CancellationToken::new(),
             Arc::new(|| true),
+            Arc::new(|| {}),
             Arc::new(|_events: Vec<Event>| std::future::ready(())),
             test_terminal_reason(),
         ));
@@ -1946,6 +2106,7 @@ mod tests {
             "runtime.exec.sink".to_string(),
             CancellationToken::new(),
             Arc::new(|| true),
+            Arc::new(|| {}),
             Arc::new(|_events: Vec<Event>| std::future::ready(())),
             test_terminal_reason(),
         ));
@@ -1976,6 +2137,7 @@ mod tests {
                     "runtime.exec.source".to_string(),
                     CancellationToken::new(),
                     Arc::new(|| true),
+                    Arc::new(|| {}),
                     Arc::new(|_events: Vec<Event>| std::future::ready(())),
                     terminal_reason.clone(),
                 ),
@@ -2018,6 +2180,7 @@ mod tests {
             "runtime.exec.sink".to_string(),
             CancellationToken::new(),
             Arc::new(|| true),
+            Arc::new(|| {}),
             Arc::new(|_events: Vec<Event>| std::future::ready(())),
             terminal_reason.clone(),
         ));

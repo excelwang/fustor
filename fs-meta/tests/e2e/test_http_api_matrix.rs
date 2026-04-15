@@ -1794,7 +1794,8 @@ fn group_mount_pairs_for_roots_prefers_runtime_mount_over_local_export_source_wh
         ]
     });
 
-    let pairs = group_mount_pairs_for_roots(&grants, &[("nfs1", fs_source.as_str())]).expect("pairs");
+    let pairs =
+        group_mount_pairs_for_roots(&grants, &[("nfs1", fs_source.as_str())]).expect("pairs");
 
     assert_eq!(pairs, vec![("nfs1".to_string(), mount_root)]);
 }

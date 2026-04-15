@@ -2,8 +2,8 @@ use super::*;
 use crate::runtime::routes::{
     METHOD_SINK_QUERY, ROUTE_KEY_EVENTS, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_SINK_QUERY_INTERNAL,
     ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
-    ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_ROOTS_CONTROL,
-    ROUTE_TOKEN_FS_META_INTERNAL, sink_query_request_route_for,
+    ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_TOKEN_FS_META_INTERNAL,
+    sink_query_request_route_for,
 };
 use crate::{ControlEvent, FileMetaRecord};
 use crate::{FSMetaConfig, FSMetaProductConfig, api, query, source};
@@ -1709,7 +1709,8 @@ fn trusted_root_selected_group_ready_sink_status_uses_owner_scoped_sink_query_ro
 }
 
 #[test]
-fn trusted_root_selected_group_surviving_ready_cached_sink_status_outranks_regressed_live_snapshot_after_retire() {
+fn trusted_root_selected_group_surviving_ready_cached_sink_status_outranks_regressed_live_snapshot_after_retire()
+ {
     let request = query::InternalQueryRequest::materialized(
         query::QueryOp::Tree,
         query::QueryScope {
@@ -1820,6 +1821,86 @@ fn trusted_root_selected_group_surviving_ready_cached_sink_status_outranks_regre
         route.0,
         sink_query_request_route_for("node-a").0,
         "ready cached retire survivor nfs4 must keep the owner-scoped selected-group sink query route even when the live sink-status snapshot regresses to zero-state"
+    );
+}
+
+#[test]
+fn trusted_root_selected_group_ready_cached_sink_status_outranks_live_stale_owner_snapshot_after_upgrade_reset()
+{
+    let request = query::InternalQueryRequest::materialized(
+        query::QueryOp::Tree,
+        query::QueryScope {
+            path: b"/".to_vec(),
+            recursive: true,
+            max_depth: None,
+            selected_group: Some("nfs1".to_string()),
+        },
+        Some(query::TreeQueryOptions {
+            read_class: query::ReadClass::TrustedMaterialized,
+        }),
+    );
+    let live_snapshot = SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        groups: vec![SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-a::nfs1".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 1,
+            shadow_lag_us: 0,
+            overflow_pending_audit: false,
+            initial_audit_completed: false,
+            materialized_revision: 0,
+            estimated_heap_bytes: 64,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+    let cached_snapshot = SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-c".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        groups: vec![SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-c::nfs1".to_string(),
+            total_nodes: 9,
+            live_nodes: 8,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 1,
+            shadow_lag_us: 0,
+            overflow_pending_audit: false,
+            initial_audit_completed: true,
+            materialized_revision: 11,
+            estimated_heap_bytes: 64,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+
+    let route = selected_group_sink_query_bridge_bindings(
+        &request,
+        selected_group_sink_query_bridge_snapshot(
+            &request,
+            Some(&live_snapshot),
+            Some(&cached_snapshot),
+        ),
+    )
+    .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY)
+    .expect("resolve selected-group sink query route after upgrade-shaped live owner regression");
+
+    assert_eq!(
+        route.0,
+        sink_query_request_route_for("node-c").0,
+        "ready cached selected-group sink status must outrank a merely live stale owner snapshot after upgrade/reset continuity"
     );
 }
 
@@ -4824,6 +4905,7 @@ async fn pending_facade_exposure_confirmed_waits_for_inflight_rescan_before_shut
 include!("tests/facade_route_continuity.rs");
 
 include!("tests/query_peer_deactivate.rs");
+include!("tests/query_peer_initial_wave.rs");
 
 #[tokio::test]
 async fn query_peer_sink_query_proxy_deactivate_does_not_wait_for_inflight_source_control_handoff()
@@ -22234,6 +22316,88 @@ async fn runtime_app_start_converges_with_exact_fs_source_exports_on_fresh_exter
 }
 
 #[tokio::test]
+async fn worker_backed_sink_ensure_started_precedes_source_start_and_sink_status_route_spawn() {
+    struct SourceWorkerStartPauseHookReset;
+
+    impl Drop for SourceWorkerStartPauseHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_start_pause_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let fs_source = tmp.path().display().to_string();
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let mut sink_binding = external_runtime_worker_binding("sink", &sink_socket_dir);
+    sink_binding.role_id = "unsupported-sink-role".to_string();
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "single-app-node::root-1",
+                        "single-app-node",
+                        "127.0.0.1",
+                        &fs_source,
+                        tmp.path().to_path_buf(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            sink_binding,
+            NodeId("single-app-node".into()),
+            Some(boundary.clone()),
+            Some(boundary),
+            state_boundary,
+        )
+        .expect("init external-worker app"),
+    );
+
+    let start_entered = Arc::new(Notify::new());
+    let start_release = Arc::new(Notify::new());
+    let _pause_reset = SourceWorkerStartPauseHookReset;
+    crate::workers::source::install_source_worker_start_pause_hook(
+        crate::workers::source::SourceWorkerStartPauseHook {
+            entered: start_entered.clone(),
+            release: start_release.clone(),
+        },
+    );
+
+    let control_task = tokio::spawn({
+        let app = app.clone();
+        async move { app.on_control_frame(&[activate_envelope("runtime.exec.source")]).await }
+    });
+
+    if tokio::time::timeout(Duration::from_millis(400), start_entered.notified())
+        .await
+        .is_ok()
+    {
+        start_release.notify_waiters();
+        panic!(
+            "worker-backed sink bootstrap must fail before generation-one source control reaches source.start when the sink worker binding cannot start"
+        );
+    }
+
+    control_task.abort();
+    assert!(
+        !app.control_initialized(),
+        "failed worker-backed sink bootstrap must leave runtime uninitialized before source.start"
+    );
+
+}
+
+#[tokio::test]
 async fn failed_second_full_wave_preserves_incoming_sink_routes_for_later_replay_and_same_node_full_wave_recovery()
  {
     struct SourceControlErrorHookReset;
@@ -22596,7 +22760,7 @@ async fn filtered_stale_shared_source_deactivate_does_not_clear_desired_source_s
         )])
         .expect("split stale source deactivate");
 
-    app.apply_source_signals_with_recovery(&stale_source_deactivate, false)
+    app.apply_source_signals_with_recovery(&stale_source_deactivate, true, false)
         .await
         .expect("stale source deactivate should be filtered");
 
@@ -22678,7 +22842,7 @@ async fn source_reconcile_retains_latest_deactivate_directive_after_reset() {
 
 #[tokio::test]
 async fn generation_cutover_restart_deferred_cleanup_tail_fail_closes_before_replay_budget_exhaustion_when_replayed_source_batch_hits_retryable_resets()
-{
+ {
     use std::collections::VecDeque;
 
     let app = FSMetaApp::new(
@@ -22774,8 +22938,8 @@ async fn generation_cutover_restart_deferred_cleanup_tail_fail_closes_before_rep
             22,
         ),
     ];
-    let (cleanup_source_signals, _, _) = split_app_control_signals(&cleanup_envelopes)
-        .expect("split cleanup-tail source signals");
+    let (cleanup_source_signals, _, _) =
+        split_app_control_signals(&cleanup_envelopes).expect("split cleanup-tail source signals");
 
     let _source_apply_error_reset = SourceApplyErrorQueueHookReset;
     install_source_apply_error_queue_hook(SourceApplyErrorQueueHook {
@@ -22786,7 +22950,7 @@ async fn generation_cutover_restart_deferred_cleanup_tail_fail_closes_before_rep
 
     tokio::time::timeout(
         Duration::from_millis(900),
-        app.apply_source_signals_with_recovery(&cleanup_source_signals, true),
+        app.apply_source_signals_with_recovery(&cleanup_source_signals, true, true),
     )
     .await
     .expect(
@@ -25379,6 +25543,12 @@ async fn current_generation_source_roots_tick_followup_keeps_tick_after_generati
         )),
         "current-generation source tick followup must preserve the source-scan tick after post-reset reinitialize instead of replaying only retained generation-two activates: {last_signals:?}",
     );
+    assert!(
+        last_signals
+            .iter()
+            .all(|signal| !signal.starts_with("activate unit=")),
+        "current-generation source tick followup must not piggyback retained generation-two activates into the same source worker replay batch once the tick-only followup starts recovery: {last_signals:?}",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -25763,34 +25933,24 @@ async fn current_generation_source_roots_tick_timeout_replayed_mixed_wave_reacqu
 
     tokio::time::timeout(Duration::from_secs(5), start_entered.notified())
             .await
-            .expect(
-                "current-generation source-roots tick refresh timeout should force replay-required reinitialize before the replayed mixed wave",
+            .expect_err(
+                "current-generation source-roots tick refresh timeout should now settle without replay-required source reinitialize before any mixed replay wave can start",
             );
-
-    let _control_error_reset = SourceWorkerControlFrameErrorQueueHookReset;
-    crate::workers::source::install_source_worker_control_frame_error_queue_hook(
-        crate::workers::source::SourceWorkerControlFrameErrorQueueHook {
-            errs: std::collections::VecDeque::new(),
-            sticky_worker_instance_id: Some(previous_instance_id),
-            sticky_peer_err: Some("transport closed: sidecar control bridge stopped".to_string()),
-        },
-    );
-    start_release.notify_waiters();
 
     tokio::time::timeout(Duration::from_secs(5), tick_task)
             .await
             .expect(
-                "current-generation source-roots tick recovery should settle after replay-required reinitialize even when the stale pre-timeout source client is poisoned for the replayed mixed wave",
+                "current-generation source-roots tick recovery should settle without forcing replay-required source reinitialize after transient post-ack refresh timeouts",
             )
             .expect("join current-generation source-roots tick replay task")
             .expect(
-                "replayed mixed source wave should reacquire a fresh source client before the stale pre-timeout client can stall the replayed five-envelope batch",
+                "current-generation source-roots tick recovery should keep the current source worker live instead of depending on a replayed mixed wave",
             );
 
     let next_instance_id = source_client.worker_instance_id_for_tests().await;
-    assert_ne!(
+    assert_eq!(
         next_instance_id, previous_instance_id,
-        "current-generation source tick recovery must reacquire a fresh source worker client before replaying the retained mixed wave"
+        "current-generation source tick recovery should not churn the source worker instance once the tick-only followup is kept out of the retained replay batch"
     );
 
     let source_groups = app
