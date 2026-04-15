@@ -77,6 +77,7 @@ async fn control_frame_does_not_wait_for_inflight_status_request_before_source_r
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )

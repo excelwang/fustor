@@ -1,3 +1,4 @@
+use crate::domain_state::FacadeServiceState;
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +36,28 @@ pub(crate) struct SharedFacadePendingStatus {
 }
 
 pub(crate) type SharedFacadePendingStatusCell = Arc<RwLock<Option<SharedFacadePendingStatus>>>;
+pub(crate) type SharedFacadeServiceStateCell = Arc<RwLock<FacadeServiceState>>;
 
 pub(crate) fn shared_facade_pending_status_cell() -> SharedFacadePendingStatusCell {
     Arc::new(RwLock::new(None))
+}
+
+pub(crate) fn shared_facade_service_state_cell() -> SharedFacadeServiceStateCell {
+    Arc::new(RwLock::new(FacadeServiceState::Unavailable))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_facade_service_state_cell_defaults_to_unavailable() {
+        assert_eq!(
+            *shared_facade_service_state_cell()
+                .read()
+                .expect("read facade service state"),
+            FacadeServiceState::Unavailable
+        );
+    }
 }

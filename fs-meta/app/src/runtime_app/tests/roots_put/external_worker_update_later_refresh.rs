@@ -148,6 +148,7 @@ async fn roots_put_returns_applied_root_count_even_when_live_logical_roots_snaps
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )
@@ -377,6 +378,7 @@ async fn roots_put_before_response_does_not_reinflate_roots_count_after_later_ol
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )

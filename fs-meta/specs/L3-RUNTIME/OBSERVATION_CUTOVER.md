@@ -15,6 +15,8 @@ one `fs-meta` app product container with three worker roles. This L3 document
 may refer to runtime bootstrap details only as implementation context beneath
 that worker model.
 
+Cutover and exposure semantics in this file consume the domain states from [STATE_MODEL.md](./STATE_MODEL.md), especially `QueryObservationState`, `FacadeServiceState`, `GroupServiceState`, and `RolloutGenerationState`. Replay, lease, retained, bridge, and local gate signals remain diagnostic reasons rather than competing public state names.
+
 ## [workflow] AuthoritativeTruthReplay
 
 **Steps**
@@ -44,6 +46,16 @@ that worker model.
 5. when facade activation remains pending because runtime exposure proof is still outstanding or listener spawn is retrying, package-local status/health surfaces also expose optional `facade.pending` diagnostics so operators can distinguish cutover waiting from generic host-boundary liveness.
 6. runtime consumes generation/bind/route proof to decide which active facade unit owns the resource-scoped one-cardinality HTTP facade, while the app uses `observation_eligible` to decide when `trusted-materialized` `/tree` and `/stats` may answer as current observation.
 7. when `observation_eligible` is absent or proof is incomplete, the app keeps `trusted-materialized` `/tree` and `/stats` explicitly not-ready and surfaces weaker materialized reads as `materialized-untrusted`; `/on-demand-force-find` stays a freshness path and may be externally available earlier.
+
+## [workflow] QueryAvailabilityOrderingAcrossCutover
+
+**Steps**
+
+1. during catch-up, cutover, drain, or retire, `/on-demand-force-find` MAY become externally available before trusted-materialized `/tree` and `/stats`, as soon as the facade is serving or degraded and a fresh source execution path exists for the target group.
+2. during the same interval, materialized `/tree` and `/stats` MAY answer once materialized observation is readable, even if that observation is still `materialized-untrusted`.
+3. trusted-materialized `/tree` and `/stats` MUST remain closed until `observation_eligible` is satisfied and `QueryObservationState=trusted-materialized`.
+4. the system MUST preserve this ordering throughout recovery and failover: freshness availability first, materialized readability second, trusted-materialized serving last.
+5. regressions in trusted observation MUST close the trusted-materialized window before they close the wider freshness window, unless the facade itself or fresh source execution becomes unavailable.
 
 ## [workflow] StaleGenerationFence
 

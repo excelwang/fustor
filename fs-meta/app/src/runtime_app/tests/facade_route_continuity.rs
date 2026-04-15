@@ -43,6 +43,7 @@ async fn query_peer_deactivate_does_not_shutdown_active_facade_listener() {
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )
@@ -159,6 +160,7 @@ async fn mark_control_uninitialized_clears_retained_active_facade_continuity_bef
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )
@@ -310,6 +312,7 @@ async fn future_generation_facade_deactivate_without_successor_activate_keeps_ac
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )
@@ -425,6 +428,7 @@ async fn future_generation_facade_deactivate_without_successor_activate_keeps_qu
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )
@@ -555,6 +559,7 @@ async fn uninitialized_same_generation_facade_deactivate_keeps_listener_availabl
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )
@@ -663,6 +668,7 @@ async fn initialized_same_generation_facade_deactivate_without_successor_keeps_l
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )

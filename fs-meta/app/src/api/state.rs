@@ -8,7 +8,7 @@ use tokio::sync::Notify;
 use capanix_app_sdk::runtime::NodeId;
 use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
 
-use super::facade_status::SharedFacadePendingStatusCell;
+use super::facade_status::{SharedFacadePendingStatusCell, SharedFacadeServiceStateCell};
 use crate::query::api::ProjectionPolicy;
 use crate::workers::sink::SinkFacade;
 use crate::workers::source::SourceFacade;
@@ -121,6 +121,7 @@ pub struct ApiState {
     pub auth: Arc<AuthService>,
     pub projection_policy: Arc<RwLock<ProjectionPolicy>>,
     pub facade_pending: SharedFacadePendingStatusCell,
+    pub facade_service_state: SharedFacadeServiceStateCell,
     pub request_tracker: Arc<ApiRequestTracker>,
     pub control_gate: Arc<ApiControlGate>,
 }

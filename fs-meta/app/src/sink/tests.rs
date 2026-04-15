@@ -735,7 +735,8 @@ async fn scheduled_root_id_stream_events_materialize_ready_state_without_host_gr
 }
 
 #[tokio::test]
-async fn events_stream_materializes_split_primary_mixed_cluster_publications_after_bare_scope_activate() {
+async fn events_stream_materializes_split_primary_mixed_cluster_publications_after_bare_scope_activate()
+ {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![
         RootSpec::new("nfs1", "/mnt/nfs1"),
@@ -758,7 +759,11 @@ async fn events_stream_materializes_split_primary_mixed_cluster_publications_aft
             lease: None,
             generation: 1,
             expires_at_ms: 1,
-            bound_scopes: vec![bound_scope("nfs1"), bound_scope("nfs2"), bound_scope("nfs3")],
+            bound_scopes: vec![
+                bound_scope("nfs1"),
+                bound_scope("nfs2"),
+                bound_scope("nfs3"),
+            ],
         },
     ))
     .expect("encode split-primary stream activate")])
@@ -898,7 +903,9 @@ async fn events_stream_materializes_split_primary_mixed_cluster_publications_aft
     ])
     .expect("split-primary stream events should apply after bare-scope activate");
 
-    let snapshot = sink.status_snapshot().expect("sink status after split-primary stream apply");
+    let snapshot = sink
+        .status_snapshot()
+        .expect("sink status after split-primary stream apply");
     let ready_groups = snapshot
         .groups
         .iter()

@@ -2063,8 +2063,9 @@ impl SinkWorkerClientHandle {
                     }
                     Err(err) => {
                         let snapshot = self.cached_status_snapshot()?;
-                        if snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(&snapshot)
-                        {
+                        if snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(
+                            &snapshot,
+                        ) {
                             if debug_control_scope_capture_enabled() {
                                 eprintln!(
                                     "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=worker_unavailable_missing_scheduled_group_rows_after_stream_evidence err={} {}",

@@ -87,6 +87,7 @@
             predecessor.query_sink.clone(),
             predecessor.runtime_boundary.clone(),
             predecessor.facade_pending_status.clone(),
+            predecessor.facade_service_state.clone(),
             predecessor.api_request_tracker.clone(),
             predecessor.api_control_gate.clone(),
         )
@@ -269,6 +270,7 @@
             predecessor.query_sink.clone(),
             predecessor.runtime_boundary.clone(),
             predecessor.facade_pending_status.clone(),
+            predecessor.facade_service_state.clone(),
             predecessor.api_request_tracker.clone(),
             predecessor.api_control_gate.clone(),
         )

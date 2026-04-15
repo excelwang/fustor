@@ -4,6 +4,8 @@ version: 3.0.0
 
 # L3 Runtime: fs-meta Workflows
 
+User-visible and operator-visible state names consumed by these workflows are owned by [STATE_MODEL.md](./STATE_MODEL.md). Workflow-local replay, retained, tick, republish, and timeout classifiers are implementation diagnostics only unless and until they are folded into one of the domain state machines defined there.
+
 ## [workflow] StartupAndIndexBootstrap
 
 **Steps**

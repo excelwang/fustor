@@ -1,3 +1,4 @@
+use crate::domain_state::QueryObservationState;
 use crate::query::models::SubtreeStats;
 use crate::query::observation::{
     ObservationTrustPolicy, evaluate_observation_status, materialized_query_observation_evidence,
@@ -5980,8 +5981,9 @@ fn path_to_string_lossy(path: &[u8]) -> String {
 }
 
 fn observation_status_json(status: &ObservationStatus) -> serde_json::Value {
+    let state = QueryObservationState::from(status);
     serde_json::json!({
-        "state": status.state,
+        "state": state.as_str(),
         "reasons": status.reasons,
     })
 }

@@ -84,6 +84,7 @@
             app_1.query_sink.clone(),
             app_1.runtime_boundary.clone(),
             app_1.facade_pending_status.clone(),
+            app_1.facade_service_state.clone(),
             app_1.api_request_tracker.clone(),
             app_1.api_control_gate.clone(),
         )
@@ -285,6 +286,7 @@
             app_1.query_sink.clone(),
             app_1.runtime_boundary.clone(),
             app_1.facade_pending_status.clone(),
+            app_1.facade_service_state.clone(),
             app_1.api_request_tracker.clone(),
             app_1.api_control_gate.clone(),
         )

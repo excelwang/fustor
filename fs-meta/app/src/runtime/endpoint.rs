@@ -61,7 +61,11 @@ where
         .await
     }
 
-    fn channel_close(&self, ctx: BoundaryContext, channel: ChannelKey) -> capanix_app_sdk::Result<()> {
+    fn channel_close(
+        &self,
+        ctx: BoundaryContext,
+        channel: ChannelKey,
+    ) -> capanix_app_sdk::Result<()> {
         self.inner.channel_close(ctx, channel)
     }
 }
@@ -441,10 +445,12 @@ impl ManagedEndpointTask {
             unit_id,
             shutdown,
             should_recv,
-            || async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            .boxed(),
+            || {
+                async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                .boxed()
+            },
             || {},
             handler,
         )
@@ -473,10 +479,12 @@ impl ManagedEndpointTask {
             unit_id,
             shutdown,
             should_recv,
-            || async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            .boxed(),
+            || {
+                async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                .boxed()
+            },
             before_recv,
             handler,
         )

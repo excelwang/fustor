@@ -216,15 +216,16 @@ pub struct StatusFacadePending {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusFacade {
-    pub pending: StatusFacadePending,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<StatusFacadePending>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusResponse {
     pub source: StatusSource,
     pub sink: StatusSink,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub facade: Option<StatusFacade>,
+    pub facade: StatusFacade,
 }
 
 #[derive(Debug, Clone, Serialize)]

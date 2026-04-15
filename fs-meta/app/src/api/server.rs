@@ -31,7 +31,7 @@ use crate::workers::source::SourceFacade;
 use super::auth::AuthService;
 use super::config::ResolvedApiConfig;
 use super::errors::ApiError;
-use super::facade_status::SharedFacadePendingStatusCell;
+use super::facade_status::{SharedFacadePendingStatusCell, SharedFacadeServiceStateCell};
 use super::handlers;
 use super::state::{ApiControlGate, ApiRequestTracker, ApiState};
 
@@ -98,6 +98,7 @@ pub async fn spawn(
     query_sink: Arc<SinkFacade>,
     query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     facade_pending: SharedFacadePendingStatusCell,
+    facade_service_state: SharedFacadeServiceStateCell,
     request_tracker: Arc<ApiRequestTracker>,
     control_gate: Arc<ApiControlGate>,
 ) -> Result<ApiServerHandle> {
@@ -139,6 +140,7 @@ pub async fn spawn(
         auth,
         projection_policy,
         facade_pending,
+        facade_service_state,
         request_tracker,
         control_gate,
     };

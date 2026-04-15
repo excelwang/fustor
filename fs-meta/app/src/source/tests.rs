@@ -1054,7 +1054,8 @@ async fn scheduled_groups_publish_only_runnable_local_roots_after_mixed_scope_ac
 }
 
 #[tokio::test]
-async fn scheduled_groups_with_bare_scope_ids_only_publish_local_granted_roots_under_mixed_cluster_grants() {
+async fn scheduled_groups_with_bare_scope_ids_only_publish_local_granted_roots_under_mixed_cluster_grants()
+ {
     let nfs1_source = "127.0.0.1:/exports/nfs1";
     let nfs2_source = "127.0.0.1:/exports/nfs2";
     let nfs3_source = "127.0.0.1:/exports/nfs3";
@@ -1680,7 +1681,8 @@ async fn manual_rescan_publishes_baseline_for_each_split_primary_under_mixed_clu
                  host_ref: &str,
                  host_ip: &str,
                  mount_point: std::path::PathBuf,
-                 fs_source: &str| -> GrantedMountRoot {
+                 fs_source: &str|
+     -> GrantedMountRoot {
         GrantedMountRoot {
             object_ref,
             host_ref: host_ref.to_string(),
@@ -1743,15 +1745,69 @@ async fn manual_rescan_publishes_baseline_for_each_split_primary_under_mixed_clu
             },
         ],
         host_object_grants: vec![
-            grant(format!("{node_a_id}::nfs1"), node_a_id, "10.0.0.11", node_a_nfs1.clone(), nfs1_source),
-            grant(format!("{node_a_id}::nfs2"), node_a_id, "10.0.0.12", node_a_nfs2.clone(), nfs2_source),
-            grant(format!("{node_b_id}::nfs1"), node_b_id, "10.0.0.21", node_b_nfs1.clone(), nfs1_source),
-            grant(format!("{node_c_id}::nfs1"), node_c_id, "10.0.0.31", node_c_nfs1.clone(), nfs1_source),
-            grant(format!("{node_c_id}::nfs2"), node_c_id, "10.0.0.32", node_c_nfs2.clone(), nfs2_source),
-            grant(format!("{node_d_id}::nfs2"), node_d_id, "10.0.0.41", node_d_nfs2.clone(), nfs2_source),
-            grant(format!("{node_b_id}::nfs3"), node_b_id, "10.0.0.23", node_b_nfs3.clone(), nfs3_source),
-            grant(format!("{node_d_id}::nfs3"), node_d_id, "10.0.0.43", node_d_nfs3.clone(), nfs3_source),
-            grant(format!("{node_e_id}::nfs3"), node_e_id, "10.0.0.53", node_e_nfs3.clone(), nfs3_source),
+            grant(
+                format!("{node_a_id}::nfs1"),
+                node_a_id,
+                "10.0.0.11",
+                node_a_nfs1.clone(),
+                nfs1_source,
+            ),
+            grant(
+                format!("{node_a_id}::nfs2"),
+                node_a_id,
+                "10.0.0.12",
+                node_a_nfs2.clone(),
+                nfs2_source,
+            ),
+            grant(
+                format!("{node_b_id}::nfs1"),
+                node_b_id,
+                "10.0.0.21",
+                node_b_nfs1.clone(),
+                nfs1_source,
+            ),
+            grant(
+                format!("{node_c_id}::nfs1"),
+                node_c_id,
+                "10.0.0.31",
+                node_c_nfs1.clone(),
+                nfs1_source,
+            ),
+            grant(
+                format!("{node_c_id}::nfs2"),
+                node_c_id,
+                "10.0.0.32",
+                node_c_nfs2.clone(),
+                nfs2_source,
+            ),
+            grant(
+                format!("{node_d_id}::nfs2"),
+                node_d_id,
+                "10.0.0.41",
+                node_d_nfs2.clone(),
+                nfs2_source,
+            ),
+            grant(
+                format!("{node_b_id}::nfs3"),
+                node_b_id,
+                "10.0.0.23",
+                node_b_nfs3.clone(),
+                nfs3_source,
+            ),
+            grant(
+                format!("{node_d_id}::nfs3"),
+                node_d_id,
+                "10.0.0.43",
+                node_d_nfs3.clone(),
+                nfs3_source,
+            ),
+            grant(
+                format!("{node_e_id}::nfs3"),
+                node_e_id,
+                "10.0.0.53",
+                node_e_nfs3.clone(),
+                nfs3_source,
+            ),
         ],
         ..SourceConfig::default()
     };
@@ -1768,9 +1824,18 @@ async fn manual_rescan_publishes_baseline_for_each_split_primary_under_mixed_clu
                 generation,
                 expires_at_ms: 1,
                 bound_scopes: vec![
-                    RuntimeBoundScope { scope_id: "nfs1".to_string(), resource_ids: vec!["nfs1".to_string()] },
-                    RuntimeBoundScope { scope_id: "nfs2".to_string(), resource_ids: vec!["nfs2".to_string()] },
-                    RuntimeBoundScope { scope_id: "nfs3".to_string(), resource_ids: vec!["nfs3".to_string()] },
+                    RuntimeBoundScope {
+                        scope_id: "nfs1".to_string(),
+                        resource_ids: vec!["nfs1".to_string()],
+                    },
+                    RuntimeBoundScope {
+                        scope_id: "nfs2".to_string(),
+                        resource_ids: vec!["nfs2".to_string()],
+                    },
+                    RuntimeBoundScope {
+                        scope_id: "nfs3".to_string(),
+                        resource_ids: vec!["nfs3".to_string()],
+                    },
                 ],
             }))
             .expect("encode source roots activate"),
@@ -1781,9 +1846,18 @@ async fn manual_rescan_publishes_baseline_for_each_split_primary_under_mixed_clu
                 generation,
                 expires_at_ms: 1,
                 bound_scopes: vec![
-                    RuntimeBoundScope { scope_id: "nfs1".to_string(), resource_ids: vec!["nfs1".to_string()] },
-                    RuntimeBoundScope { scope_id: "nfs2".to_string(), resource_ids: vec!["nfs2".to_string()] },
-                    RuntimeBoundScope { scope_id: "nfs3".to_string(), resource_ids: vec!["nfs3".to_string()] },
+                    RuntimeBoundScope {
+                        scope_id: "nfs1".to_string(),
+                        resource_ids: vec!["nfs1".to_string()],
+                    },
+                    RuntimeBoundScope {
+                        scope_id: "nfs2".to_string(),
+                        resource_ids: vec!["nfs2".to_string()],
+                    },
+                    RuntimeBoundScope {
+                        scope_id: "nfs3".to_string(),
+                        resource_ids: vec!["nfs3".to_string()],
+                    },
                 ],
             }))
             .expect("encode source rescan-control activate"),
@@ -1794,9 +1868,18 @@ async fn manual_rescan_publishes_baseline_for_each_split_primary_under_mixed_clu
                 generation,
                 expires_at_ms: 1,
                 bound_scopes: vec![
-                    RuntimeBoundScope { scope_id: "nfs1".to_string(), resource_ids: vec!["nfs1".to_string()] },
-                    RuntimeBoundScope { scope_id: "nfs2".to_string(), resource_ids: vec!["nfs2".to_string()] },
-                    RuntimeBoundScope { scope_id: "nfs3".to_string(), resource_ids: vec!["nfs3".to_string()] },
+                    RuntimeBoundScope {
+                        scope_id: "nfs1".to_string(),
+                        resource_ids: vec!["nfs1".to_string()],
+                    },
+                    RuntimeBoundScope {
+                        scope_id: "nfs2".to_string(),
+                        resource_ids: vec!["nfs2".to_string()],
+                    },
+                    RuntimeBoundScope {
+                        scope_id: "nfs3".to_string(),
+                        resource_ids: vec!["nfs3".to_string()],
+                    },
                 ],
             }))
             .expect("encode source rescan activate"),
@@ -1807,9 +1890,18 @@ async fn manual_rescan_publishes_baseline_for_each_split_primary_under_mixed_clu
                 generation,
                 expires_at_ms: 1,
                 bound_scopes: vec![
-                    RuntimeBoundScope { scope_id: "nfs1".to_string(), resource_ids: vec!["nfs1".to_string()] },
-                    RuntimeBoundScope { scope_id: "nfs2".to_string(), resource_ids: vec!["nfs2".to_string()] },
-                    RuntimeBoundScope { scope_id: "nfs3".to_string(), resource_ids: vec!["nfs3".to_string()] },
+                    RuntimeBoundScope {
+                        scope_id: "nfs1".to_string(),
+                        resource_ids: vec!["nfs1".to_string()],
+                    },
+                    RuntimeBoundScope {
+                        scope_id: "nfs2".to_string(),
+                        resource_ids: vec!["nfs2".to_string()],
+                    },
+                    RuntimeBoundScope {
+                        scope_id: "nfs3".to_string(),
+                        resource_ids: vec!["nfs3".to_string()],
+                    },
                 ],
             }))
             .expect("encode source scan activate"),
@@ -1863,7 +1955,8 @@ async fn manual_rescan_publishes_baseline_for_each_split_primary_under_mixed_clu
             continue;
         };
         for event in batch {
-            let Ok(record) = rmp_serde::from_slice::<crate::FileMetaRecord>(event.payload_bytes()) else {
+            let Ok(record) = rmp_serde::from_slice::<crate::FileMetaRecord>(event.payload_bytes())
+            else {
                 continue;
             };
             if is_under_query_path(&record.path, b"/data") {
@@ -1886,12 +1979,19 @@ async fn manual_rescan_publishes_baseline_for_each_split_primary_under_mixed_clu
     source.close().await.expect("close source");
 
     assert!(
-        baseline_counts.get(&format!("{node_a_id}::nfs1")).copied().unwrap_or(0) > 0
-            && baseline_counts.get(&format!("{node_a_id}::nfs2")).copied().unwrap_or(0) > 0,
+        baseline_counts
+            .get(&format!("{node_a_id}::nfs1"))
+            .copied()
+            .unwrap_or(0)
+            > 0
+            && baseline_counts
+                .get(&format!("{node_a_id}::nfs2"))
+                .copied()
+                .unwrap_or(0)
+                > 0,
         "manual rescan should publish baseline /data for node-a split-primary roots under mixed cluster grants: {baseline_counts:?}",
     );
 }
-
 
 #[tokio::test]
 async fn runtime_managed_watch_scan_zero_grant_trigger_rescan_when_ready_publishes_baseline_data() {

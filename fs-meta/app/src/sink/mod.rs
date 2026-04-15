@@ -1584,7 +1584,8 @@ impl SinkFileMeta {
                     move || stream_sink_ready.should_receive_stream_events(),
                     move || {
                         let stream_sink_wait = stream_sink_wait.clone();
-                        async move { stream_sink_wait.wait_until_stream_can_receive().await }.boxed()
+                        async move { stream_sink_wait.wait_until_stream_can_receive().await }
+                            .boxed()
                     },
                     move || stream_sink_observe.mark_before_stream_recv(),
                     move |events| {

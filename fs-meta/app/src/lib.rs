@@ -2,6 +2,7 @@ use capanix_runtime_entry_sdk::entry::capanix_unit_entry;
 
 pub mod api;
 mod config;
+pub(crate) mod domain_state;
 pub mod query;
 pub mod runtime;
 mod runtime_app;

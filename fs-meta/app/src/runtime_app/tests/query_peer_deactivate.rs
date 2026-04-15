@@ -78,6 +78,7 @@ async fn query_peer_deactivate_does_not_wait_for_inflight_internal_sink_status_r
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )
@@ -286,6 +287,7 @@ async fn query_peer_internal_status_deactivate_does_not_wait_for_inflight_source
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )

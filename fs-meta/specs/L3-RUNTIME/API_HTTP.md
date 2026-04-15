@@ -4,6 +4,8 @@ version: 3.0.0
 
 # L3 Runtime: fs-meta HTTP API Interfaces
 
+Product-facing state names referenced in this file are owned by [STATE_MODEL.md](./STATE_MODEL.md). Query observation state, facade service state, group service state, rollout generation state, and node participation state MUST use that authority rather than implementation-local vocabulary.
+
 ## [interface] ApiNamespace
 
 **Rationale**
@@ -52,7 +54,7 @@ GET /status -> StatusResponse
 ```
 
 1. `GET /status`
-   1. response: source lifecycle, degraded roots, host-object-grant version, source coverage details, sink health/capacity stats, and optional facade-pending diagnostics. These status/health surfaces are the current fs-meta observation-evidence boundary for materialized-query readiness; they do not rely on legacy revision-pair status fields.
+   1. response: source lifecycle, degraded roots, host-object-grant version, source coverage details, sink health/capacity stats, and a `facade` object that always includes `state` (`unavailable`, `pending`, or `serving` today; `degraded` remains reserved for a later hard cut) plus optional facade-pending diagnostics. These status/health surfaces are the current fs-meta observation-evidence boundary for materialized-query readiness, GroupServiceState, and FacadeServiceState; they do not rely on legacy revision-pair status fields.
    2. source payload MUST expose per logical-root coverage summary (`matched_grants`, `active_members`, `coverage_mode`) and per concrete-root operational status (`root_key`, `object_ref`, `watch_lru_capacity`, `audit_interval_ms`, `overflow_count`, `overflow_pending`, `rescan_pending`, `last_rescan_reason`, `last_error`, `last_audit_started_at_us`, `last_audit_completed_at_us`, `last_audit_duration_ms`) so callers can inspect source-side audit progression and recovery evidence.
    3. sink payload MUST expose aggregate counts plus per-group capacity/readiness details (`estimated_heap_bytes`, `groups[].estimated_heap_bytes`, `groups[].shadow_lag_us`, `groups[].overflow_pending_audit`, `groups[].initial_audit_completed`) so large-NFS deployments can distinguish liveness from coverage pressure, first-audit completion, and materialized catch-up readiness.
    4. when facade activation is pending or retrying, status MAY expose `facade.pending` with `route_key`, `generation`, `resource_ids`, `runtime_exposure_confirmed`, `reason`, `retry_attempts`, `pending_since_us`, and optional retry diagnostics such as `last_error`, `last_attempt_at_us`, `last_error_at_us`, `retry_backoff_ms`, and `next_retry_at_us`.
@@ -169,7 +171,7 @@ GET /bound-route-metrics  -> BoundRouteMetricsResponse
    1. response: `{ "call_timeout_total": u64, "correlation_mismatch_total": u64, "uncorrelated_reply_total": u64, "recv_loop_iterations": u64, "pending_calls": usize }`.
 5. `GET /tree` payload details
    1. `observation_status` keys: `state`, `reasons`.
-   2. `observation_status.state` domain for `/tree`: `fresh-only|materialized-untrusted|trusted-materialized`.
+   2. `observation_status.state` domain for `/tree` is the `QueryObservationState` subset `fresh-only|materialized-untrusted|trusted-materialized` from `STATE_MODEL.md`.
    3. `stability` keys remain `mode`, `state`, `quiet_window_ms`, `observed_quiet_for_ms`, `remaining_ms`, `blocked_reasons`.
    4. `stability.state` domain for tree groups remains `not-evaluated|stable|unstable|unknown|degraded`.
    5. `pit` uses `{ id, expires_at_ms }`.
@@ -182,7 +184,7 @@ GET /bound-route-metrics  -> BoundRouteMetricsResponse
    12. `path_b64` is the authoritative bytes-safe path field and appears only when the underlying raw bytes are not valid UTF-8. `path` remains the default display-only UTF-8/lossy rendering for convenience.
    13. `read_class=materialized` MAY return while `observation_status.state=materialized-untrusted`; `read_class=trusted-materialized` returns explicit `NOT_READY` until the same package-local observation evidence reaches trusted state.
 6. `GET /on-demand-force-find` payload details
-   1. `observation_status.state` MUST stay `fresh-only`.
+   1. `observation_status.state` MUST stay `fresh-only`, which is the live/fresh member of `QueryObservationState` in `STATE_MODEL.md`.
    2. `stability` keys use the same object shape as `/tree`, but `state` MUST stay `not-evaluated` and `mode` MUST stay `none`.
    3. `meta.read_class` is always `fresh`; `meta.metadata_available` is always `true`.
    4. each returned group item owns its own `root`, `entries`, and `entry_page`, using the same field shapes as `/tree`, including optional `path_b64` when display strings would be lossy.
@@ -191,6 +193,15 @@ GET /bound-route-metrics  -> BoundRouteMetricsResponse
 7. `PitHandle`
    1. required keys: `id`, `expires_at_ms`.
    2. `id` is an opaque server-issued query session id; clients do not derive meaning from it.
+## [decision] QueryAvailabilityWindowOrdering
+
+1. `/on-demand-force-find` is the widest query-side availability window in the public API. It is a freshness path and MUST NOT be blocked solely because trusted-materialized observation is not yet available.
+2. `/tree` and `/stats` with `read_class=materialized` expose a middle availability window: they MAY answer while `observation_status.state=materialized-untrusted`, but they MUST NOT answer when `observation_status.state=unavailable`.
+3. `/tree` and `/stats` with `read_class=trusted-materialized` expose the narrowest availability window: they MUST fail closed with explicit `NOT_READY` whenever `observation_status.state` is not `trusted-materialized`.
+4. Default `/tree` and `/stats` behavior inherits the narrowest window because their default `read_class` is `trusted-materialized`.
+5. The public availability ordering is contractual: `/on-demand-force-find` availability ⊇ materialized `/tree|/stats` availability ⊇ trusted-materialized `/tree|/stats` availability.
+6. Status, degraded evidence, or diagnostics MAY explain why a narrower window is currently closed, but they MUST NOT collapse the wider `/on-demand-force-find` window into the trusted-materialized gate unless the facade itself or fresh source execution is unavailable.
+
 8. `GroupEnvelopeStats` (used by `/stats`)
    1. required keys: `status`, `errors`; `members` key MUST be absent.
    2. when `status=ok`: envelope MUST include `data` with `total_nodes/total_files/total_dirs/total_size/latest_file_mtime_us/attested_count/blind_spot_count`, and `partial_failure`.

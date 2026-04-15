@@ -244,10 +244,7 @@ fn runtime_scope_resource_matches_logical_root(resource_id: &str, logical_root_i
             .is_some_and(|(_, tail)| tail == logical_root_id)
 }
 
-fn runtime_scope_row_matches_logical_root(
-    row: &RuntimeBoundScope,
-    logical_root_id: &str,
-) -> bool {
+fn runtime_scope_row_matches_logical_root(row: &RuntimeBoundScope, logical_root_id: &str) -> bool {
     row.scope_id == logical_root_id
         || row.resource_ids.iter().any(|resource_id| {
             runtime_scope_resource_matches_logical_root(resource_id, logical_root_id)

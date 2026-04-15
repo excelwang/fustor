@@ -102,6 +102,7 @@ async fn roots_put_contraction_returns_single_root_count_after_external_worker_u
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )
@@ -321,6 +322,7 @@ async fn roots_put_contraction_with_fs_source_selectors_returns_single_root_coun
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )

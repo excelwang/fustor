@@ -212,6 +212,7 @@ async fn pending_facade_exposure_confirmed_waits_for_inflight_roots_put_after_si
         app.query_sink.clone(),
         app.runtime_boundary.clone(),
         app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
     )

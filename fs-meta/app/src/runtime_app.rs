@@ -1,16 +1,18 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use crate::api::facade_status::{
     FacadePendingReason, SharedFacadePendingStatus, SharedFacadePendingStatusCell,
-    shared_facade_pending_status_cell,
+    SharedFacadeServiceStateCell, shared_facade_pending_status_cell,
+    shared_facade_service_state_cell,
 };
 use crate::api::{ApiControlGate, ApiRequestTracker};
+use crate::domain_state::FacadeServiceState;
 use crate::query::TreeGroupPayload;
 use crate::query::observation::{
     ObservationTrustPolicy, candidate_group_observation_evidence, evaluate_observation_status,
@@ -234,6 +236,7 @@ struct PendingFixedBindHandoffRegistrant {
     pending_fixed_bind_has_suppressed_dependent_routes: Arc<AtomicBool>,
     facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
     facade_pending_status: SharedFacadePendingStatusCell,
+    facade_service_state: SharedFacadeServiceStateCell,
     api_request_tracker: Arc<ApiRequestTracker>,
     api_control_gate: Arc<ApiControlGate>,
     node_id: NodeId,
@@ -1548,8 +1551,8 @@ fn note_sink_apply_entry_for_tests() {
 }
 
 #[cfg(test)]
-fn local_sink_status_republish_helper_entry_count_hook_cell(
-) -> &'static StdMutex<Option<Arc<AtomicUsize>>> {
+fn local_sink_status_republish_helper_entry_count_hook_cell()
+-> &'static StdMutex<Option<Arc<AtomicUsize>>> {
     static CELL: OnceLock<StdMutex<Option<Arc<AtomicUsize>>>> = OnceLock::new();
     CELL.get_or_init(|| StdMutex::new(None))
 }
@@ -2032,6 +2035,7 @@ pub struct FSMetaApp {
     control_frame_serial: Arc<Mutex<()>>,
     shared_control_frame_serial: Arc<Mutex<()>>,
     facade_pending_status: SharedFacadePendingStatusCell,
+    facade_service_state: SharedFacadeServiceStateCell,
     facade_gate: RuntimeUnitGate,
     mirrored_query_peer_routes: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
     control_initialized: AtomicBool,
@@ -2727,6 +2731,7 @@ impl FSMetaApp {
             control_frame_serial: Arc::new(Mutex::new(())),
             shared_control_frame_serial,
             facade_pending_status: shared_facade_pending_status_cell(),
+            facade_service_state: shared_facade_service_state_cell(),
             facade_gate: RuntimeUnitGate::new(
                 "fs-meta",
                 &[
@@ -2756,6 +2761,39 @@ impl FSMetaApp {
         self.control_initialized.load(Ordering::Acquire)
     }
 
+    fn current_facade_service_state_from_runtime_facts(
+        control_ready: bool,
+        publication_ready: bool,
+        pending_facade_present: bool,
+    ) -> FacadeServiceState {
+        if pending_facade_present {
+            FacadeServiceState::Pending
+        } else if control_ready && publication_ready {
+            FacadeServiceState::Serving
+        } else {
+            FacadeServiceState::Unavailable
+        }
+    }
+
+    async fn current_facade_service_state(&self) -> FacadeServiceState {
+        let pending_facade_present = self.pending_facade.lock().await.is_some()
+            || self
+                .facade_pending_status
+                .read()
+                .ok()
+                .is_some_and(|status| status.is_some());
+        let publication_ready = self.facade_publication_ready().await;
+        let state = Self::current_facade_service_state_from_runtime_facts(
+            self.api_control_gate.is_ready(),
+            publication_ready,
+            pending_facade_present,
+        );
+        *self
+            .facade_service_state
+            .write()
+            .expect("write published facade service state") = state;
+        state
+    }
     fn should_initialize_from_control(
         source_signals: &[SourceControlSignal],
         sink_signals: &[SinkControlSignal],
@@ -3014,6 +3052,7 @@ impl FSMetaApp {
         self.control_initialized.store(true, Ordering::Release);
         self.api_control_gate
             .set_ready(self.facade_publication_ready().await);
+        let _ = self.current_facade_service_state().await;
         eprintln!("fs_meta_runtime_app: initialize_from_control done");
 
         Ok(())
@@ -4036,6 +4075,7 @@ impl FSMetaApp {
             self.pending_fixed_bind_has_suppressed_dependent_routes
                 .clone(),
             self.facade_pending_status.clone(),
+            self.facade_service_state.clone(),
             self.api_request_tracker.clone(),
             self.api_control_gate.clone(),
             self.node_id.clone(),
@@ -4107,6 +4147,7 @@ impl FSMetaApp {
         facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
         pending_fixed_bind_has_suppressed_dependent_routes: Arc<AtomicBool>,
         facade_pending_status: SharedFacadePendingStatusCell,
+        facade_service_state: SharedFacadeServiceStateCell,
         api_request_tracker: Arc<ApiRequestTracker>,
         api_control_gate: Arc<ApiControlGate>,
         node_id: NodeId,
@@ -4123,6 +4164,7 @@ impl FSMetaApp {
             facade_spawn_in_progress,
             pending_fixed_bind_has_suppressed_dependent_routes,
             facade_pending_status,
+            facade_service_state,
             api_request_tracker,
             api_control_gate,
             node_id,
@@ -4139,6 +4181,7 @@ impl FSMetaApp {
              query_sink,
              query_runtime_boundary,
              facade_pending_status,
+             facade_service_state,
              api_request_tracker,
              api_control_gate| async move {
                 api::spawn(
@@ -4150,6 +4193,7 @@ impl FSMetaApp {
                     query_sink,
                     query_runtime_boundary,
                     facade_pending_status,
+                    facade_service_state,
                     api_request_tracker,
                     api_control_gate,
                 )
@@ -4166,6 +4210,7 @@ impl FSMetaApp {
         facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
         pending_fixed_bind_has_suppressed_dependent_routes: Arc<AtomicBool>,
         facade_pending_status: SharedFacadePendingStatusCell,
+        facade_service_state: SharedFacadeServiceStateCell,
         api_request_tracker: Arc<ApiRequestTracker>,
         api_control_gate: Arc<ApiControlGate>,
         node_id: NodeId,
@@ -4186,6 +4231,7 @@ impl FSMetaApp {
             Arc<SinkFacade>,
             Option<Arc<dyn ChannelIoSubset>>,
             SharedFacadePendingStatusCell,
+            SharedFacadeServiceStateCell,
             Arc<ApiRequestTracker>,
             Arc<ApiControlGate>,
         ) -> SpawnFut,
@@ -4219,6 +4265,7 @@ impl FSMetaApp {
                         pending_fixed_bind_has_suppressed_dependent_routes.clone(),
                     facade_spawn_in_progress: facade_spawn_in_progress.clone(),
                     facade_pending_status: facade_pending_status.clone(),
+                    facade_service_state: facade_service_state.clone(),
                     api_request_tracker: api_request_tracker.clone(),
                     api_control_gate: api_control_gate.clone(),
                     node_id: node_id.clone(),
@@ -4354,6 +4401,7 @@ impl FSMetaApp {
             query_sink,
             query_runtime_boundary,
             facade_pending_status.clone(),
+            facade_service_state.clone(),
             api_request_tracker.clone(),
             api_control_gate.clone(),
         )
@@ -5102,6 +5150,7 @@ impl FSMetaApp {
                     pending.take();
                 }
                 Self::clear_pending_facade_status(&self.facade_pending_status);
+                let _ = self.current_facade_service_state().await;
                 return Ok(());
             }
         }
@@ -5117,6 +5166,7 @@ impl FSMetaApp {
             resolved,
         };
         *self.pending_facade.lock().await = Some(pending.clone());
+        let _ = self.current_facade_service_state().await;
         if !self.try_spawn_pending_facade().await? {
             eprintln!(
                 "fs_meta_runtime_app: pending facade generation={} route_key={} runtime_exposure_confirmed={}",
@@ -5213,6 +5263,7 @@ impl FSMetaApp {
     async fn reinitialize_after_control_reset(&self) -> Result<()> {
         self.control_initialized.store(false, Ordering::Release);
         self.api_control_gate.set_ready(false);
+        let _ = self.current_facade_service_state().await;
         self.source_state_replay_required
             .store(true, Ordering::Release);
         self.sink_state_replay_required
@@ -5237,6 +5288,7 @@ impl FSMetaApp {
     async fn mark_control_uninitialized_after_failure(&self) {
         self.control_initialized.store(false, Ordering::Release);
         self.api_control_gate.set_ready(false);
+        let _ = self.current_facade_service_state().await;
         self.retained_active_facade_continuity
             .store(false, Ordering::Release);
         self.source_state_replay_required
@@ -6119,6 +6171,8 @@ impl FSMetaApp {
             .store(false, Ordering::Release);
         *self.pending_facade.lock().await = None;
         Self::clear_pending_facade_status(&self.facade_pending_status);
+        let _ = self.current_facade_service_state().await;
+        let _ = self.current_facade_service_state().await;
         self.wait_for_shared_worker_control_handoff().await;
         self.shutdown_active_facade().await;
         Ok(())
@@ -6272,6 +6326,7 @@ impl FSMetaApp {
                 .clone(),
             facade_spawn_in_progress: self.facade_spawn_in_progress.clone(),
             facade_pending_status: self.facade_pending_status.clone(),
+            facade_service_state: self.facade_service_state.clone(),
             api_request_tracker: self.api_request_tracker.clone(),
             api_control_gate: self.api_control_gate.clone(),
             node_id: self.node_id.clone(),
@@ -6373,6 +6428,7 @@ impl FSMetaApp {
                     .pending_fixed_bind_has_suppressed_dependent_routes
                     .clone(),
                 registrant.facade_pending_status.clone(),
+                registrant.facade_service_state.clone(),
                 registrant.api_request_tracker.clone(),
                 registrant.api_control_gate.clone(),
                 registrant.node_id.clone(),
@@ -6761,9 +6817,7 @@ impl FSMetaApp {
                 );
                 return Err(err);
             }
-            eprintln!(
-                "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals ok"
-            );
+            eprintln!("fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals ok");
             if sink_tick_recovery_requires_status_republish {
                 if let Some(expected_groups) = self
                     .wait_for_sink_status_republish_readiness_after_recovery(false)
@@ -6841,7 +6895,8 @@ impl FSMetaApp {
             && !sink_cleanup_only_while_uninitialized
         {
             eprintln!("fs_meta_runtime_app: on_control_frame source.replay_retained begin");
-            self.apply_source_signals_with_recovery(&[], control_initialized_at_entry, false).await?;
+            self.apply_source_signals_with_recovery(&[], control_initialized_at_entry, false)
+                .await?;
             eprintln!("fs_meta_runtime_app: on_control_frame source.replay_retained ok");
         }
         let mut replayed_sink_state_after_uninitialized_source_recovery = false;
@@ -7011,6 +7066,7 @@ impl FSMetaApp {
                 let control_ready_after_republish = self.facade_publication_ready().await;
                 self.api_control_gate
                     .set_ready(control_ready_after_republish);
+                let _ = self.current_facade_service_state().await;
                 Self::spawn_deferred_sink_owned_query_peer_publication_after_local_sink_status_ready(
                     self.source.clone(),
                     self.sink.clone(),
@@ -7025,6 +7081,7 @@ impl FSMetaApp {
             } else {
                 self.api_control_gate
                     .set_ready(self.facade_publication_ready().await);
+                let _ = self.current_facade_service_state().await;
             }
         }
         eprintln!("fs_meta_runtime_app: on_control_frame done");

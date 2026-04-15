@@ -585,9 +585,9 @@ fn prime_cached_schedule_from_control_signals(
             continue;
         };
         for scope in bound_scopes {
-            let applies_locally = roots.iter().any(|root| {
-                bound_scope_applies_locally(scope, root, node_id, &grants)
-            });
+            let applies_locally = roots
+                .iter()
+                .any(|root| bound_scope_applies_locally(scope, root, node_id, &grants));
             if !applies_locally {
                 continue;
             }

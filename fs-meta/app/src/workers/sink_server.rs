@@ -976,7 +976,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_on_control_frame_ack_waits_until_events_stream_enters_first_recv_after_deferred_authority_startup_for_local_split_primary_scope()
-    {
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -1031,23 +1031,35 @@ mod tests {
         let action = plan_worker_request(
             SinkWorkerRequest::OnControlFrame {
                 envelopes: vec![
-                    encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
-                        route_key: ROUTE_KEY_QUERY.to_string(),
-                        unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
-                        lease: None,
-                        generation: 1,
-                        expires_at_ms: 1,
-                        bound_scopes: vec![bound_scope_with_resources("nfs3", &["node-b::nfs3"])],
-                    }))
+                    encode_runtime_exec_control(&RuntimeExecControl::Activate(
+                        RuntimeExecActivate {
+                            route_key: ROUTE_KEY_QUERY.to_string(),
+                            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
+                                .to_string(),
+                            lease: None,
+                            generation: 1,
+                            expires_at_ms: 1,
+                            bound_scopes: vec![bound_scope_with_resources(
+                                "nfs3",
+                                &["node-b::nfs3"],
+                            )],
+                        },
+                    ))
                     .expect("encode sink query activate"),
-                    encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
-                        route_key: events_route.clone(),
-                        unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
-                        lease: None,
-                        generation: 1,
-                        expires_at_ms: 1,
-                        bound_scopes: vec![bound_scope_with_resources("nfs3", &["node-b::nfs3"])],
-                    }))
+                    encode_runtime_exec_control(&RuntimeExecControl::Activate(
+                        RuntimeExecActivate {
+                            route_key: events_route.clone(),
+                            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
+                                .to_string(),
+                            lease: None,
+                            generation: 1,
+                            expires_at_ms: 1,
+                            bound_scopes: vec![bound_scope_with_resources(
+                                "nfs3",
+                                &["node-b::nfs3"],
+                            )],
+                        },
+                    ))
                     .expect("encode sink stream activate"),
                 ],
             },

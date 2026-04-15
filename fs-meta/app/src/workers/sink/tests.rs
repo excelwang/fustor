@@ -1061,7 +1061,10 @@ async fn external_sink_worker_stream_endpoint_materializes_split_primary_mixed_c
     ];
     {
         let mut channels = boundary.channels.lock().await;
-        channels.entry(events_route.clone()).or_default().extend(batch);
+        channels
+            .entry(events_route.clone())
+            .or_default()
+            .extend(batch);
     }
     boundary.changed.notify_waiters();
 
@@ -1079,7 +1082,10 @@ async fn external_sink_worker_stream_endpoint_materializes_split_primary_mixed_c
 
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let snapshot = sink.status_snapshot().await.expect("sink worker status snapshot");
+        let snapshot = sink
+            .status_snapshot()
+            .await
+            .expect("sink worker status snapshot");
         let ready_groups = snapshot
             .groups
             .iter()
@@ -2730,10 +2736,9 @@ async fn status_snapshot_nonblocking_returns_cached_ready_selected_group_from_pa
     });
 
     let _inflight = sink.begin_control_op();
-    let snapshot = sink
-        .status_snapshot_nonblocking()
-        .await
-        .expect("status_snapshot_nonblocking should preserve the cached ready selected-group truth");
+    let snapshot = sink.status_snapshot_nonblocking().await.expect(
+        "status_snapshot_nonblocking should preserve the cached ready selected-group truth",
+    );
 
     let nfs2 = snapshot
         .groups
@@ -2879,7 +2884,6 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
     source.close().await.expect("close source");
     sink.close().await.expect("close sink worker");
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_zero_row_cached_summary_when_control_is_marked_inflight_and_live_status_probe_fails_after_schedule_convergence()
