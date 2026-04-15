@@ -32,6 +32,7 @@ const SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE: Duration = Duration::from_secs(5)
 const SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 const SINK_WORKER_CLOSE_DRAIN_TIMEOUT: Duration = SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT;
 const SINK_WORKER_CLOSE_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const SINK_WORKER_STATUS_NONBLOCKING_PROBE_BUDGET: Duration = Duration::from_millis(350);
 
 fn can_retry_on_control_frame(err: &CnxError) -> bool {
     matches!(
@@ -277,7 +278,7 @@ fn snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(
         && snapshot_has_stream_group_evidence(snapshot, &scheduled_groups)
 }
 
-fn snapshot_looks_scheduled_zero_uninitialized(snapshot: &SinkStatusSnapshot) -> bool {
+fn snapshot_looks_scheduled_waiting_for_materialized_root(snapshot: &SinkStatusSnapshot) -> bool {
     let scheduled_groups = scheduled_groups_from_snapshot(snapshot);
     if scheduled_groups.is_empty() {
         return false;
@@ -289,15 +290,17 @@ fn snapshot_looks_scheduled_zero_uninitialized(snapshot: &SinkStatusSnapshot) ->
         .collect::<std::collections::BTreeMap<_, _>>();
     scheduled_groups.iter().all(|group_id| {
         groups_by_id.get(group_id.as_str()).is_some_and(|group| {
-            !group.initial_audit_completed
-                && group.live_nodes == 0
-                && group.total_nodes == 0
-                && group.materialized_revision <= 1
+            matches!(
+                classify_sink_group_status_readiness(group),
+                SinkGroupStatusReadiness::WaitingForMaterializedRoot
+            )
         })
     })
 }
 
-fn snapshot_looks_scheduled_replay_only_not_ready(snapshot: &SinkStatusSnapshot) -> bool {
+fn snapshot_looks_scheduled_pending_audit_without_stream_receipts(
+    snapshot: &SinkStatusSnapshot,
+) -> bool {
     let scheduled_groups = scheduled_groups_from_snapshot(snapshot);
     if scheduled_groups.is_empty() {
         return false;
@@ -308,9 +311,12 @@ fn snapshot_looks_scheduled_replay_only_not_ready(snapshot: &SinkStatusSnapshot)
         .map(|group| (group.group_id.as_str(), group))
         .collect::<std::collections::BTreeMap<_, _>>();
     if !scheduled_groups.iter().all(|group_id| {
-        groups_by_id
-            .get(group_id.as_str())
-            .is_some_and(|group| !group.initial_audit_completed)
+        groups_by_id.get(group_id.as_str()).is_some_and(|group| {
+            matches!(
+                classify_sink_group_status_readiness(group),
+                SinkGroupStatusReadiness::PendingAudit
+            )
+        })
     }) {
         return false;
     }
@@ -340,6 +346,322 @@ fn snapshot_looks_scheduled_replay_only_not_ready(snapshot: &SinkStatusSnapshot)
             .stream_applied_path_origin_counts_by_node
             .is_empty()
         && snapshot.stream_last_applied_at_us_by_node.is_empty()
+}
+
+fn snapshot_looks_stale_empty(snapshot: &SinkStatusSnapshot) -> bool {
+    snapshot.scheduled_groups_by_node.is_empty()
+        && snapshot.groups.iter().all(|group| {
+            !group.initial_audit_completed && group.live_nodes == 0 && group.total_nodes == 0
+        })
+}
+
+fn snapshot_looks_scheduled_mixed_ready_and_unready(snapshot: &SinkStatusSnapshot) -> bool {
+    let scheduled_groups = snapshot
+        .scheduled_groups_by_node
+        .values()
+        .flat_map(|groups| groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    if scheduled_groups.is_empty() {
+        return false;
+    }
+    let groups_by_id = snapshot
+        .groups
+        .iter()
+        .map(|group| (group.group_id.as_str(), group))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut any_ready = false;
+    let mut any_unready = false;
+    for group_id in scheduled_groups {
+        match groups_by_id.get(group_id.as_str()) {
+            Some(group) => match classify_sink_group_status_readiness(group) {
+                SinkGroupStatusReadiness::Ready => any_ready = true,
+                SinkGroupStatusReadiness::WaitingForMaterializedRoot
+                | SinkGroupStatusReadiness::PendingAudit => any_unready = true,
+            },
+            None => {}
+        }
+    }
+    any_ready && any_unready
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkGroupStatusReadiness {
+    WaitingForMaterializedRoot,
+    PendingAudit,
+    Ready,
+}
+
+fn classify_sink_group_status_readiness(
+    group: &crate::sink::SinkGroupStatusSnapshot,
+) -> SinkGroupStatusReadiness {
+    if group.initial_audit_completed {
+        SinkGroupStatusReadiness::Ready
+    } else if group.live_nodes == 0 && group.total_nodes == 0 && group.materialized_revision <= 1 {
+        SinkGroupStatusReadiness::WaitingForMaterializedRoot
+    } else {
+        SinkGroupStatusReadiness::PendingAudit
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkStatusSnapshotIssue {
+    StaleEmpty,
+    ScheduledMissingGroupRowsAfterStreamEvidence,
+    ScheduledPendingAuditWithoutStreamReceipts,
+    ScheduledWaitingForMaterializedRoot,
+    ScheduledMixedReadyAndUnready,
+}
+
+fn classify_sink_status_snapshot_issue(
+    snapshot: &SinkStatusSnapshot,
+    replay_required: bool,
+) -> Option<SinkStatusSnapshotIssue> {
+    if snapshot_looks_stale_empty(snapshot) {
+        return Some(SinkStatusSnapshotIssue::StaleEmpty);
+    }
+    if snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(snapshot) {
+        return Some(SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence);
+    }
+    if replay_required && snapshot_looks_scheduled_pending_audit_without_stream_receipts(snapshot) {
+        return Some(SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts);
+    }
+    if snapshot_looks_scheduled_waiting_for_materialized_root(snapshot) {
+        return Some(SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot);
+    }
+    if snapshot_looks_scheduled_mixed_ready_and_unready(snapshot) {
+        return Some(SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready);
+    }
+    None
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkStatusLiveFoldMode {
+    Blocking,
+    ControlInflight,
+    Steady,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkStatusLiveFoldOutcome {
+    ReturnLive,
+    ReturnCached,
+    FailClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkStatusCachedFoldMode {
+    WorkerUnavailable,
+    ControlInflightNoClient,
+    NotStarted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkStatusCachedFoldOutcome {
+    ReturnCached,
+    FailClosed,
+    PropagateError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkStatusAvailabilityDecision {
+    ReturnLive,
+    ReturnCached,
+    FailClosed,
+    PropagateError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SinkStatusSnapshotEvaluation {
+    decision: SinkStatusAvailabilityDecision,
+    should_mark_replay_required: bool,
+    should_republish_zero_row_summary: bool,
+}
+
+fn cached_ready_truth_covers_live_issue(
+    live_issue: SinkStatusSnapshotIssue,
+    live_snapshot: &SinkStatusSnapshot,
+    cached_snapshot: &SinkStatusSnapshot,
+) -> bool {
+    match live_issue {
+        SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts
+        | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot => {
+            let scheduled_groups = scheduled_groups_from_snapshot(live_snapshot);
+            ready_groups_cover_scheduled_groups(cached_snapshot, &scheduled_groups)
+        }
+        SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence
+        | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
+            snapshot_has_ready_scheduled_groups(cached_snapshot)
+        }
+        SinkStatusSnapshotIssue::StaleEmpty => false,
+    }
+}
+
+fn fold_live_sink_status_snapshot(
+    live_snapshot: &SinkStatusSnapshot,
+    cached_snapshot: &SinkStatusSnapshot,
+    replay_required: bool,
+    cached_issue: Option<SinkStatusSnapshotIssue>,
+    mode: SinkStatusLiveFoldMode,
+) -> SinkStatusLiveFoldOutcome {
+    let Some(live_issue) = classify_sink_status_snapshot_issue(live_snapshot, replay_required)
+    else {
+        return SinkStatusLiveFoldOutcome::ReturnLive;
+    };
+    match mode {
+        SinkStatusLiveFoldMode::Blocking => match live_issue {
+            SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts
+            | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot => {
+                SinkStatusLiveFoldOutcome::FailClosed
+            }
+            SinkStatusSnapshotIssue::StaleEmpty
+            | SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence
+            | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
+                SinkStatusLiveFoldOutcome::ReturnLive
+            }
+        },
+        SinkStatusLiveFoldMode::ControlInflight => match live_issue {
+            SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence
+            | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot
+            | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
+                if cached_ready_truth_covers_live_issue(live_issue, live_snapshot, cached_snapshot)
+                {
+                    SinkStatusLiveFoldOutcome::ReturnCached
+                } else {
+                    SinkStatusLiveFoldOutcome::FailClosed
+                }
+            }
+            SinkStatusSnapshotIssue::StaleEmpty
+            | SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts => {
+                SinkStatusLiveFoldOutcome::ReturnLive
+            }
+        },
+        SinkStatusLiveFoldMode::Steady => match live_issue {
+            SinkStatusSnapshotIssue::StaleEmpty
+                if matches!(
+                    cached_issue,
+                    Some(SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence)
+                ) =>
+            {
+                SinkStatusLiveFoldOutcome::ReturnCached
+            }
+            SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence
+            | SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts
+            | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot
+            | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
+                if cached_ready_truth_covers_live_issue(live_issue, live_snapshot, cached_snapshot)
+                {
+                    SinkStatusLiveFoldOutcome::ReturnCached
+                } else {
+                    SinkStatusLiveFoldOutcome::FailClosed
+                }
+            }
+            SinkStatusSnapshotIssue::StaleEmpty => SinkStatusLiveFoldOutcome::FailClosed,
+        },
+    }
+}
+
+fn fold_cached_sink_status_snapshot(
+    cached_snapshot: &SinkStatusSnapshot,
+    replay_required: bool,
+    mode: SinkStatusCachedFoldMode,
+) -> SinkStatusCachedFoldOutcome {
+    let Some(cached_issue) = classify_sink_status_snapshot_issue(cached_snapshot, replay_required)
+    else {
+        return SinkStatusCachedFoldOutcome::ReturnCached;
+    };
+    match mode {
+        SinkStatusCachedFoldMode::WorkerUnavailable => match cached_issue {
+            SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence => {
+                SinkStatusCachedFoldOutcome::ReturnCached
+            }
+            SinkStatusSnapshotIssue::StaleEmpty
+            | SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts
+            | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot
+            | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
+                SinkStatusCachedFoldOutcome::PropagateError
+            }
+        },
+        SinkStatusCachedFoldMode::ControlInflightNoClient
+        | SinkStatusCachedFoldMode::NotStarted => match cached_issue {
+            SinkStatusSnapshotIssue::StaleEmpty
+            | SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence
+            | SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts
+            | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot
+            | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
+                SinkStatusCachedFoldOutcome::FailClosed
+            }
+        },
+    }
+}
+
+fn cached_snapshot_needs_zero_row_republish(issue: Option<SinkStatusSnapshotIssue>) -> bool {
+    matches!(issue, Some(SinkStatusSnapshotIssue::StaleEmpty))
+}
+
+fn evaluate_live_sink_status_snapshot(
+    live_snapshot: &SinkStatusSnapshot,
+    cached_snapshot: &SinkStatusSnapshot,
+    replay_required: bool,
+    cached_issue: Option<SinkStatusSnapshotIssue>,
+    mode: SinkStatusLiveFoldMode,
+) -> SinkStatusSnapshotEvaluation {
+    let live_issue = classify_sink_status_snapshot_issue(live_snapshot, replay_required);
+    let decision = match fold_live_sink_status_snapshot(
+        live_snapshot,
+        cached_snapshot,
+        replay_required,
+        cached_issue,
+        mode,
+    ) {
+        SinkStatusLiveFoldOutcome::ReturnLive => SinkStatusAvailabilityDecision::ReturnLive,
+        SinkStatusLiveFoldOutcome::ReturnCached => SinkStatusAvailabilityDecision::ReturnCached,
+        SinkStatusLiveFoldOutcome::FailClosed => SinkStatusAvailabilityDecision::FailClosed,
+    };
+    SinkStatusSnapshotEvaluation {
+        decision,
+        should_mark_replay_required: matches!(
+            live_issue,
+            Some(SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts)
+        ),
+        should_republish_zero_row_summary: false,
+    }
+}
+
+fn evaluate_cached_sink_status_snapshot(
+    cached_snapshot: &SinkStatusSnapshot,
+    replay_required: bool,
+    mode: SinkStatusCachedFoldMode,
+) -> SinkStatusSnapshotEvaluation {
+    let cached_issue = classify_sink_status_snapshot_issue(cached_snapshot, replay_required);
+    let decision = match fold_cached_sink_status_snapshot(cached_snapshot, replay_required, mode) {
+        SinkStatusCachedFoldOutcome::ReturnCached => SinkStatusAvailabilityDecision::ReturnCached,
+        SinkStatusCachedFoldOutcome::FailClosed => SinkStatusAvailabilityDecision::FailClosed,
+        SinkStatusCachedFoldOutcome::PropagateError => SinkStatusAvailabilityDecision::PropagateError,
+    };
+    SinkStatusSnapshotEvaluation {
+        decision,
+        should_mark_replay_required: false,
+        should_republish_zero_row_summary: cached_snapshot_needs_zero_row_republish(cached_issue),
+    }
+}
+
+fn republish_scheduled_groups_into_zero_row_summary(
+    snapshot: &mut SinkStatusSnapshot,
+    node_id: &NodeId,
+    groups: &std::collections::BTreeSet<String>,
+) {
+    if groups.is_empty() || !snapshot.scheduled_groups_by_node.is_empty() {
+        return;
+    }
+    let zero_rows_only = !snapshot.groups.is_empty()
+        && snapshot.groups.iter().all(|group| {
+            !group.initial_audit_completed && group.live_nodes == 0 && group.total_nodes == 0
+        });
+    if !snapshot.groups.is_empty() && !zero_rows_only {
+        return;
+    }
+    snapshot.scheduled_groups_by_node =
+        std::collections::BTreeMap::from([(node_id.0.clone(), groups.iter().cloned().collect())]);
 }
 
 fn host_ref_matches_node_id(host_ref: &str, node_id: &NodeId) -> bool {
@@ -609,6 +931,12 @@ pub(crate) struct SinkWorkerStatusErrorHook {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SinkWorkerStatusTimeoutObserveHook {
+    pub observed_timeouts: Arc<Mutex<Vec<Duration>>>,
+}
+
+#[cfg(test)]
 pub(crate) struct SinkWorkerStatusSnapshotHook {
     pub snapshot: SinkStatusSnapshot,
 }
@@ -680,6 +1008,14 @@ fn sink_worker_status_error_hook_cell() -> &'static Mutex<Option<SinkWorkerStatu
 #[cfg(test)]
 fn sink_worker_status_snapshot_hook_cell() -> &'static Mutex<Option<SinkWorkerStatusSnapshotHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerStatusSnapshotHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn sink_worker_status_timeout_observe_hook_cell()
+-> &'static Mutex<Option<SinkWorkerStatusTimeoutObserveHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerStatusTimeoutObserveHook>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
@@ -799,6 +1135,17 @@ pub(crate) fn install_sink_worker_status_snapshot_hook(hook: SinkWorkerStatusSna
 }
 
 #[cfg(test)]
+pub(crate) fn install_sink_worker_status_timeout_observe_hook(
+    hook: SinkWorkerStatusTimeoutObserveHook,
+) {
+    let mut guard = match sink_worker_status_timeout_observe_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn install_sink_worker_status_response_queue_hook(
     hook: SinkWorkerStatusResponseQueueHook,
 ) {
@@ -910,6 +1257,15 @@ pub(crate) fn clear_sink_worker_status_snapshot_hook() {
 }
 
 #[cfg(test)]
+pub(crate) fn clear_sink_worker_status_timeout_observe_hook() {
+    let mut guard = match sink_worker_status_timeout_observe_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
 pub(crate) fn clear_sink_worker_status_response_queue_hook() {
     let mut guard = match sink_worker_status_response_queue_hook_cell().lock() {
         Ok(guard) => guard,
@@ -934,6 +1290,24 @@ fn take_sink_worker_status_snapshot_hook() -> Option<SinkStatusSnapshot> {
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.take().map(|hook| hook.snapshot)
+}
+
+#[cfg(test)]
+fn record_sink_worker_status_timeout_probe(timeout: Duration) {
+    let hook = {
+        let guard = match sink_worker_status_timeout_observe_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        let mut observed = match hook.observed_timeouts.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        observed.push(timeout);
+    }
 }
 
 #[cfg(test)]
@@ -1270,27 +1644,11 @@ impl SinkWorkerClientHandle {
         let Some(groups) = self.cached_scheduled_group_ids()? else {
             return Ok(());
         };
-        if groups.is_empty() {
-            return Ok(());
-        }
         let mut guard = self
             .status_cache
             .lock()
             .map_err(|_| CnxError::Internal("sink worker status cache lock poisoned".into()))?;
-        if !guard.scheduled_groups_by_node.is_empty() {
-            return Ok(());
-        }
-        let zero_rows_only = !guard.groups.is_empty()
-            && guard.groups.iter().all(|group| {
-                !group.initial_audit_completed && group.live_nodes == 0 && group.total_nodes == 0
-            });
-        if !guard.groups.is_empty() && !zero_rows_only {
-            return Ok(());
-        }
-        guard.scheduled_groups_by_node = std::collections::BTreeMap::from([(
-            self.node_id.0.clone(),
-            groups.into_iter().collect(),
-        )]);
+        republish_scheduled_groups_into_zero_row_summary(&mut guard, &self.node_id, &groups);
         Ok(())
     }
 
@@ -1639,6 +1997,9 @@ impl SinkWorkerClientHandle {
             .host_object_grants
             .clone();
         normalize_sink_status_snapshot_node_keys(&mut snapshot, &self.node_id, &grants);
+        if let Some(groups) = self.cached_scheduled_group_ids()? {
+            republish_scheduled_groups_into_zero_row_summary(&mut snapshot, &self.node_id, &groups);
+        }
         if debug_control_scope_capture_enabled() {
             eprintln!(
                 "fs_meta_sink_worker_client: status_snapshot reply node={} {}",
@@ -1646,7 +2007,8 @@ impl SinkWorkerClientHandle {
                 summarize_sink_status_snapshot(&snapshot)
             );
         }
-        if replay_required && snapshot_looks_scheduled_replay_only_not_ready(&snapshot) {
+        if replay_required && snapshot_looks_scheduled_pending_audit_without_stream_receipts(&snapshot)
+        {
             if debug_control_scope_capture_enabled() {
                 eprintln!(
                     "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=replay_required_not_ready_without_stream_evidence {}",
@@ -1656,10 +2018,10 @@ impl SinkWorkerClientHandle {
             }
             return Err(CnxError::Timeout);
         }
-        if snapshot_looks_scheduled_zero_uninitialized(&snapshot) {
+        if snapshot_looks_scheduled_waiting_for_materialized_root(&snapshot) {
             if debug_control_scope_capture_enabled() {
                 eprintln!(
-                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=scheduled_zero_uninitialized replay_required={} {}",
+                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=scheduled_waiting_for_materialized_root replay_required={} {}",
                     self.node_id.0,
                     replay_required,
                     summarize_sink_status_snapshot(&snapshot)
@@ -1672,53 +2034,6 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
-        fn snapshot_looks_stale_empty(snapshot: &SinkStatusSnapshot) -> bool {
-            snapshot.scheduled_groups_by_node.is_empty()
-                && snapshot.groups.iter().all(|group| {
-                    !group.initial_audit_completed
-                        && group.live_nodes == 0
-                        && group.total_nodes == 0
-                })
-        }
-
-        fn snapshot_looks_partially_stale_split(snapshot: &SinkStatusSnapshot) -> bool {
-            let scheduled_groups = snapshot
-                .scheduled_groups_by_node
-                .values()
-                .flat_map(|groups| groups.iter().cloned())
-                .collect::<std::collections::BTreeSet<_>>();
-            if scheduled_groups.is_empty() {
-                return false;
-            }
-            let groups_by_id = snapshot
-                .groups
-                .iter()
-                .map(|group| (group.group_id.as_str(), group))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            let mut any_ready = false;
-            let mut any_zero = false;
-            for group_id in scheduled_groups {
-                match groups_by_id.get(group_id.as_str()) {
-                    Some(group)
-                        if !group.initial_audit_completed
-                            && group.live_nodes == 0
-                            && group.total_nodes == 0 =>
-                    {
-                        any_zero = true;
-                    }
-                    Some(group)
-                        if group.initial_audit_completed
-                            || group.live_nodes > 0
-                            || group.total_nodes > 0 =>
-                    {
-                        any_ready = true;
-                    }
-                    Some(_) | None => {}
-                }
-            }
-            any_ready && any_zero
-        }
-
         let replay_required = self.control_state_replay_required.load(Ordering::Acquire) > 0;
 
         #[cfg(test)]
@@ -1735,173 +2050,148 @@ impl SinkWorkerClientHandle {
         }
         if self.control_op_inflight() {
             let snapshot = self.cached_status_snapshot()?;
-            let scheduled_zero_uninitialized =
-                snapshot_looks_scheduled_zero_uninitialized(&snapshot);
-            let missing_group_rows_after_stream_evidence =
-                snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(&snapshot);
-            if snapshot_looks_stale_empty(&snapshot)
-                || scheduled_zero_uninitialized
-                || missing_group_rows_after_stream_evidence
-                || snapshot_looks_partially_stale_split(&snapshot)
-            {
-                if self.existing_client().await?.is_some() {
-                    match self
-                        .status_snapshot_with_timeout(Duration::from_millis(350))
-                        .await
-                    {
-                        Ok(mut live_snapshot) => {
-                            let grants = self
-                                .config
-                                .lock()
-                                .map_err(|_| {
-                                    CnxError::Internal("sink worker config lock poisoned".into())
-                                })?
-                                .host_object_grants
-                                .clone();
-                            normalize_sink_status_snapshot_node_keys(
-                                &mut live_snapshot,
-                                &self.node_id,
-                                &grants,
-                            );
-                            let cached_snapshot = self.cached_status_snapshot()?;
-                            if snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(
+            if self.existing_client().await?.is_some() {
+                match self
+                    .status_snapshot_with_timeout(SINK_WORKER_STATUS_NONBLOCKING_PROBE_BUDGET)
+                    .await
+                {
+                    Ok(mut live_snapshot) => {
+                        let grants = self
+                            .config
+                            .lock()
+                            .map_err(|_| {
+                                CnxError::Internal("sink worker config lock poisoned".into())
+                            })?
+                            .host_object_grants
+                            .clone();
+                        normalize_sink_status_snapshot_node_keys(
+                            &mut live_snapshot,
+                            &self.node_id,
+                            &grants,
+                        );
+                        let cached_snapshot = self.cached_status_snapshot()?;
+                        let missing_group_rows_after_stream_evidence =
+                            snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(
                                 &live_snapshot,
-                            ) {
-                                if snapshot_has_ready_scheduled_groups(&cached_snapshot) {
-                                    if debug_control_scope_capture_enabled() {
-                                        eprintln!(
-                                            "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=control_inflight_missing_scheduled_group_rows_after_stream_evidence live={} cached={}",
-                                            self.node_id.0,
-                                            summarize_sink_status_snapshot(&live_snapshot),
-                                            summarize_sink_status_snapshot(&cached_snapshot)
-                                        );
-                                    }
-                                    return Ok(cached_snapshot);
-                                }
+                            );
+                        let waiting_for_materialized_root =
+                            snapshot_looks_scheduled_waiting_for_materialized_root(&live_snapshot);
+                        let mixed_ready_and_unready =
+                            snapshot_looks_scheduled_mixed_ready_and_unready(&live_snapshot);
+                        if missing_group_rows_after_stream_evidence
+                            || waiting_for_materialized_root
+                            || mixed_ready_and_unready
+                        {
+                            if snapshot_has_ready_scheduled_groups(&cached_snapshot) {
                                 if debug_control_scope_capture_enabled() {
                                     eprintln!(
-                                        "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_missing_scheduled_group_rows_after_stream_evidence {}",
+                                        "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=control_inflight live={} cached={}",
                                         self.node_id.0,
-                                        summarize_sink_status_snapshot(&live_snapshot)
+                                        summarize_sink_status_snapshot(&live_snapshot),
+                                        summarize_sink_status_snapshot(&cached_snapshot)
                                     );
                                 }
-                                return Err(CnxError::Timeout);
+                                return Ok(cached_snapshot);
                             }
-                            if snapshot_looks_scheduled_zero_uninitialized(&live_snapshot) {
-                                let scheduled_groups =
-                                    scheduled_groups_from_snapshot(&live_snapshot);
-                                if ready_groups_cover_scheduled_groups(
-                                    &cached_snapshot,
-                                    &scheduled_groups,
-                                ) {
-                                    if debug_control_scope_capture_enabled() {
-                                        eprintln!(
-                                            "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=control_inflight_scheduled_zero_uninitialized live={} cached={}",
-                                            self.node_id.0,
-                                            summarize_sink_status_snapshot(&live_snapshot),
-                                            summarize_sink_status_snapshot(&cached_snapshot)
-                                        );
-                                    }
-                                    return Ok(cached_snapshot);
-                                }
-                                if debug_control_scope_capture_enabled() {
-                                    eprintln!(
-                                        "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_zero_scheduled_snapshot {}",
-                                        self.node_id.0,
-                                        summarize_sink_status_snapshot(&live_snapshot)
-                                    );
-                                }
-                                return Err(CnxError::Timeout);
-                            }
-                            if snapshot_looks_partially_stale_split(&live_snapshot) {
-                                if snapshot_has_ready_scheduled_groups(&cached_snapshot) {
-                                    if debug_control_scope_capture_enabled() {
-                                        eprintln!(
-                                            "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=control_inflight_partially_stale_split live={} cached={}",
-                                            self.node_id.0,
-                                            summarize_sink_status_snapshot(&live_snapshot),
-                                            summarize_sink_status_snapshot(&cached_snapshot)
-                                        );
-                                    }
-                                    return Ok(cached_snapshot);
-                                }
-                                if debug_control_scope_capture_enabled() {
-                                    eprintln!(
-                                        "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_partially_stale_split {}",
-                                        self.node_id.0,
-                                        summarize_sink_status_snapshot(&live_snapshot)
-                                    );
-                                }
-                                return Err(CnxError::Timeout);
-                            }
-                            self.update_cached_status_snapshot(live_snapshot.clone())?;
+                            let reason = if missing_group_rows_after_stream_evidence {
+                                "control_inflight_missing_scheduled_group_rows_after_stream_evidence"
+                            } else if waiting_for_materialized_root {
+                                "control_inflight_scheduled_waiting_for_materialized_root"
+                            } else {
+                                "control_inflight_scheduled_mixed_ready_and_unready"
+                            };
                             if debug_control_scope_capture_enabled() {
                                 eprintln!(
-                                    "fs_meta_sink_worker_client: status_snapshot short_probe node={} reason=control_inflight {}",
+                                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason={} {}",
                                     self.node_id.0,
+                                    reason,
                                     summarize_sink_status_snapshot(&live_snapshot)
                                 );
                             }
-                            return Ok(live_snapshot);
+                            return Err(CnxError::Timeout);
                         }
-                        Err(err) => {
-                            if snapshot_looks_stale_empty(&snapshot) {
-                                self.republish_cached_scheduled_groups_into_empty_status_summary()?;
-                            }
+                        self.update_cached_status_snapshot(live_snapshot.clone())?;
+                        if debug_control_scope_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_sink_worker_client: status_snapshot short_probe node={} reason=control_inflight {}",
+                                self.node_id.0,
+                                summarize_sink_status_snapshot(&live_snapshot)
+                            );
+                        }
+                        return Ok(live_snapshot);
+                    }
+                    Err(err) => {
+                        if snapshot_looks_stale_empty(&snapshot) {
+                            self.republish_cached_scheduled_groups_into_empty_status_summary()?;
+                        }
+                        if snapshot_looks_scheduled_waiting_for_materialized_root(&snapshot) {
                             if debug_control_scope_capture_enabled() {
                                 eprintln!(
-                                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_live_status_probe_failed err={} {}",
+                                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_scheduled_waiting_for_materialized_root_cached_snapshot {}",
                                     self.node_id.0,
-                                    err,
                                     summarize_sink_status_snapshot(&snapshot)
                                 );
                             }
-                            return Err(err);
+                            return Err(CnxError::Timeout);
                         }
+                        if snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(
+                            &snapshot,
+                        ) {
+                            if debug_control_scope_capture_enabled() {
+                                eprintln!(
+                                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_missing_scheduled_group_rows_cached_snapshot {}",
+                                    self.node_id.0,
+                                    summarize_sink_status_snapshot(&snapshot)
+                                );
+                            }
+                            return Err(CnxError::Timeout);
+                        }
+                        if snapshot_looks_scheduled_mixed_ready_and_unready(&snapshot) {
+                            if debug_control_scope_capture_enabled() {
+                                eprintln!(
+                                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_scheduled_mixed_ready_and_unready_cached_snapshot {}",
+                                    self.node_id.0,
+                                    summarize_sink_status_snapshot(&snapshot)
+                                );
+                            }
+                            return Err(CnxError::Timeout);
+                        }
+                        return Err(err);
                     }
                 }
-                if snapshot_looks_stale_empty(&snapshot) {
-                    self.republish_cached_scheduled_groups_into_empty_status_summary()?;
-                    if debug_control_scope_capture_enabled() {
-                        let republished = self.cached_status_snapshot()?;
-                        eprintln!(
-                            "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_stale_empty_cached_snapshot {}",
-                            self.node_id.0,
-                            summarize_sink_status_snapshot(&republished)
-                        );
-                    }
-                    return Err(CnxError::Timeout);
+            }
+            if snapshot_looks_stale_empty(&snapshot) {
+                self.republish_cached_scheduled_groups_into_empty_status_summary()?;
+            }
+            if snapshot_looks_scheduled_waiting_for_materialized_root(&snapshot) {
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_scheduled_waiting_for_materialized_root_cached_snapshot {}",
+                        self.node_id.0,
+                        summarize_sink_status_snapshot(&snapshot)
+                    );
                 }
-                if scheduled_zero_uninitialized {
-                    if debug_control_scope_capture_enabled() {
-                        eprintln!(
-                            "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_zero_scheduled_cached_snapshot {}",
-                            self.node_id.0,
-                            summarize_sink_status_snapshot(&snapshot)
-                        );
-                    }
-                    return Err(CnxError::Timeout);
+                return Err(CnxError::Timeout);
+            }
+            if snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(&snapshot) {
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_missing_scheduled_group_rows_cached_snapshot {}",
+                        self.node_id.0,
+                        summarize_sink_status_snapshot(&snapshot)
+                    );
                 }
-                if missing_group_rows_after_stream_evidence {
-                    if debug_control_scope_capture_enabled() {
-                        eprintln!(
-                            "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_missing_scheduled_group_rows_cached_snapshot {}",
-                            self.node_id.0,
-                            summarize_sink_status_snapshot(&snapshot)
-                        );
-                    }
-                    return Err(CnxError::Timeout);
+                return Err(CnxError::Timeout);
+            }
+            if snapshot_looks_scheduled_mixed_ready_and_unready(&snapshot) {
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_scheduled_mixed_ready_and_unready_cached_snapshot {}",
+                        self.node_id.0,
+                        summarize_sink_status_snapshot(&snapshot)
+                    );
                 }
-                if snapshot_looks_partially_stale_split(&snapshot) {
-                    if debug_control_scope_capture_enabled() {
-                        eprintln!(
-                            "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=control_inflight_partially_stale_split_cached_snapshot {}",
-                            self.node_id.0,
-                            summarize_sink_status_snapshot(&snapshot)
-                        );
-                    }
-                    return Err(CnxError::Timeout);
-                }
+                return Err(CnxError::Timeout);
             }
             if debug_control_scope_capture_enabled() {
                 eprintln!(
@@ -1919,7 +2209,7 @@ impl SinkWorkerClientHandle {
                     self.republish_cached_scheduled_groups_into_empty_status_summary()?;
                 }
                 match self
-                    .status_snapshot_with_timeout(Duration::from_secs(5))
+                    .status_snapshot_with_timeout(SINK_WORKER_STATUS_NONBLOCKING_PROBE_BUDGET)
                     .await
                 {
                     Ok(mut snapshot) => {
@@ -1982,7 +2272,9 @@ impl SinkWorkerClientHandle {
                             return Err(CnxError::Timeout);
                         }
                         if replay_required
-                            && snapshot_looks_scheduled_replay_only_not_ready(&snapshot)
+                            && snapshot_looks_scheduled_pending_audit_without_stream_receipts(
+                                &snapshot,
+                            )
                         {
                             let scheduled_groups = scheduled_groups_from_snapshot(&snapshot);
                             if ready_groups_cover_scheduled_groups(
@@ -2012,7 +2304,7 @@ impl SinkWorkerClientHandle {
                             }
                             return Err(CnxError::Timeout);
                         }
-                        if snapshot_looks_scheduled_zero_uninitialized(&snapshot) {
+                        if snapshot_looks_scheduled_waiting_for_materialized_root(&snapshot) {
                             let scheduled_groups = scheduled_groups_from_snapshot(&snapshot);
                             if ready_groups_cover_scheduled_groups(
                                 &cached_snapshot,
@@ -2020,7 +2312,7 @@ impl SinkWorkerClientHandle {
                             ) {
                                 if debug_control_scope_capture_enabled() {
                                     eprintln!(
-                                        "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=scheduled_zero_uninitialized live={} cached={}",
+                                        "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=scheduled_waiting_for_materialized_root live={} cached={}",
                                         self.node_id.0,
                                         summarize_sink_status_snapshot(&snapshot),
                                         summarize_sink_status_snapshot(&cached_snapshot)
@@ -2030,18 +2322,18 @@ impl SinkWorkerClientHandle {
                             }
                             if debug_control_scope_capture_enabled() {
                                 eprintln!(
-                                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=scheduled_zero_uninitialized {}",
+                                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=scheduled_waiting_for_materialized_root {}",
                                     self.node_id.0,
                                     summarize_sink_status_snapshot(&snapshot)
                                 );
                             }
                             return Err(CnxError::Timeout);
                         }
-                        if snapshot_looks_partially_stale_split(&snapshot) {
+                        if snapshot_looks_scheduled_mixed_ready_and_unready(&snapshot) {
                             if snapshot_has_ready_scheduled_groups(&cached_snapshot) {
                                 if debug_control_scope_capture_enabled() {
                                     eprintln!(
-                                        "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=partially_stale_split live={} cached={}",
+                                        "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=scheduled_mixed_ready_and_unready live={} cached={}",
                                         self.node_id.0,
                                         summarize_sink_status_snapshot(&snapshot),
                                         summarize_sink_status_snapshot(&cached_snapshot)
@@ -2051,7 +2343,7 @@ impl SinkWorkerClientHandle {
                             }
                             if debug_control_scope_capture_enabled() {
                                 eprintln!(
-                                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=partially_stale_split {}",
+                                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=scheduled_mixed_ready_and_unready {}",
                                     self.node_id.0,
                                     summarize_sink_status_snapshot(&snapshot)
                                 );
@@ -2076,8 +2368,8 @@ impl SinkWorkerClientHandle {
                             }
                             Ok(snapshot)
                         } else if snapshot_looks_stale_empty(&snapshot)
-                            || snapshot_looks_scheduled_zero_uninitialized(&snapshot)
-                            || snapshot_looks_partially_stale_split(&snapshot)
+                            || snapshot_looks_scheduled_waiting_for_materialized_root(&snapshot)
+                            || snapshot_looks_scheduled_mixed_ready_and_unready(&snapshot)
                         {
                             if snapshot_looks_stale_empty(&snapshot) {
                                 self.republish_cached_scheduled_groups_into_empty_status_summary()?;
@@ -2092,6 +2384,7 @@ impl SinkWorkerClientHandle {
                             }
                             Err(err)
                         } else {
+                            self.republish_cached_scheduled_groups_into_empty_status_summary()?;
                             if debug_control_scope_capture_enabled() {
                                 eprintln!(
                                     "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=worker_unavailable err={} {}",
@@ -2108,9 +2401,9 @@ impl SinkWorkerClientHandle {
             None => {
                 let snapshot = self.cached_status_snapshot()?;
                 if snapshot_looks_stale_empty(&snapshot)
-                    || snapshot_looks_scheduled_zero_uninitialized(&snapshot)
+                    || snapshot_looks_scheduled_waiting_for_materialized_root(&snapshot)
                     || snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(&snapshot)
-                    || snapshot_looks_partially_stale_split(&snapshot)
+                    || snapshot_looks_scheduled_mixed_ready_and_unready(&snapshot)
                 {
                     if snapshot_looks_stale_empty(&snapshot) {
                         self.republish_cached_scheduled_groups_into_empty_status_summary()?;
@@ -2181,6 +2474,8 @@ impl SinkWorkerClientHandle {
             let replay_required_for_attempt =
                 self.control_state_replay_required.load(Ordering::Acquire) > 0;
             self.replay_retained_control_state_if_needed().await?;
+            #[cfg(test)]
+            record_sink_worker_status_timeout_probe(attempt_timeout);
             let rpc_result = self
                 .with_started_retry(|client| async move {
                     #[cfg(test)]
@@ -2211,6 +2506,8 @@ impl SinkWorkerClientHandle {
                 Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
+                    self.control_state_replay_required
+                        .store(1, Ordering::Release);
                     self.reset_shared_worker_client_for_retry().await?;
                 }
                 Err(err) => return Err(err),

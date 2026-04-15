@@ -31,6 +31,8 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
     }
 
     let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
     fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -56,7 +58,19 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
                     host_object_grants: Vec::new(),
                     ..SourceConfig::default()
                 },
-                ..FSMetaConfig::default()
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: "listener-a".to_string(),
+                    local_listener_resources: vec![api::config::ApiListenerResource {
+                        resource_id: "listener-a".to_string(),
+                        bind_addr: bind_addr.clone(),
+                    }],
+                    auth: api::ApiAuthConfig {
+                        passwd_path,
+                        shadow_path,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
             },
             external_runtime_worker_binding("source", &source_socket_dir),
             external_runtime_worker_binding("sink", &sink_socket_dir),
@@ -2379,6 +2393,610 @@ async fn ordinary_current_generation_source_sink_and_facade_ticks_do_not_reenter
     assert!(
         !app.sink_state_replay_required.load(Ordering::Acquire),
         "ordinary steady mixed source/sink/facade ticks must leave retained sink replay disarmed when replay is not required"
+    );
+
+    app.close().await.expect("close app");
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_when_source_replay_regresses_before_gate_reopen()
+{
+    struct DeferredSinkOwnedQueryPeerPublicationGateReopenPauseHookReset;
+    struct DeferredSinkOwnedQueryPeerPublicationCompletionHookReset;
+
+    impl Drop for DeferredSinkOwnedQueryPeerPublicationGateReopenPauseHookReset {
+        fn drop(&mut self) {
+            clear_deferred_sink_owned_query_peer_publication_gate_reopen_pause_hook();
+        }
+    }
+
+    impl Drop for DeferredSinkOwnedQueryPeerPublicationCompletionHookReset {
+        fn drop(&mut self) {
+            clear_deferred_sink_owned_query_peer_publication_completion_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    fs::write(nfs1.join("ready-a.txt"), b"a").expect("seed nfs1");
+    fs::write(nfs2.join("ready-b.txt"), b"b").expect("seed nfs2");
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![
+                        worker_watch_scan_root("nfs1", &nfs1),
+                        worker_watch_scan_root("nfs2", &nfs2),
+                    ],
+                    host_object_grants: Vec::new(),
+                    ..SourceConfig::default()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: "listener-a".to_string(),
+                    local_listener_resources: vec![api::config::ApiListenerResource {
+                        resource_id: "listener-a".to_string(),
+                        bind_addr: bind_addr.clone(),
+                    }],
+                    auth: api::ApiAuthConfig {
+                        passwd_path,
+                        shadow_path,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-c-deferred-query-peer-gate-reopen".into()),
+            Some(boundary.clone()),
+            Some(boundary),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    let source_wave = |generation| {
+        vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+        ]
+    };
+    let sink_wave = |generation| {
+        let root_scopes = &[("nfs1", &["nfs1"][..]), ("nfs2", &["nfs2"][..])];
+        vec![
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                root_scopes,
+                generation,
+            ),
+        ]
+    };
+
+    let mut initial = source_wave(2);
+    initial.extend(sink_wave(2));
+    app.on_control_frame(&initial)
+        .await
+        .expect("initial local source/sink wave should succeed");
+
+    let active_facade = match api::spawn(
+        app.config
+            .api
+            .resolve_for_candidate_ids(&["listener-a".to_string()])
+            .expect("resolve facade config"),
+        app.node_id.clone(),
+        app.runtime_boundary.clone(),
+        app.source.clone(),
+        app.sink.clone(),
+        app.query_sink.clone(),
+        app.runtime_boundary.clone(),
+        app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
+        app.api_request_tracker.clone(),
+        app.api_control_gate.clone(),
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(CnxError::InvalidInput(msg))
+            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+        {
+            return;
+        }
+        Err(err) => panic!("spawn active facade: {err}"),
+    };
+    *app.api_task.lock().await = Some(FacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 2,
+        resource_ids: vec!["listener-a".to_string()],
+        handle: active_facade,
+    });
+
+    let expected_groups = std::collections::BTreeSet::from([
+        "nfs1".to_string(),
+        "nfs2".to_string(),
+    ]);
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout(
+            Duration::from_millis(350),
+            app.sink.status_snapshot_nonblocking(),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => {
+                let ready_groups = snapshot
+                    .groups
+                    .iter()
+                    .filter(|group| group.initial_audit_completed)
+                    .map(|group| group.group_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>();
+                if ready_groups == expected_groups {
+                    break;
+                }
+            }
+            Ok(Err(_)) | Err(_) => {}
+        }
+        assert!(
+            tokio::time::Instant::now() < ready_deadline,
+            "timed out waiting for local sink readiness before deferred query-peer publication tail"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let deferred_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
+    assert!(
+        !app.facade_gate
+            .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &deferred_route)
+            .expect("query-peer deferred route state before helper"),
+        "precondition: deferred query-peer route must start inactive before helper publication"
+    );
+
+    let control_ready_after_republish = app.facade_publication_ready().await;
+    assert!(
+        control_ready_after_republish,
+        "precondition: helper tail red requires a stale ready bool captured before source replay regresses"
+    );
+    app.api_control_gate.set_ready(control_ready_after_republish);
+    assert!(
+        app.api_control_gate.is_ready(),
+        "precondition: helper tail red requires the API control gate to start open"
+    );
+
+    let gate_reopen_entered = Arc::new(Notify::new());
+    let gate_reopen_release = Arc::new(Notify::new());
+    let helper_completed = Arc::new(Notify::new());
+    let _gate_reopen_reset = DeferredSinkOwnedQueryPeerPublicationGateReopenPauseHookReset;
+    let _helper_completed_reset = DeferredSinkOwnedQueryPeerPublicationCompletionHookReset;
+    install_deferred_sink_owned_query_peer_publication_gate_reopen_pause_hook(
+        DeferredSinkOwnedQueryPeerPublicationGateReopenPauseHook {
+            entered: gate_reopen_entered.clone(),
+            release: gate_reopen_release.clone(),
+        },
+    );
+    install_deferred_sink_owned_query_peer_publication_completion_hook(
+        DeferredSinkOwnedQueryPeerPublicationCompletionHook {
+            entered: helper_completed.clone(),
+        },
+    );
+
+    app.source_state_replay_required.store(true, Ordering::Release);
+    app.api_control_gate.set_ready(false);
+    assert_eq!(
+        app.current_facade_service_state().await,
+        FacadeServiceState::Unavailable,
+        "source replay regression must first push facade state back to unavailable before the deferred query-peer helper tail completes"
+    );
+
+    FSMetaApp::spawn_deferred_sink_owned_query_peer_publication_after_local_sink_status_ready(
+        app.source.clone(),
+        app.sink.clone(),
+        expected_groups,
+        Vec::new(),
+        vec![FacadeControlSignal::Activate {
+            unit: FacadeRuntimeUnit::QueryPeer,
+            route_key: deferred_route.clone(),
+            generation: 2,
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: "nfs1".to_string(),
+                resource_ids: vec!["nfs1".to_string()],
+            }],
+        }],
+        app.facade_gate.clone(),
+        app.mirrored_query_peer_routes.clone(),
+        app.pending_facade.clone(),
+        app.facade_pending_status.clone(),
+        app.api_task.clone(),
+        app.api_control_gate.clone(),
+        app.facade_service_state.clone(),
+        app.control_initialized.clone(),
+        app.source_state_replay_required.clone(),
+        app.sink_state_replay_required.clone(),
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), gate_reopen_entered.notified())
+        .await
+        .expect("deferred query-peer helper must reach the tail gate-reopen point");
+
+    assert!(
+        app.facade_gate
+            .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &deferred_route)
+            .expect("query-peer deferred route state at gate-reopen pause"),
+        "helper must already have published the deferred sink-owned query-peer route before it considers reopening the API control gate"
+    );
+
+    gate_reopen_release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), helper_completed.notified())
+        .await
+        .expect("deferred query-peer helper must complete after the gate-reopen pause releases");
+
+    assert!(
+        !app.api_control_gate.is_ready(),
+        "deferred sink-owned query-peer publication must recompute the API control gate from current runtime facts instead of reopening it from a stale pre-regression ready bool"
+    );
+    assert_eq!(
+        app.current_facade_service_state().await,
+        FacadeServiceState::Unavailable,
+        "deferred sink-owned query-peer publication must leave facade state unavailable while source replay is still required"
+    );
+
+    app.close().await.expect("close app");
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_facade_state_with_serving_when_pending_reappears_before_gate_reopen()
+{
+    struct DeferredSinkOwnedQueryPeerPublicationGateReopenPauseHookReset;
+    struct DeferredSinkOwnedQueryPeerPublicationCompletionHookReset;
+
+    impl Drop for DeferredSinkOwnedQueryPeerPublicationGateReopenPauseHookReset {
+        fn drop(&mut self) {
+            clear_deferred_sink_owned_query_peer_publication_gate_reopen_pause_hook();
+        }
+    }
+
+    impl Drop for DeferredSinkOwnedQueryPeerPublicationCompletionHookReset {
+        fn drop(&mut self) {
+            clear_deferred_sink_owned_query_peer_publication_completion_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    fs::write(nfs1.join("ready-a.txt"), b"a").expect("seed nfs1");
+    fs::write(nfs2.join("ready-b.txt"), b"b").expect("seed nfs2");
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![
+                        worker_watch_scan_root("nfs1", &nfs1),
+                        worker_watch_scan_root("nfs2", &nfs2),
+                    ],
+                    host_object_grants: Vec::new(),
+                    ..SourceConfig::default()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: "listener-a".to_string(),
+                    local_listener_resources: vec![api::config::ApiListenerResource {
+                        resource_id: "listener-a".to_string(),
+                        bind_addr: bind_addr.clone(),
+                    }],
+                    auth: api::ApiAuthConfig {
+                        passwd_path,
+                        shadow_path,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-c-deferred-query-peer-pending-overwrite".into()),
+            Some(boundary.clone()),
+            Some(boundary),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    let source_wave = |generation| {
+        vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+        ]
+    };
+    let sink_wave = |generation| {
+        let root_scopes = &[("nfs1", &["nfs1"][..]), ("nfs2", &["nfs2"][..])];
+        vec![
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                root_scopes,
+                generation,
+            ),
+        ]
+    };
+
+    let mut initial = source_wave(2);
+    initial.extend(sink_wave(2));
+    app.on_control_frame(&initial)
+        .await
+        .expect("initial local source/sink wave should succeed");
+
+    let active_facade = match api::spawn(
+        app.config
+            .api
+            .resolve_for_candidate_ids(&["listener-a".to_string()])
+            .expect("resolve facade config"),
+        app.node_id.clone(),
+        app.runtime_boundary.clone(),
+        app.source.clone(),
+        app.sink.clone(),
+        app.query_sink.clone(),
+        app.runtime_boundary.clone(),
+        app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
+        app.api_request_tracker.clone(),
+        app.api_control_gate.clone(),
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(CnxError::InvalidInput(msg))
+            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+        {
+            return;
+        }
+        Err(err) => panic!("spawn active facade: {err}"),
+    };
+    *app.api_task.lock().await = Some(FacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 2,
+        resource_ids: vec!["listener-a".to_string()],
+        handle: active_facade,
+    });
+
+    let expected_groups = std::collections::BTreeSet::from([
+        "nfs1".to_string(),
+        "nfs2".to_string(),
+    ]);
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout(
+            Duration::from_millis(350),
+            app.sink.status_snapshot_nonblocking(),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => {
+                let ready_groups = snapshot
+                    .groups
+                    .iter()
+                    .filter(|group| group.initial_audit_completed)
+                    .map(|group| group.group_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>();
+                if ready_groups == expected_groups {
+                    break;
+                }
+            }
+            Ok(Err(_)) | Err(_) => {}
+        }
+        assert!(
+            tokio::time::Instant::now() < ready_deadline,
+            "timed out waiting for local sink readiness before deferred query-peer publication pending-overwrite red"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let deferred_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
+    let control_ready_after_republish = app.facade_publication_ready().await;
+    assert!(
+        control_ready_after_republish,
+        "precondition: helper pending-overwrite red requires facade publication to start ready"
+    );
+    app.api_control_gate.set_ready(control_ready_after_republish);
+    assert_eq!(
+        app.current_facade_service_state().await,
+        FacadeServiceState::Serving,
+        "precondition: helper pending-overwrite red requires facade to start serving"
+    );
+
+    let gate_reopen_entered = Arc::new(Notify::new());
+    let gate_reopen_release = Arc::new(Notify::new());
+    let helper_completed = Arc::new(Notify::new());
+    let _gate_reopen_reset = DeferredSinkOwnedQueryPeerPublicationGateReopenPauseHookReset;
+    let _helper_completed_reset = DeferredSinkOwnedQueryPeerPublicationCompletionHookReset;
+    install_deferred_sink_owned_query_peer_publication_gate_reopen_pause_hook(
+        DeferredSinkOwnedQueryPeerPublicationGateReopenPauseHook {
+            entered: gate_reopen_entered.clone(),
+            release: gate_reopen_release.clone(),
+        },
+    );
+    install_deferred_sink_owned_query_peer_publication_completion_hook(
+        DeferredSinkOwnedQueryPeerPublicationCompletionHook {
+            entered: helper_completed.clone(),
+        },
+    );
+
+    FSMetaApp::spawn_deferred_sink_owned_query_peer_publication_after_local_sink_status_ready(
+        app.source.clone(),
+        app.sink.clone(),
+        expected_groups,
+        Vec::new(),
+        vec![FacadeControlSignal::Activate {
+            unit: FacadeRuntimeUnit::QueryPeer,
+            route_key: deferred_route.clone(),
+            generation: 2,
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: "nfs1".to_string(),
+                resource_ids: vec!["nfs1".to_string()],
+            }],
+        }],
+        app.facade_gate.clone(),
+        app.mirrored_query_peer_routes.clone(),
+        app.pending_facade.clone(),
+        app.facade_pending_status.clone(),
+        app.api_task.clone(),
+        app.api_control_gate.clone(),
+        app.facade_service_state.clone(),
+        app.control_initialized.clone(),
+        app.source_state_replay_required.clone(),
+        app.sink_state_replay_required.clone(),
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), gate_reopen_entered.notified())
+        .await
+        .expect("deferred query-peer helper must reach the tail gate-reopen point for pending-overwrite red");
+
+    assert!(
+        app.facade_gate
+            .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &deferred_route)
+            .expect("query-peer deferred route state at pending-overwrite pause"),
+        "helper must already have published the deferred sink-owned query-peer route before pending facade state is reintroduced"
+    );
+
+    let pending = PendingFacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 3,
+        resource_ids: vec!["listener-a".to_string()],
+        bound_scopes: vec![RuntimeBoundScope {
+            scope_id: "listener-a".to_string(),
+            resource_ids: vec!["listener-a".to_string()],
+        }],
+        group_ids: Vec::new(),
+        runtime_managed: true,
+        runtime_exposure_confirmed: true,
+        resolved: app
+            .config
+            .api
+            .resolve_for_candidate_ids(&["listener-a".to_string()])
+            .expect("resolve pending facade config"),
+    };
+    *app.pending_facade.lock().await = Some(pending.clone());
+    FSMetaApp::set_pending_facade_status_waiting(
+        &app.facade_pending_status,
+        &pending,
+        FacadePendingReason::AwaitingObservationEligibility,
+    );
+    assert_eq!(
+        app.current_facade_service_state().await,
+        FacadeServiceState::Pending,
+        "pending facade reintroduction must first republish pending state before the deferred helper tail completes"
+    );
+    assert_eq!(
+        *app.facade_service_state
+            .read()
+            .expect("read published facade state before helper completion"),
+        FacadeServiceState::Pending,
+        "precondition: pending facade reintroduction must mark published facade state pending before helper completion"
+    );
+
+    gate_reopen_release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), helper_completed.notified())
+        .await
+        .expect("deferred query-peer helper must complete after pending-overwrite pause releases");
+
+    assert_eq!(
+        *app.facade_service_state
+            .read()
+            .expect("read published facade state after helper completion"),
+        FacadeServiceState::Pending,
+        "deferred sink-owned query-peer publication must not overwrite a newly pending facade state with serving when pending reappears before the tail gate reopen"
     );
 
     app.close().await.expect("close app");

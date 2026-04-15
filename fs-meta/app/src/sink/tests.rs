@@ -1,5 +1,6 @@
 use super::*;
 use crate::EpochType;
+use crate::query::{QueryScope, TreeQueryOptions};
 use crate::shared_types::query::UnreliableReason;
 use bytes::Bytes;
 use capanix_app_sdk::runtime::EventMetadata;
@@ -60,6 +61,23 @@ impl ChannelIoSubset for RouteCountingTimeoutBoundary {
 
 fn default_materialized_request() -> InternalQueryRequest {
     InternalQueryRequest::default()
+}
+
+fn materialized_tree_request(
+    path: &[u8],
+    recursive: bool,
+    max_depth: Option<usize>,
+) -> InternalQueryRequest {
+    InternalQueryRequest::materialized(
+        QueryOp::Tree,
+        QueryScope {
+            path: path.to_vec(),
+            recursive,
+            max_depth,
+            selected_group: None,
+        },
+        Some(TreeQueryOptions::default()),
+    )
 }
 
 fn decode_tree_payload(event: &Event) -> TreeGroupPayload {
@@ -735,6 +753,40 @@ async fn scheduled_root_id_stream_events_materialize_ready_state_without_host_gr
 }
 
 #[tokio::test]
+async fn stream_activate_without_runtime_endpoints_does_not_wait_for_stream_recv_observation() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::nfs1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("init sink");
+
+    sink.enable_stream_receive();
+    let activate =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope("nfs1")],
+        }))
+        .expect("encode stream activate");
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        sink.on_control_frame(&[activate]).await
+    })
+    .await
+    .expect("repo-local sink activate without runtime endpoints must not wait for stream-recv observation")
+    .expect("activate stream route");
+}
+
+#[tokio::test]
 async fn events_stream_materializes_split_primary_mixed_cluster_publications_after_bare_scope_activate()
  {
     let mut cfg = SourceConfig::default();
@@ -752,8 +804,8 @@ async fn events_stream_materializes_split_primary_mixed_cluster_publications_aft
         SinkFileMeta::with_boundaries(NodeId("node-b".to_string()), None, cfg).expect("init sink");
 
     sink.enable_stream_receive();
-    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
-        RuntimeExecActivate {
+    let activate =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
             route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
             unit_id: "runtime.exec.sink".to_string(),
             lease: None,
@@ -764,11 +816,16 @@ async fn events_stream_materializes_split_primary_mixed_cluster_publications_aft
                 bound_scope("nfs2"),
                 bound_scope("nfs3"),
             ],
-        },
-    ))
-    .expect("encode split-primary stream activate")])
-        .await
-        .expect("activate split-primary stream route");
+        }))
+        .expect("encode split-primary stream activate");
+    let sink_for_activate = sink.clone();
+    tokio::time::timeout(Duration::from_millis(500), async move {
+        sink_for_activate.on_control_frame(&[activate]).await
+    })
+    .await
+    .expect("non-primary bare-scope split-primary stream activate must not hang")
+    .expect("activate split-primary stream route");
+    eprintln!("test-marker: non-primary split-primary after activate");
 
     assert!(
         sink.should_receive_stream_events(),
@@ -916,6 +973,193 @@ async fn events_stream_materializes_split_primary_mixed_cluster_publications_aft
         ready_groups,
         std::collections::BTreeSet::from(["nfs1", "nfs2", "nfs3"]),
         "split-primary mixed-cluster stream publications must materialize all scheduled groups after bare-scope activate: {snapshot:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_stream_materializes_split_primary_mixed_cluster_publications_on_non_primary_request_node_after_bare_scope_activate()
+ {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+        RootSpec::new("nfs3", "/mnt/nfs3"),
+    ];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-a::nfs2", "node-a", "10.0.0.12", "/mnt/nfs2", true),
+        granted_mount_root("node-b::nfs3", "node-b", "10.0.0.13", "/mnt/nfs3", true),
+    ];
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-d".to_string()), None, cfg).expect("init sink");
+
+    sink.enable_stream_receive();
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope("nfs1"),
+                bound_scope("nfs2"),
+                bound_scope("nfs3"),
+            ],
+        },
+    ))
+    .expect("encode split-primary stream activate")])
+        .await
+        .expect("activate split-primary stream route");
+
+    assert!(
+        sink.should_receive_stream_events(),
+        "non-primary request node must still open the stream receive gate after bare-scope activate"
+    );
+    assert_eq!(
+        sink.scheduled_stream_object_refs()
+            .expect("scheduled stream object refs after split-primary activate"),
+        Some(std::collections::BTreeSet::from([
+            "node-a::nfs1".to_string(),
+            "node-a::nfs2".to_string(),
+            "node-b::nfs3".to_string(),
+        ])),
+        "bare-scope mixed-cluster sink activate on a non-primary request node must still expand to the concrete split-primary object refs before stream ingress"
+    );
+
+    sink.ingest_stream_events(&[
+        mk_source_event(
+            "node-a::nfs1",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 1,
+                    ctime_us: 1,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                1,
+                false,
+            ),
+        ),
+        mk_control_event(
+            "node-a::nfs1",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            2,
+        ),
+        mk_source_event(
+            "node-a::nfs1",
+            mk_record(b"/ready-a.txt", "ready-a.txt", 3, EventKind::Update),
+        ),
+        mk_control_event(
+            "node-a::nfs1",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            4,
+        ),
+        mk_source_event(
+            "node-a::nfs2",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 5,
+                    ctime_us: 5,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                5,
+                false,
+            ),
+        ),
+        mk_control_event(
+            "node-a::nfs2",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            6,
+        ),
+        mk_source_event(
+            "node-a::nfs2",
+            mk_record(b"/ready-b.txt", "ready-b.txt", 7, EventKind::Update),
+        ),
+        mk_control_event(
+            "node-a::nfs2",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            8,
+        ),
+        mk_source_event(
+            "node-b::nfs3",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 9,
+                    ctime_us: 9,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                9,
+                false,
+            ),
+        ),
+        mk_control_event(
+            "node-b::nfs3",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            10,
+        ),
+        mk_source_event(
+            "node-b::nfs3",
+            mk_record(b"/ready-c.txt", "ready-c.txt", 11, EventKind::Update),
+        ),
+        mk_control_event(
+            "node-b::nfs3",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            12,
+        ),
+    ])
+    .expect("split-primary stream events should apply on a non-primary request node");
+    eprintln!("test-marker: non-primary split-primary after ingest");
+
+    let snapshot = sink
+        .status_snapshot()
+        .expect("sink status after split-primary stream apply on non-primary request node");
+    eprintln!("test-marker: non-primary split-primary after status snapshot");
+    let ready_groups = snapshot
+        .groups
+        .iter()
+        .filter(|group| group.initial_audit_completed && group.live_nodes > 0)
+        .map(|group| group.group_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        ready_groups,
+        std::collections::BTreeSet::from(["nfs1", "nfs2", "nfs3"]),
+        "split-primary mixed-cluster stream publications must materialize all scheduled groups even on a non-primary request node: {snapshot:?}"
     );
 }
 
@@ -1112,6 +1356,21 @@ async fn deactivate_then_reactivate_preserves_ready_materialized_group_state() {
         .await
         .expect("deactivate should pass");
 
+    {
+        let state = sink.state.read().expect("state lock after deactivate");
+        assert!(
+            state.groups.is_empty(),
+            "empty runtime scope after deactivate must not keep ready groups active: active_groups={:?}",
+            state.groups.keys().collect::<Vec<_>>()
+        );
+        let retained_groups = state.retained_groups.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            retained_groups,
+            vec!["root-a".to_string(), "root-b".to_string()],
+            "empty runtime scope after deactivate must retain prior ready groups instead of leaving them active or dropping them: retained_groups={retained_groups:?}"
+        );
+    }
+
     let reactivate_both =
         encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
             route_key: ROUTE_KEY_QUERY.to_string(),
@@ -1144,6 +1403,93 @@ async fn deactivate_then_reactivate_preserves_ready_materialized_group_state() {
     assert_eq!(
         revisions_after, revisions_before,
         "deactivate/reactivate continuity must preserve materialized revision instead of recreating groups from scratch"
+    );
+}
+
+#[tokio::test]
+async fn deactivate_empty_runtime_scope_drops_zero_state_groups_instead_of_exposing_them() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("root-a", "/mnt/nfs1"),
+        RootSpec::new("root-b", "/mnt/nfs2"),
+    ];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::exp-a", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-b::exp-b", "node-b", "10.0.0.12", "/mnt/nfs2", true),
+    ];
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("init sink");
+
+    let activate_both =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope("root-a"), bound_scope("root-b")],
+        }))
+        .expect("encode activate both");
+    sink.on_control_frame(&[activate_both])
+        .await
+        .expect("activate both should pass");
+
+    let snapshot_before = sink
+        .status_snapshot()
+        .expect("sink status before zero-state deactivate");
+    assert_eq!(
+        snapshot_before.groups.len(),
+        2,
+        "precondition: both zero-state groups must be visible before empty runtime scope: {snapshot_before:?}"
+    );
+    assert!(
+        snapshot_before
+            .groups
+            .iter()
+            .all(|group| !group.initial_audit_completed && group.live_nodes == 0),
+        "precondition: both groups must still be zero-state before empty runtime scope: {snapshot_before:?}"
+    );
+
+    let deactivate =
+        encode_runtime_exec_control(&RuntimeExecControl::Deactivate(RuntimeExecDeactivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            reason: "test".to_string(),
+        }))
+        .expect("encode deactivate");
+    sink.on_control_frame(&[deactivate])
+        .await
+        .expect("deactivate should pass");
+
+    {
+        let state = sink
+            .state
+            .read()
+            .expect("state lock after zero-state deactivate");
+        assert!(
+            state.groups.is_empty(),
+            "empty runtime scope must not keep zero-state groups active: active_groups={:?}",
+            state.groups.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            state.retained_groups.is_empty(),
+            "empty runtime scope must not retain zero-state groups with no materialized truth: retained_groups={:?}",
+            state.retained_groups.keys().collect::<Vec<_>>()
+        );
+    }
+
+    let snapshot_after = sink
+        .status_snapshot()
+        .expect("sink status after zero-state deactivate");
+    assert!(
+        snapshot_after.groups.is_empty(),
+        "zero-state groups must disappear after empty runtime scope instead of remaining exposed: {snapshot_after:?}"
+    );
+    assert!(
+        snapshot_after.scheduled_groups_by_node.is_empty(),
+        "zero-state deactivate should also clear scheduled groups instead of leaving stale scope evidence: {snapshot_after:?}"
     );
 }
 
@@ -1608,7 +1954,7 @@ async fn logical_roots_window_missing_group_does_not_reset_ready_state_on_readd(
             .get("root-b")
             .expect("temporary logical-roots omission must retain ready root-b state");
         assert!(
-            retained_root_b.initial_audit_completed,
+            retained_root_b.initial_audit_completed(),
             "retained root-b must stay ready during temporary logical-roots omission"
         );
         assert!(
@@ -1757,7 +2103,7 @@ async fn retained_ready_group_state_survives_reopen_after_scope_wobble_and_later
             .get("root-b")
             .expect("root-b must be retained after scope wobble");
         assert!(
-            retained_root_b.initial_audit_completed,
+            retained_root_b.initial_audit_completed(),
             "retained root-b must keep ready state before reopen"
         );
         assert!(
@@ -1782,7 +2128,7 @@ async fn retained_ready_group_state_survives_reopen_after_scope_wobble_and_later
                 "reopened sink must preserve retained ready group state across the shared state boundary",
             );
         assert!(
-            retained_root_b.initial_audit_completed,
+            retained_root_b.initial_audit_completed(),
             "reopened retained root-b must keep ready state instead of regressing to init=false"
         );
         assert!(
@@ -1917,7 +2263,29 @@ async fn retained_root_id_ready_state_persists_control_only_scope_wobble_before_
         ),
         mk_source_event(
             "nfs2",
-            mk_record(b"/ready-b.txt", "ready-b.txt", 3, EventKind::Update),
+            FileMetaRecord::scan_update(
+                b"/nested".to_vec(),
+                b"nested".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 3,
+                    ctime_us: 3,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                3,
+                false,
+            ),
+        ),
+        mk_source_event(
+            "nfs2",
+            mk_record(b"/ready-b.txt", "ready-b.txt", 4, EventKind::Update),
+        ),
+        mk_source_event(
+            "nfs2",
+            mk_record(b"/nested/peer.txt", "peer.txt", 5, EventKind::Update),
         ),
         mk_control_event(
             "nfs2",
@@ -1925,7 +2293,7 @@ async fn retained_root_id_ready_state_persists_control_only_scope_wobble_before_
                 epoch_id: 0,
                 epoch_type: EpochType::Audit,
             },
-            4,
+            6,
         ),
     ])
     .expect("seed ready root-id stream-applied state for nfs2");
@@ -1975,7 +2343,7 @@ async fn retained_root_id_ready_state_persists_control_only_scope_wobble_before_
             .get("nfs2")
             .expect("nfs2 must be retained after scope wobble");
         assert!(
-            retained_nfs2.initial_audit_completed,
+            retained_nfs2.initial_audit_completed(),
             "retained nfs2 must keep ready state in memory before reopen"
         );
         assert!(
@@ -2007,7 +2375,7 @@ async fn retained_root_id_ready_state_persists_control_only_scope_wobble_before_
                 "reopened sink must preserve retained root-id ready state across control-only scope wobble without requiring close()",
             );
         assert!(
-            retained_nfs2.initial_audit_completed,
+            retained_nfs2.initial_audit_completed(),
             "reopened retained nfs2 must keep ready state instead of regressing to init=false"
         );
         assert!(
@@ -2141,7 +2509,29 @@ async fn retained_root_id_ready_state_restores_when_logical_roots_sync_readds_sc
         ),
         mk_source_event(
             "nfs2",
-            mk_record(b"/ready-b.txt", "ready-b.txt", 3, EventKind::Update),
+            FileMetaRecord::scan_update(
+                b"/nested".to_vec(),
+                b"nested".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 3,
+                    ctime_us: 3,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                3,
+                false,
+            ),
+        ),
+        mk_source_event(
+            "nfs2",
+            mk_record(b"/ready-b.txt", "ready-b.txt", 4, EventKind::Update),
+        ),
+        mk_source_event(
+            "nfs2",
+            mk_record(b"/nested/peer.txt", "peer.txt", 5, EventKind::Update),
         ),
         mk_control_event(
             "nfs2",
@@ -2149,7 +2539,7 @@ async fn retained_root_id_ready_state_restores_when_logical_roots_sync_readds_sc
                 epoch_id: 0,
                 epoch_type: EpochType::Audit,
             },
-            4,
+            6,
         ),
     ])
     .expect("seed ready root-id stream-applied state for nfs2");
@@ -2171,6 +2561,29 @@ async fn retained_root_id_ready_state_restores_when_logical_roots_sync_readds_sc
     assert!(
         nfs2_before.materialized_revision > 1,
         "precondition: nfs2 must have advanced materialized revision before scope wobble: {snapshot_before:?}"
+    );
+    let nested_before = sink
+        .materialized_query(&materialized_tree_request(b"/nested", true, Some(1)))
+        .expect("nested query before scope wobble");
+    let nested_before_responses = nested_before
+        .iter()
+        .map(|event| {
+            (
+                event.metadata().origin_id.0.clone(),
+                decode_tree_payload(event),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let nfs2_nested_before = nested_before_responses
+        .get("nfs2")
+        .expect("nfs2 nested response before scope wobble");
+    assert!(
+        nfs2_nested_before.root.exists && nfs2_nested_before.root.path == b"/nested",
+        "precondition: nfs2 nested root must exist before scope wobble: {nfs2_nested_before:?}"
+    );
+    assert!(
+        payload_contains_path(nfs2_nested_before, b"/nested/peer.txt"),
+        "precondition: nfs2 nested query must contain peer.txt before scope wobble"
     );
 
     let activate_nfs1_only =
@@ -2202,7 +2615,7 @@ async fn retained_root_id_ready_state_restores_when_logical_roots_sync_readds_sc
             .get("nfs2")
             .expect("nfs2 must be retained after control-only wobble");
         assert!(
-            retained_nfs2.initial_audit_completed,
+            retained_nfs2.initial_audit_completed(),
             "retained nfs2 must keep ready state after control-only wobble"
         );
         assert!(
@@ -2259,6 +2672,121 @@ async fn retained_root_id_ready_state_restores_when_logical_roots_sync_readds_sc
     assert!(
         payload_contains_path(nfs2_response, b"/ready-b.txt"),
         "later logical-roots sync must restore retained nfs2 tree payload instead of recreating it from scratch"
+    );
+
+    let nested_query_events = sink
+        .materialized_query(&materialized_tree_request(b"/nested", true, Some(1)))
+        .expect("nested query after logical-roots sync restores runtime scope");
+    let nested_responses = nested_query_events
+        .iter()
+        .map(|event| {
+            (
+                event.metadata().origin_id.0.clone(),
+                decode_tree_payload(event),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let nfs2_nested_response = nested_responses
+        .get("nfs2")
+        .expect("nfs2 nested response after logical-roots sync restores runtime scope");
+    assert!(
+        nfs2_nested_response.root.exists && nfs2_nested_response.root.path == b"/nested",
+        "later logical-roots sync must restore retained nfs2 nested root instead of collapsing it to an empty subtree: {nfs2_nested_response:?}"
+    );
+    assert!(
+        payload_contains_path(nfs2_nested_response, b"/nested/peer.txt"),
+        "later logical-roots sync must restore retained nfs2 nested max-depth payload instead of dropping peer.txt after scope wobble"
+    );
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn update_logical_roots_does_not_widen_runtime_scope_back_to_all_roots_when_current_schedule_is_subset()
+ {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+        RootSpec::new("nfs3", "/mnt/nfs3"),
+    ];
+    let host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-a::nfs2", "node-a", "10.0.0.11", "/mnt/nfs2", true),
+        granted_mount_root("node-b::nfs3", "node-b", "10.0.0.12", "/mnt/nfs3", true),
+    ];
+    cfg.host_object_grants = host_object_grants.clone();
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-b".to_string()), None, cfg).expect("init sink");
+
+    let activate_nfs3_only =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs3", &["node-b::nfs3"])],
+        }))
+        .expect("encode activate nfs3 only");
+    sink.on_control_frame(&[activate_nfs3_only])
+        .await
+        .expect("activate nfs3 only should pass");
+
+    let snapshot_before = sink
+        .status_snapshot()
+        .expect("status before logical-roots sync");
+    let before_groups = snapshot_before
+        .groups
+        .iter()
+        .map(|group| group.group_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        before_groups,
+        std::collections::BTreeSet::from(["nfs3"]),
+        "precondition: subset runtime schedule should only expose nfs3 before logical-roots sync: {snapshot_before:?}"
+    );
+    assert_eq!(
+        snapshot_before
+            .scheduled_groups_by_node
+            .get("node-b")
+            .cloned()
+            .unwrap_or_default(),
+        vec!["nfs3".to_string()],
+        "precondition: scheduled groups should only contain nfs3 before logical-roots sync: {snapshot_before:?}"
+    );
+
+    sink.update_logical_roots(
+        vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+            RootSpec::new("nfs3", "/mnt/nfs3"),
+        ],
+        &host_object_grants,
+    )
+    .expect("logical-roots sync should preserve current runtime schedule");
+
+    let snapshot_after = sink
+        .status_snapshot()
+        .expect("status after logical-roots sync preserves subset schedule");
+    let after_groups = snapshot_after
+        .groups
+        .iter()
+        .map(|group| group.group_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        after_groups,
+        std::collections::BTreeSet::from(["nfs3"]),
+        "logical-roots sync must not widen subset runtime schedule back to all roots with zero-state groups: {snapshot_after:?}"
+    );
+    assert_eq!(
+        snapshot_after
+            .scheduled_groups_by_node
+            .get("node-b")
+            .cloned()
+            .unwrap_or_default(),
+        vec!["nfs3".to_string()],
+        "logical-roots sync must preserve the current scheduled subset instead of widening it: {snapshot_after:?}"
     );
 
     sink.close().await.expect("close sink");
@@ -2359,7 +2887,29 @@ async fn retained_root_id_ready_state_survives_same_instance_scope_wobble_and_la
         ),
         mk_source_event(
             "nfs2",
-            mk_record(b"/ready-b.txt", "ready-b.txt", 7, EventKind::Update),
+            FileMetaRecord::scan_update(
+                b"/nested".to_vec(),
+                b"nested".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 7,
+                    ctime_us: 7,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                7,
+                false,
+            ),
+        ),
+        mk_source_event(
+            "nfs2",
+            mk_record(b"/ready-b.txt", "ready-b.txt", 8, EventKind::Update),
+        ),
+        mk_source_event(
+            "nfs2",
+            mk_record(b"/nested/peer.txt", "peer.txt", 9, EventKind::Update),
         ),
         mk_control_event(
             "nfs2",
@@ -2367,7 +2917,7 @@ async fn retained_root_id_ready_state_survives_same_instance_scope_wobble_and_la
                 epoch_id: 0,
                 epoch_type: EpochType::Audit,
             },
-            8,
+            10,
         ),
     ])
     .expect("seed ready root-id state for both groups");
@@ -2413,6 +2963,29 @@ async fn retained_root_id_ready_state_survives_same_instance_scope_wobble_and_la
         before_groups.get("nfs2").is_some_and(|row| row.2 > 1),
         "precondition: nfs2 must have advanced materialized revision before scope wobble: {snapshot_before:?}"
     );
+    let nested_before = sink
+        .materialized_query(&materialized_tree_request(b"/nested", true, Some(1)))
+        .expect("nested query before same-instance scope wobble");
+    let nested_before_responses = nested_before
+        .iter()
+        .map(|event| {
+            (
+                event.metadata().origin_id.0.clone(),
+                decode_tree_payload(event),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let nfs2_nested_before = nested_before_responses
+        .get("nfs2")
+        .expect("nfs2 nested response before same-instance scope wobble");
+    assert!(
+        nfs2_nested_before.root.exists && nfs2_nested_before.root.path == b"/nested",
+        "precondition: nfs2 nested root must exist before same-instance scope wobble: {nfs2_nested_before:?}"
+    );
+    assert!(
+        payload_contains_path(nfs2_nested_before, b"/nested/peer.txt"),
+        "precondition: nfs2 nested query must contain peer.txt before same-instance scope wobble"
+    );
 
     let activate_nfs1_only =
         encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
@@ -2440,7 +3013,7 @@ async fn retained_root_id_ready_state_survives_same_instance_scope_wobble_and_la
             .get("nfs2")
             .expect("nfs2 must be retained after same-instance scope wobble");
         assert!(
-            retained_nfs2.initial_audit_completed,
+            retained_nfs2.initial_audit_completed(),
             "retained nfs2 must stay ready in memory before same-instance reactivate"
         );
         assert!(
@@ -2537,6 +3110,30 @@ async fn retained_root_id_ready_state_survives_same_instance_scope_wobble_and_la
             b"/ready-b.txt"
         ),
         "same-instance reactivate must preserve retained nfs2 materialized payload instead of recreating it from scratch"
+    );
+
+    let nested_query_events = sink
+        .materialized_query(&materialized_tree_request(b"/nested", true, Some(1)))
+        .expect("nested query after same-instance reactivate");
+    let nested_responses = nested_query_events
+        .iter()
+        .map(|event| {
+            (
+                event.metadata().origin_id.0.clone(),
+                decode_tree_payload(event),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let nfs2_nested_response = nested_responses
+        .get("nfs2")
+        .expect("nfs2 nested response after same-instance reactivate");
+    assert!(
+        nfs2_nested_response.root.exists && nfs2_nested_response.root.path == b"/nested",
+        "same-instance reactivate must preserve retained nfs2 nested root instead of collapsing it after scope wobble: {nfs2_nested_response:?}"
+    );
+    assert!(
+        payload_contains_path(nfs2_nested_response, b"/nested/peer.txt"),
+        "same-instance reactivate must preserve retained nfs2 nested max-depth payload instead of dropping peer.txt"
     );
 }
 
@@ -3064,6 +3661,41 @@ async fn initial_audit_completion_waits_for_materialized_root() {
         snapshot.groups[0].initial_audit_completed,
         "materialized root should unlock initial audit readiness after audit completion"
     );
+}
+
+#[test]
+fn group_readiness_state_distinguishes_pending_audit_waiting_for_materialized_root_and_ready() {
+    let mut group = GroupSinkState::new("node-a::exp".to_string(), TombstonePolicy::default());
+    assert_eq!(
+        group.group_readiness_state(),
+        GroupReadinessState::PendingAudit
+    );
+
+    group.audit_epoch_completed = true;
+    assert_eq!(
+        group.group_readiness_state(),
+        GroupReadinessState::WaitingForMaterializedRoot
+    );
+
+    group.tree.insert(
+        b"/ready.txt".to_vec(),
+        tree::FileMetaNode {
+            size: 1,
+            modified_time_us: 1,
+            created_time_us: 1,
+            is_dir: false,
+            source: crate::SyncTrack::Scan,
+            monitoring_attested: true,
+            last_confirmed_at: None,
+            suspect_until: None,
+            blind_spot: false,
+            is_tombstoned: false,
+            tombstone_expires_at: None,
+            last_seen_epoch: 0,
+            subtree_last_write_significant_change_at: None,
+        },
+    );
+    assert_eq!(group.group_readiness_state(), GroupReadinessState::Ready);
 }
 
 #[tokio::test]

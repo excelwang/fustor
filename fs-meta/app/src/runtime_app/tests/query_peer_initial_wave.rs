@@ -1,3 +1,37 @@
+#[test]
+fn internal_status_availability_allows_peer_nodes_without_local_api_task_even_when_facade_is_unavailable()
+{
+    assert_eq!(
+        FSMetaApp::internal_status_available_from_published_facade_state(
+            FacadeServiceState::Unavailable,
+            false,
+        ),
+        InternalStatusAvailability::Available,
+        "peer-node internal status must stay available for cluster aggregation even when the local published facade state is unavailable"
+    );
+}
+
+#[test]
+fn internal_status_availability_fails_closed_for_local_api_task_when_facade_is_not_serving() {
+    for state in [
+        FacadeServiceState::Pending,
+        FacadeServiceState::Unavailable,
+    ] {
+        assert_eq!(
+            FSMetaApp::internal_status_available_from_published_facade_state(state, true),
+            InternalStatusAvailability::UnavailableLocalFacadeNotServing,
+            "local internal status routes must fail closed for a local api_task when the published facade state is not serving: state={state:?}"
+        );
+    }
+    for state in [FacadeServiceState::Serving, FacadeServiceState::Degraded] {
+        assert_eq!(
+            FSMetaApp::internal_status_available_from_published_facade_state(state, true),
+            InternalStatusAvailability::Available,
+            "local internal status routes must stay available when the published facade state remains serving/degraded: state={state:?}"
+        );
+    }
+}
+
 #[derive(Default)]
 struct DropUntilFirstEventsRecvBoundary {
     inner: LoopbackWorkerBoundary,
@@ -59,7 +93,12 @@ impl ChannelIoSubset for DropUntilFirstEventsRecvBoundary {
         if route == Self::events_route() {
             self.stream_recv_armed.store(true, AtomicOrdering::Release);
         }
-        *self.recv_counts.lock().expect("recv_counts lock").entry(route).or_default() += 1;
+        *self
+            .recv_counts
+            .lock()
+            .expect("recv_counts lock")
+            .entry(route)
+            .or_default() += 1;
         self.inner.channel_recv(ctx, request).await
     }
 
@@ -74,7 +113,7 @@ impl ChannelBoundary for DropUntilFirstEventsRecvBoundary {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn generation_one_initial_source_sink_and_query_peer_wave_settles_without_local_apply_timeout()
-{
+ {
     let tmp = tempdir().expect("create temp dir");
     let nfs1_dir = tmp.path().join("nfs1");
     let nfs2_dir = tmp.path().join("nfs2");
@@ -257,6 +296,994 @@ async fn generation_one_initial_source_sink_and_query_peer_wave_settles_without_
     app.close().await.expect("close app");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn internal_status_routes_stay_available_while_published_facade_state_remains_serving_after_control_gate_reclose()
+ {
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let nfs1_dir = tmp.path().join("nfs1");
+    fs::create_dir_all(&nfs1_dir).expect("create nfs1 dir");
+    fs::write(nfs1_dir.join("seed.txt"), b"a").expect("seed nfs1");
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+
+    let cfg = FSMetaConfig {
+        source: SourceConfig {
+            roots: vec![worker_watch_scan_root("nfs1", &nfs1_dir)],
+            host_object_grants: vec![worker_export(
+                "node-a::nfs1",
+                "node-a",
+                "127.0.0.1",
+                nfs1_dir.clone(),
+            )],
+            ..SourceConfig::default()
+        },
+        api: api::ApiConfig {
+            enabled: true,
+            facade_resource_id: "listener-a".to_string(),
+            local_listener_resources: vec![api::config::ApiListenerResource {
+                resource_id: "listener-a".to_string(),
+                bind_addr: bind_addr.clone(),
+            }],
+            auth: api::ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                ..api::ApiAuthConfig::default()
+            },
+        },
+    };
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            cfg,
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".into()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    if cfg!(target_os = "linux") {
+        match app.start().await {
+            Ok(()) => {}
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Err(err) => panic!(
+                "start app: {err}\nsource stderr:\n{}\nsink stderr:\n{}",
+                worker_stderr_excerpt(&source_socket_dir),
+                worker_stderr_excerpt(&sink_socket_dir),
+            ),
+        }
+    } else {
+        let err = app.start().await.expect_err("non-linux should fail fast");
+        assert!(matches!(err, CnxError::NotSupported(_)));
+        return;
+    }
+
+    let active_facade = match api::spawn(
+        app.config
+            .api
+            .resolve_for_candidate_ids(&["listener-a".to_string()])
+            .expect("resolve facade config"),
+        app.node_id.clone(),
+        app.runtime_boundary.clone(),
+        app.source.clone(),
+        app.sink.clone(),
+        app.query_sink.clone(),
+        app.runtime_boundary.clone(),
+        app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
+        app.api_request_tracker.clone(),
+        app.api_control_gate.clone(),
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(CnxError::InvalidInput(msg))
+            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+        {
+            app.close().await.expect("close app after bind restriction");
+            return;
+        }
+        Err(err) => panic!("spawn active facade: {err}"),
+    };
+    *app.api_task.lock().await = Some(FacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 1,
+        resource_ids: vec!["listener-a".to_string()],
+        handle: active_facade,
+    });
+
+    let root_scopes = &[("nfs1", &["node-a::nfs1"][..])];
+    let listener_scopes = &[("nfs1", &["listener-a"][..])];
+    let mut initial = vec![
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_scope_rows(execution_units::SINK_RUNTIME_UNIT_ID, root_scopes, 2),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_FORCE_FIND),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+    ];
+    for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+        initial.push(activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_query_request_route_for(node_id).0,
+            root_scopes,
+            2,
+        ));
+    }
+
+    app.on_control_frame(&initial)
+        .await
+        .expect("activate internal status routes");
+
+    FSMetaApp::publish_facade_service_state_from_runtime_facts(
+        &app.facade_service_state,
+        true,
+        true,
+        false,
+    );
+    assert_eq!(
+        *app.facade_service_state
+            .read()
+            .expect("read published facade state"),
+        FacadeServiceState::Serving,
+        "precondition: active facade must already publish serving before gate reclose"
+    );
+    assert!(
+        app.pending_facade.lock().await.is_none(),
+        "precondition: this seam must not depend on a pending replacement facade"
+    );
+
+    app.api_control_gate.set_ready(false);
+
+    let source_snapshots = internal_source_status_snapshots_with_timeout(
+        boundary.clone(),
+        NodeId("node-a".into()),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect(
+        "source-status route must stay available while the published facade state remains serving even after the control gate recloses",
+    );
+    assert!(
+        !source_snapshots.is_empty(),
+        "source-status route should still return at least one snapshot while serving continuity holds"
+    );
+
+    let sink_events = internal_sink_status_request_with_timeout(
+        boundary.clone(),
+        NodeId("node-a".into()),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect(
+        "sink-status route must stay available while the published facade state remains serving even after the control gate recloses",
+    );
+    let sink_snapshots = sink_events
+        .iter()
+        .map(|event| {
+            rmp_serde::from_slice::<crate::sink::SinkStatusSnapshot>(event.payload_bytes())
+                .expect("decode sink-status snapshot")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !sink_snapshots.is_empty(),
+        "sink-status route should still return at least one snapshot while serving continuity holds"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn internal_status_routes_stay_available_on_peer_nodes_without_api_task_while_published_facade_state_remains_serving_after_control_gate_reclose()
+ {
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let nfs1_dir = tmp.path().join("nfs1");
+    fs::create_dir_all(&nfs1_dir).expect("create nfs1 dir");
+    fs::write(nfs1_dir.join("seed.txt"), b"a").expect("seed nfs1");
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+
+    let cfg = FSMetaConfig {
+        source: SourceConfig {
+            roots: vec![worker_watch_scan_root("nfs1", &nfs1_dir)],
+            host_object_grants: vec![worker_export(
+                "node-a::nfs1",
+                "node-a",
+                "127.0.0.1",
+                nfs1_dir.clone(),
+            )],
+            ..SourceConfig::default()
+        },
+        api: api::ApiConfig {
+            enabled: true,
+            facade_resource_id: "listener-a".to_string(),
+            local_listener_resources: vec![api::config::ApiListenerResource {
+                resource_id: "listener-a".to_string(),
+                bind_addr: bind_addr.clone(),
+            }],
+            auth: api::ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                ..api::ApiAuthConfig::default()
+            },
+        },
+    };
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            cfg,
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".into()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    if cfg!(target_os = "linux") {
+        match app.start().await {
+            Ok(()) => {}
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Err(err) => panic!(
+                "start app: {err}\nsource stderr:\n{}\nsink stderr:\n{}",
+                worker_stderr_excerpt(&source_socket_dir),
+                worker_stderr_excerpt(&sink_socket_dir),
+            ),
+        }
+    } else {
+        let err = app.start().await.expect_err("non-linux should fail fast");
+        assert!(matches!(err, CnxError::NotSupported(_)));
+        return;
+    }
+
+    assert!(
+        app.api_task.lock().await.is_none(),
+        "peer-node continuity seam must not depend on a local api_task"
+    );
+
+    let root_scopes = &[("nfs1", &["node-a::nfs1"][..])];
+    let listener_scopes = &[("nfs1", &["listener-a"][..])];
+    let mut initial = vec![
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_scope_rows(execution_units::SINK_RUNTIME_UNIT_ID, root_scopes, 2),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_FORCE_FIND),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+    ];
+    for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+        initial.push(activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_query_request_route_for(node_id).0,
+            root_scopes,
+            2,
+        ));
+    }
+
+    app.on_control_frame(&initial)
+        .await
+        .expect("activate internal status routes");
+
+    FSMetaApp::publish_facade_service_state_from_runtime_facts(
+        &app.facade_service_state,
+        true,
+        true,
+        false,
+    );
+    assert_eq!(
+        *app.facade_service_state
+            .read()
+            .expect("read published facade state"),
+        FacadeServiceState::Serving,
+        "precondition: peer node must already publish serving before gate reclose"
+    );
+
+    let source_snapshots = internal_source_status_snapshots_with_timeout(
+        boundary.clone(),
+        NodeId("node-a".into()),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect(
+        "source-status route should be live on peer nodes once the published facade state is already serving",
+    );
+    assert!(
+        !source_snapshots.is_empty(),
+        "source-status precondition should return at least one snapshot on peer nodes once serving is published"
+    );
+
+    let initial_sink_events = internal_sink_status_request_with_timeout(
+        boundary.clone(),
+        NodeId("node-a".into()),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect(
+        "sink-status route should be live on peer nodes once the published facade state is already serving",
+    );
+    assert!(
+        !initial_sink_events.is_empty(),
+        "sink-status precondition should produce at least one event on peer nodes once serving is published"
+    );
+
+    app.api_control_gate.set_ready(false);
+
+    let source_snapshots_after_reclose = internal_source_status_snapshots_with_timeout(
+        boundary.clone(),
+        NodeId("node-a".into()),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect(
+        "source-status route must stay available on peer nodes without api_task while the published facade state remains serving after the control gate recloses",
+    );
+    assert!(
+        !source_snapshots_after_reclose.is_empty(),
+        "source-status route should still return at least one snapshot on peer nodes while serving continuity holds"
+    );
+
+    let sink_events = internal_sink_status_request_with_timeout(
+        boundary.clone(),
+        NodeId("node-a".into()),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect(
+        "sink-status route must stay available on peer nodes without api_task while the published facade state remains serving after the control gate recloses",
+    );
+    let sink_snapshots = sink_events
+        .iter()
+        .map(|event| {
+            rmp_serde::from_slice::<crate::sink::SinkStatusSnapshot>(event.payload_bytes())
+                .expect("decode sink-status snapshot")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !sink_snapshots.is_empty(),
+        "sink-status route should still return at least one snapshot on peer nodes while serving continuity holds"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn internal_status_routes_stay_available_on_peer_nodes_without_api_task_when_published_facade_state_is_unavailable()
+ {
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let nfs1_dir = tmp.path().join("nfs1");
+    fs::create_dir_all(&nfs1_dir).expect("create nfs1 dir");
+    fs::write(nfs1_dir.join("seed.txt"), b"a").expect("seed nfs1");
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+
+    let cfg = FSMetaConfig {
+        source: SourceConfig {
+            roots: vec![worker_watch_scan_root("nfs1", &nfs1_dir)],
+            host_object_grants: vec![worker_export(
+                "node-a::nfs1",
+                "node-a",
+                "127.0.0.1",
+                nfs1_dir.clone(),
+            )],
+            ..SourceConfig::default()
+        },
+        api: api::ApiConfig {
+            enabled: true,
+            facade_resource_id: "listener-a".to_string(),
+            local_listener_resources: vec![api::config::ApiListenerResource {
+                resource_id: "listener-a".to_string(),
+                bind_addr: bind_addr.clone(),
+            }],
+            auth: api::ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                ..api::ApiAuthConfig::default()
+            },
+        },
+    };
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            cfg,
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".into()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    if cfg!(target_os = "linux") {
+        match app.start().await {
+            Ok(()) => {}
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Err(err) => panic!(
+                "start app: {err}\nsource stderr:\n{}\nsink stderr:\n{}",
+                worker_stderr_excerpt(&source_socket_dir),
+                worker_stderr_excerpt(&sink_socket_dir),
+            ),
+        }
+    } else {
+        let err = app.start().await.expect_err("non-linux should fail fast");
+        assert!(matches!(err, CnxError::NotSupported(_)));
+        return;
+    }
+
+    assert!(
+        app.api_task.lock().await.is_none(),
+        "peer-node internal-status seam must not depend on a local public facade task"
+    );
+
+    let root_scopes = &[("nfs1", &["node-a::nfs1"][..])];
+    let listener_scopes = &[("nfs1", &["listener-a"][..])];
+    let mut initial = vec![
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_scope_rows(execution_units::SINK_RUNTIME_UNIT_ID, root_scopes, 2),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_FORCE_FIND),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+    ];
+    for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+        initial.push(activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_query_request_route_for(node_id).0,
+            root_scopes,
+            2,
+        ));
+    }
+
+    app.on_control_frame(&initial)
+        .await
+        .expect("activate peer internal status routes");
+
+    FSMetaApp::publish_facade_service_state_from_runtime_facts(
+        &app.facade_service_state,
+        true,
+        true,
+        false,
+    );
+    let initial_source_snapshots = internal_source_status_snapshots_with_timeout(
+        boundary.clone(),
+        NodeId("node-a".into()),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("peer source-status precondition while serving is published");
+    assert!(
+        !initial_source_snapshots.is_empty(),
+        "peer source-status precondition should return at least one snapshot before forcing facade state unavailable"
+    );
+    let initial_sink_events = internal_sink_status_request_with_timeout(
+        boundary.clone(),
+        NodeId("node-a".into()),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("peer sink-status precondition while serving is published");
+    assert!(
+        !initial_sink_events.is_empty(),
+        "peer sink-status precondition should return at least one event before forcing facade state unavailable"
+    );
+
+    *app.facade_service_state
+        .write()
+        .expect("write published facade state") = FacadeServiceState::Unavailable;
+    app.api_control_gate.set_ready(false);
+
+    let source_snapshots = internal_source_status_snapshots_with_timeout(
+        boundary.clone(),
+        NodeId("node-a".into()),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect(
+        "peer source-status route must stay available for cluster aggregation even when the local published facade state is unavailable",
+    );
+    assert!(
+        !source_snapshots.is_empty(),
+        "peer source-status route should still return at least one snapshot when the local published facade state is unavailable"
+    );
+
+    let sink_events = internal_sink_status_request_with_timeout(
+        boundary.clone(),
+        NodeId("node-a".into()),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect(
+        "peer sink-status route must stay available for cluster aggregation even when the local published facade state is unavailable",
+    );
+    assert!(
+        !sink_events.is_empty(),
+        "peer sink-status route should still return at least one event when the local published facade state is unavailable"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn internal_status_routes_fail_closed_on_local_facade_owner_when_published_facade_state_is_not_serving_even_if_control_gate_is_ready()
+{
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let nfs1_dir = tmp.path().join("nfs1");
+    fs::create_dir_all(&nfs1_dir).expect("create nfs1 dir");
+    fs::write(nfs1_dir.join("seed.txt"), b"a").expect("seed nfs1");
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+
+    let cfg = FSMetaConfig {
+        source: SourceConfig {
+            roots: vec![worker_watch_scan_root("nfs1", &nfs1_dir)],
+            host_object_grants: vec![worker_export(
+                "node-a::nfs1",
+                "node-a",
+                "127.0.0.1",
+                nfs1_dir.clone(),
+            )],
+            ..SourceConfig::default()
+        },
+        api: api::ApiConfig {
+            enabled: true,
+            facade_resource_id: "listener-a".to_string(),
+            local_listener_resources: vec![api::config::ApiListenerResource {
+                resource_id: "listener-a".to_string(),
+                bind_addr: bind_addr.clone(),
+            }],
+            auth: api::ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                ..api::ApiAuthConfig::default()
+            },
+        },
+    };
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            cfg,
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".into()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    if cfg!(target_os = "linux") {
+        match app.start().await {
+            Ok(()) => {}
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Err(err) => panic!(
+                "start app: {err}\nsource stderr:\n{}\nsink stderr:\n{}",
+                worker_stderr_excerpt(&source_socket_dir),
+                worker_stderr_excerpt(&sink_socket_dir),
+            ),
+        }
+    } else {
+        let err = app.start().await.expect_err("non-linux should fail fast");
+        assert!(matches!(err, CnxError::NotSupported(_)));
+        return;
+    }
+
+    let active_facade = match api::spawn(
+        app.config
+            .api
+            .resolve_for_candidate_ids(&["listener-a".to_string()])
+            .expect("resolve facade config"),
+        app.node_id.clone(),
+        app.runtime_boundary.clone(),
+        app.source.clone(),
+        app.sink.clone(),
+        app.query_sink.clone(),
+        app.runtime_boundary.clone(),
+        app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
+        app.api_request_tracker.clone(),
+        app.api_control_gate.clone(),
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(CnxError::InvalidInput(msg))
+            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+        {
+            app.close().await.expect("close app after bind restriction");
+            return;
+        }
+        Err(err) => panic!("spawn active facade: {err}"),
+    };
+    *app.api_task.lock().await = Some(FacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 1,
+        resource_ids: vec!["listener-a".to_string()],
+        handle: active_facade,
+    });
+
+    let root_scopes = &[("nfs1", &["node-a::nfs1"][..])];
+    let listener_scopes = &[("nfs1", &["listener-a"][..])];
+    let mut initial = vec![
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_scope_rows(execution_units::SINK_RUNTIME_UNIT_ID, root_scopes, 2),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_FORCE_FIND),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+            listener_scopes,
+            2,
+        ),
+    ];
+    for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+        initial.push(activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_query_request_route_for(node_id).0,
+            root_scopes,
+            2,
+        ));
+    }
+
+    app.on_control_frame(&initial)
+        .await
+        .expect("activate internal status routes");
+
+    app.api_control_gate.set_ready(true);
+    FSMetaApp::publish_facade_service_state_from_runtime_facts(
+        &app.facade_service_state,
+        true,
+        true,
+        false,
+    );
+
+    let source_snapshots = internal_source_status_snapshots_with_timeout(
+        boundary.clone(),
+        NodeId("node-a".into()),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("source-status precondition when published facade state is serving");
+    assert!(
+        !source_snapshots.is_empty(),
+        "source-status precondition should produce at least one snapshot while serving is published"
+    );
+
+    let initial_sink_events = internal_sink_status_request_with_timeout(
+        boundary.clone(),
+        NodeId("node-a".into()),
+        Duration::from_millis(700),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("sink-status precondition when published facade state is serving");
+    assert!(
+        !initial_sink_events.is_empty(),
+        "sink-status precondition should produce at least one event while serving is published"
+    );
+
+    for published_state in [FacadeServiceState::Pending, FacadeServiceState::Unavailable] {
+        *app.facade_service_state
+            .write()
+            .expect("write published facade state") = published_state;
+        app.api_control_gate.set_ready(true);
+
+        let source_request = internal_source_status_snapshots_with_timeout(
+            boundary.clone(),
+            NodeId("node-a".into()),
+            Duration::from_millis(250),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            source_request.is_err(),
+            "source-status route must fail closed on a local facade owner once the published facade state is {published_state:?}, even if the control gate is ready",
+        );
+
+        let sink_request = internal_sink_status_request_with_timeout(
+            boundary.clone(),
+            NodeId("node-a".into()),
+            Duration::from_millis(250),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            sink_request.is_err(),
+            "sink-status route must fail closed on a local facade owner once the published facade state is {published_state:?}, even if the control gate is ready",
+        );
+    }
+
+    app.close().await.expect("close app");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_backed_split_primary_initial_wave_arms_sink_before_source_publication() {

@@ -3259,8 +3259,13 @@ async fn materialized_target_groups(
             (QueryBackend::Local { .. }, None) => None,
         }
     };
+    let preserve_groups_when_first_routed_sink_status_is_empty = matches!(
+        &state.backend,
+        QueryBackend::Route { .. }
+    ) && scheduled_groups.as_ref().is_some_and(|groups| groups.is_empty());
     if let Some(scheduled_groups) = scheduled_groups
         && !preserve_unscheduled_groups
+        && !preserve_groups_when_first_routed_sink_status_is_empty
     {
         groups.retain(|group| scheduled_groups.contains(group));
     }
@@ -4268,10 +4273,17 @@ async fn build_tree_pit_session(
                     .as_ref()
                     .is_some_and(|root| root.exists || root.has_children)
         });
+        let trusted_materialized_non_root_rescue_required = read_class
+            == ReadClass::TrustedMaterialized
+            && observation_status.state == ObservationState::TrustedMaterialized
+            && prior_materialized_group_decoded
+            && !trusted_materialized_empty_group_root_requires_fail_closed(&params.path);
+        let trusted_materialized_group_requires_rescue =
+            trusted_materialized_ready_group || trusted_materialized_non_root_rescue_required;
         let is_last_ranked_group = rank_index + 1 == total_ranked_groups;
         let allow_empty_owner_retry =
             trusted_materialized_ready_group && !prior_materialized_group_decoded;
-        let selected_group_owner_known = if trusted_materialized_ready_group {
+        let selected_group_owner_known = if trusted_materialized_group_requires_rescue {
             match &state.backend {
                 QueryBackend::Route { source, .. } => materialized_owner_node_for_group(
                     source.as_ref(),
@@ -4327,7 +4339,9 @@ async fn build_tree_pit_session(
             && !prior_materialized_group_decoded
         {
             std::cmp::min(remaining, FIRST_RANKED_TRUSTED_READY_GROUP_STAGE_BUDGET)
-        } else if read_class == ReadClass::TrustedMaterialized && prior_materialized_group_decoded {
+        } else if read_class == ReadClass::TrustedMaterialized
+            && trusted_materialized_group_requires_rescue
+        {
             std::cmp::min(remaining, LATER_RANKED_TRUSTED_GROUP_STAGE_BUDGET)
         } else if read_class != ReadClass::TrustedMaterialized
             && selected_group_sink_status_is_unready_empty(
@@ -4392,7 +4406,7 @@ async fn build_tree_pit_session(
                         | CnxError::ProtocolViolation(_)
                 ) =>
             {
-                if trusted_materialized_ready_group {
+                if trusted_materialized_group_requires_rescue {
                     let empty_root_requires_fail_closed =
                         trusted_materialized_empty_group_root_requires_fail_closed(&params.path);
                     let fail_closed_after_retryable_gap =
@@ -4698,7 +4712,7 @@ async fn build_tree_pit_session(
         match decode_materialized_selected_group_response(&events, policy, &group_key, &params.path)
         {
             Ok(mut response) => {
-                if trusted_materialized_ready_group
+                if trusted_materialized_group_requires_rescue
                     && trusted_materialized_tree_payload_is_empty(&response)
                     && let Some(richer_response) =
                         decode_richer_same_path_materialized_selected_group_response(
@@ -4710,7 +4724,7 @@ async fn build_tree_pit_session(
                 {
                     response = richer_response;
                 }
-                if trusted_materialized_ready_group
+                if trusted_materialized_group_requires_rescue
                     && trusted_materialized_tree_payload_is_empty(&response)
                 {
                     let empty_root_requires_fail_closed =

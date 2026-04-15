@@ -31,7 +31,9 @@ use crate::workers::source::SourceFacade;
 use super::auth::AuthService;
 use super::config::ResolvedApiConfig;
 use super::errors::ApiError;
-use super::facade_status::{SharedFacadePendingStatusCell, SharedFacadeServiceStateCell};
+use super::facade_status::{
+    PublishedFacadeStatusReader, SharedFacadePendingStatusCell, SharedFacadeServiceStateCell,
+};
 use super::handlers;
 use super::state::{ApiControlGate, ApiRequestTracker, ApiState};
 
@@ -139,10 +141,11 @@ pub async fn spawn(
         query_sink,
         auth,
         projection_policy,
-        facade_pending,
-        facade_service_state,
+        published_facade_status: PublishedFacadeStatusReader::new(
+            facade_service_state,
+            facade_pending,
+        ),
         request_tracker,
-        control_gate,
     };
     refresh_policy_from_host_object_grants(
         &state.projection_policy,
@@ -152,7 +155,7 @@ pub async fn spawn(
         "fs_meta_api_server: policy refreshed bind_addr={}",
         cfg.bind_addr
     );
-    let app = router(state)?;
+    let app = router(state, control_gate)?;
     eprintln!(
         "fs_meta_api_server: router ready bind_addr={}",
         cfg.bind_addr
@@ -248,7 +251,7 @@ pub async fn spawn(
     }
 }
 
-fn router(state: ApiState) -> Result<Router> {
+fn router(state: ApiState, control_gate: Arc<ApiControlGate>) -> Result<Router> {
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods([
@@ -302,7 +305,7 @@ fn router(state: ApiState) -> Result<Router> {
     Ok(management
         .nest("/api/fs-meta/v1", projection_router)
         .layer(middleware::from_fn_with_state(
-            state.control_gate.clone(),
+            control_gate.clone(),
             projection_request_facade_guard,
         ))
         .layer(middleware::from_fn_with_state(
@@ -310,15 +313,14 @@ fn router(state: ApiState) -> Result<Router> {
             request_logging,
         ))
         .layer(middleware::from_fn_with_state(
-            state.clone(),
+            control_gate,
             request_control_readiness_guard,
         ))
         .layer(cors))
 }
 
 fn request_requires_control_readiness(method: &Method, path: &str) -> bool {
-    (matches!(method, &Method::PUT) && path == "/api/fs-meta/v1/monitoring/roots")
-        || (matches!(method, &Method::GET) && path == "/api/fs-meta/v1/status")
+    matches!(method, &Method::PUT) && path == "/api/fs-meta/v1/monitoring/roots"
 }
 
 fn request_counts_toward_control_drain(method: &Method, path: &str) -> bool {
@@ -359,17 +361,17 @@ async fn projection_request_facade_guard(
 }
 
 async fn request_control_readiness_guard(
-    State(state): State<ApiState>,
+    State(control_gate): State<Arc<ApiControlGate>>,
     request: Request,
     next: Next,
 ) -> Response {
     if !request_requires_control_readiness(request.method(), request.uri().path()) {
         return next.run(request).await;
     }
-    if state.control_gate.is_ready() {
+    if control_gate.is_ready() {
         return next.run(request).await;
     }
-    if tokio::time::timeout(Duration::from_secs(15), state.control_gate.wait_ready())
+    if tokio::time::timeout(Duration::from_secs(15), control_gate.wait_ready())
         .await
         .is_err()
     {
@@ -462,11 +464,8 @@ mod tests {
     }
 
     #[test]
-    fn request_control_readiness_stays_limited_to_status_and_roots_put() {
-        for (method, path) in [
-            (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
-            (Method::GET, "/api/fs-meta/v1/status"),
-        ] {
+    fn request_control_readiness_stays_limited_to_roots_put() {
+        for (method, path) in [(Method::PUT, "/api/fs-meta/v1/monitoring/roots")] {
             assert!(
                 request_requires_control_readiness(&method, path),
                 "{method} {path} should require control readiness"
@@ -475,6 +474,7 @@ mod tests {
 
         for (method, path) in [
             (Method::POST, "/api/fs-meta/v1/session/login"),
+            (Method::GET, "/api/fs-meta/v1/status"),
             (Method::GET, "/api/fs-meta/v1/runtime/grants"),
             (Method::POST, "/api/fs-meta/v1/monitoring/roots/preview"),
             (Method::POST, "/api/fs-meta/v1/index/rescan"),
@@ -646,6 +646,34 @@ mod tests {
         )
         .await
         .expect("facade drain should clear after query-api-keys response settles");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_request_bypasses_control_readiness_guard_when_gate_is_unready() {
+        let control_gate = Arc::new(ApiControlGate::new(false));
+        let app = Router::new()
+            .route("/api/fs-meta/v1/status", get(|| async { "ok" }))
+            .with_state(control_gate.clone())
+            .layer(middleware::from_fn_with_state(
+                control_gate,
+                request_control_readiness_guard,
+            ));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/fs-meta/v1/status")
+                    .body(Body::empty())
+                    .expect("build status request"),
+            ),
+        )
+        .await
+        .expect("status request should not wait for control readiness")
+        .expect("route status request");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 
     #[tokio::test(flavor = "current_thread")]

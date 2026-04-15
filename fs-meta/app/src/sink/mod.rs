@@ -448,6 +448,13 @@ fn sample_visibility_lag(
 }
 
 /// Internal per-group state of the sink app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupReadinessState {
+    PendingAudit,
+    WaitingForMaterializedRoot,
+    Ready,
+}
+
 pub(crate) struct GroupSinkState {
     pub(crate) tree: MaterializedTree,
     pub(crate) clock: SinkClock,
@@ -456,7 +463,6 @@ pub(crate) struct GroupSinkState {
     pub(crate) primary_object_ref: String,
     pub(crate) overflow_pending_audit: bool,
     pub(crate) audit_epoch_completed: bool,
-    pub(crate) initial_audit_completed: bool,
     pub(crate) last_coverage_recovered_at: Option<Instant>,
     pub(crate) materialized_revision: u64,
     pub(crate) sentinel_health: BTreeMap<String, String>,
@@ -472,25 +478,37 @@ impl GroupSinkState {
             primary_object_ref,
             overflow_pending_audit: false,
             audit_epoch_completed: false,
-            initial_audit_completed: false,
             last_coverage_recovered_at: Some(Instant::now()),
             materialized_revision: 1,
             sentinel_health: BTreeMap::new(),
         }
     }
 
-    fn refresh_initial_audit_completed(&mut self) {
-        let has_live_materialized_nodes = self
-            .tree
+    fn has_live_materialized_nodes(&self) -> bool {
+        self.tree
             .aggregate_at(b"/")
-            .is_some_and(|aggregate| aggregate.total_nodes > 0);
-        self.initial_audit_completed = self.audit_epoch_completed && has_live_materialized_nodes;
+            .is_some_and(|aggregate| aggregate.total_nodes > 0)
+    }
+
+    fn group_readiness_state(&self) -> GroupReadinessState {
+        if !self.audit_epoch_completed {
+            GroupReadinessState::PendingAudit
+        } else if self.has_live_materialized_nodes() {
+            GroupReadinessState::Ready
+        } else {
+            GroupReadinessState::WaitingForMaterializedRoot
+        }
+    }
+
+    fn initial_audit_completed(&self) -> bool {
+        matches!(self.group_readiness_state(), GroupReadinessState::Ready)
     }
 
     fn preserves_materialized_state_for_omission_window(&self) -> bool {
-        self.initial_audit_completed
-            || self.audit_epoch_completed
-            || self.tree.node_count() > 0
+        matches!(
+            self.group_readiness_state(),
+            GroupReadinessState::WaitingForMaterializedRoot | GroupReadinessState::Ready
+        ) || self.tree.node_count() > 0
             || self.materialized_revision > 1
     }
 }
@@ -563,7 +581,6 @@ struct PersistedGroupSinkState {
     primary_object_ref: String,
     overflow_pending_audit: bool,
     audit_epoch_completed: bool,
-    initial_audit_completed: bool,
     materialized_revision: u64,
     sentinel_health: BTreeMap<String, String>,
     shadow_time_high_us: u64,
@@ -582,7 +599,6 @@ impl PersistedGroupSinkState {
             primary_object_ref: group.primary_object_ref.clone(),
             overflow_pending_audit: group.overflow_pending_audit,
             audit_epoch_completed: group.audit_epoch_completed,
-            initial_audit_completed: group.initial_audit_completed,
             materialized_revision: group.materialized_revision,
             sentinel_health: group.sentinel_health.clone(),
             shadow_time_high_us: group.clock.shadow_time_high_us,
@@ -627,12 +643,10 @@ impl PersistedGroupSinkState {
             primary_object_ref: self.primary_object_ref,
             overflow_pending_audit: self.overflow_pending_audit,
             audit_epoch_completed: self.audit_epoch_completed,
-            initial_audit_completed: self.initial_audit_completed,
             last_coverage_recovered_at: decode_instant_age_ms(self.last_coverage_recovered_age_ms),
             materialized_revision: self.materialized_revision,
             sentinel_health: self.sentinel_health,
         };
-        restored.refresh_initial_audit_completed();
         restored
     }
 }
@@ -796,12 +810,6 @@ impl SinkState {
         grants: &[GrantedMountRoot],
         allowed_groups: Option<&BTreeSet<String>>,
     ) {
-        // Runtime scope can transiently collapse to an empty set during route/facade
-        // turnover. Preserve the last materialized group state across that empty window
-        // so a later re-activate does not recreate every group from scratch.
-        if allowed_groups.is_some_and(|groups| groups.is_empty()) {
-            return;
-        }
         let tombstone_policy = self.tombstone_policy;
         let mut groups = BTreeMap::<String, GroupSinkState>::new();
         let mut group_by_object_ref = HashMap::<String, String>::new();
@@ -842,7 +850,9 @@ impl SinkState {
                 .unwrap_or_else(|| GroupSinkState::new(primary.clone(), tombstone_policy));
             group.primary_object_ref = primary.clone();
             if allowed_groups.is_some_and(|groups| !groups.contains(&root.id)) {
-                retained_groups.insert(root.id.clone(), group);
+                if group.preserves_materialized_state_for_omission_window() {
+                    retained_groups.insert(root.id.clone(), group);
+                }
                 continue;
             }
             group_by_object_ref
@@ -869,9 +879,9 @@ impl SinkState {
             }
         }
         retained_groups.retain(|group_id, group| {
-            configured_root_ids.contains(group_id)
-                || (!reassigned_previous_group_ids.contains(group_id)
-                    && group.preserves_materialized_state_for_omission_window())
+            group.preserves_materialized_state_for_omission_window()
+                && (configured_root_ids.contains(group_id)
+                    || !reassigned_previous_group_ids.contains(group_id))
         });
         self.groups = groups;
         self.retained_groups = retained_groups;
@@ -1071,6 +1081,15 @@ impl SinkFileMeta {
         was_receivable: bool,
         observed_epoch_before: u64,
     ) {
+        if !self.unit_control.has_runtime_state()
+            || lock_or_recover(
+                &self.endpoint_tasks,
+                "sink.wait_until_stream_recv_observed_after_activation.endpoint_tasks",
+            )
+            .is_empty()
+        {
+            return;
+        }
         if was_receivable || !self.should_receive_stream_events() {
             return;
         }
@@ -2578,15 +2597,33 @@ impl SinkFileMeta {
         );
         let root_count = roots.len();
         let grant_count = host_object_grants.len();
-        let bound_scopes = roots
-            .iter()
-            .map(|root| RuntimeBoundScope {
-                scope_id: root.id.clone(),
-                resource_ids: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        self.unit_control
-            .sync_active_scopes(SINK_RUNTIME_UNIT_ID, &bound_scopes)?;
+        let current_allowed_groups = self.scheduled_group_ids()?;
+        if let Some(current_allowed_groups) = current_allowed_groups.as_ref() {
+            let restorable_group_ids = self
+                .state
+                .read()?
+                .retained_groups
+                .iter()
+                .filter(|(_, group)| group.preserves_materialized_state_for_omission_window())
+                .map(|(group_id, _)| group_id.clone())
+                .collect::<BTreeSet<_>>();
+            let next_allowed_groups = current_allowed_groups
+                .iter()
+                .chain(restorable_group_ids.iter())
+                .filter(|group_id| roots.iter().any(|root| root.id == **group_id))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let bound_scopes = roots
+                .iter()
+                .filter(|root| next_allowed_groups.contains(&root.id))
+                .map(|root| RuntimeBoundScope {
+                    scope_id: root.id.clone(),
+                    resource_ids: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            self.unit_control
+                .sync_active_scopes(SINK_RUNTIME_UNIT_ID, &bound_scopes)?;
+        }
         let mut root_specs = self
             .root_specs
             .write()
@@ -2656,7 +2693,7 @@ impl SinkFileMeta {
                     now.saturating_sub(stats.shadow_time_us)
                 },
                 overflow_pending_audit: group.overflow_pending_audit,
-                initial_audit_completed: group.initial_audit_completed,
+                initial_audit_completed: group.initial_audit_completed(),
                 materialized_revision: group.materialized_revision,
                 estimated_heap_bytes,
             });
@@ -3135,7 +3172,6 @@ impl SinkFileMeta {
                                 }
                                 group_state.overflow_pending_audit = false;
                             }
-                            group_state.refresh_initial_audit_completed();
                         }
                     }
                 }
@@ -3193,7 +3229,6 @@ impl SinkFileMeta {
             {
                 pending_lag_samples.push(sample);
             }
-            group_state.refresh_initial_audit_completed();
         }
 
         if debug_apply_events {
@@ -3286,7 +3321,7 @@ impl SinkFileMeta {
                             group.tree.node_count(),
                             live_nodes,
                             group.audit_epoch_completed,
-                            group.initial_audit_completed,
+                            group.initial_audit_completed(),
                             response.root.exists,
                             response.entries.len(),
                             response.root.has_children

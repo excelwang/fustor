@@ -2091,6 +2091,14 @@ impl Drop for SinkWorkerStatusSnapshotHookReset {
     }
 }
 
+struct SinkWorkerStatusTimeoutObserveHookReset;
+
+impl Drop for SinkWorkerStatusTimeoutObserveHookReset {
+    fn drop(&mut self) {
+        clear_sink_worker_status_timeout_observe_hook();
+    }
+}
+
 struct SinkWorkerStatusResponseQueueHookReset;
 
 impl Drop for SinkWorkerStatusResponseQueueHookReset {
@@ -3052,6 +3060,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_zero_row_
 }
 
 include!("tests/status_snapshot_partially_stale.rs");
+include!("tests/status_snapshot_fold.rs");
 include!("tests/status_snapshot_replay.rs");
 include!("tests/control_frame_recovery.rs");
 include!("tests/shared_handle_nine_wave.rs");

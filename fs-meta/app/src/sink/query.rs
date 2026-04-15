@@ -247,6 +247,11 @@ fn page_root_from_tree(tree: &MaterializedTree, dir_path: &[u8]) -> TreePageRoot
         };
     }
 
+    let subtree_has_live_nodes = tree
+        .aggregate_at(dir_path)
+        .map(|aggregate| aggregate.total_nodes > 0)
+        .unwrap_or(false);
+
     TreePageRoot {
         path: if dir_path.is_empty() {
             b"/".to_vec()
@@ -256,7 +261,7 @@ fn page_root_from_tree(tree: &MaterializedTree, dir_path: &[u8]) -> TreePageRoot
         size: 0,
         modified_time_us: 0,
         is_dir: true,
-        exists: false,
+        exists: subtree_has_live_nodes,
         has_children: tree.has_live_child(dir_path),
     }
 }
@@ -288,7 +293,7 @@ fn page_root_from_rebased_nodes(nodes: &[RebasedNode<'_>], query_path: &[u8]) ->
         size: 0,
         modified_time_us: 0,
         is_dir: true,
-        exists: query_path == b"/" && (has_children || !nodes.is_empty()),
+        exists: !nodes.is_empty(),
         has_children,
     }
 }
@@ -687,6 +692,24 @@ mod tests {
         tree
     }
 
+    fn build_prefixed_tree_with_structural_placeholder_root() -> MaterializedTree {
+        let mut tree = MaterializedTree::new();
+        insert_node(
+            &mut tree,
+            b"/tmp/capanix/data/nfs1/qf-e2e-job/nested/peer.txt",
+            false,
+            7,
+            1_200_000,
+        );
+        tree
+    }
+
+    fn build_tree_with_structural_placeholder_root() -> MaterializedTree {
+        let mut tree = MaterializedTree::new();
+        insert_node(&mut tree, b"/nested/peer.txt", false, 7, 1_200_000);
+        tree
+    }
+
     #[test]
     fn empty_tree_is_reliable_on_cold_start() {
         let tree = MaterializedTree::new();
@@ -740,6 +763,72 @@ mod tests {
         assert_eq!(
             paths,
             vec!["/nested".to_string(), "/nested/child".to_string()]
+        );
+    }
+
+    #[test]
+    fn rebased_directory_tree_synthesizes_existing_root_for_structural_placeholder_with_live_descendants(
+    ) {
+        let tree = build_prefixed_tree_with_structural_placeholder_root();
+        let clock = SinkClock::new();
+
+        let resp = get_materialized_tree_payload(
+            &tree,
+            b"/nested",
+            &clock,
+            false,
+            true,
+            Some(1),
+            ReadClass::Materialized,
+            None,
+        );
+
+        assert!(
+            resp.root.exists,
+            "rebased query root must stay logically present when a structural placeholder has live descendants: {:?}",
+            resp.root
+        );
+        assert_eq!(resp.root.path, b"/nested".to_vec());
+        assert!(resp.root.is_dir);
+        assert!(
+            resp.entries
+                .iter()
+                .any(|entry| entry.path == b"/nested/peer.txt".to_vec()),
+            "rebased query must still expose live descendants when the query root only exists as a structural placeholder: {:?}",
+            resp.entries
+        );
+    }
+
+    #[test]
+    fn direct_directory_tree_synthesizes_existing_root_for_structural_placeholder_with_live_descendants(
+    ) {
+        let tree = build_tree_with_structural_placeholder_root();
+        let clock = SinkClock::new();
+
+        let resp = get_materialized_tree_payload(
+            &tree,
+            b"/nested",
+            &clock,
+            false,
+            true,
+            Some(1),
+            ReadClass::Materialized,
+            None,
+        );
+
+        assert!(
+            resp.root.exists,
+            "direct query root must stay logically present when a structural placeholder has live descendants: {:?}",
+            resp.root
+        );
+        assert_eq!(resp.root.path, b"/nested".to_vec());
+        assert!(resp.root.is_dir);
+        assert!(
+            resp.entries
+                .iter()
+                .any(|entry| entry.path == b"/nested/peer.txt".to_vec()),
+            "direct query must still expose live descendants when the query root only exists as a structural placeholder: {:?}",
+            resp.entries
         );
     }
 

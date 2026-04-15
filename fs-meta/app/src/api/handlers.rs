@@ -22,14 +22,13 @@ use capanix_runtime_entry_sdk::advanced::boundary::{
 #[cfg(test)]
 use tokio::sync::Notify;
 
-use crate::query::ObservationState;
+use crate::domain_state::FacadeServiceState;
 use crate::query::api::{
     internal_status_request_payload, merge_sink_status_snapshots,
     refresh_policy_from_host_object_grants, route_sink_status_snapshot,
 };
 use crate::query::observation::{
     ObservationTrustPolicy, candidate_group_observation_evidence, evaluate_observation_status,
-    trusted_materialized_not_ready_message,
 };
 use crate::runtime::execution_units;
 use crate::runtime::orchestration::encode_logical_roots_control_payload;
@@ -48,9 +47,12 @@ use crate::workers::source::SourceObservabilitySnapshot;
 
 use super::auth::SessionPrincipal;
 use super::errors::ApiError;
-use super::facade_status::{
-    FacadePendingReason, SharedFacadePendingStatus,
-};
+#[cfg(test)]
+use super::facade_status::FacadePendingReason;
+#[cfg(test)]
+use super::facade_status::PublishedFacadeStatusReader;
+#[cfg(test)]
+use super::facade_status::SharedFacadePendingStatus;
 use super::state::ApiState;
 use super::types::{
     CreateQueryApiKeyRequest, CreateQueryApiKeyResponse, DegradedRoot, LoginRequest, LoginResponse,
@@ -519,7 +521,7 @@ pub async fn status(
         // Facade readiness is reported via published facade state and pending diagnostics rather than
         // by fail-closing the management surface on observation trust.
     }
-    let _facade_request_guard = state.control_gate.begin_facade_request();
+    let _facade_request_guard = state.request_tracker.begin();
     #[cfg(test)]
     maybe_pause_status_before_remote_collection().await;
     record_status_route_trace(trace_id, "status.remote.begin");
@@ -542,7 +544,7 @@ pub async fn status(
         Some(boundary) => {
             let initial = status_collect(boundary, state.node_id.clone()).await;
             let runtime_fully_unavailable =
-                should_fail_closed_status_route_collection(initial.3, initial.4);
+                status_route_collection_incomplete(initial.3, initial.4);
             if runtime_fully_unavailable {
                 if let Some(query_boundary) = query_boundary {
                     let different_boundary =
@@ -586,13 +588,9 @@ pub async fn status(
             source_outcome.as_str()
         ),
     );
-    let live_source_nodes = source
-        .grants
-        .iter()
-        .filter(|grant| grant.active)
-        .map(|grant| grant.host_ip.clone())
-        .collect::<BTreeSet<_>>()
-        .len() as u64;
+    let published_facade_status = state.published_facade_status.snapshot();
+    let published_facade_state = published_facade_status.state;
+    let live_source_nodes = active_source_node_count(&source);
     let gate_inflight = state
         .force_find_inflight
         .lock()
@@ -611,7 +609,11 @@ pub async fn status(
         runner_sets,
         merged_inflight
     );
-    if should_fail_closed_status_route_collection(sink_outcome, source_outcome) {
+    if should_fail_closed_status_route_collection(
+        sink_outcome,
+        source_outcome,
+        published_facade_state,
+    ) {
         return Err(ApiError::service_unavailable(format!(
             "status remote route collection incomplete: sink_route={} source_route={}",
             sink_outcome.as_str(),
@@ -632,7 +634,7 @@ pub async fn status(
     Ok(Json(StatusResponse {
         source: status_source_from_observability(source, runner_sets, merged_inflight),
         sink: StatusSink {
-            live_nodes: sink_status.live_nodes.max(live_source_nodes),
+            live_nodes: status_sink_live_nodes(live_source_nodes, &sink_status),
             tombstoned_count: sink_status.tombstoned_count,
             attested_count: sink_status.attested_count,
             suspect_count: sink_status.suspect_count,
@@ -670,18 +672,23 @@ pub async fn status(
                 received_origin_counts_by_node: sink_status.received_origin_counts_by_node,
             },
         },
-        facade: status_facade_from_runtime_facts(
-            *state
-                .facade_service_state
-                .read()
-                .expect("read facade service state"),
-            state
-                .facade_pending
-                .read()
-                .ok()
-                .and_then(|pending| pending.clone()),
-        ),
+        facade: status_facade_from_published_state(published_facade_status),
     }))
+}
+
+fn active_source_node_count(source: &SourceObservabilitySnapshot) -> u64 {
+    source
+        .grants
+        .iter()
+        .filter(|grant| grant.active)
+        .map(|grant| grant.host_ip.clone())
+        .collect::<BTreeSet<_>>()
+        .len() as u64
+}
+
+fn status_sink_live_nodes(live_source_nodes: u64, sink_status: &SinkStatusSnapshot) -> u64 {
+    let _ = live_source_nodes;
+    sink_status.live_nodes
 }
 
 fn snapshot_scoped_active_facade_candidate_groups(
@@ -719,7 +726,7 @@ fn snapshot_scoped_active_facade_candidate_groups(
     sink_groups
 }
 
-const STATUS_ROUTE_TIMEOUT: Duration = Duration::from_secs(10);
+const STATUS_ROUTE_TIMEOUT: Duration = Duration::from_millis(350);
 const STATUS_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -975,6 +982,22 @@ fn classify_status_route_error(err: &CnxError) -> StatusRouteOutcome {
 fn should_fail_closed_status_route_collection(
     sink_outcome: StatusRouteOutcome,
     source_outcome: StatusRouteOutcome,
+    published_facade_state: FacadeServiceState,
+) -> bool {
+    if matches!(
+        published_facade_state,
+        FacadeServiceState::Pending
+            | FacadeServiceState::Serving
+            | FacadeServiceState::Degraded
+    ) {
+        return false;
+    }
+    status_route_collection_incomplete(sink_outcome, source_outcome)
+}
+
+fn status_route_collection_incomplete(
+    sink_outcome: StatusRouteOutcome,
+    source_outcome: StatusRouteOutcome,
 ) -> bool {
     !matches!(
         sink_outcome,
@@ -1228,7 +1251,7 @@ pub async fn rescan(
     headers: HeaderMap,
 ) -> Result<Json<RescanResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
-    let _facade_request_guard = state.control_gate.begin_facade_request();
+    let _facade_request_guard = state.request_tracker.begin();
     if let Some(boundary) = state.runtime_boundary.as_ref() {
         eprintln!(
             "fs_meta_api: rescan via runtime_boundary node={}",
@@ -1996,27 +2019,28 @@ fn source_runner_sets(snapshots: &[SourceObservabilitySnapshot]) -> BTreeMap<Str
         .collect()
 }
 
-fn status_facade_from_runtime_facts(
-    facade_service_state: crate::domain_state::FacadeServiceState,
-    pending: Option<SharedFacadePendingStatus>,
+fn status_facade_from_published_state(
+    published_facade_status: crate::api::facade_status::PublishedFacadeStatusSnapshot,
 ) -> StatusFacade {
     StatusFacade {
-        state: facade_service_state.as_str().to_string(),
-        pending: pending.map(|pending| StatusFacadePending {
-            route_key: pending.route_key,
-            generation: pending.generation,
-            resource_ids: pending.resource_ids,
-            runtime_managed: pending.runtime_managed,
-            runtime_exposure_confirmed: pending.runtime_exposure_confirmed,
-            reason: pending.reason.as_str().to_string(),
-            retry_attempts: pending.retry_attempts,
-            pending_since_us: pending.pending_since_us,
-            last_error: pending.last_error,
-            last_attempt_at_us: pending.last_attempt_at_us,
-            last_error_at_us: pending.last_error_at_us,
-            retry_backoff_ms: pending.retry_backoff_ms,
-            next_retry_at_us: pending.next_retry_at_us,
-        }),
+        state: published_facade_status.state.as_str().to_string(),
+        pending: published_facade_status
+            .pending
+            .map(|pending| StatusFacadePending {
+                route_key: pending.route_key,
+                generation: pending.generation,
+                resource_ids: pending.resource_ids,
+                runtime_managed: pending.runtime_managed,
+                runtime_exposure_confirmed: pending.runtime_exposure_confirmed,
+                reason: pending.reason.as_str().to_string(),
+                retry_attempts: pending.retry_attempts,
+                pending_since_us: pending.pending_since_us,
+                last_error: pending.last_error,
+                last_attempt_at_us: pending.last_attempt_at_us,
+                last_error_at_us: pending.last_error_at_us,
+                retry_backoff_ms: pending.retry_backoff_ms,
+                next_retry_at_us: pending.next_retry_at_us,
+            }),
     }
 }
 
@@ -2204,6 +2228,7 @@ mod tests {
     }
 
     struct StatusTransportRouteBoundary;
+    struct StatusSlowTimeoutRouteBoundary;
 
     struct StatusRemoteReplyBoundary {
         source_request_channel: String,
@@ -2710,6 +2735,27 @@ mod tests {
             Err(CnxError::TransportClosed(
                 "simulated transport remote status route failure".to_string(),
             ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for StatusSlowTimeoutRouteBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            _request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            let timeout = request.timeout_ms.unwrap_or_default();
+            tokio::time::sleep(Duration::from_millis(timeout + 50)).await;
+            Err(CnxError::Timeout)
         }
     }
 
@@ -3257,8 +3303,11 @@ mod tests {
         let facade_service_state = shared_facade_service_state_cell();
         *facade_service_state
             .write()
-            .expect("write facade service state") = crate::domain_state::FacadeServiceState::Serving;
-        *facade_service_state.write().expect("write facade service state") = FacadeServiceState::Pending;
+            .expect("write facade service state") =
+            crate::domain_state::FacadeServiceState::Serving;
+        *facade_service_state
+            .write()
+            .expect("write facade service state") = FacadeServiceState::Pending;
         let state = ApiState {
             node_id: NodeId("node-a".into()),
             runtime_boundary: Some(boundary),
@@ -3269,10 +3318,11 @@ mod tests {
             query_sink: sink.clone(),
             auth,
             projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
-            facade_pending: shared_facade_pending_status_cell(),
-            facade_service_state,
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                shared_facade_pending_status_cell(),
+            ),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
-            control_gate: Arc::new(crate::api::ApiControlGate::new(false)),
         };
 
         let response = roots_put(
@@ -3399,7 +3449,9 @@ mod tests {
         });
         let headers = management_headers(auth.as_ref());
         let facade_service_state = crate::api::facade_status::shared_facade_service_state_cell();
-        *facade_service_state.write().expect("write facade service state") = FacadeServiceState::Serving;
+        *facade_service_state
+            .write()
+            .expect("write facade service state") = FacadeServiceState::Serving;
         let state = ApiState {
             node_id: NodeId("node-a".into()),
             runtime_boundary: Some(boundary),
@@ -3410,10 +3462,11 @@ mod tests {
             query_sink: sink,
             auth,
             projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
-            facade_pending: shared_facade_pending_status_cell(),
-            facade_service_state: shared_facade_service_state_cell(),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                shared_facade_pending_status_cell(),
+            ),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
-            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
         let response = rescan(State(state), headers)
@@ -4878,8 +4931,10 @@ mod tests {
             SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg).expect("sink"),
         )));
         let headers = management_headers(auth.as_ref());
-        let facade_service_state = crate::api::facade_status::shared_facade_service_state_cell();
-        *facade_service_state.write().expect("write facade service state") = FacadeServiceState::Unavailable;
+        let facade_service_state = shared_facade_service_state_cell();
+        *facade_service_state
+            .write()
+            .expect("write facade service state") = FacadeServiceState::Serving;
         let state = ApiState {
             node_id: NodeId("node-a".into()),
             runtime_boundary: None,
@@ -4890,10 +4945,11 @@ mod tests {
             query_sink: sink,
             auth,
             projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
-            facade_pending: shared_facade_pending_status_cell(),
-            facade_service_state: shared_facade_service_state_cell(),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                shared_facade_pending_status_cell(),
+            ),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
-            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
         let response = status(State(state), headers)
@@ -4905,6 +4961,16 @@ mod tests {
         assert!(
             response.facade.pending.is_none(),
             "serving facade state must not synthesize pending diagnostics"
+        );
+    }
+
+    #[test]
+    fn status_sink_live_nodes_does_not_inflate_empty_sink_from_active_source_grants() {
+        let sink_status = SinkStatusSnapshot::default();
+        assert_eq!(
+            status_sink_live_nodes(1, &sink_status),
+            0,
+            "status must not inflate sink.live_nodes from source active grants when sink has no groups"
         );
     }
 
@@ -4938,7 +5004,8 @@ mod tests {
         let facade_service_state = shared_facade_service_state_cell();
         *facade_service_state
             .write()
-            .expect("write facade service state") = crate::domain_state::FacadeServiceState::Unavailable;
+            .expect("write facade service state") =
+            crate::domain_state::FacadeServiceState::Unavailable;
         let state = ApiState {
             node_id: NodeId("node-a".into()),
             runtime_boundary: None,
@@ -4949,10 +5016,11 @@ mod tests {
             query_sink: sink,
             auth,
             projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
-            facade_pending: shared_facade_pending_status_cell(),
-            facade_service_state,
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                shared_facade_pending_status_cell(),
+            ),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
-            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
         let response = status(State(state), headers)
@@ -4992,11 +5060,11 @@ mod tests {
         )));
         let headers = management_headers(auth.as_ref());
         let facade_pending = shared_facade_pending_status_cell();
-        let facade_service_state = crate::api::facade_status::shared_facade_service_state_cell();
         let facade_service_state = shared_facade_service_state_cell();
         *facade_service_state
             .write()
-            .expect("write facade service state") = crate::domain_state::FacadeServiceState::Pending;
+            .expect("write facade service state") =
+            crate::domain_state::FacadeServiceState::Pending;
         *facade_pending.write().expect("pending facade status lock") =
             Some(SharedFacadePendingStatus {
                 route_key: "fs-meta.internal.facade-control:v1.stream".to_string(),
@@ -5023,10 +5091,11 @@ mod tests {
             query_sink: sink,
             auth,
             projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
-            facade_pending,
-            facade_service_state,
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                facade_pending,
+            ),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
-            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
         let response = status(State(state), headers)
@@ -5081,10 +5150,11 @@ mod tests {
             query_sink: sink,
             auth,
             projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
-            facade_pending: shared_facade_pending_status_cell(),
-            facade_service_state: shared_facade_service_state_cell(),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                shared_facade_service_state_cell(),
+                shared_facade_pending_status_cell(),
+            ),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
-            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
         let status_task = tokio::spawn(async move { status(State(state), headers).await });
@@ -5183,10 +5253,11 @@ mod tests {
             query_sink: sink,
             auth,
             projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
-            facade_pending: shared_facade_pending_status_cell(),
-            facade_service_state: shared_facade_service_state_cell(),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                shared_facade_service_state_cell(),
+                shared_facade_pending_status_cell(),
+            ),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
-            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
         let response = status(State(state), headers)
@@ -5288,10 +5359,11 @@ mod tests {
             query_sink: sink,
             auth,
             projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
-            facade_pending: shared_facade_pending_status_cell(),
-            facade_service_state: shared_facade_service_state_cell(),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                shared_facade_service_state_cell(),
+                shared_facade_pending_status_cell(),
+            ),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
-            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
         let response = status(State(state), headers)
@@ -5396,10 +5468,11 @@ mod tests {
             query_sink: sink,
             auth,
             projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
-            facade_pending: shared_facade_pending_status_cell(),
-            facade_service_state: shared_facade_service_state_cell(),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                shared_facade_service_state_cell(),
+                shared_facade_pending_status_cell(),
+            ),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
-            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
         let response = status(State(state), headers)
@@ -5477,10 +5550,11 @@ mod tests {
             query_sink: sink,
             auth,
             projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
-            facade_pending: shared_facade_pending_status_cell(),
-            facade_service_state: shared_facade_service_state_cell(),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                shared_facade_service_state_cell(),
+                shared_facade_pending_status_cell(),
+            ),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
-            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
 
         let status_task = tokio::spawn(async move { status(State(state), headers).await });
@@ -5527,5 +5601,287 @@ mod tests {
             ],
             "one /status request must remain traceable through remote source/sink route classification"
         );
+    }
+
+    #[tokio::test]
+    async fn status_returns_local_status_when_published_facade_is_serving_and_both_remote_status_routes_timeout()
+     {
+        tokio::time::pause();
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_cfg = SourceConfig {
+            roots: vec![RootSpec::new("nfs1", &nfs1)],
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg).expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let trace_events = Arc::new(StdMutex::new(Vec::new()));
+        install_status_route_trace_hook(StatusRouteTraceHook {
+            events: trace_events.clone(),
+        });
+        struct StatusRouteTraceHookReset;
+        impl Drop for StatusRouteTraceHookReset {
+            fn drop(&mut self) {
+                clear_status_route_trace_hook();
+            }
+        }
+        let _reset = StatusRouteTraceHookReset;
+        let facade_service_state = shared_facade_service_state_cell();
+        *facade_service_state
+            .write()
+            .expect("write facade service state") = FacadeServiceState::Serving;
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(Arc::new(StatusTransportRouteBoundary)),
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                shared_facade_pending_status_cell(),
+            ),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+        };
+
+        let status_task = tokio::spawn(async move { status(State(state), headers).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(25)).await;
+
+        let response = status_task
+            .await
+            .expect("status join")
+            .expect("serving facade must keep /status available across remote route timeouts")
+            .0;
+        assert_eq!(response.facade.state, "serving");
+        assert!(response.source.grants_count >= 1);
+        assert_eq!(
+            response.sink.live_nodes, 0,
+            "when both remote status routes time out, /status must return the local sink truth instead of inflating sink.live_nodes from active source grants"
+        );
+        assert_eq!(
+            response.sink.groups.len(),
+            1,
+            "local zero-state sink group should still be surfaced as the local sink truth"
+        );
+
+        let events = trace_events
+            .lock()
+            .expect("status route trace lock")
+            .clone();
+        assert!(
+            !events.is_empty(),
+            "status route trace must record one request lifecycle"
+        );
+        let request_id = events[0]
+            .split(':')
+            .next()
+            .expect("request id prefix")
+            .to_string();
+        let request_events = events
+            .into_iter()
+            .filter_map(|event| {
+                let (id, stage) = event.split_once(':')?;
+                (id == request_id).then_some(stage.to_string())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            request_events,
+            vec![
+                "status.enter".to_string(),
+                "status.remote.begin".to_string(),
+                "sink.collect.begin".to_string(),
+                "source.collect.begin".to_string(),
+                "sink.collect.outcome=timeout".to_string(),
+                "source.collect.outcome=timeout".to_string(),
+                "status.remote.done sink=timeout source=timeout".to_string(),
+            ],
+            "serving /status should preserve remote route traceability even when it falls back to local snapshots"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_returns_local_status_when_published_facade_is_pending_and_both_remote_status_routes_timeout()
+     {
+        tokio::time::pause();
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_cfg = SourceConfig {
+            roots: vec![RootSpec::new("nfs1", &nfs1)],
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg).expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let facade_service_state = shared_facade_service_state_cell();
+        let facade_pending_status = shared_facade_pending_status_cell();
+        *facade_service_state
+            .write()
+            .expect("write facade service state") = FacadeServiceState::Pending;
+        *facade_pending_status
+            .write()
+            .expect("write facade pending status") = Some(SharedFacadePendingStatus {
+            route_key: "route".to_string(),
+            generation: 2,
+            resource_ids: vec!["listener-a".to_string()],
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            reason: FacadePendingReason::AwaitingObservationEligibility,
+            retry_attempts: 0,
+            pending_since_us: 11,
+            last_error: None,
+            last_attempt_at_us: None,
+            last_error_at_us: None,
+            retry_backoff_ms: None,
+            next_retry_at_us: None,
+        });
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(Arc::new(StatusTransportRouteBoundary)),
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                facade_pending_status,
+            ),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+        };
+
+        let status_task = tokio::spawn(async move { status(State(state), headers).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(25)).await;
+
+        let response = status_task
+            .await
+            .expect("status join")
+            .expect("pending facade must keep /status available across remote route timeouts")
+            .0;
+        assert_eq!(response.facade.state, "pending");
+        assert!(response.facade.pending.is_some());
+        assert_eq!(response.sink.groups.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn status_pending_facade_settles_within_local_route_budget_when_remote_status_routes_never_reply()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_cfg = SourceConfig {
+            roots: vec![RootSpec::new("nfs1", &nfs1)],
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg).expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let facade_service_state = shared_facade_service_state_cell();
+        let facade_pending_status = shared_facade_pending_status_cell();
+        *facade_service_state
+            .write()
+            .expect("write facade service state") = FacadeServiceState::Pending;
+        *facade_pending_status
+            .write()
+            .expect("write facade pending status") = Some(SharedFacadePendingStatus {
+            route_key: "route".to_string(),
+            generation: 2,
+            resource_ids: vec!["listener-a".to_string()],
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            reason: FacadePendingReason::AwaitingObservationEligibility,
+            retry_attempts: 0,
+            pending_since_us: 11,
+            last_error: None,
+            last_attempt_at_us: None,
+            last_error_at_us: None,
+            retry_backoff_ms: None,
+            next_retry_at_us: None,
+        });
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(Arc::new(StatusSlowTimeoutRouteBoundary)),
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                facade_pending_status,
+            ),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+        };
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            status(State(state), headers),
+        )
+        .await
+        .expect("pending /status must settle within the local route budget")
+        .expect("pending /status should fall back to local snapshots")
+        .0;
+
+        assert_eq!(response.facade.state, "pending");
+        assert!(response.facade.pending.is_some());
     }
 }
