@@ -304,6 +304,13 @@ fn router(state: ApiState, control_gate: Arc<ApiControlGate>) -> Result<Router> 
         .with_state(state.clone());
     Ok(management
         .nest("/api/fs-meta/v1", projection_router)
+        // Management writes must count as in-flight facade/control work before
+        // they block on control readiness, otherwise facade shutdown can tear
+        // the listener down mid-request and surface transport errors upstream.
+        .layer(middleware::from_fn_with_state(
+            control_gate.clone(),
+            request_control_readiness_guard,
+        ))
         .layer(middleware::from_fn_with_state(
             control_gate.clone(),
             projection_request_facade_guard,
@@ -311,10 +318,6 @@ fn router(state: ApiState, control_gate: Arc<ApiControlGate>) -> Result<Router> 
         .layer(middleware::from_fn_with_state(
             state.clone(),
             request_logging,
-        ))
-        .layer(middleware::from_fn_with_state(
-            control_gate,
-            request_control_readiness_guard,
         ))
         .layer(cors))
 }
@@ -354,9 +357,11 @@ async fn projection_request_facade_guard(
     request: Request,
     next: Next,
 ) -> Response {
-    let _facade_request_guard =
-        request_counts_toward_facade_request_drain(request.method(), request.uri().path())
-            .then(|| control_gate.begin_facade_request());
+    let _facade_request_guard = (request_counts_toward_facade_request_drain(
+        request.method(),
+        request.uri().path(),
+    ) && !request_requires_control_readiness(request.method(), request.uri().path()))
+        .then(|| control_gate.begin_facade_request());
     next.run(request).await
 }
 
@@ -365,7 +370,10 @@ async fn request_control_readiness_guard(
     request: Request,
     next: Next,
 ) -> Response {
-    if !request_requires_control_readiness(request.method(), request.uri().path()) {
+    let requires_control_readiness =
+        request_requires_control_readiness(request.method(), request.uri().path());
+    let _facade_request_guard = requires_control_readiness.then(|| control_gate.begin_facade_request());
+    if !requires_control_readiness {
         return next.run(request).await;
     }
     if control_gate.is_ready() {
@@ -674,6 +682,77 @@ mod tests {
         .expect("route status request");
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn roots_put_request_facade_guard_holds_drain_while_control_readiness_waits() {
+        let control_gate = Arc::new(ApiControlGate::new(false));
+        let handler_entered = Arc::new(Notify::new());
+        let app = Router::new()
+            .route(
+                "/api/fs-meta/v1/monitoring/roots",
+                put({
+                    let handler_entered = handler_entered.clone();
+                    move || {
+                        let handler_entered = handler_entered.clone();
+                        async move {
+                            handler_entered.notify_waiters();
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .with_state(control_gate.clone())
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                request_control_readiness_guard,
+            ))
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                projection_request_facade_guard,
+            ));
+
+        let response_task = tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/fs-meta/v1/monitoring/roots")
+                    .body(Body::empty())
+                    .expect("build roots_put request"),
+            )
+            .await
+            .expect("route roots_put request")
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), handler_entered.notified())
+                .await
+                .is_err(),
+            "roots_put should remain blocked in control-readiness guard while the gate is unready"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                control_gate.wait_for_facade_request_drain(),
+            )
+            .await
+            .is_err(),
+            "roots_put blocked on control readiness must still hold facade drain"
+        );
+
+        control_gate.set_ready(true);
+        handler_entered.notified().await;
+        let response = tokio::time::timeout(Duration::from_secs(2), response_task)
+            .await
+            .expect("roots_put response should settle")
+            .expect("join roots_put response task");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            control_gate.wait_for_facade_request_drain(),
+        )
+        .await
+        .expect("facade drain should clear after roots_put settles");
     }
 
     #[tokio::test(flavor = "current_thread")]

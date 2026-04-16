@@ -2801,6 +2801,392 @@ async fn replay_only_sink_followup_reenters_sink_apply_once_and_local_sink_statu
     app.close().await.expect("close app");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_led_uninitialized_mixed_recovery_keeps_control_gate_closed_until_local_sink_status_republish_completes()
+{
+    struct SourceControlErrorHookReset;
+    struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+    struct LocalSinkStatusRepublishHelperEntryCountHookReset;
+    struct LocalSinkStatusRepublishProbePauseHookReset;
+
+    impl Drop for SourceControlErrorHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_control_frame_error_hook();
+        }
+    }
+
+    impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_scheduled_groups_refresh_error_queue_hook();
+        }
+    }
+
+    impl Drop for LocalSinkStatusRepublishHelperEntryCountHookReset {
+        fn drop(&mut self) {
+            clear_local_sink_status_republish_helper_entry_count_hook();
+        }
+    }
+
+    impl Drop for LocalSinkStatusRepublishProbePauseHookReset {
+        fn drop(&mut self) {
+            clear_local_sink_status_republish_probe_pause_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    fs::write(nfs1.join("ready-a.txt"), b"a").expect("seed nfs1");
+    fs::write(nfs2.join("ready-b.txt"), b"b").expect("seed nfs2");
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![
+                        worker_watch_scan_root("nfs1", &nfs1),
+                        worker_watch_scan_root("nfs2", &nfs2),
+                    ],
+                    host_object_grants: Vec::new(),
+                    ..SourceConfig::default()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: "listener-a".to_string(),
+                    local_listener_resources: vec![api::config::ApiListenerResource {
+                        resource_id: "listener-a".to_string(),
+                        bind_addr: bind_addr.clone(),
+                    }],
+                    auth: api::ApiAuthConfig {
+                        passwd_path,
+                        shadow_path,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-c-mixed-recovery-gate".into()),
+            Some(boundary.clone()),
+            Some(boundary),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    let source_client = match &*app.source {
+        SourceFacade::Worker(client) => client.clone(),
+        SourceFacade::Local(_) => panic!("expected external source worker client"),
+    };
+
+    let source_wave = |generation| {
+        vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+        ]
+    };
+    let sink_wave = |generation| {
+        let root_scopes = &[("nfs1", &["nfs1"][..]), ("nfs2", &["nfs2"][..])];
+        vec![
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                root_scopes,
+                generation,
+            ),
+        ]
+    };
+
+    let mut initial = source_wave(2);
+    initial.extend(sink_wave(2));
+    app.on_control_frame(&initial)
+        .await
+        .expect("initial local source/sink wave should succeed");
+
+    let active_facade = match api::spawn(
+        app.config
+            .api
+            .resolve_for_candidate_ids(&["listener-a".to_string()])
+            .expect("resolve facade config"),
+        app.node_id.clone(),
+        app.runtime_boundary.clone(),
+        app.source.clone(),
+        app.sink.clone(),
+        app.query_sink.clone(),
+        app.runtime_boundary.clone(),
+        app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
+        app.api_request_tracker.clone(),
+        app.api_control_gate.clone(),
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(CnxError::InvalidInput(msg))
+            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+        {
+            return;
+        }
+        Err(err) => panic!("spawn active facade: {err}"),
+    };
+    *app.api_task.lock().await = Some(FacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 2,
+        resource_ids: vec!["listener-a".to_string()],
+        handle: active_facade,
+    });
+
+    let expected_groups =
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout(
+            Duration::from_millis(350),
+            app.sink.status_snapshot_nonblocking(),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => {
+                let ready_groups = snapshot
+                    .groups
+                    .iter()
+                    .filter(|group| group.initial_audit_completed)
+                    .map(|group| group.group_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>();
+                if ready_groups == expected_groups {
+                    break;
+                }
+            }
+            Ok(Err(_)) | Err(_) => {}
+        }
+        assert!(
+            tokio::time::Instant::now() < ready_deadline,
+            "timed out waiting for local sink readiness before source-led mixed-recovery red"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let initial_gate_ready = app.facade_publication_ready().await;
+    assert!(
+        initial_gate_ready,
+        "precondition: mixed-recovery gate red requires the active facade control stream to start publication-ready"
+    );
+    app.api_control_gate.set_ready(initial_gate_ready);
+
+    let _source_error_reset = SourceControlErrorHookReset;
+    crate::workers::source::install_source_worker_control_frame_error_hook(
+        crate::workers::source::SourceWorkerControlFrameErrorHook {
+            err: CnxError::ProtocolViolation("simulated source cleanup-tail failure".to_string()),
+        },
+    );
+    app.on_control_frame(&[deactivate_envelope_with_route_key_reason_and_lease(
+        execution_units::SOURCE_RUNTIME_UNIT_ID,
+        format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+        3,
+        "restart_deferred_retire_pending",
+        7,
+        11,
+        22,
+    )])
+    .await
+    .expect("source-only deactivate should fail-close into uninitialized replay-required recovery");
+    crate::workers::source::clear_source_worker_control_frame_error_hook();
+    assert!(
+        !app.control_initialized(),
+        "precondition: mixed-recovery red requires runtime to enter uninitialized recovery before the later source-only wave"
+    );
+    assert!(
+        !app.api_control_gate.is_ready(),
+        "precondition: request-sensitive fail-closed recovery must close the API control gate before the later source-only wave"
+    );
+
+    app.on_control_frame(&[
+        deactivate_envelope_with_route_key_reason_and_lease(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            3,
+            "restart_deferred_retire_pending",
+            7,
+            11,
+            22,
+        ),
+        deactivate_envelope_with_route_key_reason_and_lease(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            3,
+            "restart_deferred_retire_pending",
+            7,
+            11,
+            22,
+        ),
+        deactivate_envelope_with_route_key_reason_and_lease(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            3,
+            "restart_deferred_retire_pending",
+            7,
+            11,
+            22,
+        ),
+    ])
+    .await
+    .expect("cleanup-only source tail should settle while runtime remains uninitialized");
+
+    let previous_instance_id = source_client.worker_instance_id_for_tests().await;
+    let _refresh_reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+    crate::workers::source::install_source_worker_scheduled_groups_refresh_error_queue_hook(
+        crate::workers::source::SourceWorkerScheduledGroupsRefreshErrorQueueHook {
+            errs: std::iter::repeat_with(|| CnxError::Timeout)
+                .take(64)
+                .collect(),
+            sticky_worker_instance_id: Some(previous_instance_id),
+            sticky_peer_err: None,
+        },
+    );
+
+    let helper_entries = Arc::new(AtomicUsize::new(0));
+    let _helper_entry_reset = LocalSinkStatusRepublishHelperEntryCountHookReset;
+    install_local_sink_status_republish_helper_entry_count_hook(helper_entries.clone());
+    let helper_probe_entered = Arc::new(Notify::new());
+    let helper_probe_release = Arc::new(Notify::new());
+    let _probe_pause_reset = LocalSinkStatusRepublishProbePauseHookReset;
+    install_local_sink_status_republish_probe_pause_hook(LocalSinkStatusRepublishProbePauseHook {
+        entered: helper_probe_entered.clone(),
+        release: helper_probe_release.clone(),
+    });
+
+    let mut later = source_wave(4);
+    later.push(activate_envelope_with_route_key_and_scope_rows(
+        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+        format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+        &[("nfs1", &["listener-a"]), ("nfs2", &["listener-a"])],
+        4,
+    ));
+
+    let later_task = tokio::spawn({
+        let app = app.clone();
+        async move { app.on_control_frame(&later).await }
+    });
+
+    if tokio::time::timeout(Duration::from_secs(2), helper_probe_entered.notified())
+        .await
+        .is_err()
+    {
+        let helper_entries_now = helper_entries.load(Ordering::Acquire);
+        let control_gate_ready = app.api_control_gate.is_ready();
+        let cached_sink_status_summary = app
+            .sink
+            .cached_status_snapshot()
+            .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+            .unwrap_or_else(|cached_err| {
+                format!("cached_sink_status_unavailable err={cached_err}")
+            });
+        let source_observability_summary =
+            summarize_source_observability_endpoint(&app.source.observability_snapshot_nonblocking().await);
+        if later_task.is_finished() {
+            let later_result = tokio::time::timeout(Duration::from_secs(1), later_task)
+                .await
+                .expect("join later source-led mixed-recovery task")
+                .expect("join later source-led mixed-recovery task");
+            panic!(
+                "source-led uninitialized mixed recovery must enter the local sink-status republish helper before reopening the API control gate when retained sink replay and sink-status publication coincide; helper_entries={helper_entries_now} control_gate_ready={control_gate_ready} cached_sink_status={cached_sink_status_summary} source_observability={source_observability_summary} later_result={later_result:?}"
+            );
+        }
+        panic!(
+            "source-led uninitialized mixed recovery never reached the local sink-status republish helper probe before stalling; helper_entries={helper_entries_now} control_gate_ready={control_gate_ready} cached_sink_status={cached_sink_status_summary} source_observability={source_observability_summary}"
+        );
+    }
+
+    assert_eq!(
+        helper_entries.load(Ordering::Acquire),
+        1,
+        "source-led uninitialized mixed recovery must enter the local sink-status republish helper exactly once before reopening the API control gate"
+    );
+    assert!(
+        !app.api_control_gate.is_ready(),
+        "source-led uninitialized mixed recovery must keep the API control gate closed while local sink-status republish is still in flight"
+    );
+    assert!(
+        !later_task.is_finished(),
+        "source-led uninitialized mixed recovery must stay blocked in the local sink-status republish helper while the control gate remains closed"
+    );
+
+    helper_probe_release.notify_waiters();
+    let later_result = tokio::time::timeout(Duration::from_secs(5), later_task)
+        .await
+        .expect("later source-led mixed recovery should complete after local sink-status republish unblocks")
+        .expect("join later source-led mixed recovery task");
+    if let Err(err) = later_result {
+        let cached_sink_status_summary = app
+            .sink
+            .cached_status_snapshot()
+            .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+            .unwrap_or_else(|cached_err| {
+                format!("cached_sink_status_unavailable err={cached_err}")
+            });
+        let source_observability_summary =
+            summarize_source_observability_endpoint(&app.source.observability_snapshot_nonblocking().await);
+        panic!(
+            "source-led uninitialized mixed recovery failed after local sink-status republish unblocked: err={err} cached_sink_status={cached_sink_status_summary} source_observability={source_observability_summary}"
+        );
+    }
+
+    assert!(
+        app.control_initialized(),
+        "source-led uninitialized mixed recovery must reinitialize runtime control after local sink-status republish completes"
+    );
+    assert!(
+        app.api_control_gate.is_ready(),
+        "source-led uninitialized mixed recovery must reopen the API control gate after local sink-status republish completes"
+    );
+
+    app.close().await.expect("close app");
+}
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_when_source_replay_regresses_before_gate_reopen()

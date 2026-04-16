@@ -19,6 +19,7 @@ use capanix_runtime_entry_sdk::control::{
 use capanix_runtime_entry_sdk::worker_runtime::{
     RuntimeWorkerClientFactory, TypedWorkerInit, TypedWorkerRpc,
 };
+use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex as StdMutex, OnceLock};
@@ -6301,6 +6302,161 @@ async fn generation_two_real_source_route_post_ack_schedule_refresh_exhaustion_d
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generation_two_real_source_route_post_ack_schedule_refresh_schedule_rpc_timeout_fail_closes_with_convergence_timeout()
+ {
+    struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+
+    impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
+        fn drop(&mut self) {
+            clear_source_worker_scheduled_groups_refresh_error_queue_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: Vec::new(),
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = Arc::new(
+        SourceWorkerClientHandle::new(
+            NodeId("node-b-schedule-rpc-timeout-refresh".to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client"),
+    );
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    let source_wave = |generation| {
+        vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-b::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-b::nfs2"]),
+                ],
+            }))
+            .expect("encode source roots activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-b::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-b::nfs2"]),
+                ],
+            }))
+            .expect("encode source rescan-control activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-b::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-b::nfs2"]),
+                ],
+            }))
+            .expect("encode source rescan activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-b::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-b::nfs2"]),
+                ],
+            }))
+            .expect("encode source scan activate"),
+        ]
+    };
+
+    let initial_control = std::iter::once(
+        encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+            version: 1,
+            grants: vec![
+                worker_route_export("node-b::nfs1", "node-b", "10.0.0.21", &nfs1),
+                worker_route_export("node-b::nfs2", "node-b", "10.0.0.22", &nfs2),
+            ],
+        })
+        .expect("encode runtime host grants changed"),
+    )
+    .chain(source_wave(1))
+    .collect::<Vec<_>>();
+
+    client
+        .on_control_frame(initial_control)
+        .await
+        .expect("initial real source route wave should succeed");
+
+    let _reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+    install_source_worker_scheduled_groups_refresh_error_queue_hook(
+        SourceWorkerScheduledGroupsRefreshErrorQueueHook {
+            errs: std::iter::repeat_with(|| {
+                CnxError::PeerError("operation timed out".to_string())
+            })
+            .take(50_000)
+            .collect(),
+            sticky_worker_instance_id: None,
+            sticky_peer_err: None,
+        },
+    );
+
+    let err = client
+        .on_control_frame_with_timeouts_for_tests(
+            source_wave(2),
+            Duration::from_millis(240),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err(
+            "generation-two real source route should fail closed when post-ack scheduled-groups refresh schedule RPCs keep returning operation timed out",
+        );
+
+    let CnxError::Internal(message) = err else {
+        panic!(
+            "schedule RPC timeouts during post-ack refresh should fail closed with a convergence timeout instead of surfacing a raw transport-shaped error: {err:?}"
+        );
+    };
+    assert!(
+        message.contains(
+            "post-ack scheduled-groups refresh exhausted before scheduled groups converged (timeout)"
+        ),
+        "schedule RPC timeouts should classify as the timeout-shaped convergence failure, got: {message}"
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn generation_two_real_source_route_replay_required_post_ack_schedule_refresh_reacquires_live_worker_after_repeated_timeouts()
  {
     struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
@@ -8621,6 +8777,242 @@ async fn nonblocking_observability_reissues_live_rpc_when_recent_cache_is_active
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recent_live_cache_preserves_last_control_summary_when_later_active_snapshot_omits_it() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: vec![
+            worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+            worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    let first_live = client
+        .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+        .await
+        .expect("prime live observability snapshot");
+    assert!(
+        first_live
+            .last_control_frame_signals_by_node
+            .get("node-a")
+            .is_some_and(|signals| !signals.is_empty()),
+        "initial live snapshot must carry control summary before omission preservation is checked: {:?}",
+        first_live.last_control_frame_signals_by_node
+    );
+
+    let mut later_live = first_live.clone();
+    later_live.last_control_frame_signals_by_node.clear();
+    later_live.published_batches_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        6,
+    )]);
+    later_live.published_events_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        6,
+    )]);
+    later_live.published_control_events_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        6,
+    )]);
+
+    client.update_cached_observability_snapshot(&first_live);
+    client.update_cached_observability_snapshot(&later_live);
+
+    let nonblocking = client.observability_snapshot_nonblocking().await;
+    assert!(
+        nonblocking
+            .last_control_frame_signals_by_node
+            .get("node-a")
+            .is_some_and(|signals| !signals.is_empty()),
+        "recent live cache must preserve last control summary when a later active snapshot omits it: {:?}",
+        nonblocking.last_control_frame_signals_by_node
+    );
+    assert_eq!(
+        nonblocking.published_batches_by_node.get("node-a"),
+        Some(&6),
+        "preserving last control summary must not roll back newer publication counters"
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observability_snapshot_nonblocking_fail_closes_incomplete_active_cache_when_worker_unavailable()
+{
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: vec![
+            worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+            worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    let live = client
+        .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+        .await
+        .expect("prime complete live observability snapshot");
+    assert!(
+        source_observability_snapshot_has_active_state(&live),
+        "live snapshot must be active before the fail-closed cache fallback invariant is checked"
+    );
+    assert!(
+        !source_observability_snapshot_debug_maps_absent(&live),
+        "live snapshot must carry debug maps before cache corruption: {:?}",
+        live
+    );
+
+    let mut incomplete = live.clone();
+    incomplete.scheduled_source_groups_by_node.clear();
+    incomplete.scheduled_scan_groups_by_node.clear();
+    incomplete.last_control_frame_signals_by_node.clear();
+    incomplete.published_batches_by_node.clear();
+    incomplete.published_events_by_node.clear();
+    incomplete.published_control_events_by_node.clear();
+    incomplete.published_data_events_by_node.clear();
+    incomplete.last_published_at_us_by_node.clear();
+    incomplete.last_published_origins_by_node.clear();
+    incomplete.published_origin_counts_by_node.clear();
+    incomplete.enqueued_path_origin_counts_by_node.clear();
+    incomplete.pending_path_origin_counts_by_node.clear();
+    incomplete.yielded_path_origin_counts_by_node.clear();
+    incomplete.summarized_path_origin_counts_by_node.clear();
+    incomplete.published_path_origin_counts_by_node.clear();
+    client.update_cached_observability_snapshot(&incomplete);
+
+    let _reset = SourceWorkerObservabilityErrorHookReset;
+    install_source_worker_observability_error_hook(SourceWorkerObservabilityErrorHook {
+        err: CnxError::Internal("synthetic observability failure".to_string()),
+    });
+
+    let degraded = client.observability_snapshot_nonblocking().await;
+    assert_eq!(
+        degraded.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
+        "worker-unavailable fallback should degrade the snapshot instead of returning a live-looking active cache"
+    );
+    assert!(
+        !source_observability_snapshot_has_active_state(&degraded)
+            || !source_observability_snapshot_debug_maps_absent(&degraded),
+        "worker-unavailable fallback must not return an active-but-debug-empty source snapshot: {:?}",
+        degraded
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn on_control_frame_refresh_retries_transient_empty_scheduled_groups_before_publishing_cache()
 {
     let tmp = tempdir().expect("create temp dir");
@@ -9921,6 +10313,14 @@ async fn local_source_observability_normalizes_instance_suffixed_node_id_to_host
         Some(&expected)
     );
     assert!(
+        snapshot
+            .last_control_frame_signals_by_node
+            .get("node-d")
+            .is_some_and(|signals| !signals.is_empty()),
+        "local source observability must carry the accepted activate-wave control summary instead of source_control=[]: {:?}",
+        snapshot.last_control_frame_signals_by_node
+    );
+    assert!(
         !snapshot
             .scheduled_source_groups_by_node
             .contains_key(&node_id.0),
@@ -9933,6 +10333,199 @@ async fn local_source_observability_normalizes_instance_suffixed_node_id_to_host
             .contains_key(&node_id.0),
         "instance-suffixed node id should not leak into local scheduled scan groups: {:?}",
         snapshot.scheduled_scan_groups_by_node
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_source_observability_preserves_published_maps_after_local_stream_emits_batches() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    std::fs::write(nfs1.join("seed.txt"), b"a").expect("seed nfs1");
+    std::fs::write(nfs2.join("seed.txt"), b"b").expect("seed nfs2");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: vec![
+            worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+            worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let source = Arc::new(
+        FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+            .expect("init source"),
+    );
+    let mut stream = source.pub_().await.expect("start source pub stream");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut control_counts = std::collections::BTreeMap::<String, usize>::new();
+    let mut data_counts = std::collections::BTreeMap::<String, usize>::new();
+    while tokio::time::Instant::now() < deadline {
+        let batch = tokio::time::timeout(Duration::from_millis(250), stream.next())
+            .await
+            .expect("initial local batch wait should not time out")
+            .expect("local pub stream should yield initial scan batch");
+        for event in batch {
+            let origin = event.metadata().origin_id.0.clone();
+            if rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok() {
+                *control_counts.entry(origin).or_insert(0) += 1;
+            } else {
+                *data_counts.entry(origin).or_insert(0) += 1;
+            }
+        }
+        let complete = ["node-a::nfs1", "node-a::nfs2"].iter().all(|origin| {
+            control_counts.get(*origin).copied() == Some(2)
+                && data_counts.get(*origin).copied().unwrap_or(0) > 0
+        });
+        if complete {
+            break;
+        }
+    }
+
+    assert!(
+        ["node-a::nfs1", "node-a::nfs2"].iter().all(|origin| {
+            control_counts.get(*origin).copied() == Some(2)
+                && data_counts.get(*origin).copied().unwrap_or(0) > 0
+        }),
+        "local source stream should emit baseline control+data for both roots before observability check: control={control_counts:?} data={data_counts:?}"
+    );
+
+    let snapshot = SourceFacade::Local(source.clone())
+        .observability_snapshot()
+        .await
+        .expect("fetch local source observability after local stream publish");
+
+    assert!(
+        snapshot.published_batches_by_node.get("node-a").copied().unwrap_or(0) > 0,
+        "local source observability must not report active scheduling/control truth with published_batches_by_node still empty after the local stream emitted batches: {:?}",
+        snapshot
+    );
+    assert!(
+        snapshot.published_events_by_node.get("node-a").copied().unwrap_or(0) > 0,
+        "local source observability must preserve published event counts after local stream publish: {:?}",
+        snapshot
+    );
+    assert!(
+        snapshot
+            .published_control_events_by_node
+            .get("node-a")
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "local source observability must preserve published control-event counts after local stream publish: {:?}",
+        snapshot
+    );
+    assert!(
+        snapshot
+            .published_data_events_by_node
+            .get("node-a")
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "local source observability must preserve published data-event counts after local stream publish: {:?}",
+        snapshot
+    );
+    assert!(
+        snapshot.last_published_at_us_by_node.contains_key("node-a"),
+        "local source observability must preserve a last_published_at_us timestamp after local stream publish: {:?}",
+        snapshot
+    );
+    assert!(
+        snapshot
+            .last_published_origins_by_node
+            .get("node-a")
+            .is_some_and(|origins| !origins.is_empty()),
+        "local source observability must preserve last_published_origins after local stream publish: {:?}",
+        snapshot
+    );
+
+    source.close().await.expect("close local source");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovered_active_local_status_yields_schedule_and_control_summary_when_runtime_state_is_empty()
+{
+    let stable_host_ref = "node-d";
+    let status = SourceStatusSnapshot {
+        current_stream_generation: Some(7),
+        logical_roots: Vec::new(),
+        concrete_roots: vec![crate::source::SourceConcreteRootHealthSnapshot {
+            root_key: "nfs2@node-d::nfs2@/tmp/nfs2".to_string(),
+            logical_root_id: "nfs2".to_string(),
+            object_ref: "node-d::nfs2".to_string(),
+            status: "running".to_string(),
+            coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            watch_enabled: true,
+            scan_enabled: true,
+            is_group_primary: true,
+            active: true,
+            watch_lru_capacity: 65_536,
+            audit_interval_ms: 300_000,
+            overflow_count: 0,
+            overflow_pending: false,
+            rescan_pending: false,
+            last_rescan_reason: None,
+            last_error: None,
+            last_audit_started_at_us: None,
+            last_audit_completed_at_us: None,
+            last_audit_duration_ms: None,
+            emitted_batch_count: 7,
+            emitted_event_count: 4051,
+            emitted_control_event_count: 2,
+            emitted_data_event_count: 4049,
+            emitted_path_capture_target: None,
+            emitted_path_event_count: 0,
+            last_emitted_at_us: Some(123456),
+            last_emitted_origins: vec!["node-d::nfs2=1".to_string()],
+            forwarded_batch_count: 7,
+            forwarded_event_count: 4051,
+            forwarded_path_event_count: 0,
+            last_forwarded_at_us: Some(123456),
+            last_forwarded_origins: vec!["node-d::nfs2=1".to_string()],
+            current_revision: Some(1),
+            current_stream_generation: Some(7),
+            candidate_revision: None,
+            candidate_stream_generation: None,
+            candidate_status: None,
+            draining_revision: None,
+            draining_stream_generation: None,
+            draining_status: None,
+        }],
+        degraded_roots: Vec::new(),
+    };
+
+    let source_groups = recovered_scheduled_groups_by_node_from_active_status(
+        stable_host_ref,
+        &status,
+        |entry| entry.watch_enabled,
+    );
+    let scan_groups = recovered_scheduled_groups_by_node_from_active_status(
+        stable_host_ref,
+        &status,
+        |entry| entry.scan_enabled,
+    );
+    let control_signals = recovered_control_signals_by_node_from_active_status(
+        stable_host_ref,
+        &status,
+        &source_groups,
+        &scan_groups,
+    );
+
+    let expected = vec!["nfs2".to_string()];
+    assert_eq!(source_groups.get(stable_host_ref), Some(&expected));
+    assert_eq!(scan_groups.get(stable_host_ref), Some(&expected));
+    assert!(
+        control_signals
+            .get(stable_host_ref)
+            .is_some_and(|signals| !signals.is_empty()),
+        "active local status recovery must synthesize a non-empty control summary instead of source_control=[]: {:?}",
+        control_signals
     );
 }
 

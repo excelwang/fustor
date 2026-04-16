@@ -89,6 +89,59 @@ fn trace_exports_summary(command: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn is_retryable_runtime_admin_connect_gap(err: &str) -> bool {
+    err.contains("connect socket: No such file or directory")
+}
+
+fn socket_accepts_probe_connection(socket_path: &Path) -> bool {
+    UnixStream::connect(socket_path).is_ok()
+}
+
+fn reserved_bind_addr_registry() -> &'static Mutex<BTreeMap<String, TcpListener>> {
+    static REGISTRY: OnceLock<Mutex<BTreeMap<String, TcpListener>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn lock_reserved_bind_addr_registry() -> MutexGuard<'static, BTreeMap<String, TcpListener>> {
+    match reserved_bind_addr_registry().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn release_reserved_bind_addr(bind_addr: &str) {
+    lock_reserved_bind_addr_registry().remove(bind_addr);
+}
+
+fn clear_reserved_bind_addrs(bind_addrs: &[String]) {
+    let mut registry = lock_reserved_bind_addr_registry();
+    for bind_addr in bind_addrs {
+        registry.remove(bind_addr);
+    }
+}
+
+fn is_retryable_startup_bind_transport_failure(err: &str) -> bool {
+    err.contains("exited before socket ready") && err.contains("failed to bind transport 127.0.0.1:")
+}
+
+fn retry_cluster_start_after_bind_transport_conflict<T, F>(mut start_once: F) -> Result<T, String>
+where
+    F: FnMut() -> Result<T, String>,
+{
+    let mut last_err = None;
+    for attempt in 1..=3 {
+        match start_once() {
+            Ok(value) => return Ok(value),
+            Err(err) if is_retryable_startup_bind_transport_failure(&err) && attempt < 3 => {
+                last_err = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "cluster start retry loop exhausted without error".to_string()))
+}
+
 fn classify_apply_release_retry(err: &str) -> Option<&'static str> {
     if err.contains("tx busy") {
         Some("tx_busy")
@@ -168,57 +221,64 @@ impl Cluster5 {
                 "capanixd binary not found; set CAPANIXD_BIN or build capanix-daemon".into(),
             );
         };
-        cleanup_stale_cluster_artifacts_before_start()?;
-        let suffix = unique_suffix();
-        let identities = NODE_NAMES
-            .iter()
-            .map(|name| generate_node_identity(name, suffix))
-            .collect::<Vec<_>>();
-        let admin_pub_b64 = admin_public_key_b64();
-        let bind_addrs = reserve_distinct_bind_addrs(NODE_NAMES.len())?;
-        let mut nodes = Vec::with_capacity(NODE_NAMES.len());
-        for (index, identity) in identities.iter().enumerate() {
-            let seeds = bind_addrs
+        retry_cluster_start_after_bind_transport_conflict(|| {
+            cleanup_stale_cluster_artifacts_before_start()?;
+            let suffix = unique_suffix();
+            let identities = NODE_NAMES
                 .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != index)
-                .map(|(_, addr)| addr.clone())
+                .map(|name| generate_node_identity(name, suffix))
                 .collect::<Vec<_>>();
-            let management_peers = identities
-                .iter()
-                .zip(bind_addrs.iter())
-                .enumerate()
-                .filter(|(i, _)| *i != index)
-                .map(|(_, (peer, addr))| (peer.node_id.clone(), addr.clone()))
-                .collect::<Vec<_>>();
-            let all_refs = identities.iter().collect::<Vec<_>>();
-            let cfg = build_cluster_config(
-                identity,
-                &all_refs,
-                &seeds,
-                &management_peers,
-                &admin_pub_b64,
-                FULL_NODE_DELEGATION_SCOPES,
-            );
-            let mut node = RunningNode::start(
-                &capanixd_bin,
-                identity,
-                &cfg,
-                &bind_addrs[index],
-                true,
-                true,
-            )?;
-            node.wait_for_socket(control_socket_startup_timeout())?;
-            nodes.push(node);
-        }
-        let cluster = Self {
-            nodes,
-            identities,
-            admin_pub_b64,
-            capanixd_bin,
-        };
-        cluster.wait_cluster_ready(Duration::from_secs(120))?;
-        Ok(cluster)
+            let admin_pub_b64 = admin_public_key_b64();
+            let bind_addrs = reserve_distinct_bind_addrs(NODE_NAMES.len())?;
+            let start_result = (|| {
+                let mut nodes = Vec::with_capacity(NODE_NAMES.len());
+                for (index, identity) in identities.iter().enumerate() {
+                    let seeds = bind_addrs
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != index)
+                        .map(|(_, addr)| addr.clone())
+                        .collect::<Vec<_>>();
+                    let management_peers = identities
+                        .iter()
+                        .zip(bind_addrs.iter())
+                        .enumerate()
+                        .filter(|(i, _)| *i != index)
+                        .map(|(_, (peer, addr))| (peer.node_id.clone(), addr.clone()))
+                        .collect::<Vec<_>>();
+                    let all_refs = identities.iter().collect::<Vec<_>>();
+                    let cfg = build_cluster_config(
+                        identity,
+                        &all_refs,
+                        &seeds,
+                        &management_peers,
+                        &admin_pub_b64,
+                        FULL_NODE_DELEGATION_SCOPES,
+                    );
+                    release_reserved_bind_addr(&bind_addrs[index]);
+                    let mut node = RunningNode::start(
+                        &capanixd_bin,
+                        identity,
+                        &cfg,
+                        &bind_addrs[index],
+                        true,
+                        true,
+                    )?;
+                    node.wait_for_socket(control_socket_startup_timeout())?;
+                    nodes.push(node);
+                }
+                let cluster = Self {
+                    nodes,
+                    identities,
+                    admin_pub_b64,
+                    capanixd_bin: capanixd_bin.clone(),
+                };
+                cluster.wait_cluster_ready(Duration::from_secs(120))?;
+                Ok(cluster)
+            })();
+            clear_reserved_bind_addrs(&bind_addrs);
+            start_result
+        })
     }
 
     pub fn fs_meta_app_runtime_path(&self) -> Result<PathBuf, String> {
@@ -343,6 +403,11 @@ impl Cluster5 {
                     );
                     if e.contains("\"code\":\"replay_detected\"") {
                         last_err = e;
+                        continue;
+                    }
+                    if is_retryable_runtime_admin_connect_gap(&e) && attempt + 1 < 3 {
+                        last_err = e;
+                        thread::sleep(Duration::from_millis(25));
                         continue;
                     }
                     return Err(e);
@@ -957,6 +1022,10 @@ fn cleanup_stale_cluster_artifacts_before_start() -> Result<(), String> {
         let meta = fs::symlink_metadata(&path)
             .map_err(|e| format!("stat cluster artifact {} failed: {e}", path.display()))?;
         if meta.file_type().is_dir() {
+            let socket_path = path.join("core.sock");
+            if socket_path.exists() && socket_accepts_probe_connection(&socket_path) {
+                continue;
+            }
             fs::remove_dir_all(&path)
                 .map_err(|e| format!("remove stale cluster dir {} failed: {e}", path.display()))?;
         } else {
@@ -985,12 +1054,21 @@ fn tmp_dir(prefix: &str) -> PathBuf {
         .filter(|c| c.is_ascii_alphanumeric())
         .take(8)
         .collect::<String>();
-    let dir = cluster_artifact_root().join(format!("dx-{short_prefix}-{ts:x}-{seq:x}"));
+    let base = if prefix == "fsmeta-manifest" {
+        let dir = e2e_tmp_root().join("cluster5-manifests");
+        fs::create_dir_all(&dir).expect("create manifest temp root");
+        dir
+    } else {
+        cluster_artifact_root()
+    };
+    let dir = base.join(format!("dx-{short_prefix}-{ts:x}-{seq:x}"));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
 
 fn reserve_distinct_bind_addrs(count: usize) -> Result<Vec<String>, String> {
+    let mut registry = lock_reserved_bind_addr_registry();
+    registry.clear();
     let mut addrs = Vec::with_capacity(count);
     let mut used = BTreeSet::new();
     while addrs.len() < count {
@@ -1002,6 +1080,7 @@ fn reserve_distinct_bind_addrs(count: usize) -> Result<Vec<String>, String> {
             .port();
         let addr = format!("127.0.0.1:{port}");
         if used.insert(addr.clone()) {
+            registry.insert(addr.clone(), socket);
             addrs.push(addr);
         }
     }
@@ -1572,7 +1651,7 @@ impl RunningNode {
     fn wait_for_socket(&mut self, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.socket_path.exists() {
+            if self.socket_path.exists() && socket_accepts_probe_connection(&self.socket_path) {
                 return Ok(());
             }
             if let Some(status) = self
@@ -1588,7 +1667,7 @@ impl RunningNode {
             }
             if Instant::now() > deadline {
                 return Err(format!(
-                    "node {} did not create control socket in {:?}; stdout:\n{}\nstderr:\n{}",
+                    "node {} did not expose a connectable control socket in {:?}; stdout:\n{}\nstderr:\n{}",
                     self.node_id,
                     timeout,
                     log_excerpt(&self.stdout_log),
@@ -2181,6 +2260,7 @@ fn next_auth_seq_global() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use capanix_runtime_api::{RuntimeAdminEnvelope, RuntimeAdminResponse};
     use tempfile::TempDir;
 
     fn env_lock() -> MutexGuard<'static, ()> {
@@ -2202,6 +2282,212 @@ mod tests {
             None => std::env::remove_var(E2E_TMP_ROOT_ENV),
         }
         result
+    }
+
+    fn spawn_sleeping_child() -> Child {
+        Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn sleeping child")
+    }
+
+    fn test_running_node(temp: &TempDir) -> RunningNode {
+        let stdout_log = temp.path().join("stdout.log");
+        let stderr_log = temp.path().join("stderr.log");
+        fs::write(&stdout_log, b"").expect("write stdout log");
+        fs::write(&stderr_log, b"").expect("write stderr log");
+        RunningNode {
+            name: "node-a".to_string(),
+            node_id: "node-a-id".to_string(),
+            bind_addr: "127.0.0.1:0".to_string(),
+            home_dir: temp.path().to_path_buf(),
+            socket_path: temp.path().join("core.sock"),
+            stdout_log,
+            stderr_log,
+            child: spawn_sleeping_child(),
+        }
+    }
+
+    fn test_cluster_with_single_node(temp: &TempDir) -> Cluster5 {
+        Cluster5 {
+            nodes: vec![test_running_node(temp)],
+            identities: vec![NodeIdentity {
+                name: "node-a".to_string(),
+                node_id: "node-a-id".to_string(),
+                node_sk_b64: "node-sk".to_string(),
+                node_pk_b64: "node-pk".to_string(),
+            }],
+            admin_pub_b64: "admin-pub".to_string(),
+            capanixd_bin: PathBuf::from("/bin/true"),
+        }
+    }
+
+    fn runtime_admin_ok_response_bytes(result: Value) -> Vec<u8> {
+        rmp_serde::to_vec_named(&RuntimeAdminEnvelope::AdminResult(RuntimeAdminResponse::ok(
+            result,
+        )))
+        .expect("encode runtime-admin response")
+    }
+
+    fn spawn_runtime_admin_responder_after_delay(
+        socket_path: PathBuf,
+        bind_delay: Duration,
+        result: Value,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            thread::sleep(bind_delay);
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+                .expect("bind runtime-admin responder socket");
+            listener
+                .set_nonblocking(true)
+                .expect("set responder nonblocking");
+            let deadline = Instant::now() + Duration::from_millis(300);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut len_buf = [0u8; 4];
+                        stream
+                            .read_exact(&mut len_buf)
+                            .expect("read request length");
+                        let req_len = u32::from_le_bytes(len_buf) as usize;
+                        let mut req = vec![0u8; req_len];
+                        stream.read_exact(&mut req).expect("read request body");
+                        let body = runtime_admin_ok_response_bytes(result.clone());
+                        stream
+                            .write_all(&(body.len() as u32).to_le_bytes())
+                            .expect("write response length");
+                        stream
+                            .write_all(&body)
+                            .expect("write response body");
+                        stream.flush().expect("flush response body");
+                        return;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for runtime-admin client after delayed bind"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("accept runtime-admin responder: {err}"),
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn wait_for_socket_requires_connectable_core_socket_not_just_path_existence() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let mut node = test_running_node(&temp);
+        fs::write(&node.socket_path, b"not-a-socket").expect("create fake socket path");
+
+        let err = node
+            .wait_for_socket(Duration::from_millis(50))
+            .expect_err("plain file must not satisfy control socket readiness");
+
+        assert!(
+            err.contains("control socket")
+                || err.contains("connectable")
+                || err.contains("socket"),
+            "error should explain that the path was not a usable control socket: {err}"
+        );
+    }
+
+    #[test]
+    fn runtime_admin_ok_retries_transient_connect_socket_enoent_after_ready_gap() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let cluster = test_cluster_with_single_node(&temp);
+        let socket_path = cluster.nodes[0].socket_path.clone();
+        let responder = spawn_runtime_admin_responder_after_delay(
+            socket_path,
+            Duration::from_millis(40),
+            json!({"accepted": true}),
+        );
+
+        let result = cluster.runtime_admin_ok(
+            "node-a",
+            json!({
+                "command": "resource_export_announce",
+                "exports": [{
+                    "resource_id": "nfs1",
+                    "node_id": "node-a-id",
+                    "resource_kind": "nfs",
+                    "source": "/exports/nfs1",
+                    "mount_hint": "/mnt/nfs1"
+                }]
+            }),
+        );
+
+        let responder_result = responder.join();
+        assert!(
+            responder_result.is_ok(),
+            "runtime-admin responder should either serve the retried request or panic loudly"
+        );
+        assert_eq!(
+            result.expect("runtime_admin_ok should retry a transient ENOENT gap"),
+            json!({"accepted": true})
+        );
+    }
+
+    #[test]
+    fn reserve_distinct_bind_addrs_keeps_reserved_ports_unavailable_until_use() {
+        let addrs = reserve_distinct_bind_addrs(3).expect("reserve bind addrs");
+
+        let bind_result = TcpListener::bind(&addrs[0]);
+        clear_reserved_bind_addrs(&addrs);
+
+        bind_result
+            .expect_err("reserved bind addr must stay unavailable until cluster startup consumes it");
+    }
+
+    #[test]
+    fn release_reserved_bind_addr_makes_port_bindable_for_startup_consumption() {
+        let addrs = reserve_distinct_bind_addrs(2).expect("reserve bind addrs");
+
+        release_reserved_bind_addr(&addrs[0]);
+        let listener = TcpListener::bind(&addrs[0])
+            .expect("released bind addr must become bindable for the child daemon");
+
+        drop(listener);
+        clear_reserved_bind_addrs(&addrs);
+    }
+
+    #[test]
+    fn retry_cluster_start_after_bind_transport_conflict_retries_once_on_retryable_error() {
+        let mut attempts = 0;
+
+        let result = retry_cluster_start_after_bind_transport_conflict(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(
+                    "node node-a-123 exited before socket ready (exit status: 1); stderr:\nfailed to bind transport 127.0.0.1:45527"
+                        .to_string(),
+                )
+            } else {
+                Ok("started".to_string())
+            }
+        });
+
+        assert_eq!(
+            result.expect("cluster start should retry a retryable bind transport startup race"),
+            "started"
+        );
+        assert_eq!(attempts, 2, "retryable startup bind race should trigger one retry");
+    }
+
+    #[test]
+    fn retry_cluster_start_after_bind_transport_conflict_does_not_retry_non_bind_error() {
+        let mut attempts = 0;
+
+        let err = retry_cluster_start_after_bind_transport_conflict::<(), _>(|| {
+            attempts += 1;
+            Err("node node-a exited before socket ready (exit status: 1); stderr:\nconfig parse failed".to_string())
+        })
+        .expect_err("non-bind startup failure must surface immediately");
+
+        assert!(err.contains("config parse failed"));
+        assert_eq!(attempts, 1, "non-bind startup failure must not be retried");
     }
 
     #[test]
@@ -2632,6 +2918,18 @@ mod tests {
     }
 
     #[test]
+    fn fsmeta_manifest_tmp_dir_does_not_share_cluster_artifact_cleanup_root() {
+        with_e2e_tmp_root(|root| {
+            let dir = tmp_dir("fsmeta-manifest");
+            let cluster_root = root.path().join(CLUSTER_ARTIFACT_COMPONENT);
+            assert!(
+                !dir.starts_with(&cluster_root),
+                "later startup cleanup must not be able to delete another live run's fs-meta manifest dir"
+            );
+        });
+    }
+
+    #[test]
     fn cleanup_stale_cluster_artifacts_before_start_removes_previous_entries() {
         with_e2e_tmp_root(|root| {
             let cluster_root = root.path().join(CLUSTER_ARTIFACT_COMPONENT);
@@ -2644,6 +2942,29 @@ mod tests {
                 .expect("read cluster root")
                 .next()
                 .is_none());
+        });
+    }
+
+    #[test]
+    fn cleanup_stale_cluster_artifacts_before_start_preserves_live_socket_bearing_cluster_dir() {
+        with_e2e_tmp_root(|root| {
+            let cluster_root = root.path().join(CLUSTER_ARTIFACT_COMPONENT);
+            let live_dir = cluster_root.join("cluster-node-live");
+            fs::create_dir_all(&live_dir).expect("create live dir");
+            let socket_path = live_dir.join("core.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&socket_path)
+                .expect("bind live socket");
+
+            cleanup_stale_cluster_artifacts_before_start().expect("cleanup cluster artifacts");
+
+            assert!(
+                live_dir.exists(),
+                "later startup cleanup must not delete another live run's node home dir"
+            );
+            assert!(
+                socket_path.exists(),
+                "later startup cleanup must not unlink another live run's live core.sock path"
+            );
         });
     }
 

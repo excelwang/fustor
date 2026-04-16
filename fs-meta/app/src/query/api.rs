@@ -905,6 +905,219 @@ async fn load_request_scoped_materialized_sink_status_snapshot(
     }
 }
 
+fn merge_request_scoped_materialized_sink_status_snapshot(
+    loaded_sink_status: &SinkStatusSnapshot,
+    request_scoped_sink_status: SinkStatusSnapshot,
+) -> SinkStatusSnapshot {
+    let mut allowed_groups = materialized_scheduled_group_ids(loaded_sink_status);
+    allowed_groups.extend(materialized_scheduled_group_ids(&request_scoped_sink_status));
+    let cached = CachedSinkStatusSnapshot {
+        snapshot: loaded_sink_status.clone(),
+    };
+    let merged = merge_with_cached_sink_status_snapshot(
+        Some(&cached),
+        &allowed_groups,
+        request_scoped_sink_status.clone(),
+    );
+    preserve_request_scoped_ready_owner_across_equal_score_ties(
+        merged,
+        &request_scoped_sink_status,
+    )
+}
+
+fn preserve_request_scoped_ready_owner_across_equal_score_ties(
+    mut current: SinkStatusSnapshot,
+    request_scoped_sink_status: &SinkStatusSnapshot,
+) -> SinkStatusSnapshot {
+    let current_by_group = current
+        .groups
+        .iter()
+        .map(|group| (group.group_id.as_str(), group))
+        .collect::<BTreeMap<_, _>>();
+    let replacement_groups = request_scoped_sink_status
+        .groups
+        .iter()
+        .filter(|group| {
+            sink_group_readiness_reports_live_materialized_group(group)
+                && current_by_group
+                    .get(group.group_id.as_str())
+                    .is_some_and(|current_group| {
+                        sink_group_merge_score(group) == sink_group_merge_score(current_group)
+                            && group.primary_object_ref != current_group.primary_object_ref
+                    })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if replacement_groups.is_empty() {
+        return current;
+    }
+    let replacement_group_ids = replacement_groups
+        .iter()
+        .map(|group| group.group_id.clone())
+        .collect::<BTreeSet<_>>();
+    current
+        .groups
+        .retain(|group| !replacement_group_ids.contains(&group.group_id));
+    current.scheduled_groups_by_node =
+        remove_groups_from_scheduled_map(current.scheduled_groups_by_node, &replacement_group_ids);
+    let replacement_scheduled_groups_by_node = request_scoped_sink_status
+        .scheduled_groups_by_node
+        .iter()
+        .filter_map(|(node_id, groups)| {
+            let groups = groups
+                .iter()
+                .filter(|group_id| replacement_group_ids.contains(*group_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!groups.is_empty()).then_some((node_id.clone(), groups))
+        })
+        .collect::<BTreeMap<_, _>>();
+    merge_sink_status_snapshots(vec![
+        current,
+        SinkStatusSnapshot {
+            groups: replacement_groups,
+            scheduled_groups_by_node: replacement_scheduled_groups_by_node,
+            ..SinkStatusSnapshot::default()
+        },
+    ])
+}
+
+fn preserve_request_loaded_ready_groups_across_explicit_empty_request_scoped_drift(
+    current: SinkStatusSnapshot,
+    loaded_sink_status: &SinkStatusSnapshot,
+    request_scoped_sink_status: &SinkStatusSnapshot,
+) -> SinkStatusSnapshot {
+    let explicit_empty_groups = request_scoped_sink_status
+        .groups
+        .iter()
+        .filter(|group| fresh_sink_group_explicitly_empty(group))
+        .map(|group| group.group_id.clone())
+        .collect::<BTreeSet<_>>();
+    if explicit_empty_groups.is_empty() {
+        return current;
+    }
+    let current_by_group = current
+        .groups
+        .iter()
+        .map(|group| (group.group_id.as_str(), group))
+        .collect::<BTreeMap<_, _>>();
+    let restored_groups = loaded_sink_status
+        .groups
+        .iter()
+        .filter(|group| {
+            explicit_empty_groups.contains(&group.group_id)
+                && sink_group_readiness_reports_live_materialized_group(group)
+                && current_by_group
+                    .get(group.group_id.as_str())
+                    .map(|current| sink_group_merge_score(group) > sink_group_merge_score(current))
+                    .unwrap_or(true)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if restored_groups.is_empty() {
+        return current;
+    }
+    let restored_group_ids = restored_groups
+        .iter()
+        .map(|group| group.group_id.clone())
+        .collect::<BTreeSet<_>>();
+    let restored_scheduled_groups_by_node = loaded_sink_status
+        .scheduled_groups_by_node
+        .iter()
+        .filter_map(|(node_id, groups)| {
+            let groups = groups
+                .iter()
+                .filter(|group_id| restored_group_ids.contains(*group_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!groups.is_empty()).then_some((node_id.clone(), groups))
+        })
+        .collect::<BTreeMap<_, _>>();
+    merge_sink_status_snapshots(vec![
+        current,
+        SinkStatusSnapshot {
+            groups: restored_groups,
+            scheduled_groups_by_node: restored_scheduled_groups_by_node,
+            ..SinkStatusSnapshot::default()
+        },
+    ])
+}
+
+fn preserve_request_loaded_ready_groups_across_partial_request_scoped_schedule_omission(
+    current: SinkStatusSnapshot,
+    loaded_sink_status: &SinkStatusSnapshot,
+    request_scoped_sink_status: &SinkStatusSnapshot,
+) -> SinkStatusSnapshot {
+    let request_scoped_scheduled_groups = materialized_scheduled_group_ids(request_scoped_sink_status);
+    if request_scoped_scheduled_groups.is_empty() {
+        return current;
+    }
+    let current_by_group = current
+        .groups
+        .iter()
+        .map(|group| (group.group_id.as_str(), group))
+        .collect::<BTreeMap<_, _>>();
+    let restored_groups = loaded_sink_status
+        .groups
+        .iter()
+        .filter(|group| {
+            !request_scoped_scheduled_groups.contains(&group.group_id)
+                && !sink_status_mentions_group(request_scoped_sink_status, &group.group_id)
+                && sink_group_readiness_reports_live_materialized_group(group)
+                && current_by_group
+                    .get(group.group_id.as_str())
+                    .map(|current| sink_group_merge_score(group) > sink_group_merge_score(current))
+                    .unwrap_or(true)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if restored_groups.is_empty() {
+        return current;
+    }
+    let restored_group_ids = restored_groups
+        .iter()
+        .map(|group| group.group_id.clone())
+        .collect::<BTreeSet<_>>();
+    let restored_scheduled_groups_by_node = loaded_sink_status
+        .scheduled_groups_by_node
+        .iter()
+        .filter_map(|(node_id, groups)| {
+            let groups = groups
+                .iter()
+                .filter(|group_id| restored_group_ids.contains(*group_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!groups.is_empty()).then_some((node_id.clone(), groups))
+        })
+        .collect::<BTreeMap<_, _>>();
+    merge_sink_status_snapshots(vec![
+        current,
+        SinkStatusSnapshot {
+            groups: restored_groups,
+            scheduled_groups_by_node: restored_scheduled_groups_by_node,
+            ..SinkStatusSnapshot::default()
+        },
+    ])
+}
+
+fn request_scoped_schedule_omitted_ready_groups(
+    loaded_sink_status: &SinkStatusSnapshot,
+    request_scoped_sink_status: &SinkStatusSnapshot,
+) -> BTreeSet<String> {
+    if sink_status_snapshot_omits_all_groups_from_schedule(request_scoped_sink_status) {
+        return BTreeSet::new();
+    }
+    loaded_sink_status
+        .groups
+        .iter()
+        .filter(|group| {
+            sink_group_readiness_reports_live_materialized_group(group)
+                && !sink_status_mentions_group(request_scoped_sink_status, &group.group_id)
+        })
+        .map(|group| group.group_id.clone())
+        .collect()
+}
+
 fn materialized_observation_status(
     source_status: &SourceStatusSnapshot,
     sink_status: &SinkStatusSnapshot,
@@ -2056,10 +2269,87 @@ fn selected_group_materialized_tree_payload_is_empty(
     saw_same_path_payload
 }
 
+fn selected_group_materialized_tree_payload_is_structural_placeholder(
+    policy: &ProjectionPolicy,
+    events: &[Event],
+    group_id: &str,
+    query_path: &[u8],
+) -> bool {
+    for event in events {
+        if event_group_key(policy, event) != group_id {
+            continue;
+        }
+        let Ok(MaterializedQueryPayload::Tree(payload)) =
+            rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes())
+        else {
+            continue;
+        };
+        if payload.root.path != query_path {
+            continue;
+        }
+        // A same-path root that already attests child continuity is usable
+        // trusted-materialized evidence, even if the current page is empty.
+        if payload.root.exists && payload.entries.is_empty() && !payload.root.has_children {
+            return true;
+        }
+    }
+    false
+}
+
+fn selected_group_materialized_tree_payload_has_no_entries(
+    policy: &ProjectionPolicy,
+    events: &[Event],
+    group_id: &str,
+    query_path: &[u8],
+) -> bool {
+    for event in events {
+        if event_group_key(policy, event) != group_id {
+            continue;
+        }
+        let Ok(MaterializedQueryPayload::Tree(payload)) =
+            rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes())
+        else {
+            continue;
+        };
+        if payload.root.path == query_path && payload.entries.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+fn selected_group_ready_root_tree_requires_rescue(
+    policy: &ProjectionPolicy,
+    request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
+    events: &[Event],
+    group_id: &str,
+    query_path: &[u8],
+) -> bool {
+    let is_root_path = query_path.is_empty() || query_path == b"/";
+    if is_root_path
+        && request_scoped_schedule_omitted_ready_groups
+            .is_some_and(|groups| groups.contains(group_id))
+        && selected_group_materialized_tree_payload_has_no_entries(
+            policy,
+            events,
+            group_id,
+            query_path,
+        )
+    {
+        return true;
+    }
+    selected_group_materialized_tree_payload_is_empty(policy, events, group_id, query_path)
+        || (is_root_path
+            && selected_group_materialized_tree_payload_is_structural_placeholder(
+                policy, events, group_id, query_path,
+            ))
+}
+
 fn selected_group_empty_ready_tree_requires_proxy_fallback(
     policy: &ProjectionPolicy,
     params: &InternalQueryRequest,
     selected_group_sink_status: Option<&SinkStatusSnapshot>,
+    request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
     group_id: &str,
     events: &[Event],
 ) -> bool {
@@ -2078,13 +2368,20 @@ fn selected_group_empty_ready_tree_requires_proxy_fallback(
             selected_group_sink_status,
             group_id,
         )
-        && selected_group_materialized_tree_payload_is_empty(policy, events, group_id, path)
+        && selected_group_ready_root_tree_requires_rescue(
+            policy,
+            request_scoped_schedule_omitted_ready_groups,
+            events,
+            group_id,
+            path,
+        )
 }
 
 fn selected_group_empty_ready_tree_requires_primary_owner_reroute(
     policy: &ProjectionPolicy,
     params: &InternalQueryRequest,
     selected_group_sink_status: Option<&SinkStatusSnapshot>,
+    request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
     group_id: &str,
     events: &[Event],
 ) -> bool {
@@ -2097,8 +2394,9 @@ fn selected_group_empty_ready_tree_requires_primary_owner_reroute(
             selected_group_sink_status,
             group_id,
         )
-        && selected_group_materialized_tree_payload_is_empty(
+        && selected_group_ready_root_tree_requires_rescue(
             policy,
+            request_scoped_schedule_omitted_ready_groups,
             events,
             group_id,
             params.scope.path.as_slice(),
@@ -2223,6 +2521,75 @@ fn selected_group_sink_status_is_unready_empty_prefers_exported_readiness_over_l
     assert!(
         selected_group_sink_status_is_unready_empty(Some(&snapshot), "nfs2"),
         "selected-group unready-empty classification must trust exported sink readiness over stale initial_audit_completed=true: {snapshot:?}"
+    );
+}
+
+#[test]
+fn merge_request_scoped_materialized_sink_status_snapshot_prefers_later_ready_owner_on_equal_score()
+{
+    let loaded_sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-a::nfs1".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 9,
+            shadow_lag_us: 0,
+            overflow_pending_audit: false,
+            initial_audit_completed: true,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 7,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+    let request_scoped_sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-b::nfs1".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 9,
+            shadow_lag_us: 0,
+            overflow_pending_audit: false,
+            initial_audit_completed: true,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 7,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+
+    let merged = merge_request_scoped_materialized_sink_status_snapshot(
+        &loaded_sink_status,
+        request_scoped_sink_status,
+    );
+
+    assert_eq!(
+        merged.groups[0].primary_object_ref,
+        "node-b::nfs1",
+        "later request-scoped ready owner should replace equally-ready loaded owner instead of keeping stale primary_object_ref: {merged:?}"
+    );
+    assert_eq!(
+        sink_primary_owner_node_for_group(Some(&merged), "nfs1"),
+        Some(NodeId("node-b".to_string())),
+        "selected-group owner resolution should follow the later request-scoped ready owner on equal score ties: {merged:?}"
     );
 }
 
@@ -2355,6 +2722,29 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
     reserve_proxy_budget: bool,
     allow_empty_owner_retry: bool,
 ) -> Result<Vec<Event>, CnxError> {
+    query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
+        state,
+        policy,
+        params,
+        timeout,
+        selected_group_sink_status,
+        None,
+        reserve_proxy_budget,
+        allow_empty_owner_retry,
+    )
+    .await
+}
+
+async fn query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
+    state: &ApiState,
+    policy: &ProjectionPolicy,
+    params: InternalQueryRequest,
+    timeout: Duration,
+    selected_group_sink_status: Option<SinkStatusSnapshot>,
+    request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
+    reserve_proxy_budget: bool,
+    allow_empty_owner_retry: bool,
+) -> Result<Vec<Event>, CnxError> {
     match &state.backend {
         QueryBackend::Route {
             boundary,
@@ -2392,6 +2782,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                             policy,
                             &params,
                             selected_group_sink_status.as_ref(),
+                            request_scoped_schedule_omitted_ready_groups,
                             group_id,
                             &events,
                         );
@@ -2400,6 +2791,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                             policy,
                             &params,
                             selected_group_sink_status.as_ref(),
+                            request_scoped_schedule_omitted_ready_groups,
                             group_id,
                             &events,
                         );
@@ -2538,6 +2930,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                             policy,
                             &params,
                             selected_group_sink_status.as_ref(),
+                            request_scoped_schedule_omitted_ready_groups,
                             group_id,
                             &primary_events,
                         ) {
@@ -2555,6 +2948,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                         policy,
                         &params,
                         selected_group_sink_status.as_ref(),
+                        request_scoped_schedule_omitted_ready_groups,
                         group_id,
                         &events,
                     ) {
@@ -2577,6 +2971,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                                     policy,
                                     &params,
                                     selected_group_sink_status.as_ref(),
+                                    request_scoped_schedule_omitted_ready_groups,
                                     group_id,
                                     &retry_events,
                                 ) {
@@ -2616,6 +3011,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                                 policy,
                                 &params,
                                 selected_group_sink_status.as_ref(),
+                                request_scoped_schedule_omitted_ready_groups,
                                 group_id,
                                 &events,
                             );
@@ -2624,6 +3020,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                                 policy,
                                 &params,
                                 selected_group_sink_status.as_ref(),
+                                request_scoped_schedule_omitted_ready_groups,
                                 group_id,
                                 &events,
                             );
@@ -2768,6 +3165,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                                 policy,
                                 &params,
                                 selected_group_sink_status.as_ref(),
+                                request_scoped_schedule_omitted_ready_groups,
                                 group_id,
                                 &primary_events,
                             ) {
@@ -2785,6 +3183,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                             policy,
                             &params,
                             selected_group_sink_status.as_ref(),
+                            request_scoped_schedule_omitted_ready_groups,
                             group_id,
                             &events,
                         ) {
@@ -2811,6 +3210,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                                         policy,
                                         &params,
                                         selected_group_sink_status.as_ref(),
+                                        request_scoped_schedule_omitted_ready_groups,
                                         group_id,
                                         &retry_events,
                                     ) {
@@ -2872,6 +3272,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                             policy,
                             &params,
                             selected_group_sink_status.as_ref(),
+                            request_scoped_schedule_omitted_ready_groups,
                             group_id,
                             &proxy_events,
                         ) && let Some(primary_node_id) = sink_primary_owner_node_for_group(
@@ -3281,6 +3682,7 @@ fn materialized_scheduled_group_ids(snapshot: &SinkStatusSnapshot) -> BTreeSet<S
 async fn materialized_target_groups(
     state: &ApiState,
     selected_group: Option<&str>,
+    request_source_status: Option<&SourceStatusSnapshot>,
     request_sink_status: Option<&SinkStatusSnapshot>,
     timeout: Duration,
     preserve_unscheduled_groups: bool,
@@ -3304,19 +3706,34 @@ async fn materialized_target_groups(
     let mut groups = if let Some(group) = selected_group {
         vec![group.to_string()]
     } else {
-        source
-            .as_ref()
-            .map(|source| {
-                source.cached_logical_roots_snapshot().map(|roots| {
-                    roots
-                        .into_iter()
-                        .filter(|root| root.scan)
-                        .map(|root| root.id)
+        let request_source_groups = preserve_unscheduled_groups.then(|| {
+            request_source_status
+                .map(|status| {
+                    status
+                        .logical_roots
+                        .iter()
+                        .map(|root| root.root_id.clone())
                         .collect::<Vec<_>>()
                 })
-            })
-            .transpose()?
-            .unwrap_or_default()
+                .unwrap_or_default()
+        });
+        if let Some(groups) = request_source_groups.filter(|groups| !groups.is_empty()) {
+            groups
+        } else {
+            source
+                .as_ref()
+                .map(|source| {
+                    source.cached_logical_roots_snapshot().map(|roots| {
+                        roots
+                            .into_iter()
+                            .filter(|root| root.scan)
+                            .map(|root| root.id)
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default()
+        }
     };
     groups.sort();
     groups.dedup();
@@ -4327,6 +4744,27 @@ async fn build_tree_pit_session(
     observation_status: ObservationStatus,
     request_sink_status: Option<&SinkStatusSnapshot>,
 ) -> Result<PitSession, CnxError> {
+    build_tree_pit_session_with_request_scoped_schedule_omitted_ready_groups(
+        state,
+        policy,
+        params,
+        timeout,
+        observation_status,
+        request_sink_status,
+        None,
+    )
+    .await
+}
+
+async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_groups(
+    state: &ApiState,
+    policy: &ProjectionPolicy,
+    params: &NormalizedApiParams,
+    timeout: Duration,
+    observation_status: ObservationStatus,
+    request_sink_status: Option<&SinkStatusSnapshot>,
+    request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
+) -> Result<PitSession, CnxError> {
     eprintln!(
         "fs_meta_query_api: build_tree_pit_session start path={} recursive={}",
         String::from_utf8_lossy(&params.path),
@@ -4336,6 +4774,7 @@ async fn build_tree_pit_session(
     let target_groups = materialized_target_groups(
         state,
         params.group.as_deref(),
+        None,
         request_sink_status,
         timeout,
         params.group.is_none() && !params.path.is_empty() && params.path != b"/",
@@ -4516,12 +4955,13 @@ async fn build_tree_pit_session(
         }
         let stage_deadline = tokio::time::Instant::now() + stage_timeout;
         let events = match run_timed_query(
-            query_materialized_events_with_selected_group_owner_snapshot(
+            query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
                 state,
                 policy,
                 tree_params.clone(),
                 stage_timeout,
                 selected_group_sink_status.clone(),
+                request_scoped_schedule_omitted_ready_groups,
                 !(read_class == ReadClass::TrustedMaterialized
                     && trusted_materialized_ready_group
                     && !prior_materialized_group_decoded),
@@ -5352,6 +5792,7 @@ async fn query_tree_page_response(
     timeout: Duration,
     observation_status: ObservationStatus,
     request_sink_status: Option<SinkStatusSnapshot>,
+    request_scoped_schedule_omitted_ready_groups: Option<BTreeSet<String>>,
 ) -> Result<serde_json::Value, CnxError> {
     let group_page_size = normalize_group_page_size(params)?;
     let entry_page_size = normalize_entry_page_size(params)?.unwrap_or(0);
@@ -5406,13 +5847,14 @@ async fn query_tree_page_response(
 
     let _tree_query_serial = state.tree_query_serial.lock().await;
     let session = Arc::new(
-        build_tree_pit_session(
+        build_tree_pit_session_with_request_scoped_schedule_omitted_ready_groups(
             state,
             policy,
             params,
             timeout,
             observation_status,
             request_sink_status.as_ref(),
+            request_scoped_schedule_omitted_ready_groups.as_ref(),
         )
         .await?,
     );
@@ -5793,6 +6235,7 @@ async fn collect_materialized_stats_groups(
     policy: &ProjectionPolicy,
     params: &NormalizedApiParams,
     read_class: ReadClass,
+    request_source_status: Option<&SourceStatusSnapshot>,
     request_sink_status: Option<&SinkStatusSnapshot>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, CnxError> {
     let mut groups = serde_json::Map::<String, serde_json::Value>::new();
@@ -5802,6 +6245,7 @@ async fn collect_materialized_stats_groups(
             materialized_target_groups(
                 state,
                 params.group.as_deref(),
+                request_source_status,
                 request_sink_status,
                 policy.query_timeout(),
                 params.group.is_none() && !params.path.is_empty() && params.path != b"/",
@@ -5830,12 +6274,13 @@ async fn collect_materialized_stats_groups(
             }
             ReadClass::Materialized | ReadClass::TrustedMaterialized => {
                 if let Some(snapshot) = request_sink_status {
-                    query_materialized_events_with_selected_group_owner_snapshot(
+                    query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
                         state,
                         policy,
                         materialized_request.clone(),
                         policy.query_timeout(),
                         Some(snapshot.clone()),
+                        None,
                         true,
                         false,
                     )
@@ -5902,10 +6347,7 @@ async fn collect_materialized_stats_groups(
             )
             && targeted
                 .get(&group_id)
-                .and_then(|group| group.get("data"))
-                .and_then(|data| data.get("total_nodes"))
-                .and_then(|value| value.as_u64())
-                == Some(0)
+                .is_some_and(stats_group_looks_zeroish)
         {
             return Err(trusted_materialized_unavailable_selected_group_stats_error(
                 &group_id,
@@ -5933,6 +6375,7 @@ async fn get_stats(
         Err(err) => return error_response_with_context(err, None),
     };
     let read_class = stats_read_class(&params);
+    let mut request_source_status = None::<SourceStatusSnapshot>;
     let mut request_sink_status = None::<SinkStatusSnapshot>;
     let observation_status = match read_class {
         ReadClass::Fresh => ObservationStatus::fresh_only(),
@@ -5951,6 +6394,26 @@ async fn get_stats(
                     Some(&params.path),
                 );
             }
+            request_source_status = Some(
+                if params.group.is_none() && !params.path.is_empty() && params.path != b"/" {
+                    match &state.backend {
+                        QueryBackend::Route {
+                            boundary,
+                            origin_id,
+                            ..
+                        } => route_source_status_snapshot(
+                            boundary.clone(),
+                            origin_id.clone(),
+                            std::cmp::min(policy.query_timeout(), Duration::from_secs(5)),
+                        )
+                        .await
+                        .unwrap_or_else(|_| source_status.clone()),
+                        QueryBackend::Local { .. } => source_status.clone(),
+                    }
+                } else {
+                    source_status.clone()
+                },
+            );
             request_sink_status = Some(sink_status.clone());
             status
         }
@@ -5960,6 +6423,7 @@ async fn get_stats(
         &policy,
         &params,
         read_class,
+        request_source_status.as_ref(),
         request_sink_status.as_ref(),
     )
     .await
@@ -6034,22 +6498,38 @@ async fn get_tree(
             trusted_materialized_not_ready_message(&observation_status)
         );
     }
-    let request_sink_status = if read_class == ReadClass::TrustedMaterialized {
+    let (request_sink_status, request_scoped_schedule_omitted_ready_groups) =
+        if read_class == ReadClass::TrustedMaterialized {
         let request_scoped =
             load_request_scoped_materialized_sink_status_snapshot(&state, policy.query_timeout())
                 .await
                 .unwrap_or_else(|| sink_status.clone());
-        if trusted_materialized_empty_group_root_requires_fail_closed(&params.path) {
-            if sink_status_snapshot_omits_all_groups_from_schedule(&request_scoped) {
-                request_scoped
-            } else {
-                sink_status.clone()
-            }
+        let request_scoped_schedule_omitted_ready_groups =
+            request_scoped_schedule_omitted_ready_groups(&sink_status, &request_scoped);
+        let merged = merge_request_scoped_materialized_sink_status_snapshot(
+            &sink_status,
+            request_scoped.clone(),
+        );
+        let preserved_omission =
+            preserve_request_loaded_ready_groups_across_partial_request_scoped_schedule_omission(
+                merged,
+                &sink_status,
+                &request_scoped,
+            );
+        let preserved = preserve_request_loaded_ready_groups_across_explicit_empty_request_scoped_drift(
+            preserved_omission,
+            &sink_status,
+            &request_scoped,
+        );
+        if trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
+            && sink_status_snapshot_omits_all_groups_from_schedule(&request_scoped)
+        {
+            (request_scoped, Some(request_scoped_schedule_omitted_ready_groups))
         } else {
-            request_scoped
+            (preserved, Some(request_scoped_schedule_omitted_ready_groups))
         }
     } else {
-        sink_status.clone()
+        (sink_status.clone(), None)
     };
     match query_tree_page_response(
         &state,
@@ -6058,6 +6538,7 @@ async fn get_tree(
         policy.query_timeout(),
         observation_status,
         Some(request_sink_status),
+        request_scoped_schedule_omitted_ready_groups,
     )
     .await
     {

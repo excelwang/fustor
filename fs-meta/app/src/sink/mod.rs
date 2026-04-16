@@ -2308,6 +2308,12 @@ impl SinkFileMeta {
                 unit_id,
                 generation
             );
+        } else if unit == SinkRuntimeUnit::Sink && !bound_scopes.is_empty() {
+            // Sink holder routes should converge on one current scoped holder truth.
+            // When a successor runtime.exec.sink activate arrives for the same scopes,
+            // keep active routes aligned to the latest bound scope/resource mapping
+            // instead of merging stale dead-holder refs into the exported state.
+            self.unit_control.sync_active_scopes(unit_id, bound_scopes)?;
         }
         Ok(())
     }

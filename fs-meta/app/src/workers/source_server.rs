@@ -24,6 +24,7 @@ use crate::source::FSMetaSource;
 use crate::source::config::SourceConfig;
 use crate::workers::source::SourceObservabilitySnapshot;
 use crate::workers::source::SourceWorkerRpc;
+use crate::workers::source::recovered_scheduled_groups_by_node_from_active_status;
 use crate::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
 
 const ROUTE_KEY_EVENTS: &str = "fs-meta.events:v1";
@@ -468,7 +469,6 @@ async fn stop_source_runtime_with_timeouts(
     }
     state.source = None;
     state.pump_boundary = None;
-    state.last_control_frame_signals.clear();
 }
 
 async fn stop_source_runtime(state: &mut SourceWorkerState) {
@@ -603,19 +603,9 @@ fn source_observability_snapshot(
     let grants = source.host_object_grants_snapshot();
     let stable_host_ref = stable_host_ref_for_node_id(&node_id, &grants);
     let published = lock_publish_stats(published_stats);
-    let enqueued_path_origin_counts = source.enqueued_path_origin_counts_snapshot();
-    let pending_path_origin_counts = source.pending_path_origin_counts_snapshot();
-    let yielded_path_origin_counts = source.yielded_path_origin_counts_snapshot();
-    SourceObservabilitySnapshot {
-        lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
-        host_object_grants_version: source.host_object_grants_version_snapshot(),
-        grants,
-        logical_roots: source.logical_roots_snapshot(),
-        status: source.status_snapshot(),
-        source_primary_by_group: source.source_primary_by_group_snapshot(),
-        last_force_find_runner_by_group: source.last_force_find_runner_by_group_snapshot(),
-        force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
-        scheduled_source_groups_by_node: source
+    let status = source.status_snapshot();
+    let scheduled_source_groups_by_node = {
+        let explicit = source
             .scheduled_source_group_ids()
             .ok()
             .flatten()
@@ -626,8 +616,19 @@ fn source_observability_snapshot(
                     groups.into_iter().collect(),
                 )])
             })
-            .unwrap_or_default(),
-        scheduled_scan_groups_by_node: source
+            .unwrap_or_default();
+        if explicit.is_empty() {
+            recovered_scheduled_groups_by_node_from_active_status(
+                &stable_host_ref,
+                &status,
+                |entry| entry.watch_enabled,
+            )
+        } else {
+            explicit
+        }
+    };
+    let scheduled_scan_groups_by_node = {
+        let explicit = source
             .scheduled_scan_group_ids()
             .ok()
             .flatten()
@@ -638,10 +639,59 @@ fn source_observability_snapshot(
                     groups.into_iter().collect(),
                 )])
             })
-            .unwrap_or_default(),
+            .unwrap_or_default();
+        if explicit.is_empty() {
+            recovered_scheduled_groups_by_node_from_active_status(
+                &stable_host_ref,
+                &status,
+                |entry| entry.scan_enabled,
+            )
+        } else {
+            explicit
+        }
+    };
+    let source_summary = source.last_control_frame_signals_snapshot();
+    let has_recovered_active_state = status.current_stream_generation.is_some()
+        || status
+            .logical_roots
+            .iter()
+            .any(|entry| entry.active_members > 0 || entry.status.eq_ignore_ascii_case("ready"))
+        || status.concrete_roots.iter().any(|entry| {
+            entry.active
+                || entry.current_stream_generation.is_some()
+                || entry.emitted_batch_count > 0
+                || entry.forwarded_batch_count > 0
+                || entry.emitted_event_count > 0
+                || entry.forwarded_event_count > 0
+        })
+        || !scheduled_source_groups_by_node.is_empty()
+        || !scheduled_scan_groups_by_node.is_empty();
+    let control_summary = if !last_control_frame_signals.is_empty() {
+        if has_recovered_active_state {
+            last_control_frame_signals.to_vec()
+        } else {
+            Vec::new()
+        }
+    } else {
+        source_summary
+    };
+    let enqueued_path_origin_counts = source.enqueued_path_origin_counts_snapshot();
+    let pending_path_origin_counts = source.pending_path_origin_counts_snapshot();
+    let yielded_path_origin_counts = source.yielded_path_origin_counts_snapshot();
+    SourceObservabilitySnapshot {
+        lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
+        host_object_grants_version: source.host_object_grants_version_snapshot(),
+        grants,
+        logical_roots: source.logical_roots_snapshot(),
+        status,
+        source_primary_by_group: source.source_primary_by_group_snapshot(),
+        last_force_find_runner_by_group: source.last_force_find_runner_by_group_snapshot(),
+        force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
+        scheduled_source_groups_by_node,
+        scheduled_scan_groups_by_node,
         last_control_frame_signals_by_node: last_control_frame_signals_by_node(
             &stable_host_ref,
-            last_control_frame_signals,
+            &control_summary,
         ),
         published_batches_by_node: std::collections::BTreeMap::from([(
             stable_host_ref.clone(),
@@ -760,7 +810,6 @@ async fn bootstrap_init_source_runtime(
     );
     let _ = stop_source_runtime(state).await;
     state.pending_init = Some((node_id, config));
-    state.last_control_frame_signals.clear();
     *lock_publish_stats(&state.published_stats) = PublishedBatchStats::default();
     eprintln!("fs_meta_source_worker_server: bootstrap_init ok");
 }
@@ -1230,12 +1279,16 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
             "fs_meta_source_worker_server: on_runtime_control begin envelopes={}",
             envelopes.len()
         );
-        let source = {
+        let (source, summary) = {
             let mut guard = self.state.lock().await;
             if fail_closed_if_publish_pump_dead(&mut guard, "runtime_control").await {
-                None
+                (None, Vec::new())
             } else {
-                guard.source.clone()
+                let summary = match source_control_signals_from_envelopes(envelopes) {
+                    Ok(signals) => summarize_source_control_signals(&signals),
+                    Err(err) => vec![format!("decode_err={err}")],
+                };
+                (guard.source.clone(), summary)
             }
         };
         let Some(source) = source else {
@@ -1244,6 +1297,17 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
             ));
         };
         let result = source.on_control_frame(envelopes).await;
+        if result.is_ok() {
+            let mut guard = self.state.lock().await;
+            guard.last_control_frame_signals = summary.clone();
+            if debug_control_scope_capture_enabled() {
+                eprintln!(
+                    "fs_meta_source_worker_server: on_runtime_control summary node={} signals={:?}",
+                    source.node_id().0,
+                    summary
+                );
+            }
+        }
         eprintln!(
             "fs_meta_source_worker_server: on_runtime_control done envelopes={} ok={}",
             envelopes.len(),
@@ -2748,6 +2812,349 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_without_new_control_preserves_observability_control_summary_when_active_state_recovers(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                test_watch_scan_root("nfs1", nfs1.clone()),
+                test_watch_scan_root("nfs2", nfs2.clone()),
+            ],
+            host_object_grants: vec![
+                test_export("node-a::nfs1", nfs1),
+                test_export("node-a::nfs2", nfs2),
+            ],
+            ..SourceConfig::default()
+        };
+
+        let boundary = Arc::new(LoopbackPublishBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let context = WorkerSessionContext::new(
+            boundary.clone(),
+            boundary.clone(),
+            state_boundary.clone(),
+        );
+        let state = Arc::new(Mutex::new(SourceWorkerState {
+            source: None,
+            pending_init: None,
+            pump_task: None,
+            pump_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        }));
+        let mut session = SourceWorkerSession {
+            state: state.clone(),
+        };
+
+        let source_wave = |generation| {
+            [
+                (
+                    ROUTE_KEY_SOURCE_ROOTS_CONTROL.to_string(),
+                    SOURCE_RUNTIME_UNIT_ID.to_string(),
+                ),
+                (
+                    ROUTE_KEY_SOURCE_RESCAN_CONTROL.to_string(),
+                    SOURCE_RUNTIME_UNIT_ID.to_string(),
+                ),
+                (
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    SOURCE_RUNTIME_UNIT_ID.to_string(),
+                ),
+                (
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                ),
+            ]
+            .into_iter()
+            .map(|(route_key, unit_id)| {
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key,
+                    unit_id,
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["node-a::nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["node-a::nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source activate")
+            })
+            .collect::<Vec<_>>()
+        };
+
+        session
+            .on_init(
+                NodeId("node-a-observability-restart-preserve".to_string()),
+                cfg.clone(),
+                &context,
+            )
+            .await
+            .expect("init source worker");
+        session
+            .on_start(&context)
+            .await
+            .expect("start source worker");
+        session
+            .on_runtime_control(&source_wave(2), &context)
+            .await
+            .expect("apply initial runtime control");
+
+        let WorkerLoopControl::Continue(SourceWorkerResponse::ObservabilitySnapshot(initial)) =
+            session
+                .handle_request(SourceWorkerRequest::ObservabilitySnapshot, &context)
+                .await
+                .expect("fetch initial observability")
+        else {
+            panic!("initial observability request should return live snapshot");
+        };
+        assert!(
+            initial
+                .last_control_frame_signals_by_node
+                .get("node-a")
+                .is_some_and(|signals| !signals.is_empty()),
+            "initial snapshot should capture accepted control summary before restart: {:?}",
+            initial.last_control_frame_signals_by_node
+        );
+
+        session
+            .on_close(&context)
+            .await
+            .expect("close source worker for restart");
+        session
+            .on_init(
+                NodeId("node-a-observability-restart-preserve".to_string()),
+                cfg,
+                &context,
+            )
+            .await
+            .expect("re-init source worker");
+        session
+            .on_start(&context)
+            .await
+            .expect("restart source worker");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let WorkerLoopControl::Continue(SourceWorkerResponse::ObservabilitySnapshot(snapshot)) =
+                session
+                    .handle_request(SourceWorkerRequest::ObservabilitySnapshot, &context)
+                    .await
+                    .expect("fetch restarted observability")
+            else {
+                panic!("restarted observability request should return live snapshot");
+            };
+
+            let active_recovered = snapshot.status.current_stream_generation.is_some()
+                || snapshot.status.concrete_roots.iter().any(|entry| {
+                    entry.active
+                        || entry.current_stream_generation.is_some()
+                        || entry.emitted_batch_count > 0
+                        || entry.forwarded_batch_count > 0
+                });
+            if active_recovered {
+                assert!(
+                    snapshot
+                        .last_control_frame_signals_by_node
+                        .get("node-a")
+                        .is_some_and(|signals| !signals.is_empty()),
+                    "restarted active observability must preserve last_control_frame_signals_by_node even before a new control wave arrives: current_stream_generation={:?} source={:?} scan={:?} control={:?}",
+                    snapshot.status.current_stream_generation,
+                    snapshot.scheduled_source_groups_by_node,
+                    snapshot.scheduled_scan_groups_by_node,
+                    snapshot.last_control_frame_signals_by_node
+                );
+                break;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for restarted worker to recover active observability without a new control wave: source={:?} scan={:?} current_stream_generation={:?}",
+                snapshot.scheduled_source_groups_by_node,
+                snapshot.scheduled_scan_groups_by_node,
+                snapshot.status.current_stream_generation
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_without_new_control_recovers_observability_scheduled_groups_from_active_state(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                test_watch_scan_root("nfs1", nfs1.clone()),
+                test_watch_scan_root("nfs2", nfs2.clone()),
+            ],
+            host_object_grants: vec![
+                test_export("node-a::nfs1", nfs1),
+                test_export("node-a::nfs2", nfs2),
+            ],
+            ..SourceConfig::default()
+        };
+
+        let boundary = Arc::new(LoopbackPublishBoundary::default());
+        let context = WorkerSessionContext::new(
+            boundary.clone(),
+            boundary,
+            in_memory_state_boundary(),
+        );
+        let state = Arc::new(Mutex::new(SourceWorkerState {
+            source: None,
+            pending_init: None,
+            pump_task: None,
+            pump_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        }));
+        let mut session = SourceWorkerSession {
+            state: state.clone(),
+        };
+
+        let source_wave = |generation| {
+            [
+                (
+                    ROUTE_KEY_SOURCE_ROOTS_CONTROL.to_string(),
+                    SOURCE_RUNTIME_UNIT_ID.to_string(),
+                ),
+                (
+                    ROUTE_KEY_SOURCE_RESCAN_CONTROL.to_string(),
+                    SOURCE_RUNTIME_UNIT_ID.to_string(),
+                ),
+                (
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    SOURCE_RUNTIME_UNIT_ID.to_string(),
+                ),
+                (
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                ),
+            ]
+            .into_iter()
+            .map(|(route_key, unit_id)| {
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key,
+                    unit_id,
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["node-a::nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["node-a::nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source activate")
+            })
+            .collect::<Vec<_>>()
+        };
+
+        session
+            .on_init(
+                NodeId("node-a-observability-restart-groups".to_string()),
+                cfg.clone(),
+                &context,
+            )
+            .await
+            .expect("init source worker");
+        session
+            .on_start(&context)
+            .await
+            .expect("start source worker");
+        session
+            .on_runtime_control(&source_wave(2), &context)
+            .await
+            .expect("apply initial runtime control");
+        session
+            .on_close(&context)
+            .await
+            .expect("close source worker for restart");
+        session
+            .on_init(
+                NodeId("node-a-observability-restart-groups".to_string()),
+                cfg,
+                &context,
+            )
+            .await
+            .expect("re-init source worker");
+        session
+            .on_start(&context)
+            .await
+            .expect("restart source worker");
+
+        let expected_groups = vec!["nfs1".to_string(), "nfs2".to_string()];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let WorkerLoopControl::Continue(SourceWorkerResponse::ObservabilitySnapshot(snapshot)) =
+                session
+                    .handle_request(SourceWorkerRequest::ObservabilitySnapshot, &context)
+                    .await
+                    .expect("fetch restarted observability")
+            else {
+                panic!("restarted observability request should return live snapshot");
+            };
+
+            let active_recovered = snapshot.status.current_stream_generation.is_some()
+                || snapshot.status.concrete_roots.iter().any(|entry| {
+                    entry.active
+                        || entry.current_stream_generation.is_some()
+                        || entry.emitted_batch_count > 0
+                        || entry.forwarded_batch_count > 0
+                });
+            if active_recovered {
+                assert_eq!(
+                    snapshot.scheduled_source_groups_by_node.get("node-a"),
+                    Some(&expected_groups),
+                    "restarted active observability must recover scheduled source groups from active status before a new control wave arrives: current_stream_generation={:?} source={:?} scan={:?}",
+                    snapshot.status.current_stream_generation,
+                    snapshot.scheduled_source_groups_by_node,
+                    snapshot.scheduled_scan_groups_by_node
+                );
+                assert_eq!(
+                    snapshot.scheduled_scan_groups_by_node.get("node-a"),
+                    Some(&expected_groups),
+                    "restarted active observability must recover scheduled scan groups from active status before a new control wave arrives: current_stream_generation={:?} source={:?} scan={:?}",
+                    snapshot.status.current_stream_generation,
+                    snapshot.scheduled_source_groups_by_node,
+                    snapshot.scheduled_scan_groups_by_node
+                );
+                break;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for restarted worker to recover active observability without a new control wave: source={:?} scan={:?} current_stream_generation={:?}",
+                snapshot.scheduled_source_groups_by_node,
+                snapshot.scheduled_scan_groups_by_node,
+                snapshot.status.current_stream_generation
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn ping_reports_not_ready_after_publish_pump_dies_and_primary_roots_turn_output_closed() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
@@ -3490,6 +3897,154 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn runtime_control_updates_observability_control_summary_before_observability_snapshot() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_watch_scan_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![test_export("node-a::nfs1", nfs1)],
+            ..SourceConfig::default()
+        };
+
+        let state = Arc::new(Mutex::new(SourceWorkerState {
+            source: None,
+            pending_init: None,
+            pump_task: None,
+            pump_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        }));
+        let mut session = SourceWorkerSession {
+            state: state.clone(),
+        };
+        let boundary = Arc::new(LoopbackPublishBoundary::default());
+        let context = WorkerSessionContext::new(
+            boundary.clone(),
+            boundary.clone(),
+            in_memory_state_boundary(),
+        );
+
+        session
+            .on_init(
+                NodeId("node-a-runtime-control-observability".to_string()),
+                cfg,
+                &context,
+            )
+            .await
+            .expect("init source worker session");
+        session
+            .on_start(&context)
+            .await
+            .expect("start source worker session");
+
+        let activate = encode_runtime_exec_control(&RuntimeExecControl::Activate(
+            RuntimeExecActivate {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            },
+        ))
+        .expect("encode source activate");
+        session
+            .on_runtime_control(&[activate], &context)
+            .await
+            .expect("apply runtime control activate");
+
+        let response = session
+            .handle_request(SourceWorkerRequest::ObservabilitySnapshot, &context)
+            .await
+            .expect("fetch observability snapshot after runtime control");
+
+        let WorkerLoopControl::Continue(SourceWorkerResponse::ObservabilitySnapshot(snapshot)) =
+            response
+        else {
+            panic!("observability snapshot request should return live snapshot response");
+        };
+
+        assert_eq!(
+            snapshot.scheduled_source_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string()]),
+            "runtime control activation should surface scheduled source groups in worker observability snapshot",
+        );
+        assert!(
+            snapshot
+                .last_control_frame_signals_by_node
+                .get("node-a")
+                .is_some_and(|signals| !signals.is_empty()),
+            "runtime control activation should surface a non-empty control summary in worker observability snapshot: {:?}",
+            snapshot.last_control_frame_signals_by_node
+        );
+    }
+
+    #[tokio::test]
+    async fn observability_snapshot_request_falls_back_to_source_control_summary_when_worker_state_summary_is_empty(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![test_export("node-a::nfs1", nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::new(cfg, NodeId("node-a".to_string())).expect("init source");
+        let activate = encode_runtime_exec_control(&RuntimeExecControl::Activate(
+            RuntimeExecActivate {
+                route_key: crate::runtime::routes::ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            },
+        ))
+        .expect("encode source activate");
+        source
+            .on_control_frame(&[activate])
+            .await
+            .expect("apply source activate");
+
+        let mut state = SourceWorkerState {
+            source: Some(Arc::new(source)),
+            pending_init: None,
+            pump_task: None,
+            pump_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        };
+
+        let action = plan_worker_request(SourceWorkerRequest::ObservabilitySnapshot, &mut state);
+        let SourceWorkerAction::Immediate(
+            SourceWorkerResponse::ObservabilitySnapshot(snapshot),
+            false,
+        ) = action
+        else {
+            panic!("observability snapshot request should return immediate snapshot response");
+        };
+
+        assert!(
+            snapshot
+                .last_control_frame_signals_by_node
+                .get("node-a")
+                .is_some_and(|signals| !signals.is_empty()),
+            "worker observability must fall back to the source-owned accepted control summary when worker-side cached summary is empty: {:?}",
+            snapshot.last_control_frame_signals_by_node
+        );
+    }
+
     #[test]
     fn observability_snapshot_request_preserves_live_published_path_counts_from_stats() {
         unsafe {
@@ -3582,6 +4137,49 @@ mod tests {
         assert!(
             counts.iter().any(|entry| entry == "node-a::nfs2=7"),
             "snapshot should preserve nfs2 published path counts from live stats: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn observability_snapshot_request_does_not_treat_historical_published_stats_as_active_recovery(
+    ) {
+        let cfg = SourceConfig::default();
+        let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let published_stats = Arc::new(StdMutex::new(PublishedBatchStats {
+            batch_count: 12,
+            event_count: 345,
+            control_event_count: 6,
+            data_event_count: 339,
+            last_published_at_us: Some(123456),
+            last_published_origins: vec!["node-a::nfs1=4".to_string()],
+            published_origin_counts: std::collections::BTreeMap::from([(
+                "node-a::nfs1".to_string(),
+                345,
+            )]),
+            summarized_path_origin_counts: std::collections::BTreeMap::new(),
+            published_path_origin_counts: std::collections::BTreeMap::new(),
+        }));
+
+        let snapshot = source_observability_snapshot(
+            &source,
+            &["tick unit=runtime.exec.source generation=11 groups=[\"nfs1\"]".to_string()],
+            &published_stats,
+        );
+
+        assert!(
+            snapshot.last_control_frame_signals_by_node.is_empty(),
+            "historical published stats alone must not resurrect active control summary in source_server observability: current_stream_generation={:?} source={:?} scan={:?} control={:?} published_batches={:?}",
+            snapshot.status.current_stream_generation,
+            snapshot.scheduled_source_groups_by_node,
+            snapshot.scheduled_scan_groups_by_node,
+            snapshot.last_control_frame_signals_by_node,
+            snapshot.published_batches_by_node
+        );
+        assert_eq!(
+            snapshot.published_batches_by_node.get("node-a"),
+            Some(&12),
+            "source_server observability should still preserve historical published stats for diagnostics even when they do not prove active recovery"
         );
     }
 }

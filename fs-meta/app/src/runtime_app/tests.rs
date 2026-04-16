@@ -11442,6 +11442,212 @@ async fn pending_fixed_bind_release_does_not_overwrite_pending_facade_state_with
 }
 
 #[tokio::test]
+async fn pending_fixed_bind_release_keeps_facade_unavailable_when_active_control_stream_disappears_before_handoff_completion()
+{
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+    struct ProcessFacadeClaimReset;
+    struct PendingFixedBindHandoffCompletionGateReopenPauseHookReset;
+    struct PendingFixedBindHandoffCompletionCompletionHookReset;
+
+    impl Drop for ProcessFacadeClaimReset {
+        fn drop(&mut self) {
+            clear_process_facade_claim_for_tests();
+        }
+    }
+
+    impl Drop for PendingFixedBindHandoffCompletionGateReopenPauseHookReset {
+        fn drop(&mut self) {
+            clear_pending_fixed_bind_handoff_completion_gate_reopen_pause_hook();
+        }
+    }
+
+    impl Drop for PendingFixedBindHandoffCompletionCompletionHookReset {
+        fn drop(&mut self) {
+            clear_pending_fixed_bind_handoff_completion_completion_hook();
+        }
+    }
+
+    clear_process_facade_claim_for_tests();
+    let _claim_reset = ProcessFacadeClaimReset;
+    let _hook_reset = PendingFixedBindHandoffCompletionGateReopenPauseHookReset;
+    let _completion_hook_reset = PendingFixedBindHandoffCompletionCompletionHookReset;
+
+    let tmp = tempdir().expect("create temp dir");
+    let (passwd_path_1, shadow_path_1) = write_auth_files(&tmp);
+    let listener_resource = api::config::ApiListenerResource {
+        resource_id: "listener-release".to_string(),
+        bind_addr: reserve_bind_addr(),
+    };
+
+    let predecessor = Arc::new(
+        FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new(
+                        "pre-release-root",
+                        tmp.path(),
+                    )],
+                    host_object_grants: vec![granted_mount_root("node-release::root", tmp.path())],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path: passwd_path_1,
+                        shadow_path: shadow_path_1,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-release-predecessor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init predecessor"),
+    );
+
+    let bound_scope = RuntimeBoundScope {
+        scope_id: listener_resource.resource_id.clone(),
+        resource_ids: vec![listener_resource.resource_id.clone()],
+    };
+
+    predecessor
+        .apply_facade_activate(
+            FacadeRuntimeUnit::Facade,
+            &facade_control_stream_route(),
+            1,
+            &[bound_scope.clone()],
+        )
+        .await
+        .expect("activate predecessor facade");
+
+    let (passwd_path_2, shadow_path_2) = write_auth_files(&tmp);
+    let successor = Arc::new(
+        FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("successor-root", tmp.path())],
+                    host_object_grants: vec![granted_mount_root("node-release::root", tmp.path())],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path: passwd_path_2,
+                        shadow_path: shadow_path_2,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-release-successor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init successor"),
+    );
+
+    let candidate_resource_ids = FSMetaApp::facade_candidate_resource_ids(&[bound_scope.clone()]);
+    let resolved = successor
+        .config
+        .api
+        .resolve_for_candidate_ids(&candidate_resource_ids)
+        .expect("resolve successor facade config");
+
+    let pending = PendingFacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 2,
+        resource_ids: candidate_resource_ids,
+        bound_scopes: vec![bound_scope],
+        group_ids: Vec::new(),
+        runtime_managed: successor.runtime_boundary.is_some(),
+        runtime_exposure_confirmed: !successor.runtime_boundary.is_some(),
+        resolved,
+    };
+
+    *successor.pending_facade.lock().await = Some(pending.clone());
+
+    if let Some(claim) = ProcessFacadeClaim::from_pending(predecessor.instance_id, &pending) {
+        process_facade_claim_cell()
+            .lock()
+            .expect("lock claim cell")
+            .insert(claim.bind_addr.clone(), claim);
+    }
+
+    successor
+        .try_spawn_pending_facade()
+        .await
+        .expect("try spawn pending facade should handle conflict");
+
+    let bind_addr = pending.resolved.bind_addr.clone();
+    let hook_entered = Arc::new(Notify::new());
+    let hook_release = Arc::new(Notify::new());
+    let completion_entered = Arc::new(Notify::new());
+    install_pending_fixed_bind_handoff_completion_gate_reopen_pause_hook(
+        PendingFixedBindHandoffCompletionGateReopenPauseHook {
+            entered: hook_entered.clone(),
+            release: hook_release.clone(),
+        },
+    );
+    install_pending_fixed_bind_handoff_completion_completion_hook(
+        PendingFixedBindHandoffCompletionCompletionHook {
+            entered: completion_entered.clone(),
+        },
+    );
+
+    let predecessor_for_shutdown = predecessor.clone();
+    let shutdown_task = tokio::spawn(async move {
+        predecessor_for_shutdown.shutdown_active_facade().await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), hook_entered.notified())
+        .await
+        .expect("fixed-bind handoff completion must reach the gate-reopen pause");
+
+    let successor_active = successor
+        .api_task
+        .lock()
+        .await
+        .take()
+        .expect("precondition: handoff completion must have an active control stream before pause");
+    successor
+        .facade_service_state
+        .write()
+        .expect("write facade state before handoff completion resume")
+        .clone_from(&FacadeServiceState::Unavailable);
+    successor.api_control_gate.set_ready(false);
+    successor_active
+        .handle
+        .shutdown(ACTIVE_FACADE_SHUTDOWN_TIMEOUT)
+        .await;
+
+    hook_release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), completion_entered.notified())
+        .await
+        .expect("fixed-bind handoff completion must finish after the pause is released");
+    tokio::time::timeout(Duration::from_secs(2), shutdown_task)
+        .await
+        .expect("fixed-bind shutdown task must finish after the ready tail resumes")
+        .expect("join fixed-bind shutdown task");
+
+    assert!(
+        !successor.api_control_gate.is_ready(),
+        "fixed-bind handoff completion must keep the API control gate closed when the active control stream disappears before the ready tail resumes"
+    );
+    assert_eq!(
+        *successor
+            .facade_service_state
+            .read()
+            .expect("read published facade state after handoff completion"),
+        FacadeServiceState::Unavailable,
+        "fixed-bind handoff completion must not publish serving after the active control stream disappears before the ready tail resumes"
+    );
+
+    successor.close().await.expect("close successor");
+}
+
+#[tokio::test]
 async fn pending_fixed_bind_release_remains_blocked_without_runtime_exposure_confirmation() {
     let _serial = fixed_bind_handoff_test_serial().lock().await;
     struct ProcessFacadeClaimReset;

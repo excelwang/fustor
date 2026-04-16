@@ -453,7 +453,6 @@ enum SinkStatusSnapshotIssue {
 
 fn classify_sink_status_snapshot_issue(
     snapshot: &SinkStatusSnapshot,
-    replay_required: bool,
 ) -> Option<SinkStatusSnapshotIssue> {
     if snapshot_looks_stale_empty(snapshot) {
         return Some(SinkStatusSnapshotIssue::StaleEmpty);
@@ -461,7 +460,7 @@ fn classify_sink_status_snapshot_issue(
     if snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(snapshot) {
         return Some(SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence);
     }
-    if replay_required && snapshot_looks_scheduled_pending_audit_without_stream_receipts(snapshot) {
+    if snapshot_looks_scheduled_pending_audit_without_stream_receipts(snapshot) {
         return Some(SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts);
     }
     if snapshot_looks_scheduled_waiting_for_materialized_root(snapshot) {
@@ -545,11 +544,10 @@ fn cached_ready_truth_covers_live_issue(
 fn fold_live_sink_status_snapshot(
     live_snapshot: &SinkStatusSnapshot,
     cached_snapshot: &SinkStatusSnapshot,
-    replay_required: bool,
     cached_issue: Option<SinkStatusSnapshotIssue>,
     mode: SinkStatusLiveFoldMode,
 ) -> SinkStatusLiveFoldOutcome {
-    let Some(live_issue) = classify_sink_status_snapshot_issue(live_snapshot, replay_required)
+    let Some(live_issue) = classify_sink_status_snapshot_issue(live_snapshot)
     else {
         return SinkStatusLiveFoldOutcome::ReturnLive;
     };
@@ -632,10 +630,9 @@ fn fold_live_sink_status_snapshot(
 
 fn fold_cached_sink_status_snapshot(
     cached_snapshot: &SinkStatusSnapshot,
-    replay_required: bool,
     mode: SinkStatusCachedFoldMode,
 ) -> SinkStatusCachedFoldOutcome {
-    let Some(cached_issue) = classify_sink_status_snapshot_issue(cached_snapshot, replay_required)
+    let Some(cached_issue) = classify_sink_status_snapshot_issue(cached_snapshot)
     else {
         return SinkStatusCachedFoldOutcome::ReturnCached;
     };
@@ -671,15 +668,13 @@ fn cached_snapshot_needs_zero_row_republish(issue: Option<SinkStatusSnapshotIssu
 fn evaluate_live_sink_status_snapshot(
     live_snapshot: &SinkStatusSnapshot,
     cached_snapshot: &SinkStatusSnapshot,
-    replay_required: bool,
     cached_issue: Option<SinkStatusSnapshotIssue>,
     mode: SinkStatusLiveFoldMode,
 ) -> SinkStatusSnapshotEvaluation {
-    let live_issue = classify_sink_status_snapshot_issue(live_snapshot, replay_required);
+    let live_issue = classify_sink_status_snapshot_issue(live_snapshot);
     let decision = match fold_live_sink_status_snapshot(
         live_snapshot,
         cached_snapshot,
-        replay_required,
         cached_issue,
         mode,
     ) {
@@ -699,11 +694,10 @@ fn evaluate_live_sink_status_snapshot(
 
 fn evaluate_cached_sink_status_snapshot(
     cached_snapshot: &SinkStatusSnapshot,
-    replay_required: bool,
     mode: SinkStatusCachedFoldMode,
 ) -> SinkStatusSnapshotEvaluation {
-    let cached_issue = classify_sink_status_snapshot_issue(cached_snapshot, replay_required);
-    let decision = match fold_cached_sink_status_snapshot(cached_snapshot, replay_required, mode) {
+    let cached_issue = classify_sink_status_snapshot_issue(cached_snapshot);
+    let decision = match fold_cached_sink_status_snapshot(cached_snapshot, mode) {
         SinkStatusCachedFoldOutcome::ReturnCached => SinkStatusAvailabilityDecision::ReturnCached,
         SinkStatusCachedFoldOutcome::FailClosed => SinkStatusAvailabilityDecision::FailClosed,
         SinkStatusCachedFoldOutcome::PropagateError => SinkStatusAvailabilityDecision::PropagateError,
@@ -2086,12 +2080,12 @@ impl SinkWorkerClientHandle {
                 summarize_sink_status_snapshot(&snapshot)
             );
         }
-        if replay_required && snapshot_looks_scheduled_pending_audit_without_stream_receipts(&snapshot)
-        {
+        if snapshot_looks_scheduled_pending_audit_without_stream_receipts(&snapshot) {
             if debug_control_scope_capture_enabled() {
                 eprintln!(
-                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=replay_required_not_ready_without_stream_evidence {}",
+                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=scheduled_pending_audit_without_stream_receipts replay_required={} {}",
                     self.node_id.0,
+                    replay_required,
                     summarize_sink_status_snapshot(&snapshot)
                 );
             }
@@ -2113,8 +2107,6 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
-        let replay_required = self.control_state_replay_required.load(Ordering::Acquire) > 0;
-
         #[cfg(test)]
         if take_sink_worker_status_nonblocking_cache_fallback_hook() {
             let snapshot = self.cached_status_snapshot()?;
@@ -2316,8 +2308,7 @@ impl SinkWorkerClientHandle {
                                 summarize_sink_status_snapshot(&snapshot)
                             );
                         }
-                        let cached_issue =
-                            classify_sink_status_snapshot_issue(&cached_snapshot, replay_required);
+                        let cached_issue = classify_sink_status_snapshot_issue(&cached_snapshot);
                         let fold_mode = if probe_outcome.recovered_after_retry_reset {
                             SinkStatusLiveFoldMode::SteadyAfterRetryReset
                         } else {
@@ -2326,12 +2317,10 @@ impl SinkWorkerClientHandle {
                         let evaluation = evaluate_live_sink_status_snapshot(
                             &snapshot,
                             &cached_snapshot,
-                            replay_required,
                             cached_issue,
                             fold_mode,
                         );
-                        let live_issue =
-                            classify_sink_status_snapshot_issue(&snapshot, replay_required);
+                        let live_issue = classify_sink_status_snapshot_issue(&snapshot);
                         if evaluation.should_mark_replay_required {
                             self.control_state_replay_required
                                 .store(1, Ordering::Release);

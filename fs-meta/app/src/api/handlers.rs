@@ -614,6 +614,17 @@ pub async fn status(
         sink_outcome,
         source_outcome,
         published_facade_state,
+    ) || should_fail_closed_partial_local_status_fallback(
+        sink_outcome,
+        source_outcome,
+        published_facade_state,
+        &sink_status,
+        &source,
+        &runner_sets,
+    ) || should_fail_closed_source_ready_sink_empty_status(
+        published_facade_state,
+        &sink_status,
+        &source,
     ) {
         return Err(ApiError::service_unavailable(format!(
             "status remote route collection incomplete: sink_route={} source_route={}",
@@ -738,8 +749,105 @@ fn snapshot_scoped_active_facade_candidate_groups(
     sink_groups
 }
 
+fn source_snapshot_active_groups(snapshot: &SourceObservabilitySnapshot) -> BTreeSet<String> {
+    let mut groups = snapshot
+        .scheduled_source_groups_by_node
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    groups.extend(
+        snapshot
+            .scheduled_scan_groups_by_node
+            .values()
+            .flatten()
+            .cloned(),
+    );
+    groups
+}
+
+fn source_snapshot_has_published_activity(snapshot: &SourceObservabilitySnapshot) -> bool {
+    snapshot
+        .published_batches_by_node
+        .values()
+        .any(|count| *count > 0)
+        || snapshot
+            .published_events_by_node
+            .values()
+            .any(|count| *count > 0)
+        || snapshot
+            .published_control_events_by_node
+            .values()
+            .any(|count| *count > 0)
+        || snapshot
+            .published_data_events_by_node
+            .values()
+            .any(|count| *count > 0)
+        || !snapshot.last_published_at_us_by_node.is_empty()
+        || !snapshot.last_published_origins_by_node.is_empty()
+        || !snapshot.published_origin_counts_by_node.is_empty()
+}
+
+fn sink_snapshot_advertised_groups(snapshot: &SinkStatusSnapshot) -> BTreeSet<String> {
+    let mut groups = snapshot
+        .scheduled_groups_by_node
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    groups.extend(snapshot.groups.iter().map(|group| group.group_id.clone()));
+    groups
+}
+
+fn sink_snapshot_live_materialized_groups(snapshot: &SinkStatusSnapshot) -> BTreeSet<String> {
+    snapshot
+        .groups
+        .iter()
+        .filter(|group| {
+            matches!(group.readiness, crate::sink::GroupReadinessState::Ready)
+                && group.live_nodes > 0
+                && group.total_nodes > 0
+        })
+        .map(|group| group.group_id.clone())
+        .collect()
+}
+
+fn sink_status_snapshot_omits_active_source_groups(
+    source: &SourceObservabilitySnapshot,
+    sink: &SinkStatusSnapshot,
+) -> bool {
+    let active_source_groups = source_snapshot_active_groups(source);
+    if active_source_groups.is_empty() {
+        return false;
+    }
+    let advertised_sink_groups = sink_snapshot_advertised_groups(sink);
+    !active_source_groups.is_subset(&advertised_sink_groups)
+}
+
+fn sink_status_snapshot_lacks_ingress_evidence(snapshot: &SinkStatusSnapshot) -> bool {
+    snapshot.scheduled_groups_by_node.is_empty()
+        && snapshot.last_control_frame_signals_by_node.is_empty()
+        && snapshot.received_batches_by_node.is_empty()
+        && snapshot.received_events_by_node.is_empty()
+        && snapshot.received_control_events_by_node.is_empty()
+        && snapshot.received_data_events_by_node.is_empty()
+        && snapshot.last_received_at_us_by_node.is_empty()
+        && snapshot.last_received_origins_by_node.is_empty()
+        && snapshot.received_origin_counts_by_node.is_empty()
+}
+
+fn sink_status_snapshot_is_zeroish_for_active_source_groups(snapshot: &SinkStatusSnapshot) -> bool {
+    snapshot.live_nodes == 0
+        && snapshot.groups.iter().all(|group| {
+            group.live_nodes == 0
+                && group.total_nodes == 0
+                && !matches!(group.readiness, crate::sink::GroupReadinessState::Ready)
+        })
+}
+
 const STATUS_ROUTE_TIMEOUT: Duration = Duration::from_millis(350);
 const STATUS_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(2);
+const STATUS_SINK_ROUTE_RECOLLECT_BUDGET: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusRouteOutcome {
@@ -863,8 +971,10 @@ where
         ),
         Err(err) => {
             log_status_route_fallback("source", &err);
+            let mut source = local_source;
+            fail_close_incomplete_active_source_observability_snapshot(&mut source);
             (
-                local_source,
+                source,
                 local_source_runner_sets,
                 classify_status_route_error(&err),
             )
@@ -893,8 +1003,10 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
     StatusRouteOutcome,
     StatusRouteOutcome,
 ) {
+    let sink_retry_boundary = boundary.clone();
+    let sink_retry_node_id = node_id.clone();
     record_status_route_trace(trace_id, "sink.collect.begin");
-    let sink_result =
+    let mut sink_result =
         route_sink_status_snapshot(boundary.clone(), node_id.clone(), STATUS_ROUTE_TIMEOUT).await;
     record_status_route_trace(trace_id, "source.collect.begin");
     let source_result = route_source_observability_snapshot(
@@ -904,6 +1016,21 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
         STATUS_ROUTE_COLLECT_IDLE_GRACE,
     )
     .await;
+    if let (Ok(sink_snapshot), Ok((source_snapshot, _))) = (&mut sink_result, &source_result)
+        && sink_status_snapshot_omits_active_source_groups(source_snapshot, sink_snapshot)
+        && !source_snapshot_active_groups(source_snapshot)
+            .is_subset(&sink_snapshot_live_materialized_groups(&local_sink))
+    {
+        if let Ok(retry_snapshot) = route_sink_status_snapshot(
+            sink_retry_boundary,
+            sink_retry_node_id,
+            STATUS_SINK_ROUTE_RECOLLECT_BUDGET,
+        )
+        .await
+        {
+            *sink_snapshot = retry_snapshot;
+        }
+    }
     let local_source_runner_sets = local_runner_sets(&local_source);
 
     let (sink_status, sink_outcome) = match sink_result {
@@ -928,8 +1055,10 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
         ),
         Err(err) => {
             log_status_route_fallback("source", &err);
+            let mut source = local_source;
+            fail_close_incomplete_active_source_observability_snapshot(&mut source);
             (
-                local_source,
+                source,
                 local_source_runner_sets,
                 classify_status_route_error(&err),
             )
@@ -1005,6 +1134,44 @@ fn should_fail_closed_status_route_collection(
         return false;
     }
     status_route_collection_incomplete(sink_outcome, source_outcome)
+}
+
+fn should_fail_closed_partial_local_status_fallback(
+    sink_outcome: StatusRouteOutcome,
+    source_outcome: StatusRouteOutcome,
+    published_facade_state: FacadeServiceState,
+    sink_status: &SinkStatusSnapshot,
+    source: &SourceObservabilitySnapshot,
+    runner_sets: &BTreeMap<String, Vec<String>>,
+) -> bool {
+    matches!(
+        published_facade_state,
+        FacadeServiceState::Serving | FacadeServiceState::Degraded
+    ) && status_route_collection_incomplete(sink_outcome, source_outcome)
+        && sink_status.live_nodes == 0
+        && sink_status.groups.is_empty()
+        && source.status.logical_roots.is_empty()
+        && source.status.concrete_roots.is_empty()
+        && source.source_primary_by_group.is_empty()
+        && source.last_force_find_runner_by_group.is_empty()
+        && runner_sets.is_empty()
+        && source_observability_snapshot_debug_maps_absent(source)
+}
+
+fn should_fail_closed_source_ready_sink_empty_status(
+    published_facade_state: FacadeServiceState,
+    sink_status: &SinkStatusSnapshot,
+    source: &SourceObservabilitySnapshot,
+) -> bool {
+    matches!(
+        published_facade_state,
+        FacadeServiceState::Serving | FacadeServiceState::Degraded
+    ) && !source_snapshot_active_groups(source).is_empty()
+        && source_snapshot_has_published_activity(source)
+        && !source_snapshot_active_groups(source)
+            .is_subset(&sink_snapshot_live_materialized_groups(sink_status))
+        && sink_status_snapshot_is_zeroish_for_active_source_groups(sink_status)
+        && sink_status_snapshot_lacks_ingress_evidence(sink_status)
 }
 
 fn status_route_collection_incomplete(
@@ -1581,11 +1748,12 @@ async fn route_source_observability_snapshot(
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if source_observability_snapshots_need_retry(&snapshots)
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
+        if source_observability_snapshots_need_retry(&snapshots) {
+            if tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            return Err(last_err.unwrap_or(CnxError::Timeout));
         }
         if debug_status_route_fanin_enabled() {
             let summaries = snapshots
@@ -1673,6 +1841,19 @@ fn source_observability_snapshots_need_retry(
         source_observability_snapshot_has_active_state(snapshot)
             && source_observability_snapshot_debug_maps_absent(snapshot)
     })
+}
+
+fn fail_close_incomplete_active_source_observability_snapshot(
+    snapshot: &mut SourceObservabilitySnapshot,
+) {
+    if !(source_observability_snapshot_has_active_state(snapshot)
+        && source_observability_snapshot_debug_maps_absent(snapshot))
+    {
+        return;
+    }
+    snapshot.status.current_stream_generation = None;
+    snapshot.status.logical_roots.clear();
+    snapshot.status.concrete_roots.clear();
 }
 
 async fn collect_internal_source_status_events(
@@ -1833,10 +2014,15 @@ fn merge_source_observability(
         }
     }
     for (node_id, signals) in fallback.last_control_frame_signals_by_node {
-        merged
-            .last_control_frame_signals_by_node
-            .entry(node_id)
-            .or_insert(signals);
+        match merged.last_control_frame_signals_by_node.get_mut(&node_id) {
+            Some(existing) if existing.is_empty() && !signals.is_empty() => *existing = signals,
+            None => {
+                merged
+                    .last_control_frame_signals_by_node
+                    .insert(node_id, signals);
+            }
+            _ => {}
+        }
     }
     for (node_id, count) in fallback.published_batches_by_node {
         merged
@@ -2256,7 +2442,7 @@ mod tests {
     use crate::workers::source::SourceObservabilitySnapshot;
     use axum::Json;
     use axum::extract::State;
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderValue, StatusCode};
     use capanix_app_sdk::CnxError;
     use capanix_app_sdk::runtime::{NodeId, in_memory_state_boundary};
     use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
@@ -2329,6 +2515,20 @@ mod tests {
         sink_status_payloads: Vec<(String, Vec<u8>)>,
         correlations_by_channel: StdMutex<std::collections::HashMap<String, u64>>,
         recv_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
+    }
+
+    struct StatusSinkPartialRetryThenReplyBoundary {
+        source_request_channel: String,
+        source_reply_channel: String,
+        sink_request_channel: String,
+        sink_reply_channel: String,
+        source_status_payloads: Vec<(String, Vec<u8>)>,
+        first_sink_status_payloads: Vec<(String, Vec<u8>)>,
+        second_sink_status_payloads: Vec<(String, Vec<u8>)>,
+        correlations_by_channel: StdMutex<std::collections::HashMap<String, u64>>,
+        send_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
+        recv_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
+        sink_recv_state: StdMutex<(usize, usize)>,
     }
 
     struct StatusOverlapPoisonBoundary {
@@ -2911,6 +3111,64 @@ mod tests {
         }
     }
 
+    impl StatusSinkPartialRetryThenReplyBoundary {
+        fn new(
+            source_snapshots: Vec<(String, SourceObservabilitySnapshot)>,
+            first_sink_snapshots: Vec<(String, SinkStatusSnapshot)>,
+            second_sink_snapshots: Vec<(String, SinkStatusSnapshot)>,
+        ) -> Self {
+            let source_route = default_route_bindings()
+                .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+                .expect("resolve source-status route");
+            let sink_route = default_route_bindings()
+                .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+                .expect("resolve sink-status route");
+            Self {
+                source_request_channel: source_route.0.clone(),
+                source_reply_channel: format!("{}:reply", source_route.0),
+                sink_request_channel: sink_route.0.clone(),
+                sink_reply_channel: format!("{}:reply", sink_route.0),
+                source_status_payloads: source_snapshots
+                    .into_iter()
+                    .map(|(origin, snapshot)| {
+                        let payload =
+                            rmp_serde::to_vec_named(&snapshot).expect("encode source snapshot");
+                        (origin, payload)
+                    })
+                    .collect(),
+                first_sink_status_payloads: first_sink_snapshots
+                    .into_iter()
+                    .map(|(origin, snapshot)| {
+                        let payload =
+                            rmp_serde::to_vec_named(&snapshot).expect("encode first sink snapshot");
+                        (origin, payload)
+                    })
+                    .collect(),
+                second_sink_status_payloads: second_sink_snapshots
+                    .into_iter()
+                    .map(|(origin, snapshot)| {
+                        let payload = rmp_serde::to_vec_named(&snapshot)
+                            .expect("encode second sink snapshot");
+                        (origin, payload)
+                    })
+                    .collect(),
+                correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+                send_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+                recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+                sink_recv_state: StdMutex::new((0, 0)),
+            }
+        }
+
+        fn recv_batch_count(&self, channel: &str) -> usize {
+            self.recv_batches_by_channel
+                .lock()
+                .expect("status sink partial retry recv batches lock")
+                .get(channel)
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
     #[async_trait::async_trait]
     impl ChannelIoSubset for StatusTransportRouteBoundary {
         async fn channel_send(
@@ -3048,6 +3306,128 @@ mod tests {
                     .collect());
             }
             Err(CnxError::Timeout)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for StatusSinkPartialRetryThenReplyBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            if let Some(correlation) = request
+                .events
+                .first()
+                .and_then(|event| event.metadata().correlation_id)
+            {
+                self.correlations_by_channel
+                    .lock()
+                    .expect("status sink partial retry correlations lock")
+                    .insert(request.channel_key.0.clone(), correlation);
+            }
+            *self
+                .send_batches_by_channel
+                .lock()
+                .expect("status sink partial retry send batches lock")
+                .entry(request.channel_key.0)
+                .or_default() += 1;
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            *self
+                .recv_batches_by_channel
+                .lock()
+                .expect("status sink partial retry recv batches lock")
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+
+            if request.channel_key.0 == self.source_reply_channel {
+                let correlation = self
+                    .correlations_by_channel
+                    .lock()
+                    .expect("status sink partial retry correlations lock")
+                    .get(&self.source_request_channel)
+                    .copied()
+                    .unwrap_or(1);
+                return Ok(self
+                    .source_status_payloads
+                    .iter()
+                    .map(|(origin, payload)| {
+                        Event::new(
+                            EventMetadata {
+                                origin_id: NodeId(origin.clone()),
+                                timestamp_us: 1,
+                                logical_ts: None,
+                                correlation_id: Some(correlation),
+                                ingress_auth: None,
+                                trace: None,
+                            },
+                            bytes::Bytes::from(payload.clone()),
+                        )
+                    })
+                    .collect());
+            }
+            if request.channel_key.0 != self.sink_reply_channel {
+                return Err(CnxError::Timeout);
+            }
+
+            let request_channel = self.sink_reply_channel.trim_end_matches(":reply");
+            let send_batch = self
+                .send_batches_by_channel
+                .lock()
+                .expect("status sink partial retry send batches lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or_default();
+            let recv_in_send = {
+                let mut state = self
+                    .sink_recv_state
+                    .lock()
+                    .expect("status sink partial retry recv state lock");
+                if state.0 != send_batch {
+                    *state = (send_batch, 0);
+                }
+                let recv_in_send = state.1;
+                state.1 += 1;
+                recv_in_send
+            };
+            if recv_in_send > 0 {
+                return Err(CnxError::Timeout);
+            }
+            let payloads = if send_batch <= 1 {
+                &self.first_sink_status_payloads
+            } else {
+                &self.second_sink_status_payloads
+            };
+            let correlation = self
+                .correlations_by_channel
+                .lock()
+                .expect("status sink partial retry correlations lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or(1);
+            Ok(payloads
+                .iter()
+                .map(|(origin, payload)| {
+                    Event::new(
+                        EventMetadata {
+                            origin_id: NodeId(origin.clone()),
+                            timestamp_us: 1,
+                            logical_ts: None,
+                            correlation_id: Some(correlation),
+                            ingress_auth: None,
+                            trace: None,
+                        },
+                        bytes::Bytes::from(payload.clone()),
+                    )
+                })
+                .collect())
         }
     }
 
@@ -3884,6 +4264,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_remote_merge_fail_closes_incomplete_active_local_source_when_source_times_out()
+    {
+        let local_sink = local_sink_snapshot();
+        let local_source = SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::new(),
+            scheduled_scan_groups_by_node: BTreeMap::new(),
+            last_control_frame_signals_by_node: BTreeMap::new(),
+            published_batches_by_node: BTreeMap::new(),
+            published_events_by_node: BTreeMap::new(),
+            published_control_events_by_node: BTreeMap::new(),
+            published_data_events_by_node: BTreeMap::new(),
+            last_published_at_us_by_node: BTreeMap::new(),
+            last_published_origins_by_node: BTreeMap::new(),
+            published_origin_counts_by_node: BTreeMap::new(),
+            enqueued_path_origin_counts_by_node: BTreeMap::new(),
+            pending_path_origin_counts_by_node: BTreeMap::new(),
+            yielded_path_origin_counts_by_node: BTreeMap::new(),
+            summarized_path_origin_counts_by_node: BTreeMap::new(),
+            published_path_origin_counts_by_node: BTreeMap::new(),
+            ..local_source_snapshot()
+        };
+
+        let (_sink, source, runner_sets, sink_outcome, source_outcome) =
+            merge_remote_status_snapshots(
+                local_sink,
+                local_source.clone(),
+                Some(std::sync::Arc::new(NoopBoundary)),
+                NodeId("node-a".into()),
+                |_boundary, _origin_id| async move { Ok(SinkStatusSnapshot::default()) },
+                |_boundary, _origin_id| async move { Err(CnxError::Timeout) },
+            )
+            .await;
+
+        assert_eq!(sink_outcome, StatusRouteOutcome::Ok);
+        assert_eq!(source_outcome, StatusRouteOutcome::Timeout);
+        assert_eq!(runner_sets, local_runner_sets(&local_source));
+        assert_eq!(
+            source.status.current_stream_generation,
+            None,
+            "source timeout must fail-close incomplete active local source instead of surfacing stale current_stream_generation"
+        );
+        assert!(
+            source.status.logical_roots.is_empty(),
+            "source timeout must clear incomplete active logical-root status before local fallback is accepted: {:?}",
+            source.status.logical_roots
+        );
+        assert!(
+            source.status.concrete_roots.is_empty(),
+            "source timeout must clear incomplete active concrete-root status before local fallback is accepted: {:?}",
+            source.status.concrete_roots
+        );
+    }
+
+    #[tokio::test]
     async fn status_remote_merge_preserves_remote_force_find_runner_fields() {
         let local_sink = local_sink_snapshot();
         let local_source = SourceObservabilitySnapshot {
@@ -4646,6 +5080,105 @@ mod tests {
     }
 
     #[test]
+    fn merge_source_observability_preserves_non_empty_fallback_control_signals_when_live_snapshot_has_empty_entry()
+    {
+        let local = SourceObservabilitySnapshot {
+            lifecycle_state: "degraded_worker_unreachable".to_string(),
+            host_object_grants_version: 1,
+            grants: Vec::new(),
+            logical_roots: Vec::new(),
+            status: SourceStatusSnapshot::default(),
+            source_primary_by_group: BTreeMap::new(),
+            last_force_find_runner_by_group: BTreeMap::new(),
+            force_find_inflight_groups: Vec::new(),
+            scheduled_source_groups_by_node: BTreeMap::new(),
+            scheduled_scan_groups_by_node: BTreeMap::new(),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["activate unit=runtime.exec.source route=source-logical-roots-control:v1.stream generation=7 scopes=[\"nfs1=>node-a::nfs1\", \"nfs2=>node-a::nfs2\"]".to_string()],
+            )]),
+            published_batches_by_node: BTreeMap::from([("node-a".to_string(), 8)]),
+            published_events_by_node: BTreeMap::from([("node-a".to_string(), 808)]),
+            published_control_events_by_node: BTreeMap::from([("node-a".to_string(), 4)]),
+            published_data_events_by_node: BTreeMap::from([("node-a".to_string(), 804)]),
+            last_published_at_us_by_node: BTreeMap::new(),
+            last_published_origins_by_node: BTreeMap::new(),
+            published_origin_counts_by_node: BTreeMap::new(),
+            published_path_capture_target: None,
+            enqueued_path_origin_counts_by_node: BTreeMap::new(),
+            pending_path_origin_counts_by_node: BTreeMap::new(),
+            yielded_path_origin_counts_by_node: BTreeMap::new(),
+            summarized_path_origin_counts_by_node: BTreeMap::new(),
+            published_path_origin_counts_by_node: BTreeMap::new(),
+        };
+        let aggregated = SourceObservabilitySnapshot {
+            lifecycle_state: "ready".to_string(),
+            host_object_grants_version: 7,
+            grants: vec![GrantedMountRoot {
+                object_ref: "node-a::nfs1".to_string(),
+                host_ref: "node-a".to_string(),
+                host_ip: "10.0.0.11".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: BTreeMap::new(),
+                mount_point: "/mnt/nfs1".into(),
+                fs_source: "srv:/nfs1".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: Vec::new(),
+                interfaces: Vec::new(),
+                active: true,
+            }],
+            logical_roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            status: SourceStatusSnapshot {
+                current_stream_generation: Some(13),
+                ..SourceStatusSnapshot::default()
+            },
+            source_primary_by_group: BTreeMap::new(),
+            last_force_find_runner_by_group: BTreeMap::new(),
+            force_find_inflight_groups: Vec::new(),
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                Vec::new(),
+            )]),
+            published_batches_by_node: BTreeMap::from([("node-a".to_string(), 20)]),
+            published_events_by_node: BTreeMap::from([("node-a".to_string(), 9109)]),
+            published_control_events_by_node: BTreeMap::from([("node-a".to_string(), 9)]),
+            published_data_events_by_node: BTreeMap::from([("node-a".to_string(), 9100)]),
+            last_published_at_us_by_node: BTreeMap::new(),
+            last_published_origins_by_node: BTreeMap::new(),
+            published_origin_counts_by_node: BTreeMap::new(),
+            published_path_capture_target: None,
+            enqueued_path_origin_counts_by_node: BTreeMap::new(),
+            pending_path_origin_counts_by_node: BTreeMap::new(),
+            yielded_path_origin_counts_by_node: BTreeMap::new(),
+            summarized_path_origin_counts_by_node: BTreeMap::new(),
+            published_path_origin_counts_by_node: BTreeMap::new(),
+        };
+
+        let merged = merge_source_observability(local, aggregated);
+
+        assert_eq!(
+            merged.last_control_frame_signals_by_node.get("node-a"),
+            Some(&vec!["activate unit=runtime.exec.source route=source-logical-roots-control:v1.stream generation=7 scopes=[\"nfs1=>node-a::nfs1\", \"nfs2=>node-a::nfs2\"]".to_string()]),
+            "live source snapshot must not erase fallback control summary when it still carries active publication counters but omits control signals"
+        );
+        assert_eq!(
+            merged.published_batches_by_node.get("node-a"),
+            Some(&20),
+            "preserving fallback control summary must not roll back newer live publication counters"
+        );
+    }
+
+    #[test]
     fn merge_source_observability_snapshots_preserves_last_control_signals_by_node() {
         let node_a = SourceObservabilitySnapshot {
             lifecycle_state: "ready".to_string(),
@@ -5221,6 +5754,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_source_observability_snapshot_times_out_instead_of_accepting_incomplete_active_source_debug_at_deadline()
+    {
+        let source_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+            .expect("resolve source-status route");
+        let incomplete_node_a = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::new(),
+            scheduled_scan_groups_by_node: BTreeMap::new(),
+            last_control_frame_signals_by_node: BTreeMap::new(),
+            published_batches_by_node: BTreeMap::new(),
+            published_events_by_node: BTreeMap::new(),
+            published_control_events_by_node: BTreeMap::new(),
+            published_data_events_by_node: BTreeMap::new(),
+            last_published_at_us_by_node: BTreeMap::new(),
+            last_published_origins_by_node: BTreeMap::new(),
+            published_origin_counts_by_node: BTreeMap::new(),
+            enqueued_path_origin_counts_by_node: BTreeMap::new(),
+            pending_path_origin_counts_by_node: BTreeMap::new(),
+            yielded_path_origin_counts_by_node: BTreeMap::new(),
+            summarized_path_origin_counts_by_node: BTreeMap::new(),
+            published_path_origin_counts_by_node: BTreeMap::new(),
+            ..local_source_snapshot()
+        })
+        .expect("encode incomplete node-a source status");
+        let node_b_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::new(),
+            scheduled_scan_groups_by_node: BTreeMap::new(),
+            last_control_frame_signals_by_node: BTreeMap::new(),
+            published_batches_by_node: BTreeMap::new(),
+            published_events_by_node: BTreeMap::new(),
+            published_control_events_by_node: BTreeMap::new(),
+            published_data_events_by_node: BTreeMap::new(),
+            last_published_at_us_by_node: BTreeMap::new(),
+            last_published_origins_by_node: BTreeMap::new(),
+            published_origin_counts_by_node: BTreeMap::new(),
+            enqueued_path_origin_counts_by_node: BTreeMap::new(),
+            pending_path_origin_counts_by_node: BTreeMap::new(),
+            yielded_path_origin_counts_by_node: BTreeMap::new(),
+            summarized_path_origin_counts_by_node: BTreeMap::new(),
+            published_path_origin_counts_by_node: BTreeMap::new(),
+            ..local_source_snapshot()
+        })
+        .expect("encode incomplete node-b source status");
+        let boundary = Arc::new(SourceStatusIncompleteRetryThenReplyBoundary {
+            source_reply_channel: format!("{}:reply", source_route.0.clone()),
+            first_source_status_payloads: vec![incomplete_node_a.clone(), node_b_payload.clone()],
+            second_source_status_payloads: vec![incomplete_node_a, node_b_payload],
+            send_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            recv_state: StdMutex::new((0, 0)),
+        });
+
+        let err = route_source_observability_snapshot(
+            boundary.clone(),
+            NodeId("node-a".into()),
+            Duration::from_millis(250),
+            STATUS_ROUTE_COLLECT_IDLE_GRACE,
+        )
+        .await
+        .expect_err(
+            "active source snapshot with empty debug maps until deadline must fail closed instead of being accepted",
+        );
+        assert!(
+            matches!(err, CnxError::Timeout),
+            "deadline exhaustion for active-but-debug-empty source observability must surface as timeout, got {err:?}"
+        );
+
+        let send_batches = boundary
+            .send_batches_by_channel
+            .lock()
+            .expect("source incomplete deadline boundary send batches lock");
+        assert!(
+            send_batches
+                .get(&source_route.0)
+                .copied()
+                .unwrap_or_default()
+                >= 1,
+            "active-but-debug-empty source observability must issue routed source-status collection before failing closed at deadline"
+        );
+    }
+
+    #[tokio::test]
     async fn status_reports_serving_facade_state_without_pending_diagnostics() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
@@ -5705,6 +6321,397 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn status_retries_routed_sink_status_when_first_reply_omits_active_groups_and_local_sink_cannot_fill_them()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        let nfs3 = tmp.path().join("nfs3");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2");
+        std::fs::create_dir_all(&nfs3).expect("create nfs3");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let roots = vec![
+            RootSpec::new("nfs1", &nfs1),
+            RootSpec::new("nfs2", &nfs2),
+            RootSpec::new("nfs3", &nfs3),
+        ];
+        let grants = vec![
+            granted_mount_root("node-a::nfs1", &nfs1),
+            granted_mount_root("node-a::nfs2", &nfs2),
+            granted_mount_root("node-b::nfs3", &nfs3),
+        ];
+        let source_cfg = SourceConfig {
+            roots: roots.clone(),
+            host_object_grants: grants.clone(),
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg).expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let mut remote_source = local_source_snapshot();
+        remote_source.grants = grants;
+        remote_source.logical_roots = roots;
+        remote_source.status.logical_roots = vec![
+            SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".into(),
+                status: "ready".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            },
+            SourceLogicalRootHealthSnapshot {
+                root_id: "nfs2".into(),
+                status: "ready".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            },
+            SourceLogicalRootHealthSnapshot {
+                root_id: "nfs3".into(),
+                status: "ready".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            },
+        ];
+        remote_source.source_primary_by_group = BTreeMap::from([
+            ("nfs1".into(), "node-a::nfs1".into()),
+            ("nfs2".into(), "node-a::nfs2".into()),
+            ("nfs3".into(), "node-b::nfs3".into()),
+        ]);
+        remote_source.scheduled_source_groups_by_node = BTreeMap::from([
+            ("node-a".into(), vec!["nfs1".into(), "nfs2".into()]),
+            ("node-b".into(), vec!["nfs3".into()]),
+        ]);
+        remote_source.scheduled_scan_groups_by_node =
+            remote_source.scheduled_source_groups_by_node.clone();
+
+        let first_sink_snapshot = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs3".to_string()],
+            )]),
+            groups: vec![crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs3".to_string(),
+                primary_object_ref: "node-b::nfs3".to_string(),
+                total_nodes: 0,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 21,
+                shadow_lag_us: 22,
+                overflow_pending_audit: false,
+                initial_audit_completed: false,
+                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                materialized_revision: 0,
+                estimated_heap_bytes: 0,
+            }],
+            ..SinkStatusSnapshot::default()
+        };
+        let second_sink_snapshot = SinkStatusSnapshot {
+            live_nodes: 3,
+            scheduled_groups_by_node: BTreeMap::from([
+                ("node-a".to_string(), vec!["nfs1".to_string(), "nfs2".to_string()]),
+                ("node-b".to_string(), vec!["nfs3".to_string()]),
+            ]),
+            groups: vec![
+                crate::sink::SinkGroupStatusSnapshot {
+                    group_id: "nfs1".to_string(),
+                    primary_object_ref: "node-a::nfs1".to_string(),
+                    total_nodes: 1,
+                    live_nodes: 1,
+                    tombstoned_count: 0,
+                    attested_count: 0,
+                    suspect_count: 0,
+                    blind_spot_count: 0,
+                    shadow_time_us: 31,
+                    shadow_lag_us: 32,
+                    overflow_pending_audit: false,
+                    initial_audit_completed: true,
+                    readiness: crate::sink::GroupReadinessState::Ready,
+                    materialized_revision: 1,
+                    estimated_heap_bytes: 0,
+                },
+                crate::sink::SinkGroupStatusSnapshot {
+                    group_id: "nfs2".to_string(),
+                    primary_object_ref: "node-a::nfs2".to_string(),
+                    total_nodes: 1,
+                    live_nodes: 1,
+                    tombstoned_count: 0,
+                    attested_count: 0,
+                    suspect_count: 0,
+                    blind_spot_count: 0,
+                    shadow_time_us: 33,
+                    shadow_lag_us: 34,
+                    overflow_pending_audit: false,
+                    initial_audit_completed: true,
+                    readiness: crate::sink::GroupReadinessState::Ready,
+                    materialized_revision: 1,
+                    estimated_heap_bytes: 0,
+                },
+                crate::sink::SinkGroupStatusSnapshot {
+                    group_id: "nfs3".to_string(),
+                    primary_object_ref: "node-b::nfs3".to_string(),
+                    total_nodes: 1,
+                    live_nodes: 1,
+                    tombstoned_count: 0,
+                    attested_count: 0,
+                    suspect_count: 0,
+                    blind_spot_count: 0,
+                    shadow_time_us: 35,
+                    shadow_lag_us: 36,
+                    overflow_pending_audit: false,
+                    initial_audit_completed: true,
+                    readiness: crate::sink::GroupReadinessState::Ready,
+                    materialized_revision: 1,
+                    estimated_heap_bytes: 0,
+                },
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+        let runtime_boundary = Arc::new(StatusSinkPartialRetryThenReplyBoundary::new(
+            vec![(
+                "node-b-29776275144172679041384449".to_string(),
+                remote_source,
+            )],
+            vec![(
+                "node-b-29776275144172679041384449".to_string(),
+                first_sink_snapshot,
+            )],
+            vec![(
+                "node-b-29776275144172679041384449".to_string(),
+                second_sink_snapshot,
+            )],
+        ));
+        let facade_service_state = shared_facade_service_state_cell();
+        let facade_pending_status = shared_facade_pending_status_cell();
+        *facade_service_state
+            .write()
+            .expect("write facade service state") = FacadeServiceState::Serving;
+        *facade_pending_status
+            .write()
+            .expect("write facade pending status") = None;
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(runtime_boundary.clone()),
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                facade_pending_status,
+            ),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+        };
+
+        let response = status(State(state), headers)
+            .await
+            .expect("status should retry partial routed sink status when local sink cannot fill missing active groups")
+            .0;
+
+        let group_ids = response
+            .sink
+            .groups
+            .iter()
+            .map(|group| group.group_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            group_ids,
+            BTreeSet::from(["nfs1", "nfs2", "nfs3"]),
+            "status must not accept a first partial routed sink-status reply that omits active source groups when a second routed sink snapshot supplies the full mixed-cluster sink truth"
+        );
+        assert!(
+            runtime_boundary.recv_batch_count(&runtime_boundary.sink_reply_channel) > 1,
+            "status must recollect routed sink-status when the first reply omits active source groups and local sink only advertises zero-state scheduled groups"
+        );
+        assert_eq!(response.sink.live_nodes, 3);
+    }
+
+    #[tokio::test]
+    async fn status_fail_closes_when_routed_sink_status_remains_empty_while_source_is_ready_and_local_sink_cannot_fill_it()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        let nfs3 = tmp.path().join("nfs3");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2");
+        std::fs::create_dir_all(&nfs3).expect("create nfs3");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let roots = vec![
+            RootSpec::new("nfs1", &nfs1),
+            RootSpec::new("nfs2", &nfs2),
+            RootSpec::new("nfs3", &nfs3),
+        ];
+        let grants = vec![
+            granted_mount_root("node-a::nfs1", &nfs1),
+            granted_mount_root("node-a::nfs2", &nfs2),
+            granted_mount_root("node-b::nfs3", &nfs3),
+        ];
+        let source_cfg = SourceConfig {
+            roots: roots.clone(),
+            host_object_grants: grants.clone(),
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg).expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let mut remote_source = local_source_snapshot();
+        remote_source.grants = grants;
+        remote_source.logical_roots = roots;
+        remote_source.status.logical_roots = vec![
+            SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".into(),
+                status: "ready".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            },
+            SourceLogicalRootHealthSnapshot {
+                root_id: "nfs2".into(),
+                status: "ready".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            },
+            SourceLogicalRootHealthSnapshot {
+                root_id: "nfs3".into(),
+                status: "ready".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            },
+        ];
+        remote_source.source_primary_by_group = BTreeMap::from([
+            ("nfs1".into(), "node-a::nfs1".into()),
+            ("nfs2".into(), "node-a::nfs2".into()),
+            ("nfs3".into(), "node-b::nfs3".into()),
+        ]);
+        remote_source.scheduled_source_groups_by_node = BTreeMap::from([
+            ("node-a".into(), vec!["nfs1".into(), "nfs2".into()]),
+            ("node-b".into(), vec!["nfs3".into()]),
+        ]);
+        remote_source.scheduled_scan_groups_by_node =
+            remote_source.scheduled_source_groups_by_node.clone();
+        remote_source.published_batches_by_node = BTreeMap::from([
+            ("node-a".into(), 4),
+            ("node-b".into(), 6),
+        ]);
+        remote_source.published_events_by_node = BTreeMap::from([
+            ("node-a".into(), 11),
+            ("node-b".into(), 16),
+        ]);
+        remote_source.published_control_events_by_node = BTreeMap::from([
+            ("node-a".into(), 3),
+            ("node-b".into(), 4),
+        ]);
+        remote_source.published_data_events_by_node = BTreeMap::from([
+            ("node-a".into(), 8),
+            ("node-b".into(), 12),
+        ]);
+        remote_source.last_published_at_us_by_node = BTreeMap::from([
+            ("node-a".into(), 100),
+            ("node-b".into(), 200),
+        ]);
+        remote_source.last_published_origins_by_node = BTreeMap::from([
+            ("node-a".into(), vec!["node-a::nfs2=1".into()]),
+            ("node-b".into(), vec!["node-b::nfs3=1".into()]),
+        ]);
+        remote_source.published_origin_counts_by_node = BTreeMap::from([
+            (
+                "node-a".into(),
+                vec!["node-a::nfs1=1".into(), "node-a::nfs2=10".into()],
+            ),
+            ("node-b".into(), vec!["node-b::nfs3=16".into()]),
+        ]);
+        let runtime_boundary = Arc::new(StatusSinkPartialRetryThenReplyBoundary::new(
+            vec![(
+                "node-b-29776275144172679041384449".to_string(),
+                remote_source,
+            )],
+            vec![(
+                "node-b-29776275144172679041384449".to_string(),
+                SinkStatusSnapshot::default(),
+            )],
+            vec![(
+                "node-b-29776275144172679041384449".to_string(),
+                SinkStatusSnapshot::default(),
+            )],
+        ));
+        let facade_service_state = shared_facade_service_state_cell();
+        let facade_pending_status = shared_facade_pending_status_cell();
+        *facade_service_state
+            .write()
+            .expect("write facade service state") = FacadeServiceState::Serving;
+        *facade_pending_status
+            .write()
+            .expect("write facade pending status") = None;
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(runtime_boundary.clone()),
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                facade_pending_status,
+            ),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+        };
+
+        let err = status(State(state), headers)
+            .await
+            .expect_err("status must fail-close when routed sink-status stays empty while source is ready and local sink cannot fill active groups");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.message.contains("status remote route collection incomplete"),
+            "unexpected error message: {}",
+            err.message
+        );
+        assert!(
+            runtime_boundary.recv_batch_count(&runtime_boundary.sink_reply_channel) > 1,
+            "status must recollect sink-status before fail-closing the source-ready/sink-empty seam"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn status_serializes_same_boundary_remote_source_and_sink_collects_when_overlap_would_transport_poison()
      {
@@ -6125,8 +7132,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_pending_facade_settles_within_local_route_budget_when_remote_status_routes_never_reply()
+    async fn status_fail_closes_when_published_facade_is_serving_and_both_remote_status_routes_timeout_with_only_partial_local_fallback_truth()
      {
+        tokio::time::pause();
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_cfg = SourceConfig {
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg).expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let facade_service_state = shared_facade_service_state_cell();
+        *facade_service_state
+            .write()
+            .expect("write facade service state") = FacadeServiceState::Serving;
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(Arc::new(StatusTransportRouteBoundary)),
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                shared_facade_pending_status_cell(),
+            ),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+        };
+
+        let status_task = tokio::spawn(async move { status(State(state), headers).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(25)).await;
+
+        let err = status_task
+            .await
+            .expect("status join")
+            .expect_err("serving facade with only partial local fallback truth must fail-close when both remote status routes time out");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.message.contains("status remote route collection incomplete"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn status_pending_facade_settles_within_local_route_budget_when_remote_status_routes_never_reply()
+    {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         std::fs::create_dir_all(&nfs1).expect("create nfs1");

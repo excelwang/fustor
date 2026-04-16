@@ -14,7 +14,7 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_missing_group_rows_afte
     };
 
     assert_eq!(
-        classify_sink_status_snapshot_issue(&snapshot, false),
+        classify_sink_status_snapshot_issue(&snapshot),
         Some(SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence),
         "scheduled sink groups that already carry stream evidence must classify as missing-group-rows, not as healthy"
     );
@@ -48,7 +48,7 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_waiting_for_materialize
     };
 
     assert_eq!(
-        classify_sink_status_snapshot_issue(&snapshot, false),
+        classify_sink_status_snapshot_issue(&snapshot),
         Some(SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot),
         "scheduled groups that only expose zero/uninitialized rows must classify as waiting for a materialized root"
     );
@@ -101,20 +101,20 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_mixed_ready_and_unready
     };
 
     assert_eq!(
-        classify_sink_status_snapshot_issue(&snapshot, false),
+        classify_sink_status_snapshot_issue(&snapshot),
         Some(SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready),
         "scheduled groups that split between ready and unready rows must classify as a mixed readiness regression"
     );
 }
 
 #[test]
-fn classify_sink_status_snapshot_issue_detects_scheduled_pending_audit_without_stream_receipts_only_when_replay_is_required()
- {
+fn classify_sink_status_snapshot_issue_detects_scheduled_pending_audit_without_stream_receipts_regardless_of_replay_required(
+) {
     let snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs3".to_string(),
             primary_object_ref: "node-b::nfs3".to_string(),
-            total_nodes: 6,
+            total_nodes: 0,
             live_nodes: 0,
             tombstoned_count: 0,
             attested_count: 0,
@@ -124,7 +124,7 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_pending_audit_without_s
             shadow_lag_us: 0,
             overflow_pending_audit: false,
             initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
+            readiness: crate::sink::GroupReadinessState::PendingAudit,
             materialized_revision: 7,
             estimated_heap_bytes: 1,
         }],
@@ -136,14 +136,9 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_pending_audit_without_s
     };
 
     assert_eq!(
-        classify_sink_status_snapshot_issue(&snapshot, false),
-        None,
-        "without replay_required, a replay-only not-ready snapshot should stay classified as healthy so caller policy can decide separately"
-    );
-    assert_eq!(
-        classify_sink_status_snapshot_issue(&snapshot, true),
+        classify_sink_status_snapshot_issue(&snapshot),
         Some(SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts),
-        "with replay_required, the same snapshot must classify as pending-audit without stream receipts"
+        "scheduled zero-state pending-audit snapshots must classify as pending-audit without stream receipts even before replay_required is armed"
     );
 }
 
@@ -426,7 +421,6 @@ fn fold_live_sink_status_snapshot_returns_cached_for_control_inflight_scheduled_
         fold_live_sink_status_snapshot(
             &live_snapshot,
             &cached_snapshot,
-            false,
             None,
             SinkStatusLiveFoldMode::ControlInflight,
         ),
@@ -467,7 +461,6 @@ fn evaluate_live_sink_status_snapshot_marks_replay_required_for_pending_audit_wi
     let evaluation = evaluate_live_sink_status_snapshot(
         &live_snapshot,
         &cached_snapshot,
-        true,
         None,
         SinkStatusLiveFoldMode::Steady,
     );
@@ -515,7 +508,6 @@ fn evaluate_live_sink_status_snapshot_returns_live_for_steady_after_retry_reset_
     let evaluation = evaluate_live_sink_status_snapshot(
         &live_snapshot,
         &cached_snapshot,
-        false,
         None,
         SinkStatusLiveFoldMode::SteadyAfterRetryReset,
     );
@@ -541,7 +533,6 @@ fn fold_live_sink_status_snapshot_fails_closed_for_steady_stale_empty_without_ca
         fold_live_sink_status_snapshot(
             &live_snapshot,
             &cached_snapshot,
-            false,
             None,
             SinkStatusLiveFoldMode::Steady,
         ),
@@ -568,7 +559,6 @@ fn fold_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_missin
     assert_eq!(
         fold_cached_sink_status_snapshot(
             &cached_snapshot,
-            false,
             SinkStatusCachedFoldMode::WorkerUnavailable,
         ),
         SinkStatusCachedFoldOutcome::ReturnCached,
@@ -583,7 +573,6 @@ fn fold_cached_sink_status_snapshot_fails_closed_for_not_started_stale_empty_cac
     assert_eq!(
         fold_cached_sink_status_snapshot(
             &cached_snapshot,
-            false,
             SinkStatusCachedFoldMode::NotStarted,
         ),
         SinkStatusCachedFoldOutcome::FailClosed,
@@ -597,7 +586,6 @@ fn evaluate_cached_sink_status_snapshot_requests_zero_row_republish_for_stale_em
 
     let evaluation = evaluate_cached_sink_status_snapshot(
         &cached_snapshot,
-        false,
         SinkStatusCachedFoldMode::NotStarted,
     );
 

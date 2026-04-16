@@ -4613,17 +4613,24 @@ async fn status_snapshot_nonblocking_fails_closed_when_live_snapshot_is_single_s
         raw_group.primary_object_ref, raw_group.group_id,
         "precondition: this seam needs a bound primary object ref distinct from the group id so the live zero-state can slip past the current scheduled-zero guard: {raw_snapshot:?}"
     );
+    sink.control_state_replay_required
+        .store(0, Ordering::Release);
+    assert_eq!(
+        sink.control_state_replay_required.load(Ordering::Acquire),
+        0,
+        "precondition: this legacy seam only reproduces when replay_required has already cleared before the public status probe",
+    );
 
     let err = sink
             .status_snapshot_nonblocking()
             .await
             .expect_err(
-                "status_snapshot_nonblocking must fail closed instead of publishing a single scheduled zero/uninitialized group whose live primary_object_ref is a concrete bound grant ref",
+                "status_snapshot_nonblocking must fail close instead of publishing a single scheduled zero/pending-audit group whose live primary_object_ref is a concrete bound grant ref after replay_required already cleared",
             );
 
     assert!(
         matches!(err, CnxError::Timeout),
-        "single scheduled zero/uninitialized group with a bound primary_object_ref must fail close with timeout instead of reaching runtime-app as an ok empty-root summary: err={err:?}"
+        "single scheduled zero/pending-audit group with a bound primary_object_ref must fail close with timeout even after replay_required clears instead of reaching runtime-app as an ok empty-root summary: err={err:?}"
     );
 
     sink.close().await.expect("close sink worker");

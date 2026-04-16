@@ -553,6 +553,8 @@ pub struct FSMetaSource {
     force_find_inflight: Arc<Mutex<HashSet<String>>>,
     /// Last successful force-find runner per group for diagnostics/e2e verification.
     force_find_last_runner: Arc<Mutex<BTreeMap<String, String>>>,
+    /// Last accepted runtime control summary for local observability snapshots.
+    last_control_frame_signals: Arc<Mutex<Vec<String>>>,
     /// Coalesced runtime-topology refresh trigger.
     runtime_refresh_dirty: Arc<AtomicBool>,
     /// Pending rescan request coupled to topology refresh.
@@ -2196,6 +2198,7 @@ impl FSMetaSource {
             force_find_rr: Arc::new(Mutex::new(HashMap::new())),
             force_find_inflight: Arc::new(Mutex::new(HashSet::new())),
             force_find_last_runner: Arc::new(Mutex::new(BTreeMap::new())),
+            last_control_frame_signals: Arc::new(Mutex::new(Vec::new())),
             runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
             runtime_refresh_rescan: Arc::new(AtomicBool::new(false)),
             runtime_refresh_running: Arc::new(AtomicBool::new(false)),
@@ -3097,6 +3100,14 @@ impl FSMetaSource {
         lock_or_recover(
             &self.force_find_last_runner,
             "source.force_find.last_runner.snapshot",
+        )
+        .clone()
+    }
+
+    pub fn last_control_frame_signals_snapshot(&self) -> Vec<String> {
+        lock_or_recover(
+            &self.last_control_frame_signals,
+            "source.last_control_frame_signals.snapshot",
         )
         .clone()
     }
@@ -4621,7 +4632,12 @@ impl FSMetaSource {
 
     pub async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
         let signals = source_control_signals_from_envelopes(envelopes)?;
-        self.apply_orchestration_signals(&signals).await
+        self.apply_orchestration_signals(&signals).await?;
+        *lock_or_recover(
+            &self.last_control_frame_signals,
+            "source.on_control_frame.last_control_frame_signals",
+        ) = summarize_source_control_signals(&signals);
+        Ok(())
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -4660,6 +4676,52 @@ impl FSMetaSource {
         *lock_or_recover(&self.state, "source.close.state") = LifecycleState::Closed;
         Ok(())
     }
+}
+
+fn summarize_source_control_signals(signals: &[SourceControlSignal]) -> Vec<String> {
+    signals
+        .iter()
+        .map(|signal| match signal {
+            SourceControlSignal::Activate {
+                unit,
+                route_key,
+                generation,
+                bound_scopes,
+                ..
+            } => format!(
+                "activate unit={} route={} generation={} scopes={:?}",
+                unit.unit_id(),
+                route_key,
+                generation,
+                summarize_bound_scopes(bound_scopes)
+            ),
+            SourceControlSignal::Deactivate {
+                unit,
+                route_key,
+                generation,
+                ..
+            } => format!(
+                "deactivate unit={} route={} generation={}",
+                unit.unit_id(),
+                route_key,
+                generation
+            ),
+            SourceControlSignal::Tick {
+                unit,
+                route_key,
+                generation,
+                ..
+            } => format!(
+                "tick unit={} route={} generation={}",
+                unit.unit_id(),
+                route_key,
+                generation
+            ),
+            SourceControlSignal::RuntimeHostGrantChange { .. } => "host_grant_change".into(),
+            SourceControlSignal::ManualRescan { .. } => "manual_rescan".into(),
+            SourceControlSignal::Passthrough(_) => "passthrough".into(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

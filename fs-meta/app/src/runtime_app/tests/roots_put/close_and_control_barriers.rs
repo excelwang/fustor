@@ -117,6 +117,10 @@
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
+        app.on_control_frame(&[activate_envelope("runtime.exec.source")])
+            .await
+            .expect("initialize app from runtime control before roots_put");
+
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let _reset = RootsPutPauseHookReset;
@@ -152,7 +156,7 @@
 
         tokio::time::timeout(Duration::from_secs(5), entered.notified())
             .await
-            .expect("public /tree should reach sink query proxy before the late sink events deactivate wave runs");
+            .expect("roots_put should reach the handler hook once runtime control readiness is initialized");
         let close_task = tokio::spawn({
             let app = app.clone();
             async move { app.close().await }
@@ -174,6 +178,203 @@
         assert!(
             status.is_success(),
             "in-flight roots_put should complete before facade teardown: status={status} body={body}"
+        );
+        close_task
+            .await
+            .expect("join app close")
+            .expect("close app after in-flight roots_put");
+    }
+
+    #[tokio::test]
+    async fn closing_app_waits_for_control_ready_blocked_roots_put_before_tearing_down_facade() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![
+                            api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            },
+                            api::config::ApiListenerResource {
+                                resource_id: "listener-b".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            },
+                        ],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init external-worker app"),
+        );
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.facade_service_state.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _reset = RootsPutPauseHookReset;
+        crate::api::install_roots_put_pause_hook(crate::api::RootsPutPauseHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let roots_body = json!({
+            "roots": [{
+                "id": "test-root",
+                "selector": { "fs_source": fs_source },
+                "subpath_scope": "/",
+                "watch": false,
+                "scan": true,
+            }]
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .put(format!(
+                        "http://{bind_addr}/api/fs-meta/v1/monitoring/roots"
+                    ))
+                    .bearer_auth(token)
+                    .json(&roots_body)
+                    .send()
+                    .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), entered.notified())
+                .await
+                .is_err(),
+            "roots_put should still be blocked on control readiness before it reaches the handler hook"
+        );
+
+        let close_task = tokio::spawn({
+            let app = app.clone();
+            async move { app.close().await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !close_task.is_finished(),
+            "app.close() must wait for a roots_put request that is already blocked on control readiness"
+        );
+
+        app.control_initialized.store(true, Ordering::Release);
+        app.api_control_gate.set_ready(true);
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("roots_put should reach the handler hook after control readiness becomes available");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !close_task.is_finished(),
+            "app.close() must remain blocked while the now-control-ready roots_put is paused in the handler"
+        );
+        release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join roots_put request")
+            .expect("roots_put request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode roots_put body");
+        assert!(
+            status.is_success(),
+            "roots_put unblocked by late control readiness should complete before facade teardown: status={status} body={body}"
         );
         close_task
             .await
@@ -1070,4 +1271,3 @@
             .expect("handle control frame after roots_put");
         app.close().await.expect("close app");
     }
-

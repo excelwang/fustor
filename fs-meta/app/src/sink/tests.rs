@@ -544,6 +544,62 @@ async fn stale_activate_generation_is_ignored() {
     assert_eq!(state, Some((5, false)));
 }
 
+#[tokio::test]
+async fn sink_runtime_exec_failover_reactivate_replaces_scoped_holder_without_stale_activated_scope()
+{
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs2", "/mnt/nfs2")];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-b::nfs2-old", "node-b", "10.0.0.12", "/mnt/nfs2", true),
+        granted_mount_root("node-c::nfs2-new", "node-c", "10.0.0.13", "/mnt/nfs2", true),
+    ];
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-c".to_string()), None, cfg).expect("init sink");
+
+    let initial_holder =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs2", &["node-b::nfs2-old"])],
+        }))
+        .expect("encode initial holder activate");
+    sink.on_control_frame(&[initial_holder])
+        .await
+        .expect("initial holder activate should pass");
+
+    let successor_holder =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 2,
+            bound_scopes: vec![bound_scope_with_resources("nfs2", &["node-c::nfs2-new"])],
+        }))
+        .expect("encode successor holder activate");
+    sink.on_control_frame(&[successor_holder])
+        .await
+        .expect("successor holder activate should pass");
+
+    let state = sink
+        .unit_control
+        .unit_state("runtime.exec.sink")
+        .expect("unit state after successor activate")
+        .expect("runtime.exec.sink unit state should exist");
+    assert!(state.0, "runtime.exec.sink should remain active after successor activate");
+    assert_eq!(
+        state.1,
+        vec![RuntimeBoundScope {
+            scope_id: "nfs2".to_string(),
+            resource_ids: vec!["node-c::nfs2-new".to_string()],
+        }],
+        "successor scoped holder activate must replace the stale activated scope instead of merging the dead holder resource into runtime.exec.sink state",
+    );
+}
+
 #[test]
 fn force_find_aggregation_delete_wins_on_same_mtime() {
     let update = mk_source_event("src", mk_record(b"/a.txt", "a.txt", 10, EventKind::Update));
