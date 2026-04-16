@@ -7,6 +7,29 @@ pub use capanix_managed_state_sdk::{
     trusted_materialized_not_ready_message,
 };
 
+fn concrete_root_counts_as_materialized_candidate(
+    root: &crate::source::SourceConcreteRootHealthSnapshot,
+) -> bool {
+    root.active
+        && root.is_group_primary
+        && root.scan_enabled
+        && !root.status.starts_with("waiting_for_root:")
+}
+
+fn group_has_local_sink_presence(
+    group_id: &str,
+    sink_groups: &BTreeMap<&str, &crate::sink::SinkGroupStatusSnapshot>,
+    scheduled_groups: &BTreeSet<String>,
+) -> bool {
+    sink_groups.contains_key(group_id) || scheduled_groups.contains(group_id)
+}
+
+fn sink_group_blocks_materialized_observation(
+    group: &crate::sink::SinkGroupStatusSnapshot,
+) -> bool {
+    !matches!(group.readiness, crate::sink::GroupReadinessState::Ready)
+}
+
 pub fn materialized_query_observation_evidence(
     source_status: &SourceStatusSnapshot,
     sink_status: &SinkStatusSnapshot,
@@ -25,7 +48,14 @@ pub fn materialized_query_observation_evidence(
     let concrete_candidate_groups = source_status
         .concrete_roots
         .iter()
-        .filter(|root| root.active && root.is_group_primary && root.scan_enabled)
+        .filter(|root| {
+            concrete_root_counts_as_materialized_candidate(root)
+                && group_has_local_sink_presence(
+                    &root.logical_root_id,
+                    &sink_groups,
+                    &scheduled_groups,
+                )
+        })
         .map(|root| root.logical_root_id.clone())
         .collect::<BTreeSet<_>>();
     let mut candidate_groups = concrete_candidate_groups.clone();
@@ -52,7 +82,7 @@ pub fn materialized_query_observation_evidence(
             initial_audit_groups.insert(group_id.clone());
             continue;
         };
-        if !group.initial_audit_completed {
+        if sink_group_blocks_materialized_observation(group) {
             initial_audit_groups.insert(group_id.clone());
         }
         if group.overflow_pending_audit {
@@ -83,14 +113,22 @@ pub fn candidate_group_observation_evidence(
         .iter()
         .map(|(root_id, _)| root_id.clone())
         .collect::<BTreeSet<_>>();
+    let scheduled_groups = sink_status
+        .scheduled_groups_by_node
+        .values()
+        .flat_map(|groups| groups.iter().cloned())
+        .collect::<BTreeSet<_>>();
     let scan_groups = source_status
         .concrete_roots
         .iter()
         .filter(|root| {
-            root.active
-                && root.is_group_primary
-                && root.scan_enabled
+            concrete_root_counts_as_materialized_candidate(root)
                 && candidate_groups.contains(&root.logical_root_id)
+                && group_has_local_sink_presence(
+                    &root.logical_root_id,
+                    &sink_groups,
+                    &scheduled_groups,
+                )
         })
         .map(|root| root.logical_root_id.clone())
         .collect::<BTreeSet<_>>();
@@ -108,7 +146,7 @@ pub fn candidate_group_observation_evidence(
                 initial_audit_groups.insert(group_id.clone());
                 continue;
             };
-            if !group.initial_audit_completed {
+            if sink_group_blocks_materialized_observation(group) {
                 initial_audit_groups.insert(group_id.clone());
             }
         }
@@ -190,6 +228,7 @@ mod tests {
             shadow_lag_us: 0,
             overflow_pending_audit: false,
             initial_audit_completed: false,
+            readiness: crate::sink::GroupReadinessState::PendingAudit,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
         }
@@ -268,6 +307,187 @@ mod tests {
             evidence.initial_audit_groups,
             BTreeSet::from(["nfs1".to_string()]),
             "scheduled logical-only groups must still block on initial audit until materialized: {evidence:?}"
+        );
+    }
+
+    #[test]
+    fn materialized_query_observation_evidence_ignores_waiting_for_root_primary_scan_groups_without_local_sink_schedule()
+     {
+        let mut waiting_for_root = concrete_root("nfs1", true);
+        waiting_for_root.status = "waiting_for_root: No such file or directory (os error 2)"
+            .to_string();
+        waiting_for_root.last_error = Some("No such file or directory (os error 2)".to_string());
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            }],
+            concrete_roots: vec![waiting_for_root],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot::default();
+
+        let evidence = materialized_query_observation_evidence(&source_status, &sink_status);
+        assert!(
+            evidence.candidate_groups.is_empty(),
+            "primary scan groups whose concrete roots are still waiting_for_root and have no local sink schedule must not keep package-local materialized observation untrusted: {evidence:?}"
+        );
+        assert!(
+            evidence.initial_audit_groups.is_empty(),
+            "waiting_for_root primary scan groups without any local sink schedule must not be reported as initial-audit blockers: {evidence:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_group_observation_evidence_ignores_waiting_for_root_primary_scan_groups_without_local_sink_schedule()
+     {
+        let mut waiting_for_root = concrete_root("nfs1", true);
+        waiting_for_root.status = "waiting_for_root: No such file or directory (os error 2)"
+            .to_string();
+        waiting_for_root.last_error = Some("No such file or directory (os error 2)".to_string());
+        let source_status = SourceStatusSnapshot {
+            concrete_roots: vec![waiting_for_root],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot::default();
+        let candidate_groups = BTreeSet::from(["nfs1".to_string()]);
+
+        let evidence =
+            candidate_group_observation_evidence(&source_status, &sink_status, &candidate_groups);
+        assert!(
+            evidence.initial_audit_groups.is_empty(),
+            "waiting_for_root primary scan groups without local sink schedule must not stay in candidate-group initial-audit blockers: {evidence:?}"
+        );
+    }
+
+    #[test]
+    fn materialized_query_observation_evidence_ignores_running_primary_scan_groups_without_local_sink_schedule()
+     {
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            }],
+            concrete_roots: vec![concrete_root("nfs1", true)],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot::default();
+
+        let evidence = materialized_query_observation_evidence(&source_status, &sink_status);
+        assert!(
+            evidence.candidate_groups.is_empty(),
+            "primary scan groups without any local sink schedule must not keep package-local materialized observation untrusted: {evidence:?}"
+        );
+        assert!(
+            evidence.initial_audit_groups.is_empty(),
+            "primary scan groups without any local sink schedule must not be reported as initial-audit blockers: {evidence:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_group_observation_evidence_ignores_running_primary_scan_groups_without_local_sink_schedule()
+     {
+        let source_status = SourceStatusSnapshot {
+            concrete_roots: vec![concrete_root("nfs1", true)],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot::default();
+        let candidate_groups = BTreeSet::from(["nfs1".to_string()]);
+
+        let evidence =
+            candidate_group_observation_evidence(&source_status, &sink_status, &candidate_groups);
+        assert!(
+            evidence.initial_audit_groups.is_empty(),
+            "primary scan groups without local sink schedule must not stay in candidate-group initial-audit blockers: {evidence:?}"
+        );
+    }
+
+    #[test]
+    fn materialized_query_observation_evidence_prefers_exported_readiness_over_legacy_initial_audit_bool()
+     {
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            }],
+            concrete_roots: vec![concrete_root("nfs1", true)],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![SinkGroupStatusSnapshot {
+                group_id: "nfs1".to_string(),
+                primary_object_ref: "node-a::nfs1".to_string(),
+                total_nodes: 3,
+                live_nodes: 3,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 10,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: false,
+                readiness: crate::sink::GroupReadinessState::Ready,
+                materialized_revision: 7,
+                estimated_heap_bytes: 0,
+            }],
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..SinkStatusSnapshot::default()
+        };
+
+        let evidence = materialized_query_observation_evidence(&source_status, &sink_status);
+        assert!(
+            evidence.initial_audit_groups.is_empty(),
+            "query observation must trust exported sink readiness over stale legacy initial_audit_completed=false: {evidence:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_group_observation_evidence_prefers_exported_readiness_over_legacy_initial_audit_bool()
+     {
+        let source_status = SourceStatusSnapshot {
+            concrete_roots: vec![concrete_root("nfs1", true)],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![SinkGroupStatusSnapshot {
+                group_id: "nfs1".to_string(),
+                primary_object_ref: "node-a::nfs1".to_string(),
+                total_nodes: 3,
+                live_nodes: 3,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 10,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: false,
+                readiness: crate::sink::GroupReadinessState::Ready,
+                materialized_revision: 7,
+                estimated_heap_bytes: 0,
+            }],
+            ..SinkStatusSnapshot::default()
+        };
+        let candidate_groups = BTreeSet::from(["nfs1".to_string()]);
+
+        let evidence =
+            candidate_group_observation_evidence(&source_status, &sink_status, &candidate_groups);
+        assert!(
+            evidence.initial_audit_groups.is_empty(),
+            "candidate-group observation must trust exported sink readiness over stale legacy initial_audit_completed=false: {evidence:?}"
         );
     }
 }

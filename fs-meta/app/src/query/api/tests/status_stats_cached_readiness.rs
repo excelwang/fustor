@@ -14,6 +14,11 @@ fn sink_group_status(
         shadow_time_us: 1,
         shadow_lag_us: 0,
         overflow_pending_audit: false,
+        readiness: if initial_audit_completed {
+            crate::sink::GroupReadinessState::Ready
+        } else {
+            crate::sink::GroupReadinessState::PendingAudit
+        },
         initial_audit_completed,
         materialized_revision: 1,
         estimated_heap_bytes: 0,
@@ -168,6 +173,7 @@ fn local_sink_snapshot_explicit_empty_clears_preserved_cached_ready_groups_after
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
+            readiness: crate::sink::GroupReadinessState::PendingAudit,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -184,6 +190,7 @@ fn local_sink_snapshot_explicit_empty_clears_preserved_cached_ready_groups_after
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
+            readiness: crate::sink::GroupReadinessState::PendingAudit,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -218,6 +225,7 @@ fn local_sink_snapshot_explicit_empty_clears_preserved_cached_ready_groups_after
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
+            readiness: crate::sink::GroupReadinessState::PendingAudit,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -234,6 +242,7 @@ fn local_sink_snapshot_explicit_empty_clears_preserved_cached_ready_groups_after
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
+            readiness: crate::sink::GroupReadinessState::PendingAudit,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -428,4 +437,3 @@ fn cached_sink_status_preserves_missing_nfs2_readiness_when_later_fresh_snapshot
         "later fresh snapshots that only mention other groups must not make cached nfs2 readiness disappear again"
     );
 }
-

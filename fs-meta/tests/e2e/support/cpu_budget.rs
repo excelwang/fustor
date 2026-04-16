@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -128,8 +129,11 @@ fn read_process_jiffies(pids: &[u32]) -> Result<u64, String> {
     let mut total = 0u64;
     for pid in pids {
         let path = PathBuf::from(format!("/proc/{pid}/stat"));
-        let raw = fs::read_to_string(&path)
-            .map_err(|e| format!("read {} failed: {e}", path.display()))?;
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("read {} failed: {err}", path.display())),
+        };
         let rparen = raw
             .rfind(')')
             .ok_or_else(|| format!("unexpected stat format in {}", path.display()))?;
@@ -172,6 +176,7 @@ fn read_total_jiffies() -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn sample_many_does_not_serially_spend_one_full_window_per_node() {
@@ -192,5 +197,46 @@ mod tests {
             elapsed < Duration::from_millis(85),
             "sample_many should spend roughly one window per sample across all nodes; elapsed={elapsed:?}"
         );
+    }
+
+    #[test]
+    fn read_process_jiffies_treats_vanished_pid_as_zero_instead_of_error() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn short-lived process");
+        let vanished_pid = child.id();
+        let status = child.wait().expect("wait for short-lived process");
+        assert!(status.success(), "child must exit cleanly");
+
+        let jiffies = read_process_jiffies(&[vanished_pid])
+            .expect("vanished pid should be treated as zero jiffies rather than a hard error");
+        assert_eq!(jiffies, 0);
+    }
+
+    #[test]
+    fn sample_many_ignores_vanished_pid_in_selected_steady_set() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn short-lived process");
+        let vanished_pid = child.id();
+        let status = child.wait().expect("wait for short-lived process");
+        assert!(status.success(), "child must exit cleanly");
+
+        let pids_by_node = BTreeMap::from([(
+            "node-a".to_string(),
+            vec![std::process::id(), vanished_pid],
+        )]);
+        let samples = sample_many(
+            &pids_by_node,
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        )
+        .expect("vanished steady pid should not abort cpu budget sampling");
+
+        assert_eq!(samples.get("node-a").map(Vec::len), Some(1));
     }
 }

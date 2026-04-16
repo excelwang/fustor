@@ -170,6 +170,12 @@ enum InternalStatusAvailability {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FacadeReadyTailDecision {
+    control_gate_ready: bool,
+    published_state: FacadeServiceState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UninitializedCleanupDisposition {
     None,
     FacadeOnly,
@@ -2827,20 +2833,18 @@ impl FSMetaApp {
             let publication_ready = api_task.lock().await.as_ref().is_some_and(|active| {
                 active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
             });
-            let control_ready = publication_ready
-                && Self::control_gate_ready_from_runtime_facts(
-                    control_initialized.load(Ordering::Acquire),
-                    source_state_replay_required.load(Ordering::Acquire),
-                    sink_state_replay_required.load(Ordering::Acquire),
-                    false,
-                );
-            api_control_gate.set_ready(control_ready);
-            Self::publish_facade_service_state_from_runtime_facts(
-                &facade_service_state,
-                control_ready,
+            let ready_tail_decision = Self::facade_ready_tail_decision_from_runtime_facts(
+                control_initialized.load(Ordering::Acquire),
+                source_state_replay_required.load(Ordering::Acquire),
+                sink_state_replay_required.load(Ordering::Acquire),
+                false,
                 publication_ready,
                 pending_facade_present,
             );
+            api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
+            *facade_service_state
+                .write()
+                .expect("write published facade service state") = ready_tail_decision.published_state;
             #[cfg(test)]
             notify_deferred_sink_owned_query_peer_publication_completion();
         });
@@ -3085,6 +3089,32 @@ impl FSMetaApp {
             FacadeServiceState::Serving
         } else {
             FacadeServiceState::Unavailable
+        }
+    }
+
+    fn facade_ready_tail_decision_from_runtime_facts(
+        control_initialized: bool,
+        source_replay_required: bool,
+        sink_replay_required: bool,
+        allow_facade_only_handoff: bool,
+        publication_ready: bool,
+        pending_facade_present: bool,
+    ) -> FacadeReadyTailDecision {
+        let control_gate_ready = publication_ready
+            && Self::control_gate_ready_from_runtime_facts(
+                control_initialized,
+                source_replay_required,
+                sink_replay_required,
+                allow_facade_only_handoff,
+            );
+        let published_state = Self::current_facade_service_state_from_runtime_facts(
+            control_gate_ready,
+            publication_ready,
+            pending_facade_present,
+        );
+        FacadeReadyTailDecision {
+            control_gate_ready,
+            published_state,
         }
     }
 
@@ -4858,19 +4888,19 @@ impl FSMetaApp {
                     pending_guard.take();
                 }
                 Self::clear_pending_facade_status(&facade_pending_status);
-                let control_ready = Self::control_gate_ready_from_runtime_facts(
+                let ready_tail_decision = Self::facade_ready_tail_decision_from_runtime_facts(
                     control_initialized.load(Ordering::Acquire),
                     source_state_replay_required.load(Ordering::Acquire),
                     sink_state_replay_required.load(Ordering::Acquire),
                     false,
-                );
-                api_control_gate.set_ready(control_ready);
-                Self::publish_facade_service_state_from_runtime_facts(
-                    &facade_service_state,
-                    control_ready,
                     true,
                     false,
                 );
+                api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
+                *facade_service_state
+                    .write()
+                    .expect("write published facade service state") =
+                    ready_tail_decision.published_state;
                 return Ok(true);
             }
             if let Some(current) = api_task_guard.as_ref()
@@ -4916,19 +4946,19 @@ impl FSMetaApp {
                     pending_guard.take();
                 }
                 Self::clear_pending_facade_status(&facade_pending_status);
-                let control_ready = Self::control_gate_ready_from_runtime_facts(
+                let ready_tail_decision = Self::facade_ready_tail_decision_from_runtime_facts(
                     control_initialized.load(Ordering::Acquire),
                     source_state_replay_required.load(Ordering::Acquire),
                     sink_state_replay_required.load(Ordering::Acquire),
                     false,
-                );
-                api_control_gate.set_ready(control_ready);
-                Self::publish_facade_service_state_from_runtime_facts(
-                    &facade_service_state,
-                    control_ready,
                     true,
                     false,
                 );
+                api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
+                *facade_service_state
+                    .write()
+                    .expect("write published facade service state") =
+                    ready_tail_decision.published_state;
                 return Ok(true);
             }
         }
@@ -7042,19 +7072,21 @@ impl FSMetaApp {
                                 .read()
                                 .ok()
                                 .is_some_and(|status| status.is_some());
-                        let control_ready = Self::control_gate_ready_from_runtime_facts(
-                            registrant.control_initialized.load(Ordering::Acquire),
-                            source_replay_required,
-                            sink_replay_required,
-                            true,
-                        );
-                        api_control_gate.set_ready(control_ready);
-                        Self::publish_facade_service_state_from_runtime_facts(
-                            &registrant.facade_service_state,
-                            control_ready,
-                            true,
-                            pending_facade_present,
-                        );
+                        let ready_tail_decision =
+                            Self::facade_ready_tail_decision_from_runtime_facts(
+                                registrant.control_initialized.load(Ordering::Acquire),
+                                source_replay_required,
+                                sink_replay_required,
+                                true,
+                                true,
+                                pending_facade_present,
+                            );
+                        api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
+                        *registrant
+                            .facade_service_state
+                            .write()
+                            .expect("write published facade service state") =
+                            ready_tail_decision.published_state;
                         #[cfg(test)]
                         notify_pending_fixed_bind_handoff_completion_completion();
                         break;
@@ -7096,13 +7128,14 @@ impl FSMetaApp {
         if !control_ready {
             return false;
         }
+        let active_control_stream_ready = self.api_task.lock().await.as_ref().is_some_and(|active| {
+            active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+        });
         let Some(pending) = pending else {
-            return self.api_task.lock().await.as_ref().is_some_and(|active| {
-                active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-            });
+            return active_control_stream_ready;
         };
         if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL) {
-            return true;
+            return active_control_stream_ready;
         }
         let active_ready = self.api_task.lock().await.as_ref().is_some_and(|active| {
             active.route_key == pending.route_key && active.resource_ids == pending.resource_ids
@@ -7477,6 +7510,10 @@ impl FSMetaApp {
                 }
             }
             SourceControlWaveDisposition::ReplayRetained => {
+                #[cfg(test)]
+                note_source_apply_entry_for_tests();
+                #[cfg(test)]
+                maybe_pause_before_source_apply().await;
                 eprintln!("fs_meta_runtime_app: on_control_frame source.replay_retained begin");
                 self.apply_source_signals_with_recovery(&[], control_initialized_at_entry, false)
                     .await?;
@@ -7485,6 +7522,7 @@ impl FSMetaApp {
             SourceControlWaveDisposition::Idle => {}
         }
         let mut replayed_sink_state_after_uninitialized_source_recovery = false;
+        let mut replayed_sink_state_requires_local_status_republish = None;
         match sink_wave_disposition {
             SinkControlWaveDisposition::ApplyBeforeInitialSourceWave => {}
             SinkControlWaveDisposition::CleanupOnlyQueryWhileUninitialized => {
@@ -7547,6 +7585,10 @@ impl FSMetaApp {
                 }
             }
             SinkControlWaveDisposition::ReplayRetained => {
+                #[cfg(test)]
+                note_sink_apply_entry_for_tests();
+                #[cfg(test)]
+                maybe_pause_before_sink_apply().await;
                 eprintln!("fs_meta_runtime_app: on_control_frame sink.replay_retained begin");
                 let replay_signals = current_generation_sink_replay_tick(
                     &source_signals,
@@ -7559,6 +7601,17 @@ impl FSMetaApp {
                 eprintln!("fs_meta_runtime_app: on_control_frame sink.replay_retained ok");
                 replayed_sink_state_after_uninitialized_source_recovery =
                     !control_initialized_at_entry;
+                if control_initialized_at_entry && sink_status_publication_present {
+                    let expected_groups =
+                        Self::runtime_scoped_facade_group_ids(&self.source, &self.sink)
+                            .await?
+                            .into_iter()
+                            .collect::<std::collections::BTreeSet<_>>();
+                    if !expected_groups.is_empty() {
+                        replayed_sink_state_requires_local_status_republish =
+                            Some(expected_groups);
+                    }
+                }
             }
             SinkControlWaveDisposition::Idle => {}
         }
@@ -7646,6 +7699,12 @@ impl FSMetaApp {
             .await?;
         if !sink_cleanup_only_while_uninitialized {
             self.ensure_runtime_proxy_endpoints_started().await?;
+        }
+        if let Some(expected_groups) =
+            replayed_sink_state_requires_local_status_republish.as_ref()
+        {
+            self.wait_for_local_sink_status_republish_after_recovery(expected_groups)
+                .await?;
         }
         if let Some(expected_groups) = mixed_recovery_expected_sink_groups.as_ref() {
             self.wait_for_local_sink_status_republish_after_recovery(expected_groups)

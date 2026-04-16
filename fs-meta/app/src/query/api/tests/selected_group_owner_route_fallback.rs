@@ -113,6 +113,7 @@ async fn selected_group_materialized_route_falls_back_to_generic_proxy_when_owne
             shadow_lag_us: 0,
             overflow_pending_audit: false,
             initial_audit_completed: true,
+            readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
         }],

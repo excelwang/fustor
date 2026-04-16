@@ -498,13 +498,19 @@ fn merge_cached_local_scheduled_groups(
     }
 }
 
+#[derive(Default, Clone, Copy)]
+struct PrimedLocalScheduleSummary {
+    saw_activate_with_bound_scopes: bool,
+    has_local_runnable_groups: bool,
+}
+
 fn prime_cached_schedule_from_control_signals(
     cache: &mut SourceWorkerSnapshotCache,
     node_id: &NodeId,
     signals: &[SourceControlSignal],
     fallback_roots: &[RootSpec],
     fallback_grants: &[GrantedMountRoot],
-) {
+) -> PrimedLocalScheduleSummary {
     let changed_grants = signals.iter().rev().find_map(|signal| match signal {
         SourceControlSignal::RuntimeHostGrantChange { changed, .. } => Some((
             changed.version,
@@ -573,6 +579,8 @@ fn prime_cached_schedule_from_control_signals(
     };
     let mut scheduled_source = std::collections::BTreeSet::new();
     let mut scheduled_scan = std::collections::BTreeSet::new();
+    let mut saw_source_activate = false;
+    let mut saw_scan_activate = false;
     for signal in signals {
         let (unit, bound_scopes) = match signal {
             SourceControlSignal::Activate {
@@ -584,6 +592,10 @@ fn prime_cached_schedule_from_control_signals(
         let Some(bound_scopes) = bound_scopes else {
             continue;
         };
+        match unit {
+            SourceRuntimeUnit::Source => saw_source_activate = true,
+            SourceRuntimeUnit::Scan => saw_scan_activate = true,
+        }
         for scope in bound_scopes {
             let applies_locally = roots
                 .iter()
@@ -601,18 +613,49 @@ fn prime_cached_schedule_from_control_signals(
             }
         }
     }
-    if !scheduled_source.is_empty() {
+    let has_local_runnable_groups = !(scheduled_source.is_empty() && scheduled_scan.is_empty());
+    if saw_source_activate && scheduled_source.is_empty() {
+        cache.scheduled_source_groups_by_node = None;
+    } else if !scheduled_source.is_empty() {
         cache.scheduled_source_groups_by_node = Some(std::collections::BTreeMap::from([(
             stable_host_ref.clone(),
             scheduled_source.into_iter().collect::<Vec<_>>(),
         )]));
     }
-    if !scheduled_scan.is_empty() {
+    if saw_scan_activate && scheduled_scan.is_empty() {
+        cache.scheduled_scan_groups_by_node = None;
+    } else if !scheduled_scan.is_empty() {
         cache.scheduled_scan_groups_by_node = Some(std::collections::BTreeMap::from([(
             stable_host_ref,
             scheduled_scan.into_iter().collect::<Vec<_>>(),
         )]));
     }
+    PrimedLocalScheduleSummary {
+        saw_activate_with_bound_scopes: saw_source_activate || saw_scan_activate,
+        has_local_runnable_groups,
+    }
+}
+
+fn prime_cached_control_summary_from_control_signals(
+    cache: &mut SourceWorkerSnapshotCache,
+    node_id: &NodeId,
+    signals: &[SourceControlSignal],
+    fallback_grants: &[GrantedMountRoot],
+) {
+    let summary = summarize_source_control_signals(signals);
+    if summary.is_empty() {
+        return;
+    }
+    let grants = cache
+        .grants
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| fallback_grants.to_vec());
+    let stable_host_ref = stable_host_ref_for_node_id(node_id, &grants);
+    cache.last_control_frame_signals_by_node = Some(std::collections::BTreeMap::from([(
+        stable_host_ref,
+        summary,
+    )]));
 }
 
 fn summarize_bound_scopes(
@@ -700,6 +743,58 @@ fn summarize_source_observability_snapshot(snapshot: &SourceObservabilitySnapsho
         summarize_groups_by_node(&snapshot.published_path_origin_counts_by_node),
         snapshot.status.degraded_roots
     )
+}
+
+fn source_observability_snapshot_debug_maps_absent(
+    snapshot: &SourceObservabilitySnapshot,
+) -> bool {
+    snapshot.scheduled_source_groups_by_node.is_empty()
+        && snapshot.scheduled_scan_groups_by_node.is_empty()
+        && snapshot.last_control_frame_signals_by_node.is_empty()
+        && snapshot.published_batches_by_node.values().all(|count| *count == 0)
+        && snapshot.published_events_by_node.values().all(|count| *count == 0)
+        && snapshot
+            .published_control_events_by_node
+            .values()
+            .all(|count| *count == 0)
+        && snapshot
+            .published_data_events_by_node
+            .values()
+            .all(|count| *count == 0)
+        && snapshot.last_published_at_us_by_node.is_empty()
+        && snapshot.last_published_origins_by_node.is_empty()
+        && snapshot.published_origin_counts_by_node.is_empty()
+        && snapshot.enqueued_path_origin_counts_by_node.is_empty()
+        && snapshot.pending_path_origin_counts_by_node.is_empty()
+        && snapshot.yielded_path_origin_counts_by_node.is_empty()
+        && snapshot.summarized_path_origin_counts_by_node.is_empty()
+        && snapshot.published_path_origin_counts_by_node.is_empty()
+}
+
+fn source_observability_snapshot_has_active_state(
+    snapshot: &SourceObservabilitySnapshot,
+) -> bool {
+    snapshot.status.current_stream_generation.is_some()
+        || snapshot
+            .status
+            .logical_roots
+            .iter()
+            .any(|entry| entry.active_members > 0 || entry.status.eq_ignore_ascii_case("ready"))
+        || snapshot.status.concrete_roots.iter().any(|entry| {
+            entry.active
+                || entry.current_stream_generation.is_some()
+                || entry.emitted_batch_count > 0
+                || entry.forwarded_batch_count > 0
+                || entry.emitted_event_count > 0
+                || entry.forwarded_event_count > 0
+        })
+}
+
+fn recent_cached_source_observability_snapshot_is_incomplete(
+    snapshot: &SourceObservabilitySnapshot,
+) -> bool {
+    source_observability_snapshot_has_active_state(snapshot)
+        && source_observability_snapshot_debug_maps_absent(snapshot)
 }
 
 fn debug_source_status_lifecycle_enabled() -> bool {
@@ -3434,16 +3529,26 @@ impl SourceWorkerClientHandle {
                     }
                     let should_refresh_cached_schedule =
                         if let Some(signals) = decoded_signals.as_ref() {
-                            self.with_cache_mut(|cache| {
-                                prime_cached_schedule_from_control_signals(
+                            let primed_local_schedule = self.with_cache_mut(|cache| {
+                                let primed_local_schedule =
+                                    prime_cached_schedule_from_control_signals(
                                     cache,
                                     &self.node_id,
                                     signals,
                                     &self.config.roots,
                                     &self.config.host_object_grants,
                                 );
+                                prime_cached_control_summary_from_control_signals(
+                                    cache,
+                                    &self.node_id,
+                                    signals,
+                                    &self.config.host_object_grants,
+                                );
+                                primed_local_schedule
                             });
                             source_control_signals_require_post_ack_schedule_refresh(signals)
+                                && !(primed_local_schedule.saw_activate_with_bound_scopes
+                                    && !primed_local_schedule.has_local_runnable_groups)
                         } else {
                             true
                         };
@@ -3626,14 +3731,16 @@ impl SourceWorkerClientHandle {
                 .filter(|last| last.elapsed() < SOURCE_WORKER_NONBLOCKING_OBSERVABILITY_CACHE_TTL)
                 .and_then(|_| build_cached_worker_observability_snapshot(cache))
         }) {
-            if debug_control_scope_capture_enabled() {
-                eprintln!(
-                    "fs_meta_source_worker_client: observability_snapshot cache_fallback node={} reason=recent_live_cache {}",
-                    self.node_id.0,
-                    summarize_source_observability_snapshot(&snapshot)
-                );
+            if !recent_cached_source_observability_snapshot_is_incomplete(&snapshot) {
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_source_worker_client: observability_snapshot cache_fallback node={} reason=recent_live_cache {}",
+                        self.node_id.0,
+                        summarize_source_observability_snapshot(&snapshot)
+                    );
+                }
+                return Ok(snapshot);
             }
-            return Ok(snapshot);
         }
         let trace_id = next_source_status_trace_id();
         let mut trace_guard =

@@ -1163,6 +1163,225 @@ async fn events_stream_materializes_split_primary_mixed_cluster_publications_on_
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_logical_roots_preserves_pending_audit_scheduled_group_during_split_primary_refresh_when_siblings_are_ready()
+{
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+        RootSpec::new("nfs3", "/mnt/nfs3"),
+    ];
+    let host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-a::nfs2", "node-a", "10.0.0.12", "/mnt/nfs2", true),
+        granted_mount_root("node-b::nfs3", "node-b", "10.0.0.13", "/mnt/nfs3", true),
+    ];
+    cfg.host_object_grants = host_object_grants.clone();
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-d".to_string()), None, cfg).expect("init sink");
+
+    sink.enable_stream_receive();
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope("nfs1"),
+                bound_scope("nfs2"),
+                bound_scope("nfs3"),
+            ],
+        },
+    ))
+    .expect("encode split-primary stream activate")])
+        .await
+        .expect("activate split-primary stream route");
+
+    sink.ingest_stream_events(&[
+        mk_source_event(
+            "node-a::nfs1",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 1,
+                    ctime_us: 1,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                1,
+                false,
+            ),
+        ),
+        mk_control_event(
+            "node-a::nfs1",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            2,
+        ),
+        mk_source_event(
+            "node-a::nfs1",
+            mk_record(b"/pending-a.txt", "pending-a.txt", 3, EventKind::Update),
+        ),
+        mk_source_event(
+            "node-a::nfs2",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 5,
+                    ctime_us: 5,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                5,
+                false,
+            ),
+        ),
+        mk_control_event(
+            "node-a::nfs2",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            6,
+        ),
+        mk_source_event(
+            "node-a::nfs2",
+            mk_record(b"/ready-b.txt", "ready-b.txt", 7, EventKind::Update),
+        ),
+        mk_control_event(
+            "node-a::nfs2",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            8,
+        ),
+        mk_source_event(
+            "node-b::nfs3",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 9,
+                    ctime_us: 9,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                9,
+                false,
+            ),
+        ),
+        mk_control_event(
+            "node-b::nfs3",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            10,
+        ),
+        mk_source_event(
+            "node-b::nfs3",
+            mk_record(b"/ready-c.txt", "ready-c.txt", 11, EventKind::Update),
+        ),
+        mk_control_event(
+            "node-b::nfs3",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            12,
+        ),
+    ])
+    .expect("split-primary stream events should apply with nfs1 left pending-audit");
+
+    let snapshot_before = sink
+        .status_snapshot()
+        .expect("status before logical-roots refresh");
+    let nfs1_before = snapshot_before
+        .groups
+        .iter()
+        .find(|group| group.group_id == "nfs1")
+        .expect("nfs1 row before logical-roots refresh");
+    assert_eq!(
+        nfs1_before.readiness,
+        GroupReadinessState::PendingAudit,
+        "precondition: nfs1 must still be pending-audit before logical-roots refresh: {snapshot_before:?}"
+    );
+
+    sink.update_logical_roots(
+        vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+            RootSpec::new("nfs3", "/mnt/nfs3"),
+        ],
+        &host_object_grants,
+    )
+    .expect("logical-roots refresh should preserve pending-audit split-primary group");
+
+    let snapshot_after = sink
+        .status_snapshot()
+        .expect("status after logical-roots refresh");
+    let nfs1_after = snapshot_after
+        .groups
+        .iter()
+        .find(|group| group.group_id == "nfs1")
+        .expect("nfs1 row after logical-roots refresh");
+    assert_eq!(
+        nfs1_after.readiness,
+        GroupReadinessState::PendingAudit,
+        "logical-roots refresh must preserve pending-audit readiness for nfs1 instead of dropping it or rewriting it as another state: {snapshot_after:?}"
+    );
+    let scheduled_after = snapshot_after
+        .scheduled_groups_by_node
+        .values()
+        .flat_map(|groups| groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        scheduled_after.contains("nfs1"),
+        "logical-roots refresh must preserve pending-audit scheduled groups instead of dropping nfs1 from scheduled_groups_by_node: {snapshot_after:?}"
+    );
+
+    sink.ingest_stream_events(&[mk_control_event(
+        "node-a::nfs1",
+        ControlEvent::EpochEnd {
+            epoch_id: 0,
+            epoch_type: EpochType::Audit,
+        },
+        13,
+    )])
+    .expect("nfs1 audit end after logical-roots refresh should apply");
+
+    let snapshot_ready = sink
+        .status_snapshot()
+        .expect("status after nfs1 audit end post-refresh");
+    let nfs1_ready = snapshot_ready
+        .groups
+        .iter()
+        .find(|group| group.group_id == "nfs1")
+        .expect("nfs1 row after audit end post-refresh");
+    assert_eq!(
+        nfs1_ready.readiness,
+        GroupReadinessState::Ready,
+        "nfs1 should become ready after its pending audit completes without requiring a second reactivate: {snapshot_ready:?}"
+    );
+}
+
 #[test]
 fn group_primary_prefers_lowest_active_process_member() {
     let mut cfg = SourceConfig::default();
@@ -2792,6 +3011,151 @@ async fn update_logical_roots_does_not_widen_runtime_scope_back_to_all_roots_whe
     sink.close().await.expect("close sink");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_logical_roots_drops_unrelated_pending_audit_group_from_local_sink_schedule_after_force_find_stress_scope_contraction(
+) {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+        RootSpec::new("nfs3", "/mnt/nfs3"),
+    ];
+    let host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-a::nfs2", "node-a", "10.0.0.12", "/mnt/nfs2", true),
+        granted_mount_root("node-b::nfs3", "node-b", "10.0.0.13", "/mnt/nfs3", true),
+    ];
+    cfg.host_object_grants = host_object_grants.clone();
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-d".to_string()), None, cfg).expect("init sink");
+
+    let activate_force_find_subset =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 2,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+            ],
+        }))
+        .expect("encode force-find subset activate");
+    sink.on_control_frame(&[activate_force_find_subset])
+        .await
+        .expect("force-find subset activate should pass");
+
+    let scheduled_before = sink
+        .scheduled_group_ids_snapshot()
+        .expect("scheduled group ids before retained pending injection")
+        .expect("runtime schedule should exist before retained pending injection");
+    assert_eq!(
+        scheduled_before,
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        "precondition: force-find subset schedule must start contracted to nfs1/nfs2"
+    );
+
+    {
+        let mut state = sink
+            .state
+            .write()
+            .expect("state lock before retained pending injection");
+        state.groups.remove("nfs3");
+        let mut retained_nfs3 =
+            GroupSinkState::new("node-b::nfs3".to_string(), TombstonePolicy::default());
+        retained_nfs3.materialized_revision = 2;
+        retained_nfs3.tree.insert(
+            b"/pending-c.txt".to_vec(),
+            tree::FileMetaNode {
+                size: 1,
+                modified_time_us: 11,
+                created_time_us: 11,
+                is_dir: false,
+                source: crate::SyncTrack::Scan,
+                monitoring_attested: true,
+                last_confirmed_at: None,
+                suspect_until: None,
+                blind_spot: false,
+                is_tombstoned: false,
+                tombstone_expires_at: None,
+                last_seen_epoch: 0,
+                subtree_last_write_significant_change_at: None,
+            },
+        );
+        state
+            .retained_groups
+            .insert("nfs3".to_string(), retained_nfs3);
+    }
+
+    {
+        let state = sink
+            .state
+            .read()
+            .expect("state lock after force-find subset contraction");
+        assert!(
+            !state.groups.contains_key("nfs3"),
+            "force-find subset contraction should move nfs3 out of active groups: groups={:?}",
+            state.groups.keys().collect::<Vec<_>>()
+        );
+        let retained_nfs3 = state
+            .retained_groups
+            .get("nfs3")
+            .expect("nfs3 must be retained after force-find subset contraction");
+        assert_eq!(
+            retained_nfs3.group_readiness_state(),
+            GroupReadinessState::PendingAudit,
+            "retained nfs3 must stay pending-audit after force-find subset contraction"
+        );
+    }
+
+    sink.update_logical_roots(
+        vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+            RootSpec::new("nfs3", "/mnt/nfs3"),
+        ],
+        &host_object_grants,
+    )
+    .expect("logical-roots sync should preserve the contracted force-find subset");
+
+    let scheduled_after = sink
+        .scheduled_group_ids_snapshot()
+        .expect("scheduled group ids after logical-roots sync")
+        .expect("runtime schedule should remain available after logical-roots sync");
+    assert_eq!(
+        scheduled_after,
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        "logical-roots sync must not re-add unrelated pending-audit nfs3 after force-find subset contraction"
+    );
+
+    let snapshot_after = sink
+        .status_snapshot()
+        .expect("status after logical-roots sync preserves force-find subset");
+    let after_groups = snapshot_after
+        .groups
+        .iter()
+        .map(|group| group.group_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        after_groups,
+        std::collections::BTreeSet::from(["nfs1", "nfs2"]),
+        "logical-roots sync must not export unrelated pending-audit nfs3 after force-find subset contraction: {snapshot_after:?}"
+    );
+    let scheduled_after_snapshot = snapshot_after
+        .scheduled_groups_by_node
+        .values()
+        .flat_map(|groups| groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        scheduled_after_snapshot,
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        "logical-roots sync must not republish nfs3 in scheduled_groups_by_node after force-find subset contraction: {snapshot_after:?}"
+    );
+
+    sink.close().await.expect("close sink");
+}
+
 #[tokio::test]
 async fn retained_root_id_ready_state_survives_same_instance_scope_wobble_and_later_reactivate() {
     let mut cfg = SourceConfig::default();
@@ -3420,6 +3784,183 @@ async fn buffered_audit_control_events_restore_initial_audit_after_grants_catch_
 }
 
 #[tokio::test]
+async fn active_stream_route_refreshes_dynamic_object_refs_and_accepts_new_origin_batches() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+    ];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-a::nfs2", "node-a", "10.0.0.12", "/mnt/nfs2", true),
+    ];
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("init sink");
+
+    sink.enable_stream_receive();
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope("nfs1"), bound_scope("nfs2")],
+        },
+    ))
+    .expect("encode stream activate")])
+    .await
+    .expect("activate stream route");
+
+    assert_eq!(
+        sink.scheduled_stream_object_refs()
+            .expect("scheduled stream refs before grants refresh"),
+        Some(std::collections::BTreeSet::from([
+            "node-a::nfs1".to_string(),
+            "node-a::nfs2".to_string(),
+        ])),
+        "precondition: stream route should start from the initial concrete object refs"
+    );
+
+    let grants_changed = host_object_grants_changed_envelope(
+        1,
+        &[
+            granted_mount_root(
+                "node-a-activation-42::nfs1",
+                "node-a",
+                "10.0.0.11",
+                "/mnt/nfs1",
+                true,
+            ),
+            granted_mount_root(
+                "node-a-activation-42::nfs2",
+                "node-a",
+                "10.0.0.12",
+                "/mnt/nfs2",
+                true,
+            ),
+        ],
+    );
+    sink.on_control_frame(&[grants_changed])
+        .await
+        .expect("grants refresh should update stream targets");
+
+    assert_eq!(
+        sink.scheduled_stream_object_refs()
+            .expect("scheduled stream refs after grants refresh"),
+        Some(std::collections::BTreeSet::from([
+            "node-a-activation-42::nfs1".to_string(),
+            "node-a-activation-42::nfs2".to_string(),
+        ])),
+        "active stream route must refresh its concrete object refs after host grant refresh"
+    );
+
+    sink.ingest_stream_events(&[
+        mk_source_event(
+            "node-a-activation-42::nfs1",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 1,
+                    ctime_us: 1,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                1,
+                false,
+            ),
+        ),
+        mk_control_event(
+            "node-a-activation-42::nfs1",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            2,
+        ),
+        mk_source_event(
+            "node-a-activation-42::nfs1",
+            mk_record(b"/ready-a.txt", "ready-a.txt", 3, EventKind::Update),
+        ),
+        mk_control_event(
+            "node-a-activation-42::nfs1",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            4,
+        ),
+        mk_source_event(
+            "node-a-activation-42::nfs2",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 5,
+                    ctime_us: 5,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                5,
+                false,
+            ),
+        ),
+        mk_control_event(
+            "node-a-activation-42::nfs2",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            6,
+        ),
+        mk_source_event(
+            "node-a-activation-42::nfs2",
+            mk_record(b"/ready-b.txt", "ready-b.txt", 7, EventKind::Update),
+        ),
+        mk_control_event(
+            "node-a-activation-42::nfs2",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            8,
+        ),
+    ])
+    .expect("stream events with refreshed object refs should apply");
+
+    let snapshot = sink
+        .status_snapshot()
+        .expect("status after refreshed object-ref stream ingest");
+    assert_eq!(
+        snapshot
+            .stream_received_batches_by_node
+            .get("node-a")
+            .copied()
+            .unwrap_or(0),
+        1,
+        "sink should record one received stream batch after refreshed object-ref ingress: {snapshot:?}"
+    );
+    let ready_groups = snapshot
+        .groups
+        .iter()
+        .filter(|group| group.readiness == GroupReadinessState::Ready && group.live_nodes > 0)
+        .map(|group| group.group_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        ready_groups,
+        std::collections::BTreeSet::from(["nfs1", "nfs2"]),
+        "refreshed object-ref ingress must still materialize both contracted groups: {snapshot:?}"
+    );
+}
+
+#[tokio::test]
 async fn runtime_scoped_send_ignores_out_of_scope_group_events() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![
@@ -3660,6 +4201,89 @@ async fn initial_audit_completion_waits_for_materialized_root() {
     assert!(
         snapshot.groups[0].initial_audit_completed,
         "materialized root should unlock initial audit readiness after audit completion"
+    );
+}
+
+#[tokio::test]
+async fn status_snapshot_exports_waiting_for_materialized_root_after_audit_completes_without_materialized_root()
+{
+    let sink = build_single_group_sink();
+    sink.send(&[
+        mk_control_event(
+            "node-a::exp",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            1,
+        ),
+        mk_control_event(
+            "node-a::exp",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            2,
+        ),
+    ])
+    .await
+    .expect("apply empty audit epoch");
+
+    let snapshot = sink.status_snapshot().expect("sink status");
+    assert_eq!(snapshot.groups.len(), 1);
+    assert_eq!(
+        snapshot.groups[0].readiness,
+        GroupReadinessState::WaitingForMaterializedRoot,
+        "status snapshot must export the distinct waiting-for-materialized-root state after audit completes without a live materialized root: {snapshot:?}"
+    );
+    assert!(
+        !snapshot.groups[0].initial_audit_completed,
+        "waiting-for-materialized-root must still leave initial_audit_completed=false in the compatibility bit"
+    );
+}
+
+#[tokio::test]
+async fn status_snapshot_exports_audit_epoch_completed_alongside_waiting_for_materialized_root()
+{
+    let sink = build_single_group_sink();
+    sink.send(&[
+        mk_control_event(
+            "node-a::exp",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            1,
+        ),
+        mk_control_event(
+            "node-a::exp",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            2,
+        ),
+    ])
+    .await
+    .expect("apply empty audit epoch");
+
+    let snapshot = sink.status_snapshot().expect("sink status");
+    assert_eq!(snapshot.groups.len(), 1);
+    let group = &snapshot.groups[0];
+    assert_eq!(
+        group.readiness,
+        GroupReadinessState::WaitingForMaterializedRoot,
+        "status snapshot must keep the distinct waiting-for-materialized-root state after audit completes without a live materialized root: {snapshot:?}"
+    );
+    assert!(
+        !group.initial_audit_completed,
+        "waiting-for-materialized-root must keep the legacy compatibility bit false"
+    );
+    let group_json = serde_json::to_value(group).expect("serialize sink group status snapshot");
+    assert_eq!(
+        group_json["audit_epoch_completed"],
+        serde_json::Value::Bool(true),
+        "status snapshot export must surface the raw audit-epoch-completed bit alongside waiting-for-materialized-root compatibility fields: {group_json}"
     );
 }
 

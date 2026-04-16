@@ -150,6 +150,14 @@ pub struct StatusSourceDebug {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StatusSinkGroupReadiness {
+    PendingAudit,
+    WaitingForMaterializedRoot,
+    Ready,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct StatusSinkGroup {
     pub group_id: String,
     pub primary_object_ref: String,
@@ -162,6 +170,7 @@ pub struct StatusSinkGroup {
     pub shadow_time_us: u64,
     pub shadow_lag_us: u64,
     pub overflow_pending_audit: bool,
+    pub readiness: StatusSinkGroupReadiness,
     pub initial_audit_completed: bool,
     pub estimated_heap_bytes: u64,
 }

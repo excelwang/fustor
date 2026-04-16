@@ -988,6 +988,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
+            readiness: crate::sink::GroupReadinessState::PendingAudit,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -1004,6 +1005,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
+            readiness: crate::sink::GroupReadinessState::PendingAudit,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -1176,6 +1178,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
+            readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -1192,6 +1195,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
+            readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -2393,6 +2397,405 @@ async fn ordinary_current_generation_source_sink_and_facade_ticks_do_not_reenter
     assert!(
         !app.sink_state_replay_required.load(Ordering::Acquire),
         "ordinary steady mixed source/sink/facade ticks must leave retained sink replay disarmed when replay is not required"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replay_only_source_followup_reenters_source_apply_once_when_source_replay_required() {
+    struct SourceApplyEntryCountHookReset;
+
+    impl Drop for SourceApplyEntryCountHookReset {
+        fn drop(&mut self) {
+            clear_source_apply_entry_count_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    fs::create_dir_all(nfs1.join("replay-source")).expect("create nfs1 dir");
+    fs::create_dir_all(nfs2.join("replay-source")).expect("create nfs2 dir");
+    fs::write(nfs1.join("replay-source").join("seed.txt"), b"a").expect("seed nfs1");
+    fs::write(nfs2.join("replay-source").join("seed.txt"), b"b").expect("seed nfs2");
+
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_root("nfs1", &nfs1), worker_root("nfs2", &nfs2)],
+                    host_object_grants: vec![
+                        worker_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+                        worker_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+                    ],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".to_string()),
+            Some(boundary.clone()),
+            Some(boundary),
+            state_boundary,
+        )
+        .expect("init external-worker runtime app"),
+    );
+
+    let expected_groups =
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+
+    let source_wave = |generation| {
+        vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+        ]
+    };
+    let sink_wave = |generation| {
+        let root_scopes = &[
+            ("nfs1", &["node-a::nfs1"][..]),
+            ("nfs2", &["node-a::nfs2"][..]),
+        ];
+        vec![
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                root_scopes,
+                generation,
+            ),
+        ]
+    };
+
+    let mut initial = source_wave(2);
+    initial.extend(sink_wave(2));
+    app.on_control_frame(&initial)
+        .await
+        .expect("generation-two source/sink activate should succeed before replay-only source followup");
+
+    let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let source_groups = app
+            .source
+            .scheduled_source_group_ids()
+            .await
+            .expect("source groups")
+            .unwrap_or_default();
+        let scan_groups = app
+            .source
+            .scheduled_scan_group_ids()
+            .await
+            .expect("scan groups")
+            .unwrap_or_default();
+        let sink_groups = app
+            .sink
+            .scheduled_group_ids()
+            .await
+            .expect("sink groups")
+            .unwrap_or_default();
+        if source_groups == expected_groups
+            && scan_groups == expected_groups
+            && sink_groups == expected_groups
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < scheduling_deadline,
+            "timed out waiting for generation-two scope convergence before replay-only source followup: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        app.control_initialized(),
+        "replay-only source followup requires runtime control to remain initialized before the followup"
+    );
+    app.source_state_replay_required
+        .store(true, Ordering::Release);
+    app.sink_state_replay_required
+        .store(false, Ordering::Release);
+
+    let source_apply_entries = Arc::new(AtomicUsize::new(0));
+    let _source_apply_entry_reset = SourceApplyEntryCountHookReset;
+    install_source_apply_entry_count_hook(source_apply_entries.clone());
+
+    app.on_control_frame(&[tick_envelope(
+        execution_units::FACADE_RUNTIME_UNIT_ID,
+        2,
+    )])
+    .await
+    .expect(
+        "replay-only source followup should settle without exhausting runtime_app control recovery",
+    );
+
+    assert_eq!(
+        source_apply_entries.load(Ordering::Acquire),
+        1,
+        "source replay-only followup must re-enter runtime_app source.apply exactly once when source replay is required",
+    );
+    assert!(
+        !app.source_state_replay_required.load(Ordering::Acquire),
+        "source replay-only followup must clear retained source replay after replaying current-generation state"
+    );
+    assert!(
+        !app.sink_state_replay_required.load(Ordering::Acquire),
+        "source replay-only followup must not arm retained sink replay when no sink replay is required"
+    );
+    assert!(
+        app.control_initialized(),
+        "source replay-only followup must leave runtime control initialized after replay completes"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replay_only_sink_followup_reenters_sink_apply_once_and_local_sink_status_republish_helper_once_when_sink_replay_required()
+{
+    struct SinkApplyEntryCountHookReset;
+    struct LocalSinkStatusRepublishHelperEntryCountHookReset;
+
+    impl Drop for SinkApplyEntryCountHookReset {
+        fn drop(&mut self) {
+            clear_sink_apply_entry_count_hook();
+        }
+    }
+
+    impl Drop for LocalSinkStatusRepublishHelperEntryCountHookReset {
+        fn drop(&mut self) {
+            clear_local_sink_status_republish_helper_entry_count_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    fs::create_dir_all(nfs1.join("replay-sink")).expect("create nfs1 dir");
+    fs::create_dir_all(nfs2.join("replay-sink")).expect("create nfs2 dir");
+    fs::write(nfs1.join("replay-sink").join("seed.txt"), b"a").expect("seed nfs1");
+    fs::write(nfs2.join("replay-sink").join("seed.txt"), b"b").expect("seed nfs2");
+
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_root("nfs1", &nfs1), worker_root("nfs2", &nfs2)],
+                    host_object_grants: vec![
+                        worker_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+                        worker_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+                    ],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".to_string()),
+            Some(boundary.clone()),
+            Some(boundary),
+            state_boundary,
+        )
+        .expect("init external-worker runtime app"),
+    );
+
+    let expected_groups =
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+
+    let source_wave = |generation| {
+        vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+        ]
+    };
+    let sink_wave = |generation| {
+        let root_scopes = &[
+            ("nfs1", &["node-a::nfs1"][..]),
+            ("nfs2", &["node-a::nfs2"][..]),
+        ];
+        vec![
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                root_scopes,
+                generation,
+            ),
+        ]
+    };
+
+    let mut initial = source_wave(2);
+    initial.extend(sink_wave(2));
+    initial.push(activate_envelope_with_route_key_and_scope_rows(
+        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+        format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+        &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+        2,
+    ));
+    app.on_control_frame(&initial)
+        .await
+        .expect("generation-two source/sink activate should succeed before replay-only sink followup");
+
+    let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let source_groups = app
+            .source
+            .scheduled_source_group_ids()
+            .await
+            .expect("source groups")
+            .unwrap_or_default();
+        let scan_groups = app
+            .source
+            .scheduled_scan_group_ids()
+            .await
+            .expect("scan groups")
+            .unwrap_or_default();
+        let sink_groups = app
+            .sink
+            .scheduled_group_ids()
+            .await
+            .expect("sink groups")
+            .unwrap_or_default();
+        if source_groups == expected_groups
+            && scan_groups == expected_groups
+            && sink_groups == expected_groups
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < scheduling_deadline,
+            "timed out waiting for generation-two scope convergence before replay-only sink followup: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        app.control_initialized(),
+        "replay-only sink followup requires runtime control to remain initialized before the followup"
+    );
+    app.source_state_replay_required
+        .store(false, Ordering::Release);
+    app.sink_state_replay_required.store(true, Ordering::Release);
+
+    let sink_apply_entries = Arc::new(AtomicUsize::new(0));
+    let helper_entries = Arc::new(AtomicUsize::new(0));
+    let _sink_apply_entry_reset = SinkApplyEntryCountHookReset;
+    let _helper_entry_reset = LocalSinkStatusRepublishHelperEntryCountHookReset;
+    install_sink_apply_entry_count_hook(sink_apply_entries.clone());
+    install_local_sink_status_republish_helper_entry_count_hook(helper_entries.clone());
+
+    app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+        format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+        &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+        2,
+    )])
+    .await
+    .expect(
+        "replay-only sink followup should settle without exhausting runtime_app control recovery",
+    );
+
+    assert_eq!(
+        sink_apply_entries.load(Ordering::Acquire),
+        1,
+        "sink replay-only followup must re-enter runtime_app sink.apply exactly once when sink replay is required",
+    );
+    assert_eq!(
+        helper_entries.load(Ordering::Acquire),
+        1,
+        "sink replay-only followup must enter the local sink-status republish helper exactly once when sink replay is required",
+    );
+    assert!(
+        !app.sink_state_replay_required.load(Ordering::Acquire),
+        "sink replay-only followup must clear retained sink replay after replaying current-generation state"
+    );
+    assert!(
+        !app.source_state_replay_required.load(Ordering::Acquire),
+        "sink replay-only followup must not arm retained source replay when only sink replay is required"
+    );
+    assert!(
+        app.control_initialized(),
+        "sink replay-only followup must leave runtime control initialized after replay completes"
     );
 
     app.close().await.expect("close app");

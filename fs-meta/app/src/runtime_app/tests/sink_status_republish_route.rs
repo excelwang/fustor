@@ -1410,6 +1410,7 @@ async fn sink_status_route_reuses_cached_ready_snapshot_when_replay_required_pro
                     shadow_lag_us: 0,
                     overflow_pending_audit: false,
                     initial_audit_completed: false,
+            readiness: crate::sink::GroupReadinessState::PendingAudit,
                     materialized_revision: 1,
                     estimated_heap_bytes: 0,
                 }],

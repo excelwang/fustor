@@ -247,6 +247,7 @@ async fn selected_group_materialized_route_prefers_sink_primary_object_ref_when_
             shadow_lag_us: 0,
             overflow_pending_audit: false,
             initial_audit_completed: true,
+            readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
         }],

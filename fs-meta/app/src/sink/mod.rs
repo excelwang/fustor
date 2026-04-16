@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::FutureExt;
+use serde::ser::SerializeStruct;
 
 use capanix_app_sdk::runtime::{
     ControlEnvelope, EventMetadata, NodeId, RecvOpts, RouteKey, StateCellHandle,
@@ -335,7 +336,7 @@ impl VisibilityLagTelemetry {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct SinkGroupStatusSnapshot {
     pub group_id: String,
     pub primary_object_ref: String,
@@ -348,9 +349,42 @@ pub struct SinkGroupStatusSnapshot {
     pub shadow_time_us: u64,
     pub shadow_lag_us: u64,
     pub overflow_pending_audit: bool,
+    pub readiness: GroupReadinessState,
     pub initial_audit_completed: bool,
     pub materialized_revision: u64,
     pub estimated_heap_bytes: u64,
+}
+
+impl SinkGroupStatusSnapshot {
+    pub fn audit_epoch_completed(&self) -> bool {
+        !matches!(self.readiness, GroupReadinessState::PendingAudit)
+    }
+}
+
+impl serde::Serialize for SinkGroupStatusSnapshot {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("SinkGroupStatusSnapshot", 16)?;
+        state.serialize_field("group_id", &self.group_id)?;
+        state.serialize_field("primary_object_ref", &self.primary_object_ref)?;
+        state.serialize_field("total_nodes", &self.total_nodes)?;
+        state.serialize_field("live_nodes", &self.live_nodes)?;
+        state.serialize_field("tombstoned_count", &self.tombstoned_count)?;
+        state.serialize_field("attested_count", &self.attested_count)?;
+        state.serialize_field("suspect_count", &self.suspect_count)?;
+        state.serialize_field("blind_spot_count", &self.blind_spot_count)?;
+        state.serialize_field("shadow_time_us", &self.shadow_time_us)?;
+        state.serialize_field("shadow_lag_us", &self.shadow_lag_us)?;
+        state.serialize_field("overflow_pending_audit", &self.overflow_pending_audit)?;
+        state.serialize_field("readiness", &self.readiness)?;
+        state.serialize_field("audit_epoch_completed", &self.audit_epoch_completed())?;
+        state.serialize_field("initial_audit_completed", &self.initial_audit_completed)?;
+        state.serialize_field("materialized_revision", &self.materialized_revision)?;
+        state.serialize_field("estimated_heap_bytes", &self.estimated_heap_bytes)?;
+        state.end()
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -448,8 +482,8 @@ fn sample_visibility_lag(
 }
 
 /// Internal per-group state of the sink app.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GroupReadinessState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GroupReadinessState {
     PendingAudit,
     WaitingForMaterializedRoot,
     Ready,
@@ -2604,7 +2638,10 @@ impl SinkFileMeta {
                 .read()?
                 .retained_groups
                 .iter()
-                .filter(|(_, group)| group.preserves_materialized_state_for_omission_window())
+                .filter(|(_, group)| {
+                    group.preserves_materialized_state_for_omission_window()
+                        && !matches!(group.group_readiness_state(), GroupReadinessState::PendingAudit)
+                })
                 .map(|(group_id, _)| group_id.clone())
                 .collect::<BTreeSet<_>>();
             let next_allowed_groups = current_allowed_groups
@@ -2677,6 +2714,7 @@ impl SinkFileMeta {
             let stats = query::get_health_stats(&group.tree, &group.clock);
             let estimated_heap_bytes = group.tree.estimated_heap_bytes();
             accumulate_status_snapshot(&mut snapshot, &stats, estimated_heap_bytes);
+            let readiness = group.group_readiness_state();
             groups.push(SinkGroupStatusSnapshot {
                 group_id: group_id.clone(),
                 primary_object_ref: group.primary_object_ref.clone(),
@@ -2693,6 +2731,7 @@ impl SinkFileMeta {
                     now.saturating_sub(stats.shadow_time_us)
                 },
                 overflow_pending_audit: group.overflow_pending_audit,
+                readiness,
                 initial_audit_completed: group.initial_audit_completed(),
                 materialized_revision: group.materialized_revision,
                 estimated_heap_bytes,

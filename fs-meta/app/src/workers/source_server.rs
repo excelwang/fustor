@@ -585,13 +585,13 @@ async fn fail_closed_if_publish_pump_dead(
 }
 
 fn last_control_frame_signals_by_node(
-    node_id: &NodeId,
+    node_key: &str,
     signals: &[String],
 ) -> std::collections::BTreeMap<String, Vec<String>> {
     if signals.is_empty() {
         return std::collections::BTreeMap::new();
     }
-    std::collections::BTreeMap::from([(node_id.0.clone(), signals.to_vec())])
+    std::collections::BTreeMap::from([(node_key.to_string(), signals.to_vec())])
 }
 
 fn source_observability_snapshot(
@@ -640,33 +640,33 @@ fn source_observability_snapshot(
             })
             .unwrap_or_default(),
         last_control_frame_signals_by_node: last_control_frame_signals_by_node(
-            &node_id,
+            &stable_host_ref,
             last_control_frame_signals,
         ),
         published_batches_by_node: std::collections::BTreeMap::from([(
-            node_id.0.clone(),
+            stable_host_ref.clone(),
             published.batch_count,
         )]),
         published_events_by_node: std::collections::BTreeMap::from([(
-            node_id.0.clone(),
+            stable_host_ref.clone(),
             published.event_count,
         )]),
         published_control_events_by_node: std::collections::BTreeMap::from([(
-            node_id.0.clone(),
+            stable_host_ref.clone(),
             published.control_event_count,
         )]),
         published_data_events_by_node: std::collections::BTreeMap::from([(
-            node_id.0.clone(),
+            stable_host_ref.clone(),
             published.data_event_count,
         )]),
         last_published_at_us_by_node: published
             .last_published_at_us
-            .map(|ts| std::collections::BTreeMap::from([(node_id.0.clone(), ts)]))
+            .map(|ts| std::collections::BTreeMap::from([(stable_host_ref.clone(), ts)]))
             .unwrap_or_default(),
         last_published_origins_by_node: (!published.last_published_origins.is_empty())
             .then(|| {
                 std::collections::BTreeMap::from([(
-                    node_id.0.clone(),
+                    stable_host_ref.clone(),
                     published.last_published_origins.clone(),
                 )])
             })
@@ -674,7 +674,7 @@ fn source_observability_snapshot(
         published_origin_counts_by_node: (!published.published_origin_counts.is_empty())
             .then(|| {
                 std::collections::BTreeMap::from([(
-                    node_id.0.clone(),
+                    stable_host_ref.clone(),
                     published
                         .published_origin_counts
                         .iter()
@@ -688,7 +688,7 @@ fn source_observability_snapshot(
         enqueued_path_origin_counts_by_node: (!enqueued_path_origin_counts.is_empty())
             .then(|| {
                 std::collections::BTreeMap::from([(
-                    node_id.0.clone(),
+                    stable_host_ref.clone(),
                     enqueued_path_origin_counts
                         .iter()
                         .map(|(origin, count)| format!("{origin}={count}"))
@@ -699,7 +699,7 @@ fn source_observability_snapshot(
         pending_path_origin_counts_by_node: (!pending_path_origin_counts.is_empty())
             .then(|| {
                 std::collections::BTreeMap::from([(
-                    node_id.0.clone(),
+                    stable_host_ref.clone(),
                     pending_path_origin_counts
                         .iter()
                         .map(|(origin, count)| format!("{origin}={count}"))
@@ -710,7 +710,7 @@ fn source_observability_snapshot(
         yielded_path_origin_counts_by_node: (!yielded_path_origin_counts.is_empty())
             .then(|| {
                 std::collections::BTreeMap::from([(
-                    node_id.0.clone(),
+                    stable_host_ref.clone(),
                     yielded_path_origin_counts
                         .iter()
                         .map(|(origin, count)| format!("{origin}={count}"))
@@ -723,7 +723,7 @@ fn source_observability_snapshot(
             .is_empty())
         .then(|| {
             std::collections::BTreeMap::from([(
-                node_id.0.clone(),
+                stable_host_ref.clone(),
                 published
                     .summarized_path_origin_counts
                     .iter()
@@ -735,7 +735,7 @@ fn source_observability_snapshot(
         published_path_origin_counts_by_node: (!published.published_path_origin_counts.is_empty())
             .then(|| {
                 std::collections::BTreeMap::from([(
-                    node_id.0.clone(),
+                    stable_host_ref.clone(),
                     published
                         .published_path_origin_counts
                         .iter()
@@ -3276,8 +3276,24 @@ mod tests {
 
         let snapshot = source_observability_snapshot(
             &source,
-            &[],
-            &Arc::new(StdMutex::new(PublishedBatchStats::default())),
+            &["activate unit=runtime.exec.source route=source-logical-roots-control:v1.stream generation=2 scopes=[\"nfs2=>node-d::nfs2\"]".to_string()],
+            &Arc::new(StdMutex::new(PublishedBatchStats {
+                batch_count: 12,
+                event_count: 345,
+                control_event_count: 6,
+                data_event_count: 339,
+                last_published_at_us: Some(123456),
+                last_published_origins: vec!["node-d::nfs2=4".to_string()],
+                published_origin_counts: std::collections::BTreeMap::from([
+                    ("node-d::nfs2".to_string(), 10),
+                ]),
+                summarized_path_origin_counts: std::collections::BTreeMap::from([
+                    ("node-d::nfs2".to_string(), 7),
+                ]),
+                published_path_origin_counts: std::collections::BTreeMap::from([
+                    ("node-d::nfs2".to_string(), 7),
+                ]),
+            })),
         );
         let expected = vec!["nfs2".to_string()];
         assert_eq!(
@@ -3302,6 +3318,66 @@ mod tests {
             "instance-suffixed node id should not leak into scheduled scan groups: {:?}",
             snapshot.scheduled_scan_groups_by_node
         );
+        assert_eq!(
+            snapshot.last_control_frame_signals_by_node.get("node-d"),
+            Some(&vec!["activate unit=runtime.exec.source route=source-logical-roots-control:v1.stream generation=2 scopes=[\"nfs2=>node-d::nfs2\"]".to_string()])
+        );
+        assert_eq!(
+            snapshot.published_batches_by_node.get("node-d"),
+            Some(&12)
+        );
+        assert_eq!(
+            snapshot.published_events_by_node.get("node-d"),
+            Some(&345)
+        );
+        assert_eq!(
+            snapshot.published_control_events_by_node.get("node-d"),
+            Some(&6)
+        );
+        assert_eq!(
+            snapshot.published_data_events_by_node.get("node-d"),
+            Some(&339)
+        );
+        assert_eq!(
+            snapshot.last_published_at_us_by_node.get("node-d"),
+            Some(&123456)
+        );
+        assert!(
+            snapshot
+                .last_published_origins_by_node
+                .get("node-d")
+                .is_some_and(|origins| origins.iter().any(|entry| entry == "node-d::nfs2=4"))
+        );
+        assert!(
+            snapshot
+                .published_path_origin_counts_by_node
+                .get("node-d")
+                .is_some_and(|counts| counts.iter().any(|entry| entry == "node-d::nfs2=7"))
+        );
+        for leaked in [
+            &snapshot.last_control_frame_signals_by_node,
+            &snapshot.last_published_origins_by_node,
+            &snapshot.published_origin_counts_by_node,
+            &snapshot.summarized_path_origin_counts_by_node,
+            &snapshot.published_path_origin_counts_by_node,
+        ] {
+            assert!(
+                !leaked.contains_key("node-d-29775443922859927994892289"),
+                "instance-suffixed node id should not leak into observability export maps: {leaked:?}"
+            );
+        }
+        for leaked in [
+            &snapshot.published_batches_by_node,
+            &snapshot.published_events_by_node,
+            &snapshot.published_control_events_by_node,
+            &snapshot.published_data_events_by_node,
+            &snapshot.last_published_at_us_by_node,
+        ] {
+            assert!(
+                !leaked.contains_key("node-d-29775443922859927994892289"),
+                "instance-suffixed node id should not leak into observability export maps: {leaked:?}"
+            );
+        }
     }
 
     #[tokio::test]

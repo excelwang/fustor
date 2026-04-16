@@ -483,13 +483,13 @@ pub(crate) fn merge_sink_status_snapshots(
                 .entry(group.group_id.clone())
                 .and_modify(|current| {
                     let current_score = (
-                        u8::from(current.initial_audit_completed),
+                        u8::from(sink_group_readiness_reports_live_materialized_group(current)),
                         current.total_nodes,
                         current.live_nodes,
                         current.shadow_time_us,
                     );
                     let incoming_score = (
-                        u8::from(group.initial_audit_completed),
+                        u8::from(sink_group_readiness_reports_live_materialized_group(&group)),
                         group.total_nodes,
                         group.live_nodes,
                         group.shadow_time_us,
@@ -879,6 +879,32 @@ async fn load_materialized_status_snapshots(
     Ok((source_status, sink_status))
 }
 
+async fn load_request_scoped_materialized_sink_status_snapshot(
+    state: &ApiState,
+    timeout: Duration,
+) -> Option<SinkStatusSnapshot> {
+    let readiness_groups = scan_enabled_readiness_groups(state).ok()?;
+    match &state.backend {
+        QueryBackend::Route {
+            boundary,
+            origin_id,
+            ..
+        } => route_sink_status_snapshot(
+            boundary.clone(),
+            origin_id.clone(),
+            std::cmp::min(timeout, Duration::from_secs(5)),
+        )
+        .await
+        .ok()
+        .map(|snapshot| filter_sink_status_snapshot(snapshot, &readiness_groups)),
+        QueryBackend::Local { sink, .. } => sink
+            .status_snapshot()
+            .await
+            .ok()
+            .map(|snapshot| filter_sink_status_snapshot(snapshot, &readiness_groups)),
+    }
+}
+
 fn materialized_observation_status(
     source_status: &SourceStatusSnapshot,
     sink_status: &SinkStatusSnapshot,
@@ -976,7 +1002,7 @@ fn filter_source_status_snapshot(
 }
 
 fn fresh_sink_group_explicitly_empty(group: &crate::sink::SinkGroupStatusSnapshot) -> bool {
-    !group.initial_audit_completed
+    !sink_group_readiness_reports_live_materialized_group(group)
         && group.total_nodes == 0
         && group.live_nodes == 0
         && group.shadow_time_us == 0
@@ -1030,7 +1056,7 @@ fn merge_with_cached_sink_status_snapshot(
 
 fn sink_group_merge_score(group: &crate::sink::SinkGroupStatusSnapshot) -> (u8, u64, u64, u64) {
     (
-        u8::from(group.initial_audit_completed),
+        u8::from(sink_group_readiness_reports_live_materialized_group(group)),
         group.total_nodes,
         group.live_nodes,
         group.shadow_time_us,
@@ -1070,7 +1096,7 @@ fn preserve_cached_ready_groups_across_explicit_empty_root_transition(
         .iter()
         .filter(|group| {
             explicit_empty_groups.contains(&group.group_id)
-                && group.initial_audit_completed
+                && sink_group_readiness_reports_live_materialized_group(group)
                 && source_status_group_still_active(source_status, &group.group_id)
                 && current_by_group
                     .get(group.group_id.as_str())
@@ -1947,9 +1973,7 @@ fn selected_group_sink_status_reports_live_materialized_group(
                 .iter()
                 .find(|group| group.group_id == group_id)
         })
-        .is_some_and(|group| {
-            group.initial_audit_completed && group.live_nodes > 0 && group.total_nodes > 0
-        })
+        .is_some_and(sink_group_readiness_reports_live_materialized_group)
 }
 
 fn selected_group_sink_status_is_unready_empty(
@@ -1963,41 +1987,55 @@ fn selected_group_sink_status_is_unready_empty(
                 .iter()
                 .find(|group| group.group_id == group_id)
         })
-        .is_some_and(|group| {
-            !group.initial_audit_completed && group.live_nodes == 0 && group.total_nodes == 0
-        })
+        .is_some_and(sink_group_readiness_reports_unready_empty_group)
+}
+
+fn sink_group_readiness_reports_live_materialized_group(
+    group: &crate::sink::SinkGroupStatusSnapshot,
+) -> bool {
+    matches!(group.readiness, crate::sink::GroupReadinessState::Ready)
+        && group.live_nodes > 0
+        && group.total_nodes > 0
+}
+
+fn sink_group_readiness_reports_unready_empty_group(
+    group: &crate::sink::SinkGroupStatusSnapshot,
+) -> bool {
+    !matches!(group.readiness, crate::sink::GroupReadinessState::Ready)
+        && group.live_nodes == 0
+        && group.total_nodes == 0
+}
+
+fn sink_status_snapshot_schedules_group(
+    snapshot: Option<&SinkStatusSnapshot>,
+    group_id: &str,
+) -> bool {
+    snapshot.is_some_and(|snapshot| {
+        snapshot
+            .scheduled_groups_by_node
+            .values()
+            .any(|groups| groups.iter().any(|group| group == group_id))
+    })
+}
+
+fn selected_group_sink_status_omits_group(
+    snapshot: Option<&SinkStatusSnapshot>,
+    group_id: &str,
+) -> bool {
+    snapshot.is_some_and(|snapshot| !sink_status_mentions_group(snapshot, group_id))
+}
+
+fn sink_status_snapshot_omits_all_groups_from_schedule(snapshot: &SinkStatusSnapshot) -> bool {
+    snapshot.groups.is_empty() && snapshot.scheduled_groups_by_node.is_empty()
 }
 
 fn selected_group_materialized_tree_payload_is_empty(
     policy: &ProjectionPolicy,
     events: &[Event],
     group_id: &str,
+    query_path: &[u8],
 ) -> bool {
-    fn payload_score(payload: &TreeGroupPayload) -> (u8, usize, bool, u64) {
-        (
-            u8::from(payload.root.exists),
-            payload.entries.len(),
-            payload.root.has_children,
-            payload.root.modified_time_us,
-        )
-    }
-
-    fn payload_precedence(
-        event: &Event,
-        payload: &TreeGroupPayload,
-    ) -> (u64, u8, usize, bool, u64) {
-        let score = payload_score(payload);
-        (
-            event.metadata().timestamp_us,
-            score.0,
-            score.1,
-            score.2,
-            score.3,
-        )
-    }
-
-    let mut best = None::<TreeGroupPayload>;
-    let mut best_precedence = None::<(u64, u8, usize, bool, u64)>;
+    let mut saw_same_path_payload = false;
     for event in events {
         if event_group_key(policy, event) != group_id {
             continue;
@@ -2007,19 +2045,15 @@ fn selected_group_materialized_tree_payload_is_empty(
         else {
             continue;
         };
-        let precedence = payload_precedence(event, &payload);
-        let replace = best_precedence
-            .as_ref()
-            .is_none_or(|current| precedence > *current);
-        if replace {
-            best_precedence = Some(precedence);
-            best = Some(payload);
+        if payload.root.path != query_path {
+            continue;
+        }
+        saw_same_path_payload = true;
+        if payload.root.exists || !payload.entries.is_empty() || payload.root.has_children {
+            return false;
         }
     }
-
-    best.is_some_and(|payload| {
-        !payload.root.exists && payload.entries.is_empty() && !payload.root.has_children
-    })
+    saw_same_path_payload
 }
 
 fn selected_group_empty_ready_tree_requires_proxy_fallback(
@@ -2044,7 +2078,7 @@ fn selected_group_empty_ready_tree_requires_proxy_fallback(
             selected_group_sink_status,
             group_id,
         )
-        && selected_group_materialized_tree_payload_is_empty(policy, events, group_id)
+        && selected_group_materialized_tree_payload_is_empty(policy, events, group_id, path)
 }
 
 fn selected_group_empty_ready_tree_requires_primary_owner_reroute(
@@ -2063,7 +2097,12 @@ fn selected_group_empty_ready_tree_requires_primary_owner_reroute(
             selected_group_sink_status,
             group_id,
         )
-        && selected_group_materialized_tree_payload_is_empty(policy, events, group_id)
+        && selected_group_materialized_tree_payload_is_empty(
+            policy,
+            events,
+            group_id,
+            params.scope.path.as_slice(),
+        )
 }
 
 fn sink_primary_owner_node_for_group(
@@ -2114,6 +2153,7 @@ fn selected_group_sink_status_reports_live_materialized_group_requires_positive_
             shadow_lag_us: 0,
             overflow_pending_audit: false,
             initial_audit_completed: true,
+            readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 9,
             estimated_heap_bytes: 0,
         }],
@@ -2123,6 +2163,66 @@ fn selected_group_sink_status_reports_live_materialized_group_requires_positive_
     assert!(
         !selected_group_sink_status_reports_live_materialized_group(Some(&snapshot), "nfs2"),
         "live materialized selected-group status must not treat total_nodes=0 as ready even when live_nodes>0 and initial_audit_completed=true: {snapshot:?}"
+    );
+}
+
+#[test]
+fn selected_group_sink_status_reports_live_materialized_group_prefers_exported_readiness_over_legacy_initial_audit_bool()
+{
+    let snapshot = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs2".to_string(),
+            primary_object_ref: "node-a::nfs2".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 1,
+            shadow_lag_us: 0,
+            overflow_pending_audit: false,
+            initial_audit_completed: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 9,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        selected_group_sink_status_reports_live_materialized_group(Some(&snapshot), "nfs2"),
+        "selected-group readiness must trust exported sink readiness over stale initial_audit_completed=false: {snapshot:?}"
+    );
+}
+
+#[test]
+fn selected_group_sink_status_is_unready_empty_prefers_exported_readiness_over_legacy_initial_audit_bool()
+{
+    let snapshot = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs2".to_string(),
+            primary_object_ref: "node-a::nfs2".to_string(),
+            total_nodes: 0,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_audit: false,
+            initial_audit_completed: true,
+            readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
+            materialized_revision: 9,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        selected_group_sink_status_is_unready_empty(Some(&snapshot), "nfs2"),
+        "selected-group unready-empty classification must trust exported sink readiness over stale initial_audit_completed=true: {snapshot:?}"
     );
 }
 
@@ -2326,6 +2426,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                                     policy,
                                     &primary_events,
                                     group_id,
+                                    params.scope.path.as_slice(),
                                 ) {
                                     return Ok(primary_events);
                                 }
@@ -2337,7 +2438,10 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                                 group_id,
                             )
                             && selected_group_materialized_tree_payload_is_empty(
-                                policy, &events, group_id,
+                                policy,
+                                &events,
+                                group_id,
+                                params.scope.path.as_slice(),
                             )
                         {
                             let remaining = deadline
@@ -2360,6 +2464,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                                                 policy,
                                                 &retry_events,
                                                 group_id,
+                                                params.scope.path.as_slice(),
                                             ) {
                                                 return Ok(retry_events);
                                             }
@@ -2545,6 +2650,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                                         policy,
                                         &primary_events,
                                         group_id,
+                                        params.scope.path.as_slice(),
                                     ) {
                                         return Ok(primary_events);
                                     }
@@ -2556,7 +2662,10 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                                     group_id,
                                 )
                                 && selected_group_materialized_tree_payload_is_empty(
-                                    policy, &events, group_id,
+                                    policy,
+                                    &events,
+                                    group_id,
+                                    params.scope.path.as_slice(),
                                 )
                             {
                                 let remaining = deadline
@@ -2581,6 +2690,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                                                     policy,
                                                     &retry_events,
                                                     group_id,
+                                                    params.scope.path.as_slice(),
                                                 ) {
                                                     return Ok(retry_events);
                                                 }
@@ -2785,6 +2895,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                                     policy,
                                     &primary_events,
                                     group_id,
+                                    params.scope.path.as_slice(),
                                 ) {
                                     return Ok(primary_events);
                                 }
@@ -2796,6 +2907,14 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
                 }
             }
             if params.scope.selected_group.is_some() {
+                if let Some(group_id) = params.scope.selected_group.as_deref()
+                    && selected_group_sink_status_omits_group(
+                        selected_group_sink_status.as_ref(),
+                        group_id,
+                    )
+                {
+                    return Ok(Vec::new());
+                }
                 let remaining = deadline
                     .checked_duration_since(tokio::time::Instant::now())
                     .unwrap_or_default();
@@ -3306,15 +3425,29 @@ fn scheduled_sink_owner_node_for_group(
     scheduled_nodes.into_iter().next()
 }
 
+fn sink_status_mentions_group(sink_status: &SinkStatusSnapshot, group_id: &str) -> bool {
+    sink_status
+        .groups
+        .iter()
+        .any(|group| group.group_id == group_id)
+        || sink_status
+            .scheduled_groups_by_node
+            .values()
+            .any(|groups| groups.iter().any(|group| group == group_id))
+}
+
 async fn materialized_owner_node_for_group(
     source: &SourceFacade,
     sink_status: Option<&SinkStatusSnapshot>,
     group_id: &str,
 ) -> Result<Option<NodeId>, CnxError> {
-    if let Some(sink_status) = sink_status
-        && let Some(node_id) = scheduled_sink_owner_node_for_group(sink_status, group_id)
-    {
-        return Ok(Some(node_id));
+    if let Some(sink_status) = sink_status {
+        if let Some(node_id) = scheduled_sink_owner_node_for_group(sink_status, group_id) {
+            return Ok(Some(node_id));
+        }
+        if !sink_status_mentions_group(sink_status, group_id) {
+            return Ok(None);
+        }
     }
     Ok(source
         .source_primary_by_group_snapshot()
@@ -4205,7 +4338,7 @@ async fn build_tree_pit_session(
         params.group.as_deref(),
         request_sink_status,
         timeout,
-        false,
+        params.group.is_none() && !params.path.is_empty() && params.path != b"/",
     )
     .await?;
     let (rankings, ranking_retryable_failure) = collect_group_rankings(
@@ -4238,6 +4371,7 @@ async fn build_tree_pit_session(
         tokio::time::Instant::now() + timeout
     };
     let total_ranked_groups = rankings.len();
+    let mut deferred_first_ranked_empty_trusted_non_root_group = None::<String>;
     for (rank_index, rank) in rankings.into_iter().enumerate() {
         let group_key = rank.group_key.clone();
         let tree_params = build_materialized_tree_request(
@@ -4930,6 +5064,23 @@ async fn build_tree_pit_session(
                 {
                     return Err(trusted_materialized_empty_selected_group_tree_error(
                         &group_key,
+                    ));
+                }
+                let response_is_empty = trusted_materialized_tree_payload_is_empty(&response);
+                if trusted_materialized_ready_group
+                    && rank_index == 0
+                    && !prior_materialized_group_decoded
+                    && !trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
+                    && response_is_empty
+                {
+                    deferred_first_ranked_empty_trusted_non_root_group = Some(group_key.clone());
+                } else if let Some(deferred_group) =
+                    deferred_first_ranked_empty_trusted_non_root_group.as_ref()
+                    && rank_index > 0
+                    && !response_is_empty
+                {
+                    return Err(trusted_materialized_empty_selected_group_tree_error(
+                        deferred_group,
                     ));
                 }
                 let (metadata_available, _meta_json) = tree_metadata_json(read_class);
@@ -5866,19 +6017,47 @@ async fn get_tree(
     let observation_status = materialized_observation_status(&source_status, &sink_status);
     if read_class == ReadClass::TrustedMaterialized
         && observation_status.state != ObservationState::TrustedMaterialized
+        && trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
     {
         return error_response_with_context(
             CnxError::NotReady(trusted_materialized_not_ready_message(&observation_status)),
             Some(&path_for_error),
         );
     }
+    if read_class == ReadClass::TrustedMaterialized
+        && observation_status.state != ObservationState::TrustedMaterialized
+        && !trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
+    {
+        eprintln!(
+            "fs_meta_query_api: trusted non-root tree proceeding with request-scoped readiness path={} not_ready={}",
+            String::from_utf8_lossy(&params.path),
+            trusted_materialized_not_ready_message(&observation_status)
+        );
+    }
+    let request_sink_status = if read_class == ReadClass::TrustedMaterialized {
+        let request_scoped =
+            load_request_scoped_materialized_sink_status_snapshot(&state, policy.query_timeout())
+                .await
+                .unwrap_or_else(|| sink_status.clone());
+        if trusted_materialized_empty_group_root_requires_fail_closed(&params.path) {
+            if sink_status_snapshot_omits_all_groups_from_schedule(&request_scoped) {
+                request_scoped
+            } else {
+                sink_status.clone()
+            }
+        } else {
+            request_scoped
+        }
+    } else {
+        sink_status.clone()
+    };
     match query_tree_page_response(
         &state,
         &policy,
         &params,
         policy.query_timeout(),
         observation_status,
-        Some(sink_status),
+        Some(request_sink_status),
     )
     .await
     {

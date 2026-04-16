@@ -59,7 +59,8 @@ use super::types::{
     QueryApiKeysResponse, RescanResponse, RevokeQueryApiKeyResponse, RootEntry, RootPreviewItem,
     RootSelectorEntry, RootUpdateEntry, RootsPreviewResponse, RootsResponse, RootsUpdateRequest,
     RootsUpdateResponse, RuntimeGrantsResponse, StatusFacade, StatusFacadePending, StatusResponse,
-    StatusSink, StatusSinkDebug, StatusSinkGroup, StatusSource, StatusSourceConcreteRoot,
+    StatusSink, StatusSinkDebug, StatusSinkGroup, StatusSinkGroupReadiness, StatusSource,
+    StatusSourceConcreteRoot,
     StatusSourceLogicalRoot,
 };
 
@@ -656,6 +657,17 @@ pub async fn status(
                     shadow_time_us: group.shadow_time_us,
                     shadow_lag_us: group.shadow_lag_us,
                     overflow_pending_audit: group.overflow_pending_audit,
+                    readiness: match group.readiness {
+                        crate::sink::GroupReadinessState::PendingAudit => {
+                            StatusSinkGroupReadiness::PendingAudit
+                        }
+                        crate::sink::GroupReadinessState::WaitingForMaterializedRoot => {
+                            StatusSinkGroupReadiness::WaitingForMaterializedRoot
+                        }
+                        crate::sink::GroupReadinessState::Ready => {
+                            StatusSinkGroupReadiness::Ready
+                        }
+                    },
                     initial_audit_completed: group.initial_audit_completed,
                     estimated_heap_bytes: group.estimated_heap_bytes,
                 })
@@ -1531,13 +1543,13 @@ async fn route_source_observability_snapshot(
 ) -> Result<(SourceObservabilitySnapshot, BTreeMap<String, Vec<String>>), CnxError> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_err = None::<CnxError>;
-    let events = loop {
+    loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            break Err(last_err.unwrap_or(CnxError::Timeout));
+            return Err(last_err.unwrap_or(CnxError::Timeout));
         }
         let attempt_timeout = remaining.min(Duration::from_secs(5));
-        match collect_internal_source_status_events(
+        let events = match collect_internal_source_status_events(
             boundary.clone(),
             origin_id.clone(),
             attempt_timeout,
@@ -1549,50 +1561,118 @@ async fn route_source_observability_snapshot(
         )
         .await
         {
-            Ok(events) => break Ok(events),
+            Ok(events) => events,
             Err(err @ CnxError::Timeout)
             | Err(err @ CnxError::TransportClosed(_))
             | Err(err @ CnxError::ProtocolViolation(_))
             | Err(err @ CnxError::Internal(_)) => {
                 last_err = Some(err);
                 tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
             }
-            Err(err) => break Err(err),
+            Err(err) => return Err(err),
+        };
+        let snapshots = events
+            .into_iter()
+            .map(|event| {
+                rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes())
+                    .map_err(|err| {
+                        CnxError::Internal(format!("decode source observability failed: {err}"))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if source_observability_snapshots_need_retry(&snapshots)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
         }
-    }?;
-    let snapshots = events
-        .into_iter()
-        .map(|event| {
-            rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes()).map_err(
-                |err| CnxError::Internal(format!("decode source observability failed: {err}")),
-            )
+        if debug_status_route_fanin_enabled() {
+            let summaries = snapshots
+                .iter()
+                .map(summarize_source_status_route_snapshot)
+                .collect::<Vec<_>>();
+            eprintln!(
+                "fs_meta_api_status: source_route_collect events={} snapshots={:?}",
+                snapshots.len(),
+                summaries
+            );
+        }
+        let runner_sets = source_runner_sets(&snapshots);
+        if debug_force_find_runner_capture_enabled() {
+            let last_runners = snapshots
+                .iter()
+                .map(|snapshot| summarize_group_string_map(&snapshot.last_force_find_runner_by_group))
+                .collect::<Vec<_>>();
+            eprintln!(
+                "fs_meta_api_status: source_route_runner_capture snapshots={} last_runners={:?} runner_sets={:?}",
+                snapshots.len(),
+                last_runners,
+                runner_sets
+            );
+        }
+        return Ok((merge_source_observability_snapshots(snapshots), runner_sets));
+    }
+}
+
+fn source_observability_snapshot_debug_maps_absent(
+    snapshot: &SourceObservabilitySnapshot,
+) -> bool {
+    snapshot.scheduled_source_groups_by_node.is_empty()
+        && snapshot.scheduled_scan_groups_by_node.is_empty()
+        && snapshot.last_control_frame_signals_by_node.is_empty()
+        && snapshot
+            .published_batches_by_node
+            .values()
+            .all(|count| *count == 0)
+        && snapshot
+            .published_events_by_node
+            .values()
+            .all(|count| *count == 0)
+        && snapshot
+            .published_control_events_by_node
+            .values()
+            .all(|count| *count == 0)
+        && snapshot
+            .published_data_events_by_node
+            .values()
+            .all(|count| *count == 0)
+        && snapshot.last_published_at_us_by_node.is_empty()
+        && snapshot.last_published_origins_by_node.is_empty()
+        && snapshot.published_origin_counts_by_node.is_empty()
+        && snapshot.enqueued_path_origin_counts_by_node.is_empty()
+        && snapshot.pending_path_origin_counts_by_node.is_empty()
+        && snapshot.yielded_path_origin_counts_by_node.is_empty()
+        && snapshot.summarized_path_origin_counts_by_node.is_empty()
+        && snapshot.published_path_origin_counts_by_node.is_empty()
+}
+
+fn source_observability_snapshot_has_active_state(
+    snapshot: &SourceObservabilitySnapshot,
+) -> bool {
+    snapshot.status.current_stream_generation.is_some()
+        || snapshot
+            .status
+            .logical_roots
+            .iter()
+            .any(|entry| entry.active_members > 0 || entry.status.eq_ignore_ascii_case("ready"))
+        || snapshot.status.concrete_roots.iter().any(|entry| {
+            entry.active
+                || entry.current_stream_generation.is_some()
+                || entry.emitted_batch_count > 0
+                || entry.forwarded_batch_count > 0
+                || entry.emitted_event_count > 0
+                || entry.forwarded_event_count > 0
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    if debug_status_route_fanin_enabled() {
-        let summaries = snapshots
-            .iter()
-            .map(summarize_source_status_route_snapshot)
-            .collect::<Vec<_>>();
-        eprintln!(
-            "fs_meta_api_status: source_route_collect events={} snapshots={:?}",
-            snapshots.len(),
-            summaries
-        );
-    }
-    let runner_sets = source_runner_sets(&snapshots);
-    if debug_force_find_runner_capture_enabled() {
-        let last_runners = snapshots
-            .iter()
-            .map(|snapshot| summarize_group_string_map(&snapshot.last_force_find_runner_by_group))
-            .collect::<Vec<_>>();
-        eprintln!(
-            "fs_meta_api_status: source_route_runner_capture snapshots={} last_runners={:?} runner_sets={:?}",
-            snapshots.len(),
-            last_runners,
-            runner_sets
-        );
-    }
-    Ok((merge_source_observability_snapshots(snapshots), runner_sets))
+}
+
+fn source_observability_snapshots_need_retry(
+    snapshots: &[SourceObservabilitySnapshot],
+) -> bool {
+    snapshots.iter().any(|snapshot| {
+        source_observability_snapshot_has_active_state(snapshot)
+            && source_observability_snapshot_debug_maps_absent(snapshot)
+    })
 }
 
 async fn collect_internal_source_status_events(
@@ -2227,6 +2307,16 @@ mod tests {
         first_source_recv_failed: std::sync::atomic::AtomicBool,
     }
 
+    struct SourceStatusIncompleteRetryThenReplyBoundary {
+        source_reply_channel: String,
+        first_source_status_payloads: Vec<Vec<u8>>,
+        second_source_status_payloads: Vec<Vec<u8>>,
+        send_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
+        recv_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
+        correlations_by_channel: StdMutex<std::collections::HashMap<String, u64>>,
+        recv_state: StdMutex<(usize, usize)>,
+    }
+
     struct StatusTransportRouteBoundary;
     struct StatusSlowTimeoutRouteBoundary;
 
@@ -2622,6 +2712,110 @@ mod tests {
                         0 => "node-b-29776275144172679041384449",
                         1 => "node-c-29776275144172679041384449",
                         _ => "node-d-29776275144172679041384449",
+                    };
+                    Event::new(
+                        EventMetadata {
+                            origin_id: NodeId(origin.to_string()),
+                            timestamp_us: 1,
+                            logical_ts: None,
+                            correlation_id: Some(correlation),
+                            ingress_auth: None,
+                            trace: None,
+                        },
+                        bytes::Bytes::from(payload.clone()),
+                    )
+                })
+                .collect())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for SourceStatusIncompleteRetryThenReplyBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            if let Some(correlation) = request
+                .events
+                .first()
+                .and_then(|event| event.metadata().correlation_id)
+            {
+                self.correlations_by_channel
+                    .lock()
+                    .expect("source incomplete retry boundary correlations lock")
+                    .insert(request.channel_key.0.clone(), correlation);
+            }
+            let mut send_batches = self
+                .send_batches_by_channel
+                .lock()
+                .expect("source incomplete retry boundary send batches lock");
+            *send_batches.entry(request.channel_key.0).or_default() += 1;
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("source incomplete retry boundary recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+            drop(recv_batches);
+
+            if request.channel_key.0 != self.source_reply_channel {
+                return Err(CnxError::Timeout);
+            }
+
+            let request_channel = self.source_reply_channel.trim_end_matches(":reply");
+            let send_batch = self
+                .send_batches_by_channel
+                .lock()
+                .expect("source incomplete retry boundary send batches lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or_default();
+            let recv_in_send = {
+                let mut state = self
+                    .recv_state
+                    .lock()
+                    .expect("source incomplete retry boundary recv state lock");
+                if state.0 != send_batch {
+                    *state = (send_batch, 0);
+                }
+                let recv_in_send = state.1;
+                state.1 += 1;
+                recv_in_send
+            };
+            if recv_in_send > 0 {
+                return Err(CnxError::Timeout);
+            }
+            let payloads = if send_batch <= 1 {
+                &self.first_source_status_payloads
+            } else {
+                &self.second_source_status_payloads
+            };
+
+            let correlation = self
+                .correlations_by_channel
+                .lock()
+                .expect("source incomplete retry boundary correlations lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or(1);
+            Ok(payloads
+                .iter()
+                .enumerate()
+                .map(|(idx, payload)| {
+                    let origin = match idx {
+                        0 => "node-a-29776275144172679041384449",
+                        1 => "node-b-29776275144172679041384449",
+                        _ => "node-c-29776275144172679041384449",
                     };
                     Event::new(
                         EventMetadata {
@@ -3220,6 +3414,7 @@ mod tests {
                 shadow_lag_us: 12,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             }],
@@ -3246,6 +3441,7 @@ mod tests {
                 shadow_lag_us: 12,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
+                readiness: crate::sink::GroupReadinessState::PendingAudit,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             }],
@@ -3657,6 +3853,7 @@ mod tests {
                 shadow_lag_us: 22,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             }],
@@ -3856,6 +4053,7 @@ mod tests {
                 shadow_lag_us: 22,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             }],
@@ -3990,6 +4188,7 @@ mod tests {
                 shadow_lag_us: 22,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             }],
@@ -4905,6 +5104,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_source_observability_snapshot_retries_incomplete_active_source_debug_before_accepting_snapshot()
+     {
+        let source_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+            .expect("resolve source-status route");
+        let incomplete_node_a = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::new(),
+            scheduled_scan_groups_by_node: BTreeMap::new(),
+            last_control_frame_signals_by_node: BTreeMap::new(),
+            published_batches_by_node: BTreeMap::new(),
+            published_events_by_node: BTreeMap::new(),
+            published_control_events_by_node: BTreeMap::new(),
+            published_data_events_by_node: BTreeMap::new(),
+            last_published_at_us_by_node: BTreeMap::new(),
+            last_published_origins_by_node: BTreeMap::new(),
+            published_origin_counts_by_node: BTreeMap::new(),
+            enqueued_path_origin_counts_by_node: BTreeMap::new(),
+            pending_path_origin_counts_by_node: BTreeMap::new(),
+            yielded_path_origin_counts_by_node: BTreeMap::new(),
+            summarized_path_origin_counts_by_node: BTreeMap::new(),
+            published_path_origin_counts_by_node: BTreeMap::new(),
+            ..local_source_snapshot()
+        })
+        .expect("encode incomplete node-a source status");
+        let complete_node_a = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["activate unit=runtime.exec.source route=source-logical-roots-control:v1.stream generation=11 scopes=[\"nfs1=>node-a::nfs1\"]".to_string()],
+            )]),
+            published_batches_by_node: BTreeMap::from([("node-a".to_string(), 7)]),
+            published_events_by_node: BTreeMap::from([("node-a".to_string(), 321)]),
+            published_control_events_by_node: BTreeMap::from([("node-a".to_string(), 3)]),
+            published_data_events_by_node: BTreeMap::from([("node-a".to_string(), 318)]),
+            last_published_at_us_by_node: BTreeMap::from([("node-a".to_string(), 123456)]),
+            last_published_origins_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs1=7".to_string()],
+            )]),
+            published_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs1=321".to_string()],
+            )]),
+            ..local_source_snapshot()
+        })
+        .expect("encode complete node-a source status");
+        let node_b_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..local_source_snapshot()
+        })
+        .expect("encode node-b source status");
+        let boundary = Arc::new(SourceStatusIncompleteRetryThenReplyBoundary {
+            source_reply_channel: format!("{}:reply", source_route.0.clone()),
+            first_source_status_payloads: vec![incomplete_node_a.clone(), node_b_payload.clone()],
+            second_source_status_payloads: vec![complete_node_a, node_b_payload],
+            send_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            recv_state: StdMutex::new((0, 0)),
+        });
+
+        let (snapshot, _runner_sets) = route_source_observability_snapshot(
+            boundary.clone(),
+            NodeId("node-a".into()),
+            Duration::from_secs(5),
+            STATUS_ROUTE_COLLECT_IDLE_GRACE,
+        )
+        .await
+        .expect("source-status collection should retry incomplete active source debug");
+
+        assert_eq!(
+            snapshot.scheduled_source_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string()])
+        );
+        assert_eq!(
+            snapshot.scheduled_scan_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string()])
+        );
+        assert_eq!(
+            snapshot.published_batches_by_node.get("node-a"),
+            Some(&7)
+        );
+        assert!(
+            snapshot
+                .last_control_frame_signals_by_node
+                .get("node-a")
+                .is_some_and(|signals| !signals.is_empty())
+        );
+        let send_batches = boundary
+            .send_batches_by_channel
+            .lock()
+            .expect("source incomplete retry boundary send batches lock");
+        assert_eq!(
+            send_batches
+                .get(&source_route.0)
+                .copied()
+                .unwrap_or_default(),
+            2,
+            "incomplete active source debug must trigger a second routed source-status issuance before accepting snapshot"
+        );
+    }
+
+    #[tokio::test]
     async fn status_reports_serving_facade_state_without_pending_diagnostics() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
@@ -5236,6 +5552,7 @@ mod tests {
                         shadow_lag_us: 22,
                         overflow_pending_audit: false,
                         initial_audit_completed: true,
+                readiness: crate::sink::GroupReadinessState::Ready,
                         materialized_revision: 1,
                         estimated_heap_bytes: 0,
                     }],
@@ -5342,6 +5659,7 @@ mod tests {
                         shadow_lag_us: 22,
                         overflow_pending_audit: false,
                         initial_audit_completed: true,
+                readiness: crate::sink::GroupReadinessState::Ready,
                         materialized_revision: 1,
                         estimated_heap_bytes: 0,
                     }],
@@ -5451,6 +5769,7 @@ mod tests {
                         shadow_lag_us: 22,
                         overflow_pending_audit: false,
                         initial_audit_completed: true,
+                readiness: crate::sink::GroupReadinessState::Ready,
                         materialized_revision: 1,
                         estimated_heap_bytes: 0,
                     }],
