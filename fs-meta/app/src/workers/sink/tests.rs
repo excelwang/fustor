@@ -2124,6 +2124,228 @@ impl Drop for SinkWorkerRetryResetHookReset {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_error_hook_scoped_to_target_worker_instance_is_not_consumed_by_unrelated_status_probe(
+) {
+    let tmp = tempdir().expect("create temp dir");
+    let first_root = tmp.path().join("first");
+    let second_root = tmp.path().join("second");
+    std::fs::create_dir_all(&first_root).expect("create first root dir");
+    std::fs::create_dir_all(&second_root).expect("create second root dir");
+
+    let first_cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs-first", &first_root)],
+        host_object_grants: vec![sink_worker_export(
+            "node-first::nfs-first",
+            "node-first",
+            "10.0.0.41",
+            first_root.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let first_boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let first_state_boundary = in_memory_state_boundary();
+    let first_socket_dir = tempdir().expect("create first worker socket dir");
+    let first_factory = RuntimeWorkerClientFactory::new(
+        first_boundary.clone(),
+        first_boundary.clone(),
+        first_state_boundary,
+    );
+    let first_sink = SinkWorkerClientHandle::new(
+        NodeId("node-first".to_string()),
+        first_cfg,
+        external_sink_worker_binding(first_socket_dir.path()),
+        first_factory,
+    )
+    .expect("construct first sink worker client");
+
+    let second_cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs-second", &second_root)],
+        host_object_grants: vec![sink_worker_export(
+            "node-second::nfs-second",
+            "node-second",
+            "10.0.0.42",
+            second_root.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let second_boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let second_state_boundary = in_memory_state_boundary();
+    let second_socket_dir = tempdir().expect("create second worker socket dir");
+    let second_factory = RuntimeWorkerClientFactory::new(
+        second_boundary.clone(),
+        second_boundary.clone(),
+        second_state_boundary,
+    );
+    let second_sink = SinkWorkerClientHandle::new(
+        NodeId("node-second".to_string()),
+        second_cfg,
+        external_sink_worker_binding(second_socket_dir.path()),
+        second_factory,
+    )
+    .expect("construct second sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), first_sink.ensure_started())
+        .await
+        .expect("first sink worker start timed out")
+        .expect("start first sink worker");
+    tokio::time::timeout(Duration::from_secs(8), second_sink.ensure_started())
+        .await
+        .expect("second sink worker start timed out")
+        .expect("start second sink worker");
+
+    let second_worker_instance_id = second_sink.worker_instance_id_for_tests().await;
+    let _status_error_reset = SinkWorkerStatusErrorHookReset;
+    install_sink_worker_status_error_hook_for_worker_instance(
+        second_worker_instance_id,
+        SinkWorkerStatusErrorHook {
+            err: CnxError::PeerError(
+                "targeted scoped sink status error should only hit the selected worker instance"
+                    .to_string(),
+            ),
+        },
+    );
+
+    let first_snapshot = first_sink
+        .status_snapshot_probe_once_with_timeout(Duration::from_millis(250))
+        .await
+        .expect("unrelated worker instance must not consume the targeted status error hook");
+    assert_eq!(
+        first_snapshot
+            .groups
+            .iter()
+            .map(|group| group.group_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["nfs-first"],
+        "unrelated worker should still return its own snapshot shape after the targeted status hook is reserved for another worker instance: {first_snapshot:?}"
+    );
+
+    let second_result = second_sink
+        .status_snapshot_probe_once_with_timeout(Duration::from_millis(250))
+        .await;
+    match second_result {
+        Err(CnxError::PeerError(err))
+            if err
+                == "targeted scoped sink status error should only hit the selected worker instance" => {}
+        other => panic!(
+            "targeted status error hook must remain available for the selected worker instance after an unrelated worker probes status: {other:?}"
+        ),
+    }
+
+    first_sink.close().await.expect("close first sink worker");
+    second_sink.close().await.expect("close second sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_snapshot_hook_scoped_to_target_worker_instance_is_not_consumed_by_unrelated_status_probe(
+) {
+    let tmp = tempdir().expect("create temp dir");
+    let first_root = tmp.path().join("first-snapshot");
+    let second_root = tmp.path().join("second-snapshot");
+    std::fs::create_dir_all(&first_root).expect("create first snapshot root dir");
+    std::fs::create_dir_all(&second_root).expect("create second snapshot root dir");
+
+    let first_cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs-first-snapshot", &first_root)],
+        host_object_grants: vec![sink_worker_export(
+            "node-first-snapshot::nfs-first-snapshot",
+            "node-first-snapshot",
+            "10.0.0.43",
+            first_root.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let first_boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let first_state_boundary = in_memory_state_boundary();
+    let first_socket_dir = tempdir().expect("create first snapshot worker socket dir");
+    let first_factory = RuntimeWorkerClientFactory::new(
+        first_boundary.clone(),
+        first_boundary.clone(),
+        first_state_boundary,
+    );
+    let first_sink = SinkWorkerClientHandle::new(
+        NodeId("node-first-snapshot".to_string()),
+        first_cfg,
+        external_sink_worker_binding(first_socket_dir.path()),
+        first_factory,
+    )
+    .expect("construct first snapshot sink worker client");
+
+    let second_cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs-second-snapshot", &second_root)],
+        host_object_grants: vec![sink_worker_export(
+            "node-second-snapshot::nfs-second-snapshot",
+            "node-second-snapshot",
+            "10.0.0.44",
+            second_root.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let second_boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let second_state_boundary = in_memory_state_boundary();
+    let second_socket_dir = tempdir().expect("create second snapshot worker socket dir");
+    let second_factory = RuntimeWorkerClientFactory::new(
+        second_boundary.clone(),
+        second_boundary.clone(),
+        second_state_boundary,
+    );
+    let second_sink = SinkWorkerClientHandle::new(
+        NodeId("node-second-snapshot".to_string()),
+        second_cfg,
+        external_sink_worker_binding(second_socket_dir.path()),
+        second_factory,
+    )
+    .expect("construct second snapshot sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), first_sink.ensure_started())
+        .await
+        .expect("first snapshot sink worker start timed out")
+        .expect("start first snapshot sink worker");
+    tokio::time::timeout(Duration::from_secs(8), second_sink.ensure_started())
+        .await
+        .expect("second snapshot sink worker start timed out")
+        .expect("start second snapshot sink worker");
+
+    let second_worker_instance_id = second_sink.worker_instance_id_for_tests().await;
+    let _status_snapshot_reset = SinkWorkerStatusSnapshotHookReset;
+    let mut targeted_snapshot = SinkStatusSnapshot::default();
+    targeted_snapshot.live_nodes = 99;
+    install_sink_worker_status_snapshot_hook_for_worker_instance(
+        second_worker_instance_id,
+        SinkWorkerStatusSnapshotHook {
+            snapshot: targeted_snapshot.clone(),
+        },
+    );
+
+    let first_snapshot = first_sink
+        .status_snapshot_probe_once_with_timeout(Duration::from_millis(250))
+        .await
+        .expect("unrelated worker instance must not consume the targeted status snapshot hook");
+    assert_ne!(
+        first_snapshot.live_nodes,
+        99,
+        "unrelated worker should not receive the targeted snapshot payload reserved for another worker instance: {first_snapshot:?}"
+    );
+
+    let second_snapshot = second_sink
+        .status_snapshot_probe_once_with_timeout(Duration::from_millis(250))
+        .await
+        .expect("target worker instance should consume the targeted status snapshot hook");
+    assert_eq!(
+        second_snapshot.live_nodes, 99,
+        "targeted status snapshot hook must remain available for the selected worker instance after an unrelated worker probes status: {second_snapshot:?}"
+    );
+
+    first_sink
+        .close()
+        .await
+        .expect("close first snapshot sink worker");
+    second_sink
+        .close()
+        .await
+        .expect("close second snapshot sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn materialized_query_nonblocking_does_not_dispatch_worker_rpc_while_control_inflight() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");

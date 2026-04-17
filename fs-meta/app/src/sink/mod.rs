@@ -336,7 +336,7 @@ impl VisibilityLagTelemetry {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SinkGroupStatusSnapshot {
     pub group_id: String,
     pub primary_object_ref: String,
@@ -356,8 +356,166 @@ pub struct SinkGroupStatusSnapshot {
 }
 
 impl SinkGroupStatusSnapshot {
+    fn normalized_readiness_from_fields(
+        group_id: &str,
+        primary_object_ref: &str,
+        total_nodes: u64,
+        live_nodes: u64,
+        readiness: GroupReadinessState,
+    ) -> GroupReadinessState {
+        if total_nodes == 0
+            && live_nodes == 0
+            && matches!(readiness, GroupReadinessState::Ready)
+        {
+            if primary_object_ref == "unassigned" || primary_object_ref == group_id {
+                GroupReadinessState::WaitingForMaterializedRoot
+            } else {
+                GroupReadinessState::PendingAudit
+            }
+        } else {
+            readiness
+        }
+    }
+
+    fn normalized_readiness(&self) -> GroupReadinessState {
+        Self::normalized_readiness_from_fields(
+            &self.group_id,
+            &self.primary_object_ref,
+            self.total_nodes,
+            self.live_nodes,
+            self.readiness,
+        )
+    }
+
+    fn initial_audit_completed_from_readiness(readiness: GroupReadinessState) -> bool {
+        matches!(readiness, GroupReadinessState::Ready)
+    }
+
+    fn readiness_from_legacy_fields(
+        group_id: &str,
+        primary_object_ref: &str,
+        total_nodes: u64,
+        live_nodes: u64,
+        initial_audit_completed: Option<bool>,
+        audit_epoch_completed: Option<bool>,
+    ) -> GroupReadinessState {
+        let inferred = if matches!(audit_epoch_completed, Some(false)) {
+            GroupReadinessState::PendingAudit
+        } else if matches!(initial_audit_completed, Some(true)) {
+            GroupReadinessState::Ready
+        } else if matches!(audit_epoch_completed, Some(true)) {
+            if total_nodes > 0 || live_nodes > 0 {
+                GroupReadinessState::Ready
+            } else {
+                GroupReadinessState::WaitingForMaterializedRoot
+            }
+        } else if total_nodes > 0 || live_nodes > 0 {
+            GroupReadinessState::Ready
+        } else if primary_object_ref == "unassigned" || primary_object_ref == group_id {
+            GroupReadinessState::WaitingForMaterializedRoot
+        } else {
+            GroupReadinessState::PendingAudit
+        };
+
+        Self::normalized_readiness_from_fields(
+            group_id,
+            primary_object_ref,
+            total_nodes,
+            live_nodes,
+            inferred,
+        )
+    }
+
+    fn deserialized_readiness(
+        group_id: &str,
+        primary_object_ref: &str,
+        total_nodes: u64,
+        live_nodes: u64,
+        readiness: Option<GroupReadinessState>,
+        initial_audit_completed: Option<bool>,
+        audit_epoch_completed: Option<bool>,
+    ) -> GroupReadinessState {
+        readiness.map_or_else(
+            || {
+                Self::readiness_from_legacy_fields(
+                    group_id,
+                    primary_object_ref,
+                    total_nodes,
+                    live_nodes,
+                    initial_audit_completed,
+                    audit_epoch_completed,
+                )
+            },
+            |readiness| {
+                Self::normalized_readiness_from_fields(
+                    group_id,
+                    primary_object_ref,
+                    total_nodes,
+                    live_nodes,
+                    readiness,
+                )
+            },
+        )
+    }
+
     pub fn audit_epoch_completed(&self) -> bool {
-        !matches!(self.readiness, GroupReadinessState::PendingAudit)
+        !matches!(self.normalized_readiness(), GroupReadinessState::PendingAudit)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SinkGroupStatusSnapshot {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct RawSinkGroupStatusSnapshot {
+            group_id: String,
+            primary_object_ref: String,
+            total_nodes: u64,
+            live_nodes: u64,
+            tombstoned_count: u64,
+            attested_count: u64,
+            suspect_count: u64,
+            blind_spot_count: u64,
+            shadow_time_us: u64,
+            shadow_lag_us: u64,
+            overflow_pending_audit: bool,
+            #[serde(default)]
+            readiness: Option<GroupReadinessState>,
+            initial_audit_completed: Option<bool>,
+            audit_epoch_completed: Option<bool>,
+            materialized_revision: u64,
+            estimated_heap_bytes: u64,
+        }
+
+        let raw = RawSinkGroupStatusSnapshot::deserialize(deserializer)?;
+        let readiness = Self::deserialized_readiness(
+            &raw.group_id,
+            &raw.primary_object_ref,
+            raw.total_nodes,
+            raw.live_nodes,
+            raw.readiness,
+            raw.initial_audit_completed,
+            raw.audit_epoch_completed,
+        );
+        Ok(Self {
+            group_id: raw.group_id,
+            primary_object_ref: raw.primary_object_ref,
+            total_nodes: raw.total_nodes,
+            live_nodes: raw.live_nodes,
+            tombstoned_count: raw.tombstoned_count,
+            attested_count: raw.attested_count,
+            suspect_count: raw.suspect_count,
+            blind_spot_count: raw.blind_spot_count,
+            shadow_time_us: raw.shadow_time_us,
+            shadow_lag_us: raw.shadow_lag_us,
+            overflow_pending_audit: raw.overflow_pending_audit,
+            initial_audit_completed: Self::initial_audit_completed_from_readiness(readiness),
+            readiness,
+            materialized_revision: raw.materialized_revision,
+            estimated_heap_bytes: raw.estimated_heap_bytes,
+        })
     }
 }
 
@@ -366,6 +524,7 @@ impl serde::Serialize for SinkGroupStatusSnapshot {
     where
         S: serde::Serializer,
     {
+        let readiness = self.normalized_readiness();
         let mut state = serializer.serialize_struct("SinkGroupStatusSnapshot", 16)?;
         state.serialize_field("group_id", &self.group_id)?;
         state.serialize_field("primary_object_ref", &self.primary_object_ref)?;
@@ -378,9 +537,12 @@ impl serde::Serialize for SinkGroupStatusSnapshot {
         state.serialize_field("shadow_time_us", &self.shadow_time_us)?;
         state.serialize_field("shadow_lag_us", &self.shadow_lag_us)?;
         state.serialize_field("overflow_pending_audit", &self.overflow_pending_audit)?;
-        state.serialize_field("readiness", &self.readiness)?;
+        state.serialize_field("readiness", &readiness)?;
         state.serialize_field("audit_epoch_completed", &self.audit_epoch_completed())?;
-        state.serialize_field("initial_audit_completed", &self.initial_audit_completed)?;
+        state.serialize_field(
+            "initial_audit_completed",
+            &Self::initial_audit_completed_from_readiness(readiness),
+        )?;
         state.serialize_field("materialized_revision", &self.materialized_revision)?;
         state.serialize_field("estimated_heap_bytes", &self.estimated_heap_bytes)?;
         state.end()

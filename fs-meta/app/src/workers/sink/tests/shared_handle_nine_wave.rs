@@ -689,6 +689,31 @@ async fn second_exact_shaped_sink_nine_wave_first_post_replay_status_snapshot_no
         }
     }
 
+    assert!(
+        decode_exact_query_node(
+            client
+                .materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                .await
+                .expect("query nfs1 after initial"),
+            b"/force-find-stress",
+        )
+        .expect("decode nfs1 after initial")
+        .is_some(),
+        "precondition: nfs1 initial materialization should exist before repeated early-eof recovery"
+    );
+    assert!(
+        decode_exact_query_node(
+            client
+                .materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                .await
+                .expect("query nfs2 after initial"),
+            b"/force-find-stress",
+        )
+        .expect("decode nfs2 after initial")
+        .is_some(),
+        "precondition: nfs2 initial materialization should exist before repeated early-eof recovery"
+    );
+
     let previous_worker_instance_id = client.worker_instance_id_for_tests().await;
     let reset_count = Arc::new(AtomicUsize::new(0));
     let _reset_hook = SinkWorkerRetryResetHookReset;

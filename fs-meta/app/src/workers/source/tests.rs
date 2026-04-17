@@ -821,6 +821,44 @@ fn successful_refresh_does_not_clear_cached_scheduled_groups_when_latest_publica
 }
 
 #[test]
+fn successful_refresh_explicit_empty_node_clears_cached_scheduled_groups_for_that_node() {
+    let mut cache = SourceWorkerSnapshotCache {
+        scheduled_source_groups_by_node: Some(std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )])),
+        scheduled_scan_groups_by_node: Some(std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )])),
+        ..SourceWorkerSnapshotCache::default()
+    };
+
+    update_cached_scheduled_groups_from_refresh(
+        &mut cache,
+        std::collections::BTreeMap::from([("node-b".to_string(), Vec::new())]),
+        std::collections::BTreeMap::from([("node-b".to_string(), Vec::new())]),
+    );
+
+    assert_eq!(
+        cache.scheduled_source_groups_by_node,
+        Some(std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            Vec::<String>::new(),
+        )])),
+        "an explicit empty scheduled-source publication for a known node must clear stale cached groups instead of replaying them",
+    );
+    assert_eq!(
+        cache.scheduled_scan_groups_by_node,
+        Some(std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            Vec::<String>::new(),
+        )])),
+        "an explicit empty scheduled-scan publication for a known node must clear stale cached groups instead of replaying them",
+    );
+}
+
+#[test]
 fn successful_refresh_does_not_drop_cached_scheduled_groups_when_latest_publication_is_partial() {
     let mut cache = SourceWorkerSnapshotCache {
         scheduled_source_groups_by_node: Some(std::collections::BTreeMap::from([(
@@ -855,6 +893,189 @@ fn successful_refresh_does_not_drop_cached_scheduled_groups_when_latest_publicat
             vec!["nfs1".to_string(), "nfs2".to_string()],
         )])),
         "a successful control refresh must not drop previously accepted scan scopes when the immediate live publication is still a strict subset",
+    );
+}
+
+#[test]
+fn merge_non_empty_cached_groups_preserves_explicit_empty_node_groups_in_live_snapshot() {
+    let mut current = std::collections::BTreeMap::from([("node-b".to_string(), Vec::new())]);
+    let cached = Some(std::collections::BTreeMap::from([(
+        "node-b".to_string(),
+        vec!["nfs1".to_string(), "nfs2".to_string()],
+    )]));
+
+    merge_non_empty_cached_groups(&mut current, &cached);
+
+    assert_eq!(
+        current,
+        std::collections::BTreeMap::from([("node-b".to_string(), Vec::<String>::new())]),
+        "an explicit empty scheduled-group reply for a known node must survive live-snapshot cache merge instead of replaying stale cached groups",
+    );
+}
+
+#[test]
+fn normalize_node_groups_key_preserves_explicit_empty_groups_when_instance_suffix_collapses_to_stable_host_ref(
+) {
+    let mut groups_by_node = std::collections::BTreeMap::from([
+        (
+            "node-b".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        ),
+        (
+            "node-b-29775497172756365788053505".to_string(),
+            Vec::<String>::new(),
+        ),
+    ]);
+
+    normalize_node_groups_key(
+        &mut groups_by_node,
+        "node-b-29775497172756365788053505",
+        "node-b",
+    );
+
+    assert_eq!(
+        groups_by_node,
+        std::collections::BTreeMap::from([("node-b".to_string(), Vec::<String>::new())]),
+        "instance-suffixed explicit empty groups must clear the stable host-ref entry instead of replaying stale stable-host groups",
+    );
+}
+
+#[test]
+fn normalize_observability_snapshot_scheduled_group_keys_preserves_explicit_empty_groups_for_cached_stable_host_ref(
+) {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let node_id = NodeId("node-b-29775497172756365788053505".to_string());
+    let cached_grants = vec![worker_source_export(
+        "node-b::nfs1",
+        "node-b",
+        "10.0.0.21",
+        nfs1,
+    )];
+    let mut snapshot = SourceObservabilitySnapshot {
+        lifecycle_state: "ready".to_string(),
+        host_object_grants_version: 2,
+        grants: Vec::new(),
+        logical_roots: Vec::new(),
+        status: SourceStatusSnapshot::default(),
+        source_primary_by_group: std::collections::BTreeMap::new(),
+        last_force_find_runner_by_group: std::collections::BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: std::collections::BTreeMap::from([
+            ("node-b".to_string(), vec!["nfs1".to_string()]),
+            (
+                "node-b-29775497172756365788053505".to_string(),
+                Vec::<String>::new(),
+            ),
+        ]),
+        scheduled_scan_groups_by_node: std::collections::BTreeMap::from([
+            ("node-b".to_string(), vec!["nfs1".to_string()]),
+            (
+                "node-b-29775497172756365788053505".to_string(),
+                Vec::<String>::new(),
+            ),
+        ]),
+        last_control_frame_signals_by_node: std::collections::BTreeMap::new(),
+        published_batches_by_node: std::collections::BTreeMap::new(),
+        published_events_by_node: std::collections::BTreeMap::new(),
+        published_control_events_by_node: std::collections::BTreeMap::new(),
+        published_data_events_by_node: std::collections::BTreeMap::new(),
+        last_published_at_us_by_node: std::collections::BTreeMap::new(),
+        last_published_origins_by_node: std::collections::BTreeMap::new(),
+        published_origin_counts_by_node: std::collections::BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        pending_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        yielded_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        summarized_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        published_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+    };
+
+    normalize_observability_snapshot_scheduled_group_keys(
+        &mut snapshot,
+        &node_id,
+        Some(&cached_grants),
+    );
+
+    assert_eq!(
+        snapshot.scheduled_source_groups_by_node,
+        std::collections::BTreeMap::from([("node-b".to_string(), Vec::<String>::new())]),
+        "stable-host normalization must preserve an explicit empty source schedule when cached grants collapse an instance-suffixed node back to the stable host-ref",
+    );
+    assert_eq!(
+        snapshot.scheduled_scan_groups_by_node,
+        std::collections::BTreeMap::from([("node-b".to_string(), Vec::<String>::new())]),
+        "stable-host normalization must preserve an explicit empty scan schedule when cached grants collapse an instance-suffixed node back to the stable host-ref",
+    );
+}
+
+#[test]
+fn merge_cached_local_scheduled_groups_preserves_explicit_empty_live_groups_for_local_node() {
+    let node_id = NodeId("node-b".to_string());
+    let cached = Some(std::collections::BTreeMap::from([(
+        "node-b".to_string(),
+        vec!["nfs1".to_string(), "nfs2".to_string()],
+    )]));
+
+    let merged =
+        merge_cached_local_scheduled_groups(&node_id, Some(std::collections::BTreeSet::new()), &cached);
+
+    assert_eq!(
+        merged,
+        Some(std::collections::BTreeSet::new()),
+        "an explicit empty local scheduled-group reply must survive local cache merge instead of replaying stale cached groups",
+    );
+}
+
+#[test]
+fn merge_cached_local_scheduled_groups_preserves_explicit_empty_live_groups_without_cached_fallback()
+{
+    let node_id = NodeId("node-b".to_string());
+
+    let merged = merge_cached_local_scheduled_groups(
+        &node_id,
+        Some(std::collections::BTreeSet::new()),
+        &None,
+    );
+
+    assert_eq!(
+        merged,
+        Some(std::collections::BTreeSet::new()),
+        "an explicit empty local scheduled-group reply must stay explicit even when there is no cached fallback",
+    );
+}
+
+#[test]
+fn scheduled_groups_by_node_preserves_explicit_empty_reply_for_known_node() {
+    let node_id = NodeId("node-b".to_string());
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-b::nfs1".to_string(),
+        host_ref: "node-b".to_string(),
+        host_ip: "10.0.0.21".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: Default::default(),
+        mount_point: PathBuf::from("/mnt/nfs1"),
+        fs_source: "nfs://server/export1".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: vec![],
+        interfaces: vec![],
+        active: true,
+    }];
+
+    let groups = scheduled_groups_by_node(
+        &node_id,
+        &grants,
+        Ok(Some(std::collections::BTreeSet::new())),
+    );
+
+    assert_eq!(
+        groups,
+        std::collections::BTreeMap::from([("node-b".to_string(), Vec::<String>::new())]),
+        "an explicit empty scheduled-group reply for a known node must survive stable-host normalization instead of collapsing into omission",
     );
 }
 
@@ -5164,6 +5385,177 @@ async fn tick_only_followup_skips_external_worker_ipc_when_retained_active_route
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tick_only_followup_replays_retained_activates_before_forwarding_same_generation_tick_to_fresh_worker()
+{
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    let nfs1_source = "127.0.0.1:/exports/nfs1";
+
+    let cfg = SourceConfig {
+        roots: vec![worker_fs_source_watch_scan_root("nfs1", nfs1_source)],
+        host_object_grants: Vec::new(),
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = Arc::new(
+        SourceWorkerClientHandle::new(
+            NodeId("node-b-29775497172756365788053509".to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client"),
+    );
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    let source_wave = |generation| {
+        vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["nfs1"])],
+            }))
+            .expect("encode source roots activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["nfs1"])],
+            }))
+            .expect("encode source rescan-control activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["nfs1"])],
+            }))
+            .expect("encode source rescan activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["nfs1"])],
+            }))
+            .expect("encode source scan activate"),
+        ]
+    };
+    let initial_control = std::iter::once(
+        encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+            version: 1,
+            grants: vec![worker_route_export_with_fs_source(
+                "node-b::nfs1",
+                "node-b",
+                "10.0.0.21",
+                &nfs1,
+                nfs1_source,
+            )],
+        })
+        .expect("encode runtime host grants changed"),
+    )
+    .chain(source_wave(1))
+    .collect::<Vec<_>>();
+
+    client
+        .on_control_frame(initial_control)
+        .await
+        .expect("initial fs_source-selected single-root control wave should succeed");
+    client
+        .on_control_frame(source_wave(2))
+        .await
+        .expect("generation-two fs_source-selected control wave should succeed before the tick-only followup");
+
+    let previous_instance_id = client.worker_instance_id_for_tests().await;
+    client
+        .reconnect_shared_worker_client()
+        .await
+        .expect("force shared worker replacement before same-generation tick");
+    let next_instance_id = client.worker_instance_id_for_tests().await;
+    assert_ne!(
+        next_instance_id, previous_instance_id,
+        "forced shared worker replacement should rotate the source worker instance before the tick-only followup"
+    );
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_unit_tick(&RuntimeUnitTick {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                generation: 2,
+                at_ms: 1,
+            })
+            .expect("encode source-roots tick"),
+        ])
+        .await
+        .expect(
+            "same-generation tick-only followup should recover retained runtime-managed scheduling after the shared worker rotates",
+        );
+
+    let raw = client
+        .client()
+        .await
+        .expect("connect raw source worker client");
+    let snapshot = match SourceWorkerClientHandle::call_worker(
+        &raw,
+        SourceWorkerRequest::ObservabilitySnapshot,
+        SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+    )
+    .await
+    .expect("raw observability snapshot after same-generation tick-only reconnect")
+    {
+        SourceWorkerResponse::ObservabilitySnapshot(snapshot) => snapshot,
+        other => {
+            panic!("unexpected source worker response for raw observability snapshot: {other:?}")
+        }
+    };
+
+    assert_eq!(
+        snapshot.scheduled_source_groups_by_node,
+        std::collections::BTreeMap::from([("node-b".to_string(), vec!["nfs1".to_string()])]),
+        "same-generation tick-only followup after forced worker rotation must replay retained source activate scopes before forwarding the tick"
+    );
+    assert_eq!(
+        snapshot.scheduled_scan_groups_by_node,
+        std::collections::BTreeMap::from([("node-b".to_string(), vec!["nfs1".to_string()])]),
+        "same-generation tick-only followup after forced worker rotation must replay retained scan activate scopes before forwarding the tick"
+    );
+    assert_eq!(
+        snapshot.last_control_frame_signals_by_node,
+        std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec![
+                "host_grant_change".to_string(),
+                "activate unit=runtime.exec.scan route=source-manual-rescan:v1.req generation=2 scopes=[\"nfs1=>nfs1\"]".to_string(),
+                "activate unit=runtime.exec.source route=source-logical-roots-control:v1.stream generation=2 scopes=[\"nfs1=>nfs1\"]".to_string(),
+                "activate unit=runtime.exec.source route=source-manual-rescan-control:v1.stream generation=2 scopes=[\"nfs1=>nfs1\"]".to_string(),
+                "activate unit=runtime.exec.source route=source-manual-rescan:v1.req generation=2 scopes=[\"nfs1=>nfs1\"]".to_string(),
+            ],
+        )]),
+        "same-generation tick-only followup after forced worker rotation must preserve the replayed retained control summary instead of collapsing observability to the forwarded tick: {:?}",
+        snapshot.last_control_frame_signals_by_node
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_source_route_on_control_frame_retries_stale_drained_fenced_pid_errors_after_generation_one()
  {
     let tmp = tempdir().expect("create temp dir");
@@ -8887,6 +9279,936 @@ async fn recent_live_cache_preserves_last_control_summary_when_later_active_snap
         nonblocking.published_batches_by_node.get("node-a"),
         Some(&6),
         "preserving last control summary must not roll back newer publication counters"
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recent_live_cache_preserves_scheduled_groups_when_later_active_snapshot_omits_them() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: vec![
+            worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+            worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    let first_live = client
+        .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+        .await
+        .expect("prime live observability snapshot");
+    assert_eq!(
+        first_live.scheduled_source_groups_by_node.get("node-a"),
+        Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
+        "initial live snapshot must carry scheduled source groups before omission preservation is checked",
+    );
+    assert_eq!(
+        first_live.scheduled_scan_groups_by_node.get("node-a"),
+        Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
+        "initial live snapshot must carry scheduled scan groups before omission preservation is checked",
+    );
+
+    let mut later_live = first_live.clone();
+    later_live.scheduled_source_groups_by_node.clear();
+    later_live.scheduled_scan_groups_by_node.clear();
+    later_live.last_control_frame_signals_by_node.clear();
+    later_live.published_batches_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        6,
+    )]);
+    later_live.published_events_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        6,
+    )]);
+    later_live.published_control_events_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        6,
+    )]);
+
+    client.update_cached_observability_snapshot(&first_live);
+    client.update_cached_observability_snapshot(&later_live);
+
+    let nonblocking = client.observability_snapshot_nonblocking().await;
+    assert_eq!(
+        nonblocking.scheduled_source_groups_by_node.get("node-a"),
+        Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
+        "recent live cache must preserve last scheduled source groups when a later active snapshot omits them: {:?}",
+        nonblocking.scheduled_source_groups_by_node
+    );
+    assert_eq!(
+        nonblocking.scheduled_scan_groups_by_node.get("node-a"),
+        Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
+        "recent live cache must preserve last scheduled scan groups when a later active snapshot omits them: {:?}",
+        nonblocking.scheduled_scan_groups_by_node
+    );
+    assert_eq!(
+        nonblocking.published_batches_by_node.get("node-a"),
+        Some(&6),
+        "preserving last scheduled groups must not roll back newer publication counters"
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_inflight_nonblocking_observability_preserves_published_maps_when_later_active_snapshot_omits_them()
+{
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        SourceConfig::default(),
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    let first_live = SourceObservabilitySnapshot {
+        lifecycle_state: "ready".to_string(),
+        host_object_grants_version: 0,
+        grants: Vec::new(),
+        logical_roots: Vec::new(),
+        status: SourceStatusSnapshot {
+            current_stream_generation: Some(1),
+            ..SourceStatusSnapshot::default()
+        },
+        source_primary_by_group: std::collections::BTreeMap::new(),
+        last_force_find_runner_by_group: std::collections::BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]),
+        scheduled_scan_groups_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]),
+        last_control_frame_signals_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["activate unit=runtime.exec.source".to_string()],
+        )]),
+        published_batches_by_node: std::collections::BTreeMap::from([("node-a".to_string(), 4)]),
+        published_events_by_node: std::collections::BTreeMap::from([("node-a".to_string(), 9)]),
+        published_control_events_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            4,
+        )]),
+        published_data_events_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            5,
+        )]),
+        last_published_at_us_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            123_456,
+        )]),
+        last_published_origins_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["node-a::nfs1".to_string(), "node-a::nfs2".to_string()],
+        )]),
+        published_origin_counts_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["node-a::nfs1=4".to_string(), "node-a::nfs2=5".to_string()],
+        )]),
+        published_path_capture_target: Some("/force-find-stress".to_string()),
+        enqueued_path_origin_counts_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["/force-find-stress node-a::nfs1=1".to_string()],
+        )]),
+        pending_path_origin_counts_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["/force-find-stress node-a::nfs1=1".to_string()],
+        )]),
+        yielded_path_origin_counts_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["/force-find-stress node-a::nfs1=1".to_string()],
+        )]),
+        summarized_path_origin_counts_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["/force-find-stress node-a::nfs1=1".to_string()],
+        )]),
+        published_path_origin_counts_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["/force-find-stress node-a::nfs1=1".to_string()],
+        )]),
+    };
+    let mut later_live = first_live.clone();
+    later_live.published_batches_by_node.clear();
+    later_live.published_events_by_node.clear();
+    later_live.published_control_events_by_node.clear();
+    later_live.published_data_events_by_node.clear();
+    later_live.last_published_at_us_by_node.clear();
+    later_live.last_published_origins_by_node.clear();
+    later_live.published_origin_counts_by_node.clear();
+    later_live.published_path_capture_target = None;
+    later_live.enqueued_path_origin_counts_by_node.clear();
+    later_live.pending_path_origin_counts_by_node.clear();
+    later_live.yielded_path_origin_counts_by_node.clear();
+    later_live.summarized_path_origin_counts_by_node.clear();
+    later_live.published_path_origin_counts_by_node.clear();
+    later_live.last_force_find_runner_by_group = std::collections::BTreeMap::from([(
+        "nfs1".to_string(),
+        "node-a::nfs1".to_string(),
+    )]);
+
+    client.update_cached_observability_snapshot(&first_live);
+    client.update_cached_observability_snapshot(&later_live);
+
+    let inflight = client.begin_control_op();
+    let degraded = client.observability_snapshot_nonblocking().await;
+    drop(inflight);
+
+    assert_eq!(
+        degraded.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
+        "control-inflight nonblocking snapshot should still use cached fallback"
+    );
+    assert_eq!(
+        degraded.published_batches_by_node.get("node-a"),
+        Some(&4),
+        "cached fallback must preserve published batch counts when a later active snapshot omits them: {:?}",
+        degraded
+    );
+    assert_eq!(
+        degraded.published_events_by_node.get("node-a"),
+        Some(&9),
+        "cached fallback must preserve published event counts when a later active snapshot omits them: {:?}",
+        degraded
+    );
+    assert_eq!(
+        degraded.published_control_events_by_node.get("node-a"),
+        Some(&4),
+        "cached fallback must preserve published control-event counts when a later active snapshot omits them: {:?}",
+        degraded
+    );
+    assert_eq!(
+        degraded.published_data_events_by_node.get("node-a"),
+        Some(&5),
+        "cached fallback must preserve published data-event counts when a later active snapshot omits them: {:?}",
+        degraded
+    );
+    assert_eq!(
+        degraded.last_published_at_us_by_node.get("node-a"),
+        Some(&123_456),
+        "cached fallback must preserve last_published_at_us when a later active snapshot omits it: {:?}",
+        degraded
+    );
+    assert_eq!(
+        degraded.last_published_origins_by_node.get("node-a"),
+        Some(&vec!["node-a::nfs1".to_string(), "node-a::nfs2".to_string()]),
+        "cached fallback must preserve last_published_origins when a later active snapshot omits them: {:?}",
+        degraded
+    );
+    assert_eq!(
+        degraded.published_origin_counts_by_node.get("node-a"),
+        Some(&vec!["node-a::nfs1=4".to_string(), "node-a::nfs2=5".to_string()]),
+        "cached fallback must preserve published_origin_counts when a later active snapshot omits them: {:?}",
+        degraded
+    );
+    assert_eq!(
+        degraded.published_path_capture_target.as_deref(),
+        Some("/force-find-stress"),
+        "cached fallback must preserve published_path_capture_target when a later active snapshot omits it: {:?}",
+        degraded
+    );
+    assert_eq!(
+        degraded.last_force_find_runner_by_group.get("nfs1"),
+        Some(&"node-a::nfs1".to_string()),
+        "preserving cached published observability must not roll back stronger later live force-find facts"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recent_live_cache_preserves_published_observability_when_later_active_snapshot_omits_it()
+{
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: vec![
+            worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+            worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    let mut first_live = client
+        .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+        .await
+        .expect("prime live observability snapshot");
+    first_live.published_batches_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 4)]);
+    first_live.published_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 9)]);
+    first_live.published_control_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 4)]);
+    first_live.published_data_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 5)]);
+    first_live.last_published_at_us_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 123_456)]);
+    first_live.last_published_origins_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["node-a::nfs1".to_string(), "node-a::nfs2".to_string()],
+    )]);
+    first_live.published_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["node-a::nfs1=4".to_string(), "node-a::nfs2=5".to_string()],
+    )]);
+    first_live.published_path_capture_target = Some("/force-find-stress".to_string());
+    first_live.enqueued_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+    first_live.pending_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+    first_live.yielded_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+    first_live.summarized_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+    first_live.published_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+
+    let mut later_live = first_live.clone();
+    later_live.published_batches_by_node.clear();
+    later_live.published_events_by_node.clear();
+    later_live.published_control_events_by_node.clear();
+    later_live.published_data_events_by_node.clear();
+    later_live.last_published_at_us_by_node.clear();
+    later_live.last_published_origins_by_node.clear();
+    later_live.published_origin_counts_by_node.clear();
+    later_live.published_path_capture_target = None;
+    later_live.enqueued_path_origin_counts_by_node.clear();
+    later_live.pending_path_origin_counts_by_node.clear();
+    later_live.yielded_path_origin_counts_by_node.clear();
+    later_live.summarized_path_origin_counts_by_node.clear();
+    later_live.published_path_origin_counts_by_node.clear();
+    later_live.last_force_find_runner_by_group =
+        std::collections::BTreeMap::from([("nfs1".to_string(), "node-a::nfs1".to_string())]);
+
+    client.update_cached_observability_snapshot(&first_live);
+    client.update_cached_observability_snapshot(&later_live);
+
+    let nonblocking = client.observability_snapshot_nonblocking().await;
+    assert_eq!(
+        nonblocking.published_batches_by_node.get("node-a"),
+        Some(&4),
+        "recent live cache must preserve published batch counts when a later active snapshot omits them: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.published_events_by_node.get("node-a"),
+        Some(&9),
+        "recent live cache must preserve published event counts when a later active snapshot omits them: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.published_control_events_by_node.get("node-a"),
+        Some(&4),
+        "recent live cache must preserve published control-event counts when a later active snapshot omits them: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.published_data_events_by_node.get("node-a"),
+        Some(&5),
+        "recent live cache must preserve published data-event counts when a later active snapshot omits them: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.last_published_at_us_by_node.get("node-a"),
+        Some(&123_456),
+        "recent live cache must preserve last_published_at_us when a later active snapshot omits it: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.last_published_origins_by_node.get("node-a"),
+        Some(&vec!["node-a::nfs1".to_string(), "node-a::nfs2".to_string()]),
+        "recent live cache must preserve last_published_origins when a later active snapshot omits them: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.published_origin_counts_by_node.get("node-a"),
+        Some(&vec!["node-a::nfs1=4".to_string(), "node-a::nfs2=5".to_string()]),
+        "recent live cache must preserve published_origin_counts when a later active snapshot omits them: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.published_path_capture_target.as_deref(),
+        Some("/force-find-stress"),
+        "recent live cache must preserve published_path_capture_target when a later active snapshot omits it: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.last_force_find_runner_by_group.get("nfs1"),
+        Some(&"node-a::nfs1".to_string()),
+        "preserving published observability must not roll back stronger later live facts"
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[test]
+fn published_path_capture_target_only_snapshot_is_not_debug_maps_absent() {
+    let snapshot = SourceObservabilitySnapshot {
+        lifecycle_state: "ready".to_string(),
+        host_object_grants_version: 0,
+        grants: Vec::new(),
+        logical_roots: Vec::new(),
+        status: SourceStatusSnapshot::default(),
+        source_primary_by_group: std::collections::BTreeMap::new(),
+        last_force_find_runner_by_group: std::collections::BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: std::collections::BTreeMap::new(),
+        scheduled_scan_groups_by_node: std::collections::BTreeMap::new(),
+        last_control_frame_signals_by_node: std::collections::BTreeMap::new(),
+        published_batches_by_node: std::collections::BTreeMap::new(),
+        published_events_by_node: std::collections::BTreeMap::new(),
+        published_control_events_by_node: std::collections::BTreeMap::new(),
+        published_data_events_by_node: std::collections::BTreeMap::new(),
+        last_published_at_us_by_node: std::collections::BTreeMap::new(),
+        last_published_origins_by_node: std::collections::BTreeMap::new(),
+        published_origin_counts_by_node: std::collections::BTreeMap::new(),
+        published_path_capture_target: Some("/force-find-stress".to_string()),
+        enqueued_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        pending_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        yielded_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        summarized_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        published_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+    };
+
+    assert!(
+        !source_observability_snapshot_debug_maps_absent(&snapshot),
+        "published_path_capture_target should count as debug-map evidence instead of being treated like a debug-empty snapshot: {snapshot:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recent_live_cache_preserves_published_observability_when_later_live_snapshot_only_has_recovered_schedule_and_control_state()
+{
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: vec![
+            worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+            worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    let mut first_live = client
+        .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+        .await
+        .expect("prime live observability snapshot");
+    first_live.published_batches_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 4)]);
+    first_live.published_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 9)]);
+    first_live.published_control_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 4)]);
+    first_live.published_data_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 5)]);
+    first_live.last_published_at_us_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 123_456)]);
+    first_live.last_published_origins_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["node-a::nfs1".to_string(), "node-a::nfs2".to_string()],
+    )]);
+    first_live.published_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["node-a::nfs1=4".to_string(), "node-a::nfs2=5".to_string()],
+    )]);
+    first_live.published_path_capture_target = Some("/force-find-stress".to_string());
+    first_live.enqueued_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+    first_live.pending_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+    first_live.yielded_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+    first_live.summarized_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+    first_live.published_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+
+    let mut later_live = first_live.clone();
+    later_live.status.current_stream_generation = None;
+    later_live.status.logical_roots.clear();
+    later_live.status.concrete_roots.clear();
+    later_live.last_control_frame_signals_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["recovered activate unit=runtime.exec.source".to_string()],
+    )]);
+    later_live.published_batches_by_node.clear();
+    later_live.published_events_by_node.clear();
+    later_live.published_control_events_by_node.clear();
+    later_live.published_data_events_by_node.clear();
+    later_live.last_published_at_us_by_node.clear();
+    later_live.last_published_origins_by_node.clear();
+    later_live.published_origin_counts_by_node.clear();
+    later_live.published_path_capture_target = None;
+    later_live.enqueued_path_origin_counts_by_node.clear();
+    later_live.pending_path_origin_counts_by_node.clear();
+    later_live.yielded_path_origin_counts_by_node.clear();
+    later_live.summarized_path_origin_counts_by_node.clear();
+    later_live.published_path_origin_counts_by_node.clear();
+    later_live.last_force_find_runner_by_group =
+        std::collections::BTreeMap::from([("nfs1".to_string(), "node-a::nfs1".to_string())]);
+
+    client.update_cached_observability_snapshot(&first_live);
+    client.update_cached_observability_snapshot(&later_live);
+
+    let nonblocking = client.observability_snapshot_nonblocking().await;
+    assert_eq!(
+        nonblocking.scheduled_source_groups_by_node.get("node-a"),
+        Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
+        "recent live cache must keep recovered scheduled source groups from the later live snapshot: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.scheduled_scan_groups_by_node.get("node-a"),
+        Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
+        "recent live cache must keep recovered scheduled scan groups from the later live snapshot: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.last_control_frame_signals_by_node.get("node-a"),
+        Some(&vec!["recovered activate unit=runtime.exec.source".to_string()]),
+        "recent live cache must keep recovered control summary from the later live snapshot: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.published_batches_by_node.get("node-a"),
+        Some(&4),
+        "recent live cache must preserve published batch counts when a later live snapshot only keeps recovered schedule/control truth: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.published_events_by_node.get("node-a"),
+        Some(&9),
+        "recent live cache must preserve published event counts when a later live snapshot only keeps recovered schedule/control truth: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.published_control_events_by_node.get("node-a"),
+        Some(&4),
+        "recent live cache must preserve published control-event counts when a later live snapshot only keeps recovered schedule/control truth: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.published_data_events_by_node.get("node-a"),
+        Some(&5),
+        "recent live cache must preserve published data-event counts when a later live snapshot only keeps recovered schedule/control truth: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.last_published_at_us_by_node.get("node-a"),
+        Some(&123_456),
+        "recent live cache must preserve last_published_at_us when a later live snapshot only keeps recovered schedule/control truth: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.last_published_origins_by_node.get("node-a"),
+        Some(&vec!["node-a::nfs1".to_string(), "node-a::nfs2".to_string()]),
+        "recent live cache must preserve last_published_origins when a later live snapshot only keeps recovered schedule/control truth: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.published_origin_counts_by_node.get("node-a"),
+        Some(&vec!["node-a::nfs1=4".to_string(), "node-a::nfs2=5".to_string()]),
+        "recent live cache must preserve published_origin_counts when a later live snapshot only keeps recovered schedule/control truth: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.published_path_capture_target.as_deref(),
+        Some("/force-find-stress"),
+        "recent live cache must preserve published_path_capture_target when a later live snapshot only keeps recovered schedule/control truth: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.last_force_find_runner_by_group.get("nfs1"),
+        Some(&"node-a::nfs1".to_string()),
+        "preserving published observability must not roll back stronger later live force-find facts"
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recent_live_cache_clears_published_path_observability_when_later_active_snapshot_explicitly_reports_zero_publication_counters(
+) {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: vec![
+            worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+            worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    let mut first_live = client
+        .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+        .await
+        .expect("prime live observability snapshot");
+    first_live.published_batches_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 4)]);
+    first_live.published_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 9)]);
+    first_live.published_control_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 4)]);
+    first_live.published_data_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 5)]);
+    first_live.last_published_at_us_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 123_456)]);
+    first_live.last_published_origins_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["node-a::nfs1".to_string(), "node-a::nfs2".to_string()],
+    )]);
+    first_live.published_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["node-a::nfs1=4".to_string(), "node-a::nfs2=5".to_string()],
+    )]);
+    first_live.published_path_capture_target = Some("/force-find-stress".to_string());
+    first_live.enqueued_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+    first_live.pending_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+    first_live.yielded_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+    first_live.summarized_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+    first_live.published_path_origin_counts_by_node = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["/force-find-stress node-a::nfs1=1".to_string()],
+    )]);
+
+    let mut later_live = first_live.clone();
+    later_live.published_batches_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 0)]);
+    later_live.published_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 0)]);
+    later_live.published_control_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 0)]);
+    later_live.published_data_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 0)]);
+    later_live.last_published_at_us_by_node.clear();
+    later_live.last_published_origins_by_node.clear();
+    later_live.published_origin_counts_by_node.clear();
+    later_live.published_path_capture_target = None;
+    later_live.enqueued_path_origin_counts_by_node.clear();
+    later_live.pending_path_origin_counts_by_node.clear();
+    later_live.yielded_path_origin_counts_by_node.clear();
+    later_live.summarized_path_origin_counts_by_node.clear();
+    later_live.published_path_origin_counts_by_node.clear();
+
+    client.update_cached_observability_snapshot(&first_live);
+    client.update_cached_observability_snapshot(&later_live);
+
+    let nonblocking = client.observability_snapshot_nonblocking().await;
+    assert_eq!(
+        nonblocking.published_batches_by_node.get("node-a"),
+        Some(&0),
+        "recent live cache must retain explicit zero published batch counters instead of replaying stale positive counts: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.published_events_by_node.get("node-a"),
+        Some(&0),
+        "recent live cache must retain explicit zero published event counters instead of replaying stale positive counts: {:?}",
+        nonblocking
+    );
+    assert!(
+        !nonblocking.last_published_at_us_by_node.contains_key("node-a"),
+        "explicit zero published counters must clear stale last_published_at_us instead of replaying cached metadata: {:?}",
+        nonblocking
+    );
+    assert!(
+        !nonblocking.last_published_origins_by_node.contains_key("node-a"),
+        "explicit zero published counters must clear stale last_published_origins instead of replaying cached metadata: {:?}",
+        nonblocking
+    );
+    assert!(
+        !nonblocking.published_origin_counts_by_node.contains_key("node-a"),
+        "explicit zero published counters must clear stale published_origin_counts instead of replaying cached metadata: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.published_path_capture_target,
+        None,
+        "explicit zero published counters must clear stale published_path_capture_target instead of replaying cached metadata: {:?}",
+        nonblocking
+    );
+    assert!(
+        nonblocking.enqueued_path_origin_counts_by_node.is_empty(),
+        "explicit zero published counters must clear stale enqueued_path_origin_counts instead of replaying cached metadata: {:?}",
+        nonblocking
+    );
+    assert!(
+        nonblocking.pending_path_origin_counts_by_node.is_empty(),
+        "explicit zero published counters must clear stale pending_path_origin_counts instead of replaying cached metadata: {:?}",
+        nonblocking
+    );
+    assert!(
+        nonblocking.yielded_path_origin_counts_by_node.is_empty(),
+        "explicit zero published counters must clear stale yielded_path_origin_counts instead of replaying cached metadata: {:?}",
+        nonblocking
+    );
+    assert!(
+        nonblocking.summarized_path_origin_counts_by_node.is_empty(),
+        "explicit zero published counters must clear stale summarized_path_origin_counts instead of replaying cached metadata: {:?}",
+        nonblocking
+    );
+    assert!(
+        nonblocking.published_path_origin_counts_by_node.is_empty(),
+        "explicit zero published counters must clear stale published_path_origin_counts instead of replaying cached metadata: {:?}",
+        nonblocking
     );
 
     client.close().await.expect("close source worker");

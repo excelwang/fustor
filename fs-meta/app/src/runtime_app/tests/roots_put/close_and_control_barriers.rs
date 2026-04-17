@@ -1,5 +1,13 @@
+    fn roots_put_close_and_control_barrier_test_serial() -> &'static tokio::sync::Mutex<()> {
+        static CELL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        CELL.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     #[tokio::test]
     async fn closing_app_waits_for_inflight_roots_put_before_tearing_down_facade() {
+        let _serial = roots_put_close_and_control_barrier_test_serial()
+            .lock()
+            .await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -186,7 +194,11 @@
     }
 
     #[tokio::test]
-    async fn closing_app_waits_for_control_ready_blocked_roots_put_before_tearing_down_facade() {
+    async fn closing_app_waits_for_control_ready_blocked_roots_put_to_settle_before_tearing_down_facade()
+    {
+        let _serial = roots_put_close_and_control_barrier_test_serial()
+            .lock()
+            .await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -354,18 +366,6 @@
             "app.close() must wait for a roots_put request that is already blocked on control readiness"
         );
 
-        app.control_initialized.store(true, Ordering::Release);
-        app.api_control_gate.set_ready(true);
-        tokio::time::timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .expect("roots_put should reach the handler hook after control readiness becomes available");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !close_task.is_finished(),
-            "app.close() must remain blocked while the now-control-ready roots_put is paused in the handler"
-        );
-        release.notify_waiters();
-
         let response = request
             .await
             .expect("join roots_put request")
@@ -373,17 +373,24 @@
         let status = response.status();
         let body = response.text().await.expect("decode roots_put body");
         assert!(
-            status.is_success(),
-            "roots_put unblocked by late control readiness should complete before facade teardown: status={status} body={body}"
+            status == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "roots_put blocked on control readiness during close should fail closed before facade teardown: status={status} body={body}"
+        );
+        assert!(
+            body.contains("runtime control initializes the app"),
+            "blocked roots_put should surface the control-readiness fail-closed body: {body}"
         );
         close_task
             .await
             .expect("join app close")
-            .expect("close app after in-flight roots_put");
+            .expect("close app after blocked roots_put settles");
     }
 
     #[tokio::test]
     async fn closing_app_waits_for_inflight_rescan_before_tearing_down_facade() {
+        let _serial = roots_put_close_and_control_barrier_test_serial()
+            .lock()
+            .await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -550,7 +557,10 @@
 
     #[tokio::test]
     async fn closing_app_does_not_start_source_close_before_inflight_roots_put_reaches_worker_dispatch()
-     {
+    {
+        let _serial = roots_put_close_and_control_barrier_test_serial()
+            .lock()
+            .await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -662,6 +672,10 @@
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
+        app.on_control_frame(&[activate_envelope("runtime.exec.source")])
+            .await
+            .expect("initialize app from runtime control before roots_put");
+
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let _roots_reset = RootsPutPauseHookReset;
@@ -734,8 +748,11 @@
     }
 
     #[tokio::test]
-    async fn closing_app_does_not_start_facade_shutdown_while_inflight_roots_put_is_dispatching_to_source_worker()
-     {
+    async fn closing_app_does_not_start_facade_shutdown_while_inflight_roots_put_holds_response_open_after_updates()
+    {
+        let _serial = roots_put_close_and_control_barrier_test_serial()
+            .lock()
+            .await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -849,15 +866,17 @@
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
 
-        let update_entered = Arc::new(Notify::new());
-        let update_release = Arc::new(Notify::new());
-        let _update_reset = SourceWorkerUpdateRootsHookReset;
-        crate::workers::source::install_source_worker_update_roots_hook(
-            crate::workers::source::SourceWorkerUpdateRootsHook {
-                entered: update_entered.clone(),
-                release: update_release.clone(),
-            },
-        );
+        app.on_control_frame(&[activate_envelope("runtime.exec.source")])
+            .await
+            .expect("initialize app from runtime control before roots_put");
+
+        let response_entered = Arc::new(Notify::new());
+        let response_release = Arc::new(Notify::new());
+        let _response_reset = RootsPutBeforeResponseHookReset;
+        crate::api::install_roots_put_before_response_hook(crate::api::RootsPutBeforeResponseHook {
+            entered: response_entered.clone(),
+            release: response_release.clone(),
+        });
 
         let shutdown_started = Arc::new(Notify::new());
         let _shutdown_reset = FacadeShutdownStartHookReset;
@@ -890,7 +909,11 @@
             }
         });
 
-        update_entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), response_entered.notified())
+            .await
+            .expect(
+                "roots_put should reach the before-response hook once runtime control initialization and source/sink updates complete",
+            );
         let close_task = tokio::spawn({
             let app = app.clone();
             async move { app.close().await }
@@ -899,10 +922,10 @@
             tokio::time::timeout(Duration::from_millis(600), shutdown_started.notified())
                 .await
                 .is_err(),
-            "facade shutdown must not start while roots_put is still dispatching update_logical_roots to the source worker"
+            "facade shutdown must not start while roots_put is still holding the management response open after applying root updates"
         );
 
-        update_release.notify_waiters();
+        response_release.notify_waiters();
 
         let response = request
             .await
@@ -922,6 +945,9 @@
 
     #[tokio::test]
     async fn roots_put_waits_for_control_initialization_before_source_update_dispatch() {
+        let _serial = roots_put_close_and_control_barrier_test_serial()
+            .lock()
+            .await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -1084,6 +1110,9 @@
 
     #[tokio::test]
     async fn control_frame_waits_for_inflight_roots_put_before_source_reconfiguration() {
+        let _serial = roots_put_close_and_control_barrier_test_serial()
+            .lock()
+            .await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);

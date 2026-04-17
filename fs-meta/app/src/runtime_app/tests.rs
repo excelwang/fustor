@@ -2305,7 +2305,13 @@ async fn current_facade_service_state_reads_pending_runtime_facts() {
 #[test]
 fn current_facade_service_state_from_runtime_facts_prefers_pending_over_ready_publication() {
     assert_eq!(
-        FSMetaApp::current_facade_service_state_from_runtime_facts(true, true, true),
+        FSMetaApp::current_facade_service_state_from_runtime_facts(
+            FacadeServiceStateDecisionInput {
+                control_gate_ready: true,
+                publication_ready: true,
+                pending_facade_present: true,
+            },
+        ),
         FacadeServiceState::Pending
     );
 }
@@ -2313,27 +2319,86 @@ fn current_facade_service_state_from_runtime_facts_prefers_pending_over_ready_pu
 #[test]
 fn current_facade_service_state_from_runtime_facts_requires_ready_publication_without_pending() {
     assert_eq!(
-        FSMetaApp::current_facade_service_state_from_runtime_facts(true, false, false),
+        FSMetaApp::current_facade_service_state_from_runtime_facts(
+            FacadeServiceStateDecisionInput {
+                control_gate_ready: true,
+                publication_ready: false,
+                pending_facade_present: false,
+            },
+        ),
         FacadeServiceState::Unavailable
     );
     assert_eq!(
-        FSMetaApp::current_facade_service_state_from_runtime_facts(false, true, false),
+        FSMetaApp::current_facade_service_state_from_runtime_facts(
+            FacadeServiceStateDecisionInput {
+                control_gate_ready: false,
+                publication_ready: true,
+                pending_facade_present: false,
+            },
+        ),
         FacadeServiceState::Unavailable
     );
     assert_eq!(
-        FSMetaApp::current_facade_service_state_from_runtime_facts(true, false, false),
+        FSMetaApp::current_facade_service_state_from_runtime_facts(
+            FacadeServiceStateDecisionInput {
+                control_gate_ready: true,
+                publication_ready: false,
+                pending_facade_present: false,
+            },
+        ),
         FacadeServiceState::Unavailable
     );
     assert_eq!(
-        FSMetaApp::current_facade_service_state_from_runtime_facts(true, true, false),
+        FSMetaApp::current_facade_service_state_from_runtime_facts(
+            FacadeServiceStateDecisionInput {
+                control_gate_ready: true,
+                publication_ready: true,
+                pending_facade_present: false,
+            },
+        ),
         FacadeServiceState::Serving
+    );
+}
+
+#[test]
+fn control_gate_ready_from_runtime_facts_requires_initialized_or_facade_only_handoff_and_no_replay() {
+    assert_eq!(
+        FSMetaApp::control_gate_ready_from_runtime_facts(
+            RuntimeGateFacts {
+                control_initialized: false,
+                source_state_replay_required: false,
+                sink_state_replay_required: false,
+            },
+            true,
+        ),
+        true
+    );
+    assert_eq!(
+        FSMetaApp::control_gate_ready_from_runtime_facts(
+            RuntimeGateFacts {
+                control_initialized: true,
+                source_state_replay_required: false,
+                sink_state_replay_required: true,
+            },
+            true,
+        ),
+        false
     );
 }
 
 #[test]
 fn facade_ready_tail_decision_prefers_pending_over_ready_publication() {
     assert_eq!(
-        FSMetaApp::facade_ready_tail_decision_from_runtime_facts(false, false, false, true, true, true),
+        FSMetaApp::facade_ready_tail_decision_from_runtime_facts(FacadeReadyTailDecisionInput {
+            runtime: RuntimeGateFacts {
+                control_initialized: false,
+                source_state_replay_required: false,
+                sink_state_replay_required: false,
+            },
+            allow_facade_only_handoff: true,
+            publication_ready: true,
+            pending_facade_present: true,
+        }),
         FacadeReadyTailDecision {
             control_gate_ready: true,
             published_state: FacadeServiceState::Pending,
@@ -2344,7 +2409,16 @@ fn facade_ready_tail_decision_prefers_pending_over_ready_publication() {
 #[test]
 fn facade_ready_tail_decision_keeps_unavailable_while_sink_replay_required_remains() {
     assert_eq!(
-        FSMetaApp::facade_ready_tail_decision_from_runtime_facts(true, false, true, true, true, false),
+        FSMetaApp::facade_ready_tail_decision_from_runtime_facts(FacadeReadyTailDecisionInput {
+            runtime: RuntimeGateFacts {
+                control_initialized: true,
+                source_state_replay_required: false,
+                sink_state_replay_required: true,
+            },
+            allow_facade_only_handoff: true,
+            publication_ready: true,
+            pending_facade_present: false,
+        }),
         FacadeReadyTailDecision {
             control_gate_ready: false,
             published_state: FacadeServiceState::Unavailable,
@@ -2355,11 +2429,251 @@ fn facade_ready_tail_decision_keeps_unavailable_while_sink_replay_required_remai
 #[test]
 fn facade_ready_tail_decision_allows_serving_after_facade_only_handoff_without_replay() {
     assert_eq!(
-        FSMetaApp::facade_ready_tail_decision_from_runtime_facts(false, false, false, true, true, false),
+        FSMetaApp::facade_ready_tail_decision_from_runtime_facts(FacadeReadyTailDecisionInput {
+            runtime: RuntimeGateFacts {
+                control_initialized: false,
+                source_state_replay_required: false,
+                sink_state_replay_required: false,
+            },
+            allow_facade_only_handoff: true,
+            publication_ready: true,
+            pending_facade_present: false,
+        }),
         FacadeReadyTailDecision {
             control_gate_ready: true,
             published_state: FacadeServiceState::Serving,
         }
+    );
+}
+
+#[test]
+fn facade_publication_readiness_decision_blocks_uninitialized_fixed_bind_handoff_while_suppressed_routes_remain()
+{
+    assert_eq!(
+        FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
+            FacadePublicationReadinessDecisionInput {
+                runtime: RuntimeGateFacts {
+                    control_initialized: false,
+                    source_state_replay_required: false,
+                    sink_state_replay_required: false,
+                },
+                allow_facade_only_handoff: false,
+                pending_facade_present: true,
+                pending_facade_is_control_route: true,
+                pending_fixed_bind_has_suppressed_dependent_routes: true,
+                active_control_stream_present: false,
+                active_pending_control_stream_present: false,
+            },
+        ),
+        FacadePublicationReadinessDecision::BlockedControlGate
+    );
+}
+
+#[test]
+fn facade_only_handoff_allowance_decision_allows_control_route_without_suppressed_routes() {
+    assert_eq!(
+        FSMetaApp::facade_only_handoff_allowance_decision(
+            FacadeOnlyHandoffAllowanceDecisionInput {
+                pending_facade_present: true,
+                pending_facade_is_control_route: true,
+                pending_fixed_bind_has_suppressed_dependent_routes: false,
+                pending_bind_is_ephemeral: true,
+                pending_bind_owned_by_instance: false,
+            },
+        ),
+        FacadeOnlyHandoffAllowanceDecision::AllowedControlRouteWithoutSuppressedRoutes
+    );
+}
+
+#[test]
+fn facade_only_handoff_allowance_decision_blocks_control_route_while_suppressed_routes_remain() {
+    assert_eq!(
+        FSMetaApp::facade_only_handoff_allowance_decision(
+            FacadeOnlyHandoffAllowanceDecisionInput {
+                pending_facade_present: true,
+                pending_facade_is_control_route: true,
+                pending_fixed_bind_has_suppressed_dependent_routes: true,
+                pending_bind_is_ephemeral: false,
+                pending_bind_owned_by_instance: true,
+            },
+        ),
+        FacadeOnlyHandoffAllowanceDecision::Blocked
+    );
+}
+
+#[test]
+fn facade_only_handoff_allowance_decision_allows_owned_non_ephemeral_fixed_bind_handoff() {
+    assert_eq!(
+        FSMetaApp::facade_only_handoff_allowance_decision(
+            FacadeOnlyHandoffAllowanceDecisionInput {
+                pending_facade_present: true,
+                pending_facade_is_control_route: false,
+                pending_fixed_bind_has_suppressed_dependent_routes: true,
+                pending_bind_is_ephemeral: false,
+                pending_bind_owned_by_instance: true,
+            },
+        ),
+        FacadeOnlyHandoffAllowanceDecision::AllowedOwnedNonEphemeralFixedBind
+    );
+}
+
+#[test]
+fn facade_only_handoff_allowance_decision_blocks_ephemeral_non_control_pending_facade() {
+    assert_eq!(
+        FSMetaApp::facade_only_handoff_allowance_decision(
+            FacadeOnlyHandoffAllowanceDecisionInput {
+                pending_facade_present: true,
+                pending_facade_is_control_route: false,
+                pending_fixed_bind_has_suppressed_dependent_routes: false,
+                pending_bind_is_ephemeral: true,
+                pending_bind_owned_by_instance: true,
+            },
+        ),
+        FacadeOnlyHandoffAllowanceDecision::Blocked
+    );
+}
+
+#[test]
+fn fixed_bind_handoff_release_decision_blocks_non_control_pending_facade() {
+    assert_eq!(
+        FSMetaApp::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
+            handoff_ready_entry_present: true,
+            handoff_ready_owned_by_current_instance: false,
+            pending_facade_present: true,
+            pending_facade_is_control_route: false,
+            pending_runtime_exposure_confirmed: true,
+            suppressed_dependent_routes_remain: false,
+        }),
+        FixedBindHandoffReleaseDecision::Blocked
+    );
+}
+
+#[test]
+fn fixed_bind_handoff_release_decision_blocks_unconfirmed_control_route_while_suppressed_routes_remain()
+{
+    assert_eq!(
+        FSMetaApp::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
+            handoff_ready_entry_present: true,
+            handoff_ready_owned_by_current_instance: false,
+            pending_facade_present: true,
+            pending_facade_is_control_route: true,
+            pending_runtime_exposure_confirmed: false,
+            suppressed_dependent_routes_remain: true,
+        }),
+        FixedBindHandoffReleaseDecision::Blocked
+    );
+}
+
+#[test]
+fn fixed_bind_handoff_release_decision_allows_confirmed_control_route_even_with_suppressed_routes()
+{
+    assert_eq!(
+        FSMetaApp::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
+            handoff_ready_entry_present: true,
+            handoff_ready_owned_by_current_instance: false,
+            pending_facade_present: true,
+            pending_facade_is_control_route: true,
+            pending_runtime_exposure_confirmed: true,
+            suppressed_dependent_routes_remain: true,
+        }),
+        FixedBindHandoffReleaseDecision::Ready
+    );
+}
+
+#[test]
+fn fixed_bind_handoff_release_decision_allows_unsuppressed_control_route_without_exposure_confirmation()
+{
+    assert_eq!(
+        FSMetaApp::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
+            handoff_ready_entry_present: true,
+            handoff_ready_owned_by_current_instance: false,
+            pending_facade_present: true,
+            pending_facade_is_control_route: true,
+            pending_runtime_exposure_confirmed: false,
+            suppressed_dependent_routes_remain: false,
+        }),
+        FixedBindHandoffReleaseDecision::Ready
+    );
+}
+
+#[test]
+fn facade_publication_readiness_decision_requires_matching_active_control_stream_before_pending_control_route_is_ready()
+{
+    assert_eq!(
+        FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
+            FacadePublicationReadinessDecisionInput {
+                runtime: RuntimeGateFacts {
+                    control_initialized: true,
+                    source_state_replay_required: false,
+                    sink_state_replay_required: false,
+                },
+                allow_facade_only_handoff: false,
+                pending_facade_present: true,
+                pending_facade_is_control_route: true,
+                pending_fixed_bind_has_suppressed_dependent_routes: true,
+                active_control_stream_present: true,
+                active_pending_control_stream_present: false,
+            },
+        ),
+        FacadePublicationReadinessDecision::FixedBindHandoffPending
+    );
+}
+
+#[test]
+fn facade_publication_readiness_decision_allows_facade_only_handoff_without_suppressed_routes()
+{
+    assert_eq!(
+        FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
+            FacadePublicationReadinessDecisionInput {
+                runtime: RuntimeGateFacts {
+                    control_initialized: false,
+                    source_state_replay_required: false,
+                    sink_state_replay_required: false,
+                },
+                allow_facade_only_handoff: true,
+                pending_facade_present: true,
+                pending_facade_is_control_route: true,
+                pending_fixed_bind_has_suppressed_dependent_routes: false,
+                active_control_stream_present: false,
+                active_pending_control_stream_present: false,
+            },
+        ),
+        FacadePublicationReadinessDecision::FixedBindHandoffPending
+    );
+}
+
+#[test]
+fn facade_publication_readiness_decision_allows_active_control_stream_during_fixed_bind_ready_tail_even_when_pending_facade_is_not_control_route()
+{
+    assert_eq!(
+        FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
+            FacadePublicationReadinessDecisionInput {
+                runtime: RuntimeGateFacts {
+                    control_initialized: false,
+                    source_state_replay_required: false,
+                    sink_state_replay_required: false,
+                },
+                allow_facade_only_handoff: true,
+                pending_facade_present: true,
+                pending_facade_is_control_route: false,
+                pending_fixed_bind_has_suppressed_dependent_routes: true,
+                active_control_stream_present: true,
+                active_pending_control_stream_present: false,
+            },
+        ),
+        FacadePublicationReadinessDecision::Ready
+    );
+}
+
+#[test]
+fn preferred_internal_query_endpoint_units_keeps_query_peer_as_fallback_when_both_query_lanes_are_active()
+{
+    assert_eq!(
+        preferred_internal_query_endpoint_units(true, true, false),
+        vec![
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+        ]
     );
 }
 
@@ -2371,16 +2685,16 @@ fn classify_source_control_wave_disposition_detects_cleanup_only_uninitialized_f
     .expect("source signals");
 
     assert_eq!(
-        FSMetaApp::classify_source_control_wave_disposition(
-            false,
-            false,
-            false,
-            UninitializedCleanupDisposition::SourceOnly,
-            &source_signals,
-            false,
-            false,
-            false,
-        ),
+        FSMetaApp::classify_source_control_wave_disposition(SourceControlWaveDecisionInput {
+            control_initialized_at_entry: false,
+            control_initialized_now: false,
+            source_state_replay_required: false,
+            cleanup_disposition: UninitializedCleanupDisposition::SourceOnly,
+            source_signals: &source_signals,
+            facade_claim_signals_present: false,
+            facade_publication_signals_present: false,
+            sink_signals_present: false,
+        }),
         SourceControlWaveDisposition::CleanupOnlyWhileUninitialized
     );
 }
@@ -2394,7 +2708,14 @@ fn classify_uninitialized_cleanup_disposition_detects_facade_only_cleanup_wave()
     .expect("split facade cleanup-only signals");
 
     assert_eq!(
-        FSMetaApp::classify_uninitialized_cleanup_disposition(false, &[], &[], &facade_signals,),
+        FSMetaApp::classify_uninitialized_cleanup_disposition(
+            UninitializedCleanupDecisionInput {
+                control_initialized_now: false,
+                source_signals: &[],
+                sink_signals: &[],
+                facade_signals: &facade_signals,
+            },
+        ),
         UninitializedCleanupDisposition::FacadeOnly
     );
 }
@@ -2414,7 +2735,14 @@ fn classify_uninitialized_cleanup_disposition_detects_source_only_cleanup_wave()
         .expect("split source cleanup-only signals");
 
     assert_eq!(
-        FSMetaApp::classify_uninitialized_cleanup_disposition(false, &source_signals, &[], &[],),
+        FSMetaApp::classify_uninitialized_cleanup_disposition(
+            UninitializedCleanupDecisionInput {
+                control_initialized_now: false,
+                source_signals: &source_signals,
+                sink_signals: &[],
+                facade_signals: &[],
+            },
+        ),
         UninitializedCleanupDisposition::SourceOnly
     );
 }
@@ -2429,7 +2757,14 @@ fn classify_uninitialized_cleanup_disposition_detects_sink_query_only_cleanup_wa
     .expect("split sink query cleanup-only signals");
 
     assert_eq!(
-        FSMetaApp::classify_uninitialized_cleanup_disposition(false, &[], &sink_signals, &[],),
+        FSMetaApp::classify_uninitialized_cleanup_disposition(
+            UninitializedCleanupDecisionInput {
+                control_initialized_now: false,
+                source_signals: &[],
+                sink_signals: &sink_signals,
+                facade_signals: &[],
+            },
+        ),
         UninitializedCleanupDisposition::SinkOnly { query_only: true }
     );
 }
@@ -2449,7 +2784,14 @@ fn classify_source_generation_cutover_disposition_detects_restart_deferred_retir
         .expect("split source generation-cutover signals");
 
     assert_eq!(
-        FSMetaApp::classify_source_generation_cutover_disposition(true, &source_signals, &[], &[],),
+        FSMetaApp::classify_source_generation_cutover_disposition(
+            SourceGenerationCutoverDecisionInput {
+                control_initialized_at_entry: true,
+                source_signals: &source_signals,
+                sink_signals: &[],
+                facade_signals: &[],
+            },
+        ),
         SourceGenerationCutoverDisposition::FailClosedRestartDeferredRetirePending
     );
 }
@@ -2470,11 +2812,13 @@ fn classify_sink_generation_cutover_disposition_detects_shared_generation_cutove
 
     assert_eq!(
         FSMetaApp::classify_sink_generation_cutover_disposition(
-            true,
-            &[],
-            &sink_signals,
-            &[],
-            true,
+            SinkGenerationCutoverDecisionInput {
+                control_initialized_at_entry: true,
+                source_signals: &[],
+                sink_signals: &sink_signals,
+                facade_signals: &[],
+                sink_signals_in_shared_generation_cutover_lane: true,
+            },
         ),
         SinkGenerationCutoverDisposition::FailClosedSharedGenerationCutover
     );
@@ -2490,16 +2834,16 @@ fn classify_source_control_wave_disposition_detects_steady_tick_noop() {
         .expect("source tick signals");
 
     assert_eq!(
-        FSMetaApp::classify_source_control_wave_disposition(
-            true,
-            true,
-            false,
-            UninitializedCleanupDisposition::None,
-            &source_signals,
-            false,
-            false,
-            false,
-        ),
+        FSMetaApp::classify_source_control_wave_disposition(SourceControlWaveDecisionInput {
+            control_initialized_at_entry: true,
+            control_initialized_now: true,
+            source_state_replay_required: false,
+            cleanup_disposition: UninitializedCleanupDisposition::None,
+            source_signals: &source_signals,
+            facade_claim_signals_present: false,
+            facade_publication_signals_present: false,
+            sink_signals_present: false,
+        }),
         SourceControlWaveDisposition::SteadyTickNoop
     );
 }
@@ -2507,16 +2851,16 @@ fn classify_source_control_wave_disposition_detects_steady_tick_noop() {
 #[test]
 fn classify_source_control_wave_disposition_detects_replay_retained() {
     assert_eq!(
-        FSMetaApp::classify_source_control_wave_disposition(
-            true,
-            true,
-            true,
-            UninitializedCleanupDisposition::None,
-            &[],
-            false,
-            false,
-            false,
-        ),
+        FSMetaApp::classify_source_control_wave_disposition(SourceControlWaveDecisionInput {
+            control_initialized_at_entry: true,
+            control_initialized_now: true,
+            source_state_replay_required: true,
+            cleanup_disposition: UninitializedCleanupDisposition::None,
+            source_signals: &[],
+            facade_claim_signals_present: false,
+            facade_publication_signals_present: false,
+            sink_signals_present: false,
+        }),
         SourceControlWaveDisposition::ReplayRetained
     );
 }
@@ -2530,19 +2874,19 @@ fn classify_sink_control_wave_disposition_detects_initial_mixed_wave_before_sour
         .expect("sink signals");
 
     assert_eq!(
-        FSMetaApp::classify_sink_control_wave_disposition(
-            false,
-            false,
-            false,
-            false,
-            false,
-            UninitializedCleanupDisposition::None,
-            SourceControlWaveDisposition::ApplySignals,
-            true,
-            false,
-            false,
-            &sink_signals,
-        ),
+        FSMetaApp::classify_sink_control_wave_disposition(SinkControlWaveDecisionInput {
+            control_initialized_at_entry: false,
+            control_initialized_now: false,
+            retained_sink_state_present_at_entry: false,
+            sink_state_replay_required: false,
+            sink_tick_fast_path_eligible: false,
+            cleanup_disposition: UninitializedCleanupDisposition::None,
+            source_wave_disposition: SourceControlWaveDisposition::ApplySignals,
+            source_signals_present: true,
+            facade_claim_signals_present: false,
+            facade_publication_signals_present: false,
+            sink_signals: &sink_signals,
+        }),
         SinkControlWaveDisposition::ApplyBeforeInitialSourceWave
     );
 }
@@ -2557,19 +2901,19 @@ fn classify_sink_control_wave_disposition_marks_tick_recovery_apply_waiting_for_
         .expect("sink tick signals");
 
     assert_eq!(
-        FSMetaApp::classify_sink_control_wave_disposition(
-            true,
-            true,
-            true,
-            false,
-            false,
-            UninitializedCleanupDisposition::None,
-            SourceControlWaveDisposition::Idle,
-            false,
-            false,
-            false,
-            &sink_signals,
-        ),
+        FSMetaApp::classify_sink_control_wave_disposition(SinkControlWaveDecisionInput {
+            control_initialized_at_entry: true,
+            control_initialized_now: true,
+            retained_sink_state_present_at_entry: true,
+            sink_state_replay_required: false,
+            sink_tick_fast_path_eligible: false,
+            cleanup_disposition: UninitializedCleanupDisposition::None,
+            source_wave_disposition: SourceControlWaveDisposition::Idle,
+            source_signals_present: false,
+            facade_claim_signals_present: false,
+            facade_publication_signals_present: false,
+            sink_signals: &sink_signals,
+        }),
         SinkControlWaveDisposition::ApplySignals {
             wait_for_status_republish_after_apply: true,
         }
@@ -5685,9 +6029,11 @@ async fn external_worker_status_reports_serving_facade_state_after_remote_collec
     });
     FSMetaApp::publish_facade_service_state_from_runtime_facts(
         &app.facade_service_state,
-        true,
-        true,
-        false,
+        FacadeServiceStateDecisionInput {
+            control_gate_ready: true,
+            publication_ready: true,
+            pending_facade_present: false,
+        },
     );
     let listener_scopes = &[("test-root", &["listener-a"][..])];
     let initial = vec![
@@ -11437,6 +11783,238 @@ async fn pending_fixed_bind_release_does_not_overwrite_pending_facade_state_with
         FacadeServiceState::Pending,
         "fixed-bind handoff completion must not overwrite a newly pending facade state with serving when pending reappears before the ready tail completes"
     );
+    assert!(
+        !successor.api_control_gate.is_ready(),
+        "fixed-bind handoff completion must keep the API control gate closed when a higher-generation pending facade reappears before the ready tail completes"
+    );
+    assert!(
+        !successor.facade_publication_ready().await,
+        "fixed-bind handoff completion must not treat a stale active control stream as publication-ready when a higher-generation pending facade reappears before the ready tail completes"
+    );
+
+    successor.close().await.expect("close successor");
+}
+
+#[tokio::test]
+async fn pending_fixed_bind_release_reopens_control_gate_when_non_control_pending_reappears_before_handoff_completion()
+{
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+    struct ProcessFacadeClaimReset;
+    struct PendingFixedBindHandoffCompletionGateReopenPauseHookReset;
+    struct PendingFixedBindHandoffCompletionCompletionHookReset;
+
+    impl Drop for ProcessFacadeClaimReset {
+        fn drop(&mut self) {
+            clear_process_facade_claim_for_tests();
+        }
+    }
+
+    impl Drop for PendingFixedBindHandoffCompletionGateReopenPauseHookReset {
+        fn drop(&mut self) {
+            clear_pending_fixed_bind_handoff_completion_gate_reopen_pause_hook();
+        }
+    }
+
+    impl Drop for PendingFixedBindHandoffCompletionCompletionHookReset {
+        fn drop(&mut self) {
+            clear_pending_fixed_bind_handoff_completion_completion_hook();
+        }
+    }
+
+    clear_process_facade_claim_for_tests();
+    let _claim_reset = ProcessFacadeClaimReset;
+    let _hook_reset = PendingFixedBindHandoffCompletionGateReopenPauseHookReset;
+    let _completion_hook_reset = PendingFixedBindHandoffCompletionCompletionHookReset;
+
+    let tmp = tempdir().expect("create temp dir");
+    let (passwd_path_1, shadow_path_1) = write_auth_files(&tmp);
+    let listener_resource = api::config::ApiListenerResource {
+        resource_id: "listener-release".to_string(),
+        bind_addr: reserve_bind_addr(),
+    };
+
+    let predecessor = Arc::new(
+        FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new(
+                        "pre-release-root",
+                        tmp.path(),
+                    )],
+                    host_object_grants: vec![granted_mount_root("node-release::root", tmp.path())],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path: passwd_path_1,
+                        shadow_path: shadow_path_1,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-release-predecessor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init predecessor"),
+    );
+
+    let bound_scope = RuntimeBoundScope {
+        scope_id: listener_resource.resource_id.clone(),
+        resource_ids: vec![listener_resource.resource_id.clone()],
+    };
+
+    predecessor
+        .apply_facade_activate(
+            FacadeRuntimeUnit::Facade,
+            &facade_control_stream_route(),
+            1,
+            &[bound_scope.clone()],
+        )
+        .await
+        .expect("activate predecessor facade");
+
+    let (passwd_path_2, shadow_path_2) = write_auth_files(&tmp);
+    let successor = Arc::new(
+        FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("successor-root", tmp.path())],
+                    host_object_grants: vec![granted_mount_root("node-release::root", tmp.path())],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: listener_resource.resource_id.clone(),
+                    local_listener_resources: vec![listener_resource.clone()],
+                    auth: api::ApiAuthConfig {
+                        passwd_path: passwd_path_2,
+                        shadow_path: shadow_path_2,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("node-release-successor".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init successor"),
+    );
+
+    let candidate_resource_ids = FSMetaApp::facade_candidate_resource_ids(&[bound_scope.clone()]);
+    let resolved = successor
+        .config
+        .api
+        .resolve_for_candidate_ids(&candidate_resource_ids)
+        .expect("resolve successor facade config");
+
+    let pending = PendingFacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 2,
+        resource_ids: candidate_resource_ids.clone(),
+        bound_scopes: vec![bound_scope.clone()],
+        group_ids: Vec::new(),
+        runtime_managed: successor.runtime_boundary.is_some(),
+        runtime_exposure_confirmed: !successor.runtime_boundary.is_some(),
+        resolved,
+    };
+
+    *successor.pending_facade.lock().await = Some(pending.clone());
+
+    if let Some(claim) = ProcessFacadeClaim::from_pending(predecessor.instance_id, &pending) {
+        process_facade_claim_cell()
+            .lock()
+            .expect("lock claim cell")
+            .insert(claim.bind_addr.clone(), claim);
+    }
+
+    successor
+        .try_spawn_pending_facade()
+        .await
+        .expect("try spawn pending facade should handle conflict");
+
+    let bind_addr = pending.resolved.bind_addr.clone();
+    let hook_entered = Arc::new(Notify::new());
+    let hook_release = Arc::new(Notify::new());
+    let completion_entered = Arc::new(Notify::new());
+    install_pending_fixed_bind_handoff_completion_gate_reopen_pause_hook(
+        PendingFixedBindHandoffCompletionGateReopenPauseHook {
+            entered: hook_entered.clone(),
+            release: hook_release.clone(),
+        },
+    );
+    install_pending_fixed_bind_handoff_completion_completion_hook(
+        PendingFixedBindHandoffCompletionCompletionHook {
+            entered: completion_entered.clone(),
+        },
+    );
+
+    let predecessor_for_shutdown = predecessor.clone();
+    let shutdown_task = tokio::spawn(async move {
+        predecessor_for_shutdown.shutdown_active_facade().await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), hook_entered.notified())
+        .await
+        .expect("fixed-bind handoff completion must reach the tail gate-reopen point");
+
+    let next_resolved = successor
+        .config
+        .api
+        .resolve_for_candidate_ids(&candidate_resource_ids)
+        .expect("resolve next pending facade config");
+    let next_pending = PendingFacadeActivation {
+        route_key: "fs-meta.events:v1.stream".to_string(),
+        generation: 3,
+        resource_ids: candidate_resource_ids,
+        bound_scopes: vec![bound_scope],
+        group_ids: Vec::new(),
+        runtime_managed: successor.runtime_boundary.is_some(),
+        runtime_exposure_confirmed: !successor.runtime_boundary.is_some(),
+        resolved: next_resolved,
+    };
+
+    *successor.pending_facade.lock().await = Some(next_pending.clone());
+    FSMetaApp::set_pending_facade_status_waiting(
+        &successor.facade_pending_status,
+        &next_pending,
+        FacadePendingReason::AwaitingObservationEligibility,
+    );
+    *successor
+        .facade_service_state
+        .write()
+        .expect("write published facade state before handoff completion resume") =
+        FacadeServiceState::Pending;
+    successor.api_control_gate.set_ready(false);
+
+    hook_release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), completion_entered.notified())
+        .await
+        .expect(
+            "fixed-bind handoff completion must finish its ready tail after the pause is released",
+        );
+    tokio::time::timeout(Duration::from_secs(2), shutdown_task)
+        .await
+        .expect("fixed-bind shutdown task must finish after the ready tail resumes")
+        .expect("join fixed-bind shutdown task");
+
+    assert!(
+        successor.api_control_gate.is_ready(),
+        "fixed-bind handoff completion must reopen the API control gate when a non-control pending facade reappears but the active control stream still exists"
+    );
+    assert!(
+        successor.facade_publication_ready().await,
+        "fixed-bind handoff completion must treat the active control stream as publication-ready when the reintroduced pending facade is not the control route"
+    );
+    assert_eq!(
+        *successor
+            .facade_service_state
+            .read()
+            .expect("read published facade state after handoff completion"),
+        FacadeServiceState::Pending,
+        "fixed-bind handoff completion must keep the published facade state pending while the non-control facade remains pending even though the control stream is publication-ready"
+    );
 
     successor.close().await.expect("close successor");
 }
@@ -11903,6 +12481,138 @@ async fn fixed_bind_handoff_release_waits_for_live_suppressed_route_state() {
     assert!(
         !predecessor.fixed_bind_handoff_ready_for_release(2).await,
         "predecessor must keep the active listener while successor still has suppressed dependent routes and runtime exposure is unconfirmed"
+    );
+
+    predecessor.close().await.expect("close predecessor");
+    successor.close().await.expect("close successor");
+}
+
+#[tokio::test]
+async fn fixed_bind_handoff_release_ignores_non_control_pending_ready_entry() {
+    struct ProcessFacadeClaimReset;
+
+    impl Drop for ProcessFacadeClaimReset {
+        fn drop(&mut self) {
+            clear_process_facade_claim_for_tests();
+        }
+    }
+
+    clear_process_facade_claim_for_tests();
+    let _claim_reset = ProcessFacadeClaimReset;
+
+    let tmp = tempdir().expect("create temp dir");
+    let (passwd_path_1, shadow_path_1) = write_auth_files(&tmp);
+    let listener_resource = api::config::ApiListenerResource {
+        resource_id: "listener-release".to_string(),
+        bind_addr: reserve_bind_addr(),
+    };
+
+    let predecessor = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new(
+                    "pre-release-root",
+                    tmp.path(),
+                )],
+                host_object_grants: vec![granted_mount_root("node-release::root", tmp.path())],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: listener_resource.resource_id.clone(),
+                local_listener_resources: vec![listener_resource.clone()],
+                auth: api::ApiAuthConfig {
+                    passwd_path: passwd_path_1,
+                    shadow_path: shadow_path_1,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        },
+        NodeId("node-release-predecessor".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init predecessor");
+
+    let bound_scope = RuntimeBoundScope {
+        scope_id: listener_resource.resource_id.clone(),
+        resource_ids: vec![listener_resource.resource_id.clone()],
+    };
+
+    *predecessor.pending_facade.lock().await = Some(PendingFacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 1,
+        resource_ids: vec![listener_resource.resource_id.clone()],
+        bound_scopes: vec![bound_scope.clone()],
+        group_ids: Vec::new(),
+        runtime_managed: true,
+        runtime_exposure_confirmed: true,
+        resolved: predecessor
+            .config
+            .api
+            .resolve_for_candidate_ids(std::slice::from_ref(&listener_resource.resource_id))
+            .expect("resolve predecessor facade config"),
+    });
+    match predecessor.try_spawn_pending_facade().await {
+        Ok(true) => {}
+        Err(CnxError::InvalidInput(msg))
+            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+        {
+            return;
+        }
+        Ok(false) => panic!("predecessor fixed-bind facade should claim the listener"),
+        Err(err) => panic!("spawn predecessor facade: {err}"),
+    }
+
+    let (passwd_path_2, shadow_path_2) = write_auth_files(&tmp);
+    let successor = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("successor-root", tmp.path())],
+                host_object_grants: vec![granted_mount_root("node-release::root", tmp.path())],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: listener_resource.resource_id.clone(),
+                local_listener_resources: vec![listener_resource.clone()],
+                auth: api::ApiAuthConfig {
+                    passwd_path: passwd_path_2,
+                    shadow_path: shadow_path_2,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        },
+        NodeId("node-release-successor".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init successor");
+
+    let candidate_resource_ids = FSMetaApp::facade_candidate_resource_ids(&[bound_scope.clone()]);
+    let resolved = successor
+        .config
+        .api
+        .resolve_for_candidate_ids(&candidate_resource_ids)
+        .expect("resolve successor facade config");
+    let bind_addr = resolved.bind_addr.clone();
+
+    *successor.pending_facade.lock().await = Some(PendingFacadeActivation {
+        route_key: "fs-meta.events:v1.stream".to_string(),
+        generation: 2,
+        resource_ids: candidate_resource_ids,
+        bound_scopes: vec![bound_scope],
+        group_ids: Vec::new(),
+        runtime_managed: true,
+        runtime_exposure_confirmed: true,
+        resolved,
+    });
+    mark_pending_fixed_bind_handoff_ready(
+        &bind_addr,
+        successor.pending_fixed_bind_handoff_registrant(),
+    );
+
+    assert!(
+        !predecessor.fixed_bind_handoff_ready_for_release(2).await,
+        "predecessor must ignore non-control pending handoff-ready entries when deciding whether to release the active fixed bind"
     );
 
     predecessor.close().await.expect("close predecessor");
@@ -28645,7 +29355,7 @@ async fn current_generation_source_roots_tick_timeout_replayed_mixed_wave_reacqu
     app.close().await.expect("close app");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn internal_sink_status_fails_closed_when_runtime_is_uninitialized_after_failure() {
     let tmp = tempdir().expect("create temp dir");
     let bind_addr = reserve_bind_addr();
@@ -29787,6 +30497,140 @@ async fn peer_only_internal_query_routes_mirror_query_lane_activation_after_turn
 }
 
 #[tokio::test]
+async fn deferred_sink_owned_query_peer_publication_restores_peer_first_mirror_after_suppression() {
+    let app = FSMetaApp::with_boundaries(
+        FSMetaConfig::default(),
+        NodeId("node-c-29776147311333818169819137".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init app");
+
+    let route_scopes = [RuntimeBoundScope {
+        scope_id: "nfs1".to_string(),
+        resource_ids: vec!["listener-a".to_string()],
+    }];
+    let sink_status_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
+
+    app.apply_facade_activate(
+        FacadeRuntimeUnit::QueryPeer,
+        &sink_status_route,
+        2,
+        &route_scopes,
+    )
+    .await
+    .expect("activate initial query-peer sink-status route");
+
+    assert!(
+        app.facade_gate
+            .route_active(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                &sink_status_route
+            )
+            .expect("initial query-peer sink-status route state"),
+        "precondition: query-peer sink-status route should start active"
+    );
+    assert!(
+        app.facade_gate
+            .route_active(execution_units::QUERY_RUNTIME_UNIT_ID, &sink_status_route)
+            .expect("initial mirrored query sink-status route state"),
+        "precondition: query lane should start mirrored for the peer-owned sink-status route"
+    );
+    assert!(
+        app.mirrored_query_peer_routes
+            .lock()
+            .await
+            .contains_key(&sink_status_route),
+        "precondition: mirrored query-peer route marker should exist before suppression"
+    );
+
+    let deferred_signal = FacadeControlSignal::Activate {
+        unit: FacadeRuntimeUnit::QueryPeer,
+        route_key: sink_status_route.clone(),
+        generation: 3,
+        bound_scopes: route_scopes.to_vec(),
+    };
+
+    app.suppress_deferred_sink_owned_query_peer_publication_signals(std::slice::from_ref(
+        &deferred_signal,
+    ))
+    .await
+    .expect("suppress deferred sink-owned query-peer publication");
+
+    assert!(
+        !app.facade_gate
+            .route_active(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                &sink_status_route
+            )
+            .expect("suppressed query-peer sink-status route state"),
+        "suppression should clear the query-peer sink-status route until deferred publication resumes"
+    );
+    assert!(
+        app.facade_gate
+            .route_active(execution_units::QUERY_RUNTIME_UNIT_ID, &sink_status_route)
+            .expect("suppressed mirrored query sink-status route state"),
+        "suppression should leave the already mirrored query sink-status route active"
+    );
+    assert!(
+        !app.mirrored_query_peer_routes
+            .lock()
+            .await
+            .contains_key(&sink_status_route),
+        "suppression should clear the peer-first mirrored marker until deferred publication reapplies it"
+    );
+
+    FSMetaApp::apply_deferred_sink_owned_query_peer_publication_signal_from_parts(
+        app.facade_gate.clone(),
+        app.mirrored_query_peer_routes.clone(),
+        deferred_signal,
+    )
+    .await
+    .expect("reapply deferred sink-owned query-peer publication");
+
+    let query_peer_active = app
+        .facade_gate
+        .route_active(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            &sink_status_route,
+        )
+        .expect("query-peer sink-status route state after deferred publication");
+    let query_active = app
+        .facade_gate
+        .route_active(execution_units::QUERY_RUNTIME_UNIT_ID, &sink_status_route)
+        .expect("query sink-status route state after deferred publication");
+    let prefer_query_peer_first = app
+        .mirrored_query_peer_routes
+        .lock()
+        .await
+        .contains_key(&sink_status_route);
+
+    assert!(
+        query_peer_active,
+        "deferred publication should restore the query-peer sink-status route"
+    );
+    assert!(
+        query_active,
+        "deferred publication should keep the mirrored query sink-status route active for delivery continuity"
+    );
+    assert!(
+        prefer_query_peer_first,
+        "deferred publication should restore the peer-first mirror marker even when the query lane was already active from the prior mirrored publication"
+    );
+    assert_eq!(
+        preferred_internal_query_endpoint_units(
+            query_active,
+            query_peer_active,
+            prefer_query_peer_first,
+        ),
+        vec![
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+        ],
+        "deferred sink-owned peer publication should keep internal sink-status routing query-peer-first after suppression clears and later reapplies the peer-owned route"
+    );
+}
+
+#[tokio::test]
 async fn mark_control_uninitialized_clears_source_find_route_for_both_query_lanes() {
     let app = FSMetaApp::with_boundaries(
         FSMetaConfig::default(),
@@ -29937,6 +30781,171 @@ async fn uninitialized_sink_query_cleanup_clears_source_query_routes_left_active
             .expect("mirrored query source-find route state"),
         "uninitialized sink query cleanup should also withdraw mirrored local source-find route before later source replay"
     );
+}
+
+#[tokio::test]
+async fn uninitialized_sink_query_cleanup_followup_does_not_wait_for_inflight_source_control_handoff(
+) {
+    let app = Arc::new(
+        FSMetaApp::with_boundaries(
+            FSMetaConfig::default(),
+            NodeId("node-c-29776147311333818169819137".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init app"),
+    );
+
+    let route_scopes = [RuntimeBoundScope {
+        scope_id: "test-root".to_string(),
+        resource_ids: vec!["listener-a".to_string()],
+    }];
+    let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+    let source_find_route = format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL);
+
+    app.apply_facade_activate(
+        FacadeRuntimeUnit::QueryPeer,
+        &source_status_route,
+        2,
+        &route_scopes,
+    )
+    .await
+    .expect("activate query-peer source-status route");
+    app.apply_facade_activate(
+        FacadeRuntimeUnit::QueryPeer,
+        &source_find_route,
+        2,
+        &route_scopes,
+    )
+    .await
+    .expect("activate query-peer source-find route");
+
+    app.control_initialized.store(false, Ordering::Release);
+    app.api_control_gate.set_ready(false);
+
+    let shared_serial_guard = app.shared_control_frame_serial.lock().await;
+
+    let mut cleanup_followup = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                sink_query_request_route_for("node-a").0,
+                3,
+            )])
+            .await
+        }
+    });
+
+    let cleanup_result =
+        tokio::time::timeout(Duration::from_millis(600), &mut cleanup_followup).await;
+    if cleanup_result.is_err() {
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut cleanup_followup).await;
+    }
+    drop(shared_serial_guard);
+
+    assert!(
+        cleanup_result.is_ok(),
+        "uninitialized sink query cleanup followup should not wait for unrelated in-flight shared source control handoff"
+    );
+    cleanup_result
+        .expect("join sink-query cleanup followup via timeout completion")
+        .expect("join sink-query cleanup followup task")
+        .expect("uninitialized sink-query cleanup followup should settle");
+
+    assert!(
+        !app.facade_gate
+            .route_active(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                &source_status_route
+            )
+            .expect("query-peer source-status route state"),
+        "uninitialized sink query cleanup should withdraw peer source-status route even while an unrelated shared source handoff holds shared serial",
+    );
+    assert!(
+        !app.facade_gate
+            .route_active(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                &source_find_route
+            )
+            .expect("query-peer source-find route state"),
+        "uninitialized sink query cleanup should withdraw peer source-find route even while an unrelated shared source handoff holds shared serial",
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test]
+async fn uninitialized_cleanup_only_facade_deactivate_does_not_wait_for_inflight_shared_control_handoff(
+) {
+    let app = Arc::new(
+        FSMetaApp::with_boundaries(
+            FSMetaConfig::default(),
+            NodeId("node-c-facade-cleanup".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init app"),
+    );
+
+    let route_scopes = [RuntimeBoundScope {
+        scope_id: "test-root".to_string(),
+        resource_ids: vec!["listener-a".to_string()],
+    }];
+    let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+
+    app.apply_facade_activate(
+        FacadeRuntimeUnit::QueryPeer,
+        &source_status_route,
+        2,
+        &route_scopes,
+    )
+    .await
+    .expect("activate query-peer source-status route");
+
+    app.control_initialized.store(false, Ordering::Release);
+    app.api_control_gate.set_ready(false);
+
+    let shared_serial_guard = app.shared_control_frame_serial.lock().await;
+
+    let mut cleanup_followup = tokio::spawn({
+        let app = app.clone();
+        let source_status_route = source_status_route.clone();
+        async move {
+            app.on_control_frame(&[deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                source_status_route,
+                3,
+            )])
+            .await
+        }
+    });
+
+    let cleanup_result =
+        tokio::time::timeout(Duration::from_millis(600), &mut cleanup_followup).await;
+    if cleanup_result.is_err() {
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut cleanup_followup).await;
+    }
+    drop(shared_serial_guard);
+
+    assert!(
+        cleanup_result.is_ok(),
+        "uninitialized cleanup-only facade deactivate should not wait for an unrelated in-flight shared control handoff"
+    );
+    cleanup_result
+        .expect("join facade cleanup-only followup via timeout completion")
+        .expect("join facade cleanup-only followup task")
+        .expect("uninitialized cleanup-only facade followup should settle");
+
+    assert!(
+        !app.facade_gate
+            .route_active(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                &source_status_route
+            )
+            .expect("query-peer source-status route state"),
+        "uninitialized facade cleanup should withdraw the query-peer source-status route even while an unrelated shared handoff holds shared serial",
+    );
+
+    app.close().await.expect("close app");
 }
 
 #[tokio::test]

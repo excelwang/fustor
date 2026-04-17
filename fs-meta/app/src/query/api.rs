@@ -45,7 +45,7 @@ use base64::{
 use bytes::Bytes;
 // bound_route_metrics_snapshot remains an app-sdk helper for transport
 // diagnostics; ordinary app-facing imports in this module stay on app-sdk.
-use capanix_app_sdk::runtime::NodeId;
+use capanix_app_sdk::runtime::{EventMetadata, NodeId};
 use capanix_app_sdk::{CnxError, Event, bound_route_metrics_snapshot};
 use capanix_host_adapter_fs::HostAdapter;
 use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
@@ -68,12 +68,15 @@ const PIT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 // Keep the materialized collection window short so a late duplicate batch does
 // not pin `/tree` and `/stats` open indefinitely.
 const MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_millis(500);
+const SELECTED_GROUP_OWNER_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_millis(100);
+const SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_millis(100);
 const RANKING_QUERY_MIN_BUDGET: Duration = Duration::from_millis(1000);
 const SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET: Duration = Duration::from_millis(2000);
 const TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET: Duration = Duration::from_millis(400);
 const TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET: Duration = Duration::from_millis(100);
 const UNREADY_SELECTED_GROUP_ROUTE_BUDGET: Duration = Duration::from_millis(1200);
 const EXPLICIT_EMPTY_SINK_STATUS_RECOLLECT_BUDGET: Duration = Duration::from_millis(250);
+const REQUEST_SCOPED_SINK_STATUS_LOAD_BUDGET: Duration = Duration::from_millis(500);
 const FIRST_RANKED_TRUSTED_READY_GROUP_STAGE_BUDGET: Duration = Duration::from_millis(2500);
 const LATER_RANKED_TRUSTED_GROUP_STAGE_BUDGET: Duration = Duration::from_millis(1500);
 // Source/sink status fanout drives the trusted-materialized readiness gate.
@@ -81,6 +84,7 @@ const LATER_RANKED_TRUSTED_GROUP_STAGE_BUDGET: Duration = Duration::from_millis(
 // downgrade healthy groups into "initial audit incomplete". Give peer status
 // replies a little more time to settle before closing the collect window.
 const STATUS_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(2);
+const LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE: Duration = Duration::from_millis(250);
 // Force-find is intentionally a slower freshness path. Keep a larger collection
 // window here so the request remains in-flight long enough for overlap guards
 // and multi-runner aggregation scenarios.
@@ -690,6 +694,21 @@ pub(crate) async fn route_sink_status_snapshot(
     origin_id: NodeId,
     timeout: Duration,
 ) -> Result<SinkStatusSnapshot, CnxError> {
+    route_sink_status_snapshot_with_idle_grace(
+        boundary,
+        origin_id,
+        timeout,
+        STATUS_ROUTE_COLLECT_IDLE_GRACE,
+    )
+    .await
+}
+
+async fn route_sink_status_snapshot_with_idle_grace(
+    boundary: Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    timeout: Duration,
+    idle_grace: Duration,
+) -> Result<SinkStatusSnapshot, CnxError> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_err = None::<CnxError>;
     let events = loop {
@@ -709,7 +728,7 @@ pub(crate) async fn route_sink_status_snapshot(
                 METHOD_SINK_STATUS,
                 internal_status_request_payload(),
                 attempt_timeout,
-                STATUS_ROUTE_COLLECT_IDLE_GRACE,
+                idle_grace,
             )
             .await
         {
@@ -789,10 +808,11 @@ async fn load_materialized_status_snapshots(
             origin_id,
             ..
         } => {
-            let mut snapshot = match route_sink_status_snapshot(
+            let mut snapshot = match route_sink_status_snapshot_with_idle_grace(
                 boundary.clone(),
                 origin_id.clone(),
                 Duration::from_secs(30),
+                LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE,
             )
             .await
             {
@@ -809,10 +829,11 @@ async fn load_materialized_status_snapshots(
                 &snapshot,
                 &readiness_groups,
             ) {
-                if let Ok(retry_snapshot) = route_sink_status_snapshot(
+                if let Ok(retry_snapshot) = route_sink_status_snapshot_with_idle_grace(
                     boundary.clone(),
                     origin_id.clone(),
                     EXPLICIT_EMPTY_SINK_STATUS_RECOLLECT_BUDGET,
+                    LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE,
                 )
                 .await
                 {
@@ -892,7 +913,7 @@ async fn load_request_scoped_materialized_sink_status_snapshot(
         } => route_sink_status_snapshot(
             boundary.clone(),
             origin_id.clone(),
-            std::cmp::min(timeout, Duration::from_secs(5)),
+            std::cmp::min(timeout, REQUEST_SCOPED_SINK_STATUS_LOAD_BUDGET),
         )
         .await
         .ok()
@@ -939,6 +960,10 @@ fn preserve_request_scoped_ready_owner_across_equal_score_ties(
         .iter()
         .filter(|group| {
             sink_group_readiness_reports_live_materialized_group(group)
+                && sink_status_snapshot_schedules_group(
+                    Some(request_scoped_sink_status),
+                    &group.group_id,
+                )
                 && current_by_group
                     .get(group.group_id.as_str())
                     .is_some_and(|current_group| {
@@ -982,6 +1007,70 @@ fn preserve_request_scoped_ready_owner_across_equal_score_ties(
     ])
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestScopedLoadedReadyGroupPreservationLane {
+    KeepCurrent,
+    ExplicitEmptyDrift,
+    MissingReadyGroupRow,
+    PartialScheduleOmission,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RequestScopedLoadedReadyGroupPreservationDecisionInput {
+    loaded_group_reports_live_materialized: bool,
+    loaded_group_has_stronger_merge_score: bool,
+    request_scoped_mentions_group: bool,
+    request_scoped_explicit_empty: bool,
+    request_scoped_schedules_group: bool,
+    request_scoped_omits_all_groups_from_schedule: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RequestScopedLoadedReadyGroupPreservationDecision {
+    lane: RequestScopedLoadedReadyGroupPreservationLane,
+    should_restore_loaded_group: bool,
+}
+
+fn request_scoped_loaded_ready_group_preservation_decision(
+    input: RequestScopedLoadedReadyGroupPreservationDecisionInput,
+) -> RequestScopedLoadedReadyGroupPreservationDecision {
+    if !input.loaded_group_reports_live_materialized || !input.loaded_group_has_stronger_merge_score
+    {
+        return RequestScopedLoadedReadyGroupPreservationDecision {
+            lane: RequestScopedLoadedReadyGroupPreservationLane::KeepCurrent,
+            should_restore_loaded_group: false,
+        };
+    }
+    if input.request_scoped_explicit_empty {
+        return RequestScopedLoadedReadyGroupPreservationDecision {
+            lane: RequestScopedLoadedReadyGroupPreservationLane::ExplicitEmptyDrift,
+            should_restore_loaded_group: true,
+        };
+    }
+    if !input.request_scoped_omits_all_groups_from_schedule
+        && !input.request_scoped_mentions_group
+        && input.request_scoped_schedules_group
+    {
+        return RequestScopedLoadedReadyGroupPreservationDecision {
+            lane: RequestScopedLoadedReadyGroupPreservationLane::MissingReadyGroupRow,
+            should_restore_loaded_group: true,
+        };
+    }
+    if !input.request_scoped_omits_all_groups_from_schedule
+        && !input.request_scoped_mentions_group
+        && !input.request_scoped_schedules_group
+    {
+        return RequestScopedLoadedReadyGroupPreservationDecision {
+            lane: RequestScopedLoadedReadyGroupPreservationLane::PartialScheduleOmission,
+            should_restore_loaded_group: true,
+        };
+    }
+    RequestScopedLoadedReadyGroupPreservationDecision {
+        lane: RequestScopedLoadedReadyGroupPreservationLane::KeepCurrent,
+        should_restore_loaded_group: false,
+    }
+}
+
 fn preserve_request_loaded_ready_groups_across_explicit_empty_request_scoped_drift(
     current: SinkStatusSnapshot,
     loaded_sink_status: &SinkStatusSnapshot,
@@ -1001,16 +1090,33 @@ fn preserve_request_loaded_ready_groups_across_explicit_empty_request_scoped_dri
         .iter()
         .map(|group| (group.group_id.as_str(), group))
         .collect::<BTreeMap<_, _>>();
+    let request_scoped_scheduled_groups =
+        materialized_scheduled_group_ids(request_scoped_sink_status);
+    let request_scoped_omits_all_groups_from_schedule =
+        sink_status_snapshot_omits_all_groups_from_schedule(request_scoped_sink_status);
     let restored_groups = loaded_sink_status
         .groups
         .iter()
         .filter(|group| {
-            explicit_empty_groups.contains(&group.group_id)
-                && sink_group_readiness_reports_live_materialized_group(group)
-                && current_by_group
-                    .get(group.group_id.as_str())
-                    .map(|current| sink_group_merge_score(group) > sink_group_merge_score(current))
-                    .unwrap_or(true)
+            request_scoped_loaded_ready_group_preservation_decision(
+                RequestScopedLoadedReadyGroupPreservationDecisionInput {
+                    loaded_group_reports_live_materialized:
+                        sink_group_readiness_reports_live_materialized_group(group),
+                    loaded_group_has_stronger_merge_score: current_by_group
+                        .get(group.group_id.as_str())
+                        .map(|current| sink_group_merge_score(group) > sink_group_merge_score(current))
+                        .unwrap_or(true),
+                    request_scoped_mentions_group: sink_status_mentions_group(
+                        request_scoped_sink_status,
+                        &group.group_id,
+                    ),
+                    request_scoped_explicit_empty: explicit_empty_groups.contains(&group.group_id),
+                    request_scoped_schedules_group: request_scoped_scheduled_groups
+                        .contains(&group.group_id),
+                    request_scoped_omits_all_groups_from_schedule,
+                },
+            )
+            .should_restore_loaded_group
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1049,6 +1155,8 @@ fn preserve_request_loaded_ready_groups_across_partial_request_scoped_schedule_o
     request_scoped_sink_status: &SinkStatusSnapshot,
 ) -> SinkStatusSnapshot {
     let request_scoped_scheduled_groups = materialized_scheduled_group_ids(request_scoped_sink_status);
+    let request_scoped_omits_all_groups_from_schedule =
+        sink_status_snapshot_omits_all_groups_from_schedule(request_scoped_sink_status);
     if request_scoped_scheduled_groups.is_empty() {
         return current;
     }
@@ -1061,13 +1169,25 @@ fn preserve_request_loaded_ready_groups_across_partial_request_scoped_schedule_o
         .groups
         .iter()
         .filter(|group| {
-            !request_scoped_scheduled_groups.contains(&group.group_id)
-                && !sink_status_mentions_group(request_scoped_sink_status, &group.group_id)
-                && sink_group_readiness_reports_live_materialized_group(group)
-                && current_by_group
-                    .get(group.group_id.as_str())
-                    .map(|current| sink_group_merge_score(group) > sink_group_merge_score(current))
-                    .unwrap_or(true)
+            request_scoped_loaded_ready_group_preservation_decision(
+                RequestScopedLoadedReadyGroupPreservationDecisionInput {
+                    loaded_group_reports_live_materialized:
+                        sink_group_readiness_reports_live_materialized_group(group),
+                    loaded_group_has_stronger_merge_score: current_by_group
+                        .get(group.group_id.as_str())
+                        .map(|current| sink_group_merge_score(group) > sink_group_merge_score(current))
+                        .unwrap_or(true),
+                    request_scoped_mentions_group: sink_status_mentions_group(
+                        request_scoped_sink_status,
+                        &group.group_id,
+                    ),
+                    request_scoped_explicit_empty: false,
+                    request_scoped_schedules_group: request_scoped_scheduled_groups
+                        .contains(&group.group_id),
+                    request_scoped_omits_all_groups_from_schedule,
+                },
+            )
+            .should_restore_loaded_group
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1104,9 +1224,6 @@ fn request_scoped_schedule_omitted_ready_groups(
     loaded_sink_status: &SinkStatusSnapshot,
     request_scoped_sink_status: &SinkStatusSnapshot,
 ) -> BTreeSet<String> {
-    if sink_status_snapshot_omits_all_groups_from_schedule(request_scoped_sink_status) {
-        return BTreeSet::new();
-    }
     loaded_sink_status
         .groups
         .iter()
@@ -2148,13 +2265,14 @@ async fn route_materialized_events_via_node(
     }
     let payload = rmp_serde::to_vec(&params)
         .map_err(|err| CnxError::Internal(format!("encode materialized query failed: {err}")))?;
+    let collect_idle_grace = std::cmp::min(SELECTED_GROUP_OWNER_ROUTE_COLLECT_IDLE_GRACE, timeout);
     let result = adapter
         .call_collect(
             ROUTE_TOKEN_FS_META_INTERNAL,
             METHOD_SINK_QUERY,
             Bytes::from(payload),
             timeout,
-            MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
+            collect_idle_grace,
         )
         .await;
     if debug_materialized_route_capture_enabled() {
@@ -2267,6 +2385,76 @@ fn selected_group_materialized_tree_payload_is_empty(
         }
     }
     saw_same_path_payload
+}
+
+fn selected_group_materialized_tree_payload_omits_same_path(
+    policy: &ProjectionPolicy,
+    events: &[Event],
+    group_id: &str,
+    query_path: &[u8],
+) -> bool {
+    let mut saw_group_event = false;
+    for event in events {
+        if event_group_key(policy, event) != group_id {
+            continue;
+        }
+        saw_group_event = true;
+        let Ok(MaterializedQueryPayload::Tree(payload)) =
+            rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes())
+        else {
+            continue;
+        };
+        if payload.root.path == query_path {
+            return false;
+        }
+    }
+    saw_group_event
+}
+
+fn synthesize_empty_selected_group_tree_events(
+    events: &[Event],
+    policy: &ProjectionPolicy,
+    group_id: &str,
+    query_path: &[u8],
+) -> Vec<Event> {
+    let mut metadata = EventMetadata {
+        origin_id: NodeId(group_id.to_string()),
+        timestamp_us: 0,
+        logical_ts: None,
+        correlation_id: None,
+        ingress_auth: None,
+        trace: None,
+    };
+    for event in events {
+        if event_group_key(policy, event) == group_id {
+            metadata = event.metadata().clone();
+            break;
+        }
+    }
+    let payload = rmp_serde::to_vec(&MaterializedQueryPayload::Tree(
+        empty_materialized_tree_group_payload(query_path),
+    ))
+    .expect("encode synthetic empty selected-group tree payload");
+    vec![Event::new(metadata, Bytes::from(payload))]
+}
+
+fn trusted_materialized_exact_file_lane_settles_empty_after_prior_decode(
+    params: &InternalQueryRequest,
+    selected_group_sink_status: Option<&SinkStatusSnapshot>,
+    group_id: &str,
+    prior_materialized_exact_file_decoded: bool,
+) -> bool {
+    matches!(params.op, QueryOp::Tree)
+        && params
+            .tree_options
+            .as_ref()
+            .is_some_and(|options| options.read_class == ReadClass::TrustedMaterialized)
+        && prior_materialized_exact_file_decoded
+        && !trusted_materialized_empty_group_root_requires_fail_closed(&params.scope.path)
+        && selected_group_sink_status_reports_live_materialized_group(
+            selected_group_sink_status,
+            group_id,
+        )
 }
 
 fn selected_group_materialized_tree_payload_is_structural_placeholder(
@@ -2403,6 +2591,180 @@ fn selected_group_empty_ready_tree_requires_primary_owner_reroute(
         )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrustedMaterializedGroupRescueDecisionInput {
+    read_class: ReadClass,
+    observation_state: ObservationState,
+    selected_group_sink_reports_live_materialized: bool,
+    prior_materialized_group_decoded: bool,
+    empty_root_requires_fail_closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrustedMaterializedGroupRescueDecision {
+    ready_group: bool,
+    requires_rescue: bool,
+    allow_empty_owner_retry: bool,
+    should_resolve_selected_group_owner: bool,
+    empty_root_requires_fail_closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrustedMaterializedOwnerRetryPolicy {
+    Skip,
+    SelectedGroupBudget,
+    LaterNonRootBudget,
+    RemainingBudget,
+}
+
+impl TrustedMaterializedOwnerRetryPolicy {
+    fn timeout(self, remaining: Duration) -> Duration {
+        match self {
+            Self::Skip => Duration::ZERO,
+            Self::SelectedGroupBudget => {
+                std::cmp::min(TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET, remaining)
+            }
+            Self::LaterNonRootBudget => {
+                std::cmp::min(TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET, remaining)
+            }
+            Self::RemainingBudget => remaining,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrustedMaterializedEmptyResponseRescueDecisionInput {
+    ready_group: bool,
+    prior_materialized_group_decoded: bool,
+    prior_materialized_exact_file_decoded: bool,
+    selected_group_owner_known: bool,
+    allow_empty_owner_retry: bool,
+    empty_root_requires_fail_closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrustedMaterializedEmptyResponseRescueDecision {
+    owner_retry_policy: TrustedMaterializedOwnerRetryPolicy,
+    attempt_generic_proxy_fallback: bool,
+    fail_closed_after_proxy_error: bool,
+    fail_closed_on_final_empty_response: bool,
+    defer_first_ranked_empty_non_root_group: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrustedMaterializedDeferredEmptyGroupDecisionInput {
+    defer_first_ranked_empty_non_root_group: bool,
+    rank_index: usize,
+    response_is_empty: bool,
+    deferred_group_present: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrustedMaterializedDeferredEmptyGroupLane {
+    KeepCurrent,
+    DeferCurrentFirstRankedEmptyGroup,
+    FailClosedPriorDeferredGroup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TrustedMaterializedDeferredEmptyGroupDecision {
+    lane: TrustedMaterializedDeferredEmptyGroupLane,
+    should_defer_current_group: bool,
+    should_fail_closed_prior_deferred_group: bool,
+}
+
+fn trusted_materialized_group_rescue_decision(
+    input: TrustedMaterializedGroupRescueDecisionInput,
+) -> TrustedMaterializedGroupRescueDecision {
+    let ready_group = input.read_class == ReadClass::TrustedMaterialized
+        && input.selected_group_sink_reports_live_materialized;
+    let non_root_rescue_required = input.read_class == ReadClass::TrustedMaterialized
+        && input.observation_state == ObservationState::TrustedMaterialized
+        && input.prior_materialized_group_decoded
+        && !input.empty_root_requires_fail_closed;
+    let requires_rescue = ready_group || non_root_rescue_required;
+
+    TrustedMaterializedGroupRescueDecision {
+        ready_group,
+        requires_rescue,
+        allow_empty_owner_retry: ready_group && !input.prior_materialized_group_decoded,
+        should_resolve_selected_group_owner: requires_rescue,
+        empty_root_requires_fail_closed: input.empty_root_requires_fail_closed,
+    }
+}
+
+fn trusted_materialized_empty_response_rescue_decision(
+    input: TrustedMaterializedEmptyResponseRescueDecisionInput,
+) -> TrustedMaterializedEmptyResponseRescueDecision {
+    let settle_after_prior_exact_file_decode = input.ready_group
+        && input.prior_materialized_exact_file_decoded
+        && !input.empty_root_requires_fail_closed;
+    let settle_after_initial_empty_retry_path =
+        input.allow_empty_owner_retry && !input.empty_root_requires_fail_closed;
+    let owner_retry_policy =
+        if settle_after_initial_empty_retry_path
+            || settle_after_prior_exact_file_decode
+            || !input.selected_group_owner_known
+        {
+            TrustedMaterializedOwnerRetryPolicy::Skip
+        } else if input.empty_root_requires_fail_closed
+            && input.prior_materialized_group_decoded
+        {
+            TrustedMaterializedOwnerRetryPolicy::RemainingBudget
+        } else if input.prior_materialized_group_decoded {
+            TrustedMaterializedOwnerRetryPolicy::LaterNonRootBudget
+        } else {
+            TrustedMaterializedOwnerRetryPolicy::SelectedGroupBudget
+        };
+    let attempt_generic_proxy_fallback = input.selected_group_owner_known
+        && !input.empty_root_requires_fail_closed
+        && !settle_after_initial_empty_retry_path
+        && !settle_after_prior_exact_file_decode;
+
+    TrustedMaterializedEmptyResponseRescueDecision {
+        owner_retry_policy,
+        attempt_generic_proxy_fallback,
+        fail_closed_after_proxy_error: input.ready_group
+            && input.prior_materialized_group_decoded
+            && attempt_generic_proxy_fallback,
+        fail_closed_on_final_empty_response: input.ready_group
+            && input.empty_root_requires_fail_closed,
+        defer_first_ranked_empty_non_root_group: input.ready_group
+            && !input.prior_materialized_group_decoded
+            && !input.prior_materialized_exact_file_decoded
+            && !input.empty_root_requires_fail_closed,
+    }
+}
+
+fn trusted_materialized_deferred_empty_group_decision(
+    input: TrustedMaterializedDeferredEmptyGroupDecisionInput,
+) -> TrustedMaterializedDeferredEmptyGroupDecision {
+    if input.defer_first_ranked_empty_non_root_group
+        && input.rank_index == 0
+        && input.response_is_empty
+    {
+        return TrustedMaterializedDeferredEmptyGroupDecision {
+            lane: TrustedMaterializedDeferredEmptyGroupLane::DeferCurrentFirstRankedEmptyGroup,
+            should_defer_current_group: true,
+            should_fail_closed_prior_deferred_group: false,
+        };
+    }
+
+    if input.deferred_group_present && input.rank_index > 0 && !input.response_is_empty {
+        return TrustedMaterializedDeferredEmptyGroupDecision {
+            lane: TrustedMaterializedDeferredEmptyGroupLane::FailClosedPriorDeferredGroup,
+            should_defer_current_group: false,
+            should_fail_closed_prior_deferred_group: true,
+        };
+    }
+
+    TrustedMaterializedDeferredEmptyGroupDecision {
+        lane: TrustedMaterializedDeferredEmptyGroupLane::KeepCurrent,
+        should_defer_current_group: false,
+        should_fail_closed_prior_deferred_group: false,
+    }
+}
+
 fn sink_primary_owner_node_for_group(
     sink_status: Option<&SinkStatusSnapshot>,
     group_id: &str,
@@ -2525,6 +2887,84 @@ fn selected_group_sink_status_is_unready_empty_prefers_exported_readiness_over_l
 }
 
 #[test]
+fn trusted_materialized_group_rescue_decision_allows_empty_owner_retry_only_for_first_ready_group()
+{
+    let decision = trusted_materialized_group_rescue_decision(
+        TrustedMaterializedGroupRescueDecisionInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        TrustedMaterializedGroupRescueDecision {
+            ready_group: true,
+            requires_rescue: true,
+            allow_empty_owner_retry: true,
+            should_resolve_selected_group_owner: true,
+            empty_root_requires_fail_closed: false,
+        },
+        "first-ranked trusted ready group should fold to a single rescue decision that keeps one empty-owner retry and selected-owner resolution"
+    );
+}
+
+#[test]
+fn trusted_materialized_group_rescue_decision_keeps_owner_resolution_for_later_non_root_rescue_without_empty_owner_retry()
+{
+    let decision = trusted_materialized_group_rescue_decision(
+        TrustedMaterializedGroupRescueDecisionInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: true,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        TrustedMaterializedGroupRescueDecision {
+            ready_group: false,
+            requires_rescue: true,
+            allow_empty_owner_retry: false,
+            should_resolve_selected_group_owner: true,
+            empty_root_requires_fail_closed: false,
+        },
+        "later-ranked trusted non-root rescue should still resolve the selected-group owner, but must not reopen the first-ranked empty-owner retry lane"
+    );
+}
+
+#[test]
+fn trusted_materialized_group_rescue_decision_disables_non_root_rescue_when_empty_root_must_fail_closed()
+{
+    let decision = trusted_materialized_group_rescue_decision(
+        TrustedMaterializedGroupRescueDecisionInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: true,
+            empty_root_requires_fail_closed: true,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        TrustedMaterializedGroupRescueDecision {
+            ready_group: false,
+            requires_rescue: false,
+            allow_empty_owner_retry: false,
+            should_resolve_selected_group_owner: false,
+            empty_root_requires_fail_closed: true,
+        },
+        "empty-root fail-closed paths must not inherit the later-ranked non-root rescue lane"
+    );
+}
+
+#[test]
 fn merge_request_scoped_materialized_sink_status_snapshot_prefers_later_ready_owner_on_equal_score()
 {
     let loaded_sink_status = SinkStatusSnapshot {
@@ -2593,13 +3033,148 @@ fn merge_request_scoped_materialized_sink_status_snapshot_prefers_later_ready_ow
     );
 }
 
-fn selected_group_owner_attempt_timeout(
-    deadline: tokio::time::Instant,
+#[test]
+fn merge_request_scoped_materialized_sink_status_snapshot_keeps_loaded_owner_when_later_ready_row_omits_group_from_schedule()
+{
+    let loaded_sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-a::nfs1".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 9,
+            shadow_lag_us: 0,
+            overflow_pending_audit: false,
+            initial_audit_completed: true,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 7,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+    let request_scoped_sink_status = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-b::nfs1".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 9,
+            shadow_lag_us: 0,
+            overflow_pending_audit: false,
+            initial_audit_completed: true,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 7,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+
+    let merged = merge_request_scoped_materialized_sink_status_snapshot(
+        &loaded_sink_status,
+        request_scoped_sink_status,
+    );
+
+    assert_eq!(
+        merged.groups[0].primary_object_ref,
+        "node-a::nfs1",
+        "later request-scoped ready rows must not replace the loaded owner on equal score ties when the request-scoped sink snapshot omits that group from schedule: {merged:?}"
+    );
+    assert_eq!(
+        sink_primary_owner_node_for_group(Some(&merged), "nfs1"),
+        Some(NodeId("node-a".to_string())),
+        "selected-group owner resolution must keep the loaded owner when a later request-scoped sink snapshot omits the group from schedule: {merged:?}"
+    );
+}
+
+#[test]
+fn materialized_owner_node_for_group_falls_back_to_source_primary_when_request_scoped_sink_status_is_fully_empty(
+) {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root_a = tmp.path().join("node-a");
+    let root_b = tmp.path().join("node-b");
+    std::fs::create_dir_all(&root_a).expect("create node-a dir");
+    std::fs::create_dir_all(&root_b).expect("create node-b dir");
+
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: BTreeMap::new(),
+            mount_point: root_a.clone(),
+            fs_source: "server:/nfs1".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-b::nfs2".to_string(),
+            host_ref: "node-b".to_string(),
+            host_ip: "10.0.0.2".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: BTreeMap::new(),
+            mount_point: root_b.clone(),
+            fs_source: "server:/nfs2".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let source = Arc::new(SourceFacade::local(Arc::new(
+        crate::source::FSMetaSource::with_boundaries(
+            crate::source::config::SourceConfig {
+                roots: vec![
+                    crate::source::config::RootSpec::new("nfs1", &root_a),
+                    crate::source::config::RootSpec::new("nfs2", &root_b),
+                ],
+                host_object_grants: grants,
+                ..crate::source::config::SourceConfig::default()
+            },
+            NodeId("source-node".into()),
+            None,
+        )
+        .expect("build source"),
+    )));
+
+    let owner = crate::runtime_app::shared_tokio_runtime()
+        .block_on(materialized_owner_node_for_group(
+            source.as_ref(),
+            Some(&SinkStatusSnapshot::default()),
+            "nfs1",
+        ))
+        .expect("resolve owner from empty request-scoped sink snapshot")
+        .expect("empty request-scoped sink snapshot should fall back to source primary");
+
+    assert_eq!(
+        owner,
+        NodeId("node-a".to_string()),
+        "a fully empty later request-scoped sink-status snapshot must be treated as a collection gap and must not suppress source-primary owner routing for nfs1"
+    );
+}
+
+fn selected_group_owner_attempt_timeout_from_remaining(
+    remaining: Duration,
     prefer_proxy_budget: bool,
 ) -> Duration {
-    let remaining = deadline
-        .checked_duration_since(tokio::time::Instant::now())
-        .unwrap_or_default();
     if remaining.is_zero() {
         return Duration::ZERO;
     }
@@ -2611,13 +3186,75 @@ fn selected_group_owner_attempt_timeout(
             TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET
         },
     );
-    let proxy_reserve = std::cmp::max(
+    let proxy_reserve = std::cmp::min(
         remaining.checked_div(2).unwrap_or_default(),
         std::cmp::min(remaining, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET),
     );
     let capped_proxy_reserve =
         std::cmp::min(proxy_reserve, remaining.saturating_sub(owner_min_budget));
     remaining.saturating_sub(capped_proxy_reserve)
+}
+
+fn selected_group_owner_attempt_timeout(
+    deadline: tokio::time::Instant,
+    prefer_proxy_budget: bool,
+) -> Duration {
+    let remaining = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default();
+    selected_group_owner_attempt_timeout_from_remaining(remaining, prefer_proxy_budget)
+}
+
+fn selected_group_stage_reserves_proxy_budget(
+    read_class: ReadClass,
+    trusted_materialized_ready_group: bool,
+    prior_materialized_group_decoded: bool,
+    is_last_ranked_group: bool,
+    path: &[u8],
+) -> bool {
+    if read_class == ReadClass::TrustedMaterialized
+        && trusted_materialized_ready_group
+        && !prior_materialized_group_decoded
+    {
+        return !trusted_materialized_empty_group_root_requires_fail_closed(path);
+    }
+    !(read_class != ReadClass::TrustedMaterialized
+        && is_last_ranked_group
+        && prior_materialized_group_decoded)
+}
+
+fn group_counts_as_prior_materialized_tree_decode(group: &GroupPitSnapshot) -> bool {
+    group.status == "ok"
+        && group.root.as_ref().is_some_and(|root| {
+            root.exists && (root.is_dir || root.has_children)
+        })
+}
+
+fn group_counts_as_prior_materialized_exact_file_decode(group: &GroupPitSnapshot) -> bool {
+    group.status == "ok"
+        && group.root.as_ref().is_some_and(|root| {
+            root.exists && !root.is_dir && !root.has_children
+        })
+}
+
+fn decode_materialized_selected_group_response_missing_same_path_payload(err: &CnxError) -> bool {
+    matches!(
+        err,
+        CnxError::Internal(message)
+            if message.contains("tree query returned no payload for requested group")
+    )
+}
+
+fn selected_group_empty_ready_tree_settles_after_initial_owner_retry(
+    allow_empty_owner_retry: bool,
+    _path: &[u8],
+) -> bool {
+    // First-ranked trusted non-root lanes still need the generic proxy after the
+    // bounded owner retry. The PIT layer can later settle an empty proxy payload
+    // for legitimate missing-subtree/exact-file cases without short-circuiting
+    // recovery here.
+    let _ = allow_empty_owner_retry;
+    false
 }
 
 async fn query_materialized_events_via_generic_proxy(
@@ -2646,6 +3283,8 @@ async fn query_materialized_events_via_generic_proxy(
         if remaining.is_zero() {
             return Err(last_err.unwrap_or(CnxError::Timeout));
         }
+        let collect_idle_grace =
+            std::cmp::min(SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE, remaining);
         let adapter = exchange_host_adapter(
             boundary.clone(),
             origin_id.clone(),
@@ -2657,7 +3296,7 @@ async fn query_materialized_events_via_generic_proxy(
                 METHOD_SINK_QUERY_PROXY,
                 Bytes::from(payload.clone()),
                 remaining,
-                MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
+                collect_idle_grace,
             )
             .await
         {
@@ -2700,7 +3339,7 @@ async fn query_materialized_events_via_generic_proxy(
 fn is_retryable_materialized_proxy_continuity_gap(err: &CnxError) -> bool {
     matches!(
         err,
-        CnxError::Timeout | CnxError::TransportClosed(_) | CnxError::ProtocolViolation(_)
+        CnxError::Timeout | CnxError::TransportClosed(_)
     ) || matches!(
         err,
         CnxError::Internal(message)
@@ -2731,6 +3370,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
         None,
         reserve_proxy_budget,
         allow_empty_owner_retry,
+        false,
     )
     .await
 }
@@ -2744,6 +3384,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
     request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
     reserve_proxy_budget: bool,
     allow_empty_owner_retry: bool,
+    prior_materialized_exact_file_decoded: bool,
 ) -> Result<Vec<Event>, CnxError> {
     match &state.backend {
         QueryBackend::Route {
@@ -2777,6 +3418,34 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                     let events =
                         run_timed_query(sink.materialized_query(&params), owner_attempt_timeout)
                             .await?;
+                    if trusted_materialized_exact_file_lane_settles_empty_after_prior_decode(
+                        &params,
+                        selected_group_sink_status.as_ref(),
+                        group_id,
+                        prior_materialized_exact_file_decoded,
+                    ) {
+                        if selected_group_materialized_tree_payload_is_empty(
+                            policy,
+                            &events,
+                            group_id,
+                            params.scope.path.as_slice(),
+                        ) {
+                            return Ok(events);
+                        }
+                        if selected_group_materialized_tree_payload_omits_same_path(
+                            policy,
+                            &events,
+                            group_id,
+                            params.scope.path.as_slice(),
+                        ) {
+                            return Ok(synthesize_empty_selected_group_tree_events(
+                                &events,
+                                policy,
+                                group_id,
+                                params.scope.path.as_slice(),
+                            ));
+                        }
+                    }
                     let requires_proxy_fallback =
                         selected_group_empty_ready_tree_requires_proxy_fallback(
                             policy,
@@ -2840,6 +3509,11 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                                 .checked_duration_since(tokio::time::Instant::now())
                                 .unwrap_or_default();
                             if !remaining.is_zero() {
+                                let settle_after_initial_owner_retry =
+                                    selected_group_empty_ready_tree_settles_after_initial_owner_retry(
+                                        allow_empty_owner_retry,
+                                        &params.scope.path,
+                                    );
                                 let retry_owner_timeout = std::cmp::min(
                                     remaining,
                                     TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET,
@@ -2860,6 +3534,9 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                                             ) {
                                                 return Ok(retry_events);
                                             }
+                                            if settle_after_initial_owner_retry {
+                                                return Ok(retry_events);
+                                            }
                                             let remaining = deadline
                                                 .checked_duration_since(tokio::time::Instant::now())
                                                 .unwrap_or_default();
@@ -2878,6 +3555,9 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                                         Err(CnxError::Timeout)
                                         | Err(CnxError::TransportClosed(_))
                                         | Err(CnxError::ProtocolViolation(_)) => {
+                                            if settle_after_initial_owner_retry {
+                                                return Ok(events);
+                                            }
                                             let remaining = deadline
                                                 .checked_duration_since(tokio::time::Instant::now())
                                                 .unwrap_or_default();
@@ -2904,6 +3584,28 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                         return Err(trusted_materialized_empty_selected_group_tree_error(
                             group_id,
                         ));
+                    }
+                    if selected_group_empty_ready_tree_settles_after_initial_owner_retry(
+                        allow_empty_owner_retry,
+                        &params.scope.path,
+                    ) {
+                        let remaining = deadline
+                            .checked_duration_since(tokio::time::Instant::now())
+                            .unwrap_or_default();
+                        if !remaining.is_zero() {
+                            let retry_owner_timeout = std::cmp::min(
+                                remaining,
+                                TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET,
+                            );
+                            if !retry_owner_timeout.is_zero() {
+                                return run_timed_query(
+                                    sink.materialized_query(&params),
+                                    retry_owner_timeout,
+                                )
+                                .await;
+                            }
+                        }
+                        return Ok(events);
                     }
                     let remaining = deadline
                         .checked_duration_since(tokio::time::Instant::now())
@@ -3006,6 +3708,34 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                 .await
                 {
                     Ok(events) => {
+                        if trusted_materialized_exact_file_lane_settles_empty_after_prior_decode(
+                            &params,
+                            selected_group_sink_status.as_ref(),
+                            group_id,
+                            prior_materialized_exact_file_decoded,
+                        ) {
+                            if selected_group_materialized_tree_payload_is_empty(
+                                policy,
+                                &events,
+                                group_id,
+                                params.scope.path.as_slice(),
+                            ) {
+                                return Ok(events);
+                            }
+                            if selected_group_materialized_tree_payload_omits_same_path(
+                                policy,
+                                &events,
+                                group_id,
+                                params.scope.path.as_slice(),
+                            ) {
+                                return Ok(synthesize_empty_selected_group_tree_events(
+                                    &events,
+                                    policy,
+                                    group_id,
+                                    params.scope.path.as_slice(),
+                                ));
+                            }
+                        }
                         let requires_proxy_fallback =
                             selected_group_empty_ready_tree_requires_proxy_fallback(
                                 policy,
@@ -3064,16 +3794,21 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                                     group_id,
                                     params.scope.path.as_slice(),
                                 )
-                            {
-                                let remaining = deadline
-                                    .checked_duration_since(tokio::time::Instant::now())
-                                    .unwrap_or_default();
-                                if !remaining.is_zero() {
-                                    let retry_owner_timeout = std::cmp::min(
-                                        remaining,
-                                        TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET,
+                        {
+                            let remaining = deadline
+                                .checked_duration_since(tokio::time::Instant::now())
+                                .unwrap_or_default();
+                            if !remaining.is_zero() {
+                                let settle_after_initial_owner_retry =
+                                    selected_group_empty_ready_tree_settles_after_initial_owner_retry(
+                                        allow_empty_owner_retry,
+                                        &params.scope.path,
                                     );
-                                    if !retry_owner_timeout.is_zero() {
+                                let retry_owner_timeout = std::cmp::min(
+                                    remaining,
+                                    TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET,
+                                );
+                                if !retry_owner_timeout.is_zero() {
                                         match route_materialized_events_via_node(
                                             boundary.clone(),
                                             node_id.clone(),
@@ -3089,6 +3824,9 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                                                     group_id,
                                                     params.scope.path.as_slice(),
                                                 ) {
+                                                    return Ok(retry_events);
+                                                }
+                                                if settle_after_initial_owner_retry {
                                                     return Ok(retry_events);
                                                 }
                                                 let remaining = deadline
@@ -3111,6 +3849,9 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                                             Err(CnxError::Timeout)
                                             | Err(CnxError::TransportClosed(_))
                                             | Err(CnxError::ProtocolViolation(_)) => {
+                                                if settle_after_initial_owner_retry {
+                                                    return Ok(events);
+                                                }
                                                 let remaining = deadline
                                                     .checked_duration_since(
                                                         tokio::time::Instant::now(),
@@ -3139,6 +3880,30 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                             return Err(trusted_materialized_empty_selected_group_tree_error(
                                 group_id,
                             ));
+                        }
+                        if selected_group_empty_ready_tree_settles_after_initial_owner_retry(
+                            allow_empty_owner_retry,
+                            &params.scope.path,
+                        ) {
+                            let remaining = deadline
+                                .checked_duration_since(tokio::time::Instant::now())
+                                .unwrap_or_default();
+                            if !remaining.is_zero() {
+                                let retry_owner_timeout = std::cmp::min(
+                                    remaining,
+                                    TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET,
+                                );
+                                if !retry_owner_timeout.is_zero() {
+                                    return route_materialized_events_via_node(
+                                        boundary.clone(),
+                                        node_id.clone(),
+                                        params.clone(),
+                                        retry_owner_timeout,
+                                    )
+                                    .await;
+                                }
+                            }
+                            return Ok(events);
                         }
                         let remaining = deadline
                             .checked_duration_since(tokio::time::Instant::now())
@@ -3233,7 +3998,17 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                         if remaining.is_zero() {
                             return Err(CnxError::Timeout);
                         }
+                        let trusted_materialized_tree_query = matches!(
+                            params.op,
+                            QueryOp::Tree
+                        ) && params
+                            .tree_options
+                            .as_ref()
+                            .is_some_and(|options| {
+                                options.read_class == ReadClass::TrustedMaterialized
+                            });
                         let fail_closed_after_proxy_gap = reserve_proxy_budget
+                            && trusted_materialized_tree_query
                             && !allow_empty_owner_retry
                             && trusted_materialized_empty_group_root_requires_fail_closed(
                                 &params.scope.path,
@@ -3255,8 +4030,10 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                         .await
                         {
                             Ok(proxy_events) => proxy_events,
-                            Err(CnxError::Timeout)
-                            | Err(CnxError::TransportClosed(_))
+                            Err(CnxError::Timeout) if fail_closed_after_proxy_gap => {
+                                return Err(CnxError::Timeout);
+                            }
+                            Err(CnxError::TransportClosed(_))
                             | Err(CnxError::ProtocolViolation(_))
                                 if fail_closed_after_proxy_gap =>
                             {
@@ -3314,6 +4091,26 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                         group_id,
                     )
                 {
+                    let root_path_request_scoped_omitted_ready_group = matches!(
+                        params.op,
+                        QueryOp::Tree
+                    ) && params
+                        .tree_options
+                        .as_ref()
+                        .is_some_and(|options| {
+                            options.read_class == ReadClass::TrustedMaterialized
+                        })
+                        && (params.scope.path.is_empty() || params.scope.path == b"/")
+                        && request_scoped_schedule_omitted_ready_groups
+                            .is_some_and(|groups| groups.contains(group_id));
+                    if root_path_request_scoped_omitted_ready_group {
+                        return Ok(synthesize_empty_selected_group_tree_events(
+                            &[],
+                            policy,
+                            group_id,
+                            params.scope.path.as_slice(),
+                        ));
+                    }
                     return Ok(Vec::new());
                 }
                 let remaining = deadline
@@ -3679,6 +4476,12 @@ fn materialized_scheduled_group_ids(snapshot: &SinkStatusSnapshot) -> BTreeSet<S
     groups
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaterializedTargetGroupSelectionMode {
+    Tree,
+    Stats,
+}
+
 async fn materialized_target_groups(
     state: &ApiState,
     selected_group: Option<&str>,
@@ -3686,6 +4489,7 @@ async fn materialized_target_groups(
     request_sink_status: Option<&SinkStatusSnapshot>,
     timeout: Duration,
     preserve_unscheduled_groups: bool,
+    selection_mode: MaterializedTargetGroupSelectionMode,
 ) -> Result<Vec<String>, CnxError> {
     let source = state
         .readiness_source
@@ -3799,8 +4603,17 @@ async fn materialized_target_groups(
         &state.backend,
         QueryBackend::Route { .. }
     ) && scheduled_groups.as_ref().is_some_and(|groups| groups.is_empty());
+    let preserve_unscheduled_groups_for_mode = match selection_mode {
+        MaterializedTargetGroupSelectionMode::Tree => {
+            preserve_unscheduled_groups
+                && scheduled_groups
+                    .as_ref()
+                    .is_some_and(|groups| groups.is_empty())
+        }
+        MaterializedTargetGroupSelectionMode::Stats => preserve_unscheduled_groups,
+    };
     if let Some(scheduled_groups) = scheduled_groups
-        && !preserve_unscheduled_groups
+        && !preserve_unscheduled_groups_for_mode
         && !preserve_groups_when_first_routed_sink_status_is_empty
     {
         groups.retain(|group| scheduled_groups.contains(group));
@@ -3853,6 +4666,14 @@ fn sink_status_mentions_group(sink_status: &SinkStatusSnapshot, group_id: &str) 
             .any(|groups| groups.iter().any(|group| group == group_id))
 }
 
+fn sink_status_authoritatively_omits_group(
+    sink_status: &SinkStatusSnapshot,
+    group_id: &str,
+) -> bool {
+    !sink_status_mentions_group(sink_status, group_id)
+        && !sink_status_snapshot_omits_all_groups_from_schedule(sink_status)
+}
+
 async fn materialized_owner_node_for_group(
     source: &SourceFacade,
     sink_status: Option<&SinkStatusSnapshot>,
@@ -3862,7 +4683,7 @@ async fn materialized_owner_node_for_group(
         if let Some(node_id) = scheduled_sink_owner_node_for_group(sink_status, group_id) {
             return Ok(Some(node_id));
         }
-        if !sink_status_mentions_group(sink_status, group_id) {
+        if sink_status_authoritatively_omits_group(sink_status, group_id) {
             return Ok(None);
         }
     }
@@ -4366,23 +5187,6 @@ fn decode_materialized_selected_group_response(
     if let Some(payload) = best {
         return Ok(payload);
     }
-    if last_decode_error.is_none() {
-        return Ok(TreeGroupPayload {
-            reliability: GroupReliability::from_reason(Some(
-                crate::shared_types::query::UnreliableReason::Unattested,
-            )),
-            stability: TreeStability::not_evaluated(),
-            root: TreePageRoot {
-                path: query_path.to_vec(),
-                size: 0,
-                modified_time_us: 0,
-                is_dir: true,
-                exists: false,
-                has_children: false,
-            },
-            entries: Vec::new(),
-        });
-    }
     Err(CnxError::Internal(last_decode_error.unwrap_or_else(|| {
         format!("tree query returned no payload for requested group '{selected_group}'")
     })))
@@ -4778,6 +5582,7 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
         request_sink_status,
         timeout,
         params.group.is_none() && !params.path.is_empty() && params.path != b"/",
+        MaterializedTargetGroupSelectionMode::Tree,
     )
     .await?;
     let (rankings, ranking_retryable_failure) = collect_group_rankings(
@@ -4834,29 +5639,31 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
                 .as_ref()
                 .map(|cached| filter_sink_status_snapshot(cached.snapshot.clone(), &allowed_groups))
         };
-        let trusted_materialized_ready_group = read_class == ReadClass::TrustedMaterialized
-            && selected_group_sink_status_reports_live_materialized_group(
-                selected_group_sink_status.as_ref(),
-                &group_key,
-            );
-        let prior_materialized_group_decoded = groups.iter().any(|group: &GroupPitSnapshot| {
-            group.status == "ok"
-                && group
-                    .root
-                    .as_ref()
-                    .is_some_and(|root| root.exists || root.has_children)
-        });
-        let trusted_materialized_non_root_rescue_required = read_class
-            == ReadClass::TrustedMaterialized
-            && observation_status.state == ObservationState::TrustedMaterialized
-            && prior_materialized_group_decoded
-            && !trusted_materialized_empty_group_root_requires_fail_closed(&params.path);
-        let trusted_materialized_group_requires_rescue =
-            trusted_materialized_ready_group || trusted_materialized_non_root_rescue_required;
+        let prior_materialized_group_decoded = groups
+            .iter()
+            .any(group_counts_as_prior_materialized_tree_decode);
+        let prior_materialized_exact_file_decoded = groups
+            .iter()
+            .any(group_counts_as_prior_materialized_exact_file_decode);
+        let rescue_decision = trusted_materialized_group_rescue_decision(
+            TrustedMaterializedGroupRescueDecisionInput {
+                read_class,
+                observation_state: observation_status.state,
+                selected_group_sink_reports_live_materialized:
+                    selected_group_sink_status_reports_live_materialized_group(
+                        selected_group_sink_status.as_ref(),
+                        &group_key,
+                    ),
+                prior_materialized_group_decoded,
+                empty_root_requires_fail_closed:
+                    trusted_materialized_empty_group_root_requires_fail_closed(&params.path),
+            },
+        );
+        let trusted_materialized_ready_group = rescue_decision.ready_group;
+        let trusted_materialized_group_requires_rescue = rescue_decision.requires_rescue;
         let is_last_ranked_group = rank_index + 1 == total_ranked_groups;
-        let allow_empty_owner_retry =
-            trusted_materialized_ready_group && !prior_materialized_group_decoded;
-        let selected_group_owner_known = if trusted_materialized_group_requires_rescue {
+        let allow_empty_owner_retry = rescue_decision.allow_empty_owner_retry;
+        let selected_group_owner_known = if rescue_decision.should_resolve_selected_group_owner {
             match &state.backend {
                 QueryBackend::Route { source, .. } => materialized_owner_node_for_group(
                     source.as_ref(),
@@ -4906,7 +5713,7 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
             && is_last_ranked_group
             && prior_materialized_group_decoded
         {
-            remaining + MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE
+            remaining
         } else if read_class == ReadClass::TrustedMaterialized
             && trusted_materialized_ready_group
             && !prior_materialized_group_decoded
@@ -4954,6 +5761,13 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
             );
         }
         let stage_deadline = tokio::time::Instant::now() + stage_timeout;
+        let reserve_proxy_budget = selected_group_stage_reserves_proxy_budget(
+            read_class,
+            trusted_materialized_ready_group,
+            prior_materialized_group_decoded,
+            is_last_ranked_group,
+            &params.path,
+        );
         let events = match run_timed_query(
             query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
                 state,
@@ -4962,10 +5776,9 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
                 stage_timeout,
                 selected_group_sink_status.clone(),
                 request_scoped_schedule_omitted_ready_groups,
-                !(read_class == ReadClass::TrustedMaterialized
-                    && trusted_materialized_ready_group
-                    && !prior_materialized_group_decoded),
+                reserve_proxy_budget,
                 allow_empty_owner_retry,
+                prior_materialized_exact_file_decoded,
             ),
             stage_timeout,
         )
@@ -4982,7 +5795,7 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
             {
                 if trusted_materialized_group_requires_rescue {
                     let empty_root_requires_fail_closed =
-                        trusted_materialized_empty_group_root_requires_fail_closed(&params.path);
+                        rescue_decision.empty_root_requires_fail_closed;
                     let fail_closed_after_retryable_gap =
                         prior_materialized_group_decoded || empty_root_requires_fail_closed;
                     if empty_root_requires_fail_closed
@@ -5208,6 +6021,20 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
                                         }
                                     }
                                     Err(CnxError::Timeout)
+                                        if fail_closed_after_retryable_gap
+                                            && trusted_materialized_ready_group
+                                            && trusted_materialized_empty_group_root_requires_fail_closed(&params.path) =>
+                                    {
+                                        if debug_materialized_route_capture_enabled() {
+                                            eprintln!(
+                                                "fs_meta_query_api: pit_group_stage proxy_fallback_failed group={} path={} err=timeout-preserved",
+                                                group_key,
+                                                String::from_utf8_lossy(&params.path),
+                                            );
+                                        }
+                                        return Err(CnxError::Timeout);
+                                    }
+                                    Err(CnxError::Timeout)
                                     | Err(CnxError::TransportClosed(_))
                                     | Err(CnxError::ProtocolViolation(_))
                                         if fail_closed_after_retryable_gap =>
@@ -5239,9 +6066,17 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
                                 err
                             );
                         }
-                        return Err(trusted_materialized_unavailable_selected_group_tree_error(
-                            &group_key,
-                        ));
+                        if trusted_materialized_ready_group
+                            && trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
+                            && matches!(err, CnxError::Timeout)
+                        {
+                            return Err(CnxError::Timeout);
+                        }
+                        return Err(
+                            trusted_materialized_unavailable_selected_group_tree_error(
+                                &group_key,
+                            ),
+                        );
                     }
                     if debug_materialized_route_capture_enabled() {
                         eprintln!(
@@ -5251,7 +6086,9 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
                             err
                         );
                     }
-                    return Err(CnxError::Timeout);
+                    return Err(trusted_materialized_unavailable_selected_group_tree_error(
+                        &group_key,
+                    ));
                 }
                 let response = empty_materialized_tree_group_payload(&params.path);
                 groups.push(GroupPitSnapshot {
@@ -5301,188 +6138,151 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
                 if trusted_materialized_group_requires_rescue
                     && trusted_materialized_tree_payload_is_empty(&response)
                 {
-                    let empty_root_requires_fail_closed =
-                        trusted_materialized_empty_group_root_requires_fail_closed(&params.path);
-                    let settle_after_initial_empty_retry_path =
-                        allow_empty_owner_retry && !empty_root_requires_fail_closed;
-                    if !settle_after_initial_empty_retry_path {
+                    let empty_response_decision =
+                        trusted_materialized_empty_response_rescue_decision(
+                            TrustedMaterializedEmptyResponseRescueDecisionInput {
+                                ready_group: trusted_materialized_ready_group,
+                                prior_materialized_group_decoded,
+                                prior_materialized_exact_file_decoded,
+                                selected_group_owner_known,
+                                allow_empty_owner_retry,
+                                empty_root_requires_fail_closed: rescue_decision
+                                    .empty_root_requires_fail_closed,
+                            },
+                        );
+                    let remaining = session_deadline
+                        .checked_duration_since(tokio::time::Instant::now())
+                        .unwrap_or_default();
+                    let owner_retry_timeout =
+                        empty_response_decision.owner_retry_policy.timeout(remaining);
+                    if !owner_retry_timeout.is_zero() {
+                        match run_timed_query(
+                            query_materialized_events_via_selected_group_owner_direct(
+                                state,
+                                tree_params.clone(),
+                                owner_retry_timeout,
+                                selected_group_sink_status.as_ref(),
+                            ),
+                            owner_retry_timeout,
+                        )
+                        .await
+                        {
+                            Ok(retry_events) => {
+                                if let Ok(mut retry_response) =
+                                    decode_materialized_selected_group_response(
+                                        &retry_events,
+                                        policy,
+                                        &group_key,
+                                        &params.path,
+                                    )
+                                {
+                                    if trusted_materialized_tree_payload_is_empty(
+                                        &retry_response,
+                                    ) && let Some(richer_response) =
+                                        decode_richer_same_path_materialized_selected_group_response(
+                                            &retry_events,
+                                            policy,
+                                            &group_key,
+                                            &params.path,
+                                        )
+                                    {
+                                        retry_response = richer_response;
+                                    }
+                                    if !trusted_materialized_tree_payload_is_empty(&retry_response)
+                                    {
+                                        response = retry_response;
+                                    }
+                                }
+                            }
+                            Err(CnxError::Timeout)
+                            | Err(CnxError::TransportClosed(_))
+                            | Err(CnxError::ProtocolViolation(_))
+                                if rescue_decision.empty_root_requires_fail_closed =>
+                            {
+                                return Err(trusted_materialized_empty_selected_group_tree_error(
+                                    &group_key,
+                                ));
+                            }
+                            Err(CnxError::Timeout)
+                            | Err(CnxError::TransportClosed(_))
+                            | Err(CnxError::ProtocolViolation(_)) => {}
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    if empty_response_decision.attempt_generic_proxy_fallback
+                        && trusted_materialized_tree_payload_is_empty(&response)
+                        && let QueryBackend::Route {
+                            boundary,
+                            origin_id,
+                            ..
+                        } = &state.backend
+                    {
                         let remaining = session_deadline
                             .checked_duration_since(tokio::time::Instant::now())
                             .unwrap_or_default();
-                        if !remaining.is_zero() && selected_group_owner_known {
-                            let owner_retry_timeout = if empty_root_requires_fail_closed
-                                && prior_materialized_group_decoded
-                            {
-                                remaining
-                            } else if prior_materialized_group_decoded {
-                                std::cmp::min(
-                                    TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET,
-                                    remaining,
-                                )
+                        if !remaining.is_zero() {
+                            let proxy_retry_timeout = if is_last_ranked_group {
+                                std::cmp::min(remaining, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET)
                             } else {
-                                std::cmp::min(TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET, remaining)
-                            };
-                            if !owner_retry_timeout.is_zero() {
-                                match run_timed_query(
-                                    query_materialized_events_via_selected_group_owner_direct(
-                                        state,
-                                        tree_params.clone(),
-                                        owner_retry_timeout,
-                                        selected_group_sink_status.as_ref(),
+                                let shared_budget_ceiling = remaining
+                                    .checked_div(
+                                        total_ranked_groups.saturating_sub(rank_index) as u32,
+                                    )
+                                    .unwrap_or_default();
+                                std::cmp::min(
+                                    std::cmp::min(
+                                        remaining,
+                                        SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET,
                                     ),
-                                    owner_retry_timeout,
+                                    shared_budget_ceiling,
                                 )
-                                .await
-                                {
-                                    Ok(retry_events) => {
-                                        if let Ok(mut retry_response) =
-                                            decode_materialized_selected_group_response(
-                                                &retry_events,
-                                                policy,
-                                                &group_key,
-                                                &params.path,
-                                            )
-                                        {
+                            };
+                            match run_timed_query(
+                                query_materialized_events_via_generic_proxy(
+                                    boundary.clone(),
+                                    origin_id.clone(),
+                                    tree_params.clone(),
+                                    proxy_retry_timeout,
+                                ),
+                                proxy_retry_timeout,
+                            )
+                            .await
+                            {
+                                Ok(proxy_events) => {
+                                    match decode_materialized_selected_group_response(
+                                        &proxy_events,
+                                        policy,
+                                        &group_key,
+                                        &params.path,
+                                    ) {
+                                        Ok(mut proxy_response) => {
                                             if trusted_materialized_tree_payload_is_empty(
-                                                &retry_response,
+                                                &proxy_response,
                                             ) && let Some(richer_response) =
                                                 decode_richer_same_path_materialized_selected_group_response(
-                                                    &retry_events,
+                                                    &proxy_events,
                                                     policy,
                                                     &group_key,
                                                     &params.path,
                                                 )
                                             {
-                                                retry_response = richer_response;
+                                                proxy_response = richer_response;
                                             }
                                             if !trusted_materialized_tree_payload_is_empty(
-                                                &retry_response,
+                                                &proxy_response,
                                             ) {
-                                                response = retry_response;
+                                                response = proxy_response;
                                             }
                                         }
-                                    }
-                                    Err(CnxError::Timeout)
-                                    | Err(CnxError::TransportClosed(_))
-                                    | Err(CnxError::ProtocolViolation(_))
-                                        if empty_root_requires_fail_closed =>
-                                    {
-                                        return Err(
-                                            trusted_materialized_empty_selected_group_tree_error(
-                                                &group_key,
-                                            ),
-                                        );
-                                    }
-                                    Err(CnxError::Timeout)
-                                    | Err(CnxError::TransportClosed(_))
-                                    | Err(CnxError::ProtocolViolation(_)) => {}
-                                    Err(err) => return Err(err),
-                                }
-                            }
-                            if selected_group_owner_known
-                                && !empty_root_requires_fail_closed
-                                && trusted_materialized_tree_payload_is_empty(&response)
-                                && let QueryBackend::Route {
-                                    boundary,
-                                    origin_id,
-                                    ..
-                                } = &state.backend
-                            {
-                                let remaining = session_deadline
-                                    .checked_duration_since(tokio::time::Instant::now())
-                                    .unwrap_or_default();
-                                if !remaining.is_zero() {
-                                    let proxy_retry_timeout = if is_last_ranked_group {
-                                        std::cmp::min(
-                                            remaining,
-                                            SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET,
-                                        )
-                                    } else {
-                                        let shared_budget_ceiling = remaining
-                                            .checked_div(
-                                                total_ranked_groups.saturating_sub(rank_index)
-                                                    as u32,
-                                            )
-                                            .unwrap_or_default();
-                                        std::cmp::min(
-                                            std::cmp::min(
-                                                remaining,
-                                                SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET,
-                                            ),
-                                            shared_budget_ceiling,
-                                        )
-                                    };
-                                    let fail_closed_after_proxy_error =
-                                        trusted_materialized_ready_group
-                                            && prior_materialized_group_decoded
-                                            && trusted_materialized_tree_payload_is_empty(
-                                                &response,
-                                            );
-                                    match run_timed_query(
-                                        query_materialized_events_via_generic_proxy(
-                                            boundary.clone(),
-                                            origin_id.clone(),
-                                            tree_params.clone(),
-                                            proxy_retry_timeout,
-                                        ),
-                                        proxy_retry_timeout,
-                                    )
-                                    .await
-                                    {
-                                        Ok(proxy_events) => {
-                                            match decode_materialized_selected_group_response(
-                                                &proxy_events,
-                                                policy,
-                                                &group_key,
-                                                &params.path,
-                                            ) {
-                                                Ok(mut proxy_response) => {
-                                                    if trusted_materialized_tree_payload_is_empty(
-                                                        &proxy_response,
-                                                    ) && let Some(richer_response) =
-                                                        decode_richer_same_path_materialized_selected_group_response(
-                                                            &proxy_events,
-                                                            policy,
-                                                            &group_key,
-                                                            &params.path,
-                                                        )
-                                                    {
-                                                        proxy_response = richer_response;
-                                                    }
-                                                    if !trusted_materialized_tree_payload_is_empty(
-                                                        &proxy_response,
-                                                    ) {
-                                                        response = proxy_response;
-                                                    }
-                                                }
-                                                Err(err) if fail_closed_after_proxy_error => {
-                                                    if debug_materialized_route_capture_enabled() {
-                                                        eprintln!(
-                                                            "fs_meta_query_api: pit_group_stage proxy_fallback_decode_failed group={} path={} err={}",
-                                                            group_key,
-                                                            String::from_utf8_lossy(&params.path),
-                                                            err
-                                                        );
-                                                    }
-                                                    return Err(
-                                                        trusted_materialized_unavailable_selected_group_tree_error(
-                                                            &group_key,
-                                                        ),
-                                                    );
-                                                }
-                                                Err(_) => {}
-                                            }
-                                        }
-                                        Err(CnxError::Timeout)
-                                        | Err(CnxError::TransportClosed(_))
-                                        | Err(CnxError::ProtocolViolation(_))
-                                            if fail_closed_after_proxy_error =>
+                                        Err(err)
+                                            if empty_response_decision.fail_closed_after_proxy_error =>
                                         {
                                             if debug_materialized_route_capture_enabled() {
                                                 eprintln!(
-                                                    "fs_meta_query_api: pit_group_stage proxy_fallback_failed group={} path={} err=retryable-proxy-failure",
+                                                    "fs_meta_query_api: pit_group_stage proxy_fallback_decode_failed group={} path={} err={}",
                                                     group_key,
                                                     String::from_utf8_lossy(&params.path),
+                                                    err
                                                 );
                                             }
                                             return Err(
@@ -5494,12 +6294,41 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
                                         Err(_) => {}
                                     }
                                 }
+                                Err(CnxError::Timeout)
+                                | Err(CnxError::TransportClosed(_))
+                                | Err(CnxError::ProtocolViolation(_))
+                                    if empty_response_decision.fail_closed_after_proxy_error =>
+                                {
+                                    if debug_materialized_route_capture_enabled() {
+                                        eprintln!(
+                                            "fs_meta_query_api: pit_group_stage proxy_fallback_failed group={} path={} err=retryable-proxy-failure",
+                                            group_key,
+                                            String::from_utf8_lossy(&params.path),
+                                        );
+                                    }
+                                    return Err(
+                                        trusted_materialized_unavailable_selected_group_tree_error(
+                                            &group_key,
+                                        ),
+                                    );
+                                }
+                                Err(_) => {}
                             }
                         }
                     }
                 }
-                if trusted_materialized_ready_group
-                    && trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
+                let empty_response_decision = trusted_materialized_empty_response_rescue_decision(
+                            TrustedMaterializedEmptyResponseRescueDecisionInput {
+                                ready_group: trusted_materialized_ready_group,
+                                prior_materialized_group_decoded,
+                                prior_materialized_exact_file_decoded,
+                                selected_group_owner_known,
+                                allow_empty_owner_retry,
+                                empty_root_requires_fail_closed: rescue_decision
+                            .empty_root_requires_fail_closed,
+                    },
+                );
+                if empty_response_decision.fail_closed_on_final_empty_response
                     && trusted_materialized_tree_payload_is_empty(&response)
                 {
                     return Err(trusted_materialized_empty_selected_group_tree_error(
@@ -5507,18 +6336,23 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
                     ));
                 }
                 let response_is_empty = trusted_materialized_tree_payload_is_empty(&response);
-                if trusted_materialized_ready_group
-                    && rank_index == 0
-                    && !prior_materialized_group_decoded
-                    && !trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
-                    && response_is_empty
-                {
+                let deferred_empty_group_decision =
+                    trusted_materialized_deferred_empty_group_decision(
+                        TrustedMaterializedDeferredEmptyGroupDecisionInput {
+                            defer_first_ranked_empty_non_root_group: empty_response_decision
+                                .defer_first_ranked_empty_non_root_group,
+                            rank_index,
+                            response_is_empty,
+                            deferred_group_present: deferred_first_ranked_empty_trusted_non_root_group
+                                .is_some(),
+                        },
+                    );
+                if deferred_empty_group_decision.should_defer_current_group {
                     deferred_first_ranked_empty_trusted_non_root_group = Some(group_key.clone());
-                } else if let Some(deferred_group) =
-                    deferred_first_ranked_empty_trusted_non_root_group.as_ref()
-                    && rank_index > 0
-                    && !response_is_empty
-                {
+                } else if deferred_empty_group_decision.should_fail_closed_prior_deferred_group {
+                    let deferred_group = deferred_first_ranked_empty_trusted_non_root_group
+                        .as_ref()
+                        .expect("deferred empty group must exist when fail-closing prior deferred group");
                     return Err(trusted_materialized_empty_selected_group_tree_error(
                         deferred_group,
                     ));
@@ -5552,24 +6386,108 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
                     }
                 }
             }
-            Err(err) => groups.push(GroupPitSnapshot {
-                group: group_key,
-                status: "error",
-                reliable: false,
-                unreliable_reason: None,
-                stability: TreeStability {
-                    state: StabilityState::Unknown,
-                    ..TreeStability::not_evaluated()
-                },
-                meta: PitMetadata {
-                    read_class,
-                    metadata_available: false,
-                    withheld_reason: Some("group-payload-missing"),
-                },
-                root: None,
-                entries: Vec::new(),
-                errors: vec![err.to_string()],
-            }),
+            Err(err) => {
+                let root_path_request_scoped_omitted_ready_group = read_class
+                    == ReadClass::TrustedMaterialized
+                    && (params.path.is_empty() || params.path == b"/")
+                    && request_scoped_schedule_omitted_ready_groups
+                        .is_some_and(|groups| groups.contains(&group_key))
+                    && decode_materialized_selected_group_response_missing_same_path_payload(&err);
+                if root_path_request_scoped_omitted_ready_group {
+                    let response = empty_materialized_tree_group_payload(&params.path);
+                    groups.push(GroupPitSnapshot {
+                        group: group_key,
+                        status: "ok",
+                        reliable: response.reliability.reliable,
+                        unreliable_reason: response.reliability.unreliable_reason,
+                        stability: response.stability,
+                        meta: PitMetadata {
+                            read_class,
+                            metadata_available: true,
+                            withheld_reason: None,
+                        },
+                        root: Some(response.root),
+                        entries: response.entries,
+                        errors: Vec::new(),
+                    });
+                    continue;
+                }
+                if read_class == ReadClass::TrustedMaterialized
+                    && prior_materialized_group_decoded
+                    && trusted_materialized_ready_group
+                {
+                    if trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
+                        && matches!(err, CnxError::Timeout)
+                    {
+                        return Err(CnxError::Timeout);
+                    }
+                    if !trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
+                        && decode_materialized_selected_group_response_missing_same_path_payload(&err)
+                    {
+                        let response = empty_materialized_tree_group_payload(&params.path);
+                        groups.push(GroupPitSnapshot {
+                            group: group_key,
+                            status: "ok",
+                            reliable: response.reliability.reliable,
+                            unreliable_reason: response.reliability.unreliable_reason,
+                            stability: response.stability,
+                            meta: PitMetadata {
+                                read_class,
+                                metadata_available: true,
+                                withheld_reason: None,
+                            },
+                            root: Some(response.root),
+                            entries: response.entries,
+                            errors: Vec::new(),
+                        });
+                        continue;
+                    }
+                    return Err(trusted_materialized_unavailable_selected_group_tree_error(
+                        &group_key,
+                    ));
+                }
+                if read_class == ReadClass::TrustedMaterialized
+                    && prior_materialized_exact_file_decoded
+                    && trusted_materialized_ready_group
+                    && decode_materialized_selected_group_response_missing_same_path_payload(&err)
+                {
+                    let response = empty_materialized_tree_group_payload(&params.path);
+                    groups.push(GroupPitSnapshot {
+                        group: group_key,
+                        status: "ok",
+                        reliable: response.reliability.reliable,
+                        unreliable_reason: response.reliability.unreliable_reason,
+                        stability: response.stability,
+                        meta: PitMetadata {
+                            read_class,
+                            metadata_available: true,
+                            withheld_reason: None,
+                        },
+                        root: Some(response.root),
+                        entries: response.entries,
+                        errors: Vec::new(),
+                    });
+                    continue;
+                }
+                groups.push(GroupPitSnapshot {
+                    group: group_key,
+                    status: "error",
+                    reliable: false,
+                    unreliable_reason: None,
+                    stability: TreeStability {
+                        state: StabilityState::Unknown,
+                        ..TreeStability::not_evaluated()
+                    },
+                    meta: PitMetadata {
+                        read_class,
+                        metadata_available: false,
+                        withheld_reason: Some("group-payload-missing"),
+                    },
+                    root: None,
+                    entries: Vec::new(),
+                    errors: vec![err.to_string()],
+                })
+            }
         }
     }
     if matches!(
@@ -6249,6 +7167,7 @@ async fn collect_materialized_stats_groups(
                 request_sink_status,
                 policy.query_timeout(),
                 params.group.is_none() && !params.path.is_empty() && params.path != b"/",
+                MaterializedTargetGroupSelectionMode::Stats,
             )
             .await?
         }
@@ -6282,6 +7201,7 @@ async fn collect_materialized_stats_groups(
                         Some(snapshot.clone()),
                         None,
                         true,
+                        false,
                         false,
                     )
                     .await?
@@ -6401,13 +7321,16 @@ async fn get_stats(
                             boundary,
                             origin_id,
                             ..
-                        } => route_source_status_snapshot(
-                            boundary.clone(),
-                            origin_id.clone(),
-                            std::cmp::min(policy.query_timeout(), Duration::from_secs(5)),
-                        )
-                        .await
-                        .unwrap_or_else(|_| source_status.clone()),
+                        } => merge_source_status_snapshots(vec![
+                            source_status.clone(),
+                            route_source_status_snapshot(
+                                boundary.clone(),
+                                origin_id.clone(),
+                                std::cmp::min(policy.query_timeout(), Duration::from_secs(5)),
+                            )
+                            .await
+                            .unwrap_or_else(|_| source_status.clone()),
+                        ]),
                         QueryBackend::Local { .. } => source_status.clone(),
                     }
                 } else {

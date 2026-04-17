@@ -237,6 +237,603 @@ fn materialized_owner_node_for_group_does_not_fallback_to_source_primary_when_ex
 }
 
 #[test]
+fn materialized_owner_node_for_group_falls_back_to_source_primary_when_first_sink_status_snapshot_is_empty()
+{
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root_a = tmp.path().join("node-a");
+    let root_b = tmp.path().join("node-b");
+    fs::create_dir_all(&root_a).expect("create node-a dir");
+    fs::create_dir_all(&root_b).expect("create node-b dir");
+
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: root_a.clone(),
+            fs_source: "server:/nfs1".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-b::nfs2".to_string(),
+            host_ref: "node-b".to_string(),
+            host_ip: "10.0.0.2".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: root_b.clone(),
+            fs_source: "server:/nfs2".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let source = source_facade_with_roots(
+        vec![
+            RootSpec::new("nfs1", &root_a),
+            RootSpec::new("nfs2", &root_b),
+        ],
+        &grants,
+    );
+    let sink_status = SinkStatusSnapshot::default();
+
+    let owner = crate::runtime_app::shared_tokio_runtime()
+        .block_on(materialized_owner_node_for_group(
+            source.as_ref(),
+            Some(&sink_status),
+            "nfs1",
+        ))
+        .expect("resolve nfs1 owner from empty first sink status")
+        .expect("nfs1 owner should fall back to source primary");
+
+    assert_eq!(
+        owner.0, "node-a",
+        "first routed sink-status snapshots that are fully empty must still fall back to source_primary_by_group for trusted materialized owner routing"
+    );
+}
+
+#[test]
+fn trusted_materialized_empty_response_rescue_decision_defers_first_ranked_non_root_empty_after_initial_owner_retry_lane()
+{
+    let decision = trusted_materialized_empty_response_rescue_decision(
+        TrustedMaterializedEmptyResponseRescueDecisionInput {
+            ready_group: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            selected_group_owner_known: true,
+            allow_empty_owner_retry: true,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        TrustedMaterializedEmptyResponseRescueDecision {
+            owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::Skip,
+            attempt_generic_proxy_fallback: false,
+            fail_closed_after_proxy_error: false,
+            fail_closed_on_final_empty_response: false,
+            defer_first_ranked_empty_non_root_group: true,
+        },
+        "first-ranked trusted non-root empty response should fold to the defer-only lane after the initial empty-owner retry path"
+    );
+}
+
+#[test]
+fn trusted_materialized_empty_response_rescue_decision_retries_later_non_root_owner_then_proxy_when_owner_known()
+{
+    let decision = trusted_materialized_empty_response_rescue_decision(
+        TrustedMaterializedEmptyResponseRescueDecisionInput {
+            ready_group: false,
+            prior_materialized_group_decoded: true,
+            prior_materialized_exact_file_decoded: false,
+            selected_group_owner_known: true,
+            allow_empty_owner_retry: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        TrustedMaterializedEmptyResponseRescueDecision {
+            owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::LaterNonRootBudget,
+            attempt_generic_proxy_fallback: true,
+            fail_closed_after_proxy_error: false,
+            fail_closed_on_final_empty_response: false,
+            defer_first_ranked_empty_non_root_group: false,
+        },
+        "later-ranked trusted non-root rescue should keep one bounded owner retry and proxy fallback when the selected-group owner is known"
+    );
+}
+
+#[test]
+fn trusted_materialized_empty_response_rescue_decision_fail_closes_proxy_gap_for_later_ready_group_after_prior_decode()
+{
+    let decision = trusted_materialized_empty_response_rescue_decision(
+        TrustedMaterializedEmptyResponseRescueDecisionInput {
+            ready_group: true,
+            prior_materialized_group_decoded: true,
+            prior_materialized_exact_file_decoded: false,
+            selected_group_owner_known: true,
+            allow_empty_owner_retry: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        TrustedMaterializedEmptyResponseRescueDecision {
+            owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::LaterNonRootBudget,
+            attempt_generic_proxy_fallback: true,
+            fail_closed_after_proxy_error: true,
+            fail_closed_on_final_empty_response: false,
+            defer_first_ranked_empty_non_root_group: false,
+        },
+        "later-ranked trusted ready group should fail closed if the proxy fallback also gaps after the owner retry still yields an empty response"
+    );
+}
+
+#[test]
+fn trusted_materialized_empty_response_rescue_decision_uses_remaining_budget_for_fail_closed_ready_root()
+{
+    let decision = trusted_materialized_empty_response_rescue_decision(
+        TrustedMaterializedEmptyResponseRescueDecisionInput {
+            ready_group: true,
+            prior_materialized_group_decoded: true,
+            prior_materialized_exact_file_decoded: false,
+            selected_group_owner_known: true,
+            allow_empty_owner_retry: false,
+            empty_root_requires_fail_closed: true,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        TrustedMaterializedEmptyResponseRescueDecision {
+            owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::RemainingBudget,
+            attempt_generic_proxy_fallback: false,
+            fail_closed_after_proxy_error: false,
+            fail_closed_on_final_empty_response: true,
+            defer_first_ranked_empty_non_root_group: false,
+        },
+        "fail-closed trusted ready root should spend the remaining owner budget and then surface a terminal empty-response failure without reopening proxy fallback"
+    );
+}
+
+#[test]
+fn group_counts_as_prior_materialized_tree_decode_ignores_exact_file_hits() {
+    let group = GroupPitSnapshot {
+        group: "nfs1".to_string(),
+        status: "ok",
+        reliable: true,
+        unreliable_reason: None,
+        stability: TreeStability::not_evaluated(),
+        meta: PitMetadata {
+            read_class: ReadClass::TrustedMaterialized,
+            metadata_available: true,
+            withheld_reason: None,
+        },
+        root: Some(TreePageRoot {
+            path: b"/nested/child/deep.txt".to_vec(),
+            size: 10,
+            modified_time_us: 1775709709283318,
+            is_dir: false,
+            exists: true,
+            has_children: false,
+        }),
+        entries: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    assert!(
+        !group_counts_as_prior_materialized_tree_decode(&group),
+        "a first-ranked exact-file hit must not arm later ready empty groups for fail-closed rescue lanes"
+    );
+}
+
+#[test]
+fn group_counts_as_prior_materialized_exact_file_decode_tracks_exact_file_hits() {
+    let group = GroupPitSnapshot {
+        group: "nfs1".to_string(),
+        status: "ok",
+        reliable: true,
+        unreliable_reason: None,
+        stability: TreeStability::not_evaluated(),
+        meta: PitMetadata {
+            read_class: ReadClass::TrustedMaterialized,
+            metadata_available: true,
+            withheld_reason: None,
+        },
+        root: Some(TreePageRoot {
+            path: b"/nested/child/deep.txt".to_vec(),
+            size: 10,
+            modified_time_us: 1775709709283318,
+            is_dir: false,
+            exists: true,
+            has_children: false,
+        }),
+        entries: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    assert!(
+        group_counts_as_prior_materialized_exact_file_decode(&group),
+        "exact-file hits should be tracked separately so later-ranked trusted exact-file lanes can settle same-path empties without reopening proxy rescue"
+    );
+}
+
+#[test]
+fn group_counts_as_prior_materialized_tree_decode_keeps_directory_truth() {
+    let group = GroupPitSnapshot {
+        group: "nfs1".to_string(),
+        status: "ok",
+        reliable: true,
+        unreliable_reason: None,
+        stability: TreeStability::not_evaluated(),
+        meta: PitMetadata {
+            read_class: ReadClass::TrustedMaterialized,
+            metadata_available: true,
+            withheld_reason: None,
+        },
+        root: Some(TreePageRoot {
+            path: b"/nested".to_vec(),
+            size: 0,
+            modified_time_us: 1775709709283318,
+            is_dir: true,
+            exists: true,
+            has_children: false,
+        }),
+        entries: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    assert!(
+        group_counts_as_prior_materialized_tree_decode(&group),
+        "directory/tree materialization must continue to arm later trusted empty-group rescue lanes"
+    );
+}
+
+#[test]
+fn trusted_materialized_empty_response_rescue_decision_skips_proxy_after_prior_exact_file_decode()
+{
+    let decision = trusted_materialized_empty_response_rescue_decision(
+        TrustedMaterializedEmptyResponseRescueDecisionInput {
+            ready_group: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: true,
+            selected_group_owner_known: true,
+            allow_empty_owner_retry: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        TrustedMaterializedEmptyResponseRescueDecision {
+            owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::Skip,
+            attempt_generic_proxy_fallback: false,
+            fail_closed_after_proxy_error: false,
+            fail_closed_on_final_empty_response: false,
+            defer_first_ranked_empty_non_root_group: false,
+        },
+        "later-ranked trusted exact-file lanes should settle same-path empties after a prior exact-file decode instead of reopening owner/proxy rescue"
+    );
+}
+
+#[test]
+fn selected_group_owner_attempt_timeout_preserves_meaningful_owner_budget_within_shared_stage_budget()
+{
+    let timeout = selected_group_owner_attempt_timeout(
+        tokio::time::Instant::now() + Duration::from_millis(1500),
+        true,
+    );
+
+    assert!(
+        timeout >= Duration::from_millis(600),
+        "later-ranked selected-group owner attempts should retain a meaningful share of a 1500ms shared PIT stage budget instead of collapsing to a token retry lane: {timeout:?}"
+    );
+    assert!(
+        timeout <= Duration::from_millis(900),
+        "owner attempts should still leave bounded room for proxy fallback within the shared stage budget: {timeout:?}"
+    );
+}
+
+#[test]
+fn selected_group_owner_attempt_timeout_caps_proxy_reserve_to_configured_fallback_budget() {
+    let timeout = selected_group_owner_attempt_timeout(
+        tokio::time::Instant::now() + Duration::from_secs(10),
+        true,
+    );
+
+    assert!(
+        timeout >= Duration::from_secs(7),
+        "proxy reserve should cap at the configured fallback budget instead of consuming half of a large remaining PIT budget: {timeout:?}"
+    );
+    assert!(
+        timeout <= Duration::from_secs(9),
+        "owner attempt timeout should still reserve some bounded proxy fallback time: {timeout:?}"
+    );
+}
+
+#[test]
+fn request_scoped_loaded_ready_group_preservation_decision_restores_loaded_group_for_explicit_empty_drift()
+{
+    let decision = request_scoped_loaded_ready_group_preservation_decision(
+        RequestScopedLoadedReadyGroupPreservationDecisionInput {
+            loaded_group_reports_live_materialized: true,
+            loaded_group_has_stronger_merge_score: true,
+            request_scoped_mentions_group: true,
+            request_scoped_explicit_empty: true,
+            request_scoped_schedules_group: false,
+            request_scoped_omits_all_groups_from_schedule: false,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        RequestScopedLoadedReadyGroupPreservationDecision {
+            lane: RequestScopedLoadedReadyGroupPreservationLane::ExplicitEmptyDrift,
+            should_restore_loaded_group: true,
+        },
+        "request-scoped explicit empty same-group drift should fold to the explicit-empty preservation lane instead of reopening ad hoc helper branching"
+    );
+}
+
+#[test]
+fn request_scoped_loaded_ready_group_preservation_decision_restores_loaded_group_for_partial_schedule_omission()
+{
+    let decision = request_scoped_loaded_ready_group_preservation_decision(
+        RequestScopedLoadedReadyGroupPreservationDecisionInput {
+            loaded_group_reports_live_materialized: true,
+            loaded_group_has_stronger_merge_score: true,
+            request_scoped_mentions_group: false,
+            request_scoped_explicit_empty: false,
+            request_scoped_schedules_group: false,
+            request_scoped_omits_all_groups_from_schedule: false,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        RequestScopedLoadedReadyGroupPreservationDecision {
+            lane: RequestScopedLoadedReadyGroupPreservationLane::PartialScheduleOmission,
+            should_restore_loaded_group: true,
+        },
+        "request-scoped omission of a previously ready loaded group should fold to the partial-schedule-omission preservation lane"
+    );
+}
+
+#[test]
+fn request_scoped_loaded_ready_group_preservation_decision_restores_loaded_group_for_missing_ready_group_row()
+{
+    let decision = request_scoped_loaded_ready_group_preservation_decision(
+        RequestScopedLoadedReadyGroupPreservationDecisionInput {
+            loaded_group_reports_live_materialized: true,
+            loaded_group_has_stronger_merge_score: true,
+            request_scoped_mentions_group: false,
+            request_scoped_explicit_empty: false,
+            request_scoped_schedules_group: true,
+            request_scoped_omits_all_groups_from_schedule: false,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        RequestScopedLoadedReadyGroupPreservationDecision {
+            lane: RequestScopedLoadedReadyGroupPreservationLane::MissingReadyGroupRow,
+            should_restore_loaded_group: true,
+        },
+        "request-scoped snapshots that still schedule a ready loaded group but drop its row must fold to an explicit missing-ready-group-row preservation lane"
+    );
+}
+
+#[test]
+fn request_scoped_loaded_ready_group_preservation_decision_does_not_restore_when_request_scope_omits_all_groups()
+{
+    let decision = request_scoped_loaded_ready_group_preservation_decision(
+        RequestScopedLoadedReadyGroupPreservationDecisionInput {
+            loaded_group_reports_live_materialized: true,
+            loaded_group_has_stronger_merge_score: true,
+            request_scoped_mentions_group: false,
+            request_scoped_explicit_empty: false,
+            request_scoped_schedules_group: false,
+            request_scoped_omits_all_groups_from_schedule: true,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        RequestScopedLoadedReadyGroupPreservationDecision {
+            lane: RequestScopedLoadedReadyGroupPreservationLane::KeepCurrent,
+            should_restore_loaded_group: false,
+        },
+        "request-scoped snapshots that omit every scheduled group must not reopen partial-omission preservation"
+    );
+}
+
+#[test]
+fn request_scoped_schedule_omitted_ready_groups_keeps_loaded_ready_groups_when_request_scope_omits_all_groups()
+{
+    let loaded_sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]),
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs1".to_string(),
+                primary_object_ref: "node-a::nfs1".to_string(),
+                total_nodes: 1,
+                live_nodes: 1,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 1,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: true,
+                readiness: crate::sink::GroupReadinessState::Ready,
+                materialized_revision: 7,
+                estimated_heap_bytes: 0,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs2".to_string(),
+                primary_object_ref: "node-a::nfs2".to_string(),
+                total_nodes: 1,
+                live_nodes: 1,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 1,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: true,
+                readiness: crate::sink::GroupReadinessState::Ready,
+                materialized_revision: 7,
+                estimated_heap_bytes: 0,
+            },
+        ],
+        ..SinkStatusSnapshot::default()
+    };
+    let request_scoped_sink_status = SinkStatusSnapshot::default();
+
+    let omitted = request_scoped_schedule_omitted_ready_groups(
+        &loaded_sink_status,
+        &request_scoped_sink_status,
+    );
+
+    assert_eq!(
+        omitted,
+        BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        "omit-all request-scoped sink snapshots must still preserve which loaded ready groups disappeared from schedule, so root trusted tree can settle them as empty instead of group-payload-missing"
+    );
+}
+
+#[test]
+fn trusted_materialized_deferred_empty_group_decision_defers_first_ranked_empty_non_root_group() {
+    let decision = trusted_materialized_deferred_empty_group_decision(
+        TrustedMaterializedDeferredEmptyGroupDecisionInput {
+            defer_first_ranked_empty_non_root_group: true,
+            rank_index: 0,
+            response_is_empty: true,
+            deferred_group_present: false,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        TrustedMaterializedDeferredEmptyGroupDecision {
+            lane: TrustedMaterializedDeferredEmptyGroupLane::DeferCurrentFirstRankedEmptyGroup,
+            should_defer_current_group: true,
+            should_fail_closed_prior_deferred_group: false,
+        },
+        "first-ranked trusted non-root empty response should fold to the defer-current-group lane"
+    );
+}
+
+#[test]
+fn trusted_materialized_deferred_empty_group_decision_fail_closes_prior_deferred_group_when_later_group_decodes()
+{
+    let decision = trusted_materialized_deferred_empty_group_decision(
+        TrustedMaterializedDeferredEmptyGroupDecisionInput {
+            defer_first_ranked_empty_non_root_group: false,
+            rank_index: 1,
+            response_is_empty: false,
+            deferred_group_present: true,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        TrustedMaterializedDeferredEmptyGroupDecision {
+            lane: TrustedMaterializedDeferredEmptyGroupLane::FailClosedPriorDeferredGroup,
+            should_defer_current_group: false,
+            should_fail_closed_prior_deferred_group: true,
+        },
+        "a later non-empty decode after deferring the first-ranked empty non-root group should fold to the prior-deferred fail-closed lane"
+    );
+}
+
+#[test]
+fn trusted_materialized_deferred_empty_group_decision_keeps_waiting_when_later_group_is_also_empty() {
+    let decision = trusted_materialized_deferred_empty_group_decision(
+        TrustedMaterializedDeferredEmptyGroupDecisionInput {
+            defer_first_ranked_empty_non_root_group: false,
+            rank_index: 1,
+            response_is_empty: true,
+            deferred_group_present: true,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        TrustedMaterializedDeferredEmptyGroupDecision {
+            lane: TrustedMaterializedDeferredEmptyGroupLane::KeepCurrent,
+            should_defer_current_group: false,
+            should_fail_closed_prior_deferred_group: false,
+        },
+        "later empty groups must not prematurely fail closed a deferred first-ranked trusted non-root group"
+    );
+}
+
+#[test]
+fn decode_materialized_selected_group_response_errors_when_batch_omits_selected_group_payload() {
+    let events = vec![mk_event_with_correlation(
+        "other-group",
+        1,
+        real_materialized_tree_payload_for_test(b"/nested/child/deep.txt"),
+    )];
+
+    let err = decode_materialized_selected_group_response(
+        &events,
+        &ProjectionPolicy::default(),
+        "nfs2",
+        b"/nested/child/deep.txt",
+    )
+    .expect_err(
+        "selected-group decode must fail closed when a batch only contains other-group payloads for the same path",
+    );
+
+    assert!(
+        matches!(err, CnxError::Internal(ref msg) if msg.contains("nfs2")),
+        "omitted selected-group payload must surface as an internal no-payload gap instead of silently decoding to an ok empty root: {err:?}"
+    );
+}
+
+#[test]
+fn decode_materialized_selected_group_response_preserves_explicit_empty_selected_group_payload() {
+    let events = vec![mk_event_with_correlation(
+        "nfs2",
+        1,
+        empty_materialized_tree_payload_for_test(b"/nested/child/deep.txt"),
+    )];
+
+    let payload = decode_materialized_selected_group_response(
+        &events,
+        &ProjectionPolicy::default(),
+        "nfs2",
+        b"/nested/child/deep.txt",
+    )
+    .expect("explicit empty selected-group payload should still decode");
+
+    assert!(
+        trusted_materialized_tree_payload_is_empty(&payload),
+        "narrow no-payload fail-closed fix must not rewrite an explicit empty selected-group payload into a decode error"
+    );
+}
+
+#[test]
 fn resolve_force_find_groups_uses_local_source_snapshot_and_filters_scan_disabled_roots() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let root_a = tmp.path().join("nfs1");
@@ -380,6 +977,64 @@ fn max_total_files_from_stats_events_uses_highest_total_files() {
 
     let events = vec![mk_stats_event("n1", 3), mk_stats_event("n2", 8)];
     assert_eq!(max_total_files_from_stats_events(&events), Some(8));
+}
+
+#[test]
+fn selected_group_owner_attempt_timeout_from_remaining_splits_sub_proxy_min_budget_evenly_for_later_ranked_groups(
+) {
+    let timeout = selected_group_owner_attempt_timeout_from_remaining(
+        Duration::from_millis(1800),
+        true,
+    );
+
+    assert_eq!(
+        timeout,
+        Duration::from_millis(900),
+        "later-ranked owner attempts should keep half of a sub-proxy-min shared PIT budget instead of collapsing to the 100ms owner minimum"
+    );
+}
+
+#[test]
+fn selected_group_owner_attempt_timeout_from_remaining_splits_root_stage_budget_after_prior_decode(
+) {
+    let timeout = selected_group_owner_attempt_timeout_from_remaining(
+        Duration::from_millis(1200),
+        false,
+    );
+
+    assert_eq!(
+        timeout,
+        Duration::from_millis(600),
+        "decoded+stalled root groups should share one PIT budget instead of reserving almost the entire remainder for a proxy lane"
+    );
+}
+
+#[test]
+fn selected_group_stage_reserves_proxy_budget_for_first_ranked_trusted_ready_non_root() {
+    assert!(
+        selected_group_stage_reserves_proxy_budget(
+            ReadClass::TrustedMaterialized,
+            true,
+            false,
+            false,
+            b"/nested/child/deep.txt",
+        ),
+        "first-ranked trusted-ready non-root queries must keep proxy budget available when the owner stalls"
+    );
+}
+
+#[test]
+fn selected_group_stage_does_not_reserve_proxy_budget_for_first_ranked_trusted_ready_root() {
+    assert!(
+        !selected_group_stage_reserves_proxy_budget(
+            ReadClass::TrustedMaterialized,
+            true,
+            false,
+            false,
+            b"/",
+        ),
+        "first-ranked trusted-ready root queries should still spend the full owner stage instead of pre-reserving a proxy lane"
+    );
 }
 
 #[test]
@@ -917,7 +1572,13 @@ fn materialized_query_readiness_fail_closed_when_sink_group_missing() {
         concrete_roots: Vec::new(),
         degraded_roots: Vec::new(),
     };
-    let sink_status = SinkStatusSnapshot::default();
+    let sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["root-a".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
 
     let err = materialized_query_readiness_error(&source_status, &sink_status)
         .expect("missing sink group must gate materialized queries");

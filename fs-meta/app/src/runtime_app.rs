@@ -78,6 +78,7 @@ const SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_FRAME_LEASE_ACQUIRE_BUDGET: Duration = Duration::from_secs(1);
 const CONTROL_FRAME_LEASE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const INTERNAL_SINK_STATUS_BLOCKING_FALLBACK_BUDGET: Duration = Duration::from_millis(250);
 
 struct FacadeActivation {
     route_key: String,
@@ -176,6 +177,118 @@ struct FacadeReadyTailDecision {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FacadePublicationReadinessDecision {
+    BlockedControlGate,
+    BlockedWithoutActiveControlStream,
+    Ready,
+    FixedBindHandoffPending,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeGateFacts {
+    control_initialized: bool,
+    source_state_replay_required: bool,
+    sink_state_replay_required: bool,
+}
+
+impl RuntimeGateFacts {
+    fn from_atomic_flags(
+        control_initialized: &AtomicBool,
+        source_state_replay_required: &AtomicBool,
+        sink_state_replay_required: &AtomicBool,
+    ) -> Self {
+        Self {
+            control_initialized: control_initialized.load(Ordering::Acquire),
+            source_state_replay_required: source_state_replay_required.load(Ordering::Acquire),
+            sink_state_replay_required: sink_state_replay_required.load(Ordering::Acquire),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FacadeServiceStateDecisionInput {
+    control_gate_ready: bool,
+    publication_ready: bool,
+    pending_facade_present: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FacadeReadyTailDecisionInput {
+    runtime: RuntimeGateFacts,
+    allow_facade_only_handoff: bool,
+    publication_ready: bool,
+    pending_facade_present: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FacadePublicationReadinessDecisionInput {
+    runtime: RuntimeGateFacts,
+    allow_facade_only_handoff: bool,
+    pending_facade_present: bool,
+    pending_facade_is_control_route: bool,
+    pending_fixed_bind_has_suppressed_dependent_routes: bool,
+    active_control_stream_present: bool,
+    active_pending_control_stream_present: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FacadeOnlyHandoffAllowanceDecisionInput {
+    pending_facade_present: bool,
+    pending_facade_is_control_route: bool,
+    pending_fixed_bind_has_suppressed_dependent_routes: bool,
+    pending_bind_is_ephemeral: bool,
+    pending_bind_owned_by_instance: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FacadeOnlyHandoffAllowanceDecision {
+    Blocked,
+    AllowedControlRouteWithoutSuppressedRoutes,
+    AllowedOwnedNonEphemeralFixedBind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FixedBindHandoffReleaseDecisionInput {
+    handoff_ready_entry_present: bool,
+    handoff_ready_owned_by_current_instance: bool,
+    pending_facade_present: bool,
+    pending_facade_is_control_route: bool,
+    pending_runtime_exposure_confirmed: bool,
+    suppressed_dependent_routes_remain: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixedBindHandoffReleaseDecision {
+    Blocked,
+    Ready,
+}
+
+impl FacadeOnlyHandoffAllowanceDecision {
+    fn allows_handoff(self) -> bool {
+        !matches!(self, Self::Blocked)
+    }
+}
+
+impl FacadeReadyTailDecisionInput {
+    fn facade_service_state_input(self, control_gate_ready: bool) -> FacadeServiceStateDecisionInput {
+        FacadeServiceStateDecisionInput {
+            control_gate_ready,
+            publication_ready: self.publication_ready,
+            pending_facade_present: self.pending_facade_present,
+        }
+    }
+}
+
+fn active_control_stream_matches_pending_facade(
+    active: &FacadeActivation,
+    pending: &PendingFacadeActivation,
+) -> bool {
+    active.route_key == pending.route_key
+        && active.resource_ids == pending.resource_ids
+        && active.generation == pending.generation
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UninitializedCleanupDisposition {
     None,
     FacadeOnly,
@@ -222,16 +335,68 @@ enum SinkControlWaveDisposition {
     ReplayRetained,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SourceControlWaveDecisionInput<'a> {
+    control_initialized_at_entry: bool,
+    control_initialized_now: bool,
+    source_state_replay_required: bool,
+    cleanup_disposition: UninitializedCleanupDisposition,
+    source_signals: &'a [SourceControlSignal],
+    facade_claim_signals_present: bool,
+    facade_publication_signals_present: bool,
+    sink_signals_present: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SinkControlWaveDecisionInput<'a> {
+    control_initialized_at_entry: bool,
+    control_initialized_now: bool,
+    retained_sink_state_present_at_entry: bool,
+    sink_state_replay_required: bool,
+    sink_tick_fast_path_eligible: bool,
+    cleanup_disposition: UninitializedCleanupDisposition,
+    source_wave_disposition: SourceControlWaveDisposition,
+    source_signals_present: bool,
+    facade_claim_signals_present: bool,
+    facade_publication_signals_present: bool,
+    sink_signals: &'a [SinkControlSignal],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UninitializedCleanupDecisionInput<'a> {
+    control_initialized_now: bool,
+    source_signals: &'a [SourceControlSignal],
+    sink_signals: &'a [SinkControlSignal],
+    facade_signals: &'a [FacadeControlSignal],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceGenerationCutoverDisposition {
     None,
     FailClosedRestartDeferredRetirePending,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SourceGenerationCutoverDecisionInput<'a> {
+    control_initialized_at_entry: bool,
+    source_signals: &'a [SourceControlSignal],
+    sink_signals: &'a [SinkControlSignal],
+    facade_signals: &'a [FacadeControlSignal],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SinkGenerationCutoverDisposition {
     None,
     FailClosedSharedGenerationCutover,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SinkGenerationCutoverDecisionInput<'a> {
+    control_initialized_at_entry: bool,
+    source_signals: &'a [SourceControlSignal],
+    sink_signals: &'a [SinkControlSignal],
+    facade_signals: &'a [FacadeControlSignal],
+    sink_signals_in_shared_generation_cutover_lane: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1021,20 +1186,21 @@ fn preferred_internal_query_endpoint_units(
     query_peer_active: bool,
     prefer_query_peer_first: bool,
 ) -> Vec<&'static str> {
-    if prefer_query_peer_first && query_peer_active {
-        vec![
+    match (query_active, query_peer_active, prefer_query_peer_first) {
+        (true, true, true) => vec![
             execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
             execution_units::QUERY_RUNTIME_UNIT_ID,
-        ]
-    } else if query_active {
-        vec![execution_units::QUERY_RUNTIME_UNIT_ID]
-    } else if query_peer_active {
-        vec![
+        ],
+        (true, true, false) => vec![
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+        ],
+        (true, false, _) => vec![execution_units::QUERY_RUNTIME_UNIT_ID],
+        (false, true, _) => vec![
             execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
             execution_units::QUERY_RUNTIME_UNIT_ID,
-        ]
-    } else {
-        Vec::new()
+        ],
+        (false, false, _) => Vec::new(),
     }
 }
 
@@ -1483,6 +1649,16 @@ fn active_fixed_bind_facade_owner_for(
     guard.get(bind_addr).and_then(|registrant| {
         (registrant.instance_id != requester_instance_id).then_some(registrant.clone())
     })
+}
+
+fn active_fixed_bind_facade_owned_by(bind_addr: &str, instance_id: u64) -> bool {
+    let guard = match active_fixed_bind_facade_owner_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .get(bind_addr)
+        .is_some_and(|registrant| registrant.instance_id == instance_id)
 }
 
 fn conflicting_process_facade_claim_for(
@@ -2551,7 +2727,10 @@ impl FSMetaApp {
                 .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"))
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut post_return_source_to_sink_convergence_retrigger_pending = true;
+        let mut post_return_source_to_sink_convergence_retrigger_pending = matches!(
+            mode,
+            LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath
+        );
         let mut post_return_source_to_sink_convergence_retrigger_count = 0usize;
         let mut post_return_manual_rescan_republished = false;
         let mut post_return_sink_replay_pending = false;
@@ -2784,12 +2963,14 @@ impl FSMetaApp {
             return Ok(());
         }
         if is_dual_lane_internal_query_route(&route_key) {
-            let query_active = facade_gate
-                .unit_state(execution_units::QUERY_RUNTIME_UNIT_ID)?
-                .map(|(active, _)| active)
-                .unwrap_or(false);
+            let query_route_active = facade_gate
+                .route_active(execution_units::QUERY_RUNTIME_UNIT_ID, &route_key)?;
+            let query_route_generation = facade_gate
+                .route_generation(execution_units::QUERY_RUNTIME_UNIT_ID, &route_key)?
+                .unwrap_or(0);
             let mut mirrored = mirrored_query_peer_routes.lock().await;
-            if mirrored.contains_key(&route_key) || !query_active {
+            let route_was_mirrored = mirrored.contains_key(&route_key);
+            if route_was_mirrored || !query_route_active || query_route_generation < generation {
                 facade_gate.apply_activate(
                     execution_units::QUERY_RUNTIME_UNIT_ID,
                     &route_key,
@@ -2889,12 +3070,16 @@ impl FSMetaApp {
                 active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
             });
             let ready_tail_decision = Self::facade_ready_tail_decision_from_runtime_facts(
-                control_initialized.load(Ordering::Acquire),
-                source_state_replay_required.load(Ordering::Acquire),
-                sink_state_replay_required.load(Ordering::Acquire),
-                false,
-                publication_ready,
-                pending_facade_present,
+                FacadeReadyTailDecisionInput {
+                    runtime: RuntimeGateFacts::from_atomic_flags(
+                        control_initialized.as_ref(),
+                        source_state_replay_required.as_ref(),
+                        sink_state_replay_required.as_ref(),
+                    ),
+                    allow_facade_only_handoff: false,
+                    publication_ready,
+                    pending_facade_present,
+                },
             );
             api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
             *facade_service_state
@@ -3122,25 +3307,31 @@ impl FSMetaApp {
         self.control_initialized.load(Ordering::Acquire)
     }
 
+    fn runtime_gate_facts(&self) -> RuntimeGateFacts {
+        RuntimeGateFacts {
+            control_initialized: self.control_initialized(),
+            source_state_replay_required: self
+                .source_state_replay_required
+                .load(Ordering::Acquire),
+            sink_state_replay_required: self.sink_state_replay_required.load(Ordering::Acquire),
+        }
+    }
+
     fn control_gate_ready_from_runtime_facts(
-        control_initialized: bool,
-        source_replay_required: bool,
-        sink_replay_required: bool,
+        runtime: RuntimeGateFacts,
         allow_facade_only_handoff: bool,
     ) -> bool {
-        !source_replay_required
-            && !sink_replay_required
-            && (control_initialized || allow_facade_only_handoff)
+        !runtime.source_state_replay_required
+            && !runtime.sink_state_replay_required
+            && (runtime.control_initialized || allow_facade_only_handoff)
     }
 
     fn current_facade_service_state_from_runtime_facts(
-        control_ready: bool,
-        publication_ready: bool,
-        pending_facade_present: bool,
+        input: FacadeServiceStateDecisionInput,
     ) -> FacadeServiceState {
-        if pending_facade_present {
+        if input.pending_facade_present {
             FacadeServiceState::Pending
-        } else if control_ready && publication_ready {
+        } else if input.control_gate_ready && input.publication_ready {
             FacadeServiceState::Serving
         } else {
             FacadeServiceState::Unavailable
@@ -3148,28 +3339,86 @@ impl FSMetaApp {
     }
 
     fn facade_ready_tail_decision_from_runtime_facts(
-        control_initialized: bool,
-        source_replay_required: bool,
-        sink_replay_required: bool,
-        allow_facade_only_handoff: bool,
-        publication_ready: bool,
-        pending_facade_present: bool,
+        input: FacadeReadyTailDecisionInput,
     ) -> FacadeReadyTailDecision {
-        let control_gate_ready = publication_ready
+        let control_gate_ready = input.publication_ready
             && Self::control_gate_ready_from_runtime_facts(
-                control_initialized,
-                source_replay_required,
-                sink_replay_required,
-                allow_facade_only_handoff,
+                input.runtime,
+                input.allow_facade_only_handoff,
             );
         let published_state = Self::current_facade_service_state_from_runtime_facts(
-            control_gate_ready,
-            publication_ready,
-            pending_facade_present,
+            input.facade_service_state_input(control_gate_ready),
         );
         FacadeReadyTailDecision {
             control_gate_ready,
             published_state,
+        }
+    }
+
+    fn facade_publication_readiness_decision_from_runtime_facts(
+        input: FacadePublicationReadinessDecisionInput,
+    ) -> FacadePublicationReadinessDecision {
+        let control_gate_ready = Self::control_gate_ready_from_runtime_facts(
+            input.runtime,
+            input.allow_facade_only_handoff,
+        );
+        if !control_gate_ready {
+            return FacadePublicationReadinessDecision::BlockedControlGate;
+        }
+        if !input.pending_facade_present {
+            return if input.active_control_stream_present {
+                FacadePublicationReadinessDecision::Ready
+            } else {
+                FacadePublicationReadinessDecision::BlockedWithoutActiveControlStream
+            };
+        }
+        if !input.pending_facade_is_control_route {
+            return if input.active_control_stream_present {
+                FacadePublicationReadinessDecision::Ready
+            } else {
+                FacadePublicationReadinessDecision::BlockedWithoutActiveControlStream
+            };
+        }
+        if input.active_pending_control_stream_present {
+            FacadePublicationReadinessDecision::Ready
+        } else {
+            FacadePublicationReadinessDecision::FixedBindHandoffPending
+        }
+    }
+
+    fn facade_only_handoff_allowance_decision(
+        input: FacadeOnlyHandoffAllowanceDecisionInput,
+    ) -> FacadeOnlyHandoffAllowanceDecision {
+        if !input.pending_facade_present {
+            return FacadeOnlyHandoffAllowanceDecision::Blocked;
+        }
+        if input.pending_facade_is_control_route {
+            return if input.pending_fixed_bind_has_suppressed_dependent_routes {
+                FacadeOnlyHandoffAllowanceDecision::Blocked
+            } else {
+                FacadeOnlyHandoffAllowanceDecision::AllowedControlRouteWithoutSuppressedRoutes
+            };
+        }
+        if !input.pending_bind_is_ephemeral && input.pending_bind_owned_by_instance {
+            return FacadeOnlyHandoffAllowanceDecision::AllowedOwnedNonEphemeralFixedBind;
+        }
+        FacadeOnlyHandoffAllowanceDecision::Blocked
+    }
+
+    fn fixed_bind_handoff_release_decision(
+        input: FixedBindHandoffReleaseDecisionInput,
+    ) -> FixedBindHandoffReleaseDecision {
+        if !input.handoff_ready_entry_present
+            || input.handoff_ready_owned_by_current_instance
+            || !input.pending_facade_present
+            || !input.pending_facade_is_control_route
+        {
+            return FixedBindHandoffReleaseDecision::Blocked;
+        }
+        if input.pending_runtime_exposure_confirmed || !input.suppressed_dependent_routes_remain {
+            FixedBindHandoffReleaseDecision::Ready
+        } else {
+            FixedBindHandoffReleaseDecision::Blocked
         }
     }
 
@@ -3190,24 +3439,19 @@ impl FSMetaApp {
     }
 
     fn classify_source_control_wave_disposition(
-        control_initialized_at_entry: bool,
-        control_initialized_now: bool,
-        source_replay_required: bool,
-        cleanup_disposition: UninitializedCleanupDisposition,
-        source_signals: &[SourceControlSignal],
-        facade_claim_signals_present: bool,
-        facade_publication_signals_present: bool,
-        sink_signals_present: bool,
+        input: SourceControlWaveDecisionInput<'_>,
     ) -> SourceControlWaveDisposition {
-        if !source_signals.is_empty() {
-            if cleanup_disposition.is_source_only() {
+        if !input.source_signals.is_empty() {
+            if input.cleanup_disposition.is_source_only() {
                 SourceControlWaveDisposition::CleanupOnlyWhileUninitialized
-            } else if control_initialized_at_entry
-                && control_initialized_now
-                && !source_replay_required
-                && ((!facade_claim_signals_present && !facade_publication_signals_present)
-                    || sink_signals_present)
-                && source_signals
+            } else if input.control_initialized_at_entry
+                && input.control_initialized_now
+                && !input.source_state_replay_required
+                && ((!input.facade_claim_signals_present
+                    && !input.facade_publication_signals_present)
+                    || input.sink_signals_present)
+                && input
+                    .source_signals
                     .iter()
                     .all(|signal| matches!(signal, SourceControlSignal::Tick { .. }))
             {
@@ -3215,9 +3459,9 @@ impl FSMetaApp {
             } else {
                 SourceControlWaveDisposition::ApplySignals
             }
-        } else if source_replay_required
-            && !cleanup_disposition.is_source_only()
-            && !cleanup_disposition.is_sink_only()
+        } else if input.source_state_replay_required
+            && !input.cleanup_disposition.is_source_only()
+            && !input.cleanup_disposition.is_sink_only()
         {
             SourceControlWaveDisposition::ReplayRetained
         } else {
@@ -3226,58 +3470,50 @@ impl FSMetaApp {
     }
 
     fn classify_sink_control_wave_disposition(
-        control_initialized_at_entry: bool,
-        control_initialized_now: bool,
-        retained_sink_state_present_at_entry: bool,
-        sink_replay_required: bool,
-        sink_tick_fast_path_eligible: bool,
-        cleanup_disposition: UninitializedCleanupDisposition,
-        source_wave_disposition: SourceControlWaveDisposition,
-        source_signals_present: bool,
-        facade_claim_signals_present: bool,
-        facade_publication_signals_present: bool,
-        sink_signals: &[SinkControlSignal],
+        input: SinkControlWaveDecisionInput<'_>,
     ) -> SinkControlWaveDisposition {
-        if !sink_signals.is_empty() {
-            let steady_tick_noop = control_initialized_at_entry
-                && control_initialized_now
-                && !sink_replay_required
-                && sink_tick_fast_path_eligible
-                && sink_signals
+        if !input.sink_signals.is_empty() {
+            let steady_tick_noop = input.control_initialized_at_entry
+                && input.control_initialized_now
+                && !input.sink_state_replay_required
+                && input.sink_tick_fast_path_eligible
+                && input
+                    .sink_signals
                     .iter()
                     .all(|signal| matches!(signal, SinkControlSignal::Tick { .. }));
-            let apply_before_initial_source_wave = !control_initialized_at_entry
-                && !retained_sink_state_present_at_entry
-                && source_signals_present
-                && !cleanup_disposition.is_source_only()
-                && !cleanup_disposition.is_sink_query_only()
+            let apply_before_initial_source_wave = !input.control_initialized_at_entry
+                && !input.retained_sink_state_present_at_entry
+                && input.source_signals_present
+                && !input.cleanup_disposition.is_source_only()
+                && !input.cleanup_disposition.is_sink_query_only()
                 && matches!(
-                    source_wave_disposition,
+                    input.source_wave_disposition,
                     SourceControlWaveDisposition::ApplySignals
                 )
                 && !steady_tick_noop;
             if apply_before_initial_source_wave {
                 SinkControlWaveDisposition::ApplyBeforeInitialSourceWave
-            } else if cleanup_disposition.is_sink_query_only() {
+            } else if input.cleanup_disposition.is_sink_query_only() {
                 SinkControlWaveDisposition::CleanupOnlyQueryWhileUninitialized
             } else if steady_tick_noop {
                 SinkControlWaveDisposition::SteadyTickNoop
             } else {
                 SinkControlWaveDisposition::ApplySignals {
-                    wait_for_status_republish_after_apply: control_initialized_at_entry
-                        && retained_sink_state_present_at_entry
-                        && !sink_tick_fast_path_eligible
-                        && !source_signals_present
-                        && !facade_claim_signals_present
-                        && !facade_publication_signals_present
-                        && sink_signals
+                    wait_for_status_republish_after_apply: input.control_initialized_at_entry
+                        && input.retained_sink_state_present_at_entry
+                        && !input.sink_tick_fast_path_eligible
+                        && !input.source_signals_present
+                        && !input.facade_claim_signals_present
+                        && !input.facade_publication_signals_present
+                        && input
+                            .sink_signals
                             .iter()
                             .all(|signal| matches!(signal, SinkControlSignal::Tick { .. })),
                 }
             }
-        } else if sink_replay_required
-            && !cleanup_disposition.is_source_only()
-            && !cleanup_disposition.is_sink_query_only()
+        } else if input.sink_state_replay_required
+            && !input.cleanup_disposition.is_source_only()
+            && !input.cleanup_disposition.is_sink_query_only()
         {
             SinkControlWaveDisposition::ReplayRetained
         } else {
@@ -3286,36 +3522,36 @@ impl FSMetaApp {
     }
 
     fn classify_uninitialized_cleanup_disposition(
-        control_initialized_now: bool,
-        source_signals: &[SourceControlSignal],
-        sink_signals: &[SinkControlSignal],
-        facade_signals: &[FacadeControlSignal],
+        input: UninitializedCleanupDecisionInput<'_>,
     ) -> UninitializedCleanupDisposition {
-        if control_initialized_now {
+        if input.control_initialized_now {
             UninitializedCleanupDisposition::None
-        } else if source_signals.is_empty()
-            && sink_signals.is_empty()
-            && !facade_signals.is_empty()
-            && facade_signals
+        } else if input.source_signals.is_empty()
+            && input.sink_signals.is_empty()
+            && !input.facade_signals.is_empty()
+            && input
+                .facade_signals
                 .iter()
                 .all(Self::facade_signal_is_cleanup_only)
         {
             UninitializedCleanupDisposition::FacadeOnly
-        } else if sink_signals.is_empty()
-            && facade_signals.is_empty()
-            && !source_signals.is_empty()
-            && source_signals
+        } else if input.sink_signals.is_empty()
+            && input.facade_signals.is_empty()
+            && !input.source_signals.is_empty()
+            && input
+                .source_signals
                 .iter()
                 .all(Self::source_signal_is_restart_deferred_retire_pending)
         {
             UninitializedCleanupDisposition::SourceOnly
-        } else if source_signals.is_empty()
-            && facade_signals.is_empty()
-            && !sink_signals.is_empty()
-            && sink_signals.iter().all(Self::sink_signal_is_cleanup_only)
+        } else if input.source_signals.is_empty()
+            && input.facade_signals.is_empty()
+            && !input.sink_signals.is_empty()
+            && input.sink_signals.iter().all(Self::sink_signal_is_cleanup_only)
         {
             UninitializedCleanupDisposition::SinkOnly {
-                query_only: sink_signals
+                query_only: input
+                    .sink_signals
                     .iter()
                     .all(Self::sink_signal_is_cleanup_only_query_request_route),
             }
@@ -3325,16 +3561,14 @@ impl FSMetaApp {
     }
 
     fn classify_source_generation_cutover_disposition(
-        control_initialized_at_entry: bool,
-        source_signals: &[SourceControlSignal],
-        sink_signals: &[SinkControlSignal],
-        facade_signals: &[FacadeControlSignal],
+        input: SourceGenerationCutoverDecisionInput<'_>,
     ) -> SourceGenerationCutoverDisposition {
-        if control_initialized_at_entry
-            && sink_signals.is_empty()
-            && facade_signals.is_empty()
-            && !source_signals.is_empty()
-            && source_signals
+        if input.control_initialized_at_entry
+            && input.sink_signals.is_empty()
+            && input.facade_signals.is_empty()
+            && !input.source_signals.is_empty()
+            && input
+                .source_signals
                 .iter()
                 .all(Self::source_signal_is_restart_deferred_retire_pending)
         {
@@ -3345,17 +3579,13 @@ impl FSMetaApp {
     }
 
     fn classify_sink_generation_cutover_disposition(
-        control_initialized_at_entry: bool,
-        source_signals: &[SourceControlSignal],
-        sink_signals: &[SinkControlSignal],
-        facade_signals: &[FacadeControlSignal],
-        sink_signals_in_shared_generation_cutover_lane: bool,
+        input: SinkGenerationCutoverDecisionInput<'_>,
     ) -> SinkGenerationCutoverDisposition {
-        if control_initialized_at_entry
-            && source_signals.is_empty()
-            && facade_signals.is_empty()
-            && sink_signals.len() == 1
-            && sink_signals_in_shared_generation_cutover_lane
+        if input.control_initialized_at_entry
+            && input.source_signals.is_empty()
+            && input.facade_signals.is_empty()
+            && input.sink_signals.len() == 1
+            && input.sink_signals_in_shared_generation_cutover_lane
         {
             SinkGenerationCutoverDisposition::FailClosedSharedGenerationCutover
         } else {
@@ -3365,15 +3595,9 @@ impl FSMetaApp {
 
     fn publish_facade_service_state_from_runtime_facts(
         facade_service_state: &SharedFacadeServiceStateCell,
-        control_ready: bool,
-        publication_ready: bool,
-        pending_facade_present: bool,
+        input: FacadeServiceStateDecisionInput,
     ) -> FacadeServiceState {
-        let state = Self::current_facade_service_state_from_runtime_facts(
-            control_ready,
-            publication_ready,
-            pending_facade_present,
-        );
+        let state = Self::current_facade_service_state_from_runtime_facts(input);
         *facade_service_state
             .write()
             .expect("write published facade service state") = state;
@@ -3390,9 +3614,11 @@ impl FSMetaApp {
         let publication_ready = self.facade_publication_ready().await;
         Self::publish_facade_service_state_from_runtime_facts(
             &self.facade_service_state,
-            self.api_control_gate.is_ready(),
-            publication_ready,
-            pending_facade_present,
+            FacadeServiceStateDecisionInput {
+                control_gate_ready: self.api_control_gate.is_ready(),
+                publication_ready,
+                pending_facade_present,
+            },
         )
     }
     fn should_initialize_from_control(
@@ -3828,6 +4054,7 @@ impl FSMetaApp {
                 let facade_service_state = self.facade_service_state.clone();
                 let facade_gate = self.facade_gate.clone();
                 let api_task = self.api_task.clone();
+                let control_initialized = self.control_initialized.clone();
                 let sink = self.sink.clone();
                 let route_key = route.0.clone();
                 eprintln!(
@@ -3847,6 +4074,7 @@ impl FSMetaApp {
                         let facade_service_state = facade_service_state.clone();
                         let facade_gate = facade_gate.clone();
                         let api_task = api_task.clone();
+                        let control_initialized = control_initialized.clone();
                         let sink = sink.clone();
                         let route_key = route_key.clone();
                         async move {
@@ -3941,7 +4169,11 @@ impl FSMetaApp {
                                             }
                                             continue;
                                         }
-                                        if matches!(err, CnxError::Timeout)
+                                        let mut terminal_err = err;
+                                        let sink_control_inflight =
+                                            sink.control_op_inflight().await;
+                                        if matches!(terminal_err, CnxError::Timeout)
+                                            && !sink_control_inflight
                                             && let Ok(cached_snapshot) =
                                                 sink.cached_status_snapshot()
                                             && sink_status_snapshot_has_ready_scheduled_groups(
@@ -3950,7 +4182,7 @@ impl FSMetaApp {
                                         {
                                             eprintln!(
                                                 "fs_meta_runtime_app: sink status endpoint cached fallback err={} {}",
-                                                err,
+                                                terminal_err,
                                                 summarize_sink_status_endpoint(&cached_snapshot)
                                             );
                                             match sink_status_reply(
@@ -3965,9 +4197,104 @@ impl FSMetaApp {
                                             }
                                             continue;
                                         }
+                                        if matches!(terminal_err, CnxError::Timeout)
+                                            && !sink_control_inflight
+                                        {
+                                            match tokio::time::timeout(
+                                                INTERNAL_SINK_STATUS_BLOCKING_FALLBACK_BUDGET,
+                                                sink.status_snapshot(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(snapshot)) => {
+                                                    if !internal_query_route_still_active(
+                                                        &facade_gate,
+                                                        &route_key,
+                                                    ) {
+                                                        eprintln!(
+                                                            "fs_meta_runtime_app: sink status endpoint blocking fallback deactivated route={}",
+                                                            route_key
+                                                        );
+                                                        match explicit_empty_sink_status_reply(
+                                                            &req.metadata().origin_id,
+                                                            req.metadata().correlation_id,
+                                                        ) {
+                                                            Ok(event) => responses.push(event),
+                                                            Err(reply_err) => eprintln!(
+                                                                "fs_meta_runtime_app: sink status endpoint blocking fallback deactivated empty reply encode failed: {reply_err}"
+                                                            ),
+                                                        }
+                                                        continue;
+                                                    }
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: sink status endpoint blocking fallback {}",
+                                                        summarize_sink_status_endpoint(&snapshot)
+                                                    );
+                                                    match sink_status_reply(
+                                                        &snapshot,
+                                                        &req.metadata().origin_id,
+                                                        req.metadata().correlation_id,
+                                                    ) {
+                                                        Ok(event) => responses.push(event),
+                                                        Err(reply_err) => eprintln!(
+                                                            "fs_meta_runtime_app: sink status endpoint blocking fallback encode failed: {reply_err}"
+                                                        ),
+                                                    }
+                                                    continue;
+                                                }
+                                                Ok(Err(fallback_err)) => {
+                                                    terminal_err = fallback_err;
+                                                }
+                                                Err(_) => {
+                                                    terminal_err = CnxError::Timeout;
+                                                }
+                                            }
+                                        }
+                                        if matches!(terminal_err, CnxError::Timeout)
+                                            && !sink_control_inflight
+                                            && control_initialized.load(Ordering::Acquire)
+                                        {
+                                            let route_still_active =
+                                                internal_query_route_still_active(
+                                                    &facade_gate,
+                                                    &route_key,
+                                                );
+                                            let published_facade_state =
+                                                *facade_service_state
+                                                    .read()
+                                                    .expect(
+                                                        "read published facade service state after sink timeout fallback",
+                                                    );
+                                            let local_api_task_present =
+                                                api_task.lock().await.is_some();
+                                            if route_still_active
+                                                && matches!(
+                                                    Self::internal_status_available_from_published_facade_state(
+                                                        published_facade_state,
+                                                        local_api_task_present,
+                                                    ),
+                                                    InternalStatusAvailability::Available
+                                                )
+                                            {
+                                                eprintln!(
+                                                    "fs_meta_runtime_app: sink status endpoint initialized timeout empty fallback route={}",
+                                                    route_key
+                                                );
+                                                match explicit_empty_sink_status_reply(
+                                                    &req.metadata().origin_id,
+                                                    req.metadata().correlation_id,
+                                                ) {
+                                                    Ok(event) => responses.push(event),
+                                                    Err(reply_err) => eprintln!(
+                                                        "fs_meta_runtime_app: sink status endpoint initialized timeout empty fallback encode failed: {reply_err}"
+                                                    ),
+                                                }
+                                                continue;
+                                            }
+                                        }
                                         eprintln!(
                                             "fs_meta_runtime_app: sink status endpoint failed err={}",
-                                            err
+                                            terminal_err
                                         );
                                     }
                                 }
@@ -4944,12 +5271,16 @@ impl FSMetaApp {
                 }
                 Self::clear_pending_facade_status(&facade_pending_status);
                 let ready_tail_decision = Self::facade_ready_tail_decision_from_runtime_facts(
-                    control_initialized.load(Ordering::Acquire),
-                    source_state_replay_required.load(Ordering::Acquire),
-                    sink_state_replay_required.load(Ordering::Acquire),
-                    false,
-                    true,
-                    false,
+                    FacadeReadyTailDecisionInput {
+                        runtime: RuntimeGateFacts::from_atomic_flags(
+                            control_initialized.as_ref(),
+                            source_state_replay_required.as_ref(),
+                            sink_state_replay_required.as_ref(),
+                        ),
+                        allow_facade_only_handoff: false,
+                        publication_ready: true,
+                        pending_facade_present: false,
+                    },
                 );
                 api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
                 *facade_service_state
@@ -5002,12 +5333,16 @@ impl FSMetaApp {
                 }
                 Self::clear_pending_facade_status(&facade_pending_status);
                 let ready_tail_decision = Self::facade_ready_tail_decision_from_runtime_facts(
-                    control_initialized.load(Ordering::Acquire),
-                    source_state_replay_required.load(Ordering::Acquire),
-                    sink_state_replay_required.load(Ordering::Acquire),
-                    false,
-                    true,
-                    false,
+                    FacadeReadyTailDecisionInput {
+                        runtime: RuntimeGateFacts::from_atomic_flags(
+                            control_initialized.as_ref(),
+                            source_state_replay_required.as_ref(),
+                            sink_state_replay_required.as_ref(),
+                        ),
+                        allow_facade_only_handoff: false,
+                        publication_ready: true,
+                        pending_facade_present: false,
+                    },
                 );
                 api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
                 *facade_service_state
@@ -6661,6 +6996,17 @@ impl FSMetaApp {
             FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer
         );
         let sink_query_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
+        let sink_query_proxy_current_generation =
+            if query_lane && route_key == sink_query_proxy_route {
+                self.facade_gate
+                    .route_generation(unit.unit_id(), route_key)?
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+        let stale_sink_query_proxy_deactivate = query_lane
+            && route_key == sink_query_proxy_route
+            && generation < sink_query_proxy_current_generation;
         if matches!(
             unit,
             FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer
@@ -6669,18 +7015,17 @@ impl FSMetaApp {
         {
             self.api_control_gate.wait_for_facade_request_drain().await;
         }
-        if query_lane && route_key == sink_query_proxy_route {
+        if query_lane
+            && route_key == sink_query_proxy_route
+            && !stale_sink_query_proxy_deactivate
+        {
             self.sink.wait_for_control_ops_to_drain_for_handoff().await;
         }
         if !self.control_initialized() && query_lane && route_key == sink_query_proxy_route {
-            let current_generation = self
-                .facade_gate
-                .route_generation(unit.unit_id(), route_key)?
-                .unwrap_or(0);
             // Only clear per-peer sink-query shared claims as part of the uninitialized
             // stale cleanup chain. Clearing these claims during a live proxy deactivate
             // can disrupt in-flight internal proxy requests.
-            if generation < current_generation {
+            if generation < sink_query_proxy_current_generation {
                 self.clear_shared_sink_query_route_claims_for_cleanup()
                     .await;
             }
@@ -6951,20 +7296,41 @@ impl FSMetaApp {
             };
             guard.get(&bind_addr).cloned()
         };
+        let handoff_ready_owned_by_current_instance = ready
+            .as_ref()
+            .is_some_and(|ready| ready.instance_id == self.instance_id);
         let Some(ready) = ready else {
-            return false;
+            return matches!(
+                Self::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
+                    handoff_ready_entry_present: false,
+                    handoff_ready_owned_by_current_instance: false,
+                    pending_facade_present: false,
+                    pending_facade_is_control_route: false,
+                    pending_runtime_exposure_confirmed: false,
+                    suppressed_dependent_routes_remain: false,
+                }),
+                FixedBindHandoffReleaseDecision::Ready
+            );
         };
-        if ready.instance_id == self.instance_id {
-            return false;
-        }
-        let Some(pending) = ready.registrant.pending_facade.lock().await.clone() else {
-            return false;
-        };
-        pending.runtime_exposure_confirmed
-            || !ready
-                .registrant
-                .pending_fixed_bind_has_suppressed_dependent_routes
-                .load(Ordering::Acquire)
+        let pending = ready.registrant.pending_facade.lock().await.clone();
+        matches!(
+            Self::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
+                handoff_ready_entry_present: true,
+                handoff_ready_owned_by_current_instance,
+                pending_facade_present: pending.is_some(),
+                pending_facade_is_control_route: pending.as_ref().is_some_and(|pending| {
+                    pending.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+                }),
+                pending_runtime_exposure_confirmed: pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.runtime_exposure_confirmed),
+                suppressed_dependent_routes_remain: ready
+                    .registrant
+                    .pending_fixed_bind_has_suppressed_dependent_routes
+                    .load(Ordering::Acquire),
+            }),
+            FixedBindHandoffReleaseDecision::Ready
+        )
     }
 
     fn pending_fixed_bind_handoff_registrant(&self) -> PendingFixedBindHandoffRegistrant {
@@ -7106,10 +7472,61 @@ impl FSMetaApp {
                         #[cfg(test)]
                         maybe_pause_before_pending_fixed_bind_handoff_completion_gate_reopen()
                             .await;
-                        let publication_ready =
-                            api_task.lock().await.as_ref().is_some_and(|active| {
-                                active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-                            });
+                        let current_pending = pending_facade.lock().await.clone();
+                        let runtime = RuntimeGateFacts {
+                            control_initialized: registrant
+                                .control_initialized
+                                .load(Ordering::Acquire),
+                            source_state_replay_required: registrant
+                                .source_state_replay_required
+                                .load(Ordering::Acquire),
+                            sink_state_replay_required: registrant
+                                .sink_state_replay_required
+                                .load(Ordering::Acquire),
+                        };
+                        let control_route_key =
+                            format!("{}.stream", ROUTE_KEY_FACADE_CONTROL);
+                        let pending_facade_is_control_route = current_pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.route_key == control_route_key);
+                        let (
+                            active_control_stream_present,
+                            active_pending_control_stream_present,
+                        ) = {
+                            let active_task = api_task.lock().await;
+                            let active_ref = active_task.as_ref();
+                            let active_control_stream_present = active_ref
+                                .is_some_and(|active| active.route_key == control_route_key);
+                            let active_pending_control_stream_present =
+                                match (active_ref, current_pending.as_ref()) {
+                                    (Some(active), Some(pending)) => {
+                                        active_control_stream_matches_pending_facade(
+                                            active, pending,
+                                        )
+                                    }
+                                    _ => false,
+                                };
+                            (
+                                active_control_stream_present,
+                                active_pending_control_stream_present,
+                            )
+                        };
+                        let publication_ready = matches!(
+                            Self::facade_publication_readiness_decision_from_runtime_facts(
+                                FacadePublicationReadinessDecisionInput {
+                                    runtime,
+                                    allow_facade_only_handoff: true,
+                                    pending_facade_present: current_pending.is_some(),
+                                    pending_facade_is_control_route,
+                                    pending_fixed_bind_has_suppressed_dependent_routes: registrant
+                                        .pending_fixed_bind_has_suppressed_dependent_routes
+                                        .load(Ordering::Acquire),
+                                    active_control_stream_present,
+                                    active_pending_control_stream_present,
+                                },
+                            ),
+                            FacadePublicationReadinessDecision::Ready
+                        );
                         if publication_ready {
                             mark_active_fixed_bind_facade_owner(
                                 bind_addr,
@@ -7121,12 +7538,6 @@ impl FSMetaApp {
                                 },
                             );
                         }
-                        let source_replay_required = registrant
-                            .source_state_replay_required
-                            .load(Ordering::Acquire);
-                        let sink_replay_required = registrant
-                            .sink_state_replay_required
-                            .load(Ordering::Acquire);
                         let pending_facade_present = pending_facade.lock().await.is_some()
                             || registrant
                                 .facade_pending_status
@@ -7135,12 +7546,12 @@ impl FSMetaApp {
                                 .is_some_and(|status| status.is_some());
                         let ready_tail_decision =
                             Self::facade_ready_tail_decision_from_runtime_facts(
-                                registrant.control_initialized.load(Ordering::Acquire),
-                                source_replay_required,
-                                sink_replay_required,
-                                true,
-                                publication_ready,
-                                pending_facade_present,
+                                FacadeReadyTailDecisionInput {
+                                    runtime,
+                                    allow_facade_only_handoff: true,
+                                    publication_ready,
+                                    pending_facade_present,
+                                },
                             );
                         api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
                         *registrant
@@ -7172,39 +7583,69 @@ impl FSMetaApp {
 
     async fn facade_publication_ready(&self) -> bool {
         let pending = self.pending_facade.lock().await.clone();
-        let facade_only_pending_handoff = pending.as_ref().is_some_and(|pending| {
-            pending.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-                && !self
-                    .pending_fixed_bind_has_suppressed_dependent_routes
-                    .load(Ordering::Acquire)
+        let control_route_key = format!("{}.stream", ROUTE_KEY_FACADE_CONTROL);
+        let active_control_stream_present = self.api_task.lock().await.as_ref().is_some_and(|active| {
+            active.route_key == control_route_key
         });
-        let source_replay_required = self.source_state_replay_required.load(Ordering::Acquire);
-        let sink_replay_required = self.sink_state_replay_required.load(Ordering::Acquire);
-        let control_ready = Self::control_gate_ready_from_runtime_facts(
-            self.control_initialized(),
-            source_replay_required,
-            sink_replay_required,
-            facade_only_pending_handoff,
-        );
-        if !control_ready {
-            return false;
-        }
-        let active_control_stream_ready = self.api_task.lock().await.as_ref().is_some_and(|active| {
-            active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-        });
-        let Some(pending) = pending else {
-            return active_control_stream_ready;
+        let pending_facade_is_control_route = pending
+            .as_ref()
+            .is_some_and(|pending| pending.route_key == control_route_key);
+        let active_pending_control_stream_present = if let Some(pending) = pending.as_ref() {
+            self.api_task
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|active| active_control_stream_matches_pending_facade(active, pending))
+        } else {
+            false
         };
-        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL) {
-            return active_control_stream_ready;
-        }
-        let active_ready = self.api_task.lock().await.as_ref().is_some_and(|active| {
-            active.route_key == pending.route_key && active.resource_ids == pending.resource_ids
+        let allow_facade_only_handoff = pending.as_ref().is_some_and(|pending| {
+            let bind_addr = pending.resolved.bind_addr.as_str();
+            Self::facade_only_handoff_allowance_decision(
+                FacadeOnlyHandoffAllowanceDecisionInput {
+                    pending_facade_present: true,
+                    pending_facade_is_control_route,
+                    pending_fixed_bind_has_suppressed_dependent_routes: self
+                        .pending_fixed_bind_has_suppressed_dependent_routes
+                        .load(Ordering::Acquire),
+                    pending_bind_is_ephemeral: facade_bind_addr_is_ephemeral(bind_addr),
+                    pending_bind_owned_by_instance: !facade_bind_addr_is_ephemeral(bind_addr)
+                        && active_fixed_bind_facade_owned_by(bind_addr, self.instance_id),
+                },
+            )
+            .allows_handoff()
         });
-        if active_ready {
-            clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
-            return true;
+        match Self::facade_publication_readiness_decision_from_runtime_facts(
+            FacadePublicationReadinessDecisionInput {
+                runtime: self.runtime_gate_facts(),
+                allow_facade_only_handoff,
+                pending_facade_present: pending.is_some(),
+                pending_facade_is_control_route,
+                pending_fixed_bind_has_suppressed_dependent_routes: self
+                    .pending_fixed_bind_has_suppressed_dependent_routes
+                    .load(Ordering::Acquire),
+                active_control_stream_present,
+                active_pending_control_stream_present,
+            },
+        ) {
+            FacadePublicationReadinessDecision::BlockedControlGate
+            | FacadePublicationReadinessDecision::BlockedWithoutActiveControlStream => {
+                return false;
+            }
+            FacadePublicationReadinessDecision::Ready => {
+                if let Some(pending) = pending.as_ref()
+                    && pending_facade_is_control_route
+                    && active_pending_control_stream_present
+                {
+                    clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
+                }
+                return true;
+            }
+            FacadePublicationReadinessDecision::FixedBindHandoffPending => {}
         }
+        let Some(pending) = pending else {
+            return false;
+        };
         if !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
             let allow_fixed_bind_handoff = pending.runtime_exposure_confirmed;
             mark_pending_fixed_bind_handoff_ready(
@@ -7225,8 +7666,7 @@ impl FSMetaApp {
                     )
                     .await;
                     if self.api_task.lock().await.as_ref().is_some_and(|active| {
-                        active.route_key == pending.route_key
-                            && active.resource_ids == pending.resource_ids
+                        active_control_stream_matches_pending_facade(active, &pending)
                     }) {
                         clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
                         return true;
@@ -7250,8 +7690,7 @@ impl FSMetaApp {
                         )
                         .await;
                         if self.api_task.lock().await.as_ref().is_some_and(|active| {
-                            active.route_key == pending.route_key
-                                && active.resource_ids == pending.resource_ids
+                            active_control_stream_matches_pending_facade(active, &pending)
                         }) {
                             clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
                             return true;
@@ -7267,14 +7706,31 @@ impl FSMetaApp {
         let (source_signals, sink_signals, mut facade_signals) =
             split_app_control_signals(envelopes)?;
         facade_signals.sort_by_key(Self::facade_signal_apply_priority);
-        let requires_shared_serial = !source_signals.is_empty()
-            || !sink_signals.is_empty()
-            || self.control_initialized()
-            || facade_signals
-                .iter()
-                .any(Self::facade_signal_requires_shared_serial_while_uninitialized)
-            || (!self.source_state_replay_required.load(Ordering::Acquire)
-                && !self.sink_state_replay_required.load(Ordering::Acquire));
+        let uninitialized_cleanup_disposition =
+            Self::classify_uninitialized_cleanup_disposition(UninitializedCleanupDecisionInput {
+                control_initialized_now: self.control_initialized(),
+                source_signals: &source_signals,
+                sink_signals: &sink_signals,
+                facade_signals: &facade_signals,
+            });
+        let facade_cleanup_only_while_uninitialized =
+            uninitialized_cleanup_disposition.is_facade_only();
+        let sink_query_cleanup_only_while_uninitialized =
+            uninitialized_cleanup_disposition.is_sink_query_only();
+        let requires_shared_serial = if sink_query_cleanup_only_while_uninitialized
+            || facade_cleanup_only_while_uninitialized
+        {
+            false
+        } else {
+            !source_signals.is_empty()
+                || !sink_signals.is_empty()
+                || self.control_initialized()
+                || facade_signals
+                    .iter()
+                    .any(Self::facade_signal_requires_shared_serial_while_uninitialized)
+                || (!self.source_state_replay_required.load(Ordering::Acquire)
+                    && !self.sink_state_replay_required.load(Ordering::Acquire))
+        };
         let _serial_guard = self.control_frame_serial.lock().await;
         let _shared_serial_guard = if requires_shared_serial {
             Some(self.shared_control_frame_serial.lock().await)
@@ -7325,7 +7781,8 @@ impl FSMetaApp {
             !source_signals.is_empty() || !sink_signals.is_empty() || !facade_signals.is_empty();
         if request_sensitive && self.api_request_tracker.inflight() > 0 {
             let skip_request_drain_for_uninitialized_recovery =
-                !self.control_initialized() && should_initialize_from_control;
+                !self.control_initialized()
+                    && (should_initialize_from_control || facade_cleanup_only_while_uninitialized);
             if !skip_request_drain_for_uninitialized_recovery {
                 self.api_request_tracker.wait_for_drain().await;
             }
@@ -7355,35 +7812,30 @@ impl FSMetaApp {
                 source_signals
             );
         }
-        let uninitialized_cleanup_disposition = Self::classify_uninitialized_cleanup_disposition(
-            self.control_initialized(),
-            &source_signals,
-            &sink_signals,
-            &facade_signals,
-        );
-        let facade_cleanup_only_while_uninitialized =
-            uninitialized_cleanup_disposition.is_facade_only();
         let source_cleanup_only_while_uninitialized =
             uninitialized_cleanup_disposition.is_source_only();
         let sink_cleanup_only_while_uninitialized =
             uninitialized_cleanup_disposition.is_sink_only();
-        let sink_query_cleanup_only_while_uninitialized =
-            uninitialized_cleanup_disposition.is_sink_query_only();
         let source_generation_cutover_disposition =
             Self::classify_source_generation_cutover_disposition(
-                control_initialized_at_entry,
-                &source_signals,
-                &sink_signals,
-                &facade_signals,
+                SourceGenerationCutoverDecisionInput {
+                    control_initialized_at_entry,
+                    source_signals: &source_signals,
+                    sink_signals: &sink_signals,
+                    facade_signals: &facade_signals,
+                },
             );
         let sink_generation_cutover_disposition =
             Self::classify_sink_generation_cutover_disposition(
-                control_initialized_at_entry,
-                &source_signals,
-                &sink_signals,
-                &facade_signals,
-                self.sink_signals_are_in_shared_generation_cutover_lane(&sink_signals)
-                    .await,
+                SinkGenerationCutoverDecisionInput {
+                    control_initialized_at_entry,
+                    source_signals: &source_signals,
+                    sink_signals: &sink_signals,
+                    facade_signals: &facade_signals,
+                    sink_signals_in_shared_generation_cutover_lane: self
+                        .sink_signals_are_in_shared_generation_cutover_lane(&sink_signals)
+                        .await,
+                },
             );
         if should_initialize_from_control {
             if !source_cleanup_only_while_uninitialized && !sink_cleanup_only_while_uninitialized {
@@ -7440,31 +7892,37 @@ impl FSMetaApp {
         for signal in facade_claim_signals {
             self.apply_facade_signal(signal).await?;
         }
-        let source_wave_disposition = Self::classify_source_control_wave_disposition(
-            control_initialized_at_entry,
-            self.control_initialized(),
-            self.source_state_replay_required.load(Ordering::Acquire),
-            uninitialized_cleanup_disposition,
-            &source_signals,
-            facade_claim_signals_present,
-            !facade_publication_signals.is_empty(),
-            !sink_signals.is_empty(),
-        );
+        let source_wave_disposition =
+            Self::classify_source_control_wave_disposition(SourceControlWaveDecisionInput {
+                control_initialized_at_entry,
+                control_initialized_now: self.control_initialized(),
+                source_state_replay_required: self
+                    .source_state_replay_required
+                    .load(Ordering::Acquire),
+                cleanup_disposition: uninitialized_cleanup_disposition,
+                source_signals: &source_signals,
+                facade_claim_signals_present,
+                facade_publication_signals_present: !facade_publication_signals.is_empty(),
+                sink_signals_present: !sink_signals.is_empty(),
+            });
         let sink_tick_fast_path_eligible =
             self.sink.current_generation_tick_fast_path_eligible().await;
-        let sink_wave_disposition = Self::classify_sink_control_wave_disposition(
-            control_initialized_at_entry,
-            self.control_initialized(),
-            retained_sink_state_present_at_entry,
-            self.sink_state_replay_required.load(Ordering::Acquire),
-            sink_tick_fast_path_eligible,
-            uninitialized_cleanup_disposition,
-            source_wave_disposition,
-            !source_signals.is_empty(),
-            facade_claim_signals_present,
-            !facade_publication_signals.is_empty(),
-            &sink_signals,
-        );
+        let sink_wave_disposition =
+            Self::classify_sink_control_wave_disposition(SinkControlWaveDecisionInput {
+                control_initialized_at_entry,
+                control_initialized_now: self.control_initialized(),
+                retained_sink_state_present_at_entry,
+                sink_state_replay_required: self
+                    .sink_state_replay_required
+                    .load(Ordering::Acquire),
+                sink_tick_fast_path_eligible,
+                cleanup_disposition: uninitialized_cleanup_disposition,
+                source_wave_disposition,
+                source_signals_present: !source_signals.is_empty(),
+                facade_claim_signals_present,
+                facade_publication_signals_present: !facade_publication_signals.is_empty(),
+                sink_signals: &sink_signals,
+            });
         if facade_cleanup_only_while_uninitialized {
             for signal in facade_publication_signals.drain(..) {
                 self.apply_facade_signal(signal).await?;

@@ -7443,14 +7443,21 @@ async fn build_tree_pit_session_trusted_materialized_fails_closed_when_later_ran
         sink_status_route.clone(),
         "test-ready-sink-status-endpoint",
         CancellationToken::new(),
-        move |_| {
+        move |requests| {
             let sink_status_payload = sink_status_payload.clone();
             async move {
-                vec![mk_event_with_correlation(
-                    "sink-status-ready",
-                    1,
-                    sink_status_payload.clone(),
-                )]
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        mk_event_with_correlation(
+                            "sink-status-ready",
+                            req.metadata()
+                                .correlation_id
+                                .expect("sink-status request correlation"),
+                            sink_status_payload.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
             }
         },
     );

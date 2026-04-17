@@ -8,12 +8,14 @@ use std::time::Duration;
 
 use axum::{
     Router,
+    body::Body,
     extract::{Request, State},
     http::{HeaderMap, Method, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
+use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
@@ -35,7 +37,7 @@ use super::facade_status::{
     PublishedFacadeStatusReader, SharedFacadePendingStatusCell, SharedFacadeServiceStateCell,
 };
 use super::handlers;
-use super::state::{ApiControlGate, ApiRequestTracker, ApiState};
+use super::state::{ApiControlGate, ApiRequestGuard, ApiRequestTracker, ApiState};
 
 enum ApiServerJoin {
     Thread(std::thread::JoinHandle<()>),
@@ -357,12 +359,12 @@ async fn projection_request_facade_guard(
     request: Request,
     next: Next,
 ) -> Response {
-    let _facade_request_guard = (request_counts_toward_facade_request_drain(
+    let facade_request_guard = (request_counts_toward_facade_request_drain(
         request.method(),
         request.uri().path(),
     ) && !request_requires_control_readiness(request.method(), request.uri().path()))
         .then(|| control_gate.begin_facade_request());
-    next.run(request).await
+    response_with_owned_guards(next.run(request).await, None, facade_request_guard)
 }
 
 async fn request_control_readiness_guard(
@@ -372,23 +374,28 @@ async fn request_control_readiness_guard(
 ) -> Response {
     let requires_control_readiness =
         request_requires_control_readiness(request.method(), request.uri().path());
-    let _facade_request_guard = requires_control_readiness.then(|| control_gate.begin_facade_request());
+    let facade_request_guard =
+        requires_control_readiness.then(|| control_gate.begin_facade_request());
     if !requires_control_readiness {
         return next.run(request).await;
     }
     if control_gate.is_ready() {
-        return next.run(request).await;
+        return response_with_owned_guards(next.run(request).await, None, facade_request_guard);
     }
     if tokio::time::timeout(Duration::from_secs(15), control_gate.wait_ready())
         .await
         .is_err()
     {
-        return ApiError::service_unavailable(
+        return response_with_owned_guards(
+            ApiError::service_unavailable(
             "fs-meta management request handling is unavailable until runtime control initializes the app",
         )
-        .into_response();
+            .into_response(),
+            None,
+            facade_request_guard,
+        );
     }
-    next.run(request).await
+    response_with_owned_guards(next.run(request).await, None, facade_request_guard)
 }
 
 async fn request_logging(State(state): State<ApiState>, request: Request, next: Next) -> Response {
@@ -397,7 +404,7 @@ async fn request_logging(State(state): State<ApiState>, request: Request, next: 
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let method = request.method().clone();
     let path = request.uri().path().to_string();
-    let _request_guard =
+    let request_guard =
         request_counts_toward_control_drain(&method, &path).then(|| state.request_tracker.begin());
     let started_at = std::time::Instant::now();
     eprintln!(
@@ -413,7 +420,29 @@ async fn request_logging(State(state): State<ApiState>, request: Request, next: 
         response.status().as_u16(),
         started_at.elapsed().as_millis()
     );
-    response
+    response_with_owned_guards(response, request_guard, None)
+}
+
+fn response_with_owned_guards(
+    response: Response,
+    request_guard: Option<ApiRequestGuard>,
+    facade_request_guard: Option<ApiRequestGuard>,
+) -> Response {
+    if request_guard.is_none() && facade_request_guard.is_none() {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let guarded_stream = async_stream::stream! {
+        let _request_guard = request_guard;
+        let _facade_request_guard = facade_request_guard;
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            yield chunk;
+        }
+    };
+
+    Response::from_parts(parts, Body::from_stream(guarded_stream))
 }
 
 async fn query_api_key_guard(
@@ -435,9 +464,89 @@ async fn query_api_key_guard(
 mod tests {
     use super::*;
 
+    use std::convert::Infallible;
+    use std::path::PathBuf;
+
     use axum::body::Body;
+    use bytes::Bytes;
+    use tempfile::TempDir;
     use tokio::sync::Notify;
     use tower::ServiceExt;
+
+    use crate::api::config::ApiAuthConfig;
+    use crate::api::facade_status::{
+        shared_facade_pending_status_cell, shared_facade_service_state_cell,
+    };
+    use crate::domain_state::FacadeServiceState;
+    use crate::query::api::ProjectionPolicy;
+    use crate::sink::SinkFileMeta;
+    use crate::source::FSMetaSource;
+    use crate::source::config::SourceConfig;
+
+    fn write_auth_files(dir: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
+        let passwd_path = dir.path().join("passwd");
+        let shadow_path = dir.path().join("shadow");
+        let query_keys_path = dir.path().join("query-api-keys.json");
+        std::fs::write(
+            &passwd_path,
+            "admin:1000:1000:fs-meta-admin:/home/admin:/bin/sh:false\n",
+        )
+        .expect("write passwd");
+        std::fs::write(&shadow_path, "admin:plain$secret:false\n")
+            .expect("write shadow");
+        std::fs::write(&query_keys_path, "{\"keys\":[]}\n").expect("write query-api-keys");
+        (passwd_path, shadow_path, query_keys_path)
+    }
+
+    fn pending_body(release: Arc<Notify>) -> Body {
+        Body::from_stream(async_stream::stream! {
+            release.notified().await;
+            yield Ok::<Bytes, Infallible>(Bytes::from_static(b"ok"));
+        })
+    }
+
+    fn test_api_state(request_tracker: Arc<ApiRequestTracker>) -> ApiState {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let node_id = NodeId("node-a".into());
+        let source_cfg = SourceConfig::default();
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::with_boundaries(source_cfg.clone(), node_id.clone(), None)
+                .expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(node_id.clone(), None, source_cfg).expect("sink"),
+        )));
+        let facade_service_state = shared_facade_service_state_cell();
+        *facade_service_state
+            .write()
+            .expect("write facade service state") = FacadeServiceState::Serving;
+        ApiState {
+            node_id,
+            runtime_boundary: None,
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                shared_facade_pending_status_cell(),
+            ),
+            request_tracker,
+        }
+    }
     #[test]
     fn request_control_drain_counts_only_management_writes() {
         for (method, path) in [
@@ -583,6 +692,7 @@ mod tests {
             .expect("tree response should settle")
             .expect("join tree response task");
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+        drop(response);
         tokio::time::timeout(
             Duration::from_secs(1),
             control_gate.wait_for_facade_request_drain(),
@@ -648,6 +758,7 @@ mod tests {
             .expect("query-api-keys response should settle")
             .expect("join query-api-keys response task");
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+        drop(response);
         tokio::time::timeout(
             Duration::from_secs(1),
             control_gate.wait_for_facade_request_drain(),
@@ -747,12 +858,121 @@ mod tests {
             .expect("roots_put response should settle")
             .expect("join roots_put response task");
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+        drop(response);
         tokio::time::timeout(
             Duration::from_secs(1),
             control_gate.wait_for_facade_request_drain(),
         )
         .await
         .expect("facade drain should clear after roots_put settles");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn roots_put_request_facade_guard_holds_drain_until_response_body_drops() {
+        let control_gate = Arc::new(ApiControlGate::new(true));
+        let release = Arc::new(Notify::new());
+        let app = Router::new()
+            .route(
+                "/api/fs-meta/v1/monitoring/roots",
+                put({
+                    let release = release.clone();
+                    move || {
+                        let release = release.clone();
+                        async move { Response::new(pending_body(release)) }
+                    }
+                }),
+            )
+            .with_state(control_gate.clone())
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                request_control_readiness_guard,
+            ))
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                projection_request_facade_guard,
+            ));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/fs-meta/v1/monitoring/roots")
+                    .body(Body::empty())
+                    .expect("build roots_put request"),
+            ),
+        )
+        .await
+        .expect("roots_put response headers should settle")
+        .expect("route roots_put request");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                control_gate.wait_for_facade_request_drain(),
+            )
+            .await
+            .is_err(),
+            "roots_put facade drain must remain blocked until the response body settles or drops"
+        );
+
+        drop(response);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            control_gate.wait_for_facade_request_drain(),
+        )
+        .await
+        .expect("facade drain should clear after the response body drops");
+        release.notify_waiters();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_logging_holds_global_drain_until_roots_put_response_body_drops() {
+        let request_tracker = Arc::new(ApiRequestTracker::default());
+        let state = test_api_state(request_tracker.clone());
+        let release = Arc::new(Notify::new());
+        let app = Router::new()
+            .route(
+                "/api/fs-meta/v1/monitoring/roots",
+                put({
+                    let release = release.clone();
+                    move || {
+                        let release = release.clone();
+                        async move { Response::new(pending_body(release)) }
+                    }
+                }),
+            )
+            .with_state(state.clone())
+            .layer(middleware::from_fn_with_state(state, request_logging));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/fs-meta/v1/monitoring/roots")
+                    .body(Body::empty())
+                    .expect("build roots_put request"),
+            ),
+        )
+        .await
+        .expect("roots_put response headers should settle")
+        .expect("route roots_put request");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), request_tracker.wait_for_drain(),)
+                .await
+                .is_err(),
+            "global request drain must remain blocked until the response body settles or drops"
+        );
+
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), request_tracker.wait_for_drain(),)
+            .await
+            .expect("global request drain should clear after the response body drops");
+        release.notify_waiters();
     }
 
     #[tokio::test(flavor = "current_thread")]

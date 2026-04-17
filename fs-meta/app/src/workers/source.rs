@@ -357,6 +357,10 @@ fn normalize_node_groups_key(
     let entry = groups_by_node
         .entry(stable_host_ref.to_string())
         .or_default();
+    if groups.is_empty() || entry.is_empty() {
+        entry.clear();
+        return;
+    }
     entry.extend(groups);
     entry.sort();
     entry.dedup();
@@ -403,8 +407,8 @@ fn merge_non_empty_cached_groups(
     }
     for (node_id, groups) in cached {
         match current.get_mut(node_id) {
-            Some(existing) if existing.is_empty() && !groups.is_empty() => {
-                *existing = groups.clone();
+            Some(existing) if existing.is_empty() => {
+                let _ = groups;
             }
             None => {
                 current.insert(node_id.clone(), groups.clone());
@@ -425,10 +429,17 @@ fn union_cached_groups(
         if groups.is_empty() {
             continue;
         }
-        let entry = current.entry(node_id.clone()).or_default();
-        entry.extend(groups.iter().cloned());
-        entry.sort();
-        entry.dedup();
+        match current.get_mut(node_id) {
+            Some(existing) if existing.is_empty() => {}
+            Some(existing) => {
+                existing.extend(groups.iter().cloned());
+                existing.sort();
+                existing.dedup();
+            }
+            None => {
+                current.insert(node_id.clone(), groups.clone());
+            }
+        }
     }
 }
 
@@ -486,6 +497,9 @@ fn merge_cached_local_scheduled_groups(
     live_groups: Option<std::collections::BTreeSet<String>>,
     groups_by_node: &Option<std::collections::BTreeMap<String, Vec<String>>>,
 ) -> Option<std::collections::BTreeSet<String>> {
+    if live_groups.as_ref().is_some_and(|groups| groups.is_empty()) {
+        return Some(std::collections::BTreeSet::new());
+    }
     let mut groups = live_groups.unwrap_or_default();
     if let Some(cached) = cached_local_scheduled_groups(node_id, groups_by_node) {
         groups.extend(cached);
@@ -763,6 +777,7 @@ fn source_observability_snapshot_debug_maps_absent(
         && snapshot.last_published_at_us_by_node.is_empty()
         && snapshot.last_published_origins_by_node.is_empty()
         && snapshot.published_origin_counts_by_node.is_empty()
+        && snapshot.published_path_capture_target.is_none()
         && snapshot.enqueued_path_origin_counts_by_node.is_empty()
         && snapshot.pending_path_origin_counts_by_node.is_empty()
         && snapshot.yielded_path_origin_counts_by_node.is_empty()
@@ -787,6 +802,94 @@ fn source_observability_snapshot_has_active_state(
                 || entry.emitted_event_count > 0
                 || entry.forwarded_event_count > 0
         })
+        || !snapshot.scheduled_source_groups_by_node.is_empty()
+        || !snapshot.scheduled_scan_groups_by_node.is_empty()
+        || !snapshot.last_control_frame_signals_by_node.is_empty()
+}
+
+fn should_preserve_cached_observability_map<K: Ord, V>(
+    can_preserve: bool,
+    current: &std::collections::BTreeMap<K, V>,
+    cached: Option<&std::collections::BTreeMap<K, V>>,
+) -> bool {
+    can_preserve && current.is_empty() && cached.is_some_and(|entries| !entries.is_empty())
+}
+
+fn should_preserve_cached_observability_option<T>(
+    can_preserve: bool,
+    current: &Option<T>,
+    cached: &Option<T>,
+) -> bool {
+    can_preserve && current.is_none() && cached.is_some()
+}
+
+fn explicit_zero_published_counter_nodes(
+    snapshot: &SourceObservabilitySnapshot,
+) -> std::collections::BTreeSet<String> {
+    let mut nodes = std::collections::BTreeSet::new();
+    for node_id in snapshot.published_batches_by_node.keys() {
+        nodes.insert(node_id.clone());
+    }
+    for node_id in snapshot.published_events_by_node.keys() {
+        nodes.insert(node_id.clone());
+    }
+    for node_id in snapshot.published_control_events_by_node.keys() {
+        nodes.insert(node_id.clone());
+    }
+    for node_id in snapshot.published_data_events_by_node.keys() {
+        nodes.insert(node_id.clone());
+    }
+    nodes.retain(|node_id| {
+        let mut saw_counter = false;
+        for counter in [
+            snapshot.published_batches_by_node.get(node_id),
+            snapshot.published_events_by_node.get(node_id),
+            snapshot.published_control_events_by_node.get(node_id),
+            snapshot.published_data_events_by_node.get(node_id),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            saw_counter = true;
+            if *counter != 0 {
+                return false;
+            }
+        }
+        saw_counter
+    });
+    nodes
+}
+
+fn merge_cached_observability_node_map<V: Clone>(
+    can_preserve: bool,
+    current: &std::collections::BTreeMap<String, V>,
+    cached: Option<&std::collections::BTreeMap<String, V>>,
+    explicit_clear_nodes: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeMap<String, V> {
+    let mut merged = if should_preserve_cached_observability_map(can_preserve, current, cached) {
+        cached.cloned().unwrap_or_default()
+    } else {
+        current.clone()
+    };
+    for node_id in explicit_clear_nodes {
+        merged.remove(node_id);
+    }
+    merged
+}
+
+fn merge_cached_observability_option<T: Clone>(
+    can_preserve: bool,
+    current: &Option<T>,
+    cached: &Option<T>,
+    explicit_clear: bool,
+) -> Option<T> {
+    if explicit_clear {
+        None
+    } else if should_preserve_cached_observability_option(can_preserve, current, cached) {
+        cached.clone()
+    } else {
+        current.clone()
+    }
 }
 
 fn recent_cached_source_observability_snapshot_is_incomplete(
@@ -936,6 +1039,13 @@ struct SharedSourceWorkerHandleState {
 struct ScheduledGroupsRefreshFailure {
     err: CnxError,
     recovered_live_worker_during_refresh: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetainedTickOnlyWaveDisposition {
+    FastPath,
+    ReplayInPlace,
+    ReconnectAndReplay,
 }
 
 struct SharedSourceWorkerClient {
@@ -2126,7 +2236,7 @@ impl SourceWorkerClientHandle {
     async fn classify_tick_only_wave_against_retained_state(
         &self,
         signals: &[SourceControlSignal],
-    ) -> Option<bool> {
+    ) -> Option<RetainedTickOnlyWaveDisposition> {
         if signals.is_empty()
             || !signals
                 .iter()
@@ -2168,11 +2278,11 @@ impl SourceWorkerClientHandle {
             }
         }
         if saw_generation_mismatch {
-            Some(false)
+            Some(RetainedTickOnlyWaveDisposition::ReconnectAndReplay)
         } else if !replay_required {
-            Some(true)
+            Some(RetainedTickOnlyWaveDisposition::FastPath)
         } else {
-            None
+            Some(RetainedTickOnlyWaveDisposition::ReplayInPlace)
         }
     }
 
@@ -2312,13 +2422,45 @@ impl SourceWorkerClientHandle {
 
     fn update_cached_observability_snapshot(&self, snapshot: &SourceObservabilitySnapshot) {
         self.with_cache_mut(|cache| {
-            let preserve_last_control_summary = snapshot.last_control_frame_signals_by_node.is_empty()
-                && source_observability_snapshot_has_active_state(snapshot)
-                && !source_observability_snapshot_debug_maps_absent(snapshot)
-                && cache
-                    .last_control_frame_signals_by_node
-                    .as_ref()
-                    .is_some_and(|signals| !signals.is_empty());
+            let can_preserve_omitted_observability =
+                source_observability_snapshot_has_active_state(snapshot)
+                    && !source_observability_snapshot_debug_maps_absent(snapshot);
+            let explicit_zero_published_nodes = explicit_zero_published_counter_nodes(snapshot);
+            let preserve_last_scheduled_source_groups = should_preserve_cached_observability_map(
+                can_preserve_omitted_observability,
+                &snapshot.scheduled_source_groups_by_node,
+                cache.scheduled_source_groups_by_node.as_ref(),
+            );
+            let preserve_last_scheduled_scan_groups = should_preserve_cached_observability_map(
+                can_preserve_omitted_observability,
+                &snapshot.scheduled_scan_groups_by_node,
+                cache.scheduled_scan_groups_by_node.as_ref(),
+            );
+            let preserve_last_control_summary = should_preserve_cached_observability_map(
+                can_preserve_omitted_observability,
+                &snapshot.last_control_frame_signals_by_node,
+                cache.last_control_frame_signals_by_node.as_ref(),
+            );
+            let preserve_last_published_batches = should_preserve_cached_observability_map(
+                can_preserve_omitted_observability,
+                &snapshot.published_batches_by_node,
+                cache.published_batches_by_node.as_ref(),
+            );
+            let preserve_last_published_events = should_preserve_cached_observability_map(
+                can_preserve_omitted_observability,
+                &snapshot.published_events_by_node,
+                cache.published_events_by_node.as_ref(),
+            );
+            let preserve_last_published_control_events = should_preserve_cached_observability_map(
+                can_preserve_omitted_observability,
+                &snapshot.published_control_events_by_node,
+                cache.published_control_events_by_node.as_ref(),
+            );
+            let preserve_last_published_data_events = should_preserve_cached_observability_map(
+                can_preserve_omitted_observability,
+                &snapshot.published_data_events_by_node,
+                cache.published_data_events_by_node.as_ref(),
+            );
             cache.lifecycle_state = Some(snapshot.lifecycle_state.clone());
             cache.last_live_observability_snapshot_at = Some(Instant::now());
             cache.host_object_grants_version = Some(snapshot.host_object_grants_version);
@@ -2329,37 +2471,88 @@ impl SourceWorkerClientHandle {
             cache.last_force_find_runner_by_group =
                 Some(snapshot.last_force_find_runner_by_group.clone());
             cache.force_find_inflight_groups = Some(snapshot.force_find_inflight_groups.clone());
-            cache.scheduled_source_groups_by_node =
-                Some(snapshot.scheduled_source_groups_by_node.clone());
-            cache.scheduled_scan_groups_by_node =
-                Some(snapshot.scheduled_scan_groups_by_node.clone());
+            if !preserve_last_scheduled_source_groups {
+                cache.scheduled_source_groups_by_node =
+                    Some(snapshot.scheduled_source_groups_by_node.clone());
+            }
+            if !preserve_last_scheduled_scan_groups {
+                cache.scheduled_scan_groups_by_node =
+                    Some(snapshot.scheduled_scan_groups_by_node.clone());
+            }
             if !preserve_last_control_summary {
                 cache.last_control_frame_signals_by_node =
                     Some(snapshot.last_control_frame_signals_by_node.clone());
             }
-            cache.published_batches_by_node = Some(snapshot.published_batches_by_node.clone());
-            cache.published_events_by_node = Some(snapshot.published_events_by_node.clone());
-            cache.published_control_events_by_node =
-                Some(snapshot.published_control_events_by_node.clone());
-            cache.published_data_events_by_node =
-                Some(snapshot.published_data_events_by_node.clone());
-            cache.last_published_at_us_by_node =
-                Some(snapshot.last_published_at_us_by_node.clone());
-            cache.last_published_origins_by_node =
-                Some(snapshot.last_published_origins_by_node.clone());
-            cache.published_origin_counts_by_node =
-                Some(snapshot.published_origin_counts_by_node.clone());
-            cache.published_path_capture_target = snapshot.published_path_capture_target.clone();
-            cache.enqueued_path_origin_counts_by_node =
-                Some(snapshot.enqueued_path_origin_counts_by_node.clone());
-            cache.pending_path_origin_counts_by_node =
-                Some(snapshot.pending_path_origin_counts_by_node.clone());
-            cache.yielded_path_origin_counts_by_node =
-                Some(snapshot.yielded_path_origin_counts_by_node.clone());
+            if !preserve_last_published_batches {
+                cache.published_batches_by_node = Some(snapshot.published_batches_by_node.clone());
+            }
+            if !preserve_last_published_events {
+                cache.published_events_by_node = Some(snapshot.published_events_by_node.clone());
+            }
+            if !preserve_last_published_control_events {
+                cache.published_control_events_by_node =
+                    Some(snapshot.published_control_events_by_node.clone());
+            }
+            if !preserve_last_published_data_events {
+                cache.published_data_events_by_node =
+                    Some(snapshot.published_data_events_by_node.clone());
+            }
+            cache.last_published_at_us_by_node = Some(merge_cached_observability_node_map(
+                can_preserve_omitted_observability,
+                &snapshot.last_published_at_us_by_node,
+                cache.last_published_at_us_by_node.as_ref(),
+                &explicit_zero_published_nodes,
+            ));
+            cache.last_published_origins_by_node = Some(merge_cached_observability_node_map(
+                can_preserve_omitted_observability,
+                &snapshot.last_published_origins_by_node,
+                cache.last_published_origins_by_node.as_ref(),
+                &explicit_zero_published_nodes,
+            ));
+            cache.published_origin_counts_by_node = Some(merge_cached_observability_node_map(
+                can_preserve_omitted_observability,
+                &snapshot.published_origin_counts_by_node,
+                cache.published_origin_counts_by_node.as_ref(),
+                &explicit_zero_published_nodes,
+            ));
+            cache.published_path_capture_target = merge_cached_observability_option(
+                can_preserve_omitted_observability,
+                &snapshot.published_path_capture_target,
+                &cache.published_path_capture_target,
+                !explicit_zero_published_nodes.is_empty(),
+            );
+            cache.enqueued_path_origin_counts_by_node = Some(merge_cached_observability_node_map(
+                can_preserve_omitted_observability,
+                &snapshot.enqueued_path_origin_counts_by_node,
+                cache.enqueued_path_origin_counts_by_node.as_ref(),
+                &explicit_zero_published_nodes,
+            ));
+            cache.pending_path_origin_counts_by_node = Some(merge_cached_observability_node_map(
+                can_preserve_omitted_observability,
+                &snapshot.pending_path_origin_counts_by_node,
+                cache.pending_path_origin_counts_by_node.as_ref(),
+                &explicit_zero_published_nodes,
+            ));
+            cache.yielded_path_origin_counts_by_node = Some(merge_cached_observability_node_map(
+                can_preserve_omitted_observability,
+                &snapshot.yielded_path_origin_counts_by_node,
+                cache.yielded_path_origin_counts_by_node.as_ref(),
+                &explicit_zero_published_nodes,
+            ));
             cache.summarized_path_origin_counts_by_node =
-                Some(snapshot.summarized_path_origin_counts_by_node.clone());
+                Some(merge_cached_observability_node_map(
+                    can_preserve_omitted_observability,
+                    &snapshot.summarized_path_origin_counts_by_node,
+                    cache.summarized_path_origin_counts_by_node.as_ref(),
+                    &explicit_zero_published_nodes,
+                ));
             cache.published_path_origin_counts_by_node =
-                Some(snapshot.published_path_origin_counts_by_node.clone());
+                Some(merge_cached_observability_node_map(
+                    can_preserve_omitted_observability,
+                    &snapshot.published_path_origin_counts_by_node,
+                    cache.published_path_origin_counts_by_node.as_ref(),
+                    &explicit_zero_published_nodes,
+                ));
         });
     }
 
@@ -3451,15 +3644,17 @@ impl SourceWorkerClientHandle {
                 ),
             }
         }
-        if let Some(retained_tick_fast_path) = retained_tick_only_wave {
-            if retained_tick_fast_path {
+        if let Some(retained_tick_disposition) = retained_tick_only_wave {
+            if retained_tick_disposition == RetainedTickOnlyWaveDisposition::FastPath {
                 eprintln!(
                     "fs_meta_source_worker_client: on_control_frame done node={} ok=true retained_tick_fast_path=true",
                     self.node_id.0
                 );
                 return Ok(());
             }
-            self.reconnect_shared_worker_client().await?;
+            if retained_tick_disposition == RetainedTickOnlyWaveDisposition::ReconnectAndReplay {
+                self.reconnect_shared_worker_client().await?;
+            }
             self.replay_retained_control_state_if_needed_for_refresh_until(
                 std::time::Instant::now() + total_timeout,
             )
@@ -3865,9 +4060,6 @@ fn scheduled_groups_by_node(
     let Ok(Some(groups)) = groups else {
         return std::collections::BTreeMap::new();
     };
-    if groups.is_empty() {
-        return std::collections::BTreeMap::new();
-    }
     let stable_host_ref = stable_host_ref_for_node_id(node_id, grants);
     std::collections::BTreeMap::from([(stable_host_ref, groups.into_iter().collect::<Vec<_>>())])
 }

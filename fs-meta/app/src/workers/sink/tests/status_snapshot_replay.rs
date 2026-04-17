@@ -714,10 +714,14 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
         ..SinkStatusSnapshot::default()
     };
 
+    let current_worker_instance_id = sink.worker_instance_id_for_tests().await;
     let _reset = SinkWorkerStatusSnapshotHookReset;
-    install_sink_worker_status_snapshot_hook(SinkWorkerStatusSnapshotHook {
-        snapshot: live_snapshot.clone(),
-    });
+    install_sink_worker_status_snapshot_hook_for_worker_instance(
+        current_worker_instance_id,
+        SinkWorkerStatusSnapshotHook {
+            snapshot: live_snapshot.clone(),
+        },
+    );
 
     let snapshot = sink
             .status_snapshot_nonblocking()
@@ -2917,10 +2921,14 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
 
     sink.control_state_replay_required
         .store(1, Ordering::Release);
+    let current_worker_instance_id = sink.worker_instance_id_for_tests().await;
     let _status_snapshot_reset = SinkWorkerStatusSnapshotHookReset;
-    install_sink_worker_status_snapshot_hook(SinkWorkerStatusSnapshotHook {
-        snapshot: live_snapshot.clone(),
-    });
+    install_sink_worker_status_snapshot_hook_for_worker_instance(
+        current_worker_instance_id,
+        SinkWorkerStatusSnapshotHook {
+            snapshot: live_snapshot.clone(),
+        },
+    );
 
     let snapshot = sink
         .status_snapshot_nonblocking()
@@ -3457,12 +3465,21 @@ async fn status_snapshot_nonblocking_retries_single_control_inflight_retryable_s
     install_sink_worker_retry_reset_hook(SinkWorkerRetryResetHook {
         reset_count: reset_count.clone(),
     });
+    let current_worker_instance_id = sink.worker_instance_id_for_tests().await;
     let _status_error_reset = SinkWorkerStatusErrorHookReset;
-    install_sink_worker_status_error_hook(SinkWorkerStatusErrorHook {
-        err: CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
+    install_sink_worker_status_error_hook_for_worker_instance(
+        current_worker_instance_id,
+        SinkWorkerStatusErrorHook {
+            err: CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
+        },
+    );
+    let observed_timeouts = Arc::new(StdMutex::new(Vec::new()));
+    let _observe_reset = SinkWorkerStatusTimeoutObserveHookReset;
+    install_sink_worker_status_timeout_observe_hook(SinkWorkerStatusTimeoutObserveHook {
+        observed_timeouts: observed_timeouts.clone(),
     });
 
-    let _inflight = sink.begin_control_op();
+    let inflight = sink.begin_control_op();
     let snapshot = tokio::time::timeout(
         Duration::from_millis(350),
         sink.status_snapshot_nonblocking(),
@@ -3489,7 +3506,18 @@ async fn status_snapshot_nonblocking_retries_single_control_inflight_retryable_s
         std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
         "status_snapshot_nonblocking must restore the surviving ready groups after logical-root retire instead of surfacing the first retryable control-inflight bridge reset as a timeout/error: ready={ready_snapshot:?} returned={snapshot:?}"
     );
+    let observed = observed_timeouts
+        .lock()
+        .expect("status timeout observe hook lock")
+        .clone();
+    assert!(
+        observed
+            .iter()
+            .all(|timeout| *timeout <= status_snapshot_nonblocking_live_probe_budget()),
+        "control-inflight retry-reset live status probes must reserve settle slack under the outer 350ms nonblocking budget: observed={observed:?}"
+    );
 
+    drop(inflight);
     sink.close().await.expect("close sink worker");
 }
 
@@ -3729,10 +3757,14 @@ async fn status_snapshot_nonblocking_retries_single_noninflight_retryable_status
     install_sink_worker_retry_reset_hook(SinkWorkerRetryResetHook {
         reset_count: reset_count.clone(),
     });
+    let current_worker_instance_id = sink.worker_instance_id_for_tests().await;
     let _status_error_reset = SinkWorkerStatusErrorHookReset;
-    install_sink_worker_status_error_hook(SinkWorkerStatusErrorHook {
-        err: CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
-    });
+    install_sink_worker_status_error_hook_for_worker_instance(
+        current_worker_instance_id,
+        SinkWorkerStatusErrorHook {
+            err: CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
+        },
+    );
 
     let snapshot = tokio::time::timeout(
         Duration::from_millis(350),
@@ -4157,13 +4189,18 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     };
     let install_zero_snapshot = tokio::spawn({
         let reset_count = reset_count.clone();
+        let sink = sink.clone();
         async move {
             let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
             loop {
                 if reset_count.load(Ordering::SeqCst) > 0 {
-                    install_sink_worker_status_snapshot_hook(SinkWorkerStatusSnapshotHook {
-                        snapshot: zero_snapshot,
-                    });
+                    let current_worker_instance_id = sink.worker_instance_id_for_tests().await;
+                    install_sink_worker_status_snapshot_hook_for_worker_instance(
+                        current_worker_instance_id,
+                        SinkWorkerStatusSnapshotHook {
+                            snapshot: zero_snapshot,
+                        },
+                    );
                     break;
                 }
                 assert!(
@@ -4485,10 +4522,14 @@ async fn status_snapshot_does_not_publish_unscheduled_zero_uninitialized_snapsho
         }
     }
 
+    let current_worker_instance_id = sink.worker_instance_id_for_tests().await;
     let _status_snapshot_reset = SinkWorkerStatusSnapshotHookReset;
-    install_sink_worker_status_snapshot_hook(SinkWorkerStatusSnapshotHook {
-        snapshot: zero_snapshot.clone(),
-    });
+    install_sink_worker_status_snapshot_hook_for_worker_instance(
+        current_worker_instance_id,
+        SinkWorkerStatusSnapshotHook {
+            snapshot: zero_snapshot.clone(),
+        },
+    );
 
     let err = sink
         .status_snapshot()

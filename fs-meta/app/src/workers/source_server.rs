@@ -594,6 +594,12 @@ fn last_control_frame_signals_by_node(
     std::collections::BTreeMap::from([(node_key.to_string(), signals.to_vec())])
 }
 
+fn scheduled_groups_by_node_has_recovered_members(
+    groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
+) -> bool {
+    groups_by_node.values().any(|groups| !groups.is_empty())
+}
+
 fn source_observability_snapshot(
     source: &FSMetaSource,
     last_control_frame_signals: &[String],
@@ -609,7 +615,6 @@ fn source_observability_snapshot(
             .scheduled_source_group_ids()
             .ok()
             .flatten()
-            .filter(|groups| !groups.is_empty())
             .map(|groups| {
                 std::collections::BTreeMap::from([(
                     stable_host_ref.clone(),
@@ -632,7 +637,6 @@ fn source_observability_snapshot(
             .scheduled_scan_group_ids()
             .ok()
             .flatten()
-            .filter(|groups| !groups.is_empty())
             .map(|groups| {
                 std::collections::BTreeMap::from([(
                     stable_host_ref.clone(),
@@ -664,8 +668,8 @@ fn source_observability_snapshot(
                 || entry.emitted_event_count > 0
                 || entry.forwarded_event_count > 0
         })
-        || !scheduled_source_groups_by_node.is_empty()
-        || !scheduled_scan_groups_by_node.is_empty();
+        || scheduled_groups_by_node_has_recovered_members(&scheduled_source_groups_by_node)
+        || scheduled_groups_by_node_has_recovered_members(&scheduled_scan_groups_by_node);
     let control_summary = if !last_control_frame_signals.is_empty() {
         if has_recovered_active_state {
             last_control_frame_signals.to_vec()
@@ -4137,6 +4141,229 @@ mod tests {
         assert!(
             counts.iter().any(|entry| entry == "node-a::nfs2=7"),
             "snapshot should preserve nfs2 published path counts from live stats: {counts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn observability_snapshot_request_preserves_explicit_empty_scheduled_groups_without_recovering_active_groups()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_watch_scan_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![GrantedMountRoot {
+                object_ref: "node-b::nfs1".to_string(),
+                host_ref: "node-b".to_string(),
+                host_ip: "10.0.0.21".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: Default::default(),
+                mount_point: nfs1,
+                fs_source: "node-b::nfs1".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: vec![],
+                interfaces: vec![],
+                active: true,
+            }],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::new(cfg, NodeId("node-a".to_string())).expect("init source");
+        let control = vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-b::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-b::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source rescan-control activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-b::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source rescan activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-b::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source scan activate"),
+        ];
+        source
+            .on_control_frame(&control)
+            .await
+            .expect("apply non-local source activate");
+
+        assert_eq!(
+            source.scheduled_source_group_ids().expect("source groups"),
+            Some(std::collections::BTreeSet::new()),
+            "fixture must surface explicit empty scheduled source groups before worker-side snapshot folding"
+        );
+        assert_eq!(
+            source.scheduled_scan_group_ids().expect("scan groups"),
+            Some(std::collections::BTreeSet::new()),
+            "fixture must surface explicit empty scheduled scan groups before worker-side snapshot folding"
+        );
+
+        let snapshot = source_observability_snapshot(
+            &source,
+            &[],
+            &Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        );
+
+        assert_eq!(
+            snapshot.scheduled_source_groups_by_node,
+            std::collections::BTreeMap::from([("node-a".to_string(), Vec::new())]),
+            "worker observability must preserve explicit empty scheduled source groups instead of recovering them from active status: current_stream_generation={:?} source={:?}",
+            snapshot.status.current_stream_generation,
+            snapshot.scheduled_source_groups_by_node
+        );
+        assert_eq!(
+            snapshot.scheduled_scan_groups_by_node,
+            std::collections::BTreeMap::from([("node-a".to_string(), Vec::new())]),
+            "worker observability must preserve explicit empty scheduled scan groups instead of recovering them from active status: current_stream_generation={:?} scan={:?}",
+            snapshot.status.current_stream_generation,
+            snapshot.scheduled_scan_groups_by_node
+        );
+    }
+
+    #[tokio::test]
+    async fn observability_snapshot_request_does_not_recover_worker_control_summary_from_explicit_empty_scheduled_groups(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_watch_scan_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![GrantedMountRoot {
+                object_ref: "node-b::nfs1".to_string(),
+                host_ref: "node-b".to_string(),
+                host_ip: "10.0.0.21".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: Default::default(),
+                mount_point: nfs1,
+                fs_source: "node-b::nfs1".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: vec![],
+                interfaces: vec![],
+                active: true,
+            }],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::new(cfg, NodeId("node-a".to_string())).expect("init source");
+        let control = vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-b::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-b::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source rescan-control activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-b::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source rescan activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-b::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source scan activate"),
+        ];
+        source
+            .on_control_frame(&control)
+            .await
+            .expect("apply non-local source activate");
+
+        assert_eq!(
+            source.scheduled_source_group_ids().expect("source groups"),
+            Some(std::collections::BTreeSet::new()),
+            "fixture must surface explicit empty scheduled source groups before worker-side control-summary recovery"
+        );
+        assert_eq!(
+            source.scheduled_scan_group_ids().expect("scan groups"),
+            Some(std::collections::BTreeSet::new()),
+            "fixture must surface explicit empty scheduled scan groups before worker-side control-summary recovery"
+        );
+
+        let snapshot = source_observability_snapshot(
+            &source,
+            &["tick unit=runtime.exec.scan generation=2 groups=[\"nfs1\"]".to_string()],
+            &Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        );
+
+        assert!(
+            snapshot.last_control_frame_signals_by_node.is_empty(),
+            "explicit empty scheduled groups must not resurrect worker control summary as recovered active state: source={:?} scan={:?} control={:?}",
+            snapshot.scheduled_source_groups_by_node,
+            snapshot.scheduled_scan_groups_by_node,
+            snapshot.last_control_frame_signals_by_node
         );
     }
 

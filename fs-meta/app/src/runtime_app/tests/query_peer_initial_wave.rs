@@ -489,9 +489,11 @@ async fn internal_status_routes_stay_available_while_published_facade_state_rema
 
     FSMetaApp::publish_facade_service_state_from_runtime_facts(
         &app.facade_service_state,
-        true,
-        true,
-        false,
+        FacadeServiceStateDecisionInput {
+            control_gate_ready: true,
+            publication_ready: true,
+            pending_facade_present: false,
+        },
     );
     assert_eq!(
         *app.facade_service_state
@@ -711,9 +713,11 @@ async fn internal_status_routes_stay_available_on_peer_nodes_without_api_task_wh
 
     FSMetaApp::publish_facade_service_state_from_runtime_facts(
         &app.facade_service_state,
-        true,
-        true,
-        false,
+        FacadeServiceStateDecisionInput {
+            control_gate_ready: true,
+            publication_ready: true,
+            pending_facade_present: false,
+        },
     );
     assert_eq!(
         *app.facade_service_state
@@ -959,9 +963,11 @@ async fn internal_status_routes_stay_available_on_peer_nodes_without_api_task_wh
 
     FSMetaApp::publish_facade_service_state_from_runtime_facts(
         &app.facade_service_state,
-        true,
-        true,
-        false,
+        FacadeServiceStateDecisionInput {
+            control_gate_ready: true,
+            publication_ready: true,
+            pending_facade_present: false,
+        },
     );
     let initial_source_snapshots = internal_source_status_snapshots_with_timeout(
         boundary.clone(),
@@ -1220,9 +1226,11 @@ async fn internal_status_routes_fail_closed_on_local_facade_owner_when_published
     app.api_control_gate.set_ready(true);
     FSMetaApp::publish_facade_service_state_from_runtime_facts(
         &app.facade_service_state,
-        true,
-        true,
-        false,
+        FacadeServiceStateDecisionInput {
+            control_gate_ready: true,
+            publication_ready: true,
+            pending_facade_present: false,
+        },
     );
 
     let source_snapshots = internal_source_status_snapshots_with_timeout(

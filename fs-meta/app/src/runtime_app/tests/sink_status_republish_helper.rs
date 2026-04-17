@@ -1392,6 +1392,266 @@ async fn generation_one_initial_mixed_source_and_sink_activate_does_not_enter_lo
     app.close().await.expect("close app");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_for_local_sink_status_republish_requiring_probe_checks_first_probe_before_post_return_retrigger_when_cached_ready()
+ {
+    struct SourceWorkerTriggerRescanWhenReadyCallCountHookReset;
+
+    impl Drop for SourceWorkerTriggerRescanWhenReadyCallCountHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_trigger_rescan_when_ready_call_count_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    fs::write(nfs1.join("ready-a.txt"), b"a").expect("seed nfs1");
+    fs::write(nfs2.join("ready-b.txt"), b"b").expect("seed nfs2");
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![
+                        worker_watch_scan_root("nfs1", &nfs1),
+                        worker_watch_scan_root("nfs2", &nfs2),
+                    ],
+                    host_object_grants: Vec::new(),
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-c-require-probe-helper".into()),
+            Some(boundary.clone()),
+            Some(boundary),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    let source_wave = |generation| {
+        vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+        ]
+    };
+    let sink_wave = |generation| {
+        let root_scopes = &[("nfs1", &["nfs1"][..]), ("nfs2", &["nfs2"][..])];
+        vec![
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                root_scopes,
+                generation,
+            ),
+        ]
+    };
+
+    let trigger_rescan_count = Arc::new(AtomicUsize::new(0));
+    let _trigger_rescan_reset = SourceWorkerTriggerRescanWhenReadyCallCountHookReset;
+    crate::workers::source::install_source_worker_trigger_rescan_when_ready_call_count_hook(
+        crate::workers::source::SourceWorkerTriggerRescanWhenReadyCallCountHook {
+            count: trigger_rescan_count.clone(),
+        },
+    );
+
+    let mut initial = source_wave(2);
+    initial.extend(sink_wave(2));
+    app.on_control_frame(&initial)
+        .await
+        .expect("initial local source/sink wave should succeed");
+
+    let expected_groups =
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let source_groups = app
+            .source
+            .scheduled_source_group_ids()
+            .await
+            .expect("source groups")
+            .unwrap_or_default();
+        let scan_groups = app
+            .source
+            .scheduled_scan_group_ids()
+            .await
+            .expect("scan groups")
+            .unwrap_or_default();
+        let sink_groups = app
+            .sink
+            .scheduled_group_ids()
+            .await
+            .expect("sink groups")
+            .unwrap_or_default();
+        if source_groups == expected_groups
+            && scan_groups == expected_groups
+            && sink_groups == expected_groups
+        {
+            match tokio::time::timeout(
+                Duration::from_millis(350),
+                app.sink.status_snapshot_nonblocking(),
+            )
+            .await
+            {
+                Ok(Ok(snapshot))
+                    if sink_status_snapshot_ready_for_expected_groups(
+                        &snapshot,
+                        &expected_groups,
+                    ) =>
+                {
+                    break;
+                }
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < ready_deadline,
+            "timed out waiting for cached-ready local sink status before requiring-probe helper test"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let cached_snapshot_before_helper = app
+        .sink
+        .cached_status_snapshot()
+        .expect("cached sink status before requiring-probe helper");
+    assert!(
+        sink_status_snapshot_ready_for_expected_groups(
+            &cached_snapshot_before_helper,
+            &expected_groups,
+        ),
+        "precondition: requiring-probe helper seam requires cached sink status to already be ready: {cached_snapshot_before_helper:?}"
+    );
+
+    let trigger_count_before_helper = trigger_rescan_count.load(Ordering::SeqCst);
+    let post_return_retrigger_entered = Arc::new(Notify::new());
+    let post_return_retrigger_release = Arc::new(Notify::new());
+    let _post_return_retrigger_reset = LocalSinkStatusRepublishRetriggerPauseHookReset;
+    install_local_sink_status_republish_retrigger_pause_hook(
+        LocalSinkStatusRepublishRetriggerPauseHook {
+            entered: post_return_retrigger_entered.clone(),
+            release: post_return_retrigger_release.clone(),
+        },
+    );
+    let helper_probe_entered = Arc::new(Notify::new());
+    let helper_probe_release = Arc::new(Notify::new());
+    let _probe_pause_reset = LocalSinkStatusRepublishProbePauseHookReset;
+    install_local_sink_status_republish_probe_pause_hook(LocalSinkStatusRepublishProbePauseHook {
+        entered: helper_probe_entered.clone(),
+        release: helper_probe_release.clone(),
+    });
+
+    let helper_task = tokio::spawn({
+        let source = app.source.clone();
+        let sink = app.sink.clone();
+        let expected_groups = expected_groups.clone();
+        let post_return_sink_replay_signals = Vec::<SinkControlSignal>::new();
+        async move {
+            FSMetaApp::wait_for_local_sink_status_republish_after_recovery_requiring_probe_from_parts(
+                source,
+                sink,
+                &expected_groups,
+                &post_return_sink_replay_signals,
+            )
+            .await
+        }
+    });
+
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(2)) => {
+            panic!(
+                "requiring-probe helper stalled before reaching its first sink-side probe or retrigger point"
+            );
+        }
+        _ = post_return_retrigger_entered.notified() => {
+            post_return_retrigger_release.notify_waiters();
+            helper_probe_release.notify_waiters();
+            let _ = tokio::time::timeout(Duration::from_secs(1), helper_task).await;
+            panic!(
+                "requiring-probe helper must check the first sink-side probe before re-arming source->sink convergence when cached sink status is already ready"
+            );
+        }
+        _ = helper_probe_entered.notified() => {}
+    }
+
+    assert_eq!(
+        trigger_rescan_count.load(Ordering::SeqCst),
+        trigger_count_before_helper,
+        "requiring-probe helper must not trigger source->sink convergence before its first sink-side probe when cached sink status is already ready"
+    );
+
+    helper_probe_release.notify_waiters();
+    let helper_result = tokio::time::timeout(Duration::from_secs(5), helper_task)
+        .await
+        .expect("requiring-probe helper should settle after its first sink-side probe unblocks")
+        .expect("join requiring-probe helper task");
+    if let Err(err) = helper_result {
+        let cached_sink_status_summary = app
+            .sink
+            .cached_status_snapshot()
+            .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+            .unwrap_or_else(|cached_err| {
+                format!("cached_sink_status_unavailable err={cached_err}")
+            });
+        panic!(
+            "requiring-probe helper should accept an already-ready first sink-side probe without falling into post-return retrigger logic: err={err} cached_sink_status={cached_sink_status_summary}"
+        );
+    }
+
+    assert_eq!(
+        trigger_rescan_count.load(Ordering::SeqCst),
+        trigger_count_before_helper,
+        "requiring-probe helper must settle without triggering source->sink convergence when the first sink-side probe already proves readiness"
+    );
+
+    app.close().await.expect("close app");
+}
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordinary_current_generation_sink_tick_does_not_reenter_sink_worker_when_replay_not_required()

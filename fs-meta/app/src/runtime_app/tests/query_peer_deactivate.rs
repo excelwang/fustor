@@ -385,3 +385,183 @@ async fn query_peer_internal_status_deactivate_does_not_wait_for_inflight_source
 
     app.close().await.expect("close app");
 }
+
+#[tokio::test]
+async fn stale_query_peer_sink_query_proxy_deactivate_does_not_wait_for_inflight_sink_control_handoff(
+) {
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let fs_source = tmp.path().display().to_string();
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "single-app-node::root-1",
+                        "single-app-node",
+                        "127.0.0.1",
+                        &fs_source,
+                        tmp.path().to_path_buf(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: "listener-a".to_string(),
+                    local_listener_resources: vec![api::config::ApiListenerResource {
+                        resource_id: "listener-a".to_string(),
+                        bind_addr: bind_addr.clone(),
+                    }],
+                    auth: api::ApiAuthConfig {
+                        passwd_path,
+                        shadow_path,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("single-app-node".into()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    if cfg!(target_os = "linux") {
+        match app.start().await {
+            Ok(()) => {}
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Err(err) => panic!("start app: {err}"),
+        }
+    } else {
+        let err = app.start().await.expect_err("non-linux should fail fast");
+        assert!(matches!(err, CnxError::NotSupported(_)));
+        return;
+    }
+
+    let active_facade = match api::spawn(
+        app.config
+            .api
+            .resolve_for_candidate_ids(&["listener-a".to_string()])
+            .expect("resolve facade config"),
+        app.node_id.clone(),
+        app.runtime_boundary.clone(),
+        app.source.clone(),
+        app.sink.clone(),
+        app.query_sink.clone(),
+        app.runtime_boundary.clone(),
+        app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
+        app.api_request_tracker.clone(),
+        app.api_control_gate.clone(),
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(CnxError::InvalidInput(msg))
+            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+        {
+            app.close().await.expect("close app after bind restriction");
+            return;
+        }
+        Err(err) => panic!("spawn active facade: {err}"),
+    };
+    *app.api_task.lock().await = Some(FacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 1,
+        resource_ids: vec!["listener-a".to_string()],
+        handle: active_facade,
+    });
+
+    let sink_query_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
+    app.on_control_frame(&[
+        activate_envelope_with_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            sink_query_proxy_route.clone(),
+            &[("test-root", &["listener-a"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("activate source/sink + query-peer sink-query-proxy");
+
+    let sink_entered = Arc::new(Notify::new());
+    let sink_release = Arc::new(Notify::new());
+    let _sink_pause_reset = SinkWorkerControlFramePauseHookReset;
+    crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+        crate::workers::sink::SinkWorkerControlFramePauseHook {
+            entered: sink_entered.clone(),
+            release: sink_release.clone(),
+        },
+    );
+
+    let sink_control_task = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.on_control_frame(&[activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                3,
+            )])
+            .await
+        }
+    });
+
+    sink_entered.notified().await;
+
+    let mut deactivate_task = tokio::spawn({
+        let app = app.clone();
+        let sink_query_proxy_route = sink_query_proxy_route.clone();
+        async move {
+            app.apply_facade_deactivate(FacadeRuntimeUnit::QueryPeer, &sink_query_proxy_route, 1)
+                .await
+        }
+    });
+
+    let deactivate_result =
+        tokio::time::timeout(Duration::from_millis(600), &mut deactivate_task).await;
+    sink_release.notify_waiters();
+    sink_control_task
+        .await
+        .expect("join sink control followup")
+        .expect("sink control followup should finish");
+    if deactivate_result.is_err() {
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut deactivate_task).await;
+    }
+    assert!(
+        deactivate_result.is_ok(),
+        "stale query-peer sink-query-proxy deactivate should not wait for unrelated in-flight sink control handoff"
+    );
+    deactivate_result
+        .expect("join stale sink-query-proxy deactivate via timeout completion")
+        .expect("join stale sink-query-proxy deactivate task")
+        .expect("stale deactivate query-peer sink-query-proxy route");
+
+    app.close().await.expect("close app");
+}
