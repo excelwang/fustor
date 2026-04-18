@@ -140,6 +140,24 @@ pub(super) fn facade_deactivate_barrier_test_serial() -> &'static tokio::sync::M
     CELL.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+fn set_control_initialized_for_tests(app: &FSMetaApp, control_initialized: bool) {
+    app.update_runtime_gate_facts_for_tests(|state| {
+        state.control_initialized = control_initialized;
+    });
+}
+
+fn set_source_replay_required_for_tests(app: &FSMetaApp, source_state_replay_required: bool) {
+    app.update_runtime_gate_facts_for_tests(|state| {
+        state.source_state_replay_required = source_state_replay_required;
+    });
+}
+
+fn set_sink_replay_required_for_tests(app: &FSMetaApp, sink_state_replay_required: bool) {
+    app.update_runtime_gate_facts_for_tests(|state| {
+        state.sink_state_replay_required = sink_state_replay_required;
+    });
+}
+
 include!("tests/external_worker_runtime_paths.rs");
 
 fn fs_meta_worker_module_path(path: &str) -> std::path::PathBuf {
@@ -442,6 +460,48 @@ fn worker_watch_scan_root(id: &str, path: &Path) -> source::config::RootSpec {
     let mut root = worker_root(id, path);
     root.watch = true;
     root
+}
+
+#[test]
+fn runtime_scope_expected_groups_respects_scan_only_worker_roots() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    let expected_groups =
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let expected_scope_groups = RuntimeScopeExpectedGroups::from_logical_roots(
+        &[worker_root("nfs1", &nfs1), worker_root("nfs2", &nfs2)],
+        &expected_groups,
+    );
+    assert_eq!(
+        expected_scope_groups.source_groups,
+        std::collections::BTreeSet::new(),
+        "scan-only worker roots must not require source scheduling during local sink-status republish recovery",
+    );
+    assert_eq!(expected_scope_groups.scan_groups, expected_groups);
+    assert_eq!(expected_scope_groups.sink_groups, expected_groups);
+}
+
+#[test]
+fn runtime_scope_convergence_matches_lane_expected_groups_for_scan_only_worker_roots() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    let expected_groups =
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let expected_scope_groups = RuntimeScopeExpectedGroups::from_logical_roots(
+        &[worker_root("nfs1", &nfs1), worker_root("nfs2", &nfs2)],
+        &expected_groups,
+    );
+    let observation = RuntimeScopeConvergenceObservation {
+        source_groups: std::collections::BTreeSet::new(),
+        scan_groups: expected_groups.clone(),
+        sink_groups: expected_groups,
+    };
+    assert!(
+        observation.matches_expected(&expected_scope_groups),
+        "scan-only worker roots must converge once scan and sink lanes match the expected groups, even when source lane stays empty",
+    );
 }
 
 fn worker_fs_source_root(id: &str, fs_source: &str) -> source::config::RootSpec {
@@ -2545,66 +2605,102 @@ fn facade_only_handoff_allowance_decision_blocks_ephemeral_non_control_pending_f
     );
 }
 
-#[test]
-fn fixed_bind_handoff_release_decision_blocks_non_control_pending_facade() {
-    assert_eq!(
-        FSMetaApp::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
-            handoff_ready_entry_present: true,
-            handoff_ready_owned_by_current_instance: false,
-            pending_facade_present: true,
-            pending_facade_is_control_route: false,
-            pending_runtime_exposure_confirmed: true,
-            suppressed_dependent_routes_remain: false,
-        }),
-        FixedBindHandoffReleaseDecision::Blocked
+async fn pending_fixed_bind_handoff_release_registrant_for_tests(
+    route_key: &str,
+    runtime_exposure_confirmed: bool,
+    suppressed_dependent_routes_remain: bool,
+) -> PendingFixedBindHandoffRegistrant {
+    let app = FSMetaApp::new(
+        FSMetaConfig {
+            source: local_source_config(),
+            ..FSMetaConfig::default()
+        },
+        NodeId("pending-fixed-bind-release-registrant-tests".into()),
+    )
+    .expect("init app");
+    let bind_addr = "127.0.0.1:4100".to_string();
+    *app.pending_facade.lock().await = Some(PendingFacadeActivation {
+        route_key: route_key.to_string(),
+        generation: 1,
+        resource_ids: vec!["listener".to_string()],
+        bound_scopes: Vec::new(),
+        group_ids: Vec::new(),
+        runtime_managed: true,
+        runtime_exposure_confirmed,
+        resolved: api::config::ResolvedApiConfig {
+            bind_addr,
+            auth: api::ApiAuthConfig::default(),
+        },
+    });
+    app.pending_fixed_bind_has_suppressed_dependent_routes
+        .store(suppressed_dependent_routes_remain, Ordering::Release);
+    app.pending_fixed_bind_handoff_registrant()
+}
+
+#[tokio::test]
+async fn pending_fixed_bind_handoff_registrant_blocks_release_for_non_control_pending_facade() {
+    let registrant = pending_fixed_bind_handoff_release_registrant_for_tests(
+        "fs-meta.events:v1.req",
+        true,
+        false,
+    )
+    .await;
+    assert!(
+        registrant
+            .release_handoff_for_active_owner("127.0.0.1:4100", registrant.instance_id + 1)
+            .await
+            .is_none()
     );
 }
 
-#[test]
-fn fixed_bind_handoff_release_decision_blocks_unconfirmed_control_route_while_suppressed_routes_remain()
+#[tokio::test]
+async fn pending_fixed_bind_handoff_registrant_blocks_release_for_unconfirmed_control_route_while_suppressed_routes_remain()
  {
-    assert_eq!(
-        FSMetaApp::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
-            handoff_ready_entry_present: true,
-            handoff_ready_owned_by_current_instance: false,
-            pending_facade_present: true,
-            pending_facade_is_control_route: true,
-            pending_runtime_exposure_confirmed: false,
-            suppressed_dependent_routes_remain: true,
-        }),
-        FixedBindHandoffReleaseDecision::Blocked
+    let registrant = pending_fixed_bind_handoff_release_registrant_for_tests(
+        &facade_control_stream_route(),
+        false,
+        true,
+    )
+    .await;
+    assert!(
+        registrant
+            .release_handoff_for_active_owner("127.0.0.1:4100", registrant.instance_id + 1)
+            .await
+            .is_none()
     );
 }
 
-#[test]
-fn fixed_bind_handoff_release_decision_allows_confirmed_control_route_even_with_suppressed_routes()
-{
-    assert_eq!(
-        FSMetaApp::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
-            handoff_ready_entry_present: true,
-            handoff_ready_owned_by_current_instance: false,
-            pending_facade_present: true,
-            pending_facade_is_control_route: true,
-            pending_runtime_exposure_confirmed: true,
-            suppressed_dependent_routes_remain: true,
-        }),
-        FixedBindHandoffReleaseDecision::Ready
-    );
-}
-
-#[test]
-fn fixed_bind_handoff_release_decision_allows_unsuppressed_control_route_without_exposure_confirmation()
+#[tokio::test]
+async fn pending_fixed_bind_handoff_registrant_allows_release_for_confirmed_control_route_even_with_suppressed_routes()
  {
-    assert_eq!(
-        FSMetaApp::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
-            handoff_ready_entry_present: true,
-            handoff_ready_owned_by_current_instance: false,
-            pending_facade_present: true,
-            pending_facade_is_control_route: true,
-            pending_runtime_exposure_confirmed: false,
-            suppressed_dependent_routes_remain: false,
-        }),
-        FixedBindHandoffReleaseDecision::Ready
+    let registrant = pending_fixed_bind_handoff_release_registrant_for_tests(
+        &facade_control_stream_route(),
+        true,
+        true,
+    )
+    .await;
+    assert!(
+        registrant
+            .release_handoff_for_active_owner("127.0.0.1:4100", registrant.instance_id + 1)
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn pending_fixed_bind_handoff_registrant_allows_release_for_unsuppressed_control_route_without_exposure_confirmation()
+ {
+    let registrant = pending_fixed_bind_handoff_release_registrant_for_tests(
+        &facade_control_stream_route(),
+        false,
+        false,
+    )
+    .await;
+    assert!(
+        registrant
+            .release_handoff_for_active_owner("127.0.0.1:4100", registrant.instance_id + 1)
+            .await
+            .is_some()
     );
 }
 
@@ -2657,143 +2753,158 @@ fn pending_fixed_bind_handoff_attempt_disposition_blocks_without_runtime_exposur
     );
 }
 
-#[test]
-fn pending_fixed_bind_handoff_completion_disposition_applies_ready_tail_once_pending_clears_and_control_stream_is_live()
+async fn pending_fixed_bind_handoff_continuation_for_tests(
+    bind_addr: &str,
+) -> PendingFixedBindHandoffContinuation {
+    let app = FSMetaApp::new(
+        FSMetaConfig {
+            source: local_source_config(),
+            ..FSMetaConfig::default()
+        },
+        NodeId("facade-deactivate-continuity-tests".into()),
+    )
+    .expect("init app");
+    PendingFixedBindHandoffContinuation {
+        bind_addr: bind_addr.to_string(),
+        registrant: app.pending_fixed_bind_handoff_registrant(),
+    }
+}
+
+async fn facade_deactivate_continuity_execution_plan_for_tests(
+    retain_active_facade: bool,
+    pending_fixed_bind_conflict: bool,
+    release_for_fixed_bind_handoff: bool,
+    retain_pending_spawn: bool,
+) -> FacadeDeactivateContinuityExecutionPlan {
+    let release_handoff = if release_for_fixed_bind_handoff {
+        Some(pending_fixed_bind_handoff_continuation_for_tests("127.0.0.1:4100").await)
+    } else {
+        None
+    };
+    FacadeDeactivateContinuityExecutionPlan::from_parts(
+        retain_active_facade,
+        retain_pending_spawn,
+        PendingFixedBindPublicationState::new(
+            pending_fixed_bind_conflict.then(|| PendingFacadeActivation {
+                route_key: format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+                generation: 1,
+                resource_ids: vec!["listener".to_string()],
+                bound_scopes: Vec::new(),
+                group_ids: Vec::new(),
+                runtime_managed: true,
+                runtime_exposure_confirmed: true,
+                resolved: api::config::ResolvedApiConfig {
+                    bind_addr: "127.0.0.1:4100".to_string(),
+                    auth: api::ApiAuthConfig::default(),
+                },
+            }),
+            pending_fixed_bind_conflict.then(|| ProcessFacadeClaim {
+                owner_instance_id: 7,
+                route_key: format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+                resource_ids: vec!["listener".to_string()],
+                bind_addr: "127.0.0.1:4100".to_string(),
+            }),
+            pending_fixed_bind_conflict,
+        ),
+        release_handoff.clone(),
+        release_for_fixed_bind_handoff.then(|| ActiveFixedBindShutdownContinuation {
+            bind_addr: "127.0.0.1:4100".to_string(),
+            pending_handoff: release_handoff,
+        }),
+    )
+}
+
+#[tokio::test]
+async fn facade_deactivate_continuity_execution_plan_retains_active_continuity_without_conflict_or_handoff_release()
  {
-    assert_eq!(
-        FSMetaApp::pending_fixed_bind_handoff_completion_disposition(
-            PendingFixedBindHandoffCompletionDecisionInput {
-                pending_facade_present: false,
-                active_control_stream_present: true,
-                deadline_expired: false,
-            },
-        ),
-        PendingFixedBindHandoffCompletionDisposition::ApplyReadyTail
-    );
+    assert!(matches!(
+        facade_deactivate_continuity_execution_plan_for_tests(true, false, false, false).await,
+        FacadeDeactivateContinuityExecutionPlan::RetainActiveContinuity
+    ));
 }
 
-#[test]
-fn pending_fixed_bind_handoff_completion_disposition_aborts_after_deadline_when_completion_has_not_converged()
+#[tokio::test]
+async fn facade_deactivate_continuity_execution_plan_retains_active_facade_while_pending_fixed_bind_claim_conflict_remains()
  {
-    assert_eq!(
-        FSMetaApp::pending_fixed_bind_handoff_completion_disposition(
-            PendingFixedBindHandoffCompletionDecisionInput {
-                pending_facade_present: true,
-                active_control_stream_present: false,
-                deadline_expired: true,
-            },
-        ),
-        PendingFixedBindHandoffCompletionDisposition::Abort
-    );
+    assert!(matches!(
+        facade_deactivate_continuity_execution_plan_for_tests(true, true, false, false).await,
+        FacadeDeactivateContinuityExecutionPlan::RetainActiveWhilePendingFixedBindClaimConflict
+    ));
 }
 
-#[test]
-fn pending_fixed_bind_handoff_completion_disposition_continues_polling_before_deadline_when_pending_or_control_stream_is_missing()
+#[tokio::test]
+async fn facade_deactivate_continuity_execution_plan_retains_pending_facade_while_pending_fixed_bind_claim_conflict_remains()
  {
-    assert_eq!(
-        FSMetaApp::pending_fixed_bind_handoff_completion_disposition(
-            PendingFixedBindHandoffCompletionDecisionInput {
-                pending_facade_present: true,
-                active_control_stream_present: true,
-                deadline_expired: false,
-            },
-        ),
-        PendingFixedBindHandoffCompletionDisposition::ContinuePolling
-    );
+    assert!(matches!(
+        facade_deactivate_continuity_execution_plan_for_tests(false, true, false, false).await,
+        FacadeDeactivateContinuityExecutionPlan::RetainPendingWhilePendingFixedBindClaimConflict
+    ));
 }
 
-#[test]
-fn facade_deactivate_continuity_disposition_retains_active_continuity_without_conflict_or_handoff_release()
- {
-    assert_eq!(
-        FSMetaApp::facade_deactivate_continuity_disposition(
-            FacadeDeactivateContinuityDecisionInput {
-                retain_active_facade: true,
-                pending_fixed_bind_conflict: false,
-                release_for_fixed_bind_handoff: false,
-                retain_pending_spawn: false,
-            },
-        ),
-        FacadeDeactivateContinuityDisposition::RetainActiveContinuity
-    );
-}
-
-#[test]
-fn facade_deactivate_continuity_disposition_retains_active_facade_while_pending_fixed_bind_claim_conflict_remains()
- {
-    assert_eq!(
-        FSMetaApp::facade_deactivate_continuity_disposition(
-            FacadeDeactivateContinuityDecisionInput {
-                retain_active_facade: true,
-                pending_fixed_bind_conflict: true,
-                release_for_fixed_bind_handoff: false,
-                retain_pending_spawn: false,
-            },
-        ),
-        FacadeDeactivateContinuityDisposition::RetainActiveWhilePendingFixedBindClaimConflict
-    );
-}
-
-#[test]
-fn facade_deactivate_continuity_disposition_retains_pending_facade_while_pending_fixed_bind_claim_conflict_remains()
- {
-    assert_eq!(
-        FSMetaApp::facade_deactivate_continuity_disposition(
-            FacadeDeactivateContinuityDecisionInput {
-                retain_active_facade: false,
-                pending_fixed_bind_conflict: true,
-                release_for_fixed_bind_handoff: false,
-                retain_pending_spawn: false,
-            },
-        ),
-        FacadeDeactivateContinuityDisposition::RetainPendingWhilePendingFixedBindClaimConflict
-    );
-}
-
-#[test]
-fn facade_deactivate_continuity_disposition_releases_active_facade_for_fixed_bind_handoff() {
-    assert_eq!(
-        FSMetaApp::facade_deactivate_continuity_disposition(
-            FacadeDeactivateContinuityDecisionInput {
-                retain_active_facade: true,
-                pending_fixed_bind_conflict: false,
-                release_for_fixed_bind_handoff: true,
-                retain_pending_spawn: false,
-            },
-        ),
-        FacadeDeactivateContinuityDisposition::ReleaseActiveForFixedBindHandoff
-    );
-}
-
-#[test]
-fn facade_deactivate_continuity_disposition_retains_pending_facade_while_spawn_is_still_in_flight()
+#[tokio::test]
+async fn facade_deactivate_continuity_execution_plan_releases_active_facade_for_fixed_bind_handoff()
 {
-    assert_eq!(
-        FSMetaApp::facade_deactivate_continuity_disposition(
-            FacadeDeactivateContinuityDecisionInput {
-                retain_active_facade: false,
-                pending_fixed_bind_conflict: false,
-                release_for_fixed_bind_handoff: false,
-                retain_pending_spawn: true,
-            },
-        ),
-        FacadeDeactivateContinuityDisposition::RetainPendingWhileSpawnInFlight
-    );
+    assert!(matches!(
+        facade_deactivate_continuity_execution_plan_for_tests(true, false, true, false).await,
+        FacadeDeactivateContinuityExecutionPlan::ReleaseActiveForFixedBindHandoff { .. }
+    ));
 }
 
-#[test]
-fn facade_deactivate_continuity_disposition_shuts_down_when_no_continuity_lane_applies() {
-    assert_eq!(
-        FSMetaApp::facade_deactivate_continuity_disposition(
-            FacadeDeactivateContinuityDecisionInput {
-                retain_active_facade: false,
-                pending_fixed_bind_conflict: false,
-                release_for_fixed_bind_handoff: false,
-                retain_pending_spawn: false,
-            },
-        ),
-        FacadeDeactivateContinuityDisposition::Shutdown
+#[tokio::test]
+async fn facade_deactivate_continuity_execution_plan_retains_pending_facade_while_spawn_is_still_in_flight()
+ {
+    assert!(matches!(
+        facade_deactivate_continuity_execution_plan_for_tests(false, false, false, true).await,
+        FacadeDeactivateContinuityExecutionPlan::RetainPendingWhileSpawnInFlight
+    ));
+}
+
+#[tokio::test]
+async fn facade_deactivate_continuity_execution_plan_shuts_down_when_no_continuity_lane_applies() {
+    assert!(matches!(
+        facade_deactivate_continuity_execution_plan_for_tests(false, false, false, false).await,
+        FacadeDeactivateContinuityExecutionPlan::Shutdown { handoff: None }
+    ));
+}
+
+#[tokio::test]
+async fn facade_deactivate_continuity_execution_plan_reuses_observed_handoff_state_for_release() {
+    let plan = FacadeDeactivateContinuityExecutionPlan::from_parts(
+        true,
+        false,
+        PendingFixedBindPublicationState::inactive(false),
+        Some(pending_fixed_bind_handoff_continuation_for_tests("127.0.0.1:4100").await),
+        Some(ActiveFixedBindShutdownContinuation {
+            bind_addr: "127.0.0.1:4100".to_string(),
+            pending_handoff: None,
+        }),
     );
+
+    assert!(matches!(
+        plan,
+        FacadeDeactivateContinuityExecutionPlan::ReleaseActiveForFixedBindHandoff { handoff }
+            if handoff.bind_addr == "127.0.0.1:4100"
+    ));
+}
+
+#[tokio::test]
+async fn facade_deactivate_continuity_execution_plan_reuses_observed_handoff_state_for_shutdown() {
+    let plan = FacadeDeactivateContinuityExecutionPlan::from_parts(
+        false,
+        false,
+        PendingFixedBindPublicationState::inactive(false),
+        None,
+        Some(ActiveFixedBindShutdownContinuation {
+            bind_addr: "127.0.0.1:4100".to_string(),
+            pending_handoff: None,
+        }),
+    );
+
+    assert!(matches!(
+        plan,
+        FacadeDeactivateContinuityExecutionPlan::Shutdown { handoff: Some(handoff) }
+            if handoff.bind_addr == "127.0.0.1:4100"
+    ));
 }
 
 #[test]
@@ -3150,7 +3261,7 @@ async fn current_facade_service_state_reads_pending_status_before_ready_gate() {
     )
     .expect("init app");
 
-    app.control_initialized.store(true, Ordering::Release);
+    set_control_initialized_for_tests(&app, true);
     app.api_control_gate.set_ready(true);
     *app.facade_pending_status
         .write()
@@ -3347,7 +3458,7 @@ async fn reinitialize_after_control_reset_with_deadline_republishes_unavailable_
     if !install_active_single_listener_facade_or_skip(&app).await {
         return;
     }
-    app.control_initialized.store(true, Ordering::Release);
+    set_control_initialized_for_tests(&app, true);
     app.api_control_gate.set_ready(true);
     assert_eq!(
         app.current_facade_service_state().await,
@@ -3407,7 +3518,7 @@ async fn service_close_republishes_unavailable_facade_state_after_closing_contro
     if !install_active_single_listener_facade_or_skip(&app).await {
         return;
     }
-    app.control_initialized.store(true, Ordering::Release);
+    set_control_initialized_for_tests(&app, true);
     app.api_control_gate.set_ready(true);
     assert_eq!(
         app.current_facade_service_state().await,
@@ -3464,7 +3575,7 @@ async fn shutdown_active_facade_republishes_unavailable_facade_state_after_relea
     if !install_active_single_listener_facade_or_skip(&app).await {
         return;
     }
-    app.control_initialized.store(true, Ordering::Release);
+    set_control_initialized_for_tests(&app, true);
     app.api_control_gate.set_ready(true);
     assert_eq!(
         app.current_facade_service_state().await,
@@ -4222,7 +4333,7 @@ async fn facade_activate_same_listener_resource_advances_generation_without_pend
         resource_ids: vec!["single-app-listener".to_string()],
         handle: existing,
     });
-    app.control_initialized.store(true, Ordering::Release);
+    set_control_initialized_for_tests(&app, true);
     app.api_control_gate.set_ready(true);
 
     app.apply_facade_activate(
@@ -4332,7 +4443,7 @@ async fn try_spawn_pending_facade_same_generation_active_handle_republishes_serv
         resource_ids: vec!["single-app-listener".to_string()],
         handle: existing,
     });
-    app.control_initialized.store(true, Ordering::Release);
+    set_control_initialized_for_tests(&app, true);
     app.api_control_gate.set_ready(true);
     *app.pending_facade.lock().await = Some(PendingFacadeActivation {
         route_key: facade_control_stream_route(),
@@ -4374,9 +4485,7 @@ async fn try_spawn_pending_facade_same_generation_active_handle_republishes_serv
         app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
-        app.control_initialized.clone(),
-        app.source_state_replay_required.clone(),
-        app.sink_state_replay_required.clone(),
+        app.runtime_gate_state.clone(),
         app.node_id.clone(),
         app.runtime_boundary.clone(),
         app.source.clone(),
@@ -4480,9 +4589,8 @@ async fn try_spawn_pending_facade_same_generation_active_handle_keeps_published_
         resource_ids: vec!["single-app-listener".to_string()],
         handle: existing,
     });
-    app.control_initialized.store(true, Ordering::Release);
-    app.source_state_replay_required
-        .store(true, Ordering::Release);
+    set_control_initialized_for_tests(&app, true);
+    set_source_replay_required_for_tests(&app, true);
     app.api_control_gate.set_ready(true);
     *app.pending_facade.lock().await = Some(PendingFacadeActivation {
         route_key: facade_control_stream_route(),
@@ -4524,9 +4632,7 @@ async fn try_spawn_pending_facade_same_generation_active_handle_keeps_published_
         app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
-        app.control_initialized.clone(),
-        app.source_state_replay_required.clone(),
-        app.sink_state_replay_required.clone(),
+        app.runtime_gate_state.clone(),
         app.node_id.clone(),
         app.runtime_boundary.clone(),
         app.source.clone(),
@@ -4634,7 +4740,7 @@ async fn try_spawn_pending_facade_same_resource_generation_refresh_republishes_s
         resource_ids: vec!["single-app-listener".to_string()],
         handle: existing,
     });
-    app.control_initialized.store(true, Ordering::Release);
+    set_control_initialized_for_tests(&app, true);
     app.api_control_gate.set_ready(true);
     *app.pending_facade.lock().await = Some(PendingFacadeActivation {
         route_key: facade_control_stream_route(),
@@ -4676,9 +4782,7 @@ async fn try_spawn_pending_facade_same_resource_generation_refresh_republishes_s
         app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
-        app.control_initialized.clone(),
-        app.source_state_replay_required.clone(),
-        app.sink_state_replay_required.clone(),
+        app.runtime_gate_state.clone(),
         app.node_id.clone(),
         app.runtime_boundary.clone(),
         app.source.clone(),
@@ -4792,9 +4896,8 @@ async fn try_spawn_pending_facade_same_resource_generation_refresh_keeps_publish
         resource_ids: vec!["single-app-listener".to_string()],
         handle: existing,
     });
-    app.control_initialized.store(true, Ordering::Release);
-    app.sink_state_replay_required
-        .store(true, Ordering::Release);
+    set_control_initialized_for_tests(&app, true);
+    set_sink_replay_required_for_tests(&app, true);
     app.api_control_gate.set_ready(true);
     *app.pending_facade.lock().await = Some(PendingFacadeActivation {
         route_key: facade_control_stream_route(),
@@ -4836,9 +4939,7 @@ async fn try_spawn_pending_facade_same_resource_generation_refresh_keeps_publish
         app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
-        app.control_initialized.clone(),
-        app.source_state_replay_required.clone(),
-        app.sink_state_replay_required.clone(),
+        app.runtime_gate_state.clone(),
         app.node_id.clone(),
         app.runtime_boundary.clone(),
         app.source.clone(),
@@ -4943,9 +5044,7 @@ async fn facade_spawn_singleflight_adopts_latest_same_resource_generation() {
         let facade_service_state = app.facade_service_state.clone();
         let api_request_tracker = app.api_request_tracker.clone();
         let api_control_gate = app.api_control_gate.clone();
-        let control_initialized = app.control_initialized.clone();
-        let source_state_replay_required = app.source_state_replay_required.clone();
-        let sink_state_replay_required = app.sink_state_replay_required.clone();
+        let runtime_gate_state = app.runtime_gate_state.clone();
         let spawn_started = spawn_started.clone();
         let release_spawn = release_spawn.clone();
         let spawn_calls = spawn_calls.clone();
@@ -4960,9 +5059,7 @@ async fn facade_spawn_singleflight_adopts_latest_same_resource_generation() {
                 facade_service_state,
                 api_request_tracker,
                 api_control_gate,
-                control_initialized,
-                source_state_replay_required,
-                sink_state_replay_required,
+                runtime_gate_state,
                 node_id,
                 runtime_boundary,
                 source,
@@ -5025,9 +5122,7 @@ async fn facade_spawn_singleflight_adopts_latest_same_resource_generation() {
         app.facade_service_state.clone(),
         app.api_request_tracker.clone(),
         app.api_control_gate.clone(),
-        app.control_initialized.clone(),
-        app.source_state_replay_required.clone(),
-        app.sink_state_replay_required.clone(),
+        app.runtime_gate_state.clone(),
         app.node_id.clone(),
         app.runtime_boundary.clone(),
         app.source.clone(),
@@ -5161,9 +5256,7 @@ async fn facade_deactivate_during_inflight_spawn_keeps_login_transport_available
                 app.facade_service_state.clone(),
                 app.api_request_tracker.clone(),
                 app.api_control_gate.clone(),
-                app.control_initialized.clone(),
-                app.source_state_replay_required.clone(),
-                app.sink_state_replay_required.clone(),
+                app.runtime_gate_state.clone(),
                 app.node_id.clone(),
                 app.runtime_boundary.clone(),
                 app.source.clone(),
@@ -5912,7 +6005,7 @@ async fn status_surface_uses_published_pending_facade_state_without_pending_diag
         resource_ids: vec!["listener-a".to_string()],
         handle: existing,
     });
-    app.control_initialized.store(true, Ordering::Release);
+    set_control_initialized_for_tests(&app, true);
     app.api_control_gate.set_ready(true);
     let _ = app.current_facade_service_state().await;
 
@@ -11478,6 +11571,121 @@ async fn pending_fixed_bind_conflict_marks_handoff_ready_while_active_facade_exi
 }
 
 #[tokio::test]
+async fn pending_fixed_bind_publication_release_uses_local_registrant_when_ready_table_starts_empty()
+ {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+    struct ProcessFacadeClaimReset;
+
+    impl Drop for ProcessFacadeClaimReset {
+        fn drop(&mut self) {
+            clear_process_facade_claim_for_tests();
+        }
+    }
+
+    clear_process_facade_claim_for_tests();
+    let _claim_reset = ProcessFacadeClaimReset;
+
+    let tmp = tempdir().expect("create temp dir");
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let bind_addr = reserve_bind_addr();
+    let listener_resource = api::config::ApiListenerResource {
+        resource_id: "listener-publication-release".to_string(),
+        bind_addr: bind_addr.clone(),
+    };
+
+    let app = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new(
+                    "root-publication-release",
+                    tmp.path(),
+                )],
+                host_object_grants: vec![granted_mount_root(
+                    "node-test::root-publication-release",
+                    tmp.path(),
+                )],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: listener_resource.resource_id.clone(),
+                local_listener_resources: vec![listener_resource.clone()],
+                auth: api::ApiAuthConfig {
+                    passwd_path,
+                    shadow_path,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        },
+        NodeId("node-test-publication-release".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init app");
+
+    let bound_scope = RuntimeBoundScope {
+        scope_id: listener_resource.resource_id.clone(),
+        resource_ids: vec![listener_resource.resource_id.clone()],
+    };
+    let candidate_resource_ids = FSMetaApp::facade_candidate_resource_ids(&[bound_scope.clone()]);
+    let resolved = app
+        .config
+        .api
+        .resolve_for_candidate_ids(&candidate_resource_ids)
+        .expect("resolve facade config");
+    let pending = PendingFacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 2,
+        resource_ids: candidate_resource_ids,
+        bound_scopes: vec![bound_scope],
+        group_ids: Vec::new(),
+        runtime_managed: app.runtime_boundary.is_some(),
+        runtime_exposure_confirmed: true,
+        resolved,
+    };
+    *app.pending_facade.lock().await = Some(pending.clone());
+
+    let conflicting_claim = ProcessFacadeClaim::from_pending(app.instance_id + 1, &pending)
+        .expect("build conflicting claim");
+    process_facade_claim_cell()
+        .lock()
+        .expect("lock claim cell")
+        .insert(conflicting_claim.bind_addr.clone(), conflicting_claim);
+    app.pending_fixed_bind_claim_release_followup
+        .store(true, Ordering::Release);
+
+    assert!(
+        pending_fixed_bind_handoff_ready_cell()
+            .lock()
+            .expect("lock handoff ready cell")
+            .is_empty(),
+        "publication release should not require a pre-populated ready-table entry"
+    );
+
+    let handoff = app
+        .pending_fixed_bind_handoff_registrant()
+        .release_handoff_blocker_for_publication(&pending)
+        .await
+        .expect("publication release should use the local registrant");
+
+    assert_eq!(handoff.bind_addr, bind_addr);
+    assert_eq!(handoff.registrant.instance_id, app.instance_id);
+    assert!(
+        pending_fixed_bind_handoff_ready_cell()
+            .lock()
+            .expect("lock handoff ready cell")
+            .contains_key(&bind_addr),
+        "publication release should still publish handoff-ready state for observers"
+    );
+    assert!(
+        !process_facade_claim_cell()
+            .lock()
+            .expect("lock claim cell")
+            .contains_key(&bind_addr),
+        "publication release should clear the conflicting process claim once the local handoff continuation is built"
+    );
+}
+
+#[tokio::test]
 async fn pending_fixed_bind_release_unblocks_control_gate_for_pending_facade() {
     let _serial = fixed_bind_handoff_test_serial().lock().await;
     struct ProcessFacadeClaimReset;
@@ -11608,10 +11816,6 @@ async fn pending_fixed_bind_release_unblocks_control_gate_for_pending_facade() {
     );
 
     predecessor.shutdown_active_facade().await;
-
-    successor
-        .complete_pending_fixed_bind_handoff_after_release(&bind_addr, predecessor.instance_id)
-        .await;
 
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -11749,16 +11953,10 @@ async fn pending_fixed_bind_release_keeps_control_gate_closed_while_source_repla
     eprintln!("TEST_MARK handoff-red after initial try_spawn");
 
     let bind_addr = pending.resolved.bind_addr.clone();
-    successor
-        .source_state_replay_required
-        .store(true, Ordering::Release);
+    set_source_replay_required_for_tests(&successor, true);
     successor.api_control_gate.set_ready(false);
 
     predecessor.shutdown_active_facade().await;
-
-    successor
-        .complete_pending_fixed_bind_handoff_after_release(&bind_addr, predecessor.instance_id)
-        .await;
 
     assert!(
         tokio::time::timeout(
@@ -12699,7 +12897,7 @@ async fn fixed_bind_handoff_release_waits_for_live_suppressed_route_state() {
         .store(true, Ordering::Release);
 
     assert!(
-        !predecessor.fixed_bind_handoff_ready_for_release(2).await,
+        !predecessor.fixed_bind_handoff_ready_for_release().await,
         "predecessor must keep the active listener while successor still has suppressed dependent routes and runtime exposure is unconfirmed"
     );
 
@@ -12831,7 +13029,7 @@ async fn fixed_bind_handoff_release_ignores_non_control_pending_ready_entry() {
     );
 
     assert!(
-        !predecessor.fixed_bind_handoff_ready_for_release(2).await,
+        !predecessor.fixed_bind_handoff_ready_for_release().await,
         "predecessor must ignore non-control pending handoff-ready entries when deciding whether to release the active fixed bind"
     );
 
@@ -16745,8 +16943,8 @@ async fn route_peer_turnover_keeps_facade_and_query_routes_live_during_replayed_
     }
 
     let control_initialized = app.control_initialized();
-    let source_replay_required = app.source_state_replay_required.load(Ordering::Acquire);
-    let sink_replay_required = app.sink_state_replay_required.load(Ordering::Acquire);
+    let source_replay_required = app.source_state_replay_required();
+    let sink_replay_required = app.sink_state_replay_required();
     let publication_ready = app.facade_publication_ready().await;
     assert!(
         control_initialized,
@@ -26404,8 +26602,7 @@ async fn source_reconcile_retains_latest_deactivate_directive_after_reset() {
         .expect("split initial source activate");
     app.record_retained_source_control_state(&initial_source_signals)
         .await;
-    app.source_state_replay_required
-        .store(true, Ordering::Release);
+    set_source_replay_required_for_tests(&app, true);
 
     let (deactivate_source_signals, _, _) =
         split_app_control_signals(&[deactivate_envelope_with_route_key(
@@ -26493,10 +26690,8 @@ async fn generation_cutover_restart_deferred_cleanup_tail_fail_closes_before_rep
         split_app_control_signals(&seed_envelopes).expect("split seeded source replay state");
     app.record_retained_source_control_state(&seed_source_signals)
         .await;
-    app.source_state_replay_required
-        .store(true, std::sync::atomic::Ordering::Release);
-    app.control_initialized
-        .store(true, std::sync::atomic::Ordering::Release);
+    set_source_replay_required_for_tests(&app, true);
+    set_control_initialized_for_tests(&app, true);
 
     let cleanup_envelopes = vec![
         deactivate_envelope_with_route_key_reason_and_lease(
@@ -28711,8 +28906,7 @@ async fn replay_required_source_control_retains_active_routes_per_unit_not_just_
         split_app_control_signals(&initial).expect("split initial source control");
     app.record_retained_source_control_state(&initial_source)
         .await;
-    app.source_state_replay_required
-        .store(true, Ordering::Release);
+    set_source_replay_required_for_tests(&app, true);
 
     let followup = vec![activate_envelope_with_route_key_and_scope_rows(
         execution_units::SOURCE_RUNTIME_UNIT_ID,
@@ -30039,7 +30233,7 @@ async fn facade_only_deactivate_does_not_reinitialize_unready_runtime_or_replay_
         "forced failure seam should leave runtime uninitialized"
     );
     assert!(
-        app.source_state_replay_required.load(Ordering::Acquire),
+        app.source_state_replay_required(),
         "forced failure seam should leave retained source replay pending"
     );
 
@@ -30074,7 +30268,7 @@ async fn facade_only_deactivate_does_not_reinitialize_unready_runtime_or_replay_
         "facade-only deactivate cleanup must not reinitialize an unready runtime"
     );
     assert!(
-        app.source_state_replay_required.load(Ordering::Acquire),
+        app.source_state_replay_required(),
         "facade-only deactivate cleanup must leave retained source replay pending for the next authoritative source wave"
     );
 
@@ -30180,7 +30374,7 @@ async fn sink_only_deactivate_does_not_reinitialize_unready_runtime_or_replay_so
         "forced failure seam should leave runtime uninitialized"
     );
     assert!(
-        app.source_state_replay_required.load(Ordering::Acquire),
+        app.source_state_replay_required(),
         "forced failure seam should leave retained source replay pending"
     );
 
@@ -30215,7 +30409,7 @@ async fn sink_only_deactivate_does_not_reinitialize_unready_runtime_or_replay_so
         "sink-only deactivate cleanup must not reinitialize an unready runtime"
     );
     assert!(
-        app.source_state_replay_required.load(Ordering::Acquire),
+        app.source_state_replay_required(),
         "sink-only deactivate cleanup must leave retained source replay pending for the next authoritative source wave",
     );
 
@@ -30356,7 +30550,7 @@ async fn sink_only_deactivate_retries_retryable_sink_reset_without_reinitializin
         "sink-only retry recovery must leave runtime uninitialized until the next authoritative source wave",
     );
     assert!(
-        app.source_state_replay_required.load(Ordering::Acquire),
+        app.source_state_replay_required(),
         "sink-only retry recovery must preserve pending source replay state",
     );
 
@@ -30969,7 +31163,7 @@ async fn uninitialized_sink_query_cleanup_clears_source_query_routes_left_active
     .await
     .expect("activate query-peer source-find route");
 
-    app.control_initialized.store(false, Ordering::Release);
+    set_control_initialized_for_tests(&app, false);
     app.api_control_gate.set_ready(false);
 
     app.on_control_frame(&[deactivate_envelope_with_route_key(
@@ -31048,7 +31242,7 @@ async fn uninitialized_sink_query_cleanup_followup_does_not_wait_for_inflight_so
     .await
     .expect("activate query-peer source-find route");
 
-    app.control_initialized.store(false, Ordering::Release);
+    set_control_initialized_for_tests(&app, false);
     app.api_control_gate.set_ready(false);
 
     let shared_serial_guard = app.shared_control_frame_serial.lock().await;
@@ -31130,7 +31324,7 @@ async fn uninitialized_cleanup_only_facade_deactivate_does_not_wait_for_inflight
     .await
     .expect("activate query-peer source-status route");
 
-    app.control_initialized.store(false, Ordering::Release);
+    set_control_initialized_for_tests(&app, false);
     app.api_control_gate.set_ready(false);
 
     let shared_serial_guard = app.shared_control_frame_serial.lock().await;

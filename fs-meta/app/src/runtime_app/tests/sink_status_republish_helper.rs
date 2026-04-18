@@ -482,12 +482,14 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
     let helper_task = tokio::spawn({
         let source = app.source.clone();
         let sink = app.sink.clone();
+        let runtime_state_changed = app.runtime_state_changed.clone();
         let expected_groups = expected_groups.clone();
         let post_return_sink_replay_signals = post_return_sink_replay_signals.clone();
         async move {
             FSMetaApp::wait_for_local_sink_status_republish_after_recovery_from_parts(
                 source,
                 sink,
+                runtime_state_changed,
                 &expected_groups,
                 &post_return_sink_replay_signals,
             )
@@ -1155,12 +1157,14 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
     let helper_task = tokio::spawn({
         let source = app.source.clone();
         let sink = app.sink.clone();
+        let runtime_state_changed = app.runtime_state_changed.clone();
         let expected_groups = expected_groups.clone();
         let post_return_sink_replay_signals = post_return_sink_replay_signals.clone();
         async move {
             FSMetaApp::wait_for_local_sink_status_republish_after_recovery_from_parts(
                 source,
                 sink,
+                runtime_state_changed,
                 &expected_groups,
                 &post_return_sink_replay_signals,
             )
@@ -1801,6 +1805,7 @@ async fn wait_for_local_sink_status_republish_requiring_probe_checks_first_probe
 
     let expected_groups =
         std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let expected_source_groups = expected_groups.clone();
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let source_groups = app
@@ -1821,7 +1826,7 @@ async fn wait_for_local_sink_status_republish_requiring_probe_checks_first_probe
             .await
             .expect("sink groups")
             .unwrap_or_default();
-        if source_groups == expected_groups
+        if source_groups == expected_source_groups
             && scan_groups == expected_groups
             && sink_groups == expected_groups
         {
@@ -1882,12 +1887,14 @@ async fn wait_for_local_sink_status_republish_requiring_probe_checks_first_probe
     let helper_task = tokio::spawn({
         let source = app.source.clone();
         let sink = app.sink.clone();
+        let runtime_state_changed = app.runtime_state_changed.clone();
         let expected_groups = expected_groups.clone();
         let post_return_sink_replay_signals = Vec::<SinkControlSignal>::new();
         async move {
             FSMetaApp::wait_for_local_sink_status_republish_after_recovery_requiring_probe_from_parts(
                 source,
                 sink,
+                runtime_state_changed,
                 &expected_groups,
                 &post_return_sink_replay_signals,
             )
@@ -2072,6 +2079,7 @@ async fn wait_for_local_sink_status_republish_requiring_probe_replays_retained_s
 
     let expected_groups =
         std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let expected_source_groups = expected_groups.clone();
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let source_groups = app
@@ -2092,7 +2100,7 @@ async fn wait_for_local_sink_status_republish_requiring_probe_replays_retained_s
             .await
             .expect("sink groups")
             .unwrap_or_default();
-        if source_groups == expected_groups
+        if source_groups == expected_source_groups
             && scan_groups == expected_groups
             && sink_groups == expected_groups
         {
@@ -2185,12 +2193,14 @@ async fn wait_for_local_sink_status_republish_requiring_probe_replays_retained_s
     let helper_task = tokio::spawn({
         let source = app.source.clone();
         let sink = app.sink.clone();
+        let runtime_state_changed = app.runtime_state_changed.clone();
         let expected_groups = expected_groups.clone();
         let post_return_sink_replay_signals = post_return_sink_replay_signals.clone();
         async move {
             FSMetaApp::wait_for_local_sink_status_republish_after_recovery_requiring_probe_from_parts(
                 source,
                 sink,
+                runtime_state_changed,
                 &expected_groups,
                 &post_return_sink_replay_signals,
             )
@@ -2385,6 +2395,7 @@ async fn ordinary_current_generation_sink_tick_does_not_reenter_sink_worker_when
         .await
         .expect("generation-two source/sink activate should succeed before steady tick");
 
+    let expected_source_groups = std::collections::BTreeSet::new();
     let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let source_groups = app
@@ -2405,7 +2416,7 @@ async fn ordinary_current_generation_sink_tick_does_not_reenter_sink_worker_when
             .await
             .expect("sink groups")
             .unwrap_or_default();
-        if source_groups == expected_groups
+        if source_groups == expected_source_groups
             && scan_groups == expected_groups
             && sink_groups == expected_groups
         {
@@ -2423,7 +2434,7 @@ async fn ordinary_current_generation_sink_tick_does_not_reenter_sink_worker_when
         "ordinary steady sink tick seam requires runtime control to remain initialized before the tick followup"
     );
     assert!(
-        !app.sink_state_replay_required.load(Ordering::Acquire),
+        !app.sink_state_replay_required(),
         "ordinary steady sink tick seam requires retained sink replay to be disarmed before the tick followup"
     );
 
@@ -2470,7 +2481,7 @@ async fn ordinary_current_generation_sink_tick_does_not_reenter_sink_worker_when
         "ordinary steady sink tick must keep runtime control initialized when replay is not required"
     );
     assert!(
-        !app.sink_state_replay_required.load(Ordering::Acquire),
+        !app.sink_state_replay_required(),
         "ordinary steady sink tick must leave retained sink replay disarmed when replay is not required"
     );
 
@@ -2586,6 +2597,7 @@ async fn ordinary_current_generation_source_tick_does_not_reenter_source_worker_
         .await
         .expect("generation-two source/sink activate should succeed before steady source tick");
 
+    let expected_source_groups = std::collections::BTreeSet::new();
     let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let source_groups = app
@@ -2606,7 +2618,7 @@ async fn ordinary_current_generation_source_tick_does_not_reenter_source_worker_
             .await
             .expect("sink groups")
             .unwrap_or_default();
-        if source_groups == expected_groups
+        if source_groups == expected_source_groups
             && scan_groups == expected_groups
             && sink_groups == expected_groups
         {
@@ -2624,7 +2636,7 @@ async fn ordinary_current_generation_source_tick_does_not_reenter_source_worker_
         "ordinary steady source tick seam requires runtime control to remain initialized before the tick followup"
     );
     assert!(
-        !app.source_state_replay_required.load(Ordering::Acquire),
+        !app.source_state_replay_required(),
         "ordinary steady source tick seam requires retained source replay to be disarmed before the tick followup"
     );
 
@@ -2655,7 +2667,7 @@ async fn ordinary_current_generation_source_tick_does_not_reenter_source_worker_
         "ordinary steady source tick must keep runtime control initialized when replay is not required"
     );
     assert!(
-        !app.source_state_replay_required.load(Ordering::Acquire),
+        !app.source_state_replay_required(),
         "ordinary steady source tick must leave retained source replay disarmed when replay is not required"
     );
 
@@ -2771,6 +2783,7 @@ async fn ordinary_current_generation_source_and_sink_ticks_do_not_reenter_runtim
         .await
         .expect("generation-two source/sink activate should succeed before steady mixed ticks");
 
+    let expected_source_groups = std::collections::BTreeSet::new();
     let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let source_groups = app
@@ -2791,7 +2804,7 @@ async fn ordinary_current_generation_source_and_sink_ticks_do_not_reenter_runtim
             .await
             .expect("sink groups")
             .unwrap_or_default();
-        if source_groups == expected_groups
+        if source_groups == expected_source_groups
             && scan_groups == expected_groups
             && sink_groups == expected_groups
         {
@@ -2809,11 +2822,11 @@ async fn ordinary_current_generation_source_and_sink_ticks_do_not_reenter_runtim
         "ordinary steady mixed source/sink/facade ticks require runtime control to remain initialized before the followup"
     );
     assert!(
-        !app.source_state_replay_required.load(Ordering::Acquire),
+        !app.source_state_replay_required(),
         "ordinary steady mixed source/sink/facade ticks require retained source replay to be disarmed before the followup"
     );
     assert!(
-        !app.sink_state_replay_required.load(Ordering::Acquire),
+        !app.sink_state_replay_required(),
         "ordinary steady mixed source/sink/facade ticks require retained sink replay to be disarmed before the followup"
     );
 
@@ -2852,11 +2865,11 @@ async fn ordinary_current_generation_source_and_sink_ticks_do_not_reenter_runtim
         "ordinary steady mixed source/sink/facade ticks must keep runtime control initialized when replay is not required"
     );
     assert!(
-        !app.source_state_replay_required.load(Ordering::Acquire),
+        !app.source_state_replay_required(),
         "ordinary steady mixed source/sink/facade ticks must leave retained source replay disarmed when replay is not required"
     );
     assert!(
-        !app.sink_state_replay_required.load(Ordering::Acquire),
+        !app.sink_state_replay_required(),
         "ordinary steady mixed source/sink/facade ticks must leave retained sink replay disarmed when replay is not required"
     );
 
@@ -2919,6 +2932,7 @@ async fn ordinary_current_generation_source_and_facade_ticks_reenter_runtime_app
 
     let expected_groups =
         std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let expected_source_groups = std::collections::BTreeSet::new();
 
     let source_wave = |generation| {
         vec![
@@ -3000,7 +3014,7 @@ async fn ordinary_current_generation_source_and_facade_ticks_reenter_runtime_app
             .await
             .expect("sink groups")
             .unwrap_or_default();
-        if source_groups == expected_groups
+        if source_groups == expected_source_groups
             && scan_groups == expected_groups
             && sink_groups == expected_groups
         {
@@ -3018,11 +3032,11 @@ async fn ordinary_current_generation_source_and_facade_ticks_reenter_runtime_app
         "ordinary steady source+facade tick seam requires runtime control to remain initialized before the followup"
     );
     assert!(
-        !app.source_state_replay_required.load(Ordering::Acquire),
+        !app.source_state_replay_required(),
         "ordinary steady source+facade tick seam requires retained source replay to be disarmed before the followup"
     );
     assert!(
-        !app.sink_state_replay_required.load(Ordering::Acquire),
+        !app.sink_state_replay_required(),
         "ordinary steady source+facade tick seam requires retained sink replay to be disarmed before the followup"
     );
 
@@ -3058,11 +3072,11 @@ async fn ordinary_current_generation_source_and_facade_ticks_reenter_runtime_app
         "ordinary steady source+facade ticks must keep runtime control initialized when replay is not required"
     );
     assert!(
-        !app.source_state_replay_required.load(Ordering::Acquire),
+        !app.source_state_replay_required(),
         "ordinary steady source+facade ticks must leave retained source replay disarmed when replay is not required"
     );
     assert!(
-        !app.sink_state_replay_required.load(Ordering::Acquire),
+        !app.sink_state_replay_required(),
         "ordinary steady source+facade ticks must leave retained sink replay disarmed when replay is not required"
     );
 
@@ -3193,6 +3207,7 @@ async fn ordinary_current_generation_source_sink_and_facade_ticks_do_not_reenter
         .await
         .expect("generation-two source/sink activate should succeed before steady mixed ticks");
 
+    let expected_source_groups = std::collections::BTreeSet::new();
     let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let source_groups = app
@@ -3213,7 +3228,7 @@ async fn ordinary_current_generation_source_sink_and_facade_ticks_do_not_reenter
             .await
             .expect("sink groups")
             .unwrap_or_default();
-        if source_groups == expected_groups
+        if source_groups == expected_source_groups
             && scan_groups == expected_groups
             && sink_groups == expected_groups
         {
@@ -3231,11 +3246,11 @@ async fn ordinary_current_generation_source_sink_and_facade_ticks_do_not_reenter
         "ordinary steady mixed source/sink/facade ticks require runtime control to remain initialized before the followup"
     );
     assert!(
-        !app.source_state_replay_required.load(Ordering::Acquire),
+        !app.source_state_replay_required(),
         "ordinary steady mixed source/sink/facade ticks require retained source replay to be disarmed before the followup"
     );
     assert!(
-        !app.sink_state_replay_required.load(Ordering::Acquire),
+        !app.sink_state_replay_required(),
         "ordinary steady mixed source/sink/facade ticks require retained sink replay to be disarmed before the followup"
     );
 
@@ -3285,11 +3300,11 @@ async fn ordinary_current_generation_source_sink_and_facade_ticks_do_not_reenter
         "ordinary steady mixed source/sink/facade ticks must keep runtime control initialized when replay is not required"
     );
     assert!(
-        !app.source_state_replay_required.load(Ordering::Acquire),
+        !app.source_state_replay_required(),
         "ordinary steady mixed source/sink/facade ticks must leave retained source replay disarmed when replay is not required"
     );
     assert!(
-        !app.sink_state_replay_required.load(Ordering::Acquire),
+        !app.sink_state_replay_required(),
         "ordinary steady mixed source/sink/facade ticks must leave retained sink replay disarmed when replay is not required"
     );
 
@@ -3351,6 +3366,7 @@ async fn replay_only_source_followup_reenters_source_apply_once_when_source_repl
 
     let expected_groups =
         std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let expected_source_groups = std::collections::BTreeSet::new();
 
     let source_wave = |generation| {
         vec![
@@ -3432,7 +3448,7 @@ async fn replay_only_source_followup_reenters_source_apply_once_when_source_repl
             .await
             .expect("sink groups")
             .unwrap_or_default();
-        if source_groups == expected_groups
+        if source_groups == expected_source_groups
             && scan_groups == expected_groups
             && sink_groups == expected_groups
         {
@@ -3449,10 +3465,8 @@ async fn replay_only_source_followup_reenters_source_apply_once_when_source_repl
         app.control_initialized(),
         "replay-only source followup requires runtime control to remain initialized before the followup"
     );
-    app.source_state_replay_required
-        .store(true, Ordering::Release);
-    app.sink_state_replay_required
-        .store(false, Ordering::Release);
+    set_source_replay_required_for_tests(&app, true);
+    set_sink_replay_required_for_tests(&app, false);
 
     let source_apply_entries = Arc::new(AtomicUsize::new(0));
     let _source_apply_entry_reset = SourceApplyEntryCountHookReset;
@@ -3473,11 +3487,11 @@ async fn replay_only_source_followup_reenters_source_apply_once_when_source_repl
         "source replay-only followup must re-enter runtime_app source.apply exactly once when source replay is required",
     );
     assert!(
-        !app.source_state_replay_required.load(Ordering::Acquire),
+        !app.source_state_replay_required(),
         "source replay-only followup must clear retained source replay after replaying current-generation state"
     );
     assert!(
-        !app.sink_state_replay_required.load(Ordering::Acquire),
+        !app.sink_state_replay_required(),
         "source replay-only followup must not arm retained sink replay when no sink replay is required"
     );
     assert!(
@@ -3551,6 +3565,7 @@ async fn replay_only_sink_followup_reenters_sink_apply_once_and_local_sink_statu
 
     let expected_groups =
         std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let expected_source_groups = std::collections::BTreeSet::new();
 
     let source_wave = |generation| {
         vec![
@@ -3638,7 +3653,7 @@ async fn replay_only_sink_followup_reenters_sink_apply_once_and_local_sink_statu
             .await
             .expect("sink groups")
             .unwrap_or_default();
-        if source_groups == expected_groups
+        if source_groups == expected_source_groups
             && scan_groups == expected_groups
             && sink_groups == expected_groups
         {
@@ -3655,10 +3670,8 @@ async fn replay_only_sink_followup_reenters_sink_apply_once_and_local_sink_statu
         app.control_initialized(),
         "replay-only sink followup requires runtime control to remain initialized before the followup"
     );
-    app.source_state_replay_required
-        .store(false, Ordering::Release);
-    app.sink_state_replay_required
-        .store(true, Ordering::Release);
+    set_source_replay_required_for_tests(&app, false);
+    set_sink_replay_required_for_tests(&app, true);
 
     let sink_apply_entries = Arc::new(AtomicUsize::new(0));
     let helper_entries = Arc::new(AtomicUsize::new(0));
@@ -3689,11 +3702,11 @@ async fn replay_only_sink_followup_reenters_sink_apply_once_and_local_sink_statu
         "sink replay-only followup must enter the local sink-status republish helper exactly once when sink replay is required",
     );
     assert!(
-        !app.sink_state_replay_required.load(Ordering::Acquire),
+        !app.sink_state_replay_required(),
         "sink replay-only followup must clear retained sink replay after replaying current-generation state"
     );
     assert!(
-        !app.source_state_replay_required.load(Ordering::Acquire),
+        !app.source_state_replay_required(),
         "sink replay-only followup must not arm retained source replay when only sink replay is required"
     );
     assert!(
@@ -4098,7 +4111,7 @@ async fn source_led_uninitialized_mixed_recovery_keeps_control_gate_closed_until
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_when_source_replay_regresses_before_gate_reopen()
-{
+ {
     let _family_serial = deferred_sink_owned_query_peer_publication_test_serial()
         .lock()
         .await;
@@ -4330,8 +4343,7 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
         },
     );
 
-    app.source_state_replay_required
-        .store(true, Ordering::Release);
+    set_source_replay_required_for_tests(&app, true);
     app.api_control_gate.set_ready(false);
     assert_eq!(
         app.current_facade_service_state().await,
@@ -4361,9 +4373,8 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
         app.api_task.clone(),
         app.api_control_gate.clone(),
         app.facade_service_state.clone(),
-        app.control_initialized.clone(),
-        app.source_state_replay_required.clone(),
-        app.sink_state_replay_required.clone(),
+        app.runtime_gate_state.clone(),
+        app.runtime_state_changed.clone(),
         app.pending_fixed_bind_has_suppressed_dependent_routes
             .clone(),
     );
@@ -4399,7 +4410,7 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_facade_state_with_serving_when_pending_reappears_before_gate_reopen()
-{
+ {
     let _family_serial = deferred_sink_owned_query_peer_publication_test_serial()
         .lock()
         .await;
@@ -4647,9 +4658,8 @@ async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_f
         app.api_task.clone(),
         app.api_control_gate.clone(),
         app.facade_service_state.clone(),
-        app.control_initialized.clone(),
-        app.source_state_replay_required.clone(),
-        app.sink_state_replay_required.clone(),
+        app.runtime_gate_state.clone(),
+        app.runtime_state_changed.clone(),
         app.pending_fixed_bind_has_suppressed_dependent_routes
             .clone(),
     );

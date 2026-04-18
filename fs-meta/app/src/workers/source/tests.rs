@@ -381,6 +381,85 @@ fn worker_watch_scan_root(id: &str, path: &Path) -> RootSpec {
 }
 
 #[test]
+fn prime_cached_schedule_from_control_signals_respects_watch_and_scan_flags() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let roots = vec![
+        worker_source_root("nfs1", &nfs1),
+        worker_source_root("nfs2", &nfs2),
+    ];
+    let grants = vec![
+        worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1),
+        worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2),
+    ];
+    let signals = source_control_signals_from_envelopes(&[
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+            ],
+        }))
+        .expect("encode source activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+            ],
+        }))
+        .expect("encode source scan activate"),
+    ])
+    .expect("decode source control signals");
+
+    let mut cache = SourceWorkerSnapshotCache::default();
+    let summary = prime_cached_schedule_from_control_signals(
+        &mut cache,
+        &NodeId("node-a".to_string()),
+        &signals,
+        &roots,
+        &grants,
+    );
+
+    assert!(
+        summary.saw_activate_with_bound_scopes,
+        "control-signal priming should observe local activate scopes"
+    );
+    assert!(
+        summary.has_local_runnable_groups,
+        "scan-enabled roots should still report local runnable groups"
+    );
+    assert!(
+        cache
+            .scheduled_source_groups_by_node
+            .as_ref()
+            .is_none_or(|groups| groups.is_empty()),
+        "watch-disabled roots must not prime scheduled source groups from control signals: {:?}",
+        cache.scheduled_source_groups_by_node
+    );
+    assert_eq!(
+        cache.scheduled_scan_groups_by_node,
+        Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )])),
+        "scan-enabled roots should still prime scheduled scan groups"
+    );
+}
+
+#[test]
 fn fs_meta_worker_module_path_prefers_newer_debug_deps_cdylib_over_stale_top_level_debug_cdylib() {
     let tmp = tempdir().expect("create temp dir");
     let lib_name = fs_meta_runtime_lib_filename();

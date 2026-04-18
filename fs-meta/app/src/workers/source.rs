@@ -612,6 +612,10 @@ fn prime_cached_schedule_from_control_signals(
         for scope in bound_scopes {
             let applies_locally = roots
                 .iter()
+                .filter(|root| match unit {
+                    SourceRuntimeUnit::Source => root.watch,
+                    SourceRuntimeUnit::Scan => root.scan,
+                })
                 .any(|root| bound_scope_applies_locally(scope, root, node_id, &grants));
             if !applies_locally {
                 continue;
