@@ -546,7 +546,7 @@ async fn stale_activate_generation_is_ignored() {
 
 #[tokio::test]
 async fn sink_runtime_exec_failover_reactivate_replaces_scoped_holder_without_stale_activated_scope()
-{
+ {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![RootSpec::new("nfs2", "/mnt/nfs2")];
     cfg.host_object_grants = vec![
@@ -589,7 +589,10 @@ async fn sink_runtime_exec_failover_reactivate_replaces_scoped_holder_without_st
         .unit_state("runtime.exec.sink")
         .expect("unit state after successor activate")
         .expect("runtime.exec.sink unit state should exist");
-    assert!(state.0, "runtime.exec.sink should remain active after successor activate");
+    assert!(
+        state.0,
+        "runtime.exec.sink should remain active after successor activate"
+    );
     assert_eq!(
         state.1,
         vec![RuntimeBoundScope {
@@ -1221,7 +1224,7 @@ async fn events_stream_materializes_split_primary_mixed_cluster_publications_on_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_logical_roots_preserves_pending_audit_scheduled_group_during_split_primary_refresh_when_siblings_are_ready()
-{
+ {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![
         RootSpec::new("nfs1", "/mnt/nfs1"),
@@ -3068,8 +3071,8 @@ async fn update_logical_roots_does_not_widen_runtime_scope_back_to_all_roots_whe
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn update_logical_roots_drops_unrelated_pending_audit_group_from_local_sink_schedule_after_force_find_stress_scope_contraction(
-) {
+async fn update_logical_roots_drops_unrelated_pending_audit_group_from_local_sink_schedule_after_force_find_stress_scope_contraction()
+ {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![
         RootSpec::new("nfs1", "/mnt/nfs1"),
@@ -3865,8 +3868,8 @@ async fn active_stream_route_refreshes_dynamic_object_refs_and_accepts_new_origi
         },
     ))
     .expect("encode stream activate")])
-    .await
-    .expect("activate stream route");
+        .await
+        .expect("activate stream route");
 
     assert_eq!(
         sink.scheduled_stream_object_refs()
@@ -4262,7 +4265,7 @@ async fn initial_audit_completion_waits_for_materialized_root() {
 
 #[tokio::test]
 async fn status_snapshot_exports_waiting_for_materialized_root_after_audit_completes_without_materialized_root()
-{
+ {
     let sink = build_single_group_sink();
     sink.send(&[
         mk_control_event(
@@ -4299,8 +4302,7 @@ async fn status_snapshot_exports_waiting_for_materialized_root_after_audit_compl
 }
 
 #[tokio::test]
-async fn status_snapshot_exports_audit_epoch_completed_alongside_waiting_for_materialized_root()
-{
+async fn status_snapshot_exports_audit_epoch_completed_alongside_waiting_for_materialized_root() {
     let sink = build_single_group_sink();
     sink.send(&[
         mk_control_event(
@@ -4345,7 +4347,7 @@ async fn status_snapshot_exports_audit_epoch_completed_alongside_waiting_for_mat
 
 #[test]
 fn sink_group_status_snapshot_deserialize_recomputes_initial_audit_completed_from_readiness_when_waiting_for_root()
-{
+ {
     let group_json = serde_json::json!({
         "group_id": "nfs1",
         "primary_object_ref": "unassigned",
@@ -4380,7 +4382,7 @@ fn sink_group_status_snapshot_deserialize_recomputes_initial_audit_completed_fro
 
 #[test]
 fn sink_group_status_snapshot_deserialize_recomputes_initial_audit_completed_from_readiness_when_ready()
-{
+ {
     let group_json = serde_json::json!({
         "group_id": "nfs1",
         "primary_object_ref": "node-a::exp",
@@ -4411,8 +4413,8 @@ fn sink_group_status_snapshot_deserialize_recomputes_initial_audit_completed_fro
 }
 
 #[test]
-fn sink_group_status_snapshot_deserialize_derives_waiting_for_root_from_legacy_fields_when_readiness_missing(
-) {
+fn sink_group_status_snapshot_deserialize_derives_waiting_for_root_from_legacy_fields_when_readiness_missing()
+ {
     let group_json = serde_json::json!({
         "group_id": "nfs1",
         "primary_object_ref": "unassigned",
@@ -4450,8 +4452,8 @@ fn sink_group_status_snapshot_deserialize_derives_waiting_for_root_from_legacy_f
 }
 
 #[test]
-fn sink_group_status_snapshot_deserialize_derives_pending_audit_from_legacy_fields_when_readiness_missing(
-) {
+fn sink_group_status_snapshot_deserialize_derives_pending_audit_from_legacy_fields_when_readiness_missing()
+ {
     let group_json = serde_json::json!({
         "group_id": "nfs1",
         "primary_object_ref": "node-a::exp",
@@ -4489,8 +4491,8 @@ fn sink_group_status_snapshot_deserialize_derives_pending_audit_from_legacy_fiel
 }
 
 #[test]
-fn sink_group_status_snapshot_deserialize_derives_ready_from_legacy_fields_when_readiness_missing(
-) {
+fn sink_group_status_snapshot_deserialize_derives_ready_from_legacy_fields_when_readiness_missing()
+{
     let group_json = serde_json::json!({
         "group_id": "nfs1",
         "primary_object_ref": "node-a::exp",
@@ -4528,8 +4530,8 @@ fn sink_group_status_snapshot_deserialize_derives_ready_from_legacy_fields_when_
 }
 
 #[test]
-fn sink_group_status_snapshot_serialize_recomputes_initial_audit_completed_from_readiness_when_waiting_for_root(
-) {
+fn sink_group_status_snapshot_serialize_recomputes_initial_audit_completed_from_readiness_when_waiting_for_root()
+ {
     let snapshot = SinkGroupStatusSnapshot {
         group_id: "nfs1".to_string(),
         primary_object_ref: "unassigned".to_string(),
@@ -4558,8 +4560,8 @@ fn sink_group_status_snapshot_serialize_recomputes_initial_audit_completed_from_
 }
 
 #[test]
-fn sink_group_status_snapshot_serialize_recomputes_initial_audit_completed_from_readiness_when_ready(
-) {
+fn sink_group_status_snapshot_serialize_recomputes_initial_audit_completed_from_readiness_when_ready()
+ {
     let snapshot = SinkGroupStatusSnapshot {
         group_id: "nfs1".to_string(),
         primary_object_ref: "node-a::exp".to_string(),
@@ -4623,6 +4625,45 @@ fn sink_group_status_snapshot_deserialize_normalizes_zero_row_placeholder_primar
     assert!(
         snapshot.audit_epoch_completed(),
         "normalized waiting-for-materialized-root snapshots must still surface audit_epoch_completed=true: {snapshot:?}"
+    );
+}
+
+#[test]
+fn sink_group_status_snapshot_deserialize_normalizes_zero_row_empty_primary_readiness() {
+    let group_json = serde_json::json!({
+        "group_id": "nfs1",
+        "primary_object_ref": "",
+        "total_nodes": 0,
+        "live_nodes": 0,
+        "tombstoned_count": 0,
+        "attested_count": 0,
+        "suspect_count": 0,
+        "blind_spot_count": 0,
+        "shadow_time_us": 0,
+        "shadow_lag_us": 0,
+        "overflow_pending_audit": false,
+        "readiness": GroupReadinessState::Ready,
+        "audit_epoch_completed": true,
+        "initial_audit_completed": true,
+        "materialized_revision": 7,
+        "estimated_heap_bytes": 0
+    });
+
+    let snapshot: SinkGroupStatusSnapshot =
+        serde_json::from_value(group_json).expect("deserialize sink group status snapshot");
+
+    assert_eq!(
+        snapshot.readiness,
+        GroupReadinessState::WaitingForMaterializedRoot,
+        "deserialization must normalize stale exported readiness=Ready to waiting-for-materialized-root when the snapshot is still a structural zero row with an empty legacy placeholder primary: {snapshot:?}"
+    );
+    assert!(
+        !snapshot.initial_audit_completed,
+        "deserialization must keep the legacy compatibility bit false after normalizing a zero-row empty-primary snapshot to waiting-for-materialized-root: {snapshot:?}"
+    );
+    assert!(
+        snapshot.audit_epoch_completed(),
+        "normalized waiting-for-materialized-root empty-primary snapshots must still surface audit_epoch_completed=true: {snapshot:?}"
     );
 }
 
@@ -4706,6 +4747,46 @@ fn sink_group_status_snapshot_serialize_normalizes_zero_row_placeholder_primary_
 }
 
 #[test]
+fn sink_group_status_snapshot_serialize_normalizes_zero_row_empty_primary_readiness() {
+    let snapshot = SinkGroupStatusSnapshot {
+        group_id: "nfs1".to_string(),
+        primary_object_ref: "".to_string(),
+        total_nodes: 0,
+        live_nodes: 0,
+        tombstoned_count: 0,
+        attested_count: 0,
+        suspect_count: 0,
+        blind_spot_count: 0,
+        shadow_time_us: 0,
+        shadow_lag_us: 0,
+        overflow_pending_audit: false,
+        readiness: GroupReadinessState::Ready,
+        initial_audit_completed: true,
+        materialized_revision: 7,
+        estimated_heap_bytes: 0,
+    };
+
+    let group_json = serde_json::to_value(&snapshot).expect("serialize sink group status snapshot");
+
+    assert_eq!(
+        group_json["readiness"],
+        serde_json::to_value(GroupReadinessState::WaitingForMaterializedRoot)
+            .expect("serialize waiting-for-materialized-root"),
+        "serialization must normalize stale readiness=Ready to waiting-for-materialized-root when the snapshot is still a structural zero row with an empty legacy placeholder primary: {group_json}"
+    );
+    assert_eq!(
+        group_json["audit_epoch_completed"],
+        serde_json::Value::Bool(true),
+        "normalized waiting-for-materialized-root empty-primary exports must still surface audit_epoch_completed=true: {group_json}"
+    );
+    assert_eq!(
+        group_json["initial_audit_completed"],
+        serde_json::Value::Bool(false),
+        "normalized waiting-for-materialized-root empty-primary exports must keep the legacy compatibility bit false: {group_json}"
+    );
+}
+
+#[test]
 fn sink_group_status_snapshot_serialize_normalizes_zero_row_bound_primary_readiness() {
     let snapshot = SinkGroupStatusSnapshot {
         group_id: "nfs1".to_string(),
@@ -4729,8 +4810,7 @@ fn sink_group_status_snapshot_serialize_normalizes_zero_row_bound_primary_readin
 
     assert_eq!(
         group_json["readiness"],
-        serde_json::to_value(GroupReadinessState::PendingAudit)
-            .expect("serialize pending-audit"),
+        serde_json::to_value(GroupReadinessState::PendingAudit).expect("serialize pending-audit"),
         "serialization must normalize stale readiness=Ready to pending-audit when the snapshot is still a structural zero row with a bound primary: {group_json}"
     );
     assert_eq!(
@@ -4989,5 +5069,85 @@ async fn initial_audit_completion_clears_when_group_regresses_to_structural_root
     assert!(
         !response.root.exists,
         "structural-root-only tree must not keep reporting a live root after the only child is deleted"
+    );
+}
+
+#[test]
+fn sink_group_status_snapshot_deserialize_normalizes_live_row_waiting_for_materialized_root_to_ready()
+ {
+    let group_json = serde_json::json!({
+        "group_id": "nfs1",
+        "primary_object_ref": "unassigned",
+        "total_nodes": 1,
+        "live_nodes": 1,
+        "tombstoned_count": 0,
+        "attested_count": 1,
+        "suspect_count": 0,
+        "blind_spot_count": 0,
+        "shadow_time_us": 1,
+        "shadow_lag_us": 1,
+        "overflow_pending_audit": false,
+        "readiness": GroupReadinessState::WaitingForMaterializedRoot,
+        "audit_epoch_completed": true,
+        "initial_audit_completed": false,
+        "materialized_revision": 9,
+        "estimated_heap_bytes": 128
+    });
+
+    let snapshot: SinkGroupStatusSnapshot =
+        serde_json::from_value(group_json).expect("deserialize sink group status snapshot");
+
+    assert_eq!(
+        snapshot.readiness,
+        GroupReadinessState::Ready,
+        "deserialization must normalize stale waiting-for-materialized-root readiness back to ready when the snapshot already has a live materialized row: {snapshot:?}"
+    );
+    assert!(
+        snapshot.initial_audit_completed,
+        "deserialization must recompute the compatibility bit to true after normalizing a live row back to ready: {snapshot:?}"
+    );
+    assert!(
+        snapshot.audit_epoch_completed(),
+        "normalized live-row ready snapshots must preserve audit_epoch_completed=true: {snapshot:?}"
+    );
+}
+
+#[test]
+fn sink_group_status_snapshot_serialize_normalizes_live_row_waiting_for_materialized_root_to_ready()
+{
+    let snapshot = SinkGroupStatusSnapshot {
+        group_id: "nfs1".to_string(),
+        primary_object_ref: "unassigned".to_string(),
+        total_nodes: 1,
+        live_nodes: 1,
+        tombstoned_count: 0,
+        attested_count: 1,
+        suspect_count: 0,
+        blind_spot_count: 0,
+        shadow_time_us: 1,
+        shadow_lag_us: 1,
+        overflow_pending_audit: false,
+        readiness: GroupReadinessState::WaitingForMaterializedRoot,
+        initial_audit_completed: false,
+        materialized_revision: 9,
+        estimated_heap_bytes: 128,
+    };
+
+    let group_json = serde_json::to_value(&snapshot).expect("serialize sink group status snapshot");
+
+    assert_eq!(
+        group_json["readiness"],
+        serde_json::to_value(GroupReadinessState::Ready).expect("serialize ready"),
+        "serialization must normalize stale waiting-for-materialized-root readiness back to ready when the snapshot already has a live materialized row: {group_json}"
+    );
+    assert_eq!(
+        group_json["audit_epoch_completed"],
+        serde_json::Value::Bool(true),
+        "normalized live-row ready exports must preserve audit_epoch_completed=true: {group_json}"
+    );
+    assert_eq!(
+        group_json["initial_audit_completed"],
+        serde_json::Value::Bool(true),
+        "normalized live-row ready exports must recompute the compatibility bit to true: {group_json}"
     );
 }

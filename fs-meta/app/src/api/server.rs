@@ -324,34 +324,40 @@ fn router(state: ApiState, control_gate: Arc<ApiControlGate>) -> Result<Router> 
         .layer(cors))
 }
 
-fn request_requires_control_readiness(method: &Method, path: &str) -> bool {
-    matches!(method, &Method::PUT) && path == "/api/fs-meta/v1/monitoring/roots"
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ApiRequestRoutePolicy {
+    requires_control_readiness: bool,
+    counts_toward_control_drain: bool,
+    counts_toward_facade_request_drain: bool,
 }
 
-fn request_counts_toward_control_drain(method: &Method, path: &str) -> bool {
-    matches!(
-        (method, path),
-        (&Method::PUT, "/api/fs-meta/v1/monitoring/roots")
-            | (&Method::POST, "/api/fs-meta/v1/query-api-keys")
-    ) || (matches!(method, &Method::DELETE) && path.starts_with("/api/fs-meta/v1/query-api-keys/"))
-}
-fn request_counts_toward_facade_request_drain(method: &Method, path: &str) -> bool {
-    matches!(
-        (method, path),
-        (&Method::POST, "/api/fs-meta/v1/session/login")
-            | (&Method::GET, "/api/fs-meta/v1/status")
-            | (&Method::GET, "/api/fs-meta/v1/runtime/grants")
-            | (&Method::GET, "/api/fs-meta/v1/monitoring/roots")
-            | (&Method::PUT, "/api/fs-meta/v1/monitoring/roots")
-            | (&Method::POST, "/api/fs-meta/v1/monitoring/roots/preview")
-            | (&Method::POST, "/api/fs-meta/v1/index/rescan")
-            | (&Method::GET, "/api/fs-meta/v1/query-api-keys")
-            | (&Method::POST, "/api/fs-meta/v1/query-api-keys")
-            | (&Method::GET, "/api/fs-meta/v1/tree")
-            | (&Method::GET, "/api/fs-meta/v1/stats")
-            | (&Method::GET, "/api/fs-meta/v1/on-demand-force-find")
-            | (&Method::GET, "/api/fs-meta/v1/bound-route-metrics")
-    ) || (matches!(method, &Method::DELETE) && path.starts_with("/api/fs-meta/v1/query-api-keys/"))
+fn api_request_route_policy(method: &Method, path: &str) -> ApiRequestRoutePolicy {
+    let query_api_key_delete =
+        matches!(method, &Method::DELETE) && path.starts_with("/api/fs-meta/v1/query-api-keys/");
+    let roots_put = matches!(method, &Method::PUT) && path == "/api/fs-meta/v1/monitoring/roots";
+
+    ApiRequestRoutePolicy {
+        requires_control_readiness: roots_put,
+        counts_toward_control_drain: roots_put
+            || matches!(method, &Method::POST) && path == "/api/fs-meta/v1/query-api-keys"
+            || query_api_key_delete,
+        counts_toward_facade_request_drain: matches!(
+            (method, path),
+            (&Method::POST, "/api/fs-meta/v1/session/login")
+                | (&Method::GET, "/api/fs-meta/v1/status")
+                | (&Method::GET, "/api/fs-meta/v1/runtime/grants")
+                | (&Method::GET, "/api/fs-meta/v1/monitoring/roots")
+                | (&Method::PUT, "/api/fs-meta/v1/monitoring/roots")
+                | (&Method::POST, "/api/fs-meta/v1/monitoring/roots/preview")
+                | (&Method::POST, "/api/fs-meta/v1/index/rescan")
+                | (&Method::GET, "/api/fs-meta/v1/query-api-keys")
+                | (&Method::POST, "/api/fs-meta/v1/query-api-keys")
+                | (&Method::GET, "/api/fs-meta/v1/tree")
+                | (&Method::GET, "/api/fs-meta/v1/stats")
+                | (&Method::GET, "/api/fs-meta/v1/on-demand-force-find")
+                | (&Method::GET, "/api/fs-meta/v1/bound-route-metrics")
+        ) || query_api_key_delete,
+    }
 }
 
 async fn projection_request_facade_guard(
@@ -359,10 +365,9 @@ async fn projection_request_facade_guard(
     request: Request,
     next: Next,
 ) -> Response {
-    let facade_request_guard = (request_counts_toward_facade_request_drain(
-        request.method(),
-        request.uri().path(),
-    ) && !request_requires_control_readiness(request.method(), request.uri().path()))
+    let policy = api_request_route_policy(request.method(), request.uri().path());
+    let facade_request_guard = (policy.counts_toward_facade_request_drain
+        && !policy.requires_control_readiness)
         .then(|| control_gate.begin_facade_request());
     response_with_owned_guards(next.run(request).await, None, facade_request_guard)
 }
@@ -372,11 +377,11 @@ async fn request_control_readiness_guard(
     request: Request,
     next: Next,
 ) -> Response {
-    let requires_control_readiness =
-        request_requires_control_readiness(request.method(), request.uri().path());
-    let facade_request_guard =
-        requires_control_readiness.then(|| control_gate.begin_facade_request());
-    if !requires_control_readiness {
+    let policy = api_request_route_policy(request.method(), request.uri().path());
+    let facade_request_guard = policy
+        .requires_control_readiness
+        .then(|| control_gate.begin_facade_request());
+    if !policy.requires_control_readiness {
         return next.run(request).await;
     }
     if control_gate.is_ready() {
@@ -404,8 +409,9 @@ async fn request_logging(State(state): State<ApiState>, request: Request, next: 
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let method = request.method().clone();
     let path = request.uri().path().to_string();
-    let request_guard =
-        request_counts_toward_control_drain(&method, &path).then(|| state.request_tracker.begin());
+    let request_guard = api_request_route_policy(&method, &path)
+        .counts_toward_control_drain
+        .then(|| state.request_tracker.begin());
     let started_at = std::time::Instant::now();
     eprintln!(
         "fs_meta_api_server: request begin id={} method={} path={}",
@@ -492,8 +498,7 @@ mod tests {
             "admin:1000:1000:fs-meta-admin:/home/admin:/bin/sh:false\n",
         )
         .expect("write passwd");
-        std::fs::write(&shadow_path, "admin:plain$secret:false\n")
-            .expect("write shadow");
+        std::fs::write(&shadow_path, "admin:plain$secret:false\n").expect("write shadow");
         std::fs::write(&query_keys_path, "{\"keys\":[]}\n").expect("write query-api-keys");
         (passwd_path, shadow_path, query_keys_path)
     }
@@ -555,7 +560,7 @@ mod tests {
             (Method::DELETE, "/api/fs-meta/v1/query-api-keys/key-1"),
         ] {
             assert!(
-                request_counts_toward_control_drain(&method, path),
+                api_request_route_policy(&method, path).counts_toward_control_drain,
                 "{method} {path} should count toward global control drain"
             );
         }
@@ -574,7 +579,7 @@ mod tests {
             (Method::GET, "/api/fs-meta/v1/bound-route-metrics"),
         ] {
             assert!(
-                !request_counts_toward_control_drain(&method, path),
+                !api_request_route_policy(&method, path).counts_toward_control_drain,
                 "{method} {path} should not count toward global control drain"
             );
         }
@@ -584,7 +589,7 @@ mod tests {
     fn request_control_readiness_stays_limited_to_roots_put() {
         for (method, path) in [(Method::PUT, "/api/fs-meta/v1/monitoring/roots")] {
             assert!(
-                request_requires_control_readiness(&method, path),
+                api_request_route_policy(&method, path).requires_control_readiness,
                 "{method} {path} should require control readiness"
             );
         }
@@ -598,7 +603,7 @@ mod tests {
             (Method::GET, "/api/fs-meta/v1/tree"),
         ] {
             assert!(
-                !request_requires_control_readiness(&method, path),
+                !api_request_route_policy(&method, path).requires_control_readiness,
                 "{method} {path} should not require control readiness"
             );
         }
@@ -622,17 +627,41 @@ mod tests {
             (Method::GET, "/api/fs-meta/v1/bound-route-metrics"),
         ] {
             assert!(
-                request_counts_toward_facade_request_drain(&method, path),
+                api_request_route_policy(&method, path).counts_toward_facade_request_drain,
                 "{method} {path} should count toward facade request drain"
             );
         }
 
         for (method, path) in [(Method::OPTIONS, "/healthz")] {
             assert!(
-                !request_counts_toward_facade_request_drain(&method, path),
+                !api_request_route_policy(&method, path).counts_toward_facade_request_drain,
                 "{method} {path} should not count toward facade request drain"
             );
         }
+    }
+
+    #[test]
+    fn api_request_route_policy_assigns_roots_put_to_all_three_gates() {
+        assert_eq!(
+            api_request_route_policy(&Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
+            ApiRequestRoutePolicy {
+                requires_control_readiness: true,
+                counts_toward_control_drain: true,
+                counts_toward_facade_request_drain: true,
+            }
+        );
+    }
+
+    #[test]
+    fn api_request_route_policy_assigns_tree_to_facade_only_lane() {
+        assert_eq!(
+            api_request_route_policy(&Method::GET, "/api/fs-meta/v1/tree"),
+            ApiRequestRoutePolicy {
+                requires_control_readiness: false,
+                counts_toward_control_drain: false,
+                counts_toward_facade_request_drain: true,
+            }
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -969,7 +998,7 @@ mod tests {
         );
 
         drop(response);
-        tokio::time::timeout(Duration::from_secs(1), request_tracker.wait_for_drain(),)
+        tokio::time::timeout(Duration::from_secs(1), request_tracker.wait_for_drain())
             .await
             .expect("global request drain should clear after the response body drops");
         release.notify_waiters();

@@ -112,6 +112,7 @@
             resource_ids: vec!["listener-a".to_string()],
             handle: active_facade,
         });
+        app_1.refresh_active_fixed_bind_facade_owner().await;
 
         let client = Client::new();
         let login = client
@@ -127,6 +128,11 @@
         );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
+
+        app_1
+            .on_control_frame(&[activate_envelope("runtime.exec.source")])
+            .await
+            .expect("initialize active app from runtime control before roots_put");
 
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -314,6 +320,7 @@
             resource_ids: vec!["listener-a".to_string()],
             handle: active_facade,
         });
+        app_1.refresh_active_fixed_bind_facade_owner().await;
 
         let client = Client::new();
         let login = client
@@ -329,6 +336,11 @@
         );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
+
+        app_1
+            .on_control_frame(&[activate_envelope("runtime.exec.source")])
+            .await
+            .expect("initialize active app from runtime control before roots_put");
 
         let update_entered = Arc::new(Notify::new());
         let update_release = Arc::new(Notify::new());
@@ -403,4 +415,3 @@
             .expect("close successor app after roots_put");
         app_1.close().await.expect("close first app");
     }
-

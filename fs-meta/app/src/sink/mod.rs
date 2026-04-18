@@ -355,47 +355,85 @@ pub struct SinkGroupStatusSnapshot {
     pub estimated_heap_bytes: u64,
 }
 
-impl SinkGroupStatusSnapshot {
-    fn normalized_readiness_from_fields(
-        group_id: &str,
-        primary_object_ref: &str,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GroupReadinessProjection {
+    readiness: GroupReadinessState,
+    initial_audit_completed: bool,
+    audit_epoch_completed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GroupReadinessFacts<'a> {
+    group_id: &'a str,
+    primary_object_ref: &'a str,
+    total_nodes: u64,
+    live_nodes: u64,
+    ready_materialization_evidence: bool,
+}
+
+impl<'a> GroupReadinessFacts<'a> {
+    fn from_snapshot(
+        group_id: &'a str,
+        primary_object_ref: &'a str,
         total_nodes: u64,
         live_nodes: u64,
-        readiness: GroupReadinessState,
-    ) -> GroupReadinessState {
-        if total_nodes == 0
-            && live_nodes == 0
-            && matches!(readiness, GroupReadinessState::Ready)
-        {
-            if primary_object_ref == "unassigned" || primary_object_ref == group_id {
-                GroupReadinessState::WaitingForMaterializedRoot
-            } else {
-                GroupReadinessState::PendingAudit
-            }
-        } else {
-            readiness
+    ) -> Self {
+        Self {
+            group_id,
+            primary_object_ref,
+            total_nodes,
+            live_nodes,
+            ready_materialization_evidence: total_nodes > 0 || live_nodes > 0,
         }
     }
 
-    fn normalized_readiness(&self) -> GroupReadinessState {
-        Self::normalized_readiness_from_fields(
-            &self.group_id,
-            &self.primary_object_ref,
-            self.total_nodes,
-            self.live_nodes,
-            self.readiness,
-        )
+    fn from_live_group_state(
+        primary_object_ref: &'a str,
+        has_live_materialized_nodes: bool,
+    ) -> Self {
+        Self {
+            group_id: "",
+            primary_object_ref,
+            total_nodes: 0,
+            live_nodes: 0,
+            ready_materialization_evidence: has_live_materialized_nodes,
+        }
     }
 
-    fn initial_audit_completed_from_readiness(readiness: GroupReadinessState) -> bool {
-        matches!(readiness, GroupReadinessState::Ready)
+    fn uses_placeholder_primary_truth(self) -> bool {
+        self.primary_object_ref.is_empty()
+            || self.primary_object_ref == "unassigned"
+            || self.primary_object_ref == self.group_id
     }
 
-    fn readiness_from_legacy_fields(
-        group_id: &str,
-        primary_object_ref: &str,
-        total_nodes: u64,
-        live_nodes: u64,
+    fn live_readiness(self, audit_epoch_completed: bool) -> GroupReadinessState {
+        if !audit_epoch_completed {
+            GroupReadinessState::PendingAudit
+        } else if self.ready_materialization_evidence {
+            GroupReadinessState::Ready
+        } else {
+            GroupReadinessState::WaitingForMaterializedRoot
+        }
+    }
+
+    fn normalize_snapshot_readiness(self, readiness: GroupReadinessState) -> GroupReadinessState {
+        match readiness {
+            GroupReadinessState::WaitingForMaterializedRoot if self.live_nodes > 0 => {
+                GroupReadinessState::Ready
+            }
+            GroupReadinessState::Ready if self.total_nodes == 0 && self.live_nodes == 0 => {
+                if self.uses_placeholder_primary_truth() {
+                    GroupReadinessState::WaitingForMaterializedRoot
+                } else {
+                    GroupReadinessState::PendingAudit
+                }
+            }
+            _ => readiness,
+        }
+    }
+
+    fn legacy_snapshot_readiness(
+        self,
         initial_audit_completed: Option<bool>,
         audit_epoch_completed: Option<bool>,
     ) -> GroupReadinessState {
@@ -404,29 +442,66 @@ impl SinkGroupStatusSnapshot {
         } else if matches!(initial_audit_completed, Some(true)) {
             GroupReadinessState::Ready
         } else if matches!(audit_epoch_completed, Some(true)) {
-            if total_nodes > 0 || live_nodes > 0 {
-                GroupReadinessState::Ready
-            } else {
-                GroupReadinessState::WaitingForMaterializedRoot
-            }
-        } else if total_nodes > 0 || live_nodes > 0 {
+            self.live_readiness(true)
+        } else if self.ready_materialization_evidence {
             GroupReadinessState::Ready
-        } else if primary_object_ref == "unassigned" || primary_object_ref == group_id {
+        } else if self.uses_placeholder_primary_truth() {
             GroupReadinessState::WaitingForMaterializedRoot
         } else {
             GroupReadinessState::PendingAudit
         };
 
-        Self::normalized_readiness_from_fields(
-            group_id,
-            primary_object_ref,
-            total_nodes,
-            live_nodes,
-            inferred,
+        self.normalize_snapshot_readiness(inferred)
+    }
+
+    fn projection_from_normalized_snapshot(
+        self,
+        readiness: GroupReadinessState,
+    ) -> GroupReadinessProjection {
+        self.normalize_snapshot_readiness(readiness).projection()
+    }
+
+    fn projection_from_deserialized_snapshot(
+        self,
+        readiness: Option<GroupReadinessState>,
+        initial_audit_completed: Option<bool>,
+        audit_epoch_completed: Option<bool>,
+    ) -> GroupReadinessProjection {
+        readiness.map_or_else(
+            || {
+                self.legacy_snapshot_readiness(initial_audit_completed, audit_epoch_completed)
+                    .projection()
+            },
+            |readiness| self.normalize_snapshot_readiness(readiness).projection(),
         )
     }
 
-    fn deserialized_readiness(
+    fn projection_from_live_state(self, audit_epoch_completed: bool) -> GroupReadinessProjection {
+        self.live_readiness(audit_epoch_completed).projection()
+    }
+}
+
+impl GroupReadinessProjection {
+    fn from_readiness(readiness: GroupReadinessState) -> Self {
+        Self {
+            readiness,
+            initial_audit_completed: readiness.initial_audit_completed(),
+            audit_epoch_completed: readiness.audit_epoch_completed(),
+        }
+    }
+
+    fn normalized_snapshot(
+        group_id: &str,
+        primary_object_ref: &str,
+        total_nodes: u64,
+        live_nodes: u64,
+        readiness: GroupReadinessState,
+    ) -> Self {
+        GroupReadinessFacts::from_snapshot(group_id, primary_object_ref, total_nodes, live_nodes)
+            .projection_from_normalized_snapshot(readiness)
+    }
+
+    fn deserialized_snapshot(
         group_id: &str,
         primary_object_ref: &str,
         total_nodes: u64,
@@ -434,32 +509,109 @@ impl SinkGroupStatusSnapshot {
         readiness: Option<GroupReadinessState>,
         initial_audit_completed: Option<bool>,
         audit_epoch_completed: Option<bool>,
-    ) -> GroupReadinessState {
-        readiness.map_or_else(
-            || {
-                Self::readiness_from_legacy_fields(
-                    group_id,
-                    primary_object_ref,
-                    total_nodes,
-                    live_nodes,
-                    initial_audit_completed,
-                    audit_epoch_completed,
-                )
-            },
-            |readiness| {
-                Self::normalized_readiness_from_fields(
-                    group_id,
-                    primary_object_ref,
-                    total_nodes,
-                    live_nodes,
-                    readiness,
-                )
-            },
+    ) -> Self {
+        GroupReadinessFacts::from_snapshot(group_id, primary_object_ref, total_nodes, live_nodes)
+            .projection_from_deserialized_snapshot(
+                readiness,
+                initial_audit_completed,
+                audit_epoch_completed,
+            )
+    }
+}
+
+impl SinkGroupStatusSnapshot {
+    fn from_projection(
+        group_id: String,
+        primary_object_ref: String,
+        total_nodes: u64,
+        live_nodes: u64,
+        tombstoned_count: u64,
+        attested_count: u64,
+        suspect_count: u64,
+        blind_spot_count: u64,
+        shadow_time_us: u64,
+        shadow_lag_us: u64,
+        overflow_pending_audit: bool,
+        readiness: GroupReadinessProjection,
+        materialized_revision: u64,
+        estimated_heap_bytes: u64,
+    ) -> Self {
+        Self {
+            group_id,
+            primary_object_ref,
+            total_nodes,
+            live_nodes,
+            tombstoned_count,
+            attested_count,
+            suspect_count,
+            blind_spot_count,
+            shadow_time_us,
+            shadow_lag_us,
+            overflow_pending_audit,
+            readiness: readiness.readiness,
+            initial_audit_completed: readiness.initial_audit_completed,
+            materialized_revision,
+            estimated_heap_bytes,
+        }
+    }
+
+    fn from_status_fields(
+        group_id: String,
+        primary_object_ref: String,
+        total_nodes: u64,
+        live_nodes: u64,
+        tombstoned_count: u64,
+        attested_count: u64,
+        suspect_count: u64,
+        blind_spot_count: u64,
+        shadow_time_us: u64,
+        shadow_lag_us: u64,
+        overflow_pending_audit: bool,
+        readiness: GroupReadinessState,
+        materialized_revision: u64,
+        estimated_heap_bytes: u64,
+    ) -> Self {
+        let readiness = GroupReadinessProjection::normalized_snapshot(
+            &group_id,
+            &primary_object_ref,
+            total_nodes,
+            live_nodes,
+            readiness,
+        );
+        Self::from_projection(
+            group_id,
+            primary_object_ref,
+            total_nodes,
+            live_nodes,
+            tombstoned_count,
+            attested_count,
+            suspect_count,
+            blind_spot_count,
+            shadow_time_us,
+            shadow_lag_us,
+            overflow_pending_audit,
+            readiness,
+            materialized_revision,
+            estimated_heap_bytes,
         )
     }
 
+    fn normalized_readiness_projection(&self) -> GroupReadinessProjection {
+        GroupReadinessProjection::normalized_snapshot(
+            &self.group_id,
+            &self.primary_object_ref,
+            self.total_nodes,
+            self.live_nodes,
+            self.readiness,
+        )
+    }
+
+    pub(crate) fn normalized_readiness(&self) -> GroupReadinessState {
+        self.normalized_readiness_projection().readiness
+    }
+
     pub fn audit_epoch_completed(&self) -> bool {
-        !matches!(self.normalized_readiness(), GroupReadinessState::PendingAudit)
+        self.normalized_readiness_projection().audit_epoch_completed
     }
 }
 
@@ -490,7 +642,7 @@ impl<'de> serde::Deserialize<'de> for SinkGroupStatusSnapshot {
         }
 
         let raw = RawSinkGroupStatusSnapshot::deserialize(deserializer)?;
-        let readiness = Self::deserialized_readiness(
+        let readiness = GroupReadinessProjection::deserialized_snapshot(
             &raw.group_id,
             &raw.primary_object_ref,
             raw.total_nodes,
@@ -499,23 +651,22 @@ impl<'de> serde::Deserialize<'de> for SinkGroupStatusSnapshot {
             raw.initial_audit_completed,
             raw.audit_epoch_completed,
         );
-        Ok(Self {
-            group_id: raw.group_id,
-            primary_object_ref: raw.primary_object_ref,
-            total_nodes: raw.total_nodes,
-            live_nodes: raw.live_nodes,
-            tombstoned_count: raw.tombstoned_count,
-            attested_count: raw.attested_count,
-            suspect_count: raw.suspect_count,
-            blind_spot_count: raw.blind_spot_count,
-            shadow_time_us: raw.shadow_time_us,
-            shadow_lag_us: raw.shadow_lag_us,
-            overflow_pending_audit: raw.overflow_pending_audit,
-            initial_audit_completed: Self::initial_audit_completed_from_readiness(readiness),
+        Ok(Self::from_projection(
+            raw.group_id,
+            raw.primary_object_ref,
+            raw.total_nodes,
+            raw.live_nodes,
+            raw.tombstoned_count,
+            raw.attested_count,
+            raw.suspect_count,
+            raw.blind_spot_count,
+            raw.shadow_time_us,
+            raw.shadow_lag_us,
+            raw.overflow_pending_audit,
             readiness,
-            materialized_revision: raw.materialized_revision,
-            estimated_heap_bytes: raw.estimated_heap_bytes,
-        })
+            raw.materialized_revision,
+            raw.estimated_heap_bytes,
+        ))
     }
 }
 
@@ -524,7 +675,7 @@ impl serde::Serialize for SinkGroupStatusSnapshot {
     where
         S: serde::Serializer,
     {
-        let readiness = self.normalized_readiness();
+        let readiness = self.normalized_readiness_projection();
         let mut state = serializer.serialize_struct("SinkGroupStatusSnapshot", 16)?;
         state.serialize_field("group_id", &self.group_id)?;
         state.serialize_field("primary_object_ref", &self.primary_object_ref)?;
@@ -537,11 +688,11 @@ impl serde::Serialize for SinkGroupStatusSnapshot {
         state.serialize_field("shadow_time_us", &self.shadow_time_us)?;
         state.serialize_field("shadow_lag_us", &self.shadow_lag_us)?;
         state.serialize_field("overflow_pending_audit", &self.overflow_pending_audit)?;
-        state.serialize_field("readiness", &readiness)?;
-        state.serialize_field("audit_epoch_completed", &self.audit_epoch_completed())?;
+        state.serialize_field("readiness", &readiness.readiness)?;
+        state.serialize_field("audit_epoch_completed", &readiness.audit_epoch_completed)?;
         state.serialize_field(
             "initial_audit_completed",
-            &Self::initial_audit_completed_from_readiness(readiness),
+            &readiness.initial_audit_completed,
         )?;
         state.serialize_field("materialized_revision", &self.materialized_revision)?;
         state.serialize_field("estimated_heap_bytes", &self.estimated_heap_bytes)?;
@@ -584,6 +735,225 @@ pub struct SinkStatusSnapshot {
     pub stream_applied_origin_counts_by_node: BTreeMap<String, Vec<String>>,
     pub stream_applied_path_origin_counts_by_node: BTreeMap<String, Vec<String>>,
     pub stream_last_applied_at_us_by_node: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SinkStatusSnapshotReadinessSummary {
+    pub(crate) scheduled_groups: BTreeSet<String>,
+    pub(crate) ready_groups: BTreeSet<String>,
+    pub(crate) waiting_for_materialized_root_groups: BTreeSet<String>,
+    pub(crate) pending_audit_groups: BTreeSet<String>,
+    pub(crate) missing_scheduled_groups: BTreeSet<String>,
+    pub(crate) has_stream_group_evidence: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SinkStatusSnapshotIssue {
+    StaleEmpty,
+    ScheduledMissingGroupRowsAfterStreamEvidence,
+    ScheduledPendingAuditWithoutStreamReceipts,
+    ScheduledWaitingForMaterializedRoot,
+    ScheduledMixedReadyAndUnready,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SinkStatusSnapshotIssueProjection {
+    pub(crate) summary: SinkStatusSnapshotReadinessSummary,
+    pub(crate) issue: Option<SinkStatusSnapshotIssue>,
+}
+
+impl SinkStatusSnapshot {
+    pub(crate) fn scheduled_groups(&self) -> BTreeSet<String> {
+        self.scheduled_groups_by_node
+            .values()
+            .flat_map(|groups| groups.iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn readiness_summary(&self) -> SinkStatusSnapshotReadinessSummary {
+        let scheduled_groups = self.scheduled_groups();
+        if scheduled_groups.is_empty() {
+            return SinkStatusSnapshotReadinessSummary::default();
+        }
+
+        let groups_by_id = self
+            .groups
+            .iter()
+            .map(|group| (group.group_id.as_str(), group))
+            .collect::<BTreeMap<_, _>>();
+        let mut summary = SinkStatusSnapshotReadinessSummary {
+            has_stream_group_evidence: snapshot_has_stream_group_evidence(self, &scheduled_groups),
+            scheduled_groups,
+            ..SinkStatusSnapshotReadinessSummary::default()
+        };
+
+        for group_id in &summary.scheduled_groups {
+            let Some(group) = groups_by_id.get(group_id.as_str()) else {
+                summary.missing_scheduled_groups.insert(group_id.clone());
+                continue;
+            };
+            match group.normalized_readiness() {
+                GroupReadinessState::Ready if group.live_nodes > 0 && group.total_nodes > 0 => {
+                    summary.ready_groups.insert(group_id.clone());
+                }
+                GroupReadinessState::WaitingForMaterializedRoot => {
+                    summary
+                        .waiting_for_materialized_root_groups
+                        .insert(group_id.clone());
+                }
+                GroupReadinessState::PendingAudit => {
+                    summary.pending_audit_groups.insert(group_id.clone());
+                }
+                GroupReadinessState::Ready => {}
+            }
+        }
+
+        summary
+    }
+
+    pub(crate) fn ready_groups(&self) -> BTreeSet<String> {
+        self.readiness_summary().ready_groups
+    }
+
+    pub(crate) fn has_ready_scheduled_groups(&self) -> bool {
+        let projection = self.issue_projection();
+        !projection.summary.scheduled_groups.is_empty()
+            && projection
+                .summary
+                .scheduled_groups
+                .is_subset(&projection.summary.ready_groups)
+    }
+
+    pub(crate) fn looks_stale_empty(&self) -> bool {
+        self.scheduled_groups_by_node.is_empty()
+            && self
+                .groups
+                .iter()
+                .all(|group| group.live_nodes == 0 && group.total_nodes == 0)
+    }
+
+    pub(crate) fn issue_projection(&self) -> SinkStatusSnapshotIssueProjection {
+        let summary = self.readiness_summary();
+        let issue = if self.looks_stale_empty() {
+            Some(SinkStatusSnapshotIssue::StaleEmpty)
+        } else if readiness_summary_looks_scheduled_missing_group_rows_after_stream_evidence(
+            &summary,
+        ) {
+            Some(SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence)
+        } else if readiness_summary_looks_scheduled_pending_audit_without_stream_receipts(
+            &summary, self,
+        ) {
+            Some(SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts)
+        } else if readiness_summary_looks_scheduled_waiting_for_materialized_root(&summary) {
+            Some(SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot)
+        } else if readiness_summary_looks_scheduled_mixed_ready_and_unready(&summary) {
+            Some(SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready)
+        } else {
+            None
+        };
+
+        SinkStatusSnapshotIssueProjection { summary, issue }
+    }
+
+    pub(crate) fn issue(&self) -> Option<SinkStatusSnapshotIssue> {
+        self.issue_projection().issue
+    }
+}
+
+pub(crate) fn sink_status_origin_entry_group_id(entry: &str) -> &str {
+    let origin = entry
+        .split_once('=')
+        .map(|(origin, _)| origin)
+        .unwrap_or(entry);
+    let scoped = origin
+        .rsplit_once("::")
+        .map(|(_, group_id)| group_id)
+        .unwrap_or(origin);
+    scoped
+        .split_once(':')
+        .map(|(group_id, _)| group_id)
+        .unwrap_or(scoped)
+}
+
+fn snapshot_has_stream_group_evidence(
+    snapshot: &SinkStatusSnapshot,
+    scheduled_groups: &BTreeSet<String>,
+) -> bool {
+    [
+        &snapshot.stream_received_origin_counts_by_node,
+        &snapshot.stream_received_path_origin_counts_by_node,
+        &snapshot.stream_ready_origin_counts_by_node,
+        &snapshot.stream_applied_origin_counts_by_node,
+        &snapshot.stream_ready_path_origin_counts_by_node,
+        &snapshot.stream_applied_path_origin_counts_by_node,
+    ]
+    .into_iter()
+    .flat_map(|groups_by_node| groups_by_node.values())
+    .flat_map(|entries| entries.iter())
+    .any(|entry| scheduled_groups.contains(sink_status_origin_entry_group_id(entry)))
+}
+
+fn readiness_summary_looks_scheduled_missing_group_rows_after_stream_evidence(
+    summary: &SinkStatusSnapshotReadinessSummary,
+) -> bool {
+    !summary.scheduled_groups.is_empty()
+        && !summary.missing_scheduled_groups.is_empty()
+        && summary.has_stream_group_evidence
+}
+
+fn readiness_summary_looks_scheduled_waiting_for_materialized_root(
+    summary: &SinkStatusSnapshotReadinessSummary,
+) -> bool {
+    !summary.scheduled_groups.is_empty()
+        && summary.missing_scheduled_groups.is_empty()
+        && summary.waiting_for_materialized_root_groups.len() == summary.scheduled_groups.len()
+}
+
+fn readiness_summary_looks_scheduled_pending_audit_without_stream_receipts(
+    summary: &SinkStatusSnapshotReadinessSummary,
+    snapshot: &SinkStatusSnapshot,
+) -> bool {
+    if summary.scheduled_groups.is_empty()
+        || !summary.missing_scheduled_groups.is_empty()
+        || summary.pending_audit_groups.len() != summary.scheduled_groups.len()
+    {
+        return false;
+    }
+    snapshot.received_batches_by_node.is_empty()
+        && snapshot.received_events_by_node.is_empty()
+        && snapshot.received_control_events_by_node.is_empty()
+        && snapshot.received_data_events_by_node.is_empty()
+        && snapshot.last_received_at_us_by_node.is_empty()
+        && snapshot.last_received_origins_by_node.is_empty()
+        && snapshot.received_origin_counts_by_node.is_empty()
+        && snapshot.stream_received_batches_by_node.is_empty()
+        && snapshot.stream_received_events_by_node.is_empty()
+        && snapshot.stream_received_origin_counts_by_node.is_empty()
+        && snapshot
+            .stream_received_path_origin_counts_by_node
+            .is_empty()
+        && snapshot.stream_ready_origin_counts_by_node.is_empty()
+        && snapshot.stream_ready_path_origin_counts_by_node.is_empty()
+        && snapshot.stream_deferred_origin_counts_by_node.is_empty()
+        && snapshot.stream_dropped_origin_counts_by_node.is_empty()
+        && snapshot.stream_applied_batches_by_node.is_empty()
+        && snapshot.stream_applied_events_by_node.is_empty()
+        && snapshot.stream_applied_control_events_by_node.is_empty()
+        && snapshot.stream_applied_data_events_by_node.is_empty()
+        && snapshot.stream_applied_origin_counts_by_node.is_empty()
+        && snapshot
+            .stream_applied_path_origin_counts_by_node
+            .is_empty()
+        && snapshot.stream_last_applied_at_us_by_node.is_empty()
+}
+
+fn readiness_summary_looks_scheduled_mixed_ready_and_unready(
+    summary: &SinkStatusSnapshotReadinessSummary,
+) -> bool {
+    !summary.scheduled_groups.is_empty()
+        && !summary.ready_groups.is_empty()
+        && (!summary.waiting_for_materialized_root_groups.is_empty()
+            || !summary.pending_audit_groups.is_empty())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -651,6 +1021,20 @@ pub enum GroupReadinessState {
     Ready,
 }
 
+impl GroupReadinessState {
+    fn projection(self) -> GroupReadinessProjection {
+        GroupReadinessProjection::from_readiness(self)
+    }
+
+    fn initial_audit_completed(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    fn audit_epoch_completed(self) -> bool {
+        !matches!(self, Self::PendingAudit)
+    }
+}
+
 pub(crate) struct GroupSinkState {
     pub(crate) tree: MaterializedTree,
     pub(crate) clock: SinkClock,
@@ -686,23 +1070,26 @@ impl GroupSinkState {
             .is_some_and(|aggregate| aggregate.total_nodes > 0)
     }
 
+    fn group_readiness_projection(&self) -> GroupReadinessProjection {
+        GroupReadinessFacts::from_live_group_state(
+            &self.primary_object_ref,
+            self.has_live_materialized_nodes(),
+        )
+        .projection_from_live_state(self.audit_epoch_completed)
+    }
+
     fn group_readiness_state(&self) -> GroupReadinessState {
-        if !self.audit_epoch_completed {
-            GroupReadinessState::PendingAudit
-        } else if self.has_live_materialized_nodes() {
-            GroupReadinessState::Ready
-        } else {
-            GroupReadinessState::WaitingForMaterializedRoot
-        }
+        self.group_readiness_projection().readiness
     }
 
     fn initial_audit_completed(&self) -> bool {
-        matches!(self.group_readiness_state(), GroupReadinessState::Ready)
+        self.group_readiness_projection().initial_audit_completed
     }
 
     fn preserves_materialized_state_for_omission_window(&self) -> bool {
+        let readiness = self.group_readiness_projection().readiness;
         matches!(
-            self.group_readiness_state(),
+            readiness,
             GroupReadinessState::WaitingForMaterializedRoot | GroupReadinessState::Ready
         ) || self.tree.node_count() > 0
             || self.materialized_revision > 1
@@ -2475,7 +2862,8 @@ impl SinkFileMeta {
             // When a successor runtime.exec.sink activate arrives for the same scopes,
             // keep active routes aligned to the latest bound scope/resource mapping
             // instead of merging stale dead-holder refs into the exported state.
-            self.unit_control.sync_active_scopes(unit_id, bound_scopes)?;
+            self.unit_control
+                .sync_active_scopes(unit_id, bound_scopes)?;
         }
         Ok(())
     }
@@ -2808,7 +3196,10 @@ impl SinkFileMeta {
                 .iter()
                 .filter(|(_, group)| {
                     group.preserves_materialized_state_for_omission_window()
-                        && !matches!(group.group_readiness_state(), GroupReadinessState::PendingAudit)
+                        && !matches!(
+                            group.group_readiness_state(),
+                            GroupReadinessState::PendingAudit
+                        )
                 })
                 .map(|(group_id, _)| group_id.clone())
                 .collect::<BTreeSet<_>>();
@@ -2882,28 +3273,26 @@ impl SinkFileMeta {
             let stats = query::get_health_stats(&group.tree, &group.clock);
             let estimated_heap_bytes = group.tree.estimated_heap_bytes();
             accumulate_status_snapshot(&mut snapshot, &stats, estimated_heap_bytes);
-            let readiness = group.group_readiness_state();
-            groups.push(SinkGroupStatusSnapshot {
-                group_id: group_id.clone(),
-                primary_object_ref: group.primary_object_ref.clone(),
-                total_nodes: group.tree.node_count() as u64,
-                live_nodes: stats.live_nodes,
-                tombstoned_count: stats.tombstoned_count,
-                attested_count: stats.attested_count,
-                suspect_count: stats.suspect_count,
-                blind_spot_count: stats.blind_spot_count,
-                shadow_time_us: stats.shadow_time_us,
-                shadow_lag_us: if stats.shadow_time_us == 0 {
+            groups.push(SinkGroupStatusSnapshot::from_status_fields(
+                group_id.clone(),
+                group.primary_object_ref.clone(),
+                group.tree.node_count() as u64,
+                stats.live_nodes,
+                stats.tombstoned_count,
+                stats.attested_count,
+                stats.suspect_count,
+                stats.blind_spot_count,
+                stats.shadow_time_us,
+                if stats.shadow_time_us == 0 {
                     0
                 } else {
                     now.saturating_sub(stats.shadow_time_us)
                 },
-                overflow_pending_audit: group.overflow_pending_audit,
-                readiness,
-                initial_audit_completed: group.initial_audit_completed(),
-                materialized_revision: group.materialized_revision,
+                group.overflow_pending_audit,
+                group.group_readiness_state(),
+                group.materialized_revision,
                 estimated_heap_bytes,
-            });
+            ));
         }
         groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
         snapshot.groups = groups;

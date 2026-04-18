@@ -1484,6 +1484,112 @@ async fn status_snapshot_nonblocking_retries_peer_bridge_stopped_errors_after_be
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scheduled_group_ids_channel_closed_resets_shared_client_before_retry() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs1", &nfs1)],
+        host_object_grants: vec![
+            sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    sink.on_control_frame(vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+            ],
+        }))
+        .expect("encode sink activate"),
+    ])
+    .await
+    .expect("apply sink control");
+
+    let expected_groups =
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let scheduled = sink
+            .scheduled_group_ids()
+            .await
+            .expect("initial scheduled groups")
+            .unwrap_or_default();
+        if scheduled == expected_groups {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for scheduled groups before channel-closed retry test: scheduled={scheduled:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let previous_worker_identity = sink.shared_worker_identity_for_tests().await;
+    let reset_count = Arc::new(AtomicUsize::new(0));
+    let _reset_hook = SinkWorkerRetryResetHookReset;
+    install_sink_worker_retry_reset_hook(SinkWorkerRetryResetHook {
+        reset_count: reset_count.clone(),
+    });
+
+    let _error_reset = SinkWorkerScheduledGroupsErrorHookReset;
+    install_sink_worker_scheduled_groups_error_hook(SinkWorkerScheduledGroupsErrorHook {
+        err: CnxError::ChannelClosed,
+    });
+
+    let scheduled = sink
+        .scheduled_group_ids()
+        .await
+        .expect("scheduled_group_ids should recover after channel-closed error")
+        .expect("scheduled_group_ids should remain available after channel-closed retry");
+
+    let next_worker_identity = sink.shared_worker_identity_for_tests().await;
+
+    assert_eq!(
+        scheduled, expected_groups,
+        "scheduled_group_ids retry should still reach the live sink worker and preserve scheduled groups"
+    );
+    assert!(
+        reset_count.load(Ordering::SeqCst) >= 1,
+        "scheduled_group_ids channel-closed recovery must reset the shared sink worker client before retry"
+    );
+    assert_ne!(
+        next_worker_identity, previous_worker_identity,
+        "scheduled_group_ids channel-closed recovery must replace the shared sink worker client before retry"
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn update_logical_roots_reacquires_worker_client_after_transport_closes_mid_handoff() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");

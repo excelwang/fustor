@@ -2886,8 +2886,8 @@ fn test_api_state_for_route_source(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn materialized_target_groups_excludes_unscheduled_request_source_groups_after_root_transition(
-) {
+async fn materialized_target_groups_excludes_unscheduled_request_source_groups_after_root_transition()
+ {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_a_nfs2 = tmp.path().join("node-a-nfs2");
     let node_a_nfs4 = tmp.path().join("node-a-nfs4");
@@ -2984,8 +2984,8 @@ async fn materialized_target_groups_excludes_unscheduled_request_source_groups_a
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn materialized_target_groups_preserves_unscheduled_request_source_groups_for_non_root_stats(
-) {
+async fn materialized_target_groups_preserves_unscheduled_request_source_groups_for_non_root_stats()
+{
     let tmp = tempfile::tempdir().expect("create tempdir");
     let root_a = tmp.path().join("node-a");
     let root_b = tmp.path().join("node-b");
@@ -3379,8 +3379,19 @@ async fn selected_group_force_find_route_uses_source_find_endpoint_for_chosen_no
         move |requests| {
             let routed_calls = routed_calls_for_handler.clone();
             async move {
-                routed_calls.fetch_add(requests.len(), std::sync::atomic::Ordering::SeqCst);
-                vec![mk_event("node-a::routed", vec![1, 2, 3])]
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        routed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        mk_event_with_correlation(
+                            "node-a::routed",
+                            req.metadata()
+                                .correlation_id
+                                .expect("source-find request correlation"),
+                            vec![1, 2, 3],
+                        )
+                    })
+                    .collect::<Vec<_>>()
             }
         },
     );
@@ -4371,8 +4382,8 @@ async fn query_materialized_events_via_generic_proxy_retries_missing_channel_buf
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn query_materialized_events_via_generic_proxy_accepts_immediate_reply_with_timeout_smaller_than_idle_grace(
-) {
+async fn query_materialized_events_via_generic_proxy_accepts_immediate_reply_with_timeout_smaller_than_idle_grace()
+ {
     let boundary = Arc::new(ReusableObservedRouteBoundary::default());
     let proxy_route = default_route_bindings()
         .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
@@ -4444,8 +4455,8 @@ async fn query_materialized_events_via_generic_proxy_accepts_immediate_reply_wit
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn load_request_scoped_materialized_sink_status_snapshot_accepts_immediate_reply_with_timeout_smaller_than_status_idle_grace(
-) {
+async fn load_request_scoped_materialized_sink_status_snapshot_accepts_immediate_reply_with_timeout_smaller_than_status_idle_grace()
+ {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_b_root = tmp.path().join("node-b");
     fs::create_dir_all(node_b_root.join("layout-b")).expect("create node-b dir");
@@ -4521,11 +4532,9 @@ async fn load_request_scoped_materialized_sink_status_snapshot_accepts_immediate
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
 
-    let result = load_request_scoped_materialized_sink_status_snapshot(
-        &state,
-        Duration::from_millis(250),
-    )
-    .await;
+    let result =
+        load_request_scoped_materialized_sink_status_snapshot(&state, Duration::from_millis(250))
+            .await;
 
     assert!(
         result.is_some(),
@@ -4545,8 +4554,8 @@ async fn load_request_scoped_materialized_sink_status_snapshot_accepts_immediate
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn query_materialized_events_via_generic_proxy_does_not_retry_protocol_violation_until_timeout(
-) {
+async fn query_materialized_events_via_generic_proxy_does_not_retry_protocol_violation_until_timeout()
+ {
     let boundary = Arc::new(ReusableObservedRouteBoundary::default());
     let proxy_route = default_route_bindings()
         .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
@@ -4610,8 +4619,8 @@ async fn query_materialized_events_via_generic_proxy_does_not_retry_protocol_vio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn query_materialized_events_via_generic_proxy_does_not_hold_delayed_reply_open_for_full_idle_grace(
-) {
+async fn query_materialized_events_via_generic_proxy_does_not_hold_delayed_reply_open_for_full_idle_grace()
+ {
     let boundary = Arc::new(ReusableObservedRouteBoundary::default());
     let proxy_route = default_route_bindings()
         .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
@@ -4682,8 +4691,8 @@ async fn query_materialized_events_via_generic_proxy_does_not_hold_delayed_reply
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn route_materialized_events_via_node_accepts_immediate_reply_with_timeout_smaller_than_idle_grace(
-) {
+async fn route_materialized_events_via_node_accepts_immediate_reply_with_timeout_smaller_than_idle_grace()
+ {
     let boundary = Arc::new(ReusableObservedRouteBoundary::default());
     let owner_route = sink_query_request_route_for("node-a");
 
@@ -4753,8 +4762,8 @@ async fn route_materialized_events_via_node_accepts_immediate_reply_with_timeout
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn route_materialized_events_via_node_does_not_hold_immediate_reply_open_for_full_idle_grace(
-) {
+async fn route_materialized_events_via_node_does_not_hold_immediate_reply_open_for_full_idle_grace()
+{
     let boundary = Arc::new(ReusableObservedRouteBoundary::default());
     let owner_route = sink_query_request_route_for("node-a");
 
@@ -5271,7 +5280,7 @@ async fn selected_group_trusted_materialized_route_reserves_enough_proxy_budget_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_group_trusted_materialized_route_preserves_timeout_when_owner_and_proxy_both_stall_for_later_ranked_root_group()
-{
+ {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_a_root = tmp.path().join("node-a");
     let node_b_root = tmp.path().join("node-b");
@@ -5716,8 +5725,104 @@ async fn selected_group_materialized_route_falls_back_to_generic_proxy_when_owne
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn selected_group_materialized_route_falls_back_to_generic_proxy_after_first_ranked_trusted_non_root_empty_owner_retry(
-) {
+async fn selected_group_materialized_route_settles_request_scoped_omitted_ready_root_group_as_empty_tree()
+ {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a");
+    fs::create_dir_all(node_a_root.join("layout-a")).expect("create node-a dir");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-a::nfs4".to_string(),
+        host_ref: "node-a".to_string(),
+        host_ip: "10.0.0.1".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: node_a_root,
+        fs_source: "nfs".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let source = source_facade_with_group("nfs4", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let state =
+        test_api_state_for_route_source(source, sink, boundary, NodeId("node-d".to_string()));
+
+    let selected_group_sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs5".to_string()],
+        )]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs5".to_string(),
+            primary_object_ref: "node-b::nfs5".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 1,
+            shadow_lag_us: 0,
+            overflow_pending_audit: false,
+            initial_audit_completed: true,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+    let omitted_ready_groups = BTreeSet::from(["nfs4".to_string()]);
+
+    let result =
+        query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
+            &state,
+            &ProjectionPolicy::default(),
+            build_materialized_tree_request(
+                b"/",
+                true,
+                None,
+                ReadClass::TrustedMaterialized,
+                Some("nfs4".to_string()),
+            ),
+            Duration::from_millis(1200),
+            Some(selected_group_sink_status),
+            Some(&omitted_ready_groups),
+            true,
+            true,
+            false,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "request-scoped omitted ready selected-group root query should settle as a synthetic empty tree instead of plain empty/no-payload: err={:?}",
+        result.as_ref().err(),
+    );
+    let payload = decode_materialized_selected_group_response(
+        &result.expect("request-scoped omitted ready selected-group result"),
+        &ProjectionPolicy::default(),
+        "nfs4",
+        b"/",
+    )
+    .expect("decode request-scoped omitted ready selected-group response");
+    assert!(
+        !payload.root.exists,
+        "request-scoped omitted ready selected-group root query must synthesize an empty tree payload"
+    );
+    assert_eq!(
+        payload.root.path,
+        b"/".to_vec(),
+        "synthetic empty selected-group tree should preserve the root request path"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_group_materialized_route_falls_back_to_generic_proxy_after_first_ranked_trusted_non_root_empty_owner_retry()
+ {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_b_root = tmp.path().join("node-b");
     fs::create_dir_all(node_b_root.join("nested")).expect("create node-b nested dir");

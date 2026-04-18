@@ -1,6 +1,6 @@
 #[test]
-fn materialized_owner_node_for_group_prefers_scheduled_owner_when_primary_object_ref_is_unscheduled(
-) {
+fn materialized_owner_node_for_group_prefers_scheduled_owner_when_primary_object_ref_is_unscheduled()
+ {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let root_a = tmp.path().join("node-a");
     let root_b = tmp.path().join("node-b");
@@ -70,6 +70,7 @@ fn materialized_owner_node_for_group_prefers_scheduled_owner_when_primary_object
             source.as_ref(),
             Some(&sink_status),
             "nfs4",
+            MaterializedOwnerOmissionPolicy::Authoritative,
         ))
         .expect("resolve nfs4 owner")
         .expect("nfs4 owner");
@@ -133,6 +134,7 @@ fn materialized_owner_node_for_group_tracks_group_primary_by_group() {
             source.as_ref(),
             None,
             "nfs1",
+            MaterializedOwnerOmissionPolicy::Authoritative,
         ))
         .expect("resolve nfs1 owner")
         .expect("nfs1 owner");
@@ -141,6 +143,7 @@ fn materialized_owner_node_for_group_tracks_group_primary_by_group() {
             source.as_ref(),
             None,
             "nfs2",
+            MaterializedOwnerOmissionPolicy::Authoritative,
         ))
         .expect("resolve nfs2 owner")
         .expect("nfs2 owner");
@@ -151,7 +154,7 @@ fn materialized_owner_node_for_group_tracks_group_primary_by_group() {
 
 #[test]
 fn materialized_owner_node_for_group_does_not_fallback_to_source_primary_when_explicit_sink_status_omits_group()
-{
+ {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let root_a = tmp.path().join("node-a");
     let root_b = tmp.path().join("node-b");
@@ -227,6 +230,7 @@ fn materialized_owner_node_for_group_does_not_fallback_to_source_primary_when_ex
             source.as_ref(),
             Some(&sink_status),
             "nfs1",
+            MaterializedOwnerOmissionPolicy::Authoritative,
         ))
         .expect("resolve nfs1 owner");
 
@@ -238,7 +242,7 @@ fn materialized_owner_node_for_group_does_not_fallback_to_source_primary_when_ex
 
 #[test]
 fn materialized_owner_node_for_group_falls_back_to_source_primary_when_first_sink_status_snapshot_is_empty()
-{
+ {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let root_a = tmp.path().join("node-a");
     let root_b = tmp.path().join("node-b");
@@ -291,6 +295,7 @@ fn materialized_owner_node_for_group_falls_back_to_source_primary_when_first_sin
             source.as_ref(),
             Some(&sink_status),
             "nfs1",
+            MaterializedOwnerOmissionPolicy::TreatAsCollectionGap,
         ))
         .expect("resolve nfs1 owner from empty first sink status")
         .expect("nfs1 owner should fall back to source primary");
@@ -303,7 +308,7 @@ fn materialized_owner_node_for_group_falls_back_to_source_primary_when_first_sin
 
 #[test]
 fn trusted_materialized_empty_response_rescue_decision_defers_first_ranked_non_root_empty_after_initial_owner_retry_lane()
-{
+ {
     let decision = trusted_materialized_empty_response_rescue_decision(
         TrustedMaterializedEmptyResponseRescueDecisionInput {
             ready_group: true,
@@ -318,9 +323,9 @@ fn trusted_materialized_empty_response_rescue_decision_defers_first_ranked_non_r
     assert_eq!(
         decision,
         TrustedMaterializedEmptyResponseRescueDecision {
+            lane: EmptyTreeRescueLane::ReturnCurrent,
             owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::Skip,
-            attempt_generic_proxy_fallback: false,
-            fail_closed_after_proxy_error: false,
+            proxy_error_disposition: EmptyTreeProxyErrorDisposition::Ignore,
             fail_closed_on_final_empty_response: false,
             defer_first_ranked_empty_non_root_group: true,
         },
@@ -330,7 +335,7 @@ fn trusted_materialized_empty_response_rescue_decision_defers_first_ranked_non_r
 
 #[test]
 fn trusted_materialized_empty_response_rescue_decision_retries_later_non_root_owner_then_proxy_when_owner_known()
-{
+ {
     let decision = trusted_materialized_empty_response_rescue_decision(
         TrustedMaterializedEmptyResponseRescueDecisionInput {
             ready_group: false,
@@ -345,9 +350,9 @@ fn trusted_materialized_empty_response_rescue_decision_retries_later_non_root_ow
     assert_eq!(
         decision,
         TrustedMaterializedEmptyResponseRescueDecision {
+            lane: EmptyTreeRescueLane::OwnerRetryThenProxyFallback,
             owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::LaterNonRootBudget,
-            attempt_generic_proxy_fallback: true,
-            fail_closed_after_proxy_error: false,
+            proxy_error_disposition: EmptyTreeProxyErrorDisposition::Ignore,
             fail_closed_on_final_empty_response: false,
             defer_first_ranked_empty_non_root_group: false,
         },
@@ -357,7 +362,7 @@ fn trusted_materialized_empty_response_rescue_decision_retries_later_non_root_ow
 
 #[test]
 fn trusted_materialized_empty_response_rescue_decision_fail_closes_proxy_gap_for_later_ready_group_after_prior_decode()
-{
+ {
     let decision = trusted_materialized_empty_response_rescue_decision(
         TrustedMaterializedEmptyResponseRescueDecisionInput {
             ready_group: true,
@@ -372,9 +377,9 @@ fn trusted_materialized_empty_response_rescue_decision_fail_closes_proxy_gap_for
     assert_eq!(
         decision,
         TrustedMaterializedEmptyResponseRescueDecision {
+            lane: EmptyTreeRescueLane::OwnerRetryThenProxyFallback,
             owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::LaterNonRootBudget,
-            attempt_generic_proxy_fallback: true,
-            fail_closed_after_proxy_error: true,
+            proxy_error_disposition: EmptyTreeProxyErrorDisposition::FailClosedUnavailable,
             fail_closed_on_final_empty_response: false,
             defer_first_ranked_empty_non_root_group: false,
         },
@@ -384,7 +389,7 @@ fn trusted_materialized_empty_response_rescue_decision_fail_closes_proxy_gap_for
 
 #[test]
 fn trusted_materialized_empty_response_rescue_decision_uses_remaining_budget_for_fail_closed_ready_root()
-{
+ {
     let decision = trusted_materialized_empty_response_rescue_decision(
         TrustedMaterializedEmptyResponseRescueDecisionInput {
             ready_group: true,
@@ -399,9 +404,9 @@ fn trusted_materialized_empty_response_rescue_decision_uses_remaining_budget_for
     assert_eq!(
         decision,
         TrustedMaterializedEmptyResponseRescueDecision {
+            lane: EmptyTreeRescueLane::OwnerRetryThenSettle,
             owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::RemainingBudget,
-            attempt_generic_proxy_fallback: false,
-            fail_closed_after_proxy_error: false,
+            proxy_error_disposition: EmptyTreeProxyErrorDisposition::Ignore,
             fail_closed_on_final_empty_response: true,
             defer_first_ranked_empty_non_root_group: false,
         },
@@ -503,8 +508,7 @@ fn group_counts_as_prior_materialized_tree_decode_keeps_directory_truth() {
 }
 
 #[test]
-fn trusted_materialized_empty_response_rescue_decision_skips_proxy_after_prior_exact_file_decode()
-{
+fn trusted_materialized_empty_response_rescue_decision_skips_proxy_after_prior_exact_file_decode() {
     let decision = trusted_materialized_empty_response_rescue_decision(
         TrustedMaterializedEmptyResponseRescueDecisionInput {
             ready_group: true,
@@ -519,9 +523,9 @@ fn trusted_materialized_empty_response_rescue_decision_skips_proxy_after_prior_e
     assert_eq!(
         decision,
         TrustedMaterializedEmptyResponseRescueDecision {
+            lane: EmptyTreeRescueLane::ReturnCurrent,
             owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::Skip,
-            attempt_generic_proxy_fallback: false,
-            fail_closed_after_proxy_error: false,
+            proxy_error_disposition: EmptyTreeProxyErrorDisposition::Ignore,
             fail_closed_on_final_empty_response: false,
             defer_first_ranked_empty_non_root_group: false,
         },
@@ -531,7 +535,7 @@ fn trusted_materialized_empty_response_rescue_decision_skips_proxy_after_prior_e
 
 #[test]
 fn selected_group_owner_attempt_timeout_preserves_meaningful_owner_budget_within_shared_stage_budget()
-{
+ {
     let timeout = selected_group_owner_attempt_timeout(
         tokio::time::Instant::now() + Duration::from_millis(1500),
         true,
@@ -566,7 +570,7 @@ fn selected_group_owner_attempt_timeout_caps_proxy_reserve_to_configured_fallbac
 
 #[test]
 fn request_scoped_loaded_ready_group_preservation_decision_restores_loaded_group_for_explicit_empty_drift()
-{
+ {
     let decision = request_scoped_loaded_ready_group_preservation_decision(
         RequestScopedLoadedReadyGroupPreservationDecisionInput {
             loaded_group_reports_live_materialized: true,
@@ -590,7 +594,7 @@ fn request_scoped_loaded_ready_group_preservation_decision_restores_loaded_group
 
 #[test]
 fn request_scoped_loaded_ready_group_preservation_decision_restores_loaded_group_for_partial_schedule_omission()
-{
+ {
     let decision = request_scoped_loaded_ready_group_preservation_decision(
         RequestScopedLoadedReadyGroupPreservationDecisionInput {
             loaded_group_reports_live_materialized: true,
@@ -614,7 +618,7 @@ fn request_scoped_loaded_ready_group_preservation_decision_restores_loaded_group
 
 #[test]
 fn request_scoped_loaded_ready_group_preservation_decision_restores_loaded_group_for_missing_ready_group_row()
-{
+ {
     let decision = request_scoped_loaded_ready_group_preservation_decision(
         RequestScopedLoadedReadyGroupPreservationDecisionInput {
             loaded_group_reports_live_materialized: true,
@@ -638,7 +642,7 @@ fn request_scoped_loaded_ready_group_preservation_decision_restores_loaded_group
 
 #[test]
 fn request_scoped_loaded_ready_group_preservation_decision_does_not_restore_when_request_scope_omits_all_groups()
-{
+ {
     let decision = request_scoped_loaded_ready_group_preservation_decision(
         RequestScopedLoadedReadyGroupPreservationDecisionInput {
             loaded_group_reports_live_materialized: true,
@@ -662,7 +666,7 @@ fn request_scoped_loaded_ready_group_preservation_decision_does_not_restore_when
 
 #[test]
 fn request_scoped_schedule_omitted_ready_groups_keeps_loaded_ready_groups_when_request_scope_omits_all_groups()
-{
+ {
     let loaded_sink_status = SinkStatusSnapshot {
         scheduled_groups_by_node: BTreeMap::from([(
             "node-a".to_string(),
@@ -744,7 +748,7 @@ fn trusted_materialized_deferred_empty_group_decision_defers_first_ranked_empty_
 
 #[test]
 fn trusted_materialized_deferred_empty_group_decision_fail_closes_prior_deferred_group_when_later_group_decodes()
-{
+ {
     let decision = trusted_materialized_deferred_empty_group_decision(
         TrustedMaterializedDeferredEmptyGroupDecisionInput {
             defer_first_ranked_empty_non_root_group: false,
@@ -766,7 +770,8 @@ fn trusted_materialized_deferred_empty_group_decision_fail_closes_prior_deferred
 }
 
 #[test]
-fn trusted_materialized_deferred_empty_group_decision_keeps_waiting_when_later_group_is_also_empty() {
+fn trusted_materialized_deferred_empty_group_decision_keeps_waiting_when_later_group_is_also_empty()
+{
     let decision = trusted_materialized_deferred_empty_group_decision(
         TrustedMaterializedDeferredEmptyGroupDecisionInput {
             defer_first_ranked_empty_non_root_group: false,
@@ -784,6 +789,55 @@ fn trusted_materialized_deferred_empty_group_decision_keeps_waiting_when_later_g
             should_fail_closed_prior_deferred_group: false,
         },
         "later empty groups must not prematurely fail closed a deferred first-ranked trusted non-root group"
+    );
+}
+
+#[test]
+fn selected_group_owner_empty_tree_rescue_decision_retries_owner_then_proxies_for_trusted_non_root_empty_owner_response()
+ {
+    let decision = selected_group_owner_empty_tree_rescue_decision(
+        SelectedGroupOwnerEmptyTreeRescueDecisionInput {
+            owner_response_is_empty: true,
+            requires_proxy_fallback: false,
+            requires_primary_owner_reroute: false,
+            selected_group_sink_reports_live_materialized: true,
+            reserve_proxy_budget: true,
+            allow_empty_owner_retry: true,
+            settle_after_initial_owner_retry: false,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        SelectedGroupOwnerEmptyTreeRescueDecision {
+            lane: EmptyTreeRescueLane::OwnerRetryThenProxyFallback,
+            attempt_primary_owner_reroute: false,
+        },
+        "trusted non-root empty owner responses must stay on the bounded owner-retry then generic-proxy lane instead of settling empty after the first retry"
+    );
+}
+
+#[test]
+fn selected_group_owner_empty_tree_rescue_decision_fail_closes_ready_root_without_proxy_budget() {
+    let decision = selected_group_owner_empty_tree_rescue_decision(
+        SelectedGroupOwnerEmptyTreeRescueDecisionInput {
+            owner_response_is_empty: true,
+            requires_proxy_fallback: true,
+            requires_primary_owner_reroute: true,
+            selected_group_sink_reports_live_materialized: true,
+            reserve_proxy_budget: false,
+            allow_empty_owner_retry: false,
+            settle_after_initial_owner_retry: false,
+        },
+    );
+
+    assert_eq!(
+        decision,
+        SelectedGroupOwnerEmptyTreeRescueDecision {
+            lane: EmptyTreeRescueLane::FailClosed,
+            attempt_primary_owner_reroute: true,
+        },
+        "ready root empty-owner rescue must fail closed when neither proxy budget nor bounded owner retry is available, while still preserving the primary-owner reroute signal"
     );
 }
 
@@ -980,12 +1034,10 @@ fn max_total_files_from_stats_events_uses_highest_total_files() {
 }
 
 #[test]
-fn selected_group_owner_attempt_timeout_from_remaining_splits_sub_proxy_min_budget_evenly_for_later_ranked_groups(
-) {
-    let timeout = selected_group_owner_attempt_timeout_from_remaining(
-        Duration::from_millis(1800),
-        true,
-    );
+fn selected_group_owner_attempt_timeout_from_remaining_splits_sub_proxy_min_budget_evenly_for_later_ranked_groups()
+ {
+    let timeout =
+        selected_group_owner_attempt_timeout_from_remaining(Duration::from_millis(1800), true);
 
     assert_eq!(
         timeout,
@@ -995,12 +1047,10 @@ fn selected_group_owner_attempt_timeout_from_remaining_splits_sub_proxy_min_budg
 }
 
 #[test]
-fn selected_group_owner_attempt_timeout_from_remaining_splits_root_stage_budget_after_prior_decode(
-) {
-    let timeout = selected_group_owner_attempt_timeout_from_remaining(
-        Duration::from_millis(1200),
-        false,
-    );
+fn selected_group_owner_attempt_timeout_from_remaining_splits_root_stage_budget_after_prior_decode()
+{
+    let timeout =
+        selected_group_owner_attempt_timeout_from_remaining(Duration::from_millis(1200), false);
 
     assert_eq!(
         timeout,
@@ -1449,8 +1499,8 @@ fn materialized_query_readiness_waits_for_initial_audit_completion() {
 }
 
 #[test]
-fn cached_sink_status_drops_cached_ready_group_when_fresh_snapshot_explicitly_reports_same_group_empty(
-) {
+fn cached_sink_status_drops_cached_ready_group_when_fresh_snapshot_explicitly_reports_same_group_empty()
+ {
     let source_status = SourceStatusSnapshot {
         current_stream_generation: Some(1),
         logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
@@ -1684,8 +1734,8 @@ fn materialized_query_readiness_ignores_inactive_or_non_scan_groups() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn build_tree_pit_session_trusted_materialized_retries_empty_first_ranked_group_for_non_root_subtree_once(
-) {
+async fn build_tree_pit_session_trusted_materialized_retries_empty_first_ranked_group_for_non_root_subtree_once()
+ {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let root_a = tmp.path().join("node-a-nfs1");
     let root_b = tmp.path().join("node-a-nfs2");
@@ -1966,8 +2016,8 @@ async fn build_tree_pit_session_trusted_materialized_retries_empty_first_ranked_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn build_tree_pit_session_trusted_materialized_fail_closes_when_first_ranked_non_root_subtree_owner_and_proxy_stay_empty(
-) {
+async fn build_tree_pit_session_trusted_materialized_fail_closes_when_first_ranked_non_root_subtree_owner_and_proxy_stay_empty()
+ {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let root_a = tmp.path().join("node-a-nfs1");
     let root_b = tmp.path().join("node-a-nfs2");
@@ -2225,8 +2275,8 @@ async fn build_tree_pit_session_trusted_materialized_fail_closes_when_first_rank
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn build_tree_pit_session_trusted_materialized_retries_empty_first_ranked_group_for_non_root_subtree_with_max_depth_once(
-) {
+async fn build_tree_pit_session_trusted_materialized_retries_empty_first_ranked_group_for_non_root_subtree_with_max_depth_once()
+ {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let root_a = tmp.path().join("node-a-nfs1");
     let root_b = tmp.path().join("node-a-nfs2");
@@ -2528,8 +2578,8 @@ async fn build_tree_pit_session_trusted_materialized_retries_empty_first_ranked_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn build_tree_pit_session_trusted_materialized_falls_back_to_proxy_when_first_ranked_non_root_subtree_retry_times_out(
-) {
+async fn build_tree_pit_session_trusted_materialized_falls_back_to_proxy_when_first_ranked_non_root_subtree_retry_times_out()
+ {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let root_a = tmp.path().join("node-a-nfs1");
     let root_b = tmp.path().join("node-a-nfs2");
@@ -2823,8 +2873,8 @@ async fn build_tree_pit_session_trusted_materialized_falls_back_to_proxy_when_fi
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn build_tree_pit_session_trusted_materialized_preserves_richer_first_ranked_non_root_max_depth_proxy_payload_after_owner_retry_timeout(
-) {
+async fn build_tree_pit_session_trusted_materialized_preserves_richer_first_ranked_non_root_max_depth_proxy_payload_after_owner_retry_timeout()
+ {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let root_a = tmp.path().join("node-a-nfs1");
     let root_b = tmp.path().join("node-a-nfs2");
@@ -3161,8 +3211,8 @@ async fn build_tree_pit_session_trusted_materialized_preserves_richer_first_rank
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn build_tree_pit_session_trusted_materialized_falls_back_to_proxy_when_middle_ranked_non_root_max_depth_owner_remains_empty(
-) {
+async fn build_tree_pit_session_trusted_materialized_falls_back_to_proxy_when_middle_ranked_non_root_max_depth_owner_remains_empty()
+ {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let root_a = tmp.path().join("node-a-nfs1");
     let root_b = tmp.path().join("node-a-nfs2");

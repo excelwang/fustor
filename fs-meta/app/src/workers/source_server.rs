@@ -24,7 +24,10 @@ use crate::source::FSMetaSource;
 use crate::source::config::SourceConfig;
 use crate::workers::source::SourceObservabilitySnapshot;
 use crate::workers::source::SourceWorkerRpc;
-use crate::workers::source::recovered_scheduled_groups_by_node_from_active_status;
+use crate::workers::source::{
+    SourceObservabilityLiveAugment, build_source_observability_live_source_context,
+    build_source_observability_snapshot_from_live_context, control_signals_by_node,
+};
 use crate::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
 
 const ROUTE_KEY_EVENTS: &str = "fs-meta.events:v1";
@@ -169,6 +172,14 @@ fn stable_host_ref_for_node_id(
 }
 
 fn debug_stream_path_capture_target() -> Option<Vec<u8>> {
+    #[cfg(test)]
+    if let Some(target) = debug_stream_path_capture_target_override_for_tests()
+        .lock()
+        .expect("lock debug stream path capture target override")
+        .clone()
+    {
+        return target;
+    }
     static TARGET: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     TARGET
         .get_or_init(|| match std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE") {
@@ -177,6 +188,35 @@ fn debug_stream_path_capture_target() -> Option<Vec<u8>> {
             Err(_) => None,
         })
         .clone()
+}
+
+#[cfg(test)]
+fn debug_stream_path_capture_target_override_for_tests()
+-> &'static StdMutex<Option<Option<Vec<u8>>>> {
+    static TARGET: std::sync::OnceLock<StdMutex<Option<Option<Vec<u8>>>>> =
+        std::sync::OnceLock::new();
+    TARGET.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn set_debug_stream_path_capture_target_override_for_tests(value: Option<&str>) {
+    *debug_stream_path_capture_target_override_for_tests()
+        .lock()
+        .expect("lock debug stream path capture target override") =
+        Some(value.map(|target| target.as_bytes().to_vec()));
+}
+
+#[cfg(test)]
+fn clear_debug_stream_path_capture_target_override_for_tests() {
+    *debug_stream_path_capture_target_override_for_tests()
+        .lock()
+        .expect("lock debug stream path capture target override") = None;
+}
+
+#[cfg(test)]
+fn debug_stream_path_capture_target_override_serial_guard() -> &'static StdMutex<()> {
+    static GUARD: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
+    GUARD.get_or_init(|| StdMutex::new(()))
 }
 
 fn summarize_event_counts_by_origin(events: &[Event]) -> Vec<String> {
@@ -584,149 +624,79 @@ async fn fail_closed_if_publish_pump_dead(
     false
 }
 
-fn last_control_frame_signals_by_node(
-    node_key: &str,
-    signals: &[String],
-) -> std::collections::BTreeMap<String, Vec<String>> {
-    if signals.is_empty() {
-        return std::collections::BTreeMap::new();
-    }
-    std::collections::BTreeMap::from([(node_key.to_string(), signals.to_vec())])
-}
-
-fn scheduled_groups_by_node_has_recovered_members(
-    groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
-) -> bool {
-    groups_by_node.values().any(|groups| !groups.is_empty())
-}
-
 fn source_observability_snapshot(
     source: &FSMetaSource,
     last_control_frame_signals: &[String],
     published_stats: &Arc<StdMutex<PublishedBatchStats>>,
 ) -> SourceObservabilitySnapshot {
-    let node_id = source.node_id();
-    let grants = source.host_object_grants_snapshot();
-    let stable_host_ref = stable_host_ref_for_node_id(&node_id, &grants);
+    let context = build_source_observability_live_source_context(source);
     let published = lock_publish_stats(published_stats);
-    let status = source.status_snapshot();
-    let scheduled_source_groups_by_node = {
-        let explicit = source
-            .scheduled_source_group_ids()
-            .ok()
-            .flatten()
-            .map(|groups| {
-                std::collections::BTreeMap::from([(
-                    stable_host_ref.clone(),
-                    groups.into_iter().collect(),
-                )])
-            })
-            .unwrap_or_default();
-        if explicit.is_empty() {
-            recovered_scheduled_groups_by_node_from_active_status(
-                &stable_host_ref,
-                &status,
-                |entry| entry.watch_enabled,
-            )
-        } else {
-            explicit
-        }
-    };
-    let scheduled_scan_groups_by_node = {
-        let explicit = source
-            .scheduled_scan_group_ids()
-            .ok()
-            .flatten()
-            .map(|groups| {
-                std::collections::BTreeMap::from([(
-                    stable_host_ref.clone(),
-                    groups.into_iter().collect(),
-                )])
-            })
-            .unwrap_or_default();
-        if explicit.is_empty() {
-            recovered_scheduled_groups_by_node_from_active_status(
-                &stable_host_ref,
-                &status,
-                |entry| entry.scan_enabled,
-            )
-        } else {
-            explicit
-        }
-    };
-    let source_summary = source.last_control_frame_signals_snapshot();
-    let has_recovered_active_state = status.current_stream_generation.is_some()
-        || status
-            .logical_roots
-            .iter()
-            .any(|entry| entry.active_members > 0 || entry.status.eq_ignore_ascii_case("ready"))
-        || status.concrete_roots.iter().any(|entry| {
-            entry.active
-                || entry.current_stream_generation.is_some()
-                || entry.emitted_batch_count > 0
-                || entry.forwarded_batch_count > 0
-                || entry.emitted_event_count > 0
-                || entry.forwarded_event_count > 0
-        })
-        || scheduled_groups_by_node_has_recovered_members(&scheduled_source_groups_by_node)
-        || scheduled_groups_by_node_has_recovered_members(&scheduled_scan_groups_by_node);
+    let stable_host_ref = context.recovery.stable_host_ref.clone();
+    let has_local_source_grants = context
+        .grants
+        .iter()
+        .any(|grant| grant.host_ref.eq_ignore_ascii_case(&stable_host_ref));
+    let allow_control_summary = context
+        .recovery
+        .allow_control_summary(has_local_source_grants);
     let control_summary = if !last_control_frame_signals.is_empty() {
-        if has_recovered_active_state {
+        if allow_control_summary {
             last_control_frame_signals.to_vec()
         } else {
             Vec::new()
         }
+    } else if allow_control_summary {
+        context.last_control_frame_signals_snapshot.clone()
     } else {
-        source_summary
+        Vec::new()
     };
     let enqueued_path_origin_counts = source.enqueued_path_origin_counts_snapshot();
     let pending_path_origin_counts = source.pending_path_origin_counts_snapshot();
     let yielded_path_origin_counts = source.yielded_path_origin_counts_snapshot();
-    SourceObservabilitySnapshot {
-        lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
-        host_object_grants_version: source.host_object_grants_version_snapshot(),
-        grants,
-        logical_roots: source.logical_roots_snapshot(),
-        status,
-        source_primary_by_group: source.source_primary_by_group_snapshot(),
-        last_force_find_runner_by_group: source.last_force_find_runner_by_group_snapshot(),
-        force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
-        scheduled_source_groups_by_node,
-        scheduled_scan_groups_by_node,
-        last_control_frame_signals_by_node: last_control_frame_signals_by_node(
-            &stable_host_ref,
-            &control_summary,
-        ),
-        published_batches_by_node: std::collections::BTreeMap::from([(
-            stable_host_ref.clone(),
-            published.batch_count,
-        )]),
-        published_events_by_node: std::collections::BTreeMap::from([(
-            stable_host_ref.clone(),
-            published.event_count,
-        )]),
-        published_control_events_by_node: std::collections::BTreeMap::from([(
-            stable_host_ref.clone(),
-            published.control_event_count,
-        )]),
-        published_data_events_by_node: std::collections::BTreeMap::from([(
-            stable_host_ref.clone(),
-            published.data_event_count,
-        )]),
-        last_published_at_us_by_node: published
-            .last_published_at_us
-            .map(|ts| std::collections::BTreeMap::from([(stable_host_ref.clone(), ts)]))
-            .unwrap_or_default(),
-        last_published_origins_by_node: (!published.last_published_origins.is_empty())
-            .then(|| {
+    let has_explicit_zero_publication_counters = published.batch_count == 0
+        && published.event_count == 0
+        && published.control_event_count == 0
+        && published.data_event_count == 0;
+    build_source_observability_snapshot_from_live_context(
+        context,
+        SourceObservabilityLiveAugment {
+            last_control_frame_signals_by_node: control_signals_by_node(
+                &stable_host_ref,
+                &control_summary,
+            ),
+            published_batches_by_node: std::collections::BTreeMap::from([(
+                stable_host_ref.clone(),
+                published.batch_count,
+            )]),
+            published_events_by_node: std::collections::BTreeMap::from([(
+                stable_host_ref.clone(),
+                published.event_count,
+            )]),
+            published_control_events_by_node: std::collections::BTreeMap::from([(
+                stable_host_ref.clone(),
+                published.control_event_count,
+            )]),
+            published_data_events_by_node: std::collections::BTreeMap::from([(
+                stable_host_ref.clone(),
+                published.data_event_count,
+            )]),
+            last_published_at_us_by_node: (!has_explicit_zero_publication_counters)
+                .then_some(published.last_published_at_us)
+                .flatten()
+                .map(|ts| std::collections::BTreeMap::from([(stable_host_ref.clone(), ts)]))
+                .unwrap_or_default(),
+            last_published_origins_by_node: (!has_explicit_zero_publication_counters
+                && !published.last_published_origins.is_empty())
+            .then_some({
                 std::collections::BTreeMap::from([(
                     stable_host_ref.clone(),
                     published.last_published_origins.clone(),
                 )])
             })
             .unwrap_or_default(),
-        published_origin_counts_by_node: (!published.published_origin_counts.is_empty())
-            .then(|| {
+            published_origin_counts_by_node: (!has_explicit_zero_publication_counters
+                && !published.published_origin_counts.is_empty())
+            .then_some({
                 std::collections::BTreeMap::from([(
                     stable_host_ref.clone(),
                     published
@@ -737,57 +707,57 @@ fn source_observability_snapshot(
                 )])
             })
             .unwrap_or_default(),
-        published_path_capture_target: debug_stream_path_capture_target()
-            .map(|target| String::from_utf8_lossy(&target).into_owned()),
-        enqueued_path_origin_counts_by_node: (!enqueued_path_origin_counts.is_empty())
-            .then(|| {
+            published_path_capture_target: debug_stream_path_capture_target()
+                .map(|target| String::from_utf8_lossy(&target).into_owned()),
+            enqueued_path_origin_counts_by_node: (!enqueued_path_origin_counts.is_empty())
+                .then(|| {
+                    std::collections::BTreeMap::from([(
+                        stable_host_ref.clone(),
+                        enqueued_path_origin_counts
+                            .iter()
+                            .map(|(origin, count)| format!("{origin}={count}"))
+                            .collect::<Vec<_>>(),
+                    )])
+                })
+                .unwrap_or_default(),
+            pending_path_origin_counts_by_node: (!pending_path_origin_counts.is_empty())
+                .then(|| {
+                    std::collections::BTreeMap::from([(
+                        stable_host_ref.clone(),
+                        pending_path_origin_counts
+                            .iter()
+                            .map(|(origin, count)| format!("{origin}={count}"))
+                            .collect::<Vec<_>>(),
+                    )])
+                })
+                .unwrap_or_default(),
+            yielded_path_origin_counts_by_node: (!yielded_path_origin_counts.is_empty())
+                .then(|| {
+                    std::collections::BTreeMap::from([(
+                        stable_host_ref.clone(),
+                        yielded_path_origin_counts
+                            .iter()
+                            .map(|(origin, count)| format!("{origin}={count}"))
+                            .collect::<Vec<_>>(),
+                    )])
+                })
+                .unwrap_or_default(),
+            summarized_path_origin_counts_by_node: (!has_explicit_zero_publication_counters
+                && !published.summarized_path_origin_counts.is_empty())
+            .then_some({
                 std::collections::BTreeMap::from([(
                     stable_host_ref.clone(),
-                    enqueued_path_origin_counts
+                    published
+                        .summarized_path_origin_counts
                         .iter()
                         .map(|(origin, count)| format!("{origin}={count}"))
                         .collect::<Vec<_>>(),
                 )])
             })
             .unwrap_or_default(),
-        pending_path_origin_counts_by_node: (!pending_path_origin_counts.is_empty())
-            .then(|| {
-                std::collections::BTreeMap::from([(
-                    stable_host_ref.clone(),
-                    pending_path_origin_counts
-                        .iter()
-                        .map(|(origin, count)| format!("{origin}={count}"))
-                        .collect::<Vec<_>>(),
-                )])
-            })
-            .unwrap_or_default(),
-        yielded_path_origin_counts_by_node: (!yielded_path_origin_counts.is_empty())
-            .then(|| {
-                std::collections::BTreeMap::from([(
-                    stable_host_ref.clone(),
-                    yielded_path_origin_counts
-                        .iter()
-                        .map(|(origin, count)| format!("{origin}={count}"))
-                        .collect::<Vec<_>>(),
-                )])
-            })
-            .unwrap_or_default(),
-        summarized_path_origin_counts_by_node: (!published
-            .summarized_path_origin_counts
-            .is_empty())
-        .then(|| {
-            std::collections::BTreeMap::from([(
-                stable_host_ref.clone(),
-                published
-                    .summarized_path_origin_counts
-                    .iter()
-                    .map(|(origin, count)| format!("{origin}={count}"))
-                    .collect::<Vec<_>>(),
-            )])
-        })
-        .unwrap_or_default(),
-        published_path_origin_counts_by_node: (!published.published_path_origin_counts.is_empty())
-            .then(|| {
+            published_path_origin_counts_by_node: (!has_explicit_zero_publication_counters
+                && !published.published_path_origin_counts.is_empty())
+            .then_some({
                 std::collections::BTreeMap::from([(
                     stable_host_ref.clone(),
                     published
@@ -798,7 +768,8 @@ fn source_observability_snapshot(
                 )])
             })
             .unwrap_or_default(),
-    }
+        },
+    )
 }
 
 async fn bootstrap_init_source_runtime(
@@ -2816,8 +2787,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_without_new_control_preserves_observability_control_summary_when_active_state_recovers(
-    ) {
+    async fn restart_without_new_control_preserves_observability_control_summary_when_active_state_recovers()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -2838,11 +2809,8 @@ mod tests {
 
         let boundary = Arc::new(LoopbackPublishBoundary::default());
         let state_boundary = in_memory_state_boundary();
-        let context = WorkerSessionContext::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary.clone(),
-        );
+        let context =
+            WorkerSessionContext::new(boundary.clone(), boundary.clone(), state_boundary.clone());
         let state = Arc::new(Mutex::new(SourceWorkerState {
             source: None,
             pending_init: None,
@@ -2994,8 +2962,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_without_new_control_recovers_observability_scheduled_groups_from_active_state(
-    ) {
+    async fn restart_without_new_control_recovers_observability_scheduled_groups_from_active_state()
+    {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -3015,11 +2983,8 @@ mod tests {
         };
 
         let boundary = Arc::new(LoopbackPublishBoundary::default());
-        let context = WorkerSessionContext::new(
-            boundary.clone(),
-            boundary,
-            in_memory_state_boundary(),
-        );
+        let context =
+            WorkerSessionContext::new(boundary.clone(), boundary, in_memory_state_boundary());
         let state = Arc::new(Mutex::new(SourceWorkerState {
             source: None,
             pending_init: None,
@@ -3733,14 +3698,8 @@ mod tests {
             snapshot.last_control_frame_signals_by_node.get("node-d"),
             Some(&vec!["activate unit=runtime.exec.source route=source-logical-roots-control:v1.stream generation=2 scopes=[\"nfs2=>node-d::nfs2\"]".to_string()])
         );
-        assert_eq!(
-            snapshot.published_batches_by_node.get("node-d"),
-            Some(&12)
-        );
-        assert_eq!(
-            snapshot.published_events_by_node.get("node-d"),
-            Some(&345)
-        );
+        assert_eq!(snapshot.published_batches_by_node.get("node-d"), Some(&12));
+        assert_eq!(snapshot.published_events_by_node.get("node-d"), Some(&345));
         assert_eq!(
             snapshot.published_control_events_by_node.get("node-d"),
             Some(&6)
@@ -3944,8 +3903,8 @@ mod tests {
             .await
             .expect("start source worker session");
 
-        let activate = encode_runtime_exec_control(&RuntimeExecControl::Activate(
-            RuntimeExecActivate {
+        let activate =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                 route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
                 unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
                 lease: None,
@@ -3955,9 +3914,8 @@ mod tests {
                     scope_id: "nfs1".to_string(),
                     resource_ids: vec!["node-a::nfs1".to_string()],
                 }],
-            },
-        ))
-        .expect("encode source activate");
+            }))
+            .expect("encode source activate");
         session
             .on_runtime_control(&[activate], &context)
             .await
@@ -3990,8 +3948,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observability_snapshot_request_falls_back_to_source_control_summary_when_worker_state_summary_is_empty(
-    ) {
+    async fn observability_snapshot_request_falls_back_to_source_control_summary_when_worker_state_summary_is_empty()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -4002,8 +3960,8 @@ mod tests {
             ..SourceConfig::default()
         };
         let source = FSMetaSource::new(cfg, NodeId("node-a".to_string())).expect("init source");
-        let activate = encode_runtime_exec_control(&RuntimeExecControl::Activate(
-            RuntimeExecActivate {
+        let activate =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
                 route_key: crate::runtime::routes::ROUTE_KEY_QUERY.to_string(),
                 unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
                 lease: None,
@@ -4013,9 +3971,8 @@ mod tests {
                     scope_id: "nfs1".to_string(),
                     resource_ids: vec!["node-a::nfs1".to_string()],
                 }],
-            },
-        ))
-        .expect("encode source activate");
+            }))
+            .expect("encode source activate");
         source
             .on_control_frame(&[activate])
             .await
@@ -4049,11 +4006,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn observability_snapshot_request_does_not_fall_back_to_source_control_summary_without_recovered_active_state()
+     {
+        let source = FSMetaSource::new(SourceConfig::default(), NodeId("node-a".to_string()))
+            .expect("init source");
+        let activate =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: crate::runtime::routes::ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source activate");
+        source
+            .on_control_frame(&[activate])
+            .await
+            .expect("apply source activate");
+
+        assert!(
+            !source.last_control_frame_signals_snapshot().is_empty(),
+            "fixture must keep a non-empty source-owned control summary before active-state gating is checked"
+        );
+        let snapshot = source_observability_snapshot(
+            &source,
+            &[],
+            &Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        );
+
+        assert!(
+            snapshot.last_control_frame_signals_by_node.is_empty(),
+            "worker observability must not fall back to stale source-owned control summary when no recovered active state exists: status={:?} source={:?} scan={:?} control={:?}",
+            snapshot.status,
+            snapshot.scheduled_source_groups_by_node,
+            snapshot.scheduled_scan_groups_by_node,
+            snapshot.last_control_frame_signals_by_node
+        );
+    }
+
     #[test]
     fn observability_snapshot_request_preserves_live_published_path_counts_from_stats() {
-        unsafe {
-            std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", "/force-find-stress");
+        let _serial = debug_stream_path_capture_target_override_serial_guard()
+            .lock()
+            .expect("lock debug stream path capture target serial guard");
+
+        struct DebugStreamPathCaptureTargetOverrideReset;
+
+        impl Drop for DebugStreamPathCaptureTargetOverrideReset {
+            fn drop(&mut self) {
+                clear_debug_stream_path_capture_target_override_for_tests();
+            }
         }
+
+        let _reset = DebugStreamPathCaptureTargetOverrideReset;
+        set_debug_stream_path_capture_target_override_for_tests(Some("/force-find-stress"));
 
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
@@ -4141,6 +4152,117 @@ mod tests {
         assert!(
             counts.iter().any(|entry| entry == "node-a::nfs2=7"),
             "snapshot should preserve nfs2 published path counts from live stats: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn observability_snapshot_request_clears_zero_counter_published_stats_metadata_without_hiding_debug_target()
+     {
+        let _serial = debug_stream_path_capture_target_override_serial_guard()
+            .lock()
+            .expect("lock debug stream path capture target serial guard");
+
+        struct DebugStreamPathCaptureTargetOverrideReset;
+
+        impl Drop for DebugStreamPathCaptureTargetOverrideReset {
+            fn drop(&mut self) {
+                clear_debug_stream_path_capture_target_override_for_tests();
+            }
+        }
+
+        let _reset = DebugStreamPathCaptureTargetOverrideReset;
+        set_debug_stream_path_capture_target_override_for_tests(Some("/force-find-stress"));
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![test_export("node-a::nfs1", nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let published_stats = Arc::new(StdMutex::new(PublishedBatchStats {
+            batch_count: 0,
+            event_count: 0,
+            control_event_count: 0,
+            data_event_count: 0,
+            last_published_at_us: Some(123456),
+            last_published_origins: vec!["node-a::nfs1=4".to_string()],
+            published_origin_counts: std::collections::BTreeMap::from([(
+                "node-a::nfs1".to_string(),
+                4,
+            )]),
+            summarized_path_origin_counts: std::collections::BTreeMap::from([(
+                "node-a::nfs1".to_string(),
+                4,
+            )]),
+            published_path_origin_counts: std::collections::BTreeMap::from([(
+                "node-a::nfs1".to_string(),
+                4,
+            )]),
+        }));
+        let mut state = SourceWorkerState {
+            source: Some(Arc::new(source)),
+            pending_init: None,
+            pump_task: None,
+            pump_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats,
+        };
+
+        let action = plan_worker_request(SourceWorkerRequest::ObservabilitySnapshot, &mut state);
+        let SourceWorkerAction::Immediate(
+            SourceWorkerResponse::ObservabilitySnapshot(snapshot),
+            false,
+        ) = action
+        else {
+            panic!("observability snapshot request should return immediate snapshot response");
+        };
+
+        assert_eq!(
+            snapshot.published_batches_by_node.get("node-a"),
+            Some(&0),
+            "explicit zero batch counters must remain visible in the live worker snapshot: {:?}",
+            snapshot.published_batches_by_node
+        );
+        assert_eq!(
+            snapshot.published_events_by_node.get("node-a"),
+            Some(&0),
+            "explicit zero event counters must remain visible in the live worker snapshot: {:?}",
+            snapshot.published_events_by_node
+        );
+        assert!(
+            snapshot.last_published_at_us_by_node.is_empty(),
+            "explicit zero publication counters must suppress stale last_published_at_us export in the worker snapshot: {:?}",
+            snapshot.last_published_at_us_by_node
+        );
+        assert!(
+            snapshot.last_published_origins_by_node.is_empty(),
+            "explicit zero publication counters must suppress stale last_published_origins export in the worker snapshot: {:?}",
+            snapshot.last_published_origins_by_node
+        );
+        assert!(
+            snapshot.published_origin_counts_by_node.is_empty(),
+            "explicit zero publication counters must suppress stale published_origin_counts export in the worker snapshot: {:?}",
+            snapshot.published_origin_counts_by_node
+        );
+        assert!(
+            snapshot.summarized_path_origin_counts_by_node.is_empty(),
+            "explicit zero publication counters must suppress stale summarized_path_origin_counts export in the worker snapshot: {:?}",
+            snapshot.summarized_path_origin_counts_by_node
+        );
+        assert!(
+            snapshot.published_path_origin_counts_by_node.is_empty(),
+            "explicit zero publication counters must suppress stale published_path_origin_counts export in the worker snapshot: {:?}",
+            snapshot.published_path_origin_counts_by_node
+        );
+        assert_eq!(
+            snapshot.published_path_capture_target.as_deref(),
+            Some("/force-find-stress"),
+            "worker live debug target should remain visible even when zero publication counters suppress stale stats-derived metadata"
         );
     }
 
@@ -4260,8 +4382,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observability_snapshot_request_does_not_recover_worker_control_summary_from_explicit_empty_scheduled_groups(
-    ) {
+    async fn observability_snapshot_request_does_not_recover_worker_control_summary_from_explicit_empty_scheduled_groups()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -4367,9 +4489,129 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn observability_snapshot_request_does_not_fall_back_to_source_control_summary_from_explicit_empty_scheduled_groups()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_watch_scan_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![GrantedMountRoot {
+                object_ref: "node-b::nfs1".to_string(),
+                host_ref: "node-b".to_string(),
+                host_ip: "10.0.0.21".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: Default::default(),
+                mount_point: nfs1,
+                fs_source: "node-b::nfs1".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: vec![],
+                interfaces: vec![],
+                active: true,
+            }],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::new(cfg, NodeId("node-a".to_string())).expect("init source");
+        let control = vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-b::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-b::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source rescan-control activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-b::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source rescan activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-b::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source scan activate"),
+        ];
+        source
+            .on_control_frame(&control)
+            .await
+            .expect("apply non-local source activate");
+
+        assert_eq!(
+            source.scheduled_source_group_ids().expect("source groups"),
+            Some(std::collections::BTreeSet::new()),
+            "fixture must surface explicit empty scheduled source groups before source-summary fallback recovery"
+        );
+        assert_eq!(
+            source.scheduled_scan_group_ids().expect("scan groups"),
+            Some(std::collections::BTreeSet::new()),
+            "fixture must surface explicit empty scheduled scan groups before source-summary fallback recovery"
+        );
+        let source_summary = source.last_control_frame_signals_snapshot();
+        assert!(
+            !source_summary.is_empty(),
+            "fixture must keep a non-empty source-owned control summary so the fallback path is actually exercised"
+        );
+        assert!(
+            source
+                .source_primary_by_group_snapshot()
+                .values()
+                .all(|primary| !primary.starts_with("node-a::")),
+            "fixture must have no local source-primary ownership so any control summary would be recovered from explicit-empty active state instead of local-primary truth"
+        );
+
+        let snapshot = source_observability_snapshot(
+            &source,
+            &[],
+            &Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        );
+
+        assert!(
+            snapshot.last_control_frame_signals_by_node.is_empty(),
+            "explicit empty scheduled groups must suppress source-summary fallback just like worker-summary recovery: source_summary={source_summary:?} source={:?} scan={:?} control={:?}",
+            snapshot.scheduled_source_groups_by_node,
+            snapshot.scheduled_scan_groups_by_node,
+            snapshot.last_control_frame_signals_by_node
+        );
+    }
+
     #[test]
-    fn observability_snapshot_request_does_not_treat_historical_published_stats_as_active_recovery(
-    ) {
+    fn observability_snapshot_request_does_not_treat_historical_published_stats_as_active_recovery()
+    {
         let cfg = SourceConfig::default();
         let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
             .expect("init source");

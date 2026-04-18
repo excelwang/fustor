@@ -1,5 +1,7 @@
     #[tokio::test]
     async fn facade_deactivate_waits_for_inflight_roots_put_after_sink_update_begins() {
+        let _serial = facade_deactivate_barrier_test_serial().lock().await;
+
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -97,6 +99,8 @@
             resource_ids: vec!["listener-a".to_string()],
             handle: active_facade,
         });
+        app.api_control_gate.set_ready(true);
+        let _ = app.current_facade_service_state().await;
 
         let client = Client::new();
         let login = client
@@ -193,6 +197,8 @@
 
     #[tokio::test]
     async fn facade_deactivate_waits_for_inflight_status_after_remote_collection_begins() {
+        let _serial = facade_deactivate_barrier_test_serial().lock().await;
+
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -416,8 +422,221 @@
     }
 
     #[tokio::test]
+    async fn initialized_inflight_internal_sink_status_timeout_returns_explicit_empty_reply() {
+        struct SinkWorkerControlFramePauseHookReset;
+        struct SinkWorkerStatusErrorHookReset;
+
+        impl Drop for SinkWorkerControlFramePauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_control_frame_pause_hook();
+            }
+        }
+
+        impl Drop for SinkWorkerStatusErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::sink::clear_sink_worker_status_error_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = worker_socket_tempdir();
+        let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+        let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init external-worker app"),
+        );
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.facade_service_state.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("activate sink and internal sink-status routes");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = SinkWorkerControlFramePauseHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let _status_error_reset = SinkWorkerStatusErrorHookReset;
+        crate::workers::sink::install_sink_worker_status_error_hook(
+            crate::workers::sink::SinkWorkerStatusErrorHook {
+                err: CnxError::Timeout,
+            },
+        );
+
+        let sink_followup = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[activate_envelope_with_scope_rows(
+                    execution_units::SINK_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    3,
+                )])
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("sink followup should pause in sink.apply before probing internal sink-status");
+
+        let request_result = internal_sink_status_request_with_timeout(
+            boundary.clone(),
+            NodeId("single-app-node".into()),
+            Duration::from_millis(350),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        release.notify_waiters();
+        sink_followup
+            .await
+            .expect("join sink followup task")
+            .expect("sink followup should settle after releasing sink.apply pause");
+
+        let events = request_result.expect(
+            "initialized internal sink-status timeout while sink control is inflight must fail closed with an explicit empty reply instead of caller timeout",
+        );
+        let snapshots = events
+            .into_iter()
+            .map(|event| {
+                rmp_serde::from_slice::<crate::sink::SinkStatusSnapshot>(event.payload_bytes())
+                    .expect("decode internal sink-status snapshot")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            snapshots.iter().any(|snapshot| {
+                snapshot.groups.is_empty()
+                    && snapshot.scheduled_groups_by_node.is_empty()
+                    && snapshot.last_control_frame_signals_by_node.is_empty()
+            }),
+            "initialized inflight internal sink-status timeout must emit an explicit empty reply: {snapshots:?}"
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
     async fn uninitialized_cleanup_only_facade_deactivate_does_not_wait_for_inflight_status_request()
-     {
+    {
+        let _serial = facade_deactivate_barrier_test_serial().lock().await;
+
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -640,4 +859,3 @@
 
         app.close().await.expect("close app");
     }
-

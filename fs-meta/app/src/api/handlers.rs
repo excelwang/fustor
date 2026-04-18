@@ -60,8 +60,7 @@ use super::types::{
     RootSelectorEntry, RootUpdateEntry, RootsPreviewResponse, RootsResponse, RootsUpdateRequest,
     RootsUpdateResponse, RuntimeGrantsResponse, StatusFacade, StatusFacadePending, StatusResponse,
     StatusSink, StatusSinkDebug, StatusSinkGroup, StatusSinkGroupReadiness, StatusSource,
-    StatusSourceConcreteRoot,
-    StatusSourceLogicalRoot,
+    StatusSourceConcreteRoot, StatusSourceLogicalRoot,
 };
 
 fn debug_status_route_fanin_enabled() -> bool {
@@ -522,7 +521,6 @@ pub async fn status(
         // Facade readiness is reported via published facade state and pending diagnostics rather than
         // by fail-closing the management surface on observation trust.
     }
-    let _facade_request_guard = state.request_tracker.begin();
     #[cfg(test)]
     maybe_pause_status_before_remote_collection().await;
     record_status_route_trace(trace_id, "status.remote.begin");
@@ -675,9 +673,7 @@ pub async fn status(
                         crate::sink::GroupReadinessState::WaitingForMaterializedRoot => {
                             StatusSinkGroupReadiness::WaitingForMaterializedRoot
                         }
-                        crate::sink::GroupReadinessState::Ready => {
-                            StatusSinkGroupReadiness::Ready
-                        }
+                        crate::sink::GroupReadinessState::Ready => StatusSinkGroupReadiness::Ready,
                     },
                     initial_audit_completed: group.initial_audit_completed,
                     estimated_heap_bytes: group.estimated_heap_bytes,
@@ -1127,9 +1123,7 @@ fn should_fail_closed_status_route_collection(
 ) -> bool {
     if matches!(
         published_facade_state,
-        FacadeServiceState::Pending
-            | FacadeServiceState::Serving
-            | FacadeServiceState::Degraded
+        FacadeServiceState::Pending | FacadeServiceState::Serving | FacadeServiceState::Degraded
     ) {
         return false;
     }
@@ -1742,10 +1736,9 @@ async fn route_source_observability_snapshot(
         let snapshots = events
             .into_iter()
             .map(|event| {
-                rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes())
-                    .map_err(|err| {
-                        CnxError::Internal(format!("decode source observability failed: {err}"))
-                    })
+                rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes()).map_err(
+                    |err| CnxError::Internal(format!("decode source observability failed: {err}")),
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         if source_observability_snapshots_need_retry(&snapshots) {
@@ -1770,7 +1763,9 @@ async fn route_source_observability_snapshot(
         if debug_force_find_runner_capture_enabled() {
             let last_runners = snapshots
                 .iter()
-                .map(|snapshot| summarize_group_string_map(&snapshot.last_force_find_runner_by_group))
+                .map(|snapshot| {
+                    summarize_group_string_map(&snapshot.last_force_find_runner_by_group)
+                })
                 .collect::<Vec<_>>();
             eprintln!(
                 "fs_meta_api_status: source_route_runner_capture snapshots={} last_runners={:?} runner_sets={:?}",
@@ -1783,9 +1778,7 @@ async fn route_source_observability_snapshot(
     }
 }
 
-fn source_observability_snapshot_debug_maps_absent(
-    snapshot: &SourceObservabilitySnapshot,
-) -> bool {
+fn source_observability_snapshot_debug_maps_absent(snapshot: &SourceObservabilitySnapshot) -> bool {
     snapshot.scheduled_source_groups_by_node.is_empty()
         && snapshot.scheduled_scan_groups_by_node.is_empty()
         && snapshot.last_control_frame_signals_by_node.is_empty()
@@ -1815,9 +1808,7 @@ fn source_observability_snapshot_debug_maps_absent(
         && snapshot.published_path_origin_counts_by_node.is_empty()
 }
 
-fn source_observability_snapshot_has_active_state(
-    snapshot: &SourceObservabilitySnapshot,
-) -> bool {
+fn source_observability_snapshot_has_active_state(snapshot: &SourceObservabilitySnapshot) -> bool {
     snapshot.status.current_stream_generation.is_some()
         || snapshot
             .status
@@ -1834,9 +1825,7 @@ fn source_observability_snapshot_has_active_state(
         })
 }
 
-fn source_observability_snapshots_need_retry(
-    snapshots: &[SourceObservabilitySnapshot],
-) -> bool {
+fn source_observability_snapshots_need_retry(snapshots: &[SourceObservabilitySnapshot]) -> bool {
     snapshots.iter().any(|snapshot| {
         source_observability_snapshot_has_active_state(snapshot)
             && source_observability_snapshot_debug_maps_absent(snapshot)
@@ -4301,8 +4290,7 @@ mod tests {
         assert_eq!(source_outcome, StatusRouteOutcome::Timeout);
         assert_eq!(runner_sets, local_runner_sets(&local_source));
         assert_eq!(
-            source.status.current_stream_generation,
-            None,
+            source.status.current_stream_generation, None,
             "source timeout must fail-close incomplete active local source instead of surfacing stale current_stream_generation"
         );
         assert!(
@@ -5081,7 +5069,7 @@ mod tests {
 
     #[test]
     fn merge_source_observability_preserves_non_empty_fallback_control_signals_when_live_snapshot_has_empty_entry()
-    {
+     {
         let local = SourceObservabilitySnapshot {
             lifecycle_state: "degraded_worker_unreachable".to_string(),
             host_object_grants_version: 1,
@@ -5729,10 +5717,7 @@ mod tests {
             snapshot.scheduled_scan_groups_by_node.get("node-a"),
             Some(&vec!["nfs1".to_string()])
         );
-        assert_eq!(
-            snapshot.published_batches_by_node.get("node-a"),
-            Some(&7)
-        );
+        assert_eq!(snapshot.published_batches_by_node.get("node-a"), Some(&7));
         assert!(
             snapshot
                 .last_control_frame_signals_by_node
@@ -5755,7 +5740,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_source_observability_snapshot_times_out_instead_of_accepting_incomplete_active_source_debug_at_deadline()
-    {
+     {
         let source_route = default_route_bindings()
             .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
             .expect("resolve source-status route");
@@ -6106,6 +6091,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_does_not_hold_global_control_drain_while_remote_collection_is_paused() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_cfg = SourceConfig {
+            roots: vec![RootSpec::new("nfs1", &nfs1)],
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg).expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let request_tracker = Arc::new(crate::api::ApiRequestTracker::default());
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: None,
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                shared_facade_service_state_cell(),
+                shared_facade_pending_status_cell(),
+            ),
+            request_tracker: request_tracker.clone(),
+        };
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        install_status_pause_hook(StatusPauseHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        struct StatusPauseHookReset;
+        impl Drop for StatusPauseHookReset {
+            fn drop(&mut self) {
+                clear_status_pause_hook();
+            }
+        }
+        let _reset = StatusPauseHookReset;
+
+        let status_task = tokio::spawn(async move { status(State(state), headers).await });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("paused /status should enter remote-collection pause hook");
+
+        tokio::time::timeout(Duration::from_millis(200), request_tracker.wait_for_drain())
+            .await
+            .expect("paused GET /status must not hold global control drain");
+
+        release.notify_waiters();
+        let _ = status_task
+            .await
+            .expect("status join")
+            .expect("status should complete after pause release");
+    }
+
+    #[tokio::test]
     async fn status_prefers_runtime_boundary_when_query_runtime_boundary_transports() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
@@ -6168,7 +6228,7 @@ mod tests {
                         shadow_lag_us: 22,
                         overflow_pending_audit: false,
                         initial_audit_completed: true,
-                readiness: crate::sink::GroupReadinessState::Ready,
+                        readiness: crate::sink::GroupReadinessState::Ready,
                         materialized_revision: 1,
                         estimated_heap_bytes: 0,
                     }],
@@ -6275,7 +6335,7 @@ mod tests {
                         shadow_lag_us: 22,
                         overflow_pending_audit: false,
                         initial_audit_completed: true,
-                readiness: crate::sink::GroupReadinessState::Ready,
+                        readiness: crate::sink::GroupReadinessState::Ready,
                         materialized_revision: 1,
                         estimated_heap_bytes: 0,
                     }],
@@ -6428,7 +6488,10 @@ mod tests {
         let second_sink_snapshot = SinkStatusSnapshot {
             live_nodes: 3,
             scheduled_groups_by_node: BTreeMap::from([
-                ("node-a".to_string(), vec!["nfs1".to_string(), "nfs2".to_string()]),
+                (
+                    "node-a".to_string(),
+                    vec!["nfs1".to_string(), "nfs2".to_string()],
+                ),
                 ("node-b".to_string(), vec!["nfs3".to_string()]),
             ]),
             groups: vec![
@@ -6627,26 +6690,16 @@ mod tests {
         ]);
         remote_source.scheduled_scan_groups_by_node =
             remote_source.scheduled_source_groups_by_node.clone();
-        remote_source.published_batches_by_node = BTreeMap::from([
-            ("node-a".into(), 4),
-            ("node-b".into(), 6),
-        ]);
-        remote_source.published_events_by_node = BTreeMap::from([
-            ("node-a".into(), 11),
-            ("node-b".into(), 16),
-        ]);
-        remote_source.published_control_events_by_node = BTreeMap::from([
-            ("node-a".into(), 3),
-            ("node-b".into(), 4),
-        ]);
-        remote_source.published_data_events_by_node = BTreeMap::from([
-            ("node-a".into(), 8),
-            ("node-b".into(), 12),
-        ]);
-        remote_source.last_published_at_us_by_node = BTreeMap::from([
-            ("node-a".into(), 100),
-            ("node-b".into(), 200),
-        ]);
+        remote_source.published_batches_by_node =
+            BTreeMap::from([("node-a".into(), 4), ("node-b".into(), 6)]);
+        remote_source.published_events_by_node =
+            BTreeMap::from([("node-a".into(), 11), ("node-b".into(), 16)]);
+        remote_source.published_control_events_by_node =
+            BTreeMap::from([("node-a".into(), 3), ("node-b".into(), 4)]);
+        remote_source.published_data_events_by_node =
+            BTreeMap::from([("node-a".into(), 8), ("node-b".into(), 12)]);
+        remote_source.last_published_at_us_by_node =
+            BTreeMap::from([("node-a".into(), 100), ("node-b".into(), 200)]);
         remote_source.last_published_origins_by_node = BTreeMap::from([
             ("node-a".into(), vec!["node-a::nfs2=1".into()]),
             ("node-b".into(), vec!["node-b::nfs3=1".into()]),
@@ -6702,7 +6755,8 @@ mod tests {
             .expect_err("status must fail-close when routed sink-status stays empty while source is ready and local sink cannot fill active groups");
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            err.message.contains("status remote route collection incomplete"),
+            err.message
+                .contains("status remote route collection incomplete"),
             "unexpected error message: {}",
             err.message
         );
@@ -6776,7 +6830,7 @@ mod tests {
                         shadow_lag_us: 22,
                         overflow_pending_audit: false,
                         initial_audit_completed: true,
-                readiness: crate::sink::GroupReadinessState::Ready,
+                        readiness: crate::sink::GroupReadinessState::Ready,
                         materialized_revision: 1,
                         estimated_heap_bytes: 0,
                     }],
@@ -7191,7 +7245,8 @@ mod tests {
             .expect_err("serving facade with only partial local fallback truth must fail-close when both remote status routes time out");
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            err.message.contains("status remote route collection incomplete"),
+            err.message
+                .contains("status remote route collection incomplete"),
             "unexpected error message: {}",
             err.message
         );
@@ -7199,7 +7254,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_pending_facade_settles_within_local_route_budget_when_remote_status_routes_never_reply()
-    {
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         std::fs::create_dir_all(&nfs1).expect("create nfs1");
@@ -7264,14 +7319,11 @@ mod tests {
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
-        let response = tokio::time::timeout(
-            Duration::from_secs(1),
-            status(State(state), headers),
-        )
-        .await
-        .expect("pending /status must settle within the local route budget")
-        .expect("pending /status should fall back to local snapshots")
-        .0;
+        let response = tokio::time::timeout(Duration::from_secs(1), status(State(state), headers))
+            .await
+            .expect("pending /status must settle within the local route budget")
+            .expect("pending /status should fall back to local snapshots")
+            .0;
 
         assert_eq!(response.facade.state, "pending");
         assert!(response.facade.pending.is_some());

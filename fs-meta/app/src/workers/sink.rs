@@ -16,7 +16,10 @@ use crate::query::path::root_file_name_bytes;
 use crate::query::request::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
 use crate::runtime::orchestration::{SinkControlSignal, sink_control_signals_from_envelopes};
 use crate::runtime::routes::{METHOD_FIND, ROUTE_TOKEN_FS_META, default_route_bindings};
-use crate::sink::{SinkFileMeta, SinkStatusSnapshot, VisibilityLagSample};
+use crate::sink::{
+    SinkFileMeta, SinkStatusSnapshot, SinkStatusSnapshotIssue, SinkStatusSnapshotIssueProjection,
+    SinkStatusSnapshotReadinessSummary, VisibilityLagSample, sink_status_origin_entry_group_id,
+};
 use crate::source::config::{GrantedMountRoot, SourceConfig};
 use crate::workers::sink_ipc::{
     SinkWorkerInitConfig, SinkWorkerRequest, SinkWorkerResponse, decode_request, decode_response,
@@ -206,284 +209,27 @@ fn summarize_sink_status_snapshot(snapshot: &SinkStatusSnapshot) -> String {
     )
 }
 
-fn scheduled_groups_from_snapshot(
-    snapshot: &SinkStatusSnapshot,
-) -> std::collections::BTreeSet<String> {
-    snapshot
-        .scheduled_groups_by_node
-        .values()
-        .flat_map(|groups| groups.iter().cloned())
-        .collect::<std::collections::BTreeSet<_>>()
-}
-
-fn ready_groups_from_snapshot(snapshot: &SinkStatusSnapshot) -> std::collections::BTreeSet<String> {
-    snapshot
-        .groups
-        .iter()
-        .filter(|group| {
-            matches!(
-                classify_sink_group_status_readiness(group),
-                SinkGroupStatusReadiness::Ready
-            ) && group.live_nodes > 0
-                && group.total_nodes > 0
-        })
-        .map(|group| group.group_id.clone())
-        .collect::<std::collections::BTreeSet<_>>()
-}
-
-fn ready_groups_cover_scheduled_groups(
-    snapshot: &SinkStatusSnapshot,
-    scheduled_groups: &std::collections::BTreeSet<String>,
+fn readiness_summary_ready_groups_cover_expected(
+    summary: &SinkStatusSnapshotReadinessSummary,
+    expected_groups: &std::collections::BTreeSet<String>,
 ) -> bool {
-    !scheduled_groups.is_empty()
-        && scheduled_groups.is_subset(&ready_groups_from_snapshot(snapshot))
+    !expected_groups.is_empty() && expected_groups.is_subset(&summary.ready_groups)
 }
 
-fn sink_status_origin_entry_group_id(entry: &str) -> &str {
-    let origin = entry
-        .split_once('=')
-        .map(|(origin, _)| origin)
-        .unwrap_or(entry);
-    let scoped = origin
-        .rsplit_once("::")
-        .map(|(_, group_id)| group_id)
-        .unwrap_or(origin);
-    scoped
-        .split_once(':')
-        .map(|(group_id, _)| group_id)
-        .unwrap_or(scoped)
-}
-
-fn snapshot_has_stream_group_evidence(
+fn project_sink_status_snapshot_issue(
     snapshot: &SinkStatusSnapshot,
-    scheduled_groups: &std::collections::BTreeSet<String>,
-) -> bool {
-    [
-        &snapshot.stream_received_origin_counts_by_node,
-        &snapshot.stream_received_path_origin_counts_by_node,
-        &snapshot.stream_ready_origin_counts_by_node,
-        &snapshot.stream_applied_origin_counts_by_node,
-        &snapshot.stream_ready_path_origin_counts_by_node,
-        &snapshot.stream_applied_path_origin_counts_by_node,
-    ]
-    .into_iter()
-    .flat_map(|groups_by_node| groups_by_node.values())
-    .flat_map(|entries| entries.iter())
-    .any(|entry| scheduled_groups.contains(sink_status_origin_entry_group_id(entry)))
-}
-
-fn snapshot_has_ready_scheduled_groups(snapshot: &SinkStatusSnapshot) -> bool {
-    let scheduled_groups = scheduled_groups_from_snapshot(snapshot);
-    ready_groups_cover_scheduled_groups(snapshot, &scheduled_groups)
-}
-
-fn snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(
-    snapshot: &SinkStatusSnapshot,
-) -> bool {
-    let scheduled_groups = scheduled_groups_from_snapshot(snapshot);
-    if scheduled_groups.is_empty() {
-        return false;
-    }
-    let groups_by_id = snapshot
-        .groups
-        .iter()
-        .map(|group| (group.group_id.as_str(), group))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    scheduled_groups
-        .iter()
-        .any(|group_id| !groups_by_id.contains_key(group_id.as_str()))
-        && snapshot_has_stream_group_evidence(snapshot, &scheduled_groups)
-}
-
-fn snapshot_looks_scheduled_waiting_for_materialized_root(snapshot: &SinkStatusSnapshot) -> bool {
-    let scheduled_groups = scheduled_groups_from_snapshot(snapshot);
-    if scheduled_groups.is_empty() {
-        return false;
-    }
-    let groups_by_id = snapshot
-        .groups
-        .iter()
-        .map(|group| (group.group_id.as_str(), group))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    scheduled_groups.iter().all(|group_id| {
-        groups_by_id.get(group_id.as_str()).is_some_and(|group| {
-            matches!(
-                classify_sink_group_status_readiness(group),
-                SinkGroupStatusReadiness::WaitingForMaterializedRoot
-            )
-        })
-    })
-}
-
-fn snapshot_looks_scheduled_pending_audit_without_stream_receipts(
-    snapshot: &SinkStatusSnapshot,
-) -> bool {
-    let scheduled_groups = scheduled_groups_from_snapshot(snapshot);
-    if scheduled_groups.is_empty() {
-        return false;
-    }
-    let groups_by_id = snapshot
-        .groups
-        .iter()
-        .map(|group| (group.group_id.as_str(), group))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    if !scheduled_groups.iter().all(|group_id| {
-        groups_by_id.get(group_id.as_str()).is_some_and(|group| {
-            matches!(
-                classify_sink_group_status_readiness(group),
-                SinkGroupStatusReadiness::PendingAudit
-            )
-        })
-    }) {
-        return false;
-    }
-    snapshot.received_batches_by_node.is_empty()
-        && snapshot.received_events_by_node.is_empty()
-        && snapshot.received_control_events_by_node.is_empty()
-        && snapshot.received_data_events_by_node.is_empty()
-        && snapshot.last_received_at_us_by_node.is_empty()
-        && snapshot.last_received_origins_by_node.is_empty()
-        && snapshot.received_origin_counts_by_node.is_empty()
-        && snapshot.stream_received_batches_by_node.is_empty()
-        && snapshot.stream_received_events_by_node.is_empty()
-        && snapshot.stream_received_origin_counts_by_node.is_empty()
-        && snapshot
-            .stream_received_path_origin_counts_by_node
-            .is_empty()
-        && snapshot.stream_ready_origin_counts_by_node.is_empty()
-        && snapshot.stream_ready_path_origin_counts_by_node.is_empty()
-        && snapshot.stream_deferred_origin_counts_by_node.is_empty()
-        && snapshot.stream_dropped_origin_counts_by_node.is_empty()
-        && snapshot.stream_applied_batches_by_node.is_empty()
-        && snapshot.stream_applied_events_by_node.is_empty()
-        && snapshot.stream_applied_control_events_by_node.is_empty()
-        && snapshot.stream_applied_data_events_by_node.is_empty()
-        && snapshot.stream_applied_origin_counts_by_node.is_empty()
-        && snapshot
-            .stream_applied_path_origin_counts_by_node
-            .is_empty()
-        && snapshot.stream_last_applied_at_us_by_node.is_empty()
-}
-
-fn snapshot_looks_stale_empty(snapshot: &SinkStatusSnapshot) -> bool {
-    snapshot.scheduled_groups_by_node.is_empty()
-        && snapshot
-            .groups
-            .iter()
-            .all(|group| group.live_nodes == 0 && group.total_nodes == 0)
-}
-
-fn snapshot_looks_scheduled_mixed_ready_and_unready(snapshot: &SinkStatusSnapshot) -> bool {
-    let scheduled_groups = snapshot
-        .scheduled_groups_by_node
-        .values()
-        .flat_map(|groups| groups.iter().cloned())
-        .collect::<std::collections::BTreeSet<_>>();
-    if scheduled_groups.is_empty() {
-        return false;
-    }
-    let groups_by_id = snapshot
-        .groups
-        .iter()
-        .map(|group| (group.group_id.as_str(), group))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut any_ready = false;
-    let mut any_unready = false;
-    for group_id in scheduled_groups {
-        match groups_by_id.get(group_id.as_str()) {
-            Some(group) => match classify_sink_group_status_readiness(group) {
-                SinkGroupStatusReadiness::Ready => any_ready = true,
-                SinkGroupStatusReadiness::WaitingForMaterializedRoot
-                | SinkGroupStatusReadiness::PendingAudit => any_unready = true,
-            },
-            None => {}
-        }
-    }
-    any_ready && any_unready
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SinkGroupStatusReadiness {
-    WaitingForMaterializedRoot,
-    PendingAudit,
-    Ready,
-}
-
-fn classify_sink_group_status_readiness(
-    group: &crate::sink::SinkGroupStatusSnapshot,
-) -> SinkGroupStatusReadiness {
-    if group.live_nodes == 0
-        && group.total_nodes == 0
-        && matches!(group.readiness, crate::sink::GroupReadinessState::Ready)
-    {
-        return if group.primary_object_ref == "unassigned"
-            || group.primary_object_ref == group.group_id
-        {
-            SinkGroupStatusReadiness::WaitingForMaterializedRoot
-        } else {
-            SinkGroupStatusReadiness::PendingAudit
-        };
-    }
-    match group.readiness {
-        crate::sink::GroupReadinessState::WaitingForMaterializedRoot => {
-            SinkGroupStatusReadiness::WaitingForMaterializedRoot
-        }
-        crate::sink::GroupReadinessState::PendingAudit => SinkGroupStatusReadiness::PendingAudit,
-        crate::sink::GroupReadinessState::Ready => SinkGroupStatusReadiness::Ready,
-    }
-}
-
-fn snapshot_waiting_for_materialized_root_uses_placeholder_primary_truth(
-    snapshot: &SinkStatusSnapshot,
-) -> bool {
-    let scheduled_groups = scheduled_groups_from_snapshot(snapshot);
-    if scheduled_groups.is_empty() {
-        return false;
-    }
-    let groups_by_id = snapshot
-        .groups
-        .iter()
-        .map(|group| (group.group_id.as_str(), group))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    scheduled_groups.iter().all(|group_id| {
-        groups_by_id.get(group_id.as_str()).is_some_and(|group| {
-            matches!(
-                classify_sink_group_status_readiness(group),
-                SinkGroupStatusReadiness::WaitingForMaterializedRoot
-            ) && (group.primary_object_ref == "unassigned"
-                || group.primary_object_ref == group.group_id)
-        })
-    })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SinkStatusSnapshotIssue {
-    StaleEmpty,
-    ScheduledMissingGroupRowsAfterStreamEvidence,
-    ScheduledPendingAuditWithoutStreamReceipts,
-    ScheduledWaitingForMaterializedRoot,
-    ScheduledMixedReadyAndUnready,
+) -> SinkStatusSnapshotIssueProjection {
+    snapshot.issue_projection()
 }
 
 fn classify_sink_status_snapshot_issue(
     snapshot: &SinkStatusSnapshot,
 ) -> Option<SinkStatusSnapshotIssue> {
-    if snapshot_looks_stale_empty(snapshot) {
-        return Some(SinkStatusSnapshotIssue::StaleEmpty);
-    }
-    if snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(snapshot) {
-        return Some(SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence);
-    }
-    if snapshot_looks_scheduled_pending_audit_without_stream_receipts(snapshot) {
-        return Some(SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts);
-    }
-    if snapshot_looks_scheduled_waiting_for_materialized_root(snapshot) {
-        return Some(SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot);
-    }
-    if snapshot_looks_scheduled_mixed_ready_and_unready(snapshot) {
-        return Some(SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready);
-    }
-    None
+    snapshot.issue()
+}
+
+fn snapshot_looks_stale_empty(snapshot: &SinkStatusSnapshot) -> bool {
+    snapshot.looks_stale_empty()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -516,6 +262,13 @@ enum SinkStatusCachedFoldOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SinkStatusCachedFoldDisposition {
+    issue: Option<SinkStatusSnapshotIssue>,
+    outcome: SinkStatusCachedFoldOutcome,
+    should_republish_zero_row_summary: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SinkStatusAvailabilityDecision {
     ReturnLive,
     ReturnCached,
@@ -532,47 +285,52 @@ struct SinkStatusSnapshotProbeOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SinkStatusSnapshotEvaluation {
     decision: SinkStatusAvailabilityDecision,
+    issue: Option<SinkStatusSnapshotIssue>,
     should_mark_replay_required: bool,
     should_republish_zero_row_summary: bool,
 }
 
 fn cached_ready_truth_covers_live_issue(
     live_issue: SinkStatusSnapshotIssue,
-    live_snapshot: &SinkStatusSnapshot,
-    cached_snapshot: &SinkStatusSnapshot,
+    live_projection: &SinkStatusSnapshotIssueProjection,
+    cached_projection: &SinkStatusSnapshotIssueProjection,
 ) -> bool {
-    let scheduled_groups = scheduled_groups_from_snapshot(live_snapshot);
     match live_issue {
         SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts
         | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot => {
-            ready_groups_cover_scheduled_groups(cached_snapshot, &scheduled_groups)
+            readiness_summary_ready_groups_cover_expected(
+                &cached_projection.summary,
+                &live_projection.summary.scheduled_groups,
+            )
         }
         SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence
         | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
-            ready_groups_cover_scheduled_groups(cached_snapshot, &scheduled_groups)
+            readiness_summary_ready_groups_cover_expected(
+                &cached_projection.summary,
+                &live_projection.summary.scheduled_groups,
+            )
         }
         SinkStatusSnapshotIssue::StaleEmpty => false,
     }
 }
 
-fn fold_live_sink_status_snapshot(
-    live_snapshot: &SinkStatusSnapshot,
-    cached_snapshot: &SinkStatusSnapshot,
+fn fold_live_sink_status_snapshot_with_projection(
+    live_projection: &SinkStatusSnapshotIssueProjection,
+    cached_projection: &SinkStatusSnapshotIssueProjection,
     cached_issue: Option<SinkStatusSnapshotIssue>,
     mode: SinkStatusLiveFoldMode,
 ) -> SinkStatusLiveFoldOutcome {
-    let Some(live_issue) = classify_sink_status_snapshot_issue(live_snapshot)
-    else {
+    let Some(live_issue) = live_projection.issue else {
         return SinkStatusLiveFoldOutcome::ReturnLive;
     };
     match mode {
         SinkStatusLiveFoldMode::Blocking => match live_issue {
             SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts
+            | SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence
             | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot => {
                 SinkStatusLiveFoldOutcome::FailClosed
             }
             SinkStatusSnapshotIssue::StaleEmpty
-            | SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence
             | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
                 SinkStatusLiveFoldOutcome::ReturnLive
             }
@@ -581,17 +339,28 @@ fn fold_live_sink_status_snapshot(
             SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence
             | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot
             | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
-                if cached_ready_truth_covers_live_issue(live_issue, live_snapshot, cached_snapshot)
-                {
+                if cached_ready_truth_covers_live_issue(
+                    live_issue,
+                    live_projection,
+                    cached_projection,
+                ) {
                     SinkStatusLiveFoldOutcome::ReturnCached
                 } else {
                     SinkStatusLiveFoldOutcome::FailClosed
                 }
             }
-            SinkStatusSnapshotIssue::StaleEmpty
-            | SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts => {
-                SinkStatusLiveFoldOutcome::ReturnLive
+            SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts => {
+                if cached_ready_truth_covers_live_issue(
+                    live_issue,
+                    live_projection,
+                    cached_projection,
+                ) {
+                    SinkStatusLiveFoldOutcome::ReturnCached
+                } else {
+                    SinkStatusLiveFoldOutcome::ReturnLive
+                }
             }
+            SinkStatusSnapshotIssue::StaleEmpty => SinkStatusLiveFoldOutcome::ReturnLive,
         },
         SinkStatusLiveFoldMode::Steady => match live_issue {
             SinkStatusSnapshotIssue::StaleEmpty
@@ -606,8 +375,11 @@ fn fold_live_sink_status_snapshot(
             | SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts
             | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot
             | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
-                if cached_ready_truth_covers_live_issue(live_issue, live_snapshot, cached_snapshot)
-                {
+                if cached_ready_truth_covers_live_issue(
+                    live_issue,
+                    live_projection,
+                    cached_projection,
+                ) {
                     SinkStatusLiveFoldOutcome::ReturnCached
                 } else {
                     SinkStatusLiveFoldOutcome::FailClosed
@@ -625,8 +397,11 @@ fn fold_live_sink_status_snapshot(
                 SinkStatusLiveFoldOutcome::ReturnCached
             }
             SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts => {
-                if cached_ready_truth_covers_live_issue(live_issue, live_snapshot, cached_snapshot)
-                {
+                if cached_ready_truth_covers_live_issue(
+                    live_issue,
+                    live_projection,
+                    cached_projection,
+                ) {
                     SinkStatusLiveFoldOutcome::ReturnCached
                 } else {
                     SinkStatusLiveFoldOutcome::ReturnLive
@@ -637,8 +412,11 @@ fn fold_live_sink_status_snapshot(
             }
             SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence
             | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
-                if cached_ready_truth_covers_live_issue(live_issue, live_snapshot, cached_snapshot)
-                {
+                if cached_ready_truth_covers_live_issue(
+                    live_issue,
+                    live_projection,
+                    cached_projection,
+                ) {
                     SinkStatusLiveFoldOutcome::ReturnCached
                 } else {
                     SinkStatusLiveFoldOutcome::FailClosed
@@ -649,55 +427,75 @@ fn fold_live_sink_status_snapshot(
     }
 }
 
-fn fold_cached_sink_status_snapshot(
-    cached_snapshot: &SinkStatusSnapshot,
+fn project_cached_sink_status_snapshot_fold(
+    cached_projection: &SinkStatusSnapshotIssueProjection,
     mode: SinkStatusCachedFoldMode,
-) -> SinkStatusCachedFoldOutcome {
-    let Some(cached_issue) = classify_sink_status_snapshot_issue(cached_snapshot)
-    else {
-        return SinkStatusCachedFoldOutcome::ReturnCached;
+) -> SinkStatusCachedFoldDisposition {
+    let Some(issue) = cached_projection.issue else {
+        return SinkStatusCachedFoldDisposition {
+            issue: None,
+            outcome: SinkStatusCachedFoldOutcome::ReturnCached,
+            should_republish_zero_row_summary: false,
+        };
     };
-    match mode {
-        SinkStatusCachedFoldMode::WorkerUnavailable => match cached_issue {
-            SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence => {
-                SinkStatusCachedFoldOutcome::ReturnCached
-            }
+
+    match (mode, issue) {
+        (
+            _,
             SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts
-            | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot => {
-                SinkStatusCachedFoldOutcome::ReturnCached
-            }
-            SinkStatusSnapshotIssue::StaleEmpty
-            | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
-                SinkStatusCachedFoldOutcome::PropagateError
-            }
+            | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot,
+        ) => SinkStatusCachedFoldDisposition {
+            issue: Some(issue),
+            outcome: SinkStatusCachedFoldOutcome::ReturnCached,
+            should_republish_zero_row_summary: false,
         },
-        SinkStatusCachedFoldMode::ControlInflightNoClient => match cached_issue {
-            SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts
-            | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot => {
-                SinkStatusCachedFoldOutcome::ReturnCached
+        (
+            SinkStatusCachedFoldMode::WorkerUnavailable,
+            SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence,
+        )
+        | (
+            SinkStatusCachedFoldMode::NotStarted,
+            SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence,
+        ) => SinkStatusCachedFoldDisposition {
+            issue: Some(issue),
+            outcome: SinkStatusCachedFoldOutcome::ReturnCached,
+            should_republish_zero_row_summary: false,
+        },
+        (
+            SinkStatusCachedFoldMode::WorkerUnavailable
+            | SinkStatusCachedFoldMode::ControlInflightNoClient,
+            SinkStatusSnapshotIssue::StaleEmpty,
+        ) => SinkStatusCachedFoldDisposition {
+            issue: Some(issue),
+            outcome: SinkStatusCachedFoldOutcome::PropagateError,
+            should_republish_zero_row_summary: true,
+        },
+        (SinkStatusCachedFoldMode::NotStarted, SinkStatusSnapshotIssue::StaleEmpty) => {
+            SinkStatusCachedFoldDisposition {
+                issue: Some(issue),
+                outcome: SinkStatusCachedFoldOutcome::FailClosed,
+                should_republish_zero_row_summary: true,
             }
-            SinkStatusSnapshotIssue::StaleEmpty => SinkStatusCachedFoldOutcome::PropagateError,
+        }
+        (
+            SinkStatusCachedFoldMode::WorkerUnavailable,
+            SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready,
+        ) => SinkStatusCachedFoldDisposition {
+            issue: Some(issue),
+            outcome: SinkStatusCachedFoldOutcome::PropagateError,
+            should_republish_zero_row_summary: false,
+        },
+        (
+            SinkStatusCachedFoldMode::ControlInflightNoClient
+            | SinkStatusCachedFoldMode::NotStarted,
             SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence
-            | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
-                SinkStatusCachedFoldOutcome::FailClosed
-            }
-        },
-        SinkStatusCachedFoldMode::NotStarted => match cached_issue {
-            SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts
-            | SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot => {
-                SinkStatusCachedFoldOutcome::ReturnCached
-            }
-            SinkStatusSnapshotIssue::StaleEmpty
-            | SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence
-            | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready => {
-                SinkStatusCachedFoldOutcome::FailClosed
-            }
+            | SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready,
+        ) => SinkStatusCachedFoldDisposition {
+            issue: Some(issue),
+            outcome: SinkStatusCachedFoldOutcome::FailClosed,
+            should_republish_zero_row_summary: false,
         },
     }
-}
-
-fn cached_snapshot_needs_zero_row_republish(issue: Option<SinkStatusSnapshotIssue>) -> bool {
-    matches!(issue, Some(SinkStatusSnapshotIssue::StaleEmpty))
 }
 
 fn evaluate_live_sink_status_snapshot(
@@ -706,10 +504,11 @@ fn evaluate_live_sink_status_snapshot(
     cached_issue: Option<SinkStatusSnapshotIssue>,
     mode: SinkStatusLiveFoldMode,
 ) -> SinkStatusSnapshotEvaluation {
-    let live_issue = classify_sink_status_snapshot_issue(live_snapshot);
-    let decision = match fold_live_sink_status_snapshot(
-        live_snapshot,
-        cached_snapshot,
+    let live_projection = project_sink_status_snapshot_issue(live_snapshot);
+    let cached_projection = project_sink_status_snapshot_issue(cached_snapshot);
+    let decision = match fold_live_sink_status_snapshot_with_projection(
+        &live_projection,
+        &cached_projection,
         cached_issue,
         mode,
     ) {
@@ -719,10 +518,14 @@ fn evaluate_live_sink_status_snapshot(
     };
     SinkStatusSnapshotEvaluation {
         decision,
+        issue: live_projection.issue,
         should_mark_replay_required: matches!(
-            live_issue,
+            live_projection.issue,
             Some(SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts)
-        ) && !matches!(mode, SinkStatusLiveFoldMode::SteadyAfterRetryReset),
+        ) && !matches!(
+            mode,
+            SinkStatusLiveFoldMode::SteadyAfterRetryReset
+        ),
         should_republish_zero_row_summary: false,
     }
 }
@@ -731,17 +534,39 @@ fn evaluate_cached_sink_status_snapshot(
     cached_snapshot: &SinkStatusSnapshot,
     mode: SinkStatusCachedFoldMode,
 ) -> SinkStatusSnapshotEvaluation {
-    let cached_issue = classify_sink_status_snapshot_issue(cached_snapshot);
-    let decision = match fold_cached_sink_status_snapshot(cached_snapshot, mode) {
+    let cached_projection = project_sink_status_snapshot_issue(cached_snapshot);
+    let disposition = project_cached_sink_status_snapshot_fold(&cached_projection, mode);
+    let decision = match disposition.outcome {
         SinkStatusCachedFoldOutcome::ReturnCached => SinkStatusAvailabilityDecision::ReturnCached,
         SinkStatusCachedFoldOutcome::FailClosed => SinkStatusAvailabilityDecision::FailClosed,
-        SinkStatusCachedFoldOutcome::PropagateError => SinkStatusAvailabilityDecision::PropagateError,
+        SinkStatusCachedFoldOutcome::PropagateError => {
+            SinkStatusAvailabilityDecision::PropagateError
+        }
     };
     SinkStatusSnapshotEvaluation {
         decision,
+        issue: disposition.issue,
         should_mark_replay_required: false,
-        should_republish_zero_row_summary: cached_snapshot_needs_zero_row_republish(cached_issue),
+        should_republish_zero_row_summary: disposition.should_republish_zero_row_summary,
     }
+}
+
+fn apply_live_sink_status_snapshot_evaluation_side_effects(
+    sink: &SinkWorkerClientHandle,
+    snapshot: &SinkStatusSnapshot,
+    evaluation: &SinkStatusSnapshotEvaluation,
+) -> Result<()> {
+    if evaluation.should_mark_replay_required {
+        sink.control_state_replay_required
+            .store(1, Ordering::Release);
+    }
+    if matches!(
+        evaluation.decision,
+        SinkStatusAvailabilityDecision::ReturnLive
+    ) {
+        sink.update_cached_status_snapshot(snapshot.clone())?;
+    }
+    Ok(())
 }
 
 fn republish_scheduled_groups_into_zero_row_summary(
@@ -2224,12 +2049,10 @@ impl SinkWorkerClientHandle {
         }
     }
 
-    pub async fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
-        let replay_required = self.control_state_replay_required.load(Ordering::Acquire) > 0;
-        self.replay_retained_control_state_if_needed().await?;
-        let mut snapshot = self
-            .status_snapshot_with_timeout(Duration::from_secs(5))
-            .await?;
+    fn prepare_status_snapshot_for_evaluation(
+        &self,
+        mut snapshot: SinkStatusSnapshot,
+    ) -> Result<SinkStatusSnapshot> {
         let grants = self
             .config
             .lock()
@@ -2247,30 +2070,236 @@ impl SinkWorkerClientHandle {
                 summarize_sink_status_snapshot(&snapshot)
             );
         }
-        if snapshot_looks_scheduled_pending_audit_without_stream_receipts(&snapshot) {
-            if debug_control_scope_capture_enabled() {
-                eprintln!(
-                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=scheduled_pending_audit_without_stream_receipts replay_required={} {}",
-                    self.node_id.0,
-                    replay_required,
-                    summarize_sink_status_snapshot(&snapshot)
-                );
-            }
-            return Err(CnxError::Timeout);
+        Ok(snapshot)
+    }
+
+    fn nonblocking_cached_status_snapshot_reason(
+        mode: SinkStatusCachedFoldMode,
+        decision: SinkStatusAvailabilityDecision,
+        issue: Option<SinkStatusSnapshotIssue>,
+        err: Option<&CnxError>,
+    ) -> &'static str {
+        match mode {
+            SinkStatusCachedFoldMode::ControlInflightNoClient => match decision {
+                SinkStatusAvailabilityDecision::ReturnCached => {
+                    if err.is_some() {
+                        "control_inflight_cached_after_err"
+                    } else {
+                        "control_inflight"
+                    }
+                }
+                SinkStatusAvailabilityDecision::FailClosed => match issue {
+                    Some(SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot) => {
+                        "control_inflight_scheduled_waiting_for_materialized_root_cached_snapshot"
+                    }
+                    Some(SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence) => {
+                        "control_inflight_missing_scheduled_group_rows_cached_snapshot"
+                    }
+                    Some(SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready) => {
+                        "control_inflight_scheduled_mixed_ready_and_unready_cached_snapshot"
+                    }
+                    Some(SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts) => {
+                        "control_inflight_pending_audit_without_stream_receipts_cached_snapshot"
+                    }
+                    Some(SinkStatusSnapshotIssue::StaleEmpty) | None => {
+                        "control_inflight_fail_closed_cached_snapshot"
+                    }
+                },
+                SinkStatusAvailabilityDecision::PropagateError => {
+                    unreachable!("control-inflight cached evaluation never propagates error")
+                }
+                SinkStatusAvailabilityDecision::ReturnLive => {
+                    unreachable!("control-inflight cached evaluation never returns live")
+                }
+            },
+            SinkStatusCachedFoldMode::WorkerUnavailable => match issue {
+                Some(SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence) => {
+                    "worker_unavailable_missing_scheduled_group_rows_after_stream_evidence"
+                }
+                Some(SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts) => {
+                    "worker_unavailable_pending_audit_without_stream_receipts"
+                }
+                Some(SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot) => {
+                    "worker_unavailable_scheduled_waiting_for_materialized_root"
+                }
+                Some(SinkStatusSnapshotIssue::StaleEmpty) => {
+                    "worker_unavailable_stale_empty_cached_snapshot"
+                }
+                Some(SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready) => {
+                    "worker_unavailable_scheduled_mixed_ready_and_unready"
+                }
+                None => "worker_unavailable",
+            },
+            SinkStatusCachedFoldMode::NotStarted => match decision {
+                SinkStatusAvailabilityDecision::ReturnCached => "not_started",
+                SinkStatusAvailabilityDecision::FailClosed => match issue {
+                    Some(SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot) => {
+                        "not_started_scheduled_waiting_for_materialized_root_cached_snapshot"
+                    }
+                    Some(SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence) => {
+                        "not_started_missing_scheduled_group_rows_cached_snapshot"
+                    }
+                    Some(SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready) => {
+                        "not_started_scheduled_mixed_ready_and_unready_cached_snapshot"
+                    }
+                    Some(SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts) => {
+                        "not_started_pending_audit_without_stream_receipts_cached_snapshot"
+                    }
+                    Some(SinkStatusSnapshotIssue::StaleEmpty) | None => {
+                        "not_started_fail_closed_cached_snapshot"
+                    }
+                },
+                SinkStatusAvailabilityDecision::PropagateError => {
+                    unreachable!("not-started cached evaluation never propagates error")
+                }
+                SinkStatusAvailabilityDecision::ReturnLive => {
+                    unreachable!("not-started cached evaluation never returns live")
+                }
+            },
         }
-        if snapshot_looks_scheduled_waiting_for_materialized_root(&snapshot) {
-            if debug_control_scope_capture_enabled() {
-                eprintln!(
-                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=scheduled_waiting_for_materialized_root replay_required={} {}",
-                    self.node_id.0,
-                    replay_required,
-                    summarize_sink_status_snapshot(&snapshot)
-                );
-            }
-            return Err(CnxError::Timeout);
+    }
+
+    fn finalize_nonblocking_cached_status_snapshot(
+        &self,
+        snapshot: SinkStatusSnapshot,
+        mode: SinkStatusCachedFoldMode,
+        err: Option<CnxError>,
+    ) -> Result<SinkStatusSnapshot> {
+        let evaluation = evaluate_cached_sink_status_snapshot(&snapshot, mode);
+        if evaluation.should_republish_zero_row_summary {
+            self.republish_cached_scheduled_groups_into_empty_status_summary()?;
         }
+        let reason = Self::nonblocking_cached_status_snapshot_reason(
+            mode,
+            evaluation.decision,
+            evaluation.issue,
+            err.as_ref(),
+        );
+        match evaluation.decision {
+            SinkStatusAvailabilityDecision::ReturnCached => {
+                if debug_control_scope_capture_enabled() {
+                    match err.as_ref() {
+                        Some(err) => eprintln!(
+                            "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason={} err={} {}",
+                            self.node_id.0,
+                            reason,
+                            err,
+                            summarize_sink_status_snapshot(&snapshot)
+                        ),
+                        None => eprintln!(
+                            "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason={} {}",
+                            self.node_id.0,
+                            reason,
+                            summarize_sink_status_snapshot(&snapshot)
+                        ),
+                    }
+                }
+                Ok(snapshot)
+            }
+            SinkStatusAvailabilityDecision::FailClosed => {
+                if debug_control_scope_capture_enabled() {
+                    match err.as_ref() {
+                        Some(err) => eprintln!(
+                            "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason={} err={} {}",
+                            self.node_id.0,
+                            reason,
+                            err,
+                            summarize_sink_status_snapshot(&snapshot)
+                        ),
+                        None => eprintln!(
+                            "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason={} {}",
+                            self.node_id.0,
+                            reason,
+                            summarize_sink_status_snapshot(&snapshot)
+                        ),
+                    }
+                }
+                Err(CnxError::Timeout)
+            }
+            SinkStatusAvailabilityDecision::PropagateError => Err(err.expect(
+                "cached sink status propagation requires the original worker-unavailable error",
+            )),
+            SinkStatusAvailabilityDecision::ReturnLive => {
+                unreachable!("cached sink status evaluation never returns live")
+            }
+        }
+    }
+
+    fn finalize_blocking_status_snapshot(
+        &self,
+        snapshot: SinkStatusSnapshot,
+        replay_required: bool,
+    ) -> Result<SinkStatusSnapshot> {
+        let snapshot = self.prepare_status_snapshot_for_evaluation(snapshot)?;
+        let cached_snapshot = SinkStatusSnapshot::default();
+        let evaluation = evaluate_live_sink_status_snapshot(
+            &snapshot,
+            &cached_snapshot,
+            None,
+            SinkStatusLiveFoldMode::Blocking,
+        );
+        apply_live_sink_status_snapshot_evaluation_side_effects(self, &snapshot, &evaluation)?;
+        match evaluation.decision {
+            SinkStatusAvailabilityDecision::ReturnLive => Ok(snapshot),
+            SinkStatusAvailabilityDecision::FailClosed => {
+                if debug_control_scope_capture_enabled() {
+                    let live_issue = classify_sink_status_snapshot_issue(&snapshot);
+                    let reason = match live_issue {
+                        Some(
+                            SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence,
+                        ) => "blocking_missing_scheduled_group_rows_after_stream_evidence",
+                        Some(
+                            SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts,
+                        ) => "blocking_scheduled_pending_audit_without_stream_receipts",
+                        Some(SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot) => {
+                            "blocking_scheduled_waiting_for_materialized_root"
+                        }
+                        Some(SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready) => {
+                            "blocking_scheduled_mixed_ready_and_unready"
+                        }
+                        Some(SinkStatusSnapshotIssue::StaleEmpty) | None => "blocking_fail_closed",
+                    };
+                    eprintln!(
+                        "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason={} replay_required={} {}",
+                        self.node_id.0,
+                        reason,
+                        replay_required,
+                        summarize_sink_status_snapshot(&snapshot)
+                    );
+                }
+                Err(CnxError::Timeout)
+            }
+            SinkStatusAvailabilityDecision::ReturnCached => {
+                unreachable!("blocking live sink status evaluation never returns cached")
+            }
+            SinkStatusAvailabilityDecision::PropagateError => {
+                unreachable!("blocking live sink status evaluation never propagates error")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn finalize_test_hooked_blocking_status_snapshot(
+        &self,
+        snapshot: SinkStatusSnapshot,
+    ) -> Result<SinkStatusSnapshot> {
+        let snapshot = self.prepare_status_snapshot_for_evaluation(snapshot)?;
         self.update_cached_status_snapshot(snapshot.clone())?;
         Ok(snapshot)
+    }
+
+    pub async fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+        let replay_required = self.control_state_replay_required.load(Ordering::Acquire) > 0;
+        #[cfg(test)]
+        if let Some(snapshot) = take_sink_worker_status_snapshot_hook(self.shared_worker().await.0)
+        {
+            return self.finalize_test_hooked_blocking_status_snapshot(snapshot);
+        }
+        self.replay_retained_control_state_if_needed().await?;
+        let snapshot = self
+            .status_snapshot_with_timeout(Duration::from_secs(5))
+            .await?;
+        self.finalize_blocking_status_snapshot(snapshot, replay_required)
     }
 
     pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
@@ -2296,29 +2325,9 @@ impl SinkWorkerClientHandle {
                     .await
                 {
                     Ok(probe_outcome) => {
-                        let mut live_snapshot = probe_outcome.snapshot;
-                        let grants = self
-                            .config
-                            .lock()
-                            .map_err(|_| {
-                                CnxError::Internal("sink worker config lock poisoned".into())
-                            })?
-                            .host_object_grants
-                            .clone();
-                        normalize_sink_status_snapshot_node_keys(
-                            &mut live_snapshot,
-                            &self.node_id,
-                            &grants,
-                        );
-                        if let Some(groups) = self.cached_scheduled_group_ids()? {
-                            republish_scheduled_groups_into_zero_row_summary(
-                                &mut live_snapshot,
-                                &self.node_id,
-                                &groups,
-                            );
-                        }
-                        let inflight_control_summaries =
-                            self.inflight_control_frame_summaries();
+                        let live_snapshot =
+                            self.prepare_status_snapshot_for_evaluation(probe_outcome.snapshot)?;
+                        let inflight_control_summaries = self.inflight_control_frame_summaries();
                         if !snapshot_reflects_inflight_control_frame_summaries(
                             &live_snapshot,
                             &self.node_id,
@@ -2343,13 +2352,13 @@ impl SinkWorkerClientHandle {
                             cached_issue,
                             fold_mode,
                         );
-                        if evaluation.should_mark_replay_required {
-                            self.control_state_replay_required
-                                .store(1, Ordering::Release);
-                        }
+                        apply_live_sink_status_snapshot_evaluation_side_effects(
+                            self,
+                            &live_snapshot,
+                            &evaluation,
+                        )?;
                         match evaluation.decision {
                             SinkStatusAvailabilityDecision::ReturnLive => {
-                                self.update_cached_status_snapshot(live_snapshot.clone())?;
                                 if debug_control_scope_capture_enabled() {
                                     let reason = if probe_outcome.recovered_after_retry_reset {
                                         "control_inflight_recovered_after_retry_reset"
@@ -2377,7 +2386,8 @@ impl SinkWorkerClientHandle {
                                 return Ok(cached_snapshot);
                             }
                             SinkStatusAvailabilityDecision::FailClosed => {
-                                let live_issue = classify_sink_status_snapshot_issue(&live_snapshot);
+                                let live_issue =
+                                    classify_sink_status_snapshot_issue(&live_snapshot);
                                 let reason = match live_issue {
                                     Some(
                                         SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence,
@@ -2415,123 +2425,19 @@ impl SinkWorkerClientHandle {
                         }
                     }
                     Err(err) => {
-                        let evaluation = evaluate_cached_sink_status_snapshot(
-                            &snapshot,
+                        return self.finalize_nonblocking_cached_status_snapshot(
+                            snapshot,
                             SinkStatusCachedFoldMode::ControlInflightNoClient,
+                            Some(err),
                         );
-                        if evaluation.should_republish_zero_row_summary {
-                            self.republish_cached_scheduled_groups_into_empty_status_summary()?;
-                        }
-                        match evaluation.decision {
-                            SinkStatusAvailabilityDecision::ReturnCached => {
-                                if debug_control_scope_capture_enabled() {
-                                    eprintln!(
-                                        "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=control_inflight_cached_after_err err={} {}",
-                                        self.node_id.0,
-                                        err,
-                                        summarize_sink_status_snapshot(&snapshot)
-                                    );
-                                }
-                                return Ok(snapshot);
-                            }
-                            SinkStatusAvailabilityDecision::FailClosed => {
-                                let cached_issue =
-                                    classify_sink_status_snapshot_issue(&snapshot);
-                                let reason = match cached_issue {
-                                    Some(
-                                        SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot,
-                                    ) => {
-                                        "control_inflight_scheduled_waiting_for_materialized_root_cached_snapshot"
-                                    }
-                                    Some(
-                                        SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence,
-                                    ) => {
-                                        "control_inflight_missing_scheduled_group_rows_cached_snapshot"
-                                    }
-                                    Some(SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready) => {
-                                        "control_inflight_scheduled_mixed_ready_and_unready_cached_snapshot"
-                                    }
-                                    Some(
-                                        SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts,
-                                    ) => {
-                                        "control_inflight_pending_audit_without_stream_receipts_cached_snapshot"
-                                    }
-                                    Some(SinkStatusSnapshotIssue::StaleEmpty) | None => {
-                                        "control_inflight_fail_closed_cached_snapshot"
-                                    }
-                                };
-                                if debug_control_scope_capture_enabled() {
-                                    eprintln!(
-                                        "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason={} {}",
-                                        self.node_id.0,
-                                        reason,
-                                        summarize_sink_status_snapshot(&snapshot)
-                                    );
-                                }
-                                return Err(CnxError::Timeout);
-                            }
-                            SinkStatusAvailabilityDecision::PropagateError => return Err(err),
-                            SinkStatusAvailabilityDecision::ReturnLive => {
-                                unreachable!("cached sink status evaluation never returns live")
-                            }
-                        }
                     }
                 }
             }
-            let evaluation = evaluate_cached_sink_status_snapshot(
-                &snapshot,
+            return self.finalize_nonblocking_cached_status_snapshot(
+                snapshot,
                 SinkStatusCachedFoldMode::ControlInflightNoClient,
+                None,
             );
-            if evaluation.should_republish_zero_row_summary {
-                self.republish_cached_scheduled_groups_into_empty_status_summary()?;
-            }
-            match evaluation.decision {
-                SinkStatusAvailabilityDecision::ReturnCached => {
-                    if debug_control_scope_capture_enabled() {
-                        eprintln!(
-                            "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=control_inflight {}",
-                            self.node_id.0,
-                            summarize_sink_status_snapshot(&snapshot)
-                        );
-                    }
-                    return Ok(snapshot);
-                }
-                SinkStatusAvailabilityDecision::FailClosed => {
-                    let cached_issue = classify_sink_status_snapshot_issue(&snapshot);
-                    let reason = match cached_issue {
-                        Some(SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot) => {
-                            "control_inflight_scheduled_waiting_for_materialized_root_cached_snapshot"
-                        }
-                        Some(SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence) => {
-                            "control_inflight_missing_scheduled_group_rows_cached_snapshot"
-                        }
-                        Some(SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready) => {
-                            "control_inflight_scheduled_mixed_ready_and_unready_cached_snapshot"
-                        }
-                        Some(SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts) => {
-                            "control_inflight_pending_audit_without_stream_receipts_cached_snapshot"
-                        }
-                        Some(SinkStatusSnapshotIssue::StaleEmpty) | None => {
-                            "control_inflight_fail_closed_cached_snapshot"
-                        }
-                    };
-                    if debug_control_scope_capture_enabled() {
-                        eprintln!(
-                            "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason={} {}",
-                            self.node_id.0,
-                            reason,
-                            summarize_sink_status_snapshot(&snapshot)
-                        );
-                    }
-                    return Err(CnxError::Timeout);
-                }
-                SinkStatusAvailabilityDecision::PropagateError => {
-                    unreachable!("control-inflight cached evaluation never propagates error")
-                }
-                SinkStatusAvailabilityDecision::ReturnLive => {
-                    unreachable!("control-inflight cached evaluation never returns live")
-                }
-            }
         }
         match self.existing_client().await? {
             Some(_) => {
@@ -2546,35 +2452,9 @@ impl SinkWorkerClientHandle {
                     .await
                 {
                     Ok(probe_outcome) => {
-                        let mut snapshot = probe_outcome.snapshot;
                         let cached_snapshot = self.cached_status_snapshot()?;
-                        let grants = self
-                            .config
-                            .lock()
-                            .map_err(|_| {
-                                CnxError::Internal("sink worker config lock poisoned".into())
-                            })?
-                            .host_object_grants
-                            .clone();
-                        normalize_sink_status_snapshot_node_keys(
-                            &mut snapshot,
-                            &self.node_id,
-                            &grants,
-                        );
-                        if let Some(groups) = self.cached_scheduled_group_ids()? {
-                            republish_scheduled_groups_into_zero_row_summary(
-                                &mut snapshot,
-                                &self.node_id,
-                                &groups,
-                            );
-                        }
-                        if debug_control_scope_capture_enabled() {
-                            eprintln!(
-                                "fs_meta_sink_worker_client: status_snapshot reply node={} {}",
-                                self.node_id.0,
-                                summarize_sink_status_snapshot(&snapshot)
-                            );
-                        }
+                        let snapshot =
+                            self.prepare_status_snapshot_for_evaluation(probe_outcome.snapshot)?;
                         let cached_issue = classify_sink_status_snapshot_issue(&cached_snapshot);
                         let fold_mode = if probe_outcome.recovered_after_retry_reset {
                             SinkStatusLiveFoldMode::SteadyAfterRetryReset
@@ -2588,10 +2468,11 @@ impl SinkWorkerClientHandle {
                             fold_mode,
                         );
                         let live_issue = classify_sink_status_snapshot_issue(&snapshot);
-                        if evaluation.should_mark_replay_required {
-                            self.control_state_replay_required
-                                .store(1, Ordering::Release);
-                        }
+                        apply_live_sink_status_snapshot_evaluation_side_effects(
+                            self,
+                            &snapshot,
+                            &evaluation,
+                        )?;
                         match evaluation.decision {
                             SinkStatusAvailabilityDecision::ReturnLive => {
                                 if debug_control_scope_capture_enabled()
@@ -2669,82 +2550,25 @@ impl SinkWorkerClientHandle {
                             }
                             SinkStatusAvailabilityDecision::PropagateError => {}
                         }
-                        self.update_cached_status_snapshot(snapshot.clone())?;
                         Ok(snapshot)
                     }
                     Err(err) => {
                         let snapshot = self.cached_status_snapshot()?;
-                        if snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(
-                            &snapshot,
-                        ) {
-                            if debug_control_scope_capture_enabled() {
-                                eprintln!(
-                                    "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=worker_unavailable_missing_scheduled_group_rows_after_stream_evidence err={} {}",
-                                    self.node_id.0,
-                                    err,
-                                    summarize_sink_status_snapshot(&snapshot)
-                                );
-                            }
-                            Ok(snapshot)
-                        } else if snapshot_looks_stale_empty(&snapshot)
-                            || snapshot_looks_scheduled_waiting_for_materialized_root(&snapshot)
-                            || snapshot_looks_scheduled_mixed_ready_and_unready(&snapshot)
-                        {
-                            if snapshot_looks_stale_empty(&snapshot) {
-                                self.republish_cached_scheduled_groups_into_empty_status_summary()?;
-                            }
-                            if debug_control_scope_capture_enabled() {
-                                eprintln!(
-                                    "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=worker_unavailable_stale_cache err={} {}",
-                                    self.node_id.0,
-                                    err,
-                                    summarize_sink_status_snapshot(&snapshot)
-                                );
-                            }
-                            Err(err)
-                        } else {
-                            self.republish_cached_scheduled_groups_into_empty_status_summary()?;
-                            if debug_control_scope_capture_enabled() {
-                                eprintln!(
-                                    "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=worker_unavailable err={} {}",
-                                    self.node_id.0,
-                                    err,
-                                    summarize_sink_status_snapshot(&snapshot)
-                                );
-                            }
-                            Ok(snapshot)
-                        }
+                        self.finalize_nonblocking_cached_status_snapshot(
+                            snapshot,
+                            SinkStatusCachedFoldMode::WorkerUnavailable,
+                            Some(err),
+                        )
                     }
                 }
             }
             None => {
                 let snapshot = self.cached_status_snapshot()?;
-                if snapshot_looks_stale_empty(&snapshot)
-                    || snapshot_looks_scheduled_waiting_for_materialized_root(&snapshot)
-                    || snapshot_looks_scheduled_missing_group_rows_after_stream_evidence(&snapshot)
-                    || snapshot_looks_scheduled_mixed_ready_and_unready(&snapshot)
-                {
-                    if snapshot_looks_stale_empty(&snapshot) {
-                        self.republish_cached_scheduled_groups_into_empty_status_summary()?;
-                    }
-                    if debug_control_scope_capture_enabled() {
-                        eprintln!(
-                            "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason=not_started_stale_cache {}",
-                            self.node_id.0,
-                            summarize_sink_status_snapshot(&snapshot)
-                        );
-                    }
-                    Err(CnxError::Timeout)
-                } else {
-                    if debug_control_scope_capture_enabled() {
-                        eprintln!(
-                            "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=not_started {}",
-                            self.node_id.0,
-                            summarize_sink_status_snapshot(&snapshot)
-                        );
-                    }
-                    Ok(snapshot)
-                }
+                self.finalize_nonblocking_cached_status_snapshot(
+                    snapshot,
+                    SinkStatusCachedFoldMode::NotStarted,
+                    None,
+                )
             }
         }
     }
@@ -2875,7 +2699,8 @@ impl SinkWorkerClientHandle {
                         return Ok(SinkWorkerResponse::StatusSnapshot(snapshot));
                     }
                     #[cfg(test)]
-                    if let Some(err) = take_sink_worker_status_error_hook(current_worker_instance_id)
+                    if let Some(err) =
+                        take_sink_worker_status_error_hook(current_worker_instance_id)
                     {
                         return Err(err);
                     }
@@ -2917,7 +2742,10 @@ impl SinkWorkerClientHandle {
     }
 
     async fn status_snapshot_with_timeout(&self, timeout: Duration) -> Result<SinkStatusSnapshot> {
-        Ok(self.status_snapshot_with_timeout_outcome(timeout).await?.snapshot)
+        Ok(self
+            .status_snapshot_with_timeout_outcome(timeout)
+            .await?
+            .snapshot)
     }
 
     pub async fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
@@ -2970,6 +2798,7 @@ impl SinkWorkerClientHandle {
                 Err(err)
                     if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
                 {
+                    self.reset_shared_worker_client_for_retry().await?;
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(err) => return Err(err),
@@ -3218,8 +3047,7 @@ impl SinkWorkerClientHandle {
         let inflight_summary = decoded_signals
             .as_ref()
             .map(|signals| summarize_sink_control_signals(signals));
-        let _inflight_summary_guard =
-            self.begin_control_frame_summary_tracking(inflight_summary);
+        let _inflight_summary_guard = self.begin_control_frame_summary_tracking(inflight_summary);
         eprintln!(
             "fs_meta_sink_worker_client: on_control_frame begin node={} envelopes={}",
             self.node_id.0,

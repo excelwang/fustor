@@ -758,14 +758,20 @@ fn summarize_source_observability_snapshot(snapshot: &SourceObservabilitySnapsho
     )
 }
 
-fn source_observability_snapshot_debug_maps_absent(
-    snapshot: &SourceObservabilitySnapshot,
-) -> bool {
-    snapshot.scheduled_source_groups_by_node.is_empty()
+fn source_observability_snapshot_debug_maps_absent(snapshot: &SourceObservabilitySnapshot) -> bool {
+    snapshot.last_force_find_runner_by_group.is_empty()
+        && snapshot.force_find_inflight_groups.is_empty()
+        && snapshot.scheduled_source_groups_by_node.is_empty()
         && snapshot.scheduled_scan_groups_by_node.is_empty()
         && snapshot.last_control_frame_signals_by_node.is_empty()
-        && snapshot.published_batches_by_node.values().all(|count| *count == 0)
-        && snapshot.published_events_by_node.values().all(|count| *count == 0)
+        && snapshot
+            .published_batches_by_node
+            .values()
+            .all(|count| *count == 0)
+        && snapshot
+            .published_events_by_node
+            .values()
+            .all(|count| *count == 0)
         && snapshot
             .published_control_events_by_node
             .values()
@@ -785,16 +791,13 @@ fn source_observability_snapshot_debug_maps_absent(
         && snapshot.published_path_origin_counts_by_node.is_empty()
 }
 
-fn source_observability_snapshot_has_active_state(
-    snapshot: &SourceObservabilitySnapshot,
-) -> bool {
-    snapshot.status.current_stream_generation.is_some()
-        || snapshot
-            .status
+pub(crate) fn source_status_has_active_observability_truth(status: &SourceStatusSnapshot) -> bool {
+    status.current_stream_generation.is_some()
+        || status
             .logical_roots
             .iter()
             .any(|entry| entry.active_members > 0 || entry.status.eq_ignore_ascii_case("ready"))
-        || snapshot.status.concrete_roots.iter().any(|entry| {
+        || status.concrete_roots.iter().any(|entry| {
             entry.active
                 || entry.current_stream_generation.is_some()
                 || entry.emitted_batch_count > 0
@@ -802,9 +805,153 @@ fn source_observability_snapshot_has_active_state(
                 || entry.emitted_event_count > 0
                 || entry.forwarded_event_count > 0
         })
-        || !snapshot.scheduled_source_groups_by_node.is_empty()
+}
+
+pub(crate) fn scheduled_groups_by_node_have_recovered_members(
+    groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
+) -> bool {
+    groups_by_node.values().any(|groups| !groups.is_empty())
+}
+
+pub(crate) fn source_observability_has_recovered_schedule_members(
+    scheduled_source_groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
+    scheduled_scan_groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
+) -> bool {
+    scheduled_groups_by_node_have_recovered_members(scheduled_source_groups_by_node)
+        || scheduled_groups_by_node_have_recovered_members(scheduled_scan_groups_by_node)
+}
+
+pub(crate) fn source_observability_has_recovered_active_state(
+    status: &SourceStatusSnapshot,
+    last_force_find_runner_by_group: &std::collections::BTreeMap<String, String>,
+    force_find_inflight_groups: &[String],
+    scheduled_source_groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
+    scheduled_scan_groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
+) -> bool {
+    source_status_has_active_observability_truth(status)
+        || !last_force_find_runner_by_group.is_empty()
+        || !force_find_inflight_groups.is_empty()
+        || source_observability_has_recovered_schedule_members(
+            scheduled_source_groups_by_node,
+            scheduled_scan_groups_by_node,
+        )
+}
+
+pub(crate) fn source_observability_recovered_control_summary_allowed(
+    has_recovered_active_state: bool,
+    scheduled_source_groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
+    scheduled_scan_groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
+) -> bool {
+    let has_recovered_schedule_members = source_observability_has_recovered_schedule_members(
+        scheduled_source_groups_by_node,
+        scheduled_scan_groups_by_node,
+    );
+    let has_explicit_empty_recovered_schedule = (!scheduled_source_groups_by_node.is_empty()
+        || !scheduled_scan_groups_by_node.is_empty())
+        && !has_recovered_schedule_members;
+    has_recovered_active_state && !has_explicit_empty_recovered_schedule
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SourceObservabilityRecoveryProjection {
+    pub stable_host_ref: String,
+    pub scheduled_source_groups_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub scheduled_scan_groups_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub allow_recovered_control_summary: bool,
+}
+
+impl SourceObservabilityRecoveryProjection {
+    pub(crate) fn allow_control_summary(&self, has_local_source_grants: bool) -> bool {
+        self.allow_recovered_control_summary || has_local_source_grants
+    }
+}
+
+fn resolved_source_observability_schedule_groups_by_node(
+    stable_host_ref: &str,
+    status: &SourceStatusSnapshot,
+    explicit_groups_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    select_group: impl Fn(&crate::source::SourceConcreteRootHealthSnapshot) -> bool,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    if explicit_groups_by_node.is_empty() {
+        recovered_scheduled_groups_by_node_from_active_status(stable_host_ref, status, select_group)
+    } else {
+        explicit_groups_by_node
+    }
+}
+
+pub(crate) fn source_observability_recovery_projection(
+    stable_host_ref: impl Into<String>,
+    status: &SourceStatusSnapshot,
+    last_force_find_runner_by_group: &std::collections::BTreeMap<String, String>,
+    force_find_inflight_groups: &[String],
+    explicit_scheduled_source_groups_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    explicit_scheduled_scan_groups_by_node: std::collections::BTreeMap<String, Vec<String>>,
+) -> SourceObservabilityRecoveryProjection {
+    let stable_host_ref = stable_host_ref.into();
+    let scheduled_source_groups_by_node = resolved_source_observability_schedule_groups_by_node(
+        &stable_host_ref,
+        status,
+        explicit_scheduled_source_groups_by_node,
+        |entry| entry.watch_enabled,
+    );
+    let scheduled_scan_groups_by_node = resolved_source_observability_schedule_groups_by_node(
+        &stable_host_ref,
+        status,
+        explicit_scheduled_scan_groups_by_node,
+        |entry| entry.scan_enabled,
+    );
+    let has_recovered_active_state = source_observability_has_recovered_active_state(
+        status,
+        last_force_find_runner_by_group,
+        force_find_inflight_groups,
+        &scheduled_source_groups_by_node,
+        &scheduled_scan_groups_by_node,
+    );
+    let allow_recovered_control_summary = source_observability_recovered_control_summary_allowed(
+        has_recovered_active_state,
+        &scheduled_source_groups_by_node,
+        &scheduled_scan_groups_by_node,
+    );
+    SourceObservabilityRecoveryProjection {
+        stable_host_ref,
+        scheduled_source_groups_by_node,
+        scheduled_scan_groups_by_node,
+        allow_recovered_control_summary,
+    }
+}
+
+pub(crate) fn recovered_control_signals_by_node_from_active_status(
+    stable_host_ref: &str,
+    status: &SourceStatusSnapshot,
+    scheduled_source_groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
+    scheduled_scan_groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let projection = SourceObservabilityRecoveryProjection {
+        stable_host_ref: stable_host_ref.to_string(),
+        scheduled_source_groups_by_node: scheduled_source_groups_by_node.clone(),
+        scheduled_scan_groups_by_node: scheduled_scan_groups_by_node.clone(),
+        allow_recovered_control_summary: source_status_has_active_observability_truth(status),
+    };
+    recovered_control_signals_by_node_from_projection(&projection, status)
+}
+
+fn source_observability_snapshot_has_active_state(snapshot: &SourceObservabilitySnapshot) -> bool {
+    source_observability_has_recovered_active_state(
+        &snapshot.status,
+        &snapshot.last_force_find_runner_by_group,
+        &snapshot.force_find_inflight_groups,
+        &snapshot.scheduled_source_groups_by_node,
+        &snapshot.scheduled_scan_groups_by_node,
+    ) || !snapshot.scheduled_source_groups_by_node.is_empty()
         || !snapshot.scheduled_scan_groups_by_node.is_empty()
         || !snapshot.last_control_frame_signals_by_node.is_empty()
+}
+
+fn source_observability_snapshot_can_preserve_cached_observability(
+    snapshot: &SourceObservabilitySnapshot,
+) -> bool {
+    source_observability_snapshot_has_active_state(snapshot)
+        && !source_observability_snapshot_debug_maps_absent(snapshot)
 }
 
 fn should_preserve_cached_observability_map<K: Ord, V>(
@@ -892,11 +1039,151 @@ fn merge_cached_observability_option<T: Clone>(
     }
 }
 
+fn apply_observability_snapshot_to_cache(
+    cache: &mut SourceWorkerSnapshotCache,
+    snapshot: &SourceObservabilitySnapshot,
+) {
+    let can_preserve_omitted_observability =
+        source_observability_snapshot_can_preserve_cached_observability(snapshot);
+    let explicit_zero_published_nodes = explicit_zero_published_counter_nodes(snapshot);
+    let preserve_last_scheduled_source_groups = should_preserve_cached_observability_map(
+        can_preserve_omitted_observability,
+        &snapshot.scheduled_source_groups_by_node,
+        cache.scheduled_source_groups_by_node.as_ref(),
+    );
+    let preserve_last_scheduled_scan_groups = should_preserve_cached_observability_map(
+        can_preserve_omitted_observability,
+        &snapshot.scheduled_scan_groups_by_node,
+        cache.scheduled_scan_groups_by_node.as_ref(),
+    );
+    let preserve_last_control_summary = should_preserve_cached_observability_map(
+        can_preserve_omitted_observability,
+        &snapshot.last_control_frame_signals_by_node,
+        cache.last_control_frame_signals_by_node.as_ref(),
+    );
+    let preserve_last_published_batches = should_preserve_cached_observability_map(
+        can_preserve_omitted_observability,
+        &snapshot.published_batches_by_node,
+        cache.published_batches_by_node.as_ref(),
+    );
+    let preserve_last_published_events = should_preserve_cached_observability_map(
+        can_preserve_omitted_observability,
+        &snapshot.published_events_by_node,
+        cache.published_events_by_node.as_ref(),
+    );
+    let preserve_last_published_control_events = should_preserve_cached_observability_map(
+        can_preserve_omitted_observability,
+        &snapshot.published_control_events_by_node,
+        cache.published_control_events_by_node.as_ref(),
+    );
+    let preserve_last_published_data_events = should_preserve_cached_observability_map(
+        can_preserve_omitted_observability,
+        &snapshot.published_data_events_by_node,
+        cache.published_data_events_by_node.as_ref(),
+    );
+    cache.lifecycle_state = Some(snapshot.lifecycle_state.clone());
+    cache.last_live_observability_snapshot_at = Some(Instant::now());
+    cache.host_object_grants_version = Some(snapshot.host_object_grants_version);
+    cache.grants = Some(snapshot.grants.clone());
+    cache.logical_roots = Some(snapshot.logical_roots.clone());
+    cache.status = Some(snapshot.status.clone());
+    cache.source_primary_by_group = Some(snapshot.source_primary_by_group.clone());
+    cache.last_force_find_runner_by_group = Some(snapshot.last_force_find_runner_by_group.clone());
+    cache.force_find_inflight_groups = Some(snapshot.force_find_inflight_groups.clone());
+    if !preserve_last_scheduled_source_groups {
+        cache.scheduled_source_groups_by_node =
+            Some(snapshot.scheduled_source_groups_by_node.clone());
+    }
+    if !preserve_last_scheduled_scan_groups {
+        cache.scheduled_scan_groups_by_node = Some(snapshot.scheduled_scan_groups_by_node.clone());
+    }
+    if !preserve_last_control_summary {
+        cache.last_control_frame_signals_by_node =
+            Some(snapshot.last_control_frame_signals_by_node.clone());
+    }
+    if !preserve_last_published_batches {
+        cache.published_batches_by_node = Some(snapshot.published_batches_by_node.clone());
+    }
+    if !preserve_last_published_events {
+        cache.published_events_by_node = Some(snapshot.published_events_by_node.clone());
+    }
+    if !preserve_last_published_control_events {
+        cache.published_control_events_by_node =
+            Some(snapshot.published_control_events_by_node.clone());
+    }
+    if !preserve_last_published_data_events {
+        cache.published_data_events_by_node = Some(snapshot.published_data_events_by_node.clone());
+    }
+    cache.last_published_at_us_by_node = Some(merge_cached_observability_node_map(
+        can_preserve_omitted_observability,
+        &snapshot.last_published_at_us_by_node,
+        cache.last_published_at_us_by_node.as_ref(),
+        &explicit_zero_published_nodes,
+    ));
+    cache.last_published_origins_by_node = Some(merge_cached_observability_node_map(
+        can_preserve_omitted_observability,
+        &snapshot.last_published_origins_by_node,
+        cache.last_published_origins_by_node.as_ref(),
+        &explicit_zero_published_nodes,
+    ));
+    cache.published_origin_counts_by_node = Some(merge_cached_observability_node_map(
+        can_preserve_omitted_observability,
+        &snapshot.published_origin_counts_by_node,
+        cache.published_origin_counts_by_node.as_ref(),
+        &explicit_zero_published_nodes,
+    ));
+    cache.published_path_capture_target = merge_cached_observability_option(
+        can_preserve_omitted_observability,
+        &snapshot.published_path_capture_target,
+        &cache.published_path_capture_target,
+        !explicit_zero_published_nodes.is_empty(),
+    );
+    cache.enqueued_path_origin_counts_by_node = Some(merge_cached_observability_node_map(
+        can_preserve_omitted_observability,
+        &snapshot.enqueued_path_origin_counts_by_node,
+        cache.enqueued_path_origin_counts_by_node.as_ref(),
+        &explicit_zero_published_nodes,
+    ));
+    cache.pending_path_origin_counts_by_node = Some(merge_cached_observability_node_map(
+        can_preserve_omitted_observability,
+        &snapshot.pending_path_origin_counts_by_node,
+        cache.pending_path_origin_counts_by_node.as_ref(),
+        &explicit_zero_published_nodes,
+    ));
+    cache.yielded_path_origin_counts_by_node = Some(merge_cached_observability_node_map(
+        can_preserve_omitted_observability,
+        &snapshot.yielded_path_origin_counts_by_node,
+        cache.yielded_path_origin_counts_by_node.as_ref(),
+        &explicit_zero_published_nodes,
+    ));
+    cache.summarized_path_origin_counts_by_node = Some(merge_cached_observability_node_map(
+        can_preserve_omitted_observability,
+        &snapshot.summarized_path_origin_counts_by_node,
+        cache.summarized_path_origin_counts_by_node.as_ref(),
+        &explicit_zero_published_nodes,
+    ));
+    cache.published_path_origin_counts_by_node = Some(merge_cached_observability_node_map(
+        can_preserve_omitted_observability,
+        &snapshot.published_path_origin_counts_by_node,
+        cache.published_path_origin_counts_by_node.as_ref(),
+        &explicit_zero_published_nodes,
+    ));
+}
+
+fn merge_live_observability_snapshot_with_recent_cache(
+    cache: &SourceWorkerSnapshotCache,
+    snapshot: &SourceObservabilitySnapshot,
+) -> SourceObservabilitySnapshot {
+    let mut merged_cache = cache.clone();
+    apply_observability_snapshot_to_cache(&mut merged_cache, snapshot);
+    build_cached_worker_observability_snapshot(&merged_cache).unwrap_or_else(|| snapshot.clone())
+}
+
 fn recent_cached_source_observability_snapshot_is_incomplete(
     snapshot: &SourceObservabilitySnapshot,
 ) -> bool {
     source_observability_snapshot_has_active_state(snapshot)
-        && source_observability_snapshot_debug_maps_absent(snapshot)
+        && !source_observability_snapshot_can_preserve_cached_observability(snapshot)
 }
 
 fn fail_close_incomplete_active_source_observability_snapshot(
@@ -910,7 +1197,7 @@ fn fail_close_incomplete_active_source_observability_snapshot(
     snapshot.status.concrete_roots.clear();
 }
 
-fn control_signals_by_node(
+pub(crate) fn control_signals_by_node(
     node_key: &str,
     signals: &[String],
 ) -> std::collections::BTreeMap<String, Vec<String>> {
@@ -2421,139 +2708,7 @@ impl SourceWorkerClientHandle {
     }
 
     fn update_cached_observability_snapshot(&self, snapshot: &SourceObservabilitySnapshot) {
-        self.with_cache_mut(|cache| {
-            let can_preserve_omitted_observability =
-                source_observability_snapshot_has_active_state(snapshot)
-                    && !source_observability_snapshot_debug_maps_absent(snapshot);
-            let explicit_zero_published_nodes = explicit_zero_published_counter_nodes(snapshot);
-            let preserve_last_scheduled_source_groups = should_preserve_cached_observability_map(
-                can_preserve_omitted_observability,
-                &snapshot.scheduled_source_groups_by_node,
-                cache.scheduled_source_groups_by_node.as_ref(),
-            );
-            let preserve_last_scheduled_scan_groups = should_preserve_cached_observability_map(
-                can_preserve_omitted_observability,
-                &snapshot.scheduled_scan_groups_by_node,
-                cache.scheduled_scan_groups_by_node.as_ref(),
-            );
-            let preserve_last_control_summary = should_preserve_cached_observability_map(
-                can_preserve_omitted_observability,
-                &snapshot.last_control_frame_signals_by_node,
-                cache.last_control_frame_signals_by_node.as_ref(),
-            );
-            let preserve_last_published_batches = should_preserve_cached_observability_map(
-                can_preserve_omitted_observability,
-                &snapshot.published_batches_by_node,
-                cache.published_batches_by_node.as_ref(),
-            );
-            let preserve_last_published_events = should_preserve_cached_observability_map(
-                can_preserve_omitted_observability,
-                &snapshot.published_events_by_node,
-                cache.published_events_by_node.as_ref(),
-            );
-            let preserve_last_published_control_events = should_preserve_cached_observability_map(
-                can_preserve_omitted_observability,
-                &snapshot.published_control_events_by_node,
-                cache.published_control_events_by_node.as_ref(),
-            );
-            let preserve_last_published_data_events = should_preserve_cached_observability_map(
-                can_preserve_omitted_observability,
-                &snapshot.published_data_events_by_node,
-                cache.published_data_events_by_node.as_ref(),
-            );
-            cache.lifecycle_state = Some(snapshot.lifecycle_state.clone());
-            cache.last_live_observability_snapshot_at = Some(Instant::now());
-            cache.host_object_grants_version = Some(snapshot.host_object_grants_version);
-            cache.grants = Some(snapshot.grants.clone());
-            cache.logical_roots = Some(snapshot.logical_roots.clone());
-            cache.status = Some(snapshot.status.clone());
-            cache.source_primary_by_group = Some(snapshot.source_primary_by_group.clone());
-            cache.last_force_find_runner_by_group =
-                Some(snapshot.last_force_find_runner_by_group.clone());
-            cache.force_find_inflight_groups = Some(snapshot.force_find_inflight_groups.clone());
-            if !preserve_last_scheduled_source_groups {
-                cache.scheduled_source_groups_by_node =
-                    Some(snapshot.scheduled_source_groups_by_node.clone());
-            }
-            if !preserve_last_scheduled_scan_groups {
-                cache.scheduled_scan_groups_by_node =
-                    Some(snapshot.scheduled_scan_groups_by_node.clone());
-            }
-            if !preserve_last_control_summary {
-                cache.last_control_frame_signals_by_node =
-                    Some(snapshot.last_control_frame_signals_by_node.clone());
-            }
-            if !preserve_last_published_batches {
-                cache.published_batches_by_node = Some(snapshot.published_batches_by_node.clone());
-            }
-            if !preserve_last_published_events {
-                cache.published_events_by_node = Some(snapshot.published_events_by_node.clone());
-            }
-            if !preserve_last_published_control_events {
-                cache.published_control_events_by_node =
-                    Some(snapshot.published_control_events_by_node.clone());
-            }
-            if !preserve_last_published_data_events {
-                cache.published_data_events_by_node =
-                    Some(snapshot.published_data_events_by_node.clone());
-            }
-            cache.last_published_at_us_by_node = Some(merge_cached_observability_node_map(
-                can_preserve_omitted_observability,
-                &snapshot.last_published_at_us_by_node,
-                cache.last_published_at_us_by_node.as_ref(),
-                &explicit_zero_published_nodes,
-            ));
-            cache.last_published_origins_by_node = Some(merge_cached_observability_node_map(
-                can_preserve_omitted_observability,
-                &snapshot.last_published_origins_by_node,
-                cache.last_published_origins_by_node.as_ref(),
-                &explicit_zero_published_nodes,
-            ));
-            cache.published_origin_counts_by_node = Some(merge_cached_observability_node_map(
-                can_preserve_omitted_observability,
-                &snapshot.published_origin_counts_by_node,
-                cache.published_origin_counts_by_node.as_ref(),
-                &explicit_zero_published_nodes,
-            ));
-            cache.published_path_capture_target = merge_cached_observability_option(
-                can_preserve_omitted_observability,
-                &snapshot.published_path_capture_target,
-                &cache.published_path_capture_target,
-                !explicit_zero_published_nodes.is_empty(),
-            );
-            cache.enqueued_path_origin_counts_by_node = Some(merge_cached_observability_node_map(
-                can_preserve_omitted_observability,
-                &snapshot.enqueued_path_origin_counts_by_node,
-                cache.enqueued_path_origin_counts_by_node.as_ref(),
-                &explicit_zero_published_nodes,
-            ));
-            cache.pending_path_origin_counts_by_node = Some(merge_cached_observability_node_map(
-                can_preserve_omitted_observability,
-                &snapshot.pending_path_origin_counts_by_node,
-                cache.pending_path_origin_counts_by_node.as_ref(),
-                &explicit_zero_published_nodes,
-            ));
-            cache.yielded_path_origin_counts_by_node = Some(merge_cached_observability_node_map(
-                can_preserve_omitted_observability,
-                &snapshot.yielded_path_origin_counts_by_node,
-                cache.yielded_path_origin_counts_by_node.as_ref(),
-                &explicit_zero_published_nodes,
-            ));
-            cache.summarized_path_origin_counts_by_node =
-                Some(merge_cached_observability_node_map(
-                    can_preserve_omitted_observability,
-                    &snapshot.summarized_path_origin_counts_by_node,
-                    cache.summarized_path_origin_counts_by_node.as_ref(),
-                    &explicit_zero_published_nodes,
-                ));
-            cache.published_path_origin_counts_by_node =
-                Some(merge_cached_observability_node_map(
-                    can_preserve_omitted_observability,
-                    &snapshot.published_path_origin_counts_by_node,
-                    cache.published_path_origin_counts_by_node.as_ref(),
-                    &explicit_zero_published_nodes,
-                ));
-        });
+        self.with_cache_mut(|cache| apply_observability_snapshot_to_cache(cache, snapshot));
     }
 
     fn schedule_refresh_call_timeout(deadline: std::time::Instant) -> Result<Duration> {
@@ -2993,7 +3148,7 @@ impl SourceWorkerClientHandle {
         };
         match response {
             SourceWorkerResponse::ObservabilitySnapshot(mut snapshot) => {
-                self.with_cache_mut(|cache| {
+                snapshot = self.with_cache_mut(|cache| {
                     normalize_observability_snapshot_scheduled_group_keys(
                         &mut snapshot,
                         &self.node_id,
@@ -3007,6 +3162,7 @@ impl SourceWorkerClientHandle {
                         &mut snapshot.scheduled_scan_groups_by_node,
                         &cache.scheduled_scan_groups_by_node,
                     );
+                    merge_live_observability_snapshot_with_recent_cache(cache, &snapshot)
                 });
                 if debug_control_scope_capture_enabled() {
                     eprintln!(
@@ -3751,31 +3907,31 @@ impl SourceWorkerClientHandle {
                     if let Some(signals) = decoded_signals.as_ref() {
                         self.retain_control_signals(signals).await;
                     }
-                    let should_refresh_cached_schedule =
-                        if let Some(signals) = decoded_signals.as_ref() {
-                            let primed_local_schedule = self.with_cache_mut(|cache| {
-                                let primed_local_schedule =
-                                    prime_cached_schedule_from_control_signals(
-                                    cache,
-                                    &self.node_id,
-                                    signals,
-                                    &self.config.roots,
-                                    &self.config.host_object_grants,
-                                );
-                                prime_cached_control_summary_from_control_signals(
-                                    cache,
-                                    &self.node_id,
-                                    signals,
-                                    &self.config.host_object_grants,
-                                );
-                                primed_local_schedule
-                            });
-                            source_control_signals_require_post_ack_schedule_refresh(signals)
-                                && !(primed_local_schedule.saw_activate_with_bound_scopes
-                                    && !primed_local_schedule.has_local_runnable_groups)
-                        } else {
-                            true
-                        };
+                    let should_refresh_cached_schedule = if let Some(signals) =
+                        decoded_signals.as_ref()
+                    {
+                        let primed_local_schedule = self.with_cache_mut(|cache| {
+                            let primed_local_schedule = prime_cached_schedule_from_control_signals(
+                                cache,
+                                &self.node_id,
+                                signals,
+                                &self.config.roots,
+                                &self.config.host_object_grants,
+                            );
+                            prime_cached_control_summary_from_control_signals(
+                                cache,
+                                &self.node_id,
+                                signals,
+                                &self.config.host_object_grants,
+                            );
+                            primed_local_schedule
+                        });
+                        source_control_signals_require_post_ack_schedule_refresh(signals)
+                            && !(primed_local_schedule.saw_activate_with_bound_scopes
+                                && !primed_local_schedule.has_local_runnable_groups)
+                    } else {
+                        true
+                    };
                     if should_refresh_cached_schedule {
                         let replay_required_before_refresh =
                             self.control_state_replay_required.load(Ordering::Acquire);
@@ -4038,6 +4194,155 @@ pub struct SourceObservabilitySnapshot {
     pub published_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
 }
 
+pub(crate) struct SourceObservabilitySnapshotParts {
+    pub lifecycle_state: String,
+    pub host_object_grants_version: u64,
+    pub grants: Vec<GrantedMountRoot>,
+    pub logical_roots: Vec<RootSpec>,
+    pub status: SourceStatusSnapshot,
+    pub source_primary_by_group: std::collections::BTreeMap<String, String>,
+    pub last_force_find_runner_by_group: std::collections::BTreeMap<String, String>,
+    pub force_find_inflight_groups: Vec<String>,
+    pub recovery: SourceObservabilityRecoveryProjection,
+    pub last_control_frame_signals_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub published_batches_by_node: std::collections::BTreeMap<String, u64>,
+    pub published_events_by_node: std::collections::BTreeMap<String, u64>,
+    pub published_control_events_by_node: std::collections::BTreeMap<String, u64>,
+    pub published_data_events_by_node: std::collections::BTreeMap<String, u64>,
+    pub last_published_at_us_by_node: std::collections::BTreeMap<String, u64>,
+    pub last_published_origins_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub published_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub published_path_capture_target: Option<String>,
+    pub enqueued_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub pending_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub yielded_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub summarized_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub published_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+pub(crate) struct SourceObservabilityLiveSourceContext {
+    pub lifecycle_state: String,
+    pub host_object_grants_version: u64,
+    pub grants: Vec<GrantedMountRoot>,
+    pub logical_roots: Vec<RootSpec>,
+    pub status: SourceStatusSnapshot,
+    pub source_primary_by_group: std::collections::BTreeMap<String, String>,
+    pub last_force_find_runner_by_group: std::collections::BTreeMap<String, String>,
+    pub force_find_inflight_groups: Vec<String>,
+    pub recovery: SourceObservabilityRecoveryProjection,
+    pub last_control_frame_signals_snapshot: Vec<String>,
+}
+
+pub(crate) struct SourceObservabilityLiveAugment {
+    pub last_control_frame_signals_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub published_batches_by_node: std::collections::BTreeMap<String, u64>,
+    pub published_events_by_node: std::collections::BTreeMap<String, u64>,
+    pub published_control_events_by_node: std::collections::BTreeMap<String, u64>,
+    pub published_data_events_by_node: std::collections::BTreeMap<String, u64>,
+    pub last_published_at_us_by_node: std::collections::BTreeMap<String, u64>,
+    pub last_published_origins_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub published_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub published_path_capture_target: Option<String>,
+    pub enqueued_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub pending_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub yielded_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub summarized_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub published_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+pub(crate) fn build_source_observability_snapshot_from_parts(
+    parts: SourceObservabilitySnapshotParts,
+) -> SourceObservabilitySnapshot {
+    SourceObservabilitySnapshot {
+        lifecycle_state: parts.lifecycle_state,
+        host_object_grants_version: parts.host_object_grants_version,
+        grants: parts.grants,
+        logical_roots: parts.logical_roots,
+        status: parts.status,
+        source_primary_by_group: parts.source_primary_by_group,
+        last_force_find_runner_by_group: parts.last_force_find_runner_by_group,
+        force_find_inflight_groups: parts.force_find_inflight_groups,
+        scheduled_source_groups_by_node: parts.recovery.scheduled_source_groups_by_node,
+        scheduled_scan_groups_by_node: parts.recovery.scheduled_scan_groups_by_node,
+        last_control_frame_signals_by_node: parts.last_control_frame_signals_by_node,
+        published_batches_by_node: parts.published_batches_by_node,
+        published_events_by_node: parts.published_events_by_node,
+        published_control_events_by_node: parts.published_control_events_by_node,
+        published_data_events_by_node: parts.published_data_events_by_node,
+        last_published_at_us_by_node: parts.last_published_at_us_by_node,
+        last_published_origins_by_node: parts.last_published_origins_by_node,
+        published_origin_counts_by_node: parts.published_origin_counts_by_node,
+        published_path_capture_target: parts.published_path_capture_target,
+        enqueued_path_origin_counts_by_node: parts.enqueued_path_origin_counts_by_node,
+        pending_path_origin_counts_by_node: parts.pending_path_origin_counts_by_node,
+        yielded_path_origin_counts_by_node: parts.yielded_path_origin_counts_by_node,
+        summarized_path_origin_counts_by_node: parts.summarized_path_origin_counts_by_node,
+        published_path_origin_counts_by_node: parts.published_path_origin_counts_by_node,
+    }
+}
+
+pub(crate) fn build_source_observability_live_source_context(
+    source: &FSMetaSource,
+) -> SourceObservabilityLiveSourceContext {
+    let node_id = source.node_id();
+    let grants = source.host_object_grants_snapshot();
+    let stable_host_ref = stable_host_ref_for_node_id(&node_id, &grants);
+    let status = source.status_snapshot();
+    let last_force_find_runner_by_group = source.last_force_find_runner_by_group_snapshot();
+    let force_find_inflight_groups = source.force_find_inflight_groups_snapshot();
+    let recovery = source_observability_recovery_projection(
+        stable_host_ref,
+        &status,
+        &last_force_find_runner_by_group,
+        &force_find_inflight_groups,
+        scheduled_groups_by_node(&node_id, &grants, source.scheduled_source_group_ids()),
+        scheduled_groups_by_node(&node_id, &grants, source.scheduled_scan_group_ids()),
+    );
+    SourceObservabilityLiveSourceContext {
+        lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
+        host_object_grants_version: source.host_object_grants_version_snapshot(),
+        grants,
+        logical_roots: source.logical_roots_snapshot(),
+        status,
+        source_primary_by_group: source.source_primary_by_group_snapshot(),
+        last_force_find_runner_by_group,
+        force_find_inflight_groups,
+        recovery,
+        last_control_frame_signals_snapshot: source.last_control_frame_signals_snapshot(),
+    }
+}
+
+pub(crate) fn build_source_observability_snapshot_from_live_context(
+    context: SourceObservabilityLiveSourceContext,
+    augment: SourceObservabilityLiveAugment,
+) -> SourceObservabilitySnapshot {
+    build_source_observability_snapshot_from_parts(SourceObservabilitySnapshotParts {
+        lifecycle_state: context.lifecycle_state,
+        host_object_grants_version: context.host_object_grants_version,
+        grants: context.grants,
+        logical_roots: context.logical_roots,
+        status: context.status,
+        source_primary_by_group: context.source_primary_by_group,
+        last_force_find_runner_by_group: context.last_force_find_runner_by_group,
+        force_find_inflight_groups: context.force_find_inflight_groups,
+        recovery: context.recovery,
+        last_control_frame_signals_by_node: augment.last_control_frame_signals_by_node,
+        published_batches_by_node: augment.published_batches_by_node,
+        published_events_by_node: augment.published_events_by_node,
+        published_control_events_by_node: augment.published_control_events_by_node,
+        published_data_events_by_node: augment.published_data_events_by_node,
+        last_published_at_us_by_node: augment.last_published_at_us_by_node,
+        last_published_origins_by_node: augment.last_published_origins_by_node,
+        published_origin_counts_by_node: augment.published_origin_counts_by_node,
+        published_path_capture_target: augment.published_path_capture_target,
+        enqueued_path_origin_counts_by_node: augment.enqueued_path_origin_counts_by_node,
+        pending_path_origin_counts_by_node: augment.pending_path_origin_counts_by_node,
+        yielded_path_origin_counts_by_node: augment.yielded_path_origin_counts_by_node,
+        summarized_path_origin_counts_by_node: augment.summarized_path_origin_counts_by_node,
+        published_path_origin_counts_by_node: augment.published_path_origin_counts_by_node,
+    })
+}
+
 #[derive(Default)]
 struct RecoveredPublishedObservability {
     published_batches_by_node: std::collections::BTreeMap<String, u64>,
@@ -4096,38 +4401,11 @@ pub(crate) fn recovered_scheduled_groups_by_node_from_active_status(
     )])
 }
 
-fn recovered_control_signals_by_node_from_active_status(
-    stable_host_ref: &str,
+pub(crate) fn recovered_control_signals_by_node_from_projection(
+    projection: &SourceObservabilityRecoveryProjection,
     status: &SourceStatusSnapshot,
-    scheduled_source_groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
-    scheduled_scan_groups_by_node: &std::collections::BTreeMap<String, Vec<String>>,
 ) -> std::collections::BTreeMap<String, Vec<String>> {
-    if !source_observability_snapshot_has_active_state(&SourceObservabilitySnapshot {
-        lifecycle_state: String::new(),
-        host_object_grants_version: 0,
-        grants: Vec::new(),
-        logical_roots: Vec::new(),
-        status: status.clone(),
-        source_primary_by_group: std::collections::BTreeMap::new(),
-        last_force_find_runner_by_group: std::collections::BTreeMap::new(),
-        force_find_inflight_groups: Vec::new(),
-        scheduled_source_groups_by_node: std::collections::BTreeMap::new(),
-        scheduled_scan_groups_by_node: std::collections::BTreeMap::new(),
-        last_control_frame_signals_by_node: std::collections::BTreeMap::new(),
-        published_batches_by_node: std::collections::BTreeMap::new(),
-        published_events_by_node: std::collections::BTreeMap::new(),
-        published_control_events_by_node: std::collections::BTreeMap::new(),
-        published_data_events_by_node: std::collections::BTreeMap::new(),
-        last_published_at_us_by_node: std::collections::BTreeMap::new(),
-        last_published_origins_by_node: std::collections::BTreeMap::new(),
-        published_origin_counts_by_node: std::collections::BTreeMap::new(),
-        published_path_capture_target: None,
-        enqueued_path_origin_counts_by_node: std::collections::BTreeMap::new(),
-        pending_path_origin_counts_by_node: std::collections::BTreeMap::new(),
-        yielded_path_origin_counts_by_node: std::collections::BTreeMap::new(),
-        summarized_path_origin_counts_by_node: std::collections::BTreeMap::new(),
-        published_path_origin_counts_by_node: std::collections::BTreeMap::new(),
-    }) {
+    if !projection.allow_recovered_control_summary {
         return std::collections::BTreeMap::new();
     }
     let recovered_generation = status.current_stream_generation.unwrap_or_else(|| {
@@ -4139,7 +4417,10 @@ fn recovered_control_signals_by_node_from_active_status(
             .unwrap_or_default()
     });
     let mut signals = Vec::<String>::new();
-    if let Some(groups) = scheduled_source_groups_by_node.get(stable_host_ref) {
+    if let Some(groups) = projection
+        .scheduled_source_groups_by_node
+        .get(&projection.stable_host_ref)
+    {
         if !groups.is_empty() {
             signals.push(format!(
                 "recovered_active_state unit=runtime.exec.source generation={} groups={:?}",
@@ -4147,7 +4428,10 @@ fn recovered_control_signals_by_node_from_active_status(
             ));
         }
     }
-    if let Some(groups) = scheduled_scan_groups_by_node.get(stable_host_ref) {
+    if let Some(groups) = projection
+        .scheduled_scan_groups_by_node
+        .get(&projection.stable_host_ref)
+    {
         if !groups.is_empty() {
             signals.push(format!(
                 "recovered_active_state unit=runtime.exec.scan generation={} groups={:?}",
@@ -4158,7 +4442,7 @@ fn recovered_control_signals_by_node_from_active_status(
     if signals.is_empty() {
         std::collections::BTreeMap::new()
     } else {
-        std::collections::BTreeMap::from([(stable_host_ref.to_string(), signals)])
+        std::collections::BTreeMap::from([(projection.stable_host_ref.clone(), signals)])
     }
 }
 
@@ -4181,19 +4465,14 @@ fn recovered_published_observability_from_active_status(
         .iter()
         .filter(|entry| source_status_entry_looks_active_for_local_observability(entry))
     {
-        published_batch_count =
-            published_batch_count.saturating_add(entry.forwarded_batch_count);
-        published_event_count =
-            published_event_count.saturating_add(entry.forwarded_event_count);
-        published_control_event_count = published_control_event_count
-            .saturating_add(entry.emitted_control_event_count);
+        published_batch_count = published_batch_count.saturating_add(entry.forwarded_batch_count);
+        published_event_count = published_event_count.saturating_add(entry.forwarded_event_count);
+        published_control_event_count =
+            published_control_event_count.saturating_add(entry.emitted_control_event_count);
         published_data_event_count =
             published_data_event_count.saturating_add(entry.emitted_data_event_count);
-        last_published_at_us = last_published_at_us.max(
-            entry
-                .last_forwarded_at_us
-                .or(entry.last_emitted_at_us),
-        );
+        last_published_at_us =
+            last_published_at_us.max(entry.last_forwarded_at_us.or(entry.last_emitted_at_us));
         for origin in entry
             .last_forwarded_origins
             .iter()
@@ -4291,153 +4570,51 @@ fn recovered_published_observability_from_active_status(
 }
 
 fn build_local_source_observability_snapshot(source: &FSMetaSource) -> SourceObservabilitySnapshot {
-    let node_id = source.node_id();
-    let grants = source.host_object_grants_snapshot();
-    let stable_host_ref = stable_host_ref_for_node_id(&node_id, &grants);
-    let status = source.status_snapshot();
-    let scheduled_source_groups_by_node = {
-        let explicit =
-            scheduled_groups_by_node(&node_id, &grants, source.scheduled_source_group_ids());
-        if explicit.is_empty() {
-            recovered_scheduled_groups_by_node_from_active_status(
-                &stable_host_ref,
-                &status,
-                |entry| entry.watch_enabled,
-            )
-        } else {
-            explicit
-        }
-    };
-    let scheduled_scan_groups_by_node = {
-        let explicit =
-            scheduled_groups_by_node(&node_id, &grants, source.scheduled_scan_group_ids());
-        if explicit.is_empty() {
-            recovered_scheduled_groups_by_node_from_active_status(
-                &stable_host_ref,
-                &status,
-                |entry| entry.scan_enabled,
-            )
-        } else {
-            explicit
-        }
-    };
+    let context = build_source_observability_live_source_context(source);
     let last_control_frame_signals_by_node = {
         let explicit = control_signals_by_node(
-            &stable_host_ref,
-            &source.last_control_frame_signals_snapshot(),
+            &context.recovery.stable_host_ref,
+            &context.last_control_frame_signals_snapshot,
         );
         if explicit.is_empty() {
-            recovered_control_signals_by_node_from_active_status(
-                &stable_host_ref,
-                &status,
-                &scheduled_source_groups_by_node,
-                &scheduled_scan_groups_by_node,
-            )
+            recovered_control_signals_by_node_from_projection(&context.recovery, &context.status)
         } else {
             explicit
         }
     };
-    let published = recovered_published_observability_from_active_status(&stable_host_ref, &status);
-
-    SourceObservabilitySnapshot {
-        lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
-        host_object_grants_version: source.host_object_grants_version_snapshot(),
-        grants,
-        logical_roots: source.logical_roots_snapshot(),
-        status,
-        source_primary_by_group: source.source_primary_by_group_snapshot(),
-        last_force_find_runner_by_group: source.last_force_find_runner_by_group_snapshot(),
-        force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
-        scheduled_source_groups_by_node,
-        scheduled_scan_groups_by_node,
-        last_control_frame_signals_by_node,
-        published_batches_by_node: published.published_batches_by_node,
-        published_events_by_node: published.published_events_by_node,
-        published_control_events_by_node: published.published_control_events_by_node,
-        published_data_events_by_node: published.published_data_events_by_node,
-        last_published_at_us_by_node: published.last_published_at_us_by_node,
-        last_published_origins_by_node: published.last_published_origins_by_node,
-        published_origin_counts_by_node: published.published_origin_counts_by_node,
-        published_path_capture_target: published.published_path_capture_target,
-        enqueued_path_origin_counts_by_node: std::collections::BTreeMap::new(),
-        pending_path_origin_counts_by_node: std::collections::BTreeMap::new(),
-        yielded_path_origin_counts_by_node: std::collections::BTreeMap::new(),
-        summarized_path_origin_counts_by_node: published.summarized_path_origin_counts_by_node,
-        published_path_origin_counts_by_node: published.published_path_origin_counts_by_node,
-    }
+    let published = recovered_published_observability_from_active_status(
+        &context.recovery.stable_host_ref,
+        &context.status,
+    );
+    build_source_observability_snapshot_from_live_context(
+        context,
+        SourceObservabilityLiveAugment {
+            last_control_frame_signals_by_node,
+            published_batches_by_node: published.published_batches_by_node,
+            published_events_by_node: published.published_events_by_node,
+            published_control_events_by_node: published.published_control_events_by_node,
+            published_data_events_by_node: published.published_data_events_by_node,
+            last_published_at_us_by_node: published.last_published_at_us_by_node,
+            last_published_origins_by_node: published.last_published_origins_by_node,
+            published_origin_counts_by_node: published.published_origin_counts_by_node,
+            published_path_capture_target: published.published_path_capture_target,
+            enqueued_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+            pending_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+            yielded_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+            summarized_path_origin_counts_by_node: published.summarized_path_origin_counts_by_node,
+            published_path_origin_counts_by_node: published.published_path_origin_counts_by_node,
+        },
+    )
 }
 
 fn build_cached_worker_observability_snapshot(
     cache: &SourceWorkerSnapshotCache,
 ) -> Option<SourceObservabilitySnapshot> {
-    Some(SourceObservabilitySnapshot {
-        lifecycle_state: cache.lifecycle_state.clone()?,
-        host_object_grants_version: cache.host_object_grants_version.unwrap_or_default(),
-        grants: cache.grants.clone().unwrap_or_default(),
-        logical_roots: cache.logical_roots.clone().unwrap_or_default(),
-        status: cache.status.clone().unwrap_or_default(),
-        source_primary_by_group: cache.source_primary_by_group.clone().unwrap_or_default(),
-        last_force_find_runner_by_group: cache
-            .last_force_find_runner_by_group
-            .clone()
-            .unwrap_or_default(),
-        force_find_inflight_groups: cache.force_find_inflight_groups.clone().unwrap_or_default(),
-        scheduled_source_groups_by_node: cache
-            .scheduled_source_groups_by_node
-            .clone()
-            .unwrap_or_default(),
-        scheduled_scan_groups_by_node: cache
-            .scheduled_scan_groups_by_node
-            .clone()
-            .unwrap_or_default(),
-        last_control_frame_signals_by_node: cache
-            .last_control_frame_signals_by_node
-            .clone()
-            .unwrap_or_default(),
-        published_batches_by_node: cache.published_batches_by_node.clone().unwrap_or_default(),
-        published_events_by_node: cache.published_events_by_node.clone().unwrap_or_default(),
-        published_control_events_by_node: cache
-            .published_control_events_by_node
-            .clone()
-            .unwrap_or_default(),
-        published_data_events_by_node: cache
-            .published_data_events_by_node
-            .clone()
-            .unwrap_or_default(),
-        last_published_at_us_by_node: cache
-            .last_published_at_us_by_node
-            .clone()
-            .unwrap_or_default(),
-        last_published_origins_by_node: cache
-            .last_published_origins_by_node
-            .clone()
-            .unwrap_or_default(),
-        published_origin_counts_by_node: cache
-            .published_origin_counts_by_node
-            .clone()
-            .unwrap_or_default(),
-        published_path_capture_target: cache.published_path_capture_target.clone(),
-        enqueued_path_origin_counts_by_node: cache
-            .enqueued_path_origin_counts_by_node
-            .clone()
-            .unwrap_or_default(),
-        pending_path_origin_counts_by_node: cache
-            .pending_path_origin_counts_by_node
-            .clone()
-            .unwrap_or_default(),
-        yielded_path_origin_counts_by_node: cache
-            .yielded_path_origin_counts_by_node
-            .clone()
-            .unwrap_or_default(),
-        summarized_path_origin_counts_by_node: cache
-            .summarized_path_origin_counts_by_node
-            .clone()
-            .unwrap_or_default(),
-        published_path_origin_counts_by_node: cache
-            .published_path_origin_counts_by_node
-            .clone()
-            .unwrap_or_default(),
-    })
+    Some(build_source_observability_snapshot_from_cache(
+        cache,
+        cache.lifecycle_state.clone()?,
+        cache.status.clone().unwrap_or_default(),
+    ))
 }
 
 fn build_degraded_worker_observability_snapshot(
@@ -4449,8 +4626,22 @@ fn build_degraded_worker_observability_snapshot(
     status
         .degraded_roots
         .push((SOURCE_WORKER_DEGRADED_ROOT_KEY.to_string(), reason));
-    let mut snapshot = SourceObservabilitySnapshot {
-        lifecycle_state: SOURCE_WORKER_DEGRADED_STATE.to_string(),
+    let mut snapshot = build_source_observability_snapshot_from_cache(
+        cache,
+        SOURCE_WORKER_DEGRADED_STATE.to_string(),
+        status,
+    );
+    fail_close_incomplete_active_source_observability_snapshot(&mut snapshot);
+    snapshot
+}
+
+fn build_source_observability_snapshot_from_cache(
+    cache: &SourceWorkerSnapshotCache,
+    lifecycle_state: String,
+    status: SourceStatusSnapshot,
+) -> SourceObservabilitySnapshot {
+    SourceObservabilitySnapshot {
+        lifecycle_state,
         host_object_grants_version: cache.host_object_grants_version.unwrap_or_default(),
         grants: cache.grants.clone().unwrap_or_default(),
         logical_roots: cache.logical_roots.clone().unwrap_or_default(),
@@ -4516,9 +4707,7 @@ fn build_degraded_worker_observability_snapshot(
             .published_path_origin_counts_by_node
             .clone()
             .unwrap_or_default(),
-    };
-    fail_close_incomplete_active_source_observability_snapshot(&mut snapshot);
-    snapshot
+    }
 }
 
 #[derive(Clone)]

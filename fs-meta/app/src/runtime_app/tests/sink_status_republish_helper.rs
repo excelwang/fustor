@@ -1,6 +1,51 @@
+fn local_sink_status_republish_helper_test_serial() -> &'static tokio::sync::Mutex<()> {
+    static CELL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[test]
+fn sink_status_snapshot_ready_for_expected_groups_trusts_exported_readiness_over_stale_legacy_bit()
+{
+    let expected_groups = std::collections::BTreeSet::from(["nfs1".to_string()]);
+    let snapshot = crate::sink::SinkStatusSnapshot {
+        live_nodes: 1,
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "nfs1".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_audit: false,
+            initial_audit_completed: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        sink_status_snapshot_ready_for_expected_groups(&snapshot, &expected_groups),
+        "runtime_app local sink-status helper must trust exported readiness over stale initial_audit_completed=false: {snapshot:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_groups_after_cleanup_only_source_tail()
  {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     struct SourceControlErrorHookReset;
     struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
     struct SourceWorkerTriggerRescanWhenReadyCallCountHookReset;
@@ -608,6 +653,10 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_status_truth_before_reentering_retained_sink_replay()
  {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     struct SourceControlErrorHookReset;
     struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
     struct SourceWorkerTriggerRescanWhenReadyCallCountHookReset;
@@ -887,9 +936,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
         22,
     )])
     .await
-    .expect(
-        "source-only deactivate should fail-close into uninitialized replay-required recovery",
-    );
+    .expect("source-only deactivate should fail-close into uninitialized replay-required recovery");
     crate::workers::source::clear_source_worker_control_frame_error_hook();
     assert!(!app.control_initialized());
 
@@ -987,8 +1034,8 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
-                initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                initial_audit_completed: true,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -1005,7 +1052,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                readiness: crate::sink::GroupReadinessState::PendingAudit,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -1021,11 +1068,9 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
             snapshot: cached_not_ready_snapshot,
         },
     );
-    let cached_snapshot_before_helper = app
-        .sink
-        .status_snapshot()
-        .await
-        .expect("poison local cached sink status with a current but non-ready snapshot before helper runs");
+    let cached_snapshot_before_helper = app.sink.status_snapshot().await.expect(
+        "poison local cached sink status with a current but non-ready snapshot before helper runs",
+    );
     assert!(
         !sink_status_snapshot_ready_for_expected_groups(
             &cached_snapshot_before_helper,
@@ -1127,7 +1172,8 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
         .expect(
             "blocking-truth helper seam requires the post-return source->sink retrigger point to be reached",
         );
-    let trigger_count_when_helper_reached_retrigger = initial_trigger_rescan_count.load(Ordering::SeqCst);
+    let trigger_count_when_helper_reached_retrigger =
+        initial_trigger_rescan_count.load(Ordering::SeqCst);
     assert!(
         trigger_count_when_helper_reached_retrigger > trigger_count_before_helper,
         "helper must re-arm source->sink convergence before the first sink-side probe; trigger_count_before_helper={trigger_count_before_helper} trigger_count_when_helper_reached_retrigger={trigger_count_when_helper_reached_retrigger}"
@@ -1135,9 +1181,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
     post_return_retrigger_release.notify_waiters();
     tokio::time::timeout(Duration::from_secs(2), helper_probe_wait)
         .await
-        .expect(
-            "blocking-truth helper seam requires the first sink-side probe to be reached",
-        );
+        .expect("blocking-truth helper seam requires the first sink-side probe to be reached");
     let trigger_count_when_helper_reached_first_sink_probe =
         initial_trigger_rescan_count.load(Ordering::SeqCst);
     assert!(
@@ -1178,7 +1222,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
-            readiness: crate::sink::GroupReadinessState::Ready,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -1195,7 +1239,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
-            readiness: crate::sink::GroupReadinessState::Ready,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -1251,11 +1295,9 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
         );
     }
 
-    let local_sink_snapshot = app
-        .sink
-        .status_snapshot_nonblocking()
-        .await
-        .expect("local sink status should be ready after helper accepts blocking sink-status truth");
+    let local_sink_snapshot = app.sink.status_snapshot_nonblocking().await.expect(
+        "local sink status should be ready after helper accepts blocking sink-status truth",
+    );
     let local_ready_groups = local_sink_snapshot
         .groups
         .iter()
@@ -1271,10 +1313,13 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
     app.close().await.expect("close app");
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn generation_one_initial_mixed_source_and_sink_activate_does_not_enter_local_sink_status_republish_helper()
-{
+ {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     struct LocalSinkStatusRepublishHelperEntryCountHookReset;
 
     impl Drop for LocalSinkStatusRepublishHelperEntryCountHookReset {
@@ -1351,7 +1396,10 @@ async fn generation_one_initial_mixed_source_and_sink_activate_does_not_enter_lo
         ]
     };
     let sink_wave = |generation| {
-        let root_scopes = &[("nfs1", &["node-a::nfs1"][..]), ("nfs2", &["node-a::nfs2"][..])];
+        let root_scopes = &[
+            ("nfs1", &["node-a::nfs1"][..]),
+            ("nfs2", &["node-a::nfs2"][..]),
+        ];
         vec![
             activate_envelope_with_scope_rows(
                 execution_units::SINK_RUNTIME_UNIT_ID,
@@ -1393,8 +1441,253 @@ async fn generation_one_initial_mixed_source_and_sink_activate_does_not_enter_lo
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_for_sink_status_republish_readiness_after_recovery_accepts_expected_ready_groups_when_snapshot_contains_extra_ready_group()
+ {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
+    struct SinkWorkerStatusSnapshotHookReset;
+
+    impl Drop for SinkWorkerStatusSnapshotHookReset {
+        fn drop(&mut self) {
+            crate::workers::sink::clear_sink_worker_status_snapshot_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    fs::write(nfs1.join("ready-a.txt"), b"a").expect("seed nfs1");
+    fs::write(nfs2.join("ready-b.txt"), b"b").expect("seed nfs2");
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![
+                        worker_watch_scan_root("nfs1", &nfs1),
+                        worker_watch_scan_root("nfs2", &nfs2),
+                    ],
+                    host_object_grants: Vec::new(),
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-c-extra-ready-group".into()),
+            Some(boundary.clone()),
+            Some(boundary),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    let source_wave = |generation| {
+        vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+        ]
+    };
+    let sink_wave = |generation| {
+        let root_scopes = &[("nfs1", &["nfs1"][..]), ("nfs2", &["nfs2"][..])];
+        vec![
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                root_scopes,
+                generation,
+            ),
+        ]
+    };
+
+    let mut initial = source_wave(2);
+    initial.extend(sink_wave(2));
+    app.on_control_frame(&initial)
+        .await
+        .expect("initial local source/sink wave should succeed");
+
+    let expected_groups =
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let source_groups = app
+            .source
+            .scheduled_source_group_ids()
+            .await
+            .expect("source groups")
+            .unwrap_or_default();
+        let scan_groups = app
+            .source
+            .scheduled_scan_group_ids()
+            .await
+            .expect("scan groups")
+            .unwrap_or_default();
+        let sink_groups = app
+            .sink
+            .scheduled_group_ids()
+            .await
+            .expect("sink groups")
+            .unwrap_or_default();
+        if source_groups == expected_groups
+            && scan_groups == expected_groups
+            && sink_groups == expected_groups
+        {
+            match tokio::time::timeout(
+                Duration::from_millis(350),
+                app.sink.status_snapshot_nonblocking(),
+            )
+            .await
+            {
+                Ok(Ok(snapshot))
+                    if sink_status_snapshot_ready_for_expected_groups(
+                        &snapshot,
+                        &expected_groups,
+                    ) =>
+                {
+                    break;
+                }
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < ready_deadline,
+            "timed out waiting for converged ready sink status before extra-ready-group readiness exact"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _sink_status_snapshot_reset = SinkWorkerStatusSnapshotHookReset;
+    crate::workers::sink::install_sink_worker_status_snapshot_hook(
+        crate::workers::sink::SinkWorkerStatusSnapshotHook {
+            snapshot: crate::sink::SinkStatusSnapshot {
+                live_nodes: 3,
+                groups: vec![
+                    crate::sink::SinkGroupStatusSnapshot {
+                        group_id: "nfs1".to_string(),
+                        primary_object_ref: "nfs1".to_string(),
+                        total_nodes: 1,
+                        live_nodes: 1,
+                        tombstoned_count: 0,
+                        attested_count: 0,
+                        suspect_count: 0,
+                        blind_spot_count: 0,
+                        shadow_time_us: 0,
+                        shadow_lag_us: 0,
+                        overflow_pending_audit: false,
+                        initial_audit_completed: true,
+                        readiness: crate::sink::GroupReadinessState::Ready,
+                        materialized_revision: 1,
+                        estimated_heap_bytes: 0,
+                    },
+                    crate::sink::SinkGroupStatusSnapshot {
+                        group_id: "nfs2".to_string(),
+                        primary_object_ref: "nfs2".to_string(),
+                        total_nodes: 1,
+                        live_nodes: 1,
+                        tombstoned_count: 0,
+                        attested_count: 0,
+                        suspect_count: 0,
+                        blind_spot_count: 0,
+                        shadow_time_us: 0,
+                        shadow_lag_us: 0,
+                        overflow_pending_audit: false,
+                        initial_audit_completed: true,
+                        readiness: crate::sink::GroupReadinessState::Ready,
+                        materialized_revision: 1,
+                        estimated_heap_bytes: 0,
+                    },
+                    crate::sink::SinkGroupStatusSnapshot {
+                        group_id: "nfs3".to_string(),
+                        primary_object_ref: "nfs3".to_string(),
+                        total_nodes: 1,
+                        live_nodes: 1,
+                        tombstoned_count: 0,
+                        attested_count: 0,
+                        suspect_count: 0,
+                        blind_spot_count: 0,
+                        shadow_time_us: 0,
+                        shadow_lag_us: 0,
+                        overflow_pending_audit: false,
+                        initial_audit_completed: true,
+                        readiness: crate::sink::GroupReadinessState::Ready,
+                        materialized_revision: 1,
+                        estimated_heap_bytes: 0,
+                    },
+                ],
+                scheduled_groups_by_node: std::collections::BTreeMap::from([(
+                    "node-c-extra-ready-group".to_string(),
+                    vec!["nfs1".to_string(), "nfs2".to_string(), "nfs3".to_string()],
+                )]),
+                ..crate::sink::SinkStatusSnapshot::default()
+            },
+        },
+    );
+
+    let readiness_result = app
+        .wait_for_sink_status_republish_readiness_after_recovery(false)
+        .await;
+    assert_eq!(
+        readiness_result.expect(
+            "runtime_app retained-replay readiness wait must accept expected ready groups even when the snapshot still carries an extra unrelated ready group"
+        ),
+        None,
+        "runtime_app retained-replay readiness wait should settle once the expected groups are ready instead of demanding an exact ready-group set match"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wait_for_local_sink_status_republish_requiring_probe_checks_first_probe_before_post_return_retrigger_when_cached_ready()
  {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     struct SourceWorkerTriggerRescanWhenReadyCallCountHookReset;
 
     impl Drop for SourceWorkerTriggerRescanWhenReadyCallCountHookReset {
@@ -1652,10 +1945,336 @@ async fn wait_for_local_sink_status_republish_requiring_probe_checks_first_probe
     app.close().await.expect("close app");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wait_for_local_sink_status_republish_requiring_probe_replays_retained_sink_wave_before_returning_when_cached_ready()
+ {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
+    struct SourceWorkerTriggerRescanWhenReadyCallCountHookReset;
+    struct SinkWorkerControlFramePauseHookReset;
+
+    impl Drop for SourceWorkerTriggerRescanWhenReadyCallCountHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_trigger_rescan_when_ready_call_count_hook();
+        }
+    }
+
+    impl Drop for SinkWorkerControlFramePauseHookReset {
+        fn drop(&mut self) {
+            crate::workers::sink::clear_sink_worker_control_frame_pause_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    fs::write(nfs1.join("ready-a.txt"), b"a").expect("seed nfs1");
+    fs::write(nfs2.join("ready-b.txt"), b"b").expect("seed nfs2");
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![
+                        worker_watch_scan_root("nfs1", &nfs1),
+                        worker_watch_scan_root("nfs2", &nfs2),
+                    ],
+                    host_object_grants: Vec::new(),
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-c-require-probe-replay".into()),
+            Some(boundary.clone()),
+            Some(boundary),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    let source_wave = |generation| {
+        vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
+                generation,
+            ),
+        ]
+    };
+    let sink_wave = |generation| {
+        let root_scopes = &[("nfs1", &["nfs1"][..]), ("nfs2", &["nfs2"][..])];
+        vec![
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                root_scopes,
+                generation,
+            ),
+        ]
+    };
+
+    let trigger_rescan_count = Arc::new(AtomicUsize::new(0));
+    let _trigger_rescan_reset = SourceWorkerTriggerRescanWhenReadyCallCountHookReset;
+    crate::workers::source::install_source_worker_trigger_rescan_when_ready_call_count_hook(
+        crate::workers::source::SourceWorkerTriggerRescanWhenReadyCallCountHook {
+            count: trigger_rescan_count.clone(),
+        },
+    );
+
+    let mut initial = source_wave(2);
+    initial.extend(sink_wave(2));
+    app.on_control_frame(&initial)
+        .await
+        .expect("initial local source/sink wave should succeed");
+
+    let expected_groups =
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let source_groups = app
+            .source
+            .scheduled_source_group_ids()
+            .await
+            .expect("source groups")
+            .unwrap_or_default();
+        let scan_groups = app
+            .source
+            .scheduled_scan_group_ids()
+            .await
+            .expect("scan groups")
+            .unwrap_or_default();
+        let sink_groups = app
+            .sink
+            .scheduled_group_ids()
+            .await
+            .expect("sink groups")
+            .unwrap_or_default();
+        if source_groups == expected_groups
+            && scan_groups == expected_groups
+            && sink_groups == expected_groups
+        {
+            match tokio::time::timeout(
+                Duration::from_millis(350),
+                app.sink.status_snapshot_nonblocking(),
+            )
+            .await
+            {
+                Ok(Ok(snapshot))
+                    if sink_status_snapshot_ready_for_expected_groups(
+                        &snapshot,
+                        &expected_groups,
+                    ) =>
+                {
+                    break;
+                }
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < ready_deadline,
+            "timed out waiting for cached-ready local sink status before requiring-probe replay test"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let cached_snapshot_before_helper = app
+        .sink
+        .cached_status_snapshot()
+        .expect("cached sink status before requiring-probe replay helper");
+    assert!(
+        sink_status_snapshot_ready_for_expected_groups(
+            &cached_snapshot_before_helper,
+            &expected_groups,
+        ),
+        "precondition: requiring-probe replay seam requires cached sink status to already be ready: {cached_snapshot_before_helper:?}"
+    );
+
+    let post_return_sink_replay_signals = app
+        .current_generation_retained_sink_replay_signals_for_local_republish()
+        .await;
+    let post_return_replay_generations = post_return_sink_replay_signals
+        .iter()
+        .filter_map(|signal| match signal {
+            SinkControlSignal::Activate { generation, .. }
+            | SinkControlSignal::Deactivate { generation, .. }
+            | SinkControlSignal::Tick { generation, .. } => Some(*generation),
+            SinkControlSignal::RuntimeHostGrantChange { .. }
+            | SinkControlSignal::Passthrough(_) => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        !post_return_replay_generations.is_empty(),
+        "precondition: requiring-probe replay seam requires a retained sink replay wave when cached sink status is already ready",
+    );
+    assert_eq!(
+        post_return_replay_generations,
+        std::collections::BTreeSet::from([2_u64]),
+        "precondition: requiring-probe replay seam should retain the current sink generation before helper execution: {post_return_sink_replay_signals:?}",
+    );
+
+    let trigger_count_before_helper = trigger_rescan_count.load(Ordering::SeqCst);
+    let post_return_retrigger_entered = Arc::new(Notify::new());
+    let post_return_retrigger_release = Arc::new(Notify::new());
+    let _post_return_retrigger_reset = LocalSinkStatusRepublishRetriggerPauseHookReset;
+    install_local_sink_status_republish_retrigger_pause_hook(
+        LocalSinkStatusRepublishRetriggerPauseHook {
+            entered: post_return_retrigger_entered.clone(),
+            release: post_return_retrigger_release.clone(),
+        },
+    );
+    let helper_probe_entered = Arc::new(Notify::new());
+    let helper_probe_release = Arc::new(Notify::new());
+    let _probe_pause_reset = LocalSinkStatusRepublishProbePauseHookReset;
+    install_local_sink_status_republish_probe_pause_hook(LocalSinkStatusRepublishProbePauseHook {
+        entered: helper_probe_entered.clone(),
+        release: helper_probe_release.clone(),
+    });
+    let sink_replay_entered = Arc::new(Notify::new());
+    let sink_replay_release = Arc::new(Notify::new());
+    let _sink_pause_reset = SinkWorkerControlFramePauseHookReset;
+    crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+        crate::workers::sink::SinkWorkerControlFramePauseHook {
+            entered: sink_replay_entered.clone(),
+            release: sink_replay_release.clone(),
+        },
+    );
+
+    let helper_task = tokio::spawn({
+        let source = app.source.clone();
+        let sink = app.sink.clone();
+        let expected_groups = expected_groups.clone();
+        let post_return_sink_replay_signals = post_return_sink_replay_signals.clone();
+        async move {
+            FSMetaApp::wait_for_local_sink_status_republish_after_recovery_requiring_probe_from_parts(
+                source,
+                sink,
+                &expected_groups,
+                &post_return_sink_replay_signals,
+            )
+            .await
+        }
+    });
+
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(2)) => {
+            panic!(
+                "requiring-probe replay helper stalled before reaching its first sink-side probe or retrigger point"
+            );
+        }
+        _ = post_return_retrigger_entered.notified() => {
+            post_return_retrigger_release.notify_waiters();
+            helper_probe_release.notify_waiters();
+            sink_replay_release.notify_waiters();
+            let _ = tokio::time::timeout(Duration::from_secs(1), helper_task).await;
+            panic!(
+                "requiring-probe replay helper must check the first sink-side probe before re-arming source->sink convergence when cached sink status is already ready"
+            );
+        }
+        _ = helper_probe_entered.notified() => {}
+    }
+
+    assert_eq!(
+        trigger_rescan_count.load(Ordering::SeqCst),
+        trigger_count_before_helper,
+        "requiring-probe replay helper must not trigger source->sink convergence before its first sink-side probe when cached sink status is already ready"
+    );
+
+    helper_probe_release.notify_waiters();
+    if tokio::time::timeout(Duration::from_secs(2), sink_replay_entered.notified())
+        .await
+        .is_err()
+    {
+        if helper_task.is_finished() {
+            let helper_result = tokio::time::timeout(Duration::from_secs(1), helper_task)
+                .await
+                .expect("join requiring-probe replay helper task")
+                .expect("join requiring-probe replay helper task");
+            panic!(
+                "requiring-probe replay helper returned without replaying the retained sink control wave once the first sink-side probe confirmed cached readiness: {helper_result:?}"
+            );
+        }
+        panic!(
+            "requiring-probe replay helper reached the first sink-side probe but never re-entered the retained sink control wave even though cached readiness alone is insufficient in this lane"
+        );
+    }
+
+    sink_replay_release.notify_waiters();
+    let helper_result = tokio::time::timeout(Duration::from_secs(5), helper_task)
+        .await
+        .expect("requiring-probe replay helper should settle after retained sink replay unblocks")
+        .expect("join requiring-probe replay helper task");
+    if let Err(err) = helper_result {
+        let cached_sink_status_summary = app
+            .sink
+            .cached_status_snapshot()
+            .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+            .unwrap_or_else(|cached_err| {
+                format!("cached_sink_status_unavailable err={cached_err}")
+            });
+        panic!(
+            "requiring-probe replay helper should settle after replaying the retained sink control wave on top of a cached-ready first sink-side probe: err={err} cached_sink_status={cached_sink_status_summary}"
+        );
+    }
+
+    assert_eq!(
+        trigger_rescan_count.load(Ordering::SeqCst),
+        trigger_count_before_helper,
+        "requiring-probe replay helper must settle without triggering source->sink convergence when the cached-ready first probe only needs a retained sink replay wave"
+    );
+
+    app.close().await.expect("close app");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordinary_current_generation_sink_tick_does_not_reenter_sink_worker_when_replay_not_required()
-{
+ {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     struct SinkWorkerControlFramePauseHookReset;
 
     impl Drop for SinkWorkerControlFramePauseHookReset {
@@ -1858,10 +2477,13 @@ async fn ordinary_current_generation_sink_tick_does_not_reenter_sink_worker_when
     app.close().await.expect("close app");
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordinary_current_generation_source_tick_does_not_reenter_source_worker_when_replay_not_required()
-{
+ {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -2040,10 +2662,13 @@ async fn ordinary_current_generation_source_tick_does_not_reenter_source_worker_
     app.close().await.expect("close app");
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordinary_current_generation_source_and_sink_ticks_do_not_reenter_runtime_app_source_apply_when_replay_not_required()
-{
+ {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -2218,7 +2843,9 @@ async fn ordinary_current_generation_source_and_sink_ticks_do_not_reenter_runtim
         ),
     ])
     .await
-    .expect("ordinary steady mixed source/sink ticks should not exhaust runtime_app source recovery");
+    .expect(
+        "ordinary steady mixed source/sink ticks should not exhaust runtime_app source recovery",
+    );
 
     assert!(
         app.control_initialized(),
@@ -2236,10 +2863,13 @@ async fn ordinary_current_generation_source_and_sink_ticks_do_not_reenter_runtim
     app.close().await.expect("close app");
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordinary_current_generation_source_and_facade_ticks_reenter_runtime_app_source_apply_when_facade_publication_still_needs_current_generation_source_truth()
-{
+ {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     struct SourceApplyEntryCountHookReset;
 
     impl Drop for SourceApplyEntryCountHookReset {
@@ -2346,9 +2976,9 @@ async fn ordinary_current_generation_source_and_facade_ticks_reenter_runtime_app
 
     let mut initial = source_wave(2);
     initial.extend(sink_wave(2));
-    app.on_control_frame(&initial)
-        .await
-        .expect("generation-two source/sink activate should succeed before steady source+facade ticks");
+    app.on_control_frame(&initial).await.expect(
+        "generation-two source/sink activate should succeed before steady source+facade ticks",
+    );
 
     let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -2441,7 +3071,11 @@ async fn ordinary_current_generation_source_and_facade_ticks_reenter_runtime_app
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordinary_current_generation_source_sink_and_facade_ticks_do_not_reenter_runtime_app_apply_paths_when_replay_not_required()
-{
+ {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     struct SourceApplyEntryCountHookReset;
     struct SinkApplyEntryCountHookReset;
 
@@ -2664,6 +3298,10 @@ async fn ordinary_current_generation_source_sink_and_facade_ticks_do_not_reenter
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replay_only_source_followup_reenters_source_apply_once_when_source_replay_required() {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     struct SourceApplyEntryCountHookReset;
 
     impl Drop for SourceApplyEntryCountHookReset {
@@ -2770,9 +3408,9 @@ async fn replay_only_source_followup_reenters_source_apply_once_when_source_repl
 
     let mut initial = source_wave(2);
     initial.extend(sink_wave(2));
-    app.on_control_frame(&initial)
-        .await
-        .expect("generation-two source/sink activate should succeed before replay-only source followup");
+    app.on_control_frame(&initial).await.expect(
+        "generation-two source/sink activate should succeed before replay-only source followup",
+    );
 
     let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -2852,7 +3490,11 @@ async fn replay_only_source_followup_reenters_source_apply_once_when_source_repl
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replay_only_sink_followup_reenters_sink_apply_once_and_local_sink_status_republish_helper_once_when_sink_replay_required()
-{
+ {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     struct SinkApplyEntryCountHookReset;
     struct LocalSinkStatusRepublishHelperEntryCountHookReset;
 
@@ -2972,9 +3614,9 @@ async fn replay_only_sink_followup_reenters_sink_apply_once_and_local_sink_statu
         &[("nfs1", &["nfs1"]), ("nfs2", &["nfs2"])],
         2,
     ));
-    app.on_control_frame(&initial)
-        .await
-        .expect("generation-two source/sink activate should succeed before replay-only sink followup");
+    app.on_control_frame(&initial).await.expect(
+        "generation-two source/sink activate should succeed before replay-only sink followup",
+    );
 
     let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -3015,7 +3657,8 @@ async fn replay_only_sink_followup_reenters_sink_apply_once_and_local_sink_statu
     );
     app.source_state_replay_required
         .store(false, Ordering::Release);
-    app.sink_state_replay_required.store(true, Ordering::Release);
+    app.sink_state_replay_required
+        .store(true, Ordering::Release);
 
     let sink_apply_entries = Arc::new(AtomicUsize::new(0));
     let helper_entries = Arc::new(AtomicUsize::new(0));
@@ -3063,7 +3706,11 @@ async fn replay_only_sink_followup_reenters_sink_apply_once_and_local_sink_statu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn source_led_uninitialized_mixed_recovery_keeps_control_gate_closed_until_local_sink_status_republish_completes()
-{
+ {
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     struct SourceControlErrorHookReset;
     struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
     struct LocalSinkStatusRepublishHelperEntryCountHookReset;
@@ -3385,8 +4032,9 @@ async fn source_led_uninitialized_mixed_recovery_keeps_control_gate_closed_until
             .unwrap_or_else(|cached_err| {
                 format!("cached_sink_status_unavailable err={cached_err}")
             });
-        let source_observability_summary =
-            summarize_source_observability_endpoint(&app.source.observability_snapshot_nonblocking().await);
+        let source_observability_summary = summarize_source_observability_endpoint(
+            &app.source.observability_snapshot_nonblocking().await,
+        );
         if later_task.is_finished() {
             let later_result = tokio::time::timeout(Duration::from_secs(1), later_task)
                 .await
@@ -3428,8 +4076,9 @@ async fn source_led_uninitialized_mixed_recovery_keeps_control_gate_closed_until
             .unwrap_or_else(|cached_err| {
                 format!("cached_sink_status_unavailable err={cached_err}")
             });
-        let source_observability_summary =
-            summarize_source_observability_endpoint(&app.source.observability_snapshot_nonblocking().await);
+        let source_observability_summary = summarize_source_observability_endpoint(
+            &app.source.observability_snapshot_nonblocking().await,
+        );
         panic!(
             "source-led uninitialized mixed recovery failed after local sink-status republish unblocked: err={err} cached_sink_status={cached_sink_status_summary} source_observability={source_observability_summary}"
         );
@@ -3447,10 +4096,16 @@ async fn source_led_uninitialized_mixed_recovery_keeps_control_gate_closed_until
     app.close().await.expect("close app");
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_when_source_replay_regresses_before_gate_reopen()
 {
+    let _family_serial = deferred_sink_owned_query_peer_publication_test_serial()
+        .lock()
+        .await;
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     struct DeferredSinkOwnedQueryPeerPublicationGateReopenPauseHookReset;
     struct DeferredSinkOwnedQueryPeerPublicationCompletionHookReset;
 
@@ -3608,10 +4263,8 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
         handle: active_facade,
     });
 
-    let expected_groups = std::collections::BTreeSet::from([
-        "nfs1".to_string(),
-        "nfs2".to_string(),
-    ]);
+    let expected_groups =
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         match tokio::time::timeout(
@@ -3653,7 +4306,8 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
         control_ready_after_republish,
         "precondition: helper tail red requires a stale ready bool captured before source replay regresses"
     );
-    app.api_control_gate.set_ready(control_ready_after_republish);
+    app.api_control_gate
+        .set_ready(control_ready_after_republish);
     assert!(
         app.api_control_gate.is_ready(),
         "precondition: helper tail red requires the API control gate to start open"
@@ -3676,7 +4330,8 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
         },
     );
 
-    app.source_state_replay_required.store(true, Ordering::Release);
+    app.source_state_replay_required
+        .store(true, Ordering::Release);
     app.api_control_gate.set_ready(false);
     assert_eq!(
         app.current_facade_service_state().await,
@@ -3685,6 +4340,7 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
     );
 
     FSMetaApp::spawn_deferred_sink_owned_query_peer_publication_after_local_sink_status_ready(
+        app.instance_id,
         app.source.clone(),
         app.sink.clone(),
         expected_groups,
@@ -3708,6 +4364,8 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
         app.control_initialized.clone(),
         app.source_state_replay_required.clone(),
         app.sink_state_replay_required.clone(),
+        app.pending_fixed_bind_has_suppressed_dependent_routes
+            .clone(),
     );
 
     tokio::time::timeout(Duration::from_secs(2), gate_reopen_entered.notified())
@@ -3739,10 +4397,16 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
     app.close().await.expect("close app");
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_facade_state_with_serving_when_pending_reappears_before_gate_reopen()
 {
+    let _family_serial = deferred_sink_owned_query_peer_publication_test_serial()
+        .lock()
+        .await;
+    let _serial = local_sink_status_republish_helper_test_serial()
+        .lock()
+        .await;
+
     struct DeferredSinkOwnedQueryPeerPublicationGateReopenPauseHookReset;
     struct DeferredSinkOwnedQueryPeerPublicationCompletionHookReset;
 
@@ -3900,10 +4564,8 @@ async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_f
         handle: active_facade,
     });
 
-    let expected_groups = std::collections::BTreeSet::from([
-        "nfs1".to_string(),
-        "nfs2".to_string(),
-    ]);
+    let expected_groups =
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         match tokio::time::timeout(
@@ -3938,7 +4600,8 @@ async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_f
         control_ready_after_republish,
         "precondition: helper pending-overwrite red requires facade publication to start ready"
     );
-    app.api_control_gate.set_ready(control_ready_after_republish);
+    app.api_control_gate
+        .set_ready(control_ready_after_republish);
     assert_eq!(
         app.current_facade_service_state().await,
         FacadeServiceState::Serving,
@@ -3963,6 +4626,7 @@ async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_f
     );
 
     FSMetaApp::spawn_deferred_sink_owned_query_peer_publication_after_local_sink_status_ready(
+        app.instance_id,
         app.source.clone(),
         app.sink.clone(),
         expected_groups,
@@ -3986,6 +4650,8 @@ async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_f
         app.control_initialized.clone(),
         app.source_state_replay_required.clone(),
         app.sink_state_replay_required.clone(),
+        app.pending_fixed_bind_has_suppressed_dependent_routes
+            .clone(),
     );
 
     tokio::time::timeout(Duration::from_secs(2), gate_reopen_entered.notified())
@@ -4046,6 +4712,10 @@ async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_f
             .expect("read published facade state after helper completion"),
         FacadeServiceState::Pending,
         "deferred sink-owned query-peer publication must not overwrite a newly pending facade state with serving when pending reappears before the tail gate reopen"
+    );
+    assert!(
+        !app.api_control_gate.is_ready(),
+        "deferred sink-owned query-peer publication must not reopen the API control gate while a new pending control facade is still waiting before the tail gate reopen completes"
     );
 
     app.close().await.expect("close app");

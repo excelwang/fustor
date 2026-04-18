@@ -314,8 +314,8 @@ mod tests {
     fn materialized_query_observation_evidence_ignores_waiting_for_root_primary_scan_groups_without_local_sink_schedule()
      {
         let mut waiting_for_root = concrete_root("nfs1", true);
-        waiting_for_root.status = "waiting_for_root: No such file or directory (os error 2)"
-            .to_string();
+        waiting_for_root.status =
+            "waiting_for_root: No such file or directory (os error 2)".to_string();
         waiting_for_root.last_error = Some("No such file or directory (os error 2)".to_string());
         let source_status = SourceStatusSnapshot {
             logical_roots: vec![SourceLogicalRootHealthSnapshot {
@@ -345,8 +345,8 @@ mod tests {
     fn candidate_group_observation_evidence_ignores_waiting_for_root_primary_scan_groups_without_local_sink_schedule()
      {
         let mut waiting_for_root = concrete_root("nfs1", true);
-        waiting_for_root.status = "waiting_for_root: No such file or directory (os error 2)"
-            .to_string();
+        waiting_for_root.status =
+            "waiting_for_root: No such file or directory (os error 2)".to_string();
         waiting_for_root.last_error = Some("No such file or directory (os error 2)".to_string());
         let source_status = SourceStatusSnapshot {
             concrete_roots: vec![waiting_for_root],

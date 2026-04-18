@@ -499,7 +499,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
-            readiness: crate::sink::GroupReadinessState::Ready,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 11,
                 estimated_heap_bytes: 1,
             },
@@ -516,7 +516,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
-            readiness: crate::sink::GroupReadinessState::Ready,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 9,
                 estimated_heap_bytes: 1,
             },
@@ -533,7 +533,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
-            readiness: crate::sink::GroupReadinessState::Ready,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 7,
                 estimated_heap_bytes: 1,
             },
@@ -562,7 +562,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                readiness: crate::sink::GroupReadinessState::PendingAudit,
                 materialized_revision: 1,
                 estimated_heap_bytes: 1,
             },
@@ -579,7 +579,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                readiness: crate::sink::GroupReadinessState::PendingAudit,
                 materialized_revision: 1,
                 estimated_heap_bytes: 1,
             },
@@ -596,7 +596,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
-            readiness: crate::sink::GroupReadinessState::Ready,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 7,
                 estimated_heap_bytes: 1,
             },
@@ -618,7 +618,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
             );
 
     assert!(
-        snapshot_has_ready_scheduled_groups(&snapshot),
+        snapshot.has_ready_scheduled_groups(),
         "status_snapshot_nonblocking must not regress ready cached groups to a live partially stale split snapshot where nfs1/nfs2 reopened as zero while nfs3 stayed ready: ready={ready_snapshot:?} live={live_snapshot:?} returned={snapshot:?}"
     );
 
@@ -626,7 +626,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
         .cached_status_snapshot()
         .expect("cached sink status after live partially stale split snapshot");
     assert!(
-        snapshot_has_ready_scheduled_groups(&cached_snapshot),
+        cached_snapshot.has_ready_scheduled_groups(),
         "the live partially stale split snapshot must not overwrite the ready cached status summary: ready={ready_snapshot:?} live={live_snapshot:?} cached={cached_snapshot:?}"
     );
 

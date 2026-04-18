@@ -21,8 +21,8 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_missing_group_rows_afte
 }
 
 #[test]
-fn classify_sink_status_snapshot_issue_detects_scheduled_missing_group_rows_after_stream_ready_path_evidence(
-) {
+fn classify_sink_status_snapshot_issue_detects_scheduled_missing_group_rows_after_stream_ready_path_evidence()
+ {
     let snapshot = SinkStatusSnapshot {
         scheduled_groups_by_node: std::collections::BTreeMap::from([(
             "node-b".to_string(),
@@ -43,8 +43,8 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_missing_group_rows_afte
 }
 
 #[test]
-fn classify_sink_status_snapshot_issue_detects_scheduled_missing_group_rows_after_stream_applied_path_evidence(
-) {
+fn classify_sink_status_snapshot_issue_detects_scheduled_missing_group_rows_after_stream_applied_path_evidence()
+ {
     let snapshot = SinkStatusSnapshot {
         scheduled_groups_by_node: std::collections::BTreeMap::from([(
             "node-b".to_string(),
@@ -65,8 +65,8 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_missing_group_rows_afte
 }
 
 #[test]
-fn classify_sink_status_snapshot_issue_detects_scheduled_missing_group_rows_after_stream_received_evidence(
-) {
+fn classify_sink_status_snapshot_issue_detects_scheduled_missing_group_rows_after_stream_received_evidence()
+ {
     let snapshot = SinkStatusSnapshot {
         scheduled_groups_by_node: std::collections::BTreeMap::from([(
             "node-b".to_string(),
@@ -87,8 +87,8 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_missing_group_rows_afte
 }
 
 #[test]
-fn classify_sink_status_snapshot_issue_detects_scheduled_missing_group_rows_after_stream_received_path_evidence(
-) {
+fn classify_sink_status_snapshot_issue_detects_scheduled_missing_group_rows_after_stream_received_path_evidence()
+ {
     let snapshot = SinkStatusSnapshot {
         scheduled_groups_by_node: std::collections::BTreeMap::from([(
             "node-b".to_string(),
@@ -159,7 +159,7 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_mixed_ready_and_unready
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
-            readiness: crate::sink::GroupReadinessState::Ready,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 7,
                 estimated_heap_bytes: 1,
             },
@@ -176,7 +176,7 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_mixed_ready_and_unready
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
+                readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -196,8 +196,8 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_mixed_ready_and_unready
 }
 
 #[test]
-fn classify_sink_status_snapshot_issue_detects_scheduled_pending_audit_without_stream_receipts_regardless_of_replay_required(
-) {
+fn classify_sink_status_snapshot_issue_detects_scheduled_pending_audit_without_stream_receipts_regardless_of_replay_required()
+ {
     let snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs3".to_string(),
@@ -245,7 +245,7 @@ fn sink_group_status_readiness_distinguishes_waiting_for_materialized_root_from_
         shadow_lag_us: 0,
         overflow_pending_audit: false,
         initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
+        readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
         materialized_revision: 1,
         estimated_heap_bytes: 0,
     };
@@ -268,12 +268,12 @@ fn sink_group_status_readiness_distinguishes_waiting_for_materialized_root_from_
     };
 
     assert_eq!(
-        classify_sink_group_status_readiness(&waiting_for_materialized_root),
-        SinkGroupStatusReadiness::WaitingForMaterializedRoot
+        waiting_for_materialized_root.normalized_readiness(),
+        crate::sink::GroupReadinessState::WaitingForMaterializedRoot
     );
     assert_eq!(
-        classify_sink_group_status_readiness(&pending_audit),
-        SinkGroupStatusReadiness::PendingAudit
+        pending_audit.normalized_readiness(),
+        crate::sink::GroupReadinessState::PendingAudit
     );
 }
 
@@ -298,15 +298,15 @@ fn classify_sink_group_status_readiness_prefers_exported_group_readiness_over_le
     };
 
     assert_eq!(
-        classify_sink_group_status_readiness(&exported_waiting_for_materialized_root),
-        SinkGroupStatusReadiness::WaitingForMaterializedRoot,
+        exported_waiting_for_materialized_root.normalized_readiness(),
+        crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
         "workers/sink must consume the exported group readiness state directly instead of reconstructing a different readiness class from legacy snapshot fields"
     );
 }
 
 #[test]
 fn classify_sink_group_status_readiness_treats_zero_row_with_placeholder_primary_as_waiting_for_materialized_root_even_when_exported_readiness_is_ready()
-{
+ {
     let exported_ready_zero_row = crate::sink::SinkGroupStatusSnapshot {
         group_id: "nfs1".to_string(),
         primary_object_ref: "unassigned".to_string(),
@@ -326,15 +326,15 @@ fn classify_sink_group_status_readiness_treats_zero_row_with_placeholder_primary
     };
 
     assert_eq!(
-        classify_sink_group_status_readiness(&exported_ready_zero_row),
-        SinkGroupStatusReadiness::WaitingForMaterializedRoot,
+        exported_ready_zero_row.normalized_readiness(),
+        crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
         "structural zero rows with placeholder primary must override stale exported readiness=Ready and stay waiting-for-root"
     );
 }
 
 #[test]
 fn classify_sink_group_status_readiness_treats_zero_row_with_bound_primary_as_pending_audit_even_when_exported_readiness_is_ready()
-{
+ {
     let exported_ready_zero_row = crate::sink::SinkGroupStatusSnapshot {
         group_id: "nfs1".to_string(),
         primary_object_ref: "node-d::nfs1".to_string(),
@@ -354,15 +354,15 @@ fn classify_sink_group_status_readiness_treats_zero_row_with_bound_primary_as_pe
     };
 
     assert_eq!(
-        classify_sink_group_status_readiness(&exported_ready_zero_row),
-        SinkGroupStatusReadiness::PendingAudit,
+        exported_ready_zero_row.normalized_readiness(),
+        crate::sink::GroupReadinessState::PendingAudit,
         "structural zero rows with a bound primary must override stale exported readiness=Ready and stay pending-audit"
     );
 }
 
 #[test]
-fn classify_sink_group_status_readiness_preserves_exported_waiting_for_materialized_root_for_zero_row_bound_primary(
-) {
+fn classify_sink_group_status_readiness_preserves_exported_waiting_for_materialized_root_for_zero_row_bound_primary()
+ {
     let exported_waiting_zero_row = crate::sink::SinkGroupStatusSnapshot {
         group_id: "nfs1".to_string(),
         primary_object_ref: "node-d::nfs1".to_string(),
@@ -382,9 +382,37 @@ fn classify_sink_group_status_readiness_preserves_exported_waiting_for_materiali
     };
 
     assert_eq!(
-        classify_sink_group_status_readiness(&exported_waiting_zero_row),
-        SinkGroupStatusReadiness::WaitingForMaterializedRoot,
+        exported_waiting_zero_row.normalized_readiness(),
+        crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
         "workers/sink must preserve an exported waiting-for-materialized-root zero-row even when the primary is already bound; only stale exported readiness=Ready should be structurally downgraded"
+    );
+}
+
+#[test]
+fn classify_sink_group_status_readiness_normalizes_live_row_waiting_for_materialized_root_to_ready()
+{
+    let exported_waiting_live_row = crate::sink::SinkGroupStatusSnapshot {
+        group_id: "nfs1".to_string(),
+        primary_object_ref: "unassigned".to_string(),
+        total_nodes: 1,
+        live_nodes: 1,
+        tombstoned_count: 0,
+        attested_count: 1,
+        suspect_count: 0,
+        blind_spot_count: 0,
+        shadow_time_us: 0,
+        shadow_lag_us: 0,
+        overflow_pending_audit: false,
+        initial_audit_completed: false,
+        readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
+        materialized_revision: 1,
+        estimated_heap_bytes: 0,
+    };
+
+    assert_eq!(
+        exported_waiting_live_row.normalized_readiness(),
+        crate::sink::GroupReadinessState::Ready,
+        "a live materialized row must not stay structurally waiting-for-materialized-root just because exported readiness lagged behind the row-level live truth"
     );
 }
 
@@ -412,7 +440,7 @@ fn ready_groups_from_snapshot_prefers_exported_readiness_over_legacy_initial_aud
     };
 
     assert_eq!(
-        ready_groups_from_snapshot(&snapshot),
+        snapshot.ready_groups(),
         std::collections::BTreeSet::from(["nfs1".to_string()]),
         "ready-group extraction must trust exported readiness over stale initial_audit_completed=false"
     );
@@ -449,7 +477,7 @@ fn snapshot_looks_stale_empty_prefers_exported_readiness_over_legacy_initial_aud
 
 #[test]
 fn republish_scheduled_groups_into_zero_row_summary_prefers_exported_readiness_over_legacy_initial_audit_bool()
-{
+ {
     let mut snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs1".to_string(),
@@ -534,9 +562,9 @@ fn fold_live_sink_status_snapshot_returns_cached_for_control_inflight_scheduled_
     };
 
     assert_eq!(
-        fold_live_sink_status_snapshot(
-            &live_snapshot,
-            &cached_snapshot,
+        fold_live_sink_status_snapshot_with_projection(
+            &live_snapshot.issue_projection(),
+            &cached_snapshot.issue_projection(),
             None,
             SinkStatusLiveFoldMode::ControlInflight,
         ),
@@ -546,8 +574,36 @@ fn fold_live_sink_status_snapshot_returns_cached_for_control_inflight_scheduled_
 }
 
 #[test]
+fn fold_live_sink_status_snapshot_fails_closed_for_blocking_missing_group_rows_after_stream_evidence()
+ {
+    let cached_snapshot = SinkStatusSnapshot::default();
+    let live_snapshot = SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs3".to_string()],
+        )]),
+        stream_ready_origin_counts_by_node: std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["node-b::nfs3=15".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    assert_eq!(
+        fold_live_sink_status_snapshot_with_projection(
+            &live_snapshot.issue_projection(),
+            &cached_snapshot.issue_projection(),
+            None,
+            SinkStatusLiveFoldMode::Blocking,
+        ),
+        SinkStatusLiveFoldOutcome::FailClosed,
+        "blocking status truth must fail close on scheduled missing-group rows once stream evidence proves the schedule already existed instead of publishing a structurally incomplete live snapshot",
+    );
+}
+
+#[test]
 fn fold_live_sink_status_snapshot_fails_closed_for_control_inflight_missing_group_rows_when_cached_ready_groups_do_not_cover_live_schedule()
-{
+ {
     let cached_snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs1".to_string(),
@@ -585,9 +641,9 @@ fn fold_live_sink_status_snapshot_fails_closed_for_control_inflight_missing_grou
     };
 
     assert_eq!(
-        fold_live_sink_status_snapshot(
-            &live_snapshot,
-            &cached_snapshot,
+        fold_live_sink_status_snapshot_with_projection(
+            &live_snapshot.issue_projection(),
+            &cached_snapshot.issue_projection(),
             None,
             SinkStatusLiveFoldMode::ControlInflight,
         ),
@@ -598,7 +654,7 @@ fn fold_live_sink_status_snapshot_fails_closed_for_control_inflight_missing_grou
 
 #[test]
 fn evaluate_live_sink_status_snapshot_marks_replay_required_for_pending_audit_without_stream_receipts()
-{
+ {
     let cached_snapshot = SinkStatusSnapshot::default();
     let live_snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
@@ -632,7 +688,10 @@ fn evaluate_live_sink_status_snapshot_marks_replay_required_for_pending_audit_wi
         SinkStatusLiveFoldMode::Steady,
     );
 
-    assert_eq!(evaluation.decision, SinkStatusAvailabilityDecision::FailClosed);
+    assert_eq!(
+        evaluation.decision,
+        SinkStatusAvailabilityDecision::FailClosed
+    );
     assert!(
         evaluation.should_mark_replay_required,
         "pending-audit live snapshots without stream receipts must request replay before the caller decides how to surface the failure",
@@ -645,7 +704,7 @@ fn evaluate_live_sink_status_snapshot_marks_replay_required_for_pending_audit_wi
 
 #[test]
 fn evaluate_live_sink_status_snapshot_returns_live_for_steady_after_retry_reset_waiting_for_materialized_root()
-{
+ {
     let cached_snapshot = SinkStatusSnapshot::default();
     let live_snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
@@ -692,7 +751,7 @@ fn evaluate_live_sink_status_snapshot_returns_live_for_steady_after_retry_reset_
 
 #[test]
 fn evaluate_live_sink_status_snapshot_returns_cached_for_steady_after_retry_reset_pending_audit_when_cached_ready_groups_cover_live_schedule()
-{
+ {
     let cached_snapshot = SinkStatusSnapshot {
         groups: vec![
             crate::sink::SinkGroupStatusSnapshot {
@@ -805,9 +864,9 @@ fn fold_live_sink_status_snapshot_fails_closed_for_steady_stale_empty_without_ca
     let live_snapshot = SinkStatusSnapshot::default();
 
     assert_eq!(
-        fold_live_sink_status_snapshot(
-            &live_snapshot,
-            &cached_snapshot,
+        fold_live_sink_status_snapshot_with_projection(
+            &live_snapshot.issue_projection(),
+            &cached_snapshot.issue_projection(),
             None,
             SinkStatusLiveFoldMode::Steady,
         ),
@@ -832,10 +891,11 @@ fn fold_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_missin
     };
 
     assert_eq!(
-        fold_cached_sink_status_snapshot(
-            &cached_snapshot,
+        project_cached_sink_status_snapshot_fold(
+            &cached_snapshot.issue_projection(),
             SinkStatusCachedFoldMode::WorkerUnavailable,
-        ),
+        )
+        .outcome,
         SinkStatusCachedFoldOutcome::ReturnCached,
         "worker-unavailable paths should still be allowed to return cached missing-group rows when stream evidence proves the schedule was already alive",
     );
@@ -846,18 +906,19 @@ fn fold_cached_sink_status_snapshot_fails_closed_for_not_started_stale_empty_cac
     let cached_snapshot = SinkStatusSnapshot::default();
 
     assert_eq!(
-        fold_cached_sink_status_snapshot(
-            &cached_snapshot,
+        project_cached_sink_status_snapshot_fold(
+            &cached_snapshot.issue_projection(),
             SinkStatusCachedFoldMode::NotStarted,
-        ),
+        )
+        .outcome,
         SinkStatusCachedFoldOutcome::FailClosed,
         "not-started paths must fail closed on stale-empty cached snapshots instead of treating them as usable sink truth",
     );
 }
 
 #[test]
-fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_pending_audit_without_stream_receipts(
-) {
+fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_pending_audit_without_stream_receipts()
+ {
     let cached_snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs3".to_string(),
@@ -904,8 +965,8 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_pe
 }
 
 #[test]
-fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_pending_audit_without_stream_receipts(
-) {
+fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_pending_audit_without_stream_receipts()
+ {
     let cached_snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs3".to_string(),
@@ -952,8 +1013,8 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_pending_a
 }
 
 #[test]
-fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_waiting_for_materialized_root(
-) {
+fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_waiting_for_materialized_root()
+ {
     let cached_snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs3".to_string(),
@@ -1000,8 +1061,8 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_wa
 }
 
 #[test]
-fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_waiting_for_materialized_root(
-) {
+fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_waiting_for_materialized_root()
+ {
     let cached_snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs3".to_string(),
@@ -1048,8 +1109,67 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_waiting_f
 }
 
 #[test]
-fn evaluate_cached_sink_status_snapshot_returns_cached_for_control_inflight_no_client_pending_audit_without_stream_receipts(
-) {
+fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_missing_group_rows_after_stream_evidence()
+ {
+    let cached_snapshot = SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs3".to_string()],
+        )]),
+        stream_ready_origin_counts_by_node: std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["node-b::nfs3=15".to_string()],
+        )]),
+        stream_applied_batches_by_node: std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            1,
+        )]),
+        stream_applied_events_by_node: std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            15,
+        )]),
+        stream_applied_control_events_by_node: std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            3,
+        )]),
+        stream_applied_data_events_by_node: std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            12,
+        )]),
+        stream_applied_origin_counts_by_node: std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["node-b::nfs3=15".to_string()],
+        )]),
+        stream_last_applied_at_us_by_node: std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            42,
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    let evaluation = evaluate_cached_sink_status_snapshot(
+        &cached_snapshot,
+        SinkStatusCachedFoldMode::NotStarted,
+    );
+
+    assert_eq!(
+        evaluation.decision,
+        SinkStatusAvailabilityDecision::ReturnCached,
+        "not-started cached missing-group-row snapshots with stream evidence should preserve the cached scheduled truth instead of failing closed as stale cache",
+    );
+    assert!(
+        !evaluation.should_republish_zero_row_summary,
+        "not-started cached missing-group-row snapshots must not request zero-row republish"
+    );
+    assert!(
+        !evaluation.should_mark_replay_required,
+        "cached missing-group-row snapshots should not arm replay-required from the cached fold path"
+    );
+}
+
+#[test]
+fn evaluate_cached_sink_status_snapshot_returns_cached_for_control_inflight_no_client_pending_audit_without_stream_receipts()
+ {
     let cached_snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs3".to_string(),
@@ -1104,7 +1224,10 @@ fn evaluate_cached_sink_status_snapshot_requests_zero_row_republish_for_stale_em
         SinkStatusCachedFoldMode::NotStarted,
     );
 
-    assert_eq!(evaluation.decision, SinkStatusAvailabilityDecision::FailClosed);
+    assert_eq!(
+        evaluation.decision,
+        SinkStatusAvailabilityDecision::FailClosed
+    );
     assert!(
         evaluation.should_republish_zero_row_summary,
         "stale-empty cached snapshots must request zero-row republish before callers fail closed",
@@ -1116,8 +1239,8 @@ fn evaluate_cached_sink_status_snapshot_requests_zero_row_republish_for_stale_em
 }
 
 #[test]
-fn evaluate_cached_sink_status_snapshot_propagates_error_for_control_inflight_no_client_stale_empty_cache(
-) {
+fn evaluate_cached_sink_status_snapshot_propagates_error_for_control_inflight_no_client_stale_empty_cache()
+ {
     let cached_snapshot = SinkStatusSnapshot::default();
 
     let evaluation = evaluate_cached_sink_status_snapshot(

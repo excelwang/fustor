@@ -79,12 +79,24 @@ const SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_FRAME_LEASE_ACQUIRE_BUDGET: Duration = Duration::from_secs(1);
 const CONTROL_FRAME_LEASE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const INTERNAL_SINK_STATUS_BLOCKING_FALLBACK_BUDGET: Duration = Duration::from_millis(250);
+const RUNTIME_APP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 struct FacadeActivation {
     route_key: String,
     generation: u64,
     resource_ids: Vec<String>,
     handle: api::ApiServerHandle,
+}
+
+impl FacadeActivation {
+    fn matches_route_resources(&self, route_key: &str, resource_ids: &[String]) -> bool {
+        self.route_key == route_key && self.resource_ids == resource_ids
+    }
+
+    fn matches_pending(&self, pending: &PendingFacadeActivation) -> bool {
+        self.matches_route_resources(&pending.route_key, &pending.resource_ids)
+            && self.generation == pending.generation
+    }
 }
 
 #[derive(Clone)]
@@ -102,7 +114,7 @@ impl FacadeSpawnInProgress {
     }
 
     fn matches_pending(&self, pending: &PendingFacadeActivation) -> bool {
-        self.route_key == pending.route_key && self.resource_ids == pending.resource_ids
+        pending.matches_route_resources(&self.route_key, &self.resource_ids)
     }
 }
 
@@ -248,6 +260,25 @@ enum FacadeOnlyHandoffAllowanceDecision {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FacadeOnlyHandoffObservationPolicy {
+    ForceBlocked,
+    ForceAllowed,
+    DeriveFromPendingBind,
+}
+
+#[derive(Clone)]
+struct FacadeGateObservation {
+    runtime: RuntimeGateFacts,
+    current_pending: Option<PendingFacadeActivation>,
+    pending_facade_present: bool,
+    pending_facade_is_control_route: bool,
+    pending_fixed_bind_has_suppressed_dependent_routes: bool,
+    active_control_stream_present: bool,
+    active_pending_control_stream_present: bool,
+    allow_facade_only_handoff: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FixedBindHandoffReleaseDecisionInput {
     handoff_ready_entry_present: bool,
     handoff_ready_owned_by_current_instance: bool,
@@ -263,29 +294,429 @@ enum FixedBindHandoffReleaseDecision {
     Ready,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingFixedBindHandoffAttemptDecisionInput {
+    claim_conflict: bool,
+    pending_runtime_exposure_confirmed: bool,
+    active_owner_present: bool,
+    conflicting_process_claim_owner_instance_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FacadeDeactivateContinuityDecisionInput {
+    retain_active_facade: bool,
+    pending_fixed_bind_conflict: bool,
+    release_for_fixed_bind_handoff: bool,
+    retain_pending_spawn: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FacadeDeactivateContinuityDisposition {
+    RetainActiveContinuity,
+    RetainActiveWhilePendingFixedBindClaimConflict,
+    RetainPendingWhilePendingFixedBindClaimConflict,
+    ReleaseActiveForFixedBindHandoff,
+    RetainPendingForFixedBindHandoff,
+    RetainPendingWhileSpawnInFlight,
+    Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingFacadeSpawnContinuityDisposition {
+    ReuseCurrentGeneration,
+    PromoteExistingSameResource { active_generation: u64 },
+    Continue,
+}
+
+#[derive(Clone)]
+struct PendingFixedBindPublicationState {
+    pending: Option<PendingFacadeActivation>,
+    conflicting_process_claim: Option<ProcessFacadeClaim>,
+    claim_release_followup_pending: bool,
+}
+
+#[derive(Clone)]
+struct FacadeDeactivateContinuityObservation {
+    retain_active_facade: bool,
+    retain_pending_spawn: bool,
+    pending_fixed_bind_publication: PendingFixedBindPublicationState,
+    active_fixed_bind_handoff: Option<FixedBindHandoffObservation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingFixedBindClaimReleaseFollowupDisposition {
+    Inactive,
+    WaitingForClaimRelease,
+    PublicationStillIncomplete,
+    PublicationCompleted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingFixedBindRouteSuppressionDisposition {
+    Allow,
+    SuppressClaimConflict,
+    SuppressPublicationIncomplete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingFixedBindPublicationProjection {
+    claim_release_followup_required: bool,
+    claim_release_followup_disposition: PendingFixedBindClaimReleaseFollowupDisposition,
+    route_suppression_disposition: PendingFixedBindRouteSuppressionDisposition,
+    handoff_ready_bind_addr_present: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingFixedBindHandoffFollowup {
+    bind_addr: String,
+    claim_release_followup_required: bool,
+}
+
+enum PendingFacadeSpawnFollowupDisposition {
+    Spawned {
+        spawned: bool,
+        pending: Option<PendingFacadeActivation>,
+        reset_suppressed_dependent_routes: bool,
+    },
+    RetryAfterBindAddrInUse {
+        pending: PendingFacadeActivation,
+        err: CnxError,
+    },
+    PropagateError(CnxError),
+}
+
+#[derive(Clone)]
+struct FixedBindHandoffObservation {
+    handoff_ready_entry_present: bool,
+    handoff_ready_owned_by_current_instance: bool,
+    pending_facade_present: bool,
+    pending_facade_is_control_route: bool,
+    pending_runtime_exposure_confirmed: bool,
+    suppressed_dependent_routes_remain: bool,
+    claim_conflict: bool,
+    active_owner: Option<ActiveFixedBindFacadeRegistrant>,
+    conflicting_process_claim: Option<ProcessFacadeClaim>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingFixedBindHandoffAttemptDisposition {
+    NoAttempt,
+    ReleaseActiveOwner,
+    ReleaseConflictingProcessClaim { owner_instance_id: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingFixedBindHandoffCompletionDecisionInput {
+    pending_facade_present: bool,
+    active_control_stream_present: bool,
+    deadline_expired: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingFixedBindHandoffCompletionDisposition {
+    ContinuePolling,
+    ApplyReadyTail,
+    Abort,
+}
+
 impl FacadeOnlyHandoffAllowanceDecision {
     fn allows_handoff(self) -> bool {
         !matches!(self, Self::Blocked)
     }
 }
 
+impl FacadeGateObservation {
+    fn publication_readiness_input(&self) -> FacadePublicationReadinessDecisionInput {
+        FacadePublicationReadinessDecisionInput {
+            runtime: self.runtime,
+            allow_facade_only_handoff: self.allow_facade_only_handoff,
+            pending_facade_present: self.current_pending.is_some(),
+            pending_facade_is_control_route: self.pending_facade_is_control_route,
+            pending_fixed_bind_has_suppressed_dependent_routes: self
+                .pending_fixed_bind_has_suppressed_dependent_routes,
+            active_control_stream_present: self.active_control_stream_present,
+            active_pending_control_stream_present: self.active_pending_control_stream_present,
+        }
+    }
+
+    fn publication_readiness_decision(&self) -> FacadePublicationReadinessDecision {
+        FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
+            self.publication_readiness_input(),
+        )
+    }
+
+    fn publication_ready(&self) -> bool {
+        matches!(
+            self.publication_readiness_decision(),
+            FacadePublicationReadinessDecision::Ready
+        )
+    }
+
+    fn ready_tail_decision(&self, publication_ready: bool) -> FacadeReadyTailDecision {
+        FSMetaApp::facade_ready_tail_decision_from_runtime_facts(FacadeReadyTailDecisionInput {
+            runtime: self.runtime,
+            allow_facade_only_handoff: self.allow_facade_only_handoff,
+            publication_ready,
+            pending_facade_present: self.pending_facade_present,
+        })
+    }
+}
+
+impl FixedBindHandoffObservation {
+    fn pending_facts(pending: Option<&PendingFacadeActivation>) -> (bool, bool, bool) {
+        (
+            pending.is_some(),
+            pending.is_some_and(|pending| {
+                pending.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+            }),
+            pending.is_some_and(|pending| pending.runtime_exposure_confirmed),
+        )
+    }
+
+    fn suppressed_dependent_routes_remain(
+        ready: Option<&PendingFixedBindHandoffReady>,
+        fallback: bool,
+    ) -> bool {
+        ready.map_or(fallback, |ready| {
+            ready
+                .registrant
+                .pending_fixed_bind_has_suppressed_dependent_routes
+                .load(Ordering::Acquire)
+        })
+    }
+
+    fn from_parts(
+        current_instance_id: u64,
+        bind_addr: &str,
+        pending: Option<PendingFacadeActivation>,
+        ready: Option<PendingFixedBindHandoffReady>,
+        suppressed_dependent_routes_fallback: bool,
+        claim_conflict: bool,
+        conflicting_process_claim: Option<ProcessFacadeClaim>,
+    ) -> Self {
+        let (
+            pending_facade_present,
+            pending_facade_is_control_route,
+            pending_runtime_exposure_confirmed,
+        ) = Self::pending_facts(pending.as_ref());
+        let handoff_ready_owned_by_current_instance = ready
+            .as_ref()
+            .is_some_and(|ready| ready.registrant.instance_id == current_instance_id);
+
+        Self {
+            pending_facade_present,
+            pending_facade_is_control_route,
+            pending_runtime_exposure_confirmed,
+            handoff_ready_entry_present: ready.is_some(),
+            handoff_ready_owned_by_current_instance,
+            suppressed_dependent_routes_remain: Self::suppressed_dependent_routes_remain(
+                ready.as_ref(),
+                suppressed_dependent_routes_fallback,
+            ),
+            claim_conflict,
+            active_owner: active_fixed_bind_facade_owner_for(bind_addr, current_instance_id),
+            conflicting_process_claim,
+        }
+    }
+
+    fn release_decision_input(&self) -> FixedBindHandoffReleaseDecisionInput {
+        FixedBindHandoffReleaseDecisionInput {
+            handoff_ready_entry_present: self.handoff_ready_entry_present,
+            handoff_ready_owned_by_current_instance: self.handoff_ready_owned_by_current_instance,
+            pending_facade_present: self.pending_facade_present,
+            pending_facade_is_control_route: self.pending_facade_is_control_route,
+            pending_runtime_exposure_confirmed: self.pending_runtime_exposure_confirmed,
+            suppressed_dependent_routes_remain: self.suppressed_dependent_routes_remain,
+        }
+    }
+
+    fn release_decision(&self) -> FixedBindHandoffReleaseDecision {
+        FSMetaApp::fixed_bind_handoff_release_decision(self.release_decision_input())
+    }
+
+    fn ready_for_release(&self) -> bool {
+        matches!(
+            self.release_decision(),
+            FixedBindHandoffReleaseDecision::Ready
+        )
+    }
+
+    fn pending_publication_attempt_input(&self) -> PendingFixedBindHandoffAttemptDecisionInput {
+        PendingFixedBindHandoffAttemptDecisionInput {
+            claim_conflict: self.claim_conflict,
+            pending_runtime_exposure_confirmed: self.pending_runtime_exposure_confirmed,
+            active_owner_present: self.active_owner.is_some(),
+            conflicting_process_claim_owner_instance_id: self
+                .conflicting_process_claim
+                .as_ref()
+                .map(|claim| claim.owner_instance_id),
+        }
+    }
+
+    fn pending_publication_attempt_disposition(&self) -> PendingFixedBindHandoffAttemptDisposition {
+        FSMetaApp::pending_fixed_bind_handoff_attempt_disposition(
+            self.pending_publication_attempt_input(),
+        )
+    }
+
+    async fn from_ready_entry(
+        bind_addr: String,
+        ready: Option<PendingFixedBindHandoffReady>,
+        current_instance_id: u64,
+    ) -> Self {
+        let pending = match ready.as_ref() {
+            Some(ready) => ready.registrant.pending_facade.lock().await.clone(),
+            None => None,
+        };
+        Self::from_parts(
+            current_instance_id,
+            &bind_addr,
+            pending,
+            ready,
+            false,
+            false,
+            None,
+        )
+    }
+
+    fn from_pending_publication(
+        bind_addr: String,
+        pending: PendingFacadeActivation,
+        ready: Option<PendingFixedBindHandoffReady>,
+        publication_state: &PendingFixedBindPublicationState,
+        suppressed_dependent_routes_fallback: bool,
+        current_instance_id: u64,
+    ) -> Self {
+        Self::from_parts(
+            current_instance_id,
+            &bind_addr,
+            Some(pending),
+            ready,
+            suppressed_dependent_routes_fallback,
+            publication_state.claim_conflict(),
+            publication_state.conflicting_process_claim_for_handoff(),
+        )
+    }
+}
+
+impl PendingFixedBindPublicationState {
+    fn inactive(claim_release_followup_pending: bool) -> Self {
+        Self {
+            pending: None,
+            conflicting_process_claim: None,
+            claim_release_followup_pending,
+        }
+    }
+
+    fn new(
+        pending: Option<PendingFacadeActivation>,
+        conflicting_process_claim: Option<ProcessFacadeClaim>,
+        claim_release_followup_pending: bool,
+    ) -> Self {
+        Self {
+            pending,
+            conflicting_process_claim,
+            claim_release_followup_pending,
+        }
+    }
+
+    fn publication_incomplete(&self) -> Option<PendingFacadeActivation> {
+        self.pending.clone()
+    }
+
+    fn claim_conflict(&self) -> bool {
+        self.conflicting_process_claim.is_some()
+    }
+
+    fn conflicting_process_claim_for_handoff(&self) -> Option<ProcessFacadeClaim> {
+        self.claim_release_followup_pending
+            .then(|| self.conflicting_process_claim.clone())
+            .flatten()
+    }
+
+    fn projection(&self) -> PendingFixedBindPublicationProjection {
+        let claim_release_followup_required = self.claim_conflict();
+        let claim_release_followup_disposition = if !self.claim_release_followup_pending {
+            PendingFixedBindClaimReleaseFollowupDisposition::Inactive
+        } else if self.publication_incomplete().is_none() {
+            PendingFixedBindClaimReleaseFollowupDisposition::PublicationCompleted
+        } else if claim_release_followup_required {
+            PendingFixedBindClaimReleaseFollowupDisposition::WaitingForClaimRelease
+        } else {
+            PendingFixedBindClaimReleaseFollowupDisposition::PublicationStillIncomplete
+        };
+        let route_suppression_disposition = if claim_release_followup_required {
+            PendingFixedBindRouteSuppressionDisposition::SuppressClaimConflict
+        } else {
+            match claim_release_followup_disposition {
+                PendingFixedBindClaimReleaseFollowupDisposition::Inactive
+                | PendingFixedBindClaimReleaseFollowupDisposition::PublicationCompleted => {
+                    PendingFixedBindRouteSuppressionDisposition::Allow
+                }
+                PendingFixedBindClaimReleaseFollowupDisposition::WaitingForClaimRelease => {
+                    PendingFixedBindRouteSuppressionDisposition::SuppressClaimConflict
+                }
+                PendingFixedBindClaimReleaseFollowupDisposition::PublicationStillIncomplete => {
+                    PendingFixedBindRouteSuppressionDisposition::SuppressPublicationIncomplete
+                }
+            }
+        };
+
+        PendingFixedBindPublicationProjection {
+            claim_release_followup_required,
+            claim_release_followup_disposition,
+            route_suppression_disposition,
+            handoff_ready_bind_addr_present: self.pending.as_ref().is_some_and(|pending| {
+                claim_release_followup_required
+                    && pending.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+                    && !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr)
+            }),
+        }
+    }
+}
+
+impl PendingFixedBindPublicationProjection {
+    fn handoff_followup_for_pending(
+        self,
+        pending: &PendingFacadeActivation,
+    ) -> Option<PendingFixedBindHandoffFollowup> {
+        self.handoff_ready_bind_addr_present
+            .then(|| PendingFixedBindHandoffFollowup {
+                bind_addr: pending.resolved.bind_addr.clone(),
+                claim_release_followup_required: self.claim_release_followup_required,
+            })
+    }
+}
+
+impl FacadeDeactivateContinuityObservation {
+    fn decision_input(&self) -> FacadeDeactivateContinuityDecisionInput {
+        FacadeDeactivateContinuityDecisionInput {
+            retain_active_facade: self.retain_active_facade,
+            pending_fixed_bind_conflict: self.pending_fixed_bind_publication.claim_conflict(),
+            release_for_fixed_bind_handoff: self
+                .active_fixed_bind_handoff
+                .as_ref()
+                .is_some_and(|observation| observation.ready_for_release()),
+            retain_pending_spawn: self.retain_pending_spawn,
+        }
+    }
+
+    fn disposition(&self) -> FacadeDeactivateContinuityDisposition {
+        FSMetaApp::facade_deactivate_continuity_disposition(self.decision_input())
+    }
+}
+
 impl FacadeReadyTailDecisionInput {
-    fn facade_service_state_input(self, control_gate_ready: bool) -> FacadeServiceStateDecisionInput {
+    fn facade_service_state_input(
+        self,
+        control_gate_ready: bool,
+    ) -> FacadeServiceStateDecisionInput {
         FacadeServiceStateDecisionInput {
             control_gate_ready,
             publication_ready: self.publication_ready,
             pending_facade_present: self.pending_facade_present,
         }
     }
-}
-
-fn active_control_stream_matches_pending_facade(
-    active: &FacadeActivation,
-    pending: &PendingFacadeActivation,
-) -> bool {
-    active.route_key == pending.route_key
-        && active.resource_ids == pending.resource_ids
-        && active.generation == pending.generation
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -336,30 +767,18 @@ enum SinkControlWaveDisposition {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct SourceControlWaveDecisionInput<'a> {
-    control_initialized_at_entry: bool,
-    control_initialized_now: bool,
-    source_state_replay_required: bool,
-    cleanup_disposition: UninitializedCleanupDisposition,
-    source_signals: &'a [SourceControlSignal],
-    facade_claim_signals_present: bool,
-    facade_publication_signals_present: bool,
-    sink_signals_present: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct SinkControlWaveDecisionInput<'a> {
+struct ControlFrameWaveObservation {
     control_initialized_at_entry: bool,
     control_initialized_now: bool,
     retained_sink_state_present_at_entry: bool,
+    source_state_replay_required: bool,
     sink_state_replay_required: bool,
     sink_tick_fast_path_eligible: bool,
     cleanup_disposition: UninitializedCleanupDisposition,
-    source_wave_disposition: SourceControlWaveDisposition,
-    source_signals_present: bool,
     facade_claim_signals_present: bool,
     facade_publication_signals_present: bool,
-    sink_signals: &'a [SinkControlSignal],
+    source_signals_present: bool,
+    sink_signals_present: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -410,29 +829,620 @@ enum SinkRecoveryGateReopenDisposition {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SinkRecoveryGateReopenDecisionInput {
+    source_led_uninitialized_mixed_recovery: bool,
+    deferred_local_sink_replay_present: bool,
+    cached_sink_status_ready_for_expected_groups: bool,
+    source_led_expected_groups: std::collections::BTreeSet<String>,
+    recovered_expected_groups: Option<std::collections::BTreeSet<String>>,
+}
+
+impl SinkRecoveryGateReopenDisposition {
+    fn from_decision_input(input: SinkRecoveryGateReopenDecisionInput) -> Self {
+        let SinkRecoveryGateReopenDecisionInput {
+            source_led_uninitialized_mixed_recovery,
+            deferred_local_sink_replay_present,
+            cached_sink_status_ready_for_expected_groups,
+            source_led_expected_groups,
+            recovered_expected_groups,
+        } = input;
+
+        if source_led_uninitialized_mixed_recovery && !source_led_expected_groups.is_empty() {
+            if cached_sink_status_ready_for_expected_groups {
+                if deferred_local_sink_replay_present {
+                    return Self::WaitForLocalSinkStatusRepublish {
+                        expected_groups: source_led_expected_groups,
+                    };
+                }
+                return Self::None;
+            }
+            return Self::DeferGateReopenUntilSinkStatusReady {
+                expected_groups: source_led_expected_groups,
+            };
+        }
+
+        recovered_expected_groups.map_or(Self::None, |expected_groups| {
+            Self::DeferGateReopenUntilSinkStatusReady { expected_groups }
+        })
+    }
+
+    fn defers_gate_reopen(&self) -> bool {
+        matches!(self, Self::DeferGateReopenUntilSinkStatusReady { .. })
+    }
+
+    fn local_wait_expected_groups(&self) -> Option<&std::collections::BTreeSet<String>> {
+        match self {
+            Self::WaitForLocalSinkStatusRepublish { expected_groups } => Some(expected_groups),
+            Self::None | Self::DeferGateReopenUntilSinkStatusReady { .. } => None,
+        }
+    }
+
+    fn deferred_expected_groups(&self) -> Option<&std::collections::BTreeSet<String>> {
+        match self {
+            Self::DeferGateReopenUntilSinkStatusReady { expected_groups } => Some(expected_groups),
+            Self::None | Self::WaitForLocalSinkStatusRepublish { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SinkRecoveryTailPlan {
+    immediate_local_sink_status_republish_waits: Vec<std::collections::BTreeSet<String>>,
+    gate_reopen_disposition: SinkRecoveryGateReopenDisposition,
+}
+
+impl SinkRecoveryTailPlan {
+    fn new() -> Self {
+        Self {
+            immediate_local_sink_status_republish_waits: Vec::new(),
+            gate_reopen_disposition: SinkRecoveryGateReopenDisposition::None,
+        }
+    }
+
+    fn push_immediate_local_sink_status_republish_wait(
+        &mut self,
+        expected_groups: std::collections::BTreeSet<String>,
+    ) {
+        if expected_groups.is_empty() {
+            return;
+        }
+        self.immediate_local_sink_status_republish_waits
+            .push(expected_groups);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalSinkStatusRepublishWaitMode {
     AllowCachedReadyFastPath,
     RequireProbeBeforeReady,
 }
 
-fn sink_status_snapshot_has_ready_scheduled_groups(
+#[derive(Debug)]
+struct RuntimeScopeConvergenceObservation {
+    source_groups: std::collections::BTreeSet<String>,
+    scan_groups: std::collections::BTreeSet<String>,
+    sink_groups: std::collections::BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RuntimeScopeConvergenceExpectation<'a> {
+    NonemptyFullyConverged,
+    ExpectedGroups(&'a std::collections::BTreeSet<String>),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimeScopeConvergenceWaitDecisionInput<'a> {
+    observation: &'a RuntimeScopeConvergenceObservation,
+    expectation: RuntimeScopeConvergenceExpectation<'a>,
+    deadline_expired: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeScopeConvergenceWaitDecision {
+    Wait,
+    Converged,
+    ReturnTimeout,
+}
+
+impl RuntimeScopeConvergenceObservation {
+    fn is_nonempty_fully_converged(&self) -> bool {
+        !self.source_groups.is_empty()
+            && self.source_groups == self.scan_groups
+            && self.source_groups == self.sink_groups
+    }
+
+    fn matches_expected(&self, expected_groups: &std::collections::BTreeSet<String>) -> bool {
+        self.source_groups == *expected_groups
+            && self.scan_groups == *expected_groups
+            && self.sink_groups == *expected_groups
+    }
+
+    fn timeout_context(&self) -> String {
+        format!(
+            "source={:?} scan={:?} sink={:?}",
+            self.source_groups, self.scan_groups, self.sink_groups
+        )
+    }
+
+    fn matches_expectation(
+        self: &Self,
+        expectation: RuntimeScopeConvergenceExpectation<'_>,
+    ) -> bool {
+        match expectation {
+            RuntimeScopeConvergenceExpectation::NonemptyFullyConverged => {
+                self.is_nonempty_fully_converged()
+            }
+            RuntimeScopeConvergenceExpectation::ExpectedGroups(expected_groups) => {
+                self.matches_expected(expected_groups)
+            }
+        }
+    }
+}
+
+impl RuntimeScopeConvergenceWaitDecisionInput<'_> {
+    fn decide(self) -> RuntimeScopeConvergenceWaitDecision {
+        if self.observation.matches_expectation(self.expectation) {
+            RuntimeScopeConvergenceWaitDecision::Converged
+        } else if self.deadline_expired {
+            RuntimeScopeConvergenceWaitDecision::ReturnTimeout
+        } else {
+            RuntimeScopeConvergenceWaitDecision::Wait
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostRecoveryScopeConvergenceTriggerState {
+    InitialNotTriggered,
+    Triggered,
+    RetryPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostRecoverySinkStatusTimeoutRetryState {
+    NotRetried,
+    RetriedAfterManualRescan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PostRecoverySinkStatusReadinessWaitState {
+    scope_trigger_state: PostRecoveryScopeConvergenceTriggerState,
+    sink_timeout_retry_state: PostRecoverySinkStatusTimeoutRetryState,
+}
+
+#[derive(Debug)]
+struct LocalSinkStatusRepublishWaitState {
+    retrigger_state: LocalSinkStatusRepublishRetriggerState,
+    manual_rescan_state: LocalSinkStatusRepublishManualRescanState,
+    retained_sink_replay_state: LocalSinkStatusRepublishRetainedSinkReplayState,
+    #[cfg(test)]
+    first_sink_probe_pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalSinkStatusRepublishPendingStep {
+    TriggerSourceToSinkConvergence,
+    ReplayRetainedSinkWave,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalSinkStatusRepublishRetriggerState {
+    Pending { count: usize },
+    Idle { count: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalSinkStatusRepublishManualRescanState {
+    NotPublished,
+    Published,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalSinkStatusRepublishRetainedSinkReplayState {
+    None,
+    Pending,
+    RequireReadyProbe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalSinkStatusRepublishIterationDecisionInput {
+    runtime_scope_converged: bool,
+    cached_ready_fast_path_satisfied: bool,
+    deadline_expired: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalSinkStatusRepublishIterationDecision {
+    WaitForRuntimeScopeConvergence,
+    ReturnReady,
+    DrivePendingStepsAndProbe,
+    ReturnTimeout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalSinkStatusRepublishPostProbeDecision {
+    ReturnReady,
+    ReplayRetainedSinkWave,
+    PublishManualRescanFallback,
+    ReturnTimeout,
+}
+
+impl LocalSinkStatusRepublishIterationDecisionInput {
+    fn decide(self) -> LocalSinkStatusRepublishIterationDecision {
+        if !self.runtime_scope_converged {
+            return LocalSinkStatusRepublishIterationDecision::WaitForRuntimeScopeConvergence;
+        }
+        if self.cached_ready_fast_path_satisfied {
+            return LocalSinkStatusRepublishIterationDecision::ReturnReady;
+        }
+        if self.deadline_expired {
+            LocalSinkStatusRepublishIterationDecision::ReturnTimeout
+        } else {
+            LocalSinkStatusRepublishIterationDecision::DrivePendingStepsAndProbe
+        }
+    }
+}
+
+impl ControlFrameWaveObservation {
+    fn classify_source_control_wave_disposition(
+        self,
+        source_signals: &[SourceControlSignal],
+    ) -> SourceControlWaveDisposition {
+        if !source_signals.is_empty() {
+            if self.cleanup_disposition.is_source_only() {
+                SourceControlWaveDisposition::CleanupOnlyWhileUninitialized
+            } else if self.control_initialized_at_entry
+                && self.control_initialized_now
+                && !self.source_state_replay_required
+                && ((!self.facade_claim_signals_present
+                    && !self.facade_publication_signals_present)
+                    || self.sink_signals_present)
+                && source_signals
+                    .iter()
+                    .all(|signal| matches!(signal, SourceControlSignal::Tick { .. }))
+            {
+                SourceControlWaveDisposition::SteadyTickNoop
+            } else {
+                SourceControlWaveDisposition::ApplySignals
+            }
+        } else if self.source_state_replay_required
+            && !self.cleanup_disposition.is_source_only()
+            && !self.cleanup_disposition.is_sink_only()
+        {
+            SourceControlWaveDisposition::ReplayRetained
+        } else {
+            SourceControlWaveDisposition::Idle
+        }
+    }
+
+    fn classify_sink_control_wave_disposition(
+        self,
+        source_wave_disposition: SourceControlWaveDisposition,
+        sink_signals: &[SinkControlSignal],
+    ) -> SinkControlWaveDisposition {
+        if !sink_signals.is_empty() {
+            let steady_tick_noop = self.control_initialized_at_entry
+                && self.control_initialized_now
+                && !self.sink_state_replay_required
+                && self.sink_tick_fast_path_eligible
+                && sink_signals
+                    .iter()
+                    .all(|signal| matches!(signal, SinkControlSignal::Tick { .. }));
+            let apply_before_initial_source_wave = !self.control_initialized_at_entry
+                && !self.retained_sink_state_present_at_entry
+                && self.source_signals_present
+                && !self.cleanup_disposition.is_source_only()
+                && !self.cleanup_disposition.is_sink_query_only()
+                && matches!(
+                    source_wave_disposition,
+                    SourceControlWaveDisposition::ApplySignals
+                )
+                && !steady_tick_noop;
+            if apply_before_initial_source_wave {
+                SinkControlWaveDisposition::ApplyBeforeInitialSourceWave
+            } else if self.cleanup_disposition.is_sink_query_only() {
+                SinkControlWaveDisposition::CleanupOnlyQueryWhileUninitialized
+            } else if steady_tick_noop {
+                SinkControlWaveDisposition::SteadyTickNoop
+            } else {
+                SinkControlWaveDisposition::ApplySignals {
+                    wait_for_status_republish_after_apply: self.control_initialized_at_entry
+                        && self.retained_sink_state_present_at_entry
+                        && !self.sink_tick_fast_path_eligible
+                        && !self.source_signals_present
+                        && !self.facade_claim_signals_present
+                        && !self.facade_publication_signals_present
+                        && sink_signals
+                            .iter()
+                            .all(|signal| matches!(signal, SinkControlSignal::Tick { .. })),
+                }
+            }
+        } else if self.sink_state_replay_required
+            && !self.cleanup_disposition.is_source_only()
+            && !self.cleanup_disposition.is_sink_query_only()
+        {
+            SinkControlWaveDisposition::ReplayRetained
+        } else {
+            SinkControlWaveDisposition::Idle
+        }
+    }
+}
+
+impl LocalSinkStatusRepublishRetriggerState {
+    fn is_pending(self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+
+    fn count(self) -> usize {
+        match self {
+            Self::Pending { count } | Self::Idle { count } => count,
+        }
+    }
+
+    fn mark_triggered(&mut self) {
+        *self = Self::Idle {
+            count: self.count() + 1,
+        };
+    }
+}
+
+impl LocalSinkStatusRepublishRetainedSinkReplayState {
+    fn is_pending(self) -> bool {
+        matches!(self, Self::Pending)
+    }
+}
+
+impl LocalSinkStatusRepublishWaitState {
+    fn new(mode: LocalSinkStatusRepublishWaitMode) -> Self {
+        Self {
+            retrigger_state: match mode {
+                LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath => {
+                    LocalSinkStatusRepublishRetriggerState::Pending { count: 0 }
+                }
+                LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady => {
+                    LocalSinkStatusRepublishRetriggerState::Idle { count: 0 }
+                }
+            },
+            manual_rescan_state: LocalSinkStatusRepublishManualRescanState::NotPublished,
+            retained_sink_replay_state: match mode {
+                LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath => {
+                    LocalSinkStatusRepublishRetainedSinkReplayState::None
+                }
+                LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady => {
+                    LocalSinkStatusRepublishRetainedSinkReplayState::RequireReadyProbe
+                }
+            },
+            #[cfg(test)]
+            first_sink_probe_pending: true,
+        }
+    }
+
+    async fn trigger_source_to_sink_convergence(
+        &mut self,
+        source: &Arc<SourceFacade>,
+    ) -> Result<()> {
+        source.trigger_rescan_when_ready().await?;
+        #[cfg(test)]
+        maybe_pause_after_local_sink_status_republish_retrigger().await;
+        self.retrigger_state.mark_triggered();
+        Ok(())
+    }
+
+    async fn apply_pending_steps(
+        &mut self,
+        source: &Arc<SourceFacade>,
+        sink: &Arc<SinkFacade>,
+        post_return_sink_replay_signals: &[SinkControlSignal],
+        remaining: Duration,
+    ) -> Result<()> {
+        loop {
+            match self.next_pending_step() {
+                LocalSinkStatusRepublishPendingStep::TriggerSourceToSinkConvergence => {
+                    self.trigger_source_to_sink_convergence(source).await?;
+                }
+                LocalSinkStatusRepublishPendingStep::ReplayRetainedSinkWave => {
+                    sink.apply_orchestration_signals_with_total_timeout(
+                        post_return_sink_replay_signals,
+                        remaining,
+                    )
+                    .await?;
+                    self.retained_sink_replay_state =
+                        LocalSinkStatusRepublishRetainedSinkReplayState::None;
+                }
+                LocalSinkStatusRepublishPendingStep::None => return Ok(()),
+            }
+        }
+    }
+
+    async fn maybe_pause_before_probe(&mut self) {
+        #[cfg(test)]
+        if self.first_sink_probe_pending {
+            maybe_pause_before_local_sink_status_republish_probe().await;
+            self.first_sink_probe_pending = false;
+        }
+    }
+
+    async fn schedule_manual_rescan_fallback(
+        &mut self,
+        source: &Arc<SourceFacade>,
+        post_return_sink_replay_signals: &[SinkControlSignal],
+    ) -> Result<()> {
+        if matches!(
+            self.manual_rescan_state,
+            LocalSinkStatusRepublishManualRescanState::Published
+        ) {
+            return Ok(());
+        }
+        // Retained sink replay can leave the local sink status lane effectively fresh
+        // again. Force one baseline replay pass, then allow one more direct
+        // source->sink retrigger so the helper waits on a real rematerialization
+        // instead of timing out against an empty-but-scheduled local summary.
+        source.publish_manual_rescan_signal().await?;
+        self.manual_rescan_state = LocalSinkStatusRepublishManualRescanState::Published;
+        self.retained_sink_replay_state = if post_return_sink_replay_signals.is_empty() {
+            LocalSinkStatusRepublishRetainedSinkReplayState::None
+        } else {
+            LocalSinkStatusRepublishRetainedSinkReplayState::Pending
+        };
+        if self.retrigger_state.count() < 2 {
+            self.trigger_source_to_sink_convergence(source).await?;
+        }
+        Ok(())
+    }
+
+    fn post_probe_decision(
+        &mut self,
+        probe_outcome: LocalSinkStatusRepublishProbeOutcome,
+        post_return_sink_replay_signals: &[SinkControlSignal],
+        deadline_expired: bool,
+    ) -> LocalSinkStatusRepublishPostProbeDecision {
+        match probe_outcome {
+            LocalSinkStatusRepublishProbeOutcome::Ready => match self.retained_sink_replay_state {
+                LocalSinkStatusRepublishRetainedSinkReplayState::RequireReadyProbe => {
+                    self.retained_sink_replay_state = if post_return_sink_replay_signals.is_empty()
+                    {
+                        LocalSinkStatusRepublishRetainedSinkReplayState::None
+                    } else {
+                        LocalSinkStatusRepublishRetainedSinkReplayState::Pending
+                    };
+                    if self.retained_sink_replay_state.is_pending() {
+                        LocalSinkStatusRepublishPostProbeDecision::ReplayRetainedSinkWave
+                    } else {
+                        LocalSinkStatusRepublishPostProbeDecision::ReturnReady
+                    }
+                }
+                _ => LocalSinkStatusRepublishPostProbeDecision::ReturnReady,
+            },
+            LocalSinkStatusRepublishProbeOutcome::NotReady if deadline_expired => {
+                LocalSinkStatusRepublishPostProbeDecision::ReturnTimeout
+            }
+            LocalSinkStatusRepublishProbeOutcome::NotReady => {
+                LocalSinkStatusRepublishPostProbeDecision::PublishManualRescanFallback
+            }
+        }
+    }
+
+    fn next_pending_step(&self) -> LocalSinkStatusRepublishPendingStep {
+        if self.retrigger_state.is_pending() {
+            return LocalSinkStatusRepublishPendingStep::TriggerSourceToSinkConvergence;
+        }
+        if self.retained_sink_replay_state.is_pending() {
+            return LocalSinkStatusRepublishPendingStep::ReplayRetainedSinkWave;
+        }
+        LocalSinkStatusRepublishPendingStep::None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalSinkStatusRepublishProbeOutcome {
+    Ready,
+    NotReady,
+}
+
+impl PostRecoverySinkStatusReadinessWaitState {
+    fn new(source_to_sink_convergence_pretriggered: bool) -> Self {
+        Self {
+            scope_trigger_state: if source_to_sink_convergence_pretriggered {
+                PostRecoveryScopeConvergenceTriggerState::Triggered
+            } else {
+                PostRecoveryScopeConvergenceTriggerState::InitialNotTriggered
+            },
+            sink_timeout_retry_state: PostRecoverySinkStatusTimeoutRetryState::NotRetried,
+        }
+    }
+
+    async fn maybe_drive_pending_scope_convergence_retrigger(
+        &mut self,
+        source: &Arc<SourceFacade>,
+    ) -> Result<()> {
+        if matches!(
+            self.scope_trigger_state,
+            PostRecoveryScopeConvergenceTriggerState::RetryPending
+        ) {
+            source.trigger_rescan_when_ready().await?;
+            self.scope_trigger_state = PostRecoveryScopeConvergenceTriggerState::Triggered;
+        }
+        Ok(())
+    }
+
+    async fn maybe_trigger_initial_scope_convergence(
+        &mut self,
+        source: &Arc<SourceFacade>,
+    ) -> Result<()> {
+        if matches!(
+            self.scope_trigger_state,
+            PostRecoveryScopeConvergenceTriggerState::InitialNotTriggered
+        ) {
+            source.trigger_rescan_when_ready().await?;
+            self.scope_trigger_state = PostRecoveryScopeConvergenceTriggerState::Triggered;
+        }
+        Ok(())
+    }
+
+    async fn maybe_schedule_sink_timeout_retry(
+        &mut self,
+        source: &Arc<SourceFacade>,
+        before_deadline: bool,
+    ) -> Result<bool> {
+        if !before_deadline
+            || !matches!(
+                self.sink_timeout_retry_state,
+                PostRecoverySinkStatusTimeoutRetryState::NotRetried
+            )
+        {
+            return Ok(false);
+        }
+        // A later source-only recovery can converge route scopes from primed
+        // cached groups before the post-recovery rescan has actually
+        // rematerialized baseline source publication. Request one explicit
+        // manual rescan before the final source->sink retry so sink readiness
+        // wait does not return on a scheduled-only zero-state sink.
+        source.publish_manual_rescan_signal().await?;
+        self.sink_timeout_retry_state =
+            PostRecoverySinkStatusTimeoutRetryState::RetriedAfterManualRescan;
+        self.scope_trigger_state = PostRecoveryScopeConvergenceTriggerState::RetryPending;
+        Ok(true)
+    }
+}
+
+fn sink_group_status_counts_as_ready(group: &crate::sink::SinkGroupStatusSnapshot) -> bool {
+    matches!(
+        group.normalized_readiness(),
+        crate::sink::GroupReadinessState::Ready
+    )
+}
+
+fn sink_status_snapshot_scheduled_groups(
     snapshot: &crate::sink::SinkStatusSnapshot,
-) -> bool {
-    let scheduled_groups = snapshot
+) -> std::collections::BTreeSet<String> {
+    snapshot
         .scheduled_groups_by_node
         .values()
         .flat_map(|groups| groups.iter().cloned())
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<std::collections::BTreeSet<_>>()
+}
+
+fn sink_status_snapshot_ready_groups(
+    snapshot: &crate::sink::SinkStatusSnapshot,
+) -> std::collections::BTreeSet<String> {
+    snapshot
+        .groups
+        .iter()
+        .filter(|group| sink_group_status_counts_as_ready(group))
+        .map(|group| group.group_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+}
+
+fn sink_status_snapshot_has_ready_scheduled_groups(
+    snapshot: &crate::sink::SinkStatusSnapshot,
+) -> bool {
+    let scheduled_groups = sink_status_snapshot_scheduled_groups(snapshot);
     if scheduled_groups.is_empty() {
         return false;
     }
-    let ready_groups = snapshot
-        .groups
-        .iter()
-        .filter(|group| group.initial_audit_completed)
-        .map(|group| group.group_id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
+    let ready_groups = sink_status_snapshot_ready_groups(snapshot);
     scheduled_groups.is_subset(&ready_groups)
 }
 
@@ -443,17 +1453,8 @@ fn sink_status_snapshot_ready_for_expected_groups(
     if expected_groups.is_empty() {
         return false;
     }
-    let scheduled_groups = snapshot
-        .scheduled_groups_by_node
-        .values()
-        .flat_map(|groups| groups.iter().cloned())
-        .collect::<std::collections::BTreeSet<_>>();
-    let ready_groups = snapshot
-        .groups
-        .iter()
-        .filter(|group| group.initial_audit_completed)
-        .map(|group| group.group_id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
+    let scheduled_groups = sink_status_snapshot_scheduled_groups(snapshot);
+    let ready_groups = sink_status_snapshot_ready_groups(snapshot);
     expected_groups.is_subset(&scheduled_groups) && expected_groups.is_subset(&ready_groups)
 }
 
@@ -511,9 +1512,180 @@ struct ActiveFixedBindFacadeRegistrant {
     api_control_gate: Arc<ApiControlGate>,
 }
 
+impl PendingFixedBindHandoffRegistrant {
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        instance_id: u64,
+        api_task: Arc<Mutex<Option<FacadeActivation>>>,
+        pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
+        pending_fixed_bind_has_suppressed_dependent_routes: Arc<AtomicBool>,
+        facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
+        facade_pending_status: SharedFacadePendingStatusCell,
+        facade_service_state: SharedFacadeServiceStateCell,
+        api_request_tracker: Arc<ApiRequestTracker>,
+        api_control_gate: Arc<ApiControlGate>,
+        control_initialized: Arc<AtomicBool>,
+        source_state_replay_required: Arc<AtomicBool>,
+        sink_state_replay_required: Arc<AtomicBool>,
+        node_id: NodeId,
+        runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
+        source: Arc<SourceFacade>,
+        sink: Arc<SinkFacade>,
+        query_sink: Arc<SinkFacade>,
+        query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
+    ) -> Self {
+        Self {
+            instance_id,
+            api_task,
+            pending_facade,
+            pending_fixed_bind_has_suppressed_dependent_routes,
+            facade_spawn_in_progress,
+            facade_pending_status,
+            facade_service_state,
+            api_request_tracker,
+            api_control_gate,
+            control_initialized,
+            source_state_replay_required,
+            sink_state_replay_required,
+            node_id,
+            runtime_boundary,
+            source,
+            sink,
+            query_sink,
+            query_runtime_boundary,
+        }
+    }
+
+    fn runtime_gate_facts(&self) -> RuntimeGateFacts {
+        RuntimeGateFacts::from_atomic_flags(
+            self.control_initialized.as_ref(),
+            self.source_state_replay_required.as_ref(),
+            self.sink_state_replay_required.as_ref(),
+        )
+    }
+
+    fn active_fixed_bind_facade_registrant(&self) -> ActiveFixedBindFacadeRegistrant {
+        ActiveFixedBindFacadeRegistrant::from_parts(
+            self.instance_id,
+            self.api_task.clone(),
+            self.api_request_tracker.clone(),
+            self.api_control_gate.clone(),
+        )
+    }
+
+    fn clear_pending_facade_and_publish_ready_tail_after_publication(&self) {
+        FSMetaApp::clear_pending_facade_and_publish_ready_tail_from_runtime_facts(
+            &self.facade_pending_status,
+            &self.facade_service_state,
+            &self.api_control_gate,
+            FacadeReadyTailDecisionInput {
+                runtime: self.runtime_gate_facts(),
+                allow_facade_only_handoff: false,
+                publication_ready: true,
+                pending_facade_present: false,
+            },
+        );
+    }
+
+    async fn apply_forced_handoff_ready_tail(&self, bind_addr: &str) -> bool {
+        FSMetaApp::apply_observed_facade_ready_tail_from_parts(
+            self.instance_id,
+            self.api_task.clone(),
+            self.pending_facade.clone(),
+            Some(&self.facade_pending_status),
+            &self.facade_service_state,
+            &self.api_control_gate,
+            self.runtime_gate_facts(),
+            self.pending_fixed_bind_has_suppressed_dependent_routes
+                .load(Ordering::Acquire),
+            FacadeOnlyHandoffObservationPolicy::ForceAllowed,
+            Some((bind_addr, self.active_fixed_bind_facade_registrant())),
+        )
+        .await
+    }
+
+    async fn apply_pending_facade_spawn_continuity_disposition(
+        &self,
+        disposition: PendingFacadeSpawnContinuityDisposition,
+        pending: &PendingFacadeActivation,
+    ) -> Option<bool> {
+        match disposition {
+            PendingFacadeSpawnContinuityDisposition::ReuseCurrentGeneration => {
+                let active_matches = self
+                    .api_task
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|active| pending.matches_active(active));
+                if !active_matches {
+                    return None;
+                }
+                let mut pending_guard = self.pending_facade.lock().await;
+                if pending_guard.as_ref().is_some_and(|candidate| {
+                    candidate.matches_route_resources_generation(
+                        &pending.route_key,
+                        &pending.resource_ids,
+                        pending.generation,
+                    )
+                }) {
+                    pending_guard.take();
+                }
+                drop(pending_guard);
+                self.clear_pending_facade_and_publish_ready_tail_after_publication();
+                Some(true)
+            }
+            PendingFacadeSpawnContinuityDisposition::PromoteExistingSameResource {
+                active_generation,
+            } => {
+                let mut api_task_guard = self.api_task.lock().await;
+                let active_matches = api_task_guard.as_ref().is_some_and(|active| {
+                    pending.matches_active_route_resources(active)
+                        && active.generation == active_generation
+                });
+                if !active_matches {
+                    return None;
+                }
+                if let Some(active) = api_task_guard.as_mut() {
+                    active.generation = pending.generation;
+                }
+                drop(api_task_guard);
+                let mut pending_guard = self.pending_facade.lock().await;
+                if pending_guard.as_ref().is_some_and(|candidate| {
+                    candidate.matches_route_resources_generation(
+                        &pending.route_key,
+                        &pending.resource_ids,
+                        pending.generation,
+                    )
+                }) {
+                    pending_guard.take();
+                }
+                drop(pending_guard);
+                self.clear_pending_facade_and_publish_ready_tail_after_publication();
+                Some(true)
+            }
+            PendingFacadeSpawnContinuityDisposition::Continue => None,
+        }
+    }
+}
+
+impl ActiveFixedBindFacadeRegistrant {
+    fn from_parts(
+        instance_id: u64,
+        api_task: Arc<Mutex<Option<FacadeActivation>>>,
+        api_request_tracker: Arc<ApiRequestTracker>,
+        api_control_gate: Arc<ApiControlGate>,
+    ) -> Self {
+        Self {
+            instance_id,
+            api_task,
+            api_request_tracker,
+            api_control_gate,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PendingFixedBindHandoffReady {
-    instance_id: u64,
     registrant: PendingFixedBindHandoffRegistrant,
 }
 
@@ -528,6 +1700,41 @@ struct PendingFacadeActivation {
     runtime_managed: bool,
     runtime_exposure_confirmed: bool,
     resolved: api::config::ResolvedApiConfig,
+}
+
+impl PendingFacadeActivation {
+    fn matches_route_generation(&self, route_key: &str, generation: u64) -> bool {
+        self.route_key == route_key && self.generation == generation
+    }
+
+    fn matches_route_resources(&self, route_key: &str, resource_ids: &[String]) -> bool {
+        self.route_key == route_key && self.resource_ids == resource_ids
+    }
+
+    fn matches_route_resources_generation(
+        &self,
+        route_key: &str,
+        resource_ids: &[String],
+        generation: u64,
+    ) -> bool {
+        self.matches_route_resources(route_key, resource_ids) && self.generation == generation
+    }
+
+    fn matches_active(&self, active: &FacadeActivation) -> bool {
+        active.matches_pending(self)
+    }
+
+    fn matches_active_route_resources(&self, active: &FacadeActivation) -> bool {
+        active.matches_route_resources(&self.route_key, &self.resource_ids)
+    }
+
+    fn matches_status(&self, status: &SharedFacadePendingStatus) -> bool {
+        self.matches_route_resources_generation(
+            &status.route_key,
+            &status.resource_ids,
+            status.generation,
+        )
+    }
 }
 
 fn default_runtime_worker_binding(
@@ -713,11 +1920,11 @@ fn summarize_sink_groups(groups: &[crate::sink::SinkGroupStatusSnapshot]) -> Vec
         .iter()
         .map(|group| {
             format!(
-                "{}:live={} total={} init={} rev={}",
+                "{}:live={} total={} readiness={:?} rev={}",
                 group.group_id,
                 group.live_nodes,
                 group.total_nodes,
-                group.initial_audit_completed,
+                group.normalized_readiness(),
                 group.materialized_revision
             )
         })
@@ -863,18 +2070,7 @@ fn selected_group_bridge_eligible_from_sink_status(
     let Some(selected_group) = request.scope.selected_group.as_ref() else {
         return true;
     };
-    let trusted_root_tree_request = request.op == crate::query::QueryOp::Tree
-        && request.scope.path.as_slice() == b"/"
-        && request.tree_options.as_ref().is_some_and(|options| {
-            options.read_class == crate::query::ReadClass::TrustedMaterialized
-        });
-    snapshot.groups.iter().any(|group| {
-        group.group_id == *selected_group
-            && (group.live_nodes > 0
-                || (trusted_root_tree_request
-                    && group.initial_audit_completed
-                    && group.total_nodes > 0))
-    })
+    selected_group_bridge_state_from_sink_status(request, snapshot, selected_group).eligible()
 }
 
 fn node_id_from_object_ref(object_ref: &str) -> Option<NodeId> {
@@ -911,32 +2107,59 @@ fn scheduled_sink_owner_node_for_group(
     scheduled_nodes.into_iter().next()
 }
 
-fn selected_group_bridge_readiness_rank(
+fn selected_group_bridge_group_readiness_rank(
     request: &InternalQueryRequest,
-    snapshot: &crate::sink::SinkStatusSnapshot,
+    group: &crate::sink::SinkGroupStatusSnapshot,
 ) -> u8 {
-    let Some(selected_group) = request.scope.selected_group.as_deref() else {
-        return 0;
-    };
     let trusted_root_tree_request = request.op == crate::query::QueryOp::Tree
         && request.scope.path.as_slice() == b"/"
         && request.tree_options.as_ref().is_some_and(|options| {
             options.read_class == crate::query::ReadClass::TrustedMaterialized
         });
-    snapshot
+    if trusted_root_tree_request
+        && sink_group_status_counts_as_ready(group)
+        && group.total_nodes > 0
+    {
+        2
+    } else if group.live_nodes > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SelectedGroupBridgeState {
+    readiness_rank: u8,
+    owner_node: Option<NodeId>,
+}
+
+impl SelectedGroupBridgeState {
+    fn eligible(&self) -> bool {
+        self.readiness_rank > 0
+    }
+}
+
+fn selected_group_bridge_state_from_sink_status(
+    request: &InternalQueryRequest,
+    snapshot: &crate::sink::SinkStatusSnapshot,
+    selected_group: &str,
+) -> SelectedGroupBridgeState {
+    let readiness_rank = snapshot
         .groups
         .iter()
         .find(|group| group.group_id == selected_group)
-        .map(|group| {
-            if trusted_root_tree_request && group.initial_audit_completed && group.total_nodes > 0 {
-                2
-            } else if group.live_nodes > 0 {
-                1
-            } else {
-                0
-            }
-        })
-        .unwrap_or(0)
+        .map(|group| selected_group_bridge_group_readiness_rank(request, group))
+        .unwrap_or(0);
+    let owner_node = if readiness_rank > 0 {
+        scheduled_sink_owner_node_for_group(snapshot, selected_group)
+    } else {
+        None
+    };
+    SelectedGroupBridgeState {
+        readiness_rank,
+        owner_node,
+    }
 }
 
 fn selected_group_sink_query_bridge_snapshot<'a>(
@@ -944,23 +2167,38 @@ fn selected_group_sink_query_bridge_snapshot<'a>(
     live_snapshot: Option<&'a crate::sink::SinkStatusSnapshot>,
     cached_snapshot: Option<&'a crate::sink::SinkStatusSnapshot>,
 ) -> Option<&'a crate::sink::SinkStatusSnapshot> {
-    let live_eligible = live_snapshot
-        .filter(|snapshot| selected_group_bridge_eligible_from_sink_status(request, snapshot));
-    let cached_eligible = cached_snapshot
-        .filter(|snapshot| selected_group_bridge_eligible_from_sink_status(request, snapshot));
+    let selected_group = request.scope.selected_group.as_deref();
+    let live_eligible = live_snapshot.and_then(|snapshot| {
+        selected_group.map_or(
+            Some((snapshot, SelectedGroupBridgeState::default())),
+            |group_id| {
+                let state =
+                    selected_group_bridge_state_from_sink_status(request, snapshot, group_id);
+                state.eligible().then_some((snapshot, state))
+            },
+        )
+    });
+    let cached_eligible = cached_snapshot.and_then(|snapshot| {
+        selected_group.map_or(
+            Some((snapshot, SelectedGroupBridgeState::default())),
+            |group_id| {
+                let state =
+                    selected_group_bridge_state_from_sink_status(request, snapshot, group_id);
+                state.eligible().then_some((snapshot, state))
+            },
+        )
+    });
 
     match (live_eligible, cached_eligible) {
-        (Some(live), Some(cached)) if request.scope.selected_group.is_some() => {
-            if selected_group_bridge_readiness_rank(request, cached)
-                > selected_group_bridge_readiness_rank(request, live)
-            {
+        (Some((live, live_state)), Some((cached, cached_state))) if selected_group.is_some() => {
+            if cached_state.readiness_rank > live_state.readiness_rank {
                 Some(cached)
             } else {
                 Some(live)
             }
         }
-        (Some(live), _) => Some(live),
-        (_, Some(cached)) => Some(cached),
+        (Some((live, _)), _) => Some(live),
+        (_, Some((cached, _))) => Some(cached),
         _ => live_snapshot.or(cached_snapshot),
     }
 }
@@ -975,10 +2213,11 @@ fn selected_group_sink_query_bridge_bindings(
     let Some(snapshot) = snapshot else {
         return default_route_bindings();
     };
-    if !selected_group_bridge_eligible_from_sink_status(request, snapshot) {
+    let state = selected_group_bridge_state_from_sink_status(request, snapshot, selected_group);
+    if !state.eligible() {
         return default_route_bindings();
     }
-    if let Some(owner_node) = scheduled_sink_owner_node_for_group(snapshot, selected_group) {
+    if let Some(owner_node) = state.owner_node {
         return sink_query_route_bindings_for(&owner_node.0);
     }
     default_route_bindings()
@@ -1472,10 +2711,16 @@ impl Drop for ControlFrameLeaseGuard {
     }
 }
 
-type SharedSinkRouteClaims =
-    std::collections::BTreeMap<(String, String), std::collections::BTreeSet<u64>>;
-type SharedSourceRouteClaims =
-    std::collections::BTreeMap<(String, String), std::collections::BTreeSet<u64>>;
+type SharedRouteClaimId = (String, String);
+type SharedRouteClaims =
+    std::collections::BTreeMap<SharedRouteClaimId, std::collections::BTreeSet<u64>>;
+type SharedSinkRouteClaims = SharedRouteClaims;
+type SharedSourceRouteClaims = SharedRouteClaims;
+
+enum SharedRouteClaimDelta {
+    Claim(SharedRouteClaimId),
+    Release(SharedRouteClaimId),
+}
 
 fn shared_sink_route_claims_for_runtime(
     node_id: &NodeId,
@@ -1559,7 +2804,7 @@ fn pending_fixed_bind_handoff_ready_cell()
     CELL.get_or_init(|| StdMutex::new(BTreeMap::new()))
 }
 
-fn mark_pending_fixed_bind_handoff_ready(
+fn mark_pending_fixed_bind_handoff_ready_with_registrant(
     bind_addr: &str,
     registrant: PendingFixedBindHandoffRegistrant,
 ) {
@@ -1569,11 +2814,16 @@ fn mark_pending_fixed_bind_handoff_ready(
     };
     guard.insert(
         bind_addr.to_string(),
-        PendingFixedBindHandoffReady {
-            instance_id: registrant.instance_id,
-            registrant,
-        },
+        PendingFixedBindHandoffReady { registrant },
     );
+}
+
+#[cfg(test)]
+fn mark_pending_fixed_bind_handoff_ready(
+    bind_addr: &str,
+    registrant: PendingFixedBindHandoffRegistrant,
+) {
+    mark_pending_fixed_bind_handoff_ready_with_registrant(bind_addr, registrant);
 }
 
 fn clear_pending_fixed_bind_handoff_ready(bind_addr: &str) {
@@ -1582,16 +2832,6 @@ fn clear_pending_fixed_bind_handoff_ready(bind_addr: &str) {
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.remove(bind_addr);
-}
-
-fn pending_fixed_bind_handoff_ready_for(bind_addr: &str, instance_id: u64) -> bool {
-    let guard = match pending_fixed_bind_handoff_ready_cell().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    guard
-        .get(bind_addr)
-        .is_some_and(|ready| ready.instance_id != instance_id)
 }
 
 fn pending_fixed_bind_handoff_registrant_for(
@@ -1603,8 +2843,17 @@ fn pending_fixed_bind_handoff_registrant_for(
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.get(bind_addr).and_then(|ready| {
-        (ready.instance_id != released_by_instance_id).then_some(ready.registrant.clone())
+        (ready.registrant.instance_id != released_by_instance_id)
+            .then_some(ready.registrant.clone())
     })
+}
+
+fn pending_fixed_bind_handoff_ready_for(bind_addr: &str) -> Option<PendingFixedBindHandoffReady> {
+    let guard = match pending_fixed_bind_handoff_ready_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.get(bind_addr).cloned()
 }
 
 fn active_fixed_bind_facade_owner_cell()
@@ -1659,19 +2908,6 @@ fn active_fixed_bind_facade_owned_by(bind_addr: &str, instance_id: u64) -> bool 
     guard
         .get(bind_addr)
         .is_some_and(|registrant| registrant.instance_id == instance_id)
-}
-
-fn conflicting_process_facade_claim_for(
-    bind_addr: &str,
-    requester_instance_id: u64,
-) -> Option<ProcessFacadeClaim> {
-    let guard = match process_facade_claim_cell().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    guard.get(bind_addr).and_then(|claim| {
-        (claim.owner_instance_id != requester_instance_id).then_some(claim.clone())
-    })
 }
 
 fn clear_process_facade_claim_for_bind_addr(bind_addr: &str, owner_instance_id: u64) {
@@ -2348,8 +3584,14 @@ async fn maybe_pause_before_deferred_sink_owned_query_peer_publication_gate_reop
         guard.clone()
     };
     if let Some(hook) = hook {
+        let mut release = std::pin::pin!(hook.release.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(release.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
         hook.entered.notify_waiters();
-        hook.release.notified().await;
+        release.await;
     }
 }
 
@@ -2566,6 +3808,20 @@ impl FSMetaApp {
             || !snapshot.stream_last_applied_at_us_by_node.is_empty()
     }
 
+    async fn observe_runtime_scope_convergence(
+        source: &Arc<SourceFacade>,
+        sink: &Arc<SinkFacade>,
+    ) -> Result<RuntimeScopeConvergenceObservation> {
+        Ok(RuntimeScopeConvergenceObservation {
+            source_groups: source
+                .scheduled_source_group_ids()
+                .await?
+                .unwrap_or_default(),
+            scan_groups: source.scheduled_scan_group_ids().await?.unwrap_or_default(),
+            sink_groups: sink.scheduled_group_ids().await?.unwrap_or_default(),
+        })
+    }
+
     async fn wait_for_sink_status_republish_readiness_after_recovery(
         &self,
         source_to_sink_convergence_pretriggered: bool,
@@ -2576,45 +3832,39 @@ impl FSMetaApp {
                 .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
                 .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"))
         };
-        let mut triggered_rescan_when_ready = source_to_sink_convergence_pretriggered;
-        let mut post_replay_rescan_retry_pending = false;
-        let mut retried_after_post_recovery_sink_timeout = false;
-        let mut manual_rescan_requested_after_post_recovery_sink_timeout = false;
+        let mut wait_state =
+            PostRecoverySinkStatusReadinessWaitState::new(source_to_sink_convergence_pretriggered);
         loop {
             let scope_convergence_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             let converged_groups = loop {
-                if post_replay_rescan_retry_pending {
-                    self.source.trigger_rescan_when_ready().await?;
-                    triggered_rescan_when_ready = true;
-                    post_replay_rescan_retry_pending = false;
-                }
-                let source_groups = self
-                    .source
-                    .scheduled_source_group_ids()
-                    .await?
-                    .unwrap_or_default();
-                let scan_groups = self
-                    .source
-                    .scheduled_scan_group_ids()
-                    .await?
-                    .unwrap_or_default();
-                let sink_groups = self.sink.scheduled_group_ids().await?.unwrap_or_default();
-                if !source_groups.is_empty()
-                    && source_groups == scan_groups
-                    && source_groups == sink_groups
+                wait_state
+                    .maybe_drive_pending_scope_convergence_retrigger(&self.source)
+                    .await?;
+                let scope_observation =
+                    Self::observe_runtime_scope_convergence(&self.source, &self.sink).await?;
+                match (RuntimeScopeConvergenceWaitDecisionInput {
+                    observation: &scope_observation,
+                    expectation: RuntimeScopeConvergenceExpectation::NonemptyFullyConverged,
+                    deadline_expired: tokio::time::Instant::now() >= scope_convergence_deadline,
+                })
+                .decide()
                 {
-                    break sink_groups;
+                    RuntimeScopeConvergenceWaitDecision::Converged => {
+                        break scope_observation.sink_groups;
+                    }
+                    RuntimeScopeConvergenceWaitDecision::ReturnTimeout => {
+                        return Err(CnxError::Internal(format!(
+                            "runtime scope convergence not observed after retained replay: {}",
+                            scope_observation.timeout_context()
+                        )));
+                    }
+                    RuntimeScopeConvergenceWaitDecision::Wait => {
+                        wait_state
+                            .maybe_trigger_initial_scope_convergence(&self.source)
+                            .await?;
+                        tokio::time::sleep(RUNTIME_APP_POLL_INTERVAL).await;
+                    }
                 }
-                if !triggered_rescan_when_ready {
-                    self.source.trigger_rescan_when_ready().await?;
-                    triggered_rescan_when_ready = true;
-                }
-                if tokio::time::Instant::now() >= scope_convergence_deadline {
-                    return Err(CnxError::Internal(format!(
-                        "runtime scope convergence not observed after retained replay: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
-                    )));
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
             };
 
             let sink_readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -2623,13 +3873,10 @@ impl FSMetaApp {
                     .await
                 {
                     Ok(Ok(snapshot)) => {
-                        let ready_groups = snapshot
-                            .groups
-                            .iter()
-                            .filter(|group| group.initial_audit_completed)
-                            .map(|group| group.group_id.clone())
-                            .collect::<std::collections::BTreeSet<_>>();
-                        if ready_groups == converged_groups {
+                        if sink_status_snapshot_ready_for_expected_groups(
+                            &snapshot,
+                            &converged_groups,
+                        ) {
                             return Ok(None);
                         }
                         if tokio::time::Instant::now() >= sink_readiness_deadline {
@@ -2641,20 +3888,13 @@ impl FSMetaApp {
                     }
                     Ok(Err(err))
                         if matches!(err, CnxError::Timeout)
-                            && !retried_after_post_recovery_sink_timeout
-                            && tokio::time::Instant::now() < sink_readiness_deadline =>
+                            && wait_state
+                                .maybe_schedule_sink_timeout_retry(
+                                    &self.source,
+                                    tokio::time::Instant::now() < sink_readiness_deadline,
+                                )
+                                .await? =>
                     {
-                        // A later source-only recovery can converge route scopes from primed
-                        // cached groups before the post-recovery rescan has actually
-                        // rematerialized baseline source publication. Request one explicit
-                        // manual rescan before the final source->sink retry so sink readiness
-                        // wait does not return on a scheduled-only zero-state sink.
-                        if !manual_rescan_requested_after_post_recovery_sink_timeout {
-                            self.source.publish_manual_rescan_signal().await?;
-                            manual_rescan_requested_after_post_recovery_sink_timeout = true;
-                        }
-                        retried_after_post_recovery_sink_timeout = true;
-                        post_replay_rescan_retry_pending = true;
                         break;
                     }
                     Ok(Err(_err)) if tokio::time::Instant::now() < sink_readiness_deadline => {}
@@ -2677,15 +3917,13 @@ impl FSMetaApp {
                     }
                     Ok(Err(err)) => return Err(err),
                     Err(_)
-                        if !retried_after_post_recovery_sink_timeout
-                            && tokio::time::Instant::now() < sink_readiness_deadline =>
+                        if wait_state
+                            .maybe_schedule_sink_timeout_retry(
+                                &self.source,
+                                tokio::time::Instant::now() < sink_readiness_deadline,
+                            )
+                            .await? =>
                     {
-                        if !manual_rescan_requested_after_post_recovery_sink_timeout {
-                            self.source.publish_manual_rescan_signal().await?;
-                            manual_rescan_requested_after_post_recovery_sink_timeout = true;
-                        }
-                        retried_after_post_recovery_sink_timeout = true;
-                        post_replay_rescan_retry_pending = true;
                         break;
                     }
                     Err(_) if tokio::time::Instant::now() < sink_readiness_deadline => {}
@@ -2707,7 +3945,7 @@ impl FSMetaApp {
                         )));
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(RUNTIME_APP_POLL_INTERVAL).await;
             }
         }
     }
@@ -2727,132 +3965,77 @@ impl FSMetaApp {
                 .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"))
         };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut post_return_source_to_sink_convergence_retrigger_pending = matches!(
-            mode,
-            LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath
-        );
-        let mut post_return_source_to_sink_convergence_retrigger_count = 0usize;
-        let mut post_return_manual_rescan_republished = false;
-        let mut post_return_sink_replay_pending = false;
-        let mut first_sink_probe_pending = true;
+        let mut wait_state = LocalSinkStatusRepublishWaitState::new(mode);
         loop {
-            let source_groups = source
-                .scheduled_source_group_ids()
-                .await?
-                .unwrap_or_default();
-            let scan_groups = source.scheduled_scan_group_ids().await?.unwrap_or_default();
-            let sink_groups = sink.scheduled_group_ids().await?.unwrap_or_default();
-            let runtime_scope_converged = source_groups == *expected_groups
-                && scan_groups == *expected_groups
-                && sink_groups == *expected_groups;
-            if !runtime_scope_converged {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            if matches!(
-                mode,
-                LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath
-            ) {
-                if let Ok(snapshot) = sink.cached_status_snapshot() {
-                    let ready_groups = snapshot
-                        .groups
-                        .iter()
-                        .filter(|group| group.initial_audit_completed)
-                        .map(|group| group.group_id.clone())
-                        .collect::<std::collections::BTreeSet<_>>();
-                    if ready_groups == *expected_groups {
-                        return Ok(());
-                    }
-                }
-            }
+            let scope_observation = Self::observe_runtime_scope_convergence(&source, &sink).await?;
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(CnxError::Internal(format!(
-                    "local sink status republish not restored after retained replay once runtime scope converged: expected_groups={expected_groups:?} {}",
-                    summarize_cached_sink_status(&sink)
-                )));
-            }
-            if post_return_source_to_sink_convergence_retrigger_pending {
-                source.trigger_rescan_when_ready().await?;
-                #[cfg(test)]
-                maybe_pause_after_local_sink_status_republish_retrigger().await;
-                post_return_source_to_sink_convergence_retrigger_pending = false;
-                post_return_source_to_sink_convergence_retrigger_count += 1;
-            }
-            #[cfg(test)]
-            if first_sink_probe_pending {
-                maybe_pause_before_local_sink_status_republish_probe().await;
-                first_sink_probe_pending = false;
-            }
-            if post_return_sink_replay_pending {
-                sink.apply_orchestration_signals_with_total_timeout(
-                    post_return_sink_replay_signals,
-                    remaining,
+            let runtime_scope_wait_decision = (RuntimeScopeConvergenceWaitDecisionInput {
+                observation: &scope_observation,
+                expectation: RuntimeScopeConvergenceExpectation::ExpectedGroups(expected_groups),
+                deadline_expired: remaining.is_zero(),
+            })
+            .decide();
+            let runtime_scope_converged = matches!(
+                runtime_scope_wait_decision,
+                RuntimeScopeConvergenceWaitDecision::Converged
+            );
+            let cached_ready_fast_path_satisfied = runtime_scope_converged
+                && matches!(
+                    mode,
+                    LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath
                 )
-                .await?;
-                post_return_sink_replay_pending = false;
-            }
-            match tokio::time::timeout(
-                remaining.min(Duration::from_millis(350)),
-                sink.status_snapshot_nonblocking(),
-            )
-            .await
+                && Self::cached_sink_status_ready_for_expected_groups(&sink, expected_groups);
+            match (LocalSinkStatusRepublishIterationDecisionInput {
+                runtime_scope_converged: matches!(
+                    runtime_scope_wait_decision,
+                    RuntimeScopeConvergenceWaitDecision::Converged
+                ),
+                cached_ready_fast_path_satisfied,
+                deadline_expired: matches!(
+                    runtime_scope_wait_decision,
+                    RuntimeScopeConvergenceWaitDecision::ReturnTimeout
+                ),
+            })
+            .decide()
             {
-                Ok(Ok(snapshot)) => {
-                    let ready_groups = snapshot
-                        .groups
-                        .iter()
-                        .filter(|group| group.initial_audit_completed)
-                        .map(|group| group.group_id.clone())
-                        .collect::<std::collections::BTreeSet<_>>();
-                    if ready_groups == *expected_groups {
-                        return Ok(());
-                    }
+                LocalSinkStatusRepublishIterationDecision::WaitForRuntimeScopeConvergence => {
+                    tokio::time::sleep(RUNTIME_APP_POLL_INTERVAL).await;
+                    continue;
                 }
-                Ok(Err(_)) | Err(_) => {}
-            }
-            let remaining_after_nonblocking_probe =
-                deadline.saturating_duration_since(tokio::time::Instant::now());
-            if !remaining_after_nonblocking_probe.is_zero() {
-                match tokio::time::timeout(
-                    remaining_after_nonblocking_probe.min(Duration::from_millis(350)),
-                    sink.status_snapshot(),
-                )
-                .await
-                {
-                    Ok(Ok(snapshot))
-                        if sink_status_snapshot_ready_for_expected_groups(
-                            &snapshot,
-                            expected_groups,
-                        ) =>
-                    {
-                        return Ok(());
-                    }
-                    Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
+                LocalSinkStatusRepublishIterationDecision::ReturnReady => return Ok(()),
+                LocalSinkStatusRepublishIterationDecision::DrivePendingStepsAndProbe => {}
+                LocalSinkStatusRepublishIterationDecision::ReturnTimeout => {
+                    return Err(CnxError::Internal(format!(
+                        "local sink status republish not restored after retained replay once runtime scope converged: expected_groups={expected_groups:?} {}",
+                        summarize_cached_sink_status(&sink)
+                    )));
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(CnxError::Internal(format!(
-                    "local sink status republish not restored after retained replay once runtime scope converged: expected_groups={expected_groups:?} {}",
-                    summarize_cached_sink_status(&sink)
-                )));
-            }
-            if !post_return_manual_rescan_republished {
-                // Retained sink replay can leave the local sink status lane effectively fresh
-                // again. Force one baseline replay pass, then allow one more direct
-                // source->sink retrigger so the helper waits on a real rematerialization
-                // instead of timing out against an empty-but-scheduled local summary.
-                source.publish_manual_rescan_signal().await?;
-                post_return_manual_rescan_republished = true;
-                post_return_sink_replay_pending = !post_return_sink_replay_signals.is_empty();
-                if post_return_source_to_sink_convergence_retrigger_count < 2 {
-                    source.trigger_rescan_when_ready().await?;
-                    #[cfg(test)]
-                    maybe_pause_after_local_sink_status_republish_retrigger().await;
-                    post_return_source_to_sink_convergence_retrigger_count += 1;
+            wait_state
+                .apply_pending_steps(&source, &sink, post_return_sink_replay_signals, remaining)
+                .await?;
+            wait_state.maybe_pause_before_probe().await;
+            let post_probe_decision = wait_state.post_probe_decision(
+                Self::probe_local_sink_status_republish_readiness(&sink, expected_groups, deadline)
+                    .await,
+                post_return_sink_replay_signals,
+                tokio::time::Instant::now() >= deadline,
+            );
+            match post_probe_decision {
+                LocalSinkStatusRepublishPostProbeDecision::ReplayRetainedSinkWave => continue,
+                LocalSinkStatusRepublishPostProbeDecision::ReturnReady => return Ok(()),
+                LocalSinkStatusRepublishPostProbeDecision::PublishManualRescanFallback => {}
+                LocalSinkStatusRepublishPostProbeDecision::ReturnTimeout => {
+                    return Err(CnxError::Internal(format!(
+                        "local sink status republish not restored after retained replay once runtime scope converged: expected_groups={expected_groups:?} {}",
+                        summarize_cached_sink_status(&sink)
+                    )));
                 }
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            wait_state
+                .schedule_manual_rescan_fallback(&source, post_return_sink_replay_signals)
+                .await?;
+            tokio::time::sleep(RUNTIME_APP_POLL_INTERVAL).await;
         }
     }
 
@@ -2870,6 +4053,84 @@ impl FSMetaApp {
             LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
         )
         .await
+    }
+
+    async fn probe_local_sink_status_republish_readiness(
+        sink: &Arc<SinkFacade>,
+        expected_groups: &std::collections::BTreeSet<String>,
+        deadline: tokio::time::Instant,
+    ) -> LocalSinkStatusRepublishProbeOutcome {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if Self::nonblocking_sink_status_probe_ready_for_expected_groups(
+            sink,
+            expected_groups,
+            remaining,
+        )
+        .await
+        {
+            return LocalSinkStatusRepublishProbeOutcome::Ready;
+        }
+        let remaining_after_nonblocking_probe =
+            deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining_after_nonblocking_probe.is_zero() {
+            return LocalSinkStatusRepublishProbeOutcome::NotReady;
+        }
+        if Self::blocking_sink_status_probe_ready_for_expected_groups(
+            sink,
+            expected_groups,
+            remaining_after_nonblocking_probe,
+        )
+        .await
+        {
+            LocalSinkStatusRepublishProbeOutcome::Ready
+        } else {
+            LocalSinkStatusRepublishProbeOutcome::NotReady
+        }
+    }
+
+    async fn nonblocking_sink_status_probe_ready_for_expected_groups(
+        sink: &Arc<SinkFacade>,
+        expected_groups: &std::collections::BTreeSet<String>,
+        remaining: Duration,
+    ) -> bool {
+        match tokio::time::timeout(
+            remaining.min(Duration::from_millis(350)),
+            sink.status_snapshot_nonblocking(),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => {
+                sink_status_snapshot_ready_for_expected_groups(&snapshot, expected_groups)
+            }
+            Ok(Err(_)) | Err(_) => false,
+        }
+    }
+
+    fn cached_sink_status_ready_for_expected_groups(
+        sink: &Arc<SinkFacade>,
+        expected_groups: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        sink.cached_status_snapshot().ok().is_some_and(|snapshot| {
+            sink_status_snapshot_ready_for_expected_groups(&snapshot, expected_groups)
+        })
+    }
+
+    async fn blocking_sink_status_probe_ready_for_expected_groups(
+        sink: &Arc<SinkFacade>,
+        expected_groups: &std::collections::BTreeSet<String>,
+        remaining: Duration,
+    ) -> bool {
+        match tokio::time::timeout(
+            remaining.min(Duration::from_millis(350)),
+            sink.status_snapshot(),
+        )
+        .await
+        {
+            Ok(Ok(snapshot)) => {
+                sink_status_snapshot_ready_for_expected_groups(&snapshot, expected_groups)
+            }
+            Ok(Err(_)) | Err(_) => false,
+        }
     }
 
     async fn wait_for_local_sink_status_republish_after_recovery_requiring_probe_from_parts(
@@ -2938,6 +4199,185 @@ impl FSMetaApp {
             .await
     }
 
+    async fn determine_sink_recovery_gate_reopen_disposition(
+        &self,
+        replayed_sink_state_after_uninitialized_source_recovery: bool,
+        sink_status_publication_present: bool,
+        source_signals: &[SourceControlSignal],
+        sink_signals: &[SinkControlSignal],
+        pretriggered_source_to_sink_convergence: bool,
+        deferred_local_sink_replay_signals: &[SinkControlSignal],
+    ) -> Result<SinkRecoveryGateReopenDisposition> {
+        if !replayed_sink_state_after_uninitialized_source_recovery
+            || !sink_status_publication_present
+        {
+            return Ok(SinkRecoveryGateReopenDisposition::None);
+        }
+
+        let source_led_uninitialized_mixed_recovery =
+            !source_signals.is_empty() && sink_signals.is_empty();
+        let source_led_expected_groups = if source_led_uninitialized_mixed_recovery {
+            Self::runtime_scoped_facade_group_ids(&self.source, &self.sink)
+                .await?
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        let cached_sink_status_ready_for_expected_groups = !source_led_expected_groups.is_empty()
+            && self
+                .sink
+                .cached_status_snapshot()
+                .ok()
+                .is_some_and(|snapshot| {
+                    sink_status_snapshot_ready_for_expected_groups(
+                        &snapshot,
+                        &source_led_expected_groups,
+                    )
+                });
+        let recovered_expected_groups = self
+            .wait_for_sink_status_republish_readiness_after_recovery(
+                pretriggered_source_to_sink_convergence,
+            )
+            .await?;
+        let disposition = SinkRecoveryGateReopenDisposition::from_decision_input(
+            SinkRecoveryGateReopenDecisionInput {
+                source_led_uninitialized_mixed_recovery,
+                deferred_local_sink_replay_present: !deferred_local_sink_replay_signals.is_empty(),
+                cached_sink_status_ready_for_expected_groups,
+                source_led_expected_groups,
+                recovered_expected_groups,
+            },
+        );
+        match &disposition {
+            SinkRecoveryGateReopenDisposition::None
+                if source_led_uninitialized_mixed_recovery
+                    && cached_sink_status_ready_for_expected_groups =>
+            {
+                eprintln!(
+                    "fs_meta_runtime_app: skipping deferred sink-status republish wait after source-led uninitialized mixed recovery"
+                );
+            }
+            SinkRecoveryGateReopenDisposition::WaitForLocalSinkStatusRepublish {
+                expected_groups,
+            } => {
+                eprintln!(
+                    "fs_meta_runtime_app: retaining local sink-status republish wait after source-led uninitialized mixed recovery despite cached ready snapshot groups={expected_groups:?}"
+                );
+            }
+            SinkRecoveryGateReopenDisposition::DeferGateReopenUntilSinkStatusReady {
+                expected_groups,
+            } if source_led_uninitialized_mixed_recovery => {
+                eprintln!(
+                    "fs_meta_runtime_app: deferring sink-status republish wait after source-led uninitialized mixed recovery groups={expected_groups:?}"
+                );
+            }
+            SinkRecoveryGateReopenDisposition::None
+            | SinkRecoveryGateReopenDisposition::DeferGateReopenUntilSinkStatusReady { .. } => {}
+        }
+        Ok(disposition)
+    }
+
+    async fn apply_sink_recovery_tail_plan(
+        &self,
+        request_sensitive: bool,
+        sink_cleanup_only_while_uninitialized: bool,
+        sink_recovery_tail_plan: SinkRecoveryTailPlan,
+        deferred_local_sink_replay_signals: Vec<SinkControlSignal>,
+        facade_publication_signals: Vec<FacadeControlSignal>,
+    ) -> Result<()> {
+        let (deferred_sink_owned_query_peer_publication_signals, facade_publication_signals): (
+            Vec<_>,
+            Vec<_>,
+        ) = if sink_recovery_tail_plan
+            .gate_reopen_disposition
+            .defers_gate_reopen()
+        {
+            facade_publication_signals
+                .into_iter()
+                .partition(Self::facade_publication_signal_is_sink_owned_query_peer_activate)
+        } else {
+            (Vec::new(), facade_publication_signals)
+        };
+        let query_publication_followup_present = facade_publication_signals
+            .iter()
+            .any(Self::facade_publication_signal_is_query_activate);
+        if !sink_cleanup_only_while_uninitialized {
+            self.retry_pending_fixed_bind_facade_after_claim_release_without_query_followup(
+                query_publication_followup_present,
+            )
+            .await?;
+        }
+        for signal in facade_publication_signals {
+            self.apply_facade_signal(signal).await?;
+        }
+        self.replay_suppressed_public_query_activates_after_publication()
+            .await?;
+        if !sink_cleanup_only_while_uninitialized {
+            self.ensure_runtime_proxy_endpoints_started().await?;
+        }
+        for expected_groups in &sink_recovery_tail_plan.immediate_local_sink_status_republish_waits
+        {
+            self.wait_for_local_sink_status_republish_after_recovery(expected_groups)
+                .await?;
+        }
+        if let Some(expected_groups) = sink_recovery_tail_plan
+            .gate_reopen_disposition
+            .local_wait_expected_groups()
+        {
+            let post_return_sink_replay_signals = self
+                .current_generation_retained_sink_replay_signals_for_local_republish()
+                .await;
+            Self::wait_for_local_sink_status_republish_after_recovery_requiring_probe_from_parts(
+                self.source.clone(),
+                self.sink.clone(),
+                expected_groups,
+                &post_return_sink_replay_signals,
+            )
+            .await?;
+        }
+        if request_sensitive && !sink_cleanup_only_while_uninitialized {
+            if let Some(expected_groups) = sink_recovery_tail_plan
+                .gate_reopen_disposition
+                .deferred_expected_groups()
+                .cloned()
+            {
+                self.suppress_deferred_sink_owned_query_peer_publication_signals(
+                    &deferred_sink_owned_query_peer_publication_signals,
+                )
+                .await?;
+                let control_ready_after_republish = self.facade_publication_ready().await;
+                self.api_control_gate
+                    .set_ready(control_ready_after_republish);
+                let _ = self.current_facade_service_state().await;
+                Self::spawn_deferred_sink_owned_query_peer_publication_after_local_sink_status_ready(
+                    self.instance_id,
+                    self.source.clone(),
+                    self.sink.clone(),
+                    expected_groups,
+                    deferred_local_sink_replay_signals,
+                    deferred_sink_owned_query_peer_publication_signals,
+                    self.facade_gate.clone(),
+                    self.mirrored_query_peer_routes.clone(),
+                    self.pending_facade.clone(),
+                    self.facade_pending_status.clone(),
+                    self.api_task.clone(),
+                    self.api_control_gate.clone(),
+                    self.facade_service_state.clone(),
+                    self.control_initialized.clone(),
+                    self.source_state_replay_required.clone(),
+                    self.sink_state_replay_required.clone(),
+                    self.pending_fixed_bind_has_suppressed_dependent_routes.clone(),
+                );
+            } else {
+                self.api_control_gate
+                    .set_ready(self.facade_publication_ready().await);
+                let _ = self.current_facade_service_state().await;
+            }
+        }
+        Ok(())
+    }
+
     async fn apply_deferred_sink_owned_query_peer_publication_signal_from_parts(
         facade_gate: RuntimeUnitGate,
         mirrored_query_peer_routes: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
@@ -2963,8 +4403,8 @@ impl FSMetaApp {
             return Ok(());
         }
         if is_dual_lane_internal_query_route(&route_key) {
-            let query_route_active = facade_gate
-                .route_active(execution_units::QUERY_RUNTIME_UNIT_ID, &route_key)?;
+            let query_route_active =
+                facade_gate.route_active(execution_units::QUERY_RUNTIME_UNIT_ID, &route_key)?;
             let query_route_generation = facade_gate
                 .route_generation(execution_units::QUERY_RUNTIME_UNIT_ID, &route_key)?
                 .unwrap_or(0);
@@ -3012,6 +4452,7 @@ impl FSMetaApp {
     }
 
     fn spawn_deferred_sink_owned_query_peer_publication_after_local_sink_status_ready(
+        instance_id: u64,
         source: Arc<SourceFacade>,
         sink: Arc<SinkFacade>,
         expected_groups: std::collections::BTreeSet<String>,
@@ -3027,6 +4468,7 @@ impl FSMetaApp {
         control_initialized: Arc<AtomicBool>,
         source_state_replay_required: Arc<AtomicBool>,
         sink_state_replay_required: Arc<AtomicBool>,
+        pending_fixed_bind_has_suppressed_dependent_routes: Arc<AtomicBool>,
     ) {
         tokio::spawn(async move {
             if let Err(err) = Self::wait_for_local_sink_status_republish_after_recovery_from_parts(
@@ -3061,30 +4503,23 @@ impl FSMetaApp {
             }
             #[cfg(test)]
             maybe_pause_before_deferred_sink_owned_query_peer_publication_gate_reopen().await;
-            let pending_facade_present = pending_facade.lock().await.is_some()
-                || facade_pending_status
-                    .read()
-                    .ok()
-                    .is_some_and(|status| status.is_some());
-            let publication_ready = api_task.lock().await.as_ref().is_some_and(|active| {
-                active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-            });
-            let ready_tail_decision = Self::facade_ready_tail_decision_from_runtime_facts(
-                FacadeReadyTailDecisionInput {
-                    runtime: RuntimeGateFacts::from_atomic_flags(
-                        control_initialized.as_ref(),
-                        source_state_replay_required.as_ref(),
-                        sink_state_replay_required.as_ref(),
-                    ),
-                    allow_facade_only_handoff: false,
-                    publication_ready,
-                    pending_facade_present,
-                },
-            );
-            api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
-            *facade_service_state
-                .write()
-                .expect("write published facade service state") = ready_tail_decision.published_state;
+            let _ = Self::apply_observed_facade_ready_tail_from_parts(
+                instance_id,
+                api_task.clone(),
+                pending_facade.clone(),
+                Some(&facade_pending_status),
+                &facade_service_state,
+                &api_control_gate,
+                RuntimeGateFacts::from_atomic_flags(
+                    control_initialized.as_ref(),
+                    source_state_replay_required.as_ref(),
+                    sink_state_replay_required.as_ref(),
+                ),
+                pending_fixed_bind_has_suppressed_dependent_routes.load(Ordering::Acquire),
+                FacadeOnlyHandoffObservationPolicy::ForceBlocked,
+                None,
+            )
+            .await;
             #[cfg(test)]
             notify_deferred_sink_owned_query_peer_publication_completion();
         });
@@ -3310,9 +4745,7 @@ impl FSMetaApp {
     fn runtime_gate_facts(&self) -> RuntimeGateFacts {
         RuntimeGateFacts {
             control_initialized: self.control_initialized(),
-            source_state_replay_required: self
-                .source_state_replay_required
-                .load(Ordering::Acquire),
+            source_state_replay_required: self.source_state_replay_required.load(Ordering::Acquire),
             sink_state_replay_required: self.sink_state_replay_required.load(Ordering::Acquire),
         }
     }
@@ -3353,6 +4786,31 @@ impl FSMetaApp {
             control_gate_ready,
             published_state,
         }
+    }
+
+    fn apply_facade_ready_tail_decision(
+        api_control_gate: &ApiControlGate,
+        facade_service_state: &SharedFacadeServiceStateCell,
+        ready_tail_decision: FacadeReadyTailDecision,
+    ) {
+        api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
+        *facade_service_state
+            .write()
+            .expect("write published facade service state") = ready_tail_decision.published_state;
+    }
+
+    fn clear_pending_facade_and_publish_ready_tail_from_runtime_facts(
+        facade_pending_status: &SharedFacadePendingStatusCell,
+        facade_service_state: &SharedFacadeServiceStateCell,
+        api_control_gate: &ApiControlGate,
+        input: FacadeReadyTailDecisionInput,
+    ) {
+        Self::clear_pending_facade_status(facade_pending_status);
+        Self::apply_facade_ready_tail_decision(
+            api_control_gate,
+            facade_service_state,
+            Self::facade_ready_tail_decision_from_runtime_facts(input),
+        );
     }
 
     fn facade_publication_readiness_decision_from_runtime_facts(
@@ -3422,6 +4880,82 @@ impl FSMetaApp {
         }
     }
 
+    fn facade_deactivate_continuity_disposition(
+        input: FacadeDeactivateContinuityDecisionInput,
+    ) -> FacadeDeactivateContinuityDisposition {
+        if input.retain_active_facade
+            && !input.pending_fixed_bind_conflict
+            && !input.release_for_fixed_bind_handoff
+        {
+            return FacadeDeactivateContinuityDisposition::RetainActiveContinuity;
+        }
+        if input.pending_fixed_bind_conflict {
+            return if input.retain_active_facade {
+                FacadeDeactivateContinuityDisposition::RetainActiveWhilePendingFixedBindClaimConflict
+            } else {
+                FacadeDeactivateContinuityDisposition::RetainPendingWhilePendingFixedBindClaimConflict
+            };
+        }
+        if input.release_for_fixed_bind_handoff {
+            return if input.retain_active_facade {
+                FacadeDeactivateContinuityDisposition::ReleaseActiveForFixedBindHandoff
+            } else {
+                FacadeDeactivateContinuityDisposition::RetainPendingForFixedBindHandoff
+            };
+        }
+        if input.retain_pending_spawn {
+            return FacadeDeactivateContinuityDisposition::RetainPendingWhileSpawnInFlight;
+        }
+        FacadeDeactivateContinuityDisposition::Shutdown
+    }
+
+    fn pending_fixed_bind_handoff_attempt_disposition(
+        input: PendingFixedBindHandoffAttemptDecisionInput,
+    ) -> PendingFixedBindHandoffAttemptDisposition {
+        if !input.claim_conflict || !input.pending_runtime_exposure_confirmed {
+            return PendingFixedBindHandoffAttemptDisposition::NoAttempt;
+        }
+        if input.active_owner_present {
+            return PendingFixedBindHandoffAttemptDisposition::ReleaseActiveOwner;
+        }
+        if let Some(owner_instance_id) = input.conflicting_process_claim_owner_instance_id {
+            return PendingFixedBindHandoffAttemptDisposition::ReleaseConflictingProcessClaim {
+                owner_instance_id,
+            };
+        }
+        PendingFixedBindHandoffAttemptDisposition::NoAttempt
+    }
+
+    fn pending_fixed_bind_handoff_completion_disposition(
+        input: PendingFixedBindHandoffCompletionDecisionInput,
+    ) -> PendingFixedBindHandoffCompletionDisposition {
+        if !input.pending_facade_present && input.active_control_stream_present {
+            return PendingFixedBindHandoffCompletionDisposition::ApplyReadyTail;
+        }
+        if input.deadline_expired {
+            return PendingFixedBindHandoffCompletionDisposition::Abort;
+        }
+        PendingFixedBindHandoffCompletionDisposition::ContinuePolling
+    }
+
+    fn pending_facade_spawn_continuity_disposition(
+        active: Option<&FacadeActivation>,
+        pending: &PendingFacadeActivation,
+    ) -> PendingFacadeSpawnContinuityDisposition {
+        let Some(active) = active else {
+            return PendingFacadeSpawnContinuityDisposition::Continue;
+        };
+        if pending.matches_active(active) {
+            return PendingFacadeSpawnContinuityDisposition::ReuseCurrentGeneration;
+        }
+        if pending.matches_active_route_resources(active) {
+            return PendingFacadeSpawnContinuityDisposition::PromoteExistingSameResource {
+                active_generation: active.generation,
+            };
+        }
+        PendingFacadeSpawnContinuityDisposition::Continue
+    }
+
     fn internal_status_available_from_published_facade_state(
         published_facade_state: FacadeServiceState,
         local_api_task_present: bool,
@@ -3439,86 +4973,18 @@ impl FSMetaApp {
     }
 
     fn classify_source_control_wave_disposition(
-        input: SourceControlWaveDecisionInput<'_>,
+        observation: ControlFrameWaveObservation,
+        source_signals: &[SourceControlSignal],
     ) -> SourceControlWaveDisposition {
-        if !input.source_signals.is_empty() {
-            if input.cleanup_disposition.is_source_only() {
-                SourceControlWaveDisposition::CleanupOnlyWhileUninitialized
-            } else if input.control_initialized_at_entry
-                && input.control_initialized_now
-                && !input.source_state_replay_required
-                && ((!input.facade_claim_signals_present
-                    && !input.facade_publication_signals_present)
-                    || input.sink_signals_present)
-                && input
-                    .source_signals
-                    .iter()
-                    .all(|signal| matches!(signal, SourceControlSignal::Tick { .. }))
-            {
-                SourceControlWaveDisposition::SteadyTickNoop
-            } else {
-                SourceControlWaveDisposition::ApplySignals
-            }
-        } else if input.source_state_replay_required
-            && !input.cleanup_disposition.is_source_only()
-            && !input.cleanup_disposition.is_sink_only()
-        {
-            SourceControlWaveDisposition::ReplayRetained
-        } else {
-            SourceControlWaveDisposition::Idle
-        }
+        observation.classify_source_control_wave_disposition(source_signals)
     }
 
     fn classify_sink_control_wave_disposition(
-        input: SinkControlWaveDecisionInput<'_>,
+        observation: ControlFrameWaveObservation,
+        source_wave_disposition: SourceControlWaveDisposition,
+        sink_signals: &[SinkControlSignal],
     ) -> SinkControlWaveDisposition {
-        if !input.sink_signals.is_empty() {
-            let steady_tick_noop = input.control_initialized_at_entry
-                && input.control_initialized_now
-                && !input.sink_state_replay_required
-                && input.sink_tick_fast_path_eligible
-                && input
-                    .sink_signals
-                    .iter()
-                    .all(|signal| matches!(signal, SinkControlSignal::Tick { .. }));
-            let apply_before_initial_source_wave = !input.control_initialized_at_entry
-                && !input.retained_sink_state_present_at_entry
-                && input.source_signals_present
-                && !input.cleanup_disposition.is_source_only()
-                && !input.cleanup_disposition.is_sink_query_only()
-                && matches!(
-                    input.source_wave_disposition,
-                    SourceControlWaveDisposition::ApplySignals
-                )
-                && !steady_tick_noop;
-            if apply_before_initial_source_wave {
-                SinkControlWaveDisposition::ApplyBeforeInitialSourceWave
-            } else if input.cleanup_disposition.is_sink_query_only() {
-                SinkControlWaveDisposition::CleanupOnlyQueryWhileUninitialized
-            } else if steady_tick_noop {
-                SinkControlWaveDisposition::SteadyTickNoop
-            } else {
-                SinkControlWaveDisposition::ApplySignals {
-                    wait_for_status_republish_after_apply: input.control_initialized_at_entry
-                        && input.retained_sink_state_present_at_entry
-                        && !input.sink_tick_fast_path_eligible
-                        && !input.source_signals_present
-                        && !input.facade_claim_signals_present
-                        && !input.facade_publication_signals_present
-                        && input
-                            .sink_signals
-                            .iter()
-                            .all(|signal| matches!(signal, SinkControlSignal::Tick { .. })),
-                }
-            }
-        } else if input.sink_state_replay_required
-            && !input.cleanup_disposition.is_source_only()
-            && !input.cleanup_disposition.is_sink_query_only()
-        {
-            SinkControlWaveDisposition::ReplayRetained
-        } else {
-            SinkControlWaveDisposition::Idle
-        }
+        observation.classify_sink_control_wave_disposition(source_wave_disposition, sink_signals)
     }
 
     fn classify_uninitialized_cleanup_disposition(
@@ -3547,7 +5013,10 @@ impl FSMetaApp {
         } else if input.source_signals.is_empty()
             && input.facade_signals.is_empty()
             && !input.sink_signals.is_empty()
-            && input.sink_signals.iter().all(Self::sink_signal_is_cleanup_only)
+            && input
+                .sink_signals
+                .iter()
+                .all(Self::sink_signal_is_cleanup_only)
         {
             UninitializedCleanupDisposition::SinkOnly {
                 query_only: input
@@ -3602,6 +5071,125 @@ impl FSMetaApp {
             .write()
             .expect("write published facade service state") = state;
         state
+    }
+
+    async fn observe_facade_gate_from_parts(
+        instance_id: u64,
+        api_task: Arc<Mutex<Option<FacadeActivation>>>,
+        pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
+        facade_pending_status: Option<&SharedFacadePendingStatusCell>,
+        runtime: RuntimeGateFacts,
+        pending_fixed_bind_has_suppressed_dependent_routes: bool,
+        handoff_policy: FacadeOnlyHandoffObservationPolicy,
+    ) -> FacadeGateObservation {
+        let current_pending = pending_facade.lock().await.clone();
+        let control_route_key = format!("{}.stream", ROUTE_KEY_FACADE_CONTROL);
+        let pending_facade_is_control_route = current_pending
+            .as_ref()
+            .is_some_and(|pending| pending.route_key == control_route_key);
+        let pending_facade_present = current_pending.is_some()
+            || facade_pending_status
+                .and_then(|status| status.read().ok())
+                .is_some_and(|status| status.is_some());
+        let (active_control_stream_present, active_pending_control_stream_present) = {
+            let active_task = api_task.lock().await;
+            let active_ref = active_task.as_ref();
+            let active_control_stream_present =
+                active_ref.is_some_and(|active| active.route_key == control_route_key);
+            let active_pending_control_stream_present = match (active_ref, current_pending.as_ref())
+            {
+                (Some(active), Some(pending)) => pending.matches_active(active),
+                _ => false,
+            };
+            (
+                active_control_stream_present,
+                active_pending_control_stream_present,
+            )
+        };
+        let allow_facade_only_handoff =
+            match handoff_policy {
+                FacadeOnlyHandoffObservationPolicy::ForceBlocked => false,
+                FacadeOnlyHandoffObservationPolicy::ForceAllowed => true,
+                FacadeOnlyHandoffObservationPolicy::DeriveFromPendingBind => {
+                    current_pending.as_ref().is_some_and(|pending| {
+                        let bind_addr = pending.resolved.bind_addr.as_str();
+                        Self::facade_only_handoff_allowance_decision(
+                            FacadeOnlyHandoffAllowanceDecisionInput {
+                                pending_facade_present: true,
+                                pending_facade_is_control_route,
+                                pending_fixed_bind_has_suppressed_dependent_routes,
+                                pending_bind_is_ephemeral: facade_bind_addr_is_ephemeral(bind_addr),
+                                pending_bind_owned_by_instance: !facade_bind_addr_is_ephemeral(
+                                    bind_addr,
+                                )
+                                    && active_fixed_bind_facade_owned_by(bind_addr, instance_id),
+                            },
+                        )
+                        .allows_handoff()
+                    })
+                }
+            };
+        FacadeGateObservation {
+            runtime,
+            current_pending,
+            pending_facade_present,
+            pending_facade_is_control_route,
+            pending_fixed_bind_has_suppressed_dependent_routes,
+            active_control_stream_present,
+            active_pending_control_stream_present,
+            allow_facade_only_handoff,
+        }
+    }
+
+    async fn apply_observed_facade_ready_tail_from_parts(
+        instance_id: u64,
+        api_task: Arc<Mutex<Option<FacadeActivation>>>,
+        pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
+        facade_pending_status: Option<&SharedFacadePendingStatusCell>,
+        facade_service_state: &SharedFacadeServiceStateCell,
+        api_control_gate: &ApiControlGate,
+        runtime: RuntimeGateFacts,
+        pending_fixed_bind_has_suppressed_dependent_routes: bool,
+        handoff_policy: FacadeOnlyHandoffObservationPolicy,
+        active_fixed_bind_owner: Option<(&str, ActiveFixedBindFacadeRegistrant)>,
+    ) -> bool {
+        let observation = Self::observe_facade_gate_from_parts(
+            instance_id,
+            api_task,
+            pending_facade,
+            facade_pending_status,
+            runtime,
+            pending_fixed_bind_has_suppressed_dependent_routes,
+            handoff_policy,
+        )
+        .await;
+        let publication_ready = observation.publication_ready();
+        if publication_ready && let Some((bind_addr, registrant)) = active_fixed_bind_owner {
+            mark_active_fixed_bind_facade_owner(bind_addr, registrant);
+        }
+        Self::apply_facade_ready_tail_decision(
+            api_control_gate,
+            facade_service_state,
+            observation.ready_tail_decision(publication_ready),
+        );
+        publication_ready
+    }
+
+    async fn observe_facade_gate(
+        &self,
+        handoff_policy: FacadeOnlyHandoffObservationPolicy,
+    ) -> FacadeGateObservation {
+        Self::observe_facade_gate_from_parts(
+            self.instance_id,
+            self.api_task.clone(),
+            self.pending_facade.clone(),
+            Some(&self.facade_pending_status),
+            self.runtime_gate_facts(),
+            self.pending_fixed_bind_has_suppressed_dependent_routes
+                .load(Ordering::Acquire),
+            handoff_policy,
+        )
+        .await
     }
 
     async fn current_facade_service_state(&self) -> FacadeServiceState {
@@ -4251,7 +5839,6 @@ impl FSMetaApp {
                                             }
                                         }
                                         if matches!(terminal_err, CnxError::Timeout)
-                                            && !sink_control_inflight
                                             && control_initialized.load(Ordering::Acquire)
                                         {
                                             let route_still_active =
@@ -5001,122 +6588,125 @@ impl FSMetaApp {
         Ok(status.state == ObservationState::TrustedMaterialized)
     }
 
-    async fn try_spawn_pending_facade(&self) -> Result<bool> {
-        let spawn_result = Self::try_spawn_pending_facade_from_parts(
-            self.instance_id,
-            self.api_task.clone(),
-            self.pending_facade.clone(),
-            self.facade_spawn_in_progress.clone(),
+    async fn apply_pending_fixed_bind_spawn_success_followup(
+        &self,
+        pending: Option<PendingFacadeActivation>,
+        reset_suppressed_dependent_routes: bool,
+    ) {
+        if let Some(pending) = pending {
+            let state = self
+                .observe_pending_fixed_bind_publication_state_for_pending(&pending)
+                .await;
+            let _ = self.apply_pending_fixed_bind_handoff_followup(
+                state.projection().handoff_followup_for_pending(&pending),
+            );
+        } else {
+            let _ = self.apply_pending_fixed_bind_handoff_followup(None);
+        }
+        if reset_suppressed_dependent_routes {
             self.pending_fixed_bind_has_suppressed_dependent_routes
-                .clone(),
-            self.facade_pending_status.clone(),
-            self.facade_service_state.clone(),
-            self.api_request_tracker.clone(),
-            self.api_control_gate.clone(),
-            self.control_initialized.clone(),
-            self.source_state_replay_required.clone(),
-            self.sink_state_replay_required.clone(),
-            self.node_id.clone(),
-            self.runtime_boundary.clone(),
-            self.source.clone(),
-            self.sink.clone(),
-            self.query_sink.clone(),
-            self.runtime_boundary.clone(),
-        )
-        .await;
-        let pending = self.pending_facade.lock().await.clone();
+                .store(false, Ordering::Release);
+        }
+        self.refresh_active_fixed_bind_facade_owner().await;
+    }
+
+    fn apply_pending_fixed_bind_handoff_followup(
+        &self,
+        followup: Option<PendingFixedBindHandoffFollowup>,
+    ) -> bool {
+        if let Some(followup) = &followup {
+            mark_pending_fixed_bind_handoff_ready_with_registrant(
+                &followup.bind_addr,
+                self.pending_fixed_bind_handoff_registrant(),
+            );
+        }
+        let claim_release_followup = followup
+            .as_ref()
+            .is_some_and(|followup| followup.claim_release_followup_required);
+        self.pending_fixed_bind_claim_release_followup
+            .store(claim_release_followup, Ordering::Release);
+        claim_release_followup
+    }
+
+    fn apply_pending_fixed_bind_bind_addr_in_use_followup(&self, bind_addr: &str) {
+        let _ =
+            self.apply_pending_fixed_bind_handoff_followup(Some(PendingFixedBindHandoffFollowup {
+                bind_addr: bind_addr.to_string(),
+                claim_release_followup_required: true,
+            }));
+    }
+
+    fn pending_facade_spawn_followup_disposition(
+        spawn_result: Result<bool>,
+        pending: Option<PendingFacadeActivation>,
+    ) -> PendingFacadeSpawnFollowupDisposition {
         match (spawn_result, pending) {
-            (Ok(spawned), Some(pending)) => {
-                let wait_for_claim_release = self
-                    .pending_fixed_bind_facade_claim_conflict(pending.generation)
-                    .await;
-                if wait_for_claim_release
-                    && pending.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-                    && !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr)
-                {
-                    mark_pending_fixed_bind_handoff_ready(
-                        &pending.resolved.bind_addr,
-                        self.pending_fixed_bind_handoff_registrant(),
-                    );
-                }
-                self.pending_fixed_bind_claim_release_followup
-                    .store(wait_for_claim_release, Ordering::Release);
-                if spawned {
-                    self.pending_fixed_bind_has_suppressed_dependent_routes
-                        .store(false, Ordering::Release);
-                }
-                self.refresh_active_fixed_bind_facade_owner().await;
-                Ok(spawned)
-            }
-            (Ok(spawned), None) => {
-                self.pending_fixed_bind_claim_release_followup
-                    .store(false, Ordering::Release);
-                self.pending_fixed_bind_has_suppressed_dependent_routes
-                    .store(false, Ordering::Release);
-                self.refresh_active_fixed_bind_facade_owner().await;
-                Ok(spawned)
-            }
+            (Ok(spawned), pending) => PendingFacadeSpawnFollowupDisposition::Spawned {
+                spawned,
+                reset_suppressed_dependent_routes: spawned || pending.is_none(),
+                pending,
+            },
             (Err(err), Some(pending))
                 if Self::facade_spawn_error_is_bind_addr_in_use(&err)
                     && pending.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
                     && !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) =>
             {
+                PendingFacadeSpawnFollowupDisposition::RetryAfterBindAddrInUse { pending, err }
+            }
+            (Err(err), _) => PendingFacadeSpawnFollowupDisposition::PropagateError(err),
+        }
+    }
+
+    async fn apply_pending_facade_spawn_followup(
+        &self,
+        disposition: PendingFacadeSpawnFollowupDisposition,
+    ) -> Result<bool> {
+        match disposition {
+            PendingFacadeSpawnFollowupDisposition::Spawned {
+                spawned,
+                pending,
+                reset_suppressed_dependent_routes,
+            } => {
+                self.apply_pending_fixed_bind_spawn_success_followup(
+                    pending,
+                    reset_suppressed_dependent_routes,
+                )
+                .await;
+                Ok(spawned)
+            }
+            PendingFacadeSpawnFollowupDisposition::RetryAfterBindAddrInUse { pending, err } => {
                 Self::record_pending_facade_retry_error(
                     &self.facade_pending_status,
                     &pending,
                     &err,
                 );
-                mark_pending_fixed_bind_handoff_ready(
+                self.apply_pending_fixed_bind_bind_addr_in_use_followup(
                     &pending.resolved.bind_addr,
-                    self.pending_fixed_bind_handoff_registrant(),
                 );
-                self.pending_fixed_bind_claim_release_followup
-                    .store(true, Ordering::Release);
                 Ok(false)
             }
-            (Err(err), _) => Err(err),
+            PendingFacadeSpawnFollowupDisposition::PropagateError(err) => Err(err),
         }
     }
 
-    async fn try_spawn_pending_facade_from_parts(
-        instance_id: u64,
-        api_task: Arc<Mutex<Option<FacadeActivation>>>,
-        pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
-        facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
-        pending_fixed_bind_has_suppressed_dependent_routes: Arc<AtomicBool>,
-        facade_pending_status: SharedFacadePendingStatusCell,
-        facade_service_state: SharedFacadeServiceStateCell,
-        api_request_tracker: Arc<ApiRequestTracker>,
-        api_control_gate: Arc<ApiControlGate>,
-        control_initialized: Arc<AtomicBool>,
-        source_state_replay_required: Arc<AtomicBool>,
-        sink_state_replay_required: Arc<AtomicBool>,
-        node_id: NodeId,
-        runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
-        source: Arc<SourceFacade>,
-        sink: Arc<SinkFacade>,
-        query_sink: Arc<SinkFacade>,
-        query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
+    async fn try_spawn_pending_facade(&self) -> Result<bool> {
+        let spawn_result = Self::try_spawn_pending_facade_from_registrant(
+            self.pending_fixed_bind_handoff_registrant(),
+        )
+        .await;
+        let pending = self.pending_facade.lock().await.clone();
+        self.apply_pending_facade_spawn_followup(Self::pending_facade_spawn_followup_disposition(
+            spawn_result,
+            pending,
+        ))
+        .await
+    }
+
+    async fn try_spawn_pending_facade_from_registrant(
+        registrant: PendingFixedBindHandoffRegistrant,
     ) -> Result<bool> {
-        Self::try_spawn_pending_facade_from_parts_with_spawn(
-            instance_id,
-            api_task,
-            pending_facade,
-            facade_spawn_in_progress,
-            pending_fixed_bind_has_suppressed_dependent_routes,
-            facade_pending_status,
-            facade_service_state,
-            api_request_tracker,
-            api_control_gate,
-            control_initialized,
-            source_state_replay_required,
-            sink_state_replay_required,
-            node_id,
-            runtime_boundary,
-            source,
-            sink,
-            query_sink,
-            query_runtime_boundary,
+        Self::try_spawn_pending_facade_from_registrant_with_spawn(
+            registrant,
             |resolved,
              node_id,
              runtime_boundary,
@@ -5147,6 +6737,7 @@ impl FSMetaApp {
         .await
     }
 
+    #[cfg(test)]
     async fn try_spawn_pending_facade_from_parts_with_spawn<Spawn, SpawnFut>(
         instance_id: u64,
         api_task: Arc<Mutex<Option<FacadeActivation>>>,
@@ -5184,6 +6775,72 @@ impl FSMetaApp {
         ) -> SpawnFut,
         SpawnFut: std::future::Future<Output = Result<api::ApiServerHandle>>,
     {
+        Self::try_spawn_pending_facade_from_registrant_with_spawn(
+            PendingFixedBindHandoffRegistrant::from_parts(
+                instance_id,
+                api_task,
+                pending_facade,
+                pending_fixed_bind_has_suppressed_dependent_routes,
+                facade_spawn_in_progress,
+                facade_pending_status,
+                facade_service_state,
+                api_request_tracker,
+                api_control_gate,
+                control_initialized,
+                source_state_replay_required,
+                sink_state_replay_required,
+                node_id,
+                runtime_boundary,
+                source,
+                sink,
+                query_sink,
+                query_runtime_boundary,
+            ),
+            spawn_facade,
+        )
+        .await
+    }
+
+    async fn try_spawn_pending_facade_from_registrant_with_spawn<Spawn, SpawnFut>(
+        registrant: PendingFixedBindHandoffRegistrant,
+        spawn_facade: Spawn,
+    ) -> Result<bool>
+    where
+        Spawn: FnOnce(
+            api::config::ResolvedApiConfig,
+            NodeId,
+            Option<Arc<dyn ChannelIoSubset>>,
+            Arc<SourceFacade>,
+            Arc<SinkFacade>,
+            Arc<SinkFacade>,
+            Option<Arc<dyn ChannelIoSubset>>,
+            SharedFacadePendingStatusCell,
+            SharedFacadeServiceStateCell,
+            Arc<ApiRequestTracker>,
+            Arc<ApiControlGate>,
+        ) -> SpawnFut,
+        SpawnFut: std::future::Future<Output = Result<api::ApiServerHandle>>,
+    {
+        let PendingFixedBindHandoffRegistrant {
+            instance_id,
+            api_task,
+            pending_facade,
+            pending_fixed_bind_has_suppressed_dependent_routes: _,
+            facade_spawn_in_progress,
+            facade_pending_status,
+            facade_service_state,
+            api_request_tracker,
+            api_control_gate,
+            control_initialized: _,
+            source_state_replay_required: _,
+            sink_state_replay_required: _,
+            node_id,
+            runtime_boundary,
+            source,
+            sink,
+            query_sink,
+            query_runtime_boundary,
+        } = registrant.clone();
         let Some(pending) = pending_facade.lock().await.clone() else {
             return Ok(false);
         };
@@ -5204,28 +6861,10 @@ impl FSMetaApp {
                     pending.resource_ids,
                     pending.resolved.bind_addr
                 );
-                let registrant = PendingFixedBindHandoffRegistrant {
-                    instance_id,
-                    api_task: api_task.clone(),
-                    pending_facade: pending_facade.clone(),
-                    pending_fixed_bind_has_suppressed_dependent_routes:
-                        pending_fixed_bind_has_suppressed_dependent_routes.clone(),
-                    facade_spawn_in_progress: facade_spawn_in_progress.clone(),
-                    facade_pending_status: facade_pending_status.clone(),
-                    facade_service_state: facade_service_state.clone(),
-                    api_request_tracker: api_request_tracker.clone(),
-                    api_control_gate: api_control_gate.clone(),
-                    control_initialized: control_initialized.clone(),
-                    source_state_replay_required: source_state_replay_required.clone(),
-                    sink_state_replay_required: sink_state_replay_required.clone(),
-                    node_id: node_id.clone(),
-                    runtime_boundary: runtime_boundary.clone(),
-                    source: source.clone(),
-                    sink: sink.clone(),
-                    query_sink: query_sink.clone(),
-                    query_runtime_boundary: query_runtime_boundary.clone(),
-                };
-                mark_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr, registrant);
+                mark_pending_fixed_bind_handoff_ready_with_registrant(
+                    &pending.resolved.bind_addr,
+                    registrant.clone(),
+                );
                 return Ok(false);
             }
             guard.insert(claim.bind_addr.clone(), claim);
@@ -5252,55 +6891,22 @@ impl FSMetaApp {
                 clear_active_fixed_bind_facade_owner(&pending.resolved.bind_addr, instance_id);
             }
         }
-        let mut same_resource_replacement = None::<(String, Vec<String>, u64)>;
-        let replacing_existing = {
+        let (continuity_disposition, replacing_existing) = {
             let api_task_guard = api_task.lock().await;
-            if let Some(current) = api_task_guard.as_ref()
-                && current.route_key == pending.route_key
-                && current.resource_ids == pending.resource_ids
-                && current.generation == pending.generation
-            {
-                drop(api_task_guard);
-                let mut pending_guard = pending_facade.lock().await;
-                if pending_guard.as_ref().is_some_and(|candidate| {
-                    candidate.route_key == pending.route_key
-                        && candidate.resource_ids == pending.resource_ids
-                        && candidate.generation == pending.generation
-                }) {
-                    pending_guard.take();
-                }
-                Self::clear_pending_facade_status(&facade_pending_status);
-                let ready_tail_decision = Self::facade_ready_tail_decision_from_runtime_facts(
-                    FacadeReadyTailDecisionInput {
-                        runtime: RuntimeGateFacts::from_atomic_flags(
-                            control_initialized.as_ref(),
-                            source_state_replay_required.as_ref(),
-                            sink_state_replay_required.as_ref(),
-                        ),
-                        allow_facade_only_handoff: false,
-                        publication_ready: true,
-                        pending_facade_present: false,
-                    },
-                );
-                api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
-                *facade_service_state
-                    .write()
-                    .expect("write published facade service state") =
-                    ready_tail_decision.published_state;
-                return Ok(true);
-            }
-            if let Some(current) = api_task_guard.as_ref()
-                && current.route_key == pending.route_key
-                && current.resource_ids == pending.resource_ids
-            {
-                same_resource_replacement = Some((
-                    current.route_key.clone(),
-                    current.resource_ids.clone(),
-                    current.generation,
-                ));
-            }
-            api_task_guard.is_some()
+            (
+                Self::pending_facade_spawn_continuity_disposition(
+                    api_task_guard.as_ref(),
+                    &pending,
+                ),
+                api_task_guard.is_some(),
+            )
         };
+        if let Some(result) = registrant
+            .apply_pending_facade_spawn_continuity_disposition(continuity_disposition, &pending)
+            .await
+        {
+            return Ok(result);
+        }
         if let Some(wait_reason) = Self::facade_replacement_wait_reason(
             source.as_ref(),
             sink.as_ref(),
@@ -5311,46 +6917,6 @@ impl FSMetaApp {
         {
             Self::set_pending_facade_status_waiting(&facade_pending_status, &pending, wait_reason);
             return Ok(false);
-        }
-        if let Some((route_key, resource_ids, generation)) = same_resource_replacement.take() {
-            let mut api_task_guard = api_task.lock().await;
-            if api_task_guard.as_ref().is_some_and(|active| {
-                active.route_key == route_key
-                    && active.resource_ids == resource_ids
-                    && active.generation == generation
-            }) {
-                if let Some(active) = api_task_guard.as_mut() {
-                    active.generation = pending.generation;
-                }
-                drop(api_task_guard);
-                let mut pending_guard = pending_facade.lock().await;
-                if pending_guard.as_ref().is_some_and(|candidate| {
-                    candidate.route_key == pending.route_key
-                        && candidate.resource_ids == pending.resource_ids
-                        && candidate.generation == pending.generation
-                }) {
-                    pending_guard.take();
-                }
-                Self::clear_pending_facade_status(&facade_pending_status);
-                let ready_tail_decision = Self::facade_ready_tail_decision_from_runtime_facts(
-                    FacadeReadyTailDecisionInput {
-                        runtime: RuntimeGateFacts::from_atomic_flags(
-                            control_initialized.as_ref(),
-                            source_state_replay_required.as_ref(),
-                            sink_state_replay_required.as_ref(),
-                        ),
-                        allow_facade_only_handoff: false,
-                        publication_ready: true,
-                        pending_facade_present: false,
-                    },
-                );
-                api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
-                *facade_service_state
-                    .write()
-                    .expect("write published facade service state") =
-                    ready_tail_decision.published_state;
-                return Ok(true);
-            }
         }
         {
             let mut inflight_guard = facade_spawn_in_progress.lock().await;
@@ -5422,8 +6988,8 @@ impl FSMetaApp {
         let adopted_generation = {
             let pending_guard = pending_facade.lock().await;
             pending_guard.as_ref().and_then(|candidate| {
-                (candidate.route_key == pending.route_key
-                    && candidate.resource_ids == pending.resource_ids)
+                candidate
+                    .matches_route_resources(&pending.route_key, &pending.resource_ids)
                     .then_some(candidate.generation)
             })
         };
@@ -5458,8 +7024,7 @@ impl FSMetaApp {
         );
         let mut pending_guard = pending_facade.lock().await;
         if pending_guard.as_ref().is_some_and(|candidate| {
-            candidate.route_key == pending.route_key
-                && candidate.resource_ids == pending.resource_ids
+            candidate.matches_route_resources(&pending.route_key, &pending.resource_ids)
         }) {
             pending_guard.take();
         }
@@ -5493,9 +7058,7 @@ impl FSMetaApp {
         status: &SharedFacadePendingStatus,
         pending: &PendingFacadeActivation,
     ) -> bool {
-        status.route_key == pending.route_key
-            && status.generation == pending.generation
-            && status.resource_ids == pending.resource_ids
+        pending.matches_status(status)
     }
 
     fn clear_pending_facade_status(status_cell: &SharedFacadePendingStatusCell) {
@@ -5625,7 +7188,8 @@ impl FSMetaApp {
             .await
             .as_ref()
             .and_then(|pending| {
-                (pending.route_key == route_key && pending.generation == generation)
+                pending
+                    .matches_route_generation(route_key, generation)
                     .then_some(pending.clone())
             })
     }
@@ -5786,95 +7350,169 @@ impl FSMetaApp {
         message.contains("fs-meta api bind failed") && message.contains("address already in use")
     }
 
-    async fn pending_fixed_bind_facade_claim_conflict(&self, generation: u64) -> bool {
-        let pending = self.pending_facade.lock().await.clone();
-        let Some(pending) = pending else {
-            return false;
-        };
-        let _ = generation;
-        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL) {
-            return false;
-        }
-        if facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
-            return false;
-        }
-        if self.api_task.lock().await.as_ref().is_some_and(|active| {
-            active.route_key == pending.route_key && active.resource_ids == pending.resource_ids
-        }) {
-            return false;
+    fn conflicting_process_facade_claim_for_pending(
+        instance_id: u64,
+        pending: &PendingFacadeActivation,
+    ) -> Option<ProcessFacadeClaim> {
+        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+            || facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr)
+        {
+            return None;
         }
         let guard = match process_facade_claim_cell().lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.get(&pending.resolved.bind_addr).is_some_and(|claim| {
-            claim.owner_instance_id != self.instance_id && claim.matches_pending(&pending)
+        guard.get(&pending.resolved.bind_addr).and_then(|claim| {
+            (claim.owner_instance_id != instance_id && claim.matches_pending(pending))
+                .then_some(claim.clone())
         })
     }
 
-    async fn pending_fixed_bind_facade_publication_incomplete(
-        &self,
-        generation: u64,
-    ) -> Option<PendingFacadeActivation> {
-        let pending = self.pending_facade.lock().await.clone();
+    async fn observe_pending_fixed_bind_publication_for_pending(
+        instance_id: u64,
+        api_task: Arc<Mutex<Option<FacadeActivation>>>,
+        pending: Option<PendingFacadeActivation>,
+        claim_release_followup_pending: bool,
+    ) -> PendingFixedBindPublicationState {
         let Some(pending) = pending else {
-            return None;
+            return PendingFixedBindPublicationState::inactive(claim_release_followup_pending);
         };
-        let _ = generation;
-        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL) {
-            return None;
+        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+            || facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr)
+        {
+            return PendingFixedBindPublicationState::inactive(claim_release_followup_pending);
         }
-        if facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
-            return None;
+        if api_task
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|active| pending.matches_active_route_resources(active))
+        {
+            return PendingFixedBindPublicationState::inactive(claim_release_followup_pending);
         }
-        if self.api_task.lock().await.as_ref().is_some_and(|active| {
-            active.route_key == pending.route_key && active.resource_ids == pending.resource_ids
-        }) {
-            return None;
+        PendingFixedBindPublicationState::new(
+            Some(pending.clone()),
+            Self::conflicting_process_facade_claim_for_pending(instance_id, &pending),
+            claim_release_followup_pending,
+        )
+    }
+
+    async fn observe_pending_fixed_bind_publication_state(
+        &self,
+    ) -> PendingFixedBindPublicationState {
+        let pending = self.pending_facade.lock().await.clone();
+        Self::observe_pending_fixed_bind_publication_for_pending(
+            self.instance_id,
+            self.api_task.clone(),
+            pending,
+            self.pending_fixed_bind_claim_release_followup
+                .load(Ordering::Acquire),
+        )
+        .await
+    }
+
+    async fn observe_pending_fixed_bind_publication_state_for_pending(
+        &self,
+        pending: &PendingFacadeActivation,
+    ) -> PendingFixedBindPublicationState {
+        Self::observe_pending_fixed_bind_publication_for_pending(
+            self.instance_id,
+            self.api_task.clone(),
+            Some(pending.clone()),
+            self.pending_fixed_bind_claim_release_followup
+                .load(Ordering::Acquire),
+        )
+        .await
+    }
+
+    fn clear_pending_fixed_bind_claim_release_followup_if_completed(
+        &self,
+        disposition: PendingFixedBindClaimReleaseFollowupDisposition,
+    ) {
+        if matches!(
+            disposition,
+            PendingFixedBindClaimReleaseFollowupDisposition::PublicationCompleted
+        ) {
+            self.pending_fixed_bind_claim_release_followup
+                .store(false, Ordering::Release);
         }
-        Some(pending)
+    }
+
+    async fn settle_pending_fixed_bind_publication_state_after_optional_retry(
+        &self,
+        state: PendingFixedBindPublicationState,
+        retry_pending_facade: bool,
+    ) -> Result<PendingFixedBindPublicationState> {
+        if !matches!(
+            state.projection().claim_release_followup_disposition,
+            PendingFixedBindClaimReleaseFollowupDisposition::PublicationStillIncomplete
+        ) {
+            return Ok(state);
+        }
+
+        let pending = state
+            .publication_incomplete()
+            .expect("publication incomplete disposition requires pending facade");
+        if retry_pending_facade {
+            self.retry_pending_facade(&pending.route_key, pending.generation, false)
+                .await?;
+        }
+        Ok(self.observe_pending_fixed_bind_publication_state().await)
+    }
+
+    async fn pending_fixed_bind_claim_release_followup_disposition(
+        &self,
+        retry_pending_facade: bool,
+    ) -> Result<PendingFixedBindClaimReleaseFollowupDisposition> {
+        Ok(self
+            .settle_pending_fixed_bind_publication_projection_after_optional_retry(
+                retry_pending_facade,
+            )
+            .await?
+            .claim_release_followup_disposition)
     }
 
     async fn retry_pending_fixed_bind_facade_after_claim_release_without_query_followup(
         &self,
         query_followup_present: bool,
     ) -> Result<()> {
-        if query_followup_present
-            || !self
-                .pending_fixed_bind_claim_release_followup
-                .load(Ordering::Acquire)
-        {
+        if query_followup_present {
             return Ok(());
         }
-        let Some(pending) = self.pending_facade.lock().await.clone() else {
-            self.pending_fixed_bind_claim_release_followup
-                .store(false, Ordering::Release);
-            return Ok(());
-        };
-        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-            || facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr)
-        {
-            self.pending_fixed_bind_claim_release_followup
-                .store(false, Ordering::Release);
-            return Ok(());
-        }
-        if self
-            .pending_fixed_bind_facade_claim_conflict(pending.generation)
-            .await
-        {
-            return Ok(());
-        }
-        self.retry_pending_facade(&pending.route_key, pending.generation, false)
+        let _ = self
+            .pending_fixed_bind_claim_release_followup_disposition(true)
             .await?;
-        if self
-            .pending_fixed_bind_facade_publication_incomplete(pending.generation)
-            .await
-            .is_none()
-        {
-            self.pending_fixed_bind_claim_release_followup
-                .store(false, Ordering::Release);
-        }
         Ok(())
+    }
+
+    async fn settle_pending_fixed_bind_publication_projection_after_optional_retry(
+        &self,
+        retry_pending_facade: bool,
+    ) -> Result<PendingFixedBindPublicationProjection> {
+        let settled = self
+            .settle_pending_fixed_bind_publication_state_after_optional_retry(
+                self.observe_pending_fixed_bind_publication_state().await,
+                retry_pending_facade,
+            )
+            .await?;
+        let projection = settled.projection();
+        self.clear_pending_fixed_bind_claim_release_followup_if_completed(
+            projection.claim_release_followup_disposition,
+        );
+        Ok(projection)
+    }
+
+    async fn pending_fixed_bind_route_suppression_disposition(
+        &self,
+        retry_pending_facade: bool,
+    ) -> Result<PendingFixedBindRouteSuppressionDisposition> {
+        Ok(self
+            .settle_pending_fixed_bind_publication_projection_after_optional_retry(
+                retry_pending_facade,
+            )
+            .await?
+            .route_suppression_disposition)
     }
 
     async fn retained_active_facade_continuity_keeps_internal_status_routes(&self) -> bool {
@@ -5892,46 +7530,18 @@ impl FSMetaApp {
             .is_some_and(|active| active.route_key == facade_control_route_key)
     }
 
-    async fn query_route_activate_blocked_by_pending_facade_claim_conflict(
-        &self,
-        generation: u64,
-    ) -> bool {
-        self.pending_fixed_bind_facade_claim_conflict(generation)
-            .await
-    }
-
     fn sink_route_is_facade_dependent_query_request(route_key: &str) -> bool {
         route_key == format!("{}.req", ROUTE_KEY_QUERY)
             || route_key == format!("{}.req", ROUTE_KEY_FORCE_FIND)
             || is_per_peer_sink_query_request_route(route_key)
     }
 
-    async fn sink_route_activate_blocked_by_pending_fixed_bind_claim(
-        &self,
-        route_key: &str,
-        generation: u64,
-    ) -> bool {
-        if !Self::sink_route_is_facade_dependent_query_request(route_key) {
-            return false;
-        }
-        if self
-            .pending_fixed_bind_facade_claim_conflict(generation)
-            .await
-        {
-            return true;
-        }
-        self.pending_fixed_bind_claim_release_followup
-            .load(Ordering::Acquire)
-            && self
-                .pending_fixed_bind_facade_publication_incomplete(generation)
-                .await
-                .is_some()
-    }
-
     async fn filter_sink_facade_dependent_route_activates_during_pending_fixed_bind_claim(
         &self,
         sink_signals: &[SinkControlSignal],
     ) -> Vec<SinkControlSignal> {
+        let publication_state = self.observe_pending_fixed_bind_publication_state().await;
+        let suppression = publication_state.projection().route_suppression_disposition;
         let mut filtered = Vec::with_capacity(sink_signals.len());
         for signal in sink_signals {
             match signal {
@@ -5939,9 +7549,11 @@ impl FSMetaApp {
                     route_key,
                     generation,
                     ..
-                } if self
-                    .sink_route_activate_blocked_by_pending_fixed_bind_claim(route_key, *generation)
-                    .await =>
+                } if Self::sink_route_is_facade_dependent_query_request(route_key)
+                    && !matches!(
+                        suppression,
+                        PendingFixedBindRouteSuppressionDisposition::Allow
+                    ) =>
                 {
                     self.pending_fixed_bind_has_suppressed_dependent_routes
                         .store(true, Ordering::Release);
@@ -5976,40 +7588,31 @@ impl FSMetaApp {
         if matches!(
             unit,
             FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer
-        ) && self
-            .query_route_activate_blocked_by_pending_facade_claim_conflict(generation)
-            .await
-        {
-            self.pending_fixed_bind_has_suppressed_dependent_routes
-                .store(true, Ordering::Release);
-            self.record_suppressed_public_query_activate(unit, route_key, generation, bound_scopes)
-                .await;
-            eprintln!(
-                "fs_meta_runtime_app: suppress facade-dependent route unit={} route_key={} generation={} while pending facade fixed-bind claim is still owned by another instance",
-                unit.unit_id(),
-                route_key,
-                generation
-            );
-            return Ok(());
-        }
-        if matches!(
-            unit,
-            FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer
-        ) && self
-            .pending_fixed_bind_claim_release_followup
-            .load(Ordering::Acquire)
-        {
-            if let Some(pending) = self
-                .pending_fixed_bind_facade_publication_incomplete(generation)
-                .await
+        ) {
+            match self
+                .pending_fixed_bind_route_suppression_disposition(true)
+                .await?
             {
-                self.retry_pending_facade(&pending.route_key, pending.generation, false)
-                    .await?;
-                if self
-                    .pending_fixed_bind_facade_publication_incomplete(generation)
-                    .await
-                    .is_some()
-                {
+                PendingFixedBindRouteSuppressionDisposition::Allow => {}
+                PendingFixedBindRouteSuppressionDisposition::SuppressClaimConflict => {
+                    self.pending_fixed_bind_has_suppressed_dependent_routes
+                        .store(true, Ordering::Release);
+                    self.record_suppressed_public_query_activate(
+                        unit,
+                        route_key,
+                        generation,
+                        bound_scopes,
+                    )
+                    .await;
+                    eprintln!(
+                        "fs_meta_runtime_app: suppress facade-dependent route unit={} route_key={} generation={} while pending facade fixed-bind claim is still owned by another instance",
+                        unit.unit_id(),
+                        route_key,
+                        generation
+                    );
+                    return Ok(());
+                }
+                PendingFixedBindRouteSuppressionDisposition::SuppressPublicationIncomplete => {
                     self.pending_fixed_bind_has_suppressed_dependent_routes
                         .store(true, Ordering::Release);
                     self.record_suppressed_public_query_activate(
@@ -6027,8 +7630,6 @@ impl FSMetaApp {
                     );
                     return Ok(());
                 }
-                self.pending_fixed_bind_claim_release_followup
-                    .store(false, Ordering::Release);
             }
         }
         // Facade activation is a runtime-owned generation/bind/run handoff carrier.
@@ -6092,8 +7693,7 @@ impl FSMetaApp {
         let stale_active = {
             let mut api_task = self.api_task.lock().await;
             if api_task.as_ref().is_some_and(|active| {
-                active.route_key == route_key
-                    && active.resource_ids == candidate_resource_ids
+                active.matches_route_resources(route_key, &candidate_resource_ids)
                     && !active.handle.is_running()
             }) {
                 api_task.take()
@@ -6121,15 +7721,13 @@ impl FSMetaApp {
         {
             let mut api_task = self.api_task.lock().await;
             if let Some(current) = api_task.as_mut()
-                && current.route_key == route_key
-                && current.resource_ids == candidate_resource_ids
+                && current.matches_route_resources(route_key, &candidate_resource_ids)
             {
                 current.generation = generation;
                 drop(api_task);
                 let mut pending = self.pending_facade.lock().await;
                 if pending.as_ref().is_some_and(|candidate| {
-                    candidate.route_key == route_key
-                        && candidate.resource_ids == candidate_resource_ids
+                    candidate.matches_route_resources(route_key, &candidate_resource_ids)
                 }) {
                     pending.take();
                 }
@@ -6170,17 +7768,7 @@ impl FSMetaApp {
             let api_task = self.api_task.lock().await;
             api_task
                 .as_ref()
-                .and_then(|current| {
-                    (current.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL))
-                        .then(|| {
-                            self.config
-                                .api
-                                .resolve_for_candidate_ids(&current.resource_ids)
-                        })
-                        .flatten()
-                })
-                .map(|resolved| resolved.bind_addr)
-                .filter(|bind_addr| !facade_bind_addr_is_ephemeral(bind_addr))
+                .and_then(|current| self.active_fixed_bind_bind_addr_for(current))
         };
         if let Some(current) = self.api_task.lock().await.take() {
             eprintln!(
@@ -6195,8 +7783,14 @@ impl FSMetaApp {
         clear_owned_process_facade_claim(self.instance_id);
         if let Some(bind_addr) = released_bind_addr {
             clear_active_fixed_bind_facade_owner(&bind_addr, self.instance_id);
-            self.complete_pending_fixed_bind_handoff_after_release(&bind_addr, self.instance_id)
+            if let Some(registrant) =
+                pending_fixed_bind_handoff_registrant_for(&bind_addr, self.instance_id)
+            {
+                self.complete_pending_fixed_bind_handoff_after_release_with_registrant(
+                    &bind_addr, registrant,
+                )
                 .await;
+            }
         }
         if let Some(pending) = self.pending_facade.lock().await.clone() {
             clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
@@ -6382,62 +7976,136 @@ impl FSMetaApp {
             .collect()
     }
 
-    async fn filter_shared_source_route_deactivates(
-        &self,
-        source_signals: &[SourceControlSignal],
-    ) -> Vec<SourceControlSignal> {
-        let claims = self.shared_source_route_claims.lock().await;
-        source_signals
+    fn shared_route_claim_id(unit_id: &str, route_key: &str) -> SharedRouteClaimId {
+        (unit_id.to_string(), route_key.to_string())
+    }
+
+    fn filter_shared_route_deactivates<T, RouteId>(
+        signals: &[T],
+        claims: &SharedRouteClaims,
+        instance_id: u64,
+        deactivate_route_id: RouteId,
+    ) -> Vec<T>
+    where
+        T: Clone,
+        RouteId: Fn(&T) -> Option<SharedRouteClaimId>,
+    {
+        signals
             .iter()
-            .filter(|signal| match signal {
-                SourceControlSignal::Deactivate {
-                    unit, route_key, ..
-                } => claims
-                    .get(&(unit.unit_id().to_string(), route_key.clone()))
-                    .is_none_or(|owners| owners.iter().all(|owner| *owner == self.instance_id)),
-                _ => true,
+            .filter(|signal| {
+                deactivate_route_id(signal).is_none_or(|route_id| {
+                    claims
+                        .get(&route_id)
+                        .is_none_or(|owners| owners.iter().all(|owner| *owner == instance_id))
+                })
             })
             .cloned()
             .collect()
     }
 
-    async fn record_shared_source_route_claims(&self, source_signals: &[SourceControlSignal]) {
-        let mut claims = self.shared_source_route_claims.lock().await;
-        for signal in source_signals {
-            match signal {
-                SourceControlSignal::Activate {
-                    unit, route_key, ..
-                } => {
-                    claims
-                        .entry((unit.unit_id().to_string(), route_key.clone()))
-                        .or_default()
-                        .insert(self.instance_id);
+    fn apply_shared_route_claim_deltas(
+        claims: &mut SharedRouteClaims,
+        instance_id: u64,
+        deltas: impl IntoIterator<Item = SharedRouteClaimDelta>,
+    ) {
+        for delta in deltas {
+            match delta {
+                SharedRouteClaimDelta::Claim(route_id) => {
+                    claims.entry(route_id).or_default().insert(instance_id);
                 }
-                SourceControlSignal::Deactivate {
-                    unit, route_key, ..
-                } => {
-                    let route_id = (unit.unit_id().to_string(), route_key.clone());
+                SharedRouteClaimDelta::Release(route_id) => {
                     if let Some(owners) = claims.get_mut(&route_id) {
-                        owners.remove(&self.instance_id);
+                        owners.remove(&instance_id);
                         if owners.is_empty() {
                             claims.remove(&route_id);
                         }
                     }
                 }
-                SourceControlSignal::Tick { .. }
-                | SourceControlSignal::RuntimeHostGrantChange { .. }
-                | SourceControlSignal::ManualRescan { .. }
-                | SourceControlSignal::Passthrough(_) => {}
             }
         }
     }
 
-    async fn clear_shared_source_route_claims_for_instance(&self) {
-        let mut claims = self.shared_source_route_claims.lock().await;
+    fn clear_shared_route_claims_for_instance(claims: &mut SharedRouteClaims, instance_id: u64) {
         claims.retain(|_, owners| {
-            owners.remove(&self.instance_id);
+            owners.remove(&instance_id);
             !owners.is_empty()
         });
+    }
+
+    fn shared_route_claim_delta_from_source_signal(
+        signal: &SourceControlSignal,
+    ) -> Option<SharedRouteClaimDelta> {
+        match signal {
+            SourceControlSignal::Activate {
+                unit, route_key, ..
+            } => Some(SharedRouteClaimDelta::Claim(Self::shared_route_claim_id(
+                unit.unit_id(),
+                route_key,
+            ))),
+            SourceControlSignal::Deactivate {
+                unit, route_key, ..
+            } => Some(SharedRouteClaimDelta::Release(Self::shared_route_claim_id(
+                unit.unit_id(),
+                route_key,
+            ))),
+            SourceControlSignal::Tick { .. }
+            | SourceControlSignal::RuntimeHostGrantChange { .. }
+            | SourceControlSignal::ManualRescan { .. }
+            | SourceControlSignal::Passthrough(_) => None,
+        }
+    }
+
+    fn shared_route_claim_delta_from_sink_signal(
+        signal: &SinkControlSignal,
+    ) -> Option<SharedRouteClaimDelta> {
+        match signal {
+            SinkControlSignal::Activate {
+                unit, route_key, ..
+            } => Some(SharedRouteClaimDelta::Claim(Self::shared_route_claim_id(
+                unit.unit_id(),
+                route_key,
+            ))),
+            SinkControlSignal::Deactivate {
+                unit, route_key, ..
+            } => Some(SharedRouteClaimDelta::Release(Self::shared_route_claim_id(
+                unit.unit_id(),
+                route_key,
+            ))),
+            SinkControlSignal::Tick { .. }
+            | SinkControlSignal::RuntimeHostGrantChange { .. }
+            | SinkControlSignal::Passthrough(_) => None,
+        }
+    }
+
+    async fn filter_shared_source_route_deactivates(
+        &self,
+        source_signals: &[SourceControlSignal],
+    ) -> Vec<SourceControlSignal> {
+        let claims = self.shared_source_route_claims.lock().await;
+        Self::filter_shared_route_deactivates(source_signals, &claims, self.instance_id, |signal| {
+            match signal {
+                SourceControlSignal::Deactivate {
+                    unit, route_key, ..
+                } => Some(Self::shared_route_claim_id(unit.unit_id(), route_key)),
+                _ => None,
+            }
+        })
+    }
+
+    async fn record_shared_source_route_claims(&self, source_signals: &[SourceControlSignal]) {
+        let mut claims = self.shared_source_route_claims.lock().await;
+        Self::apply_shared_route_claim_deltas(
+            &mut claims,
+            self.instance_id,
+            source_signals
+                .iter()
+                .filter_map(Self::shared_route_claim_delta_from_source_signal),
+        );
+    }
+
+    async fn clear_shared_source_route_claims_for_instance(&self) {
+        let mut claims = self.shared_source_route_claims.lock().await;
+        Self::clear_shared_route_claims_for_instance(&mut claims, self.instance_id);
     }
 
     async fn apply_source_signals_with_recovery(
@@ -6769,56 +8437,30 @@ impl FSMetaApp {
         sink_signals: &[SinkControlSignal],
     ) -> Vec<SinkControlSignal> {
         let claims = self.shared_sink_route_claims.lock().await;
-        sink_signals
-            .iter()
-            .filter(|signal| match signal {
+        Self::filter_shared_route_deactivates(sink_signals, &claims, self.instance_id, |signal| {
+            match signal {
                 SinkControlSignal::Deactivate {
                     unit, route_key, ..
-                } => claims
-                    .get(&(unit.unit_id().to_string(), route_key.clone()))
-                    .is_none_or(|owners| owners.iter().all(|owner| *owner == self.instance_id)),
-                _ => true,
-            })
-            .cloned()
-            .collect()
+                } => Some(Self::shared_route_claim_id(unit.unit_id(), route_key)),
+                _ => None,
+            }
+        })
     }
 
     async fn record_shared_sink_route_claims(&self, sink_signals: &[SinkControlSignal]) {
         let mut claims = self.shared_sink_route_claims.lock().await;
-        for signal in sink_signals {
-            match signal {
-                SinkControlSignal::Activate {
-                    unit, route_key, ..
-                } => {
-                    claims
-                        .entry((unit.unit_id().to_string(), route_key.clone()))
-                        .or_default()
-                        .insert(self.instance_id);
-                }
-                SinkControlSignal::Deactivate {
-                    unit, route_key, ..
-                } => {
-                    let route_id = (unit.unit_id().to_string(), route_key.clone());
-                    if let Some(owners) = claims.get_mut(&route_id) {
-                        owners.remove(&self.instance_id);
-                        if owners.is_empty() {
-                            claims.remove(&route_id);
-                        }
-                    }
-                }
-                SinkControlSignal::Tick { .. }
-                | SinkControlSignal::RuntimeHostGrantChange { .. }
-                | SinkControlSignal::Passthrough(_) => {}
-            }
-        }
+        Self::apply_shared_route_claim_deltas(
+            &mut claims,
+            self.instance_id,
+            sink_signals
+                .iter()
+                .filter_map(Self::shared_route_claim_delta_from_sink_signal),
+        );
     }
 
     async fn clear_shared_sink_route_claims_for_instance(&self) {
         let mut claims = self.shared_sink_route_claims.lock().await;
-        claims.retain(|_, owners| {
-            owners.remove(&self.instance_id);
-            !owners.is_empty()
-        });
+        Self::clear_shared_route_claims_for_instance(&mut claims, self.instance_id);
     }
 
     async fn clear_shared_sink_query_route_claims_for_cleanup(&self) {
@@ -7015,10 +8657,7 @@ impl FSMetaApp {
         {
             self.api_control_gate.wait_for_facade_request_drain().await;
         }
-        if query_lane
-            && route_key == sink_query_proxy_route
-            && !stale_sink_query_proxy_deactivate
-        {
+        if query_lane && route_key == sink_query_proxy_route && !stale_sink_query_proxy_deactivate {
             self.sink.wait_for_control_ops_to_drain_for_handoff().await;
         }
         if !self.control_initialized() && query_lane && route_key == sink_query_proxy_route {
@@ -7089,28 +8728,21 @@ impl FSMetaApp {
         if !matches!(unit, FacadeRuntimeUnit::Facade) || route_key != facade_control_route_key {
             return Ok(());
         }
-        let retain_active_facade = {
-            let active_guard = self.api_task.lock().await;
-            active_guard.as_ref().is_some_and(|active| {
-                active.route_key == route_key && generation >= active.generation
-            })
-        };
-        let pending_fixed_bind_conflict = self
-            .pending_fixed_bind_facade_claim_conflict(generation)
+        let continuity_observation = self
+            .observe_facade_deactivate_continuity(route_key, generation)
             .await;
-        let release_for_fixed_bind_handoff =
-            self.fixed_bind_handoff_ready_for_release(generation).await;
-        if retain_active_facade && !pending_fixed_bind_conflict && !release_for_fixed_bind_handoff {
-            self.retained_active_facade_continuity
-                .store(true, Ordering::Release);
-            eprintln!(
-                "fs_meta_runtime_app: retain active facade during continuity-preserving deactivate route_key={} generation={}",
-                route_key, generation
-            );
-            return Ok(());
-        }
-        if pending_fixed_bind_conflict {
-            if retain_active_facade {
+        let disposition = continuity_observation.disposition();
+        match disposition {
+            FacadeDeactivateContinuityDisposition::RetainActiveContinuity => {
+                self.retained_active_facade_continuity
+                    .store(true, Ordering::Release);
+                eprintln!(
+                    "fs_meta_runtime_app: retain active facade during continuity-preserving deactivate route_key={} generation={}",
+                    route_key, generation
+                );
+                return Ok(());
+            }
+            FacadeDeactivateContinuityDisposition::RetainActiveWhilePendingFixedBindClaimConflict => {
                 self.retained_active_facade_continuity
                     .store(true, Ordering::Release);
                 eprintln!(
@@ -7118,50 +8750,35 @@ impl FSMetaApp {
                     route_key, generation
                 );
                 return Ok(());
-            } else {
+            }
+            FacadeDeactivateContinuityDisposition::RetainPendingWhilePendingFixedBindClaimConflict => {
                 eprintln!(
                     "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
                     route_key, generation
                 );
                 return Ok(());
             }
-        }
-        if release_for_fixed_bind_handoff {
-            if retain_active_facade {
+            FacadeDeactivateContinuityDisposition::ReleaseActiveForFixedBindHandoff => {
                 eprintln!(
                     "fs_meta_runtime_app: release active facade for fixed-bind handoff route_key={} generation={}",
                     route_key, generation
                 );
-            } else {
+            }
+            FacadeDeactivateContinuityDisposition::RetainPendingForFixedBindHandoff => {
                 eprintln!(
                     "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
                     route_key, generation
                 );
                 return Ok(());
             }
-        }
-        let retain_pending_spawn = {
-            let pending = self.pending_facade.lock().await.clone();
-            if let Some(pending) = pending {
-                if pending.route_key != route_key {
-                    false
-                } else {
-                    self.facade_spawn_in_progress
-                        .lock()
-                        .await
-                        .as_ref()
-                        .is_some_and(|inflight| inflight.matches_pending(&pending))
-                }
-            } else {
-                false
+            FacadeDeactivateContinuityDisposition::RetainPendingWhileSpawnInFlight => {
+                eprintln!(
+                    "fs_meta_runtime_app: retain pending facade during in-flight spawn route_key={} generation={}",
+                    route_key, generation
+                );
+                return Ok(());
             }
-        };
-        if retain_pending_spawn {
-            eprintln!(
-                "fs_meta_runtime_app: retain pending facade during in-flight spawn route_key={} generation={}",
-                route_key, generation
-            );
-            return Ok(());
+            FacadeDeactivateContinuityDisposition::Shutdown => {}
         }
         self.retained_active_facade_continuity
             .store(false, Ordering::Release);
@@ -7266,140 +8883,116 @@ impl FSMetaApp {
         Ok(())
     }
 
-    async fn fixed_bind_handoff_ready_for_release(&self, generation: u64) -> bool {
-        let _ = generation;
-        let Some(active) = self
-            .api_task
-            .lock()
-            .await
+    async fn active_fixed_bind_bind_addr(&self) -> Option<String> {
+        let api_task = self.api_task.lock().await;
+        api_task
             .as_ref()
-            .map(|active| (active.route_key.clone(), active.resource_ids.clone()))
-        else {
-            return false;
-        };
-        if active.0 != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL) {
-            return false;
-        }
-        let bind_addr = self
-            .config
-            .api
-            .resolve_for_candidate_ids(&active.1)
-            .map(|resolved| resolved.bind_addr)
-            .filter(|bind_addr| !facade_bind_addr_is_ephemeral(bind_addr));
-        let Some(bind_addr) = bind_addr else {
-            return false;
-        };
-        let ready = {
-            let guard = match pending_fixed_bind_handoff_ready_cell().lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.get(&bind_addr).cloned()
-        };
-        let handoff_ready_owned_by_current_instance = ready
-            .as_ref()
-            .is_some_and(|ready| ready.instance_id == self.instance_id);
-        let Some(ready) = ready else {
-            return matches!(
-                Self::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
-                    handoff_ready_entry_present: false,
-                    handoff_ready_owned_by_current_instance: false,
-                    pending_facade_present: false,
-                    pending_facade_is_control_route: false,
-                    pending_runtime_exposure_confirmed: false,
-                    suppressed_dependent_routes_remain: false,
-                }),
-                FixedBindHandoffReleaseDecision::Ready
-            );
-        };
-        let pending = ready.registrant.pending_facade.lock().await.clone();
-        matches!(
-            Self::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
-                handoff_ready_entry_present: true,
-                handoff_ready_owned_by_current_instance,
-                pending_facade_present: pending.is_some(),
-                pending_facade_is_control_route: pending.as_ref().is_some_and(|pending| {
-                    pending.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-                }),
-                pending_runtime_exposure_confirmed: pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.runtime_exposure_confirmed),
-                suppressed_dependent_routes_remain: ready
-                    .registrant
-                    .pending_fixed_bind_has_suppressed_dependent_routes
-                    .load(Ordering::Acquire),
-            }),
-            FixedBindHandoffReleaseDecision::Ready
+            .and_then(|active| self.active_fixed_bind_bind_addr_for(active))
+    }
+
+    async fn observe_active_fixed_bind_handoff(&self) -> Option<FixedBindHandoffObservation> {
+        let bind_addr = self.active_fixed_bind_bind_addr().await?;
+        let ready = pending_fixed_bind_handoff_ready_for(&bind_addr);
+        Some(
+            FixedBindHandoffObservation::from_ready_entry(bind_addr, ready, self.instance_id).await,
         )
     }
 
-    fn pending_fixed_bind_handoff_registrant(&self) -> PendingFixedBindHandoffRegistrant {
-        PendingFixedBindHandoffRegistrant {
-            instance_id: self.instance_id,
-            api_task: self.api_task.clone(),
-            pending_facade: self.pending_facade.clone(),
-            pending_fixed_bind_has_suppressed_dependent_routes: self
-                .pending_fixed_bind_has_suppressed_dependent_routes
-                .clone(),
-            facade_spawn_in_progress: self.facade_spawn_in_progress.clone(),
-            facade_pending_status: self.facade_pending_status.clone(),
-            facade_service_state: self.facade_service_state.clone(),
-            api_request_tracker: self.api_request_tracker.clone(),
-            api_control_gate: self.api_control_gate.clone(),
-            control_initialized: self.control_initialized.clone(),
-            source_state_replay_required: self.source_state_replay_required.clone(),
-            sink_state_replay_required: self.sink_state_replay_required.clone(),
-            node_id: self.node_id.clone(),
-            runtime_boundary: self.runtime_boundary.clone(),
-            source: self.source.clone(),
-            sink: self.sink.clone(),
-            query_sink: self.query_sink.clone(),
-            query_runtime_boundary: self.runtime_boundary.clone(),
-        }
+    #[cfg(test)]
+    async fn fixed_bind_handoff_ready_for_release(&self, generation: u64) -> bool {
+        let _ = generation;
+        self.observe_active_fixed_bind_handoff()
+            .await
+            .is_some_and(|observation| observation.ready_for_release())
     }
 
-    fn active_fixed_bind_facade_registrant(&self) -> ActiveFixedBindFacadeRegistrant {
-        ActiveFixedBindFacadeRegistrant {
-            instance_id: self.instance_id,
-            api_task: self.api_task.clone(),
-            api_request_tracker: self.api_request_tracker.clone(),
-            api_control_gate: self.api_control_gate.clone(),
+    async fn pending_spawn_in_flight_for_route_key(&self, route_key: &str) -> bool {
+        let pending = self.pending_facade.lock().await.clone();
+        let Some(pending) = pending else {
+            return false;
+        };
+        if pending.route_key != route_key {
+            return false;
         }
-    }
-
-    async fn refresh_active_fixed_bind_facade_owner(&self) {
-        let active = self
-            .api_task
+        self.facade_spawn_in_progress
             .lock()
             .await
             .as_ref()
-            .map(|active| (active.route_key.clone(), active.resource_ids.clone()));
-        let Some((route_key, resource_ids)) = active else {
-            return;
+            .is_some_and(|inflight| inflight.matches_pending(&pending))
+    }
+
+    async fn observe_facade_deactivate_continuity(
+        &self,
+        route_key: &str,
+        generation: u64,
+    ) -> FacadeDeactivateContinuityObservation {
+        let retain_active_facade = {
+            let active_guard = self.api_task.lock().await;
+            active_guard.as_ref().is_some_and(|active| {
+                active.route_key == route_key && generation >= active.generation
+            })
         };
-        if route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL) {
-            return;
+
+        FacadeDeactivateContinuityObservation {
+            retain_active_facade,
+            retain_pending_spawn: self.pending_spawn_in_flight_for_route_key(route_key).await,
+            pending_fixed_bind_publication: self
+                .observe_pending_fixed_bind_publication_state()
+                .await,
+            active_fixed_bind_handoff: self.observe_active_fixed_bind_handoff().await,
         }
-        let Some(bind_addr) = self
-            .config
-            .api
-            .resolve_for_candidate_ids(&resource_ids)
+    }
+
+    fn pending_fixed_bind_handoff_registrant(&self) -> PendingFixedBindHandoffRegistrant {
+        PendingFixedBindHandoffRegistrant::from_parts(
+            self.instance_id,
+            self.api_task.clone(),
+            self.pending_facade.clone(),
+            self.pending_fixed_bind_has_suppressed_dependent_routes
+                .clone(),
+            self.facade_spawn_in_progress.clone(),
+            self.facade_pending_status.clone(),
+            self.facade_service_state.clone(),
+            self.api_request_tracker.clone(),
+            self.api_control_gate.clone(),
+            self.control_initialized.clone(),
+            self.source_state_replay_required.clone(),
+            self.sink_state_replay_required.clone(),
+            self.node_id.clone(),
+            self.runtime_boundary.clone(),
+            self.source.clone(),
+            self.sink.clone(),
+            self.query_sink.clone(),
+            self.runtime_boundary.clone(),
+        )
+    }
+
+    fn active_fixed_bind_facade_registrant(&self) -> ActiveFixedBindFacadeRegistrant {
+        ActiveFixedBindFacadeRegistrant::from_parts(
+            self.instance_id,
+            self.api_task.clone(),
+            self.api_request_tracker.clone(),
+            self.api_control_gate.clone(),
+        )
+    }
+
+    fn active_fixed_bind_bind_addr_for(&self, active: &FacadeActivation) -> Option<String> {
+        (active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL))
+            .then(|| {
+                self.config
+                    .api
+                    .resolve_for_candidate_ids(&active.resource_ids)
+            })
+            .flatten()
             .map(|resolved| resolved.bind_addr)
             .filter(|bind_addr| !facade_bind_addr_is_ephemeral(bind_addr))
-        else {
+    }
+
+    async fn refresh_active_fixed_bind_facade_owner(&self) {
+        let Some(bind_addr) = self.active_fixed_bind_bind_addr().await else {
             return;
         };
         mark_active_fixed_bind_facade_owner(&bind_addr, self.active_fixed_bind_facade_registrant());
-    }
-
-    async fn release_conflicting_active_fixed_bind_facade_for_handoff(&self, bind_addr: &str) {
-        let Some(owner) = active_fixed_bind_facade_owner_for(bind_addr, self.instance_id) else {
-            return;
-        };
-        let released_by_instance_id = owner.instance_id;
-        Self::release_active_fixed_bind_facade_owner_for_handoff(bind_addr, owner).await;
-        self.complete_pending_fixed_bind_handoff_after_release(bind_addr, released_by_instance_id)
-            .await;
     }
 
     async fn release_active_fixed_bind_facade_owner_for_handoff(
@@ -7423,148 +9016,44 @@ impl FSMetaApp {
         clear_active_fixed_bind_facade_owner(bind_addr, owner.instance_id);
     }
 
-    async fn complete_pending_fixed_bind_handoff_after_release(
+    async fn complete_pending_fixed_bind_handoff_after_release_with_registrant(
         &self,
         bind_addr: &str,
-        released_by_instance_id: u64,
+        registrant: PendingFixedBindHandoffRegistrant,
     ) {
-        let Some(registrant) =
-            pending_fixed_bind_handoff_registrant_for(bind_addr, released_by_instance_id)
-        else {
-            return;
-        };
         let api_task = registrant.api_task.clone();
         let pending_facade = registrant.pending_facade.clone();
-        let api_control_gate = registrant.api_control_gate.clone();
-        let api_request_tracker = registrant.api_request_tracker.clone();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         loop {
-            match Self::try_spawn_pending_facade_from_parts(
-                registrant.instance_id,
-                registrant.api_task.clone(),
-                registrant.pending_facade.clone(),
-                registrant.facade_spawn_in_progress.clone(),
-                registrant
-                    .pending_fixed_bind_has_suppressed_dependent_routes
-                    .clone(),
-                registrant.facade_pending_status.clone(),
-                registrant.facade_service_state.clone(),
-                registrant.api_request_tracker.clone(),
-                registrant.api_control_gate.clone(),
-                registrant.control_initialized.clone(),
-                registrant.source_state_replay_required.clone(),
-                registrant.sink_state_replay_required.clone(),
-                registrant.node_id.clone(),
-                registrant.runtime_boundary.clone(),
-                registrant.source.clone(),
-                registrant.sink.clone(),
-                registrant.query_sink.clone(),
-                registrant.query_runtime_boundary.clone(),
-            )
-            .await
-            {
+            match Self::try_spawn_pending_facade_from_registrant(registrant.clone()).await {
                 Ok(_) => {
-                    if pending_facade.lock().await.is_none()
-                        && api_task.lock().await.as_ref().is_some_and(|active| {
-                            active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-                        })
-                    {
-                        #[cfg(test)]
-                        maybe_pause_before_pending_fixed_bind_handoff_completion_gate_reopen()
-                            .await;
-                        let current_pending = pending_facade.lock().await.clone();
-                        let runtime = RuntimeGateFacts {
-                            control_initialized: registrant
-                                .control_initialized
-                                .load(Ordering::Acquire),
-                            source_state_replay_required: registrant
-                                .source_state_replay_required
-                                .load(Ordering::Acquire),
-                            sink_state_replay_required: registrant
-                                .sink_state_replay_required
-                                .load(Ordering::Acquire),
-                        };
-                        let control_route_key =
-                            format!("{}.stream", ROUTE_KEY_FACADE_CONTROL);
-                        let pending_facade_is_control_route = current_pending
-                            .as_ref()
-                            .is_some_and(|pending| pending.route_key == control_route_key);
-                        let (
-                            active_control_stream_present,
-                            active_pending_control_stream_present,
-                        ) = {
-                            let active_task = api_task.lock().await;
-                            let active_ref = active_task.as_ref();
-                            let active_control_stream_present = active_ref
-                                .is_some_and(|active| active.route_key == control_route_key);
-                            let active_pending_control_stream_present =
-                                match (active_ref, current_pending.as_ref()) {
-                                    (Some(active), Some(pending)) => {
-                                        active_control_stream_matches_pending_facade(
-                                            active, pending,
-                                        )
-                                    }
-                                    _ => false,
-                                };
-                            (
-                                active_control_stream_present,
-                                active_pending_control_stream_present,
-                            )
-                        };
-                        let publication_ready = matches!(
-                            Self::facade_publication_readiness_decision_from_runtime_facts(
-                                FacadePublicationReadinessDecisionInput {
-                                    runtime,
-                                    allow_facade_only_handoff: true,
-                                    pending_facade_present: current_pending.is_some(),
-                                    pending_facade_is_control_route,
-                                    pending_fixed_bind_has_suppressed_dependent_routes: registrant
-                                        .pending_fixed_bind_has_suppressed_dependent_routes
-                                        .load(Ordering::Acquire),
-                                    active_control_stream_present,
-                                    active_pending_control_stream_present,
-                                },
-                            ),
-                            FacadePublicationReadinessDecision::Ready
+                    let completion_disposition =
+                        Self::pending_fixed_bind_handoff_completion_disposition(
+                            PendingFixedBindHandoffCompletionDecisionInput {
+                                pending_facade_present: pending_facade.lock().await.is_some(),
+                                active_control_stream_present: api_task
+                                    .lock()
+                                    .await
+                                    .as_ref()
+                                    .is_some_and(|active| {
+                                        active.route_key
+                                            == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+                                    }),
+                                deadline_expired: tokio::time::Instant::now() >= deadline,
+                            },
                         );
-                        if publication_ready {
-                            mark_active_fixed_bind_facade_owner(
-                                bind_addr,
-                                ActiveFixedBindFacadeRegistrant {
-                                    instance_id: registrant.instance_id,
-                                    api_task: api_task.clone(),
-                                    api_request_tracker: api_request_tracker.clone(),
-                                    api_control_gate: api_control_gate.clone(),
-                                },
-                            );
+                    match completion_disposition {
+                        PendingFixedBindHandoffCompletionDisposition::ApplyReadyTail => {
+                            #[cfg(test)]
+                            maybe_pause_before_pending_fixed_bind_handoff_completion_gate_reopen()
+                                .await;
+                            let _ = registrant.apply_forced_handoff_ready_tail(bind_addr).await;
+                            #[cfg(test)]
+                            notify_pending_fixed_bind_handoff_completion_completion();
+                            break;
                         }
-                        let pending_facade_present = pending_facade.lock().await.is_some()
-                            || registrant
-                                .facade_pending_status
-                                .read()
-                                .ok()
-                                .is_some_and(|status| status.is_some());
-                        let ready_tail_decision =
-                            Self::facade_ready_tail_decision_from_runtime_facts(
-                                FacadeReadyTailDecisionInput {
-                                    runtime,
-                                    allow_facade_only_handoff: true,
-                                    publication_ready,
-                                    pending_facade_present,
-                                },
-                            );
-                        api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
-                        *registrant
-                            .facade_service_state
-                            .write()
-                            .expect("write published facade service state") =
-                            ready_tail_decision.published_state;
-                        #[cfg(test)]
-                        notify_pending_fixed_bind_handoff_completion_completion();
-                        break;
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        break;
+                        PendingFixedBindHandoffCompletionDisposition::Abort => break,
+                        PendingFixedBindHandoffCompletionDisposition::ContinuePolling => {}
                     }
                 }
                 Err(err) => {
@@ -7577,65 +9066,137 @@ impl FSMetaApp {
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(RUNTIME_APP_POLL_INTERVAL).await;
         }
     }
 
-    async fn facade_publication_ready(&self) -> bool {
-        let pending = self.pending_facade.lock().await.clone();
-        let control_route_key = format!("{}.stream", ROUTE_KEY_FACADE_CONTROL);
-        let active_control_stream_present = self.api_task.lock().await.as_ref().is_some_and(|active| {
-            active.route_key == control_route_key
-        });
-        let pending_facade_is_control_route = pending
-            .as_ref()
-            .is_some_and(|pending| pending.route_key == control_route_key);
-        let active_pending_control_stream_present = if let Some(pending) = pending.as_ref() {
-            self.api_task
-                .lock()
-                .await
-                .as_ref()
-                .is_some_and(|active| active_control_stream_matches_pending_facade(active, pending))
-        } else {
-            false
+    #[cfg(test)]
+    async fn complete_pending_fixed_bind_handoff_after_release(
+        &self,
+        bind_addr: &str,
+        released_by_instance_id: u64,
+    ) {
+        let Some(registrant) =
+            pending_fixed_bind_handoff_registrant_for(bind_addr, released_by_instance_id)
+        else {
+            return;
         };
-        let allow_facade_only_handoff = pending.as_ref().is_some_and(|pending| {
-            let bind_addr = pending.resolved.bind_addr.as_str();
-            Self::facade_only_handoff_allowance_decision(
-                FacadeOnlyHandoffAllowanceDecisionInput {
-                    pending_facade_present: true,
-                    pending_facade_is_control_route,
-                    pending_fixed_bind_has_suppressed_dependent_routes: self
-                        .pending_fixed_bind_has_suppressed_dependent_routes
-                        .load(Ordering::Acquire),
-                    pending_bind_is_ephemeral: facade_bind_addr_is_ephemeral(bind_addr),
-                    pending_bind_owned_by_instance: !facade_bind_addr_is_ephemeral(bind_addr)
-                        && active_fixed_bind_facade_owned_by(bind_addr, self.instance_id),
-                },
+        self.complete_pending_fixed_bind_handoff_after_release_with_registrant(
+            bind_addr, registrant,
+        )
+        .await;
+    }
+
+    async fn observe_pending_fixed_bind_handoff_for_publication(
+        &self,
+        pending: &PendingFacadeActivation,
+    ) -> FixedBindHandoffObservation {
+        let bind_addr = pending.resolved.bind_addr.clone();
+        mark_pending_fixed_bind_handoff_ready_with_registrant(
+            &bind_addr,
+            self.pending_fixed_bind_handoff_registrant(),
+        );
+        let ready = pending_fixed_bind_handoff_ready_for(&bind_addr);
+        let state = self
+            .observe_pending_fixed_bind_publication_state_for_pending(pending)
+            .await;
+        FixedBindHandoffObservation::from_pending_publication(
+            bind_addr,
+            pending.clone(),
+            ready,
+            &state,
+            self.pending_fixed_bind_has_suppressed_dependent_routes
+                .load(Ordering::Acquire),
+            self.instance_id,
+        )
+    }
+
+    async fn release_pending_fixed_bind_handoff_blocker(
+        &self,
+        bind_addr: &str,
+        disposition: PendingFixedBindHandoffAttemptDisposition,
+    ) -> Option<PendingFixedBindHandoffRegistrant> {
+        match disposition {
+            PendingFixedBindHandoffAttemptDisposition::NoAttempt => None,
+            PendingFixedBindHandoffAttemptDisposition::ReleaseActiveOwner => {
+                let owner = active_fixed_bind_facade_owner_for(bind_addr, self.instance_id)?;
+                let registrant =
+                    pending_fixed_bind_handoff_registrant_for(bind_addr, owner.instance_id)?;
+                Self::release_active_fixed_bind_facade_owner_for_handoff(bind_addr, owner).await;
+                Some(registrant)
+            }
+            PendingFixedBindHandoffAttemptDisposition::ReleaseConflictingProcessClaim {
+                owner_instance_id,
+            } => {
+                let registrant =
+                    pending_fixed_bind_handoff_registrant_for(bind_addr, owner_instance_id)?;
+                clear_process_facade_claim_for_bind_addr(bind_addr, owner_instance_id);
+                Some(registrant)
+            }
+        }
+    }
+
+    async fn apply_pending_fixed_bind_handoff_attempt_disposition(
+        &self,
+        bind_addr: &str,
+        disposition: PendingFixedBindHandoffAttemptDisposition,
+    ) -> bool {
+        let Some(registrant) = self
+            .release_pending_fixed_bind_handoff_blocker(bind_addr, disposition)
+            .await
+        else {
+            return false;
+        };
+        self.complete_pending_fixed_bind_handoff_after_release_with_registrant(
+            bind_addr, registrant,
+        )
+        .await;
+        true
+    }
+
+    async fn complete_pending_fixed_bind_handoff_for_publication(
+        &self,
+        pending: &PendingFacadeActivation,
+    ) -> bool {
+        let bind_addr = pending.resolved.bind_addr.clone();
+        let handoff = self
+            .observe_pending_fixed_bind_handoff_for_publication(pending)
+            .await;
+        if !self
+            .apply_pending_fixed_bind_handoff_attempt_disposition(
+                &bind_addr,
+                handoff.pending_publication_attempt_disposition(),
             )
-            .allows_handoff()
-        });
-        match Self::facade_publication_readiness_decision_from_runtime_facts(
-            FacadePublicationReadinessDecisionInput {
-                runtime: self.runtime_gate_facts(),
-                allow_facade_only_handoff,
-                pending_facade_present: pending.is_some(),
-                pending_facade_is_control_route,
-                pending_fixed_bind_has_suppressed_dependent_routes: self
-                    .pending_fixed_bind_has_suppressed_dependent_routes
-                    .load(Ordering::Acquire),
-                active_control_stream_present,
-                active_pending_control_stream_present,
-            },
-        ) {
+            .await
+        {
+            return false;
+        }
+        if self
+            .api_task
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|active| pending.matches_active(active))
+        {
+            clear_pending_fixed_bind_handoff_ready(&bind_addr);
+            return true;
+        }
+        false
+    }
+
+    async fn facade_publication_ready(&self) -> bool {
+        let observation = self
+            .observe_facade_gate(FacadeOnlyHandoffObservationPolicy::DeriveFromPendingBind)
+            .await;
+        match observation.publication_readiness_decision() {
             FacadePublicationReadinessDecision::BlockedControlGate
             | FacadePublicationReadinessDecision::BlockedWithoutActiveControlStream => {
                 return false;
             }
             FacadePublicationReadinessDecision::Ready => {
-                if let Some(pending) = pending.as_ref()
-                    && pending_facade_is_control_route
-                    && active_pending_control_stream_present
+                if let Some(pending) = observation.current_pending.as_ref()
+                    && observation.pending_facade_is_control_route
+                    && observation.active_pending_control_stream_present
                 {
                     clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
                 }
@@ -7643,60 +9204,15 @@ impl FSMetaApp {
             }
             FacadePublicationReadinessDecision::FixedBindHandoffPending => {}
         }
-        let Some(pending) = pending else {
+        let Some(pending) = observation.current_pending else {
             return false;
         };
         if !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
-            let allow_fixed_bind_handoff = pending.runtime_exposure_confirmed;
-            mark_pending_fixed_bind_handoff_ready(
-                &pending.resolved.bind_addr,
-                self.pending_fixed_bind_handoff_registrant(),
-            );
             if self
-                .pending_fixed_bind_facade_claim_conflict(pending.generation)
+                .complete_pending_fixed_bind_handoff_for_publication(&pending)
                 .await
-                && allow_fixed_bind_handoff
             {
-                if let Some(owner) = active_fixed_bind_facade_owner_for(
-                    &pending.resolved.bind_addr,
-                    self.instance_id,
-                ) {
-                    self.release_conflicting_active_fixed_bind_facade_for_handoff(
-                        &pending.resolved.bind_addr,
-                    )
-                    .await;
-                    if self.api_task.lock().await.as_ref().is_some_and(|active| {
-                        active_control_stream_matches_pending_facade(active, &pending)
-                    }) {
-                        clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
-                        return true;
-                    }
-                    let _ = owner;
-                } else if self
-                    .pending_fixed_bind_claim_release_followup
-                    .load(Ordering::Acquire)
-                {
-                    if let Some(claim) = conflicting_process_facade_claim_for(
-                        &pending.resolved.bind_addr,
-                        self.instance_id,
-                    ) {
-                        clear_process_facade_claim_for_bind_addr(
-                            &pending.resolved.bind_addr,
-                            claim.owner_instance_id,
-                        );
-                        self.complete_pending_fixed_bind_handoff_after_release(
-                            &pending.resolved.bind_addr,
-                            claim.owner_instance_id,
-                        )
-                        .await;
-                        if self.api_task.lock().await.as_ref().is_some_and(|active| {
-                            active_control_stream_matches_pending_facade(active, &pending)
-                        }) {
-                            clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
-                            return true;
-                        }
-                    }
-                }
+                return true;
             }
         }
         false
@@ -7780,9 +9296,8 @@ impl FSMetaApp {
         let request_sensitive =
             !source_signals.is_empty() || !sink_signals.is_empty() || !facade_signals.is_empty();
         if request_sensitive && self.api_request_tracker.inflight() > 0 {
-            let skip_request_drain_for_uninitialized_recovery =
-                !self.control_initialized()
-                    && (should_initialize_from_control || facade_cleanup_only_while_uninitialized);
+            let skip_request_drain_for_uninitialized_recovery = !self.control_initialized()
+                && (should_initialize_from_control || facade_cleanup_only_while_uninitialized);
             if !skip_request_drain_for_uninitialized_recovery {
                 self.api_request_tracker.wait_for_drain().await;
             }
@@ -7888,41 +9403,34 @@ impl FSMetaApp {
             .any(facade_publication_signal_is_sink_status_activate);
         let facade_claim_signals_present = !facade_claim_signals.is_empty();
         let mut pretriggered_source_to_sink_convergence = false;
-        let mut mixed_recovery_expected_sink_groups = None;
+        let mut sink_recovery_tail_plan = SinkRecoveryTailPlan::new();
         for signal in facade_claim_signals {
             self.apply_facade_signal(signal).await?;
         }
-        let source_wave_disposition =
-            Self::classify_source_control_wave_disposition(SourceControlWaveDecisionInput {
-                control_initialized_at_entry,
-                control_initialized_now: self.control_initialized(),
-                source_state_replay_required: self
-                    .source_state_replay_required
-                    .load(Ordering::Acquire),
-                cleanup_disposition: uninitialized_cleanup_disposition,
-                source_signals: &source_signals,
-                facade_claim_signals_present,
-                facade_publication_signals_present: !facade_publication_signals.is_empty(),
-                sink_signals_present: !sink_signals.is_empty(),
-            });
         let sink_tick_fast_path_eligible =
             self.sink.current_generation_tick_fast_path_eligible().await;
-        let sink_wave_disposition =
-            Self::classify_sink_control_wave_disposition(SinkControlWaveDecisionInput {
-                control_initialized_at_entry,
-                control_initialized_now: self.control_initialized(),
-                retained_sink_state_present_at_entry,
-                sink_state_replay_required: self
-                    .sink_state_replay_required
-                    .load(Ordering::Acquire),
-                sink_tick_fast_path_eligible,
-                cleanup_disposition: uninitialized_cleanup_disposition,
-                source_wave_disposition,
-                source_signals_present: !source_signals.is_empty(),
-                facade_claim_signals_present,
-                facade_publication_signals_present: !facade_publication_signals.is_empty(),
-                sink_signals: &sink_signals,
-            });
+        let control_wave_observation = ControlFrameWaveObservation {
+            control_initialized_at_entry,
+            control_initialized_now: self.control_initialized(),
+            retained_sink_state_present_at_entry,
+            source_state_replay_required: self.source_state_replay_required.load(Ordering::Acquire),
+            sink_state_replay_required: self.sink_state_replay_required.load(Ordering::Acquire),
+            sink_tick_fast_path_eligible,
+            cleanup_disposition: uninitialized_cleanup_disposition,
+            facade_claim_signals_present,
+            facade_publication_signals_present: !facade_publication_signals.is_empty(),
+            source_signals_present: !source_signals.is_empty(),
+            sink_signals_present: !sink_signals.is_empty(),
+        };
+        let source_wave_disposition = Self::classify_source_control_wave_disposition(
+            control_wave_observation,
+            &source_signals,
+        );
+        let sink_wave_disposition = Self::classify_sink_control_wave_disposition(
+            control_wave_observation,
+            source_wave_disposition,
+            &sink_signals,
+        );
         if facade_cleanup_only_while_uninitialized {
             for signal in facade_publication_signals.drain(..) {
                 self.apply_facade_signal(signal).await?;
@@ -8041,7 +9549,6 @@ impl FSMetaApp {
             SourceControlWaveDisposition::Idle => {}
         }
         let mut replayed_sink_state_after_uninitialized_source_recovery = false;
-        let mut replayed_sink_state_requires_local_status_republish = None;
         match sink_wave_disposition {
             SinkControlWaveDisposition::ApplyBeforeInitialSourceWave => {}
             SinkControlWaveDisposition::CleanupOnlyQueryWhileUninitialized => {
@@ -8098,9 +9605,8 @@ impl FSMetaApp {
                             .await?
                             .into_iter()
                             .collect::<std::collections::BTreeSet<_>>();
-                    if !expected_groups.is_empty() {
-                        mixed_recovery_expected_sink_groups = Some(expected_groups);
-                    }
+                    sink_recovery_tail_plan
+                        .push_immediate_local_sink_status_republish_wait(expected_groups);
                 }
             }
             SinkControlWaveDisposition::ReplayRetained => {
@@ -8126,16 +9632,12 @@ impl FSMetaApp {
                             .await?
                             .into_iter()
                             .collect::<std::collections::BTreeSet<_>>();
-                    if !expected_groups.is_empty() {
-                        replayed_sink_state_requires_local_status_republish =
-                            Some(expected_groups);
-                    }
+                    sink_recovery_tail_plan
+                        .push_immediate_local_sink_status_republish_wait(expected_groups);
                 }
             }
             SinkControlWaveDisposition::Idle => {}
         }
-        let mut sink_recovery_gate_reopen_disposition =
-            SinkRecoveryGateReopenDisposition::None;
         let deferred_local_sink_replay_signals =
             if replayed_sink_state_after_uninitialized_source_recovery
                 && sink_status_publication_present
@@ -8145,167 +9647,25 @@ impl FSMetaApp {
             } else {
                 Vec::new()
             };
-        if replayed_sink_state_after_uninitialized_source_recovery
-            && sink_status_publication_present
-        {
-            let source_led_uninitialized_mixed_recovery =
-                !source_signals.is_empty() && sink_signals.is_empty();
-            if source_led_uninitialized_mixed_recovery {
-                let expected_groups =
-                    Self::runtime_scoped_facade_group_ids(&self.source, &self.sink)
-                        .await?
-                        .into_iter()
-                        .collect::<std::collections::BTreeSet<_>>();
-                if !expected_groups.is_empty() {
-                    let cached_sink_status_ready = self
-                        .sink
-                        .cached_status_snapshot()
-                        .ok()
-                        .is_some_and(|snapshot| {
-                            sink_status_snapshot_ready_for_expected_groups(
-                                &snapshot,
-                                &expected_groups,
-                            )
-                        });
-                    if cached_sink_status_ready {
-                        eprintln!(
-                            "fs_meta_runtime_app: skipping deferred sink-status republish wait after source-led uninitialized mixed recovery groups={expected_groups:?}"
-                        );
-                        if !deferred_local_sink_replay_signals.is_empty() {
-                            eprintln!(
-                                "fs_meta_runtime_app: retaining local sink-status republish wait after source-led uninitialized mixed recovery despite cached ready snapshot groups={expected_groups:?}"
-                            );
-                            sink_recovery_gate_reopen_disposition =
-                                SinkRecoveryGateReopenDisposition::WaitForLocalSinkStatusRepublish {
-                                    expected_groups,
-                                };
-                        }
-                    } else {
-                        eprintln!(
-                            "fs_meta_runtime_app: deferring sink-status republish wait after source-led uninitialized mixed recovery groups={expected_groups:?}"
-                        );
-                        sink_recovery_gate_reopen_disposition =
-                            SinkRecoveryGateReopenDisposition::DeferGateReopenUntilSinkStatusReady {
-                                expected_groups,
-                            };
-                    }
-                } else {
-                    if let Some(expected_groups) = self
-                        .wait_for_sink_status_republish_readiness_after_recovery(
-                            pretriggered_source_to_sink_convergence,
-                        )
-                        .await?
-                    {
-                        sink_recovery_gate_reopen_disposition =
-                            SinkRecoveryGateReopenDisposition::DeferGateReopenUntilSinkStatusReady {
-                                expected_groups,
-                            };
-                    }
-                }
-            } else {
-                if let Some(expected_groups) = self
-                    .wait_for_sink_status_republish_readiness_after_recovery(
-                        pretriggered_source_to_sink_convergence,
-                    )
-                    .await?
-                {
-                    sink_recovery_gate_reopen_disposition =
-                        SinkRecoveryGateReopenDisposition::DeferGateReopenUntilSinkStatusReady {
-                            expected_groups,
-                        };
-                }
-            }
-        }
-        let (deferred_sink_owned_query_peer_publication_signals, facade_publication_signals): (
-            Vec<_>,
-            Vec<_>,
-        ) = if matches!(
-            sink_recovery_gate_reopen_disposition,
-            SinkRecoveryGateReopenDisposition::DeferGateReopenUntilSinkStatusReady { .. }
-        ) {
-            facade_publication_signals
-                .into_iter()
-                .partition(Self::facade_publication_signal_is_sink_owned_query_peer_activate)
-        } else {
-            (Vec::new(), facade_publication_signals)
-        };
-        let query_publication_followup_present = facade_publication_signals
-            .iter()
-            .any(Self::facade_publication_signal_is_query_activate);
-        if !source_cleanup_only_while_uninitialized && !sink_cleanup_only_while_uninitialized {
-            self.retry_pending_fixed_bind_facade_after_claim_release_without_query_followup(
-                query_publication_followup_present,
+        sink_recovery_tail_plan.gate_reopen_disposition = self
+            .determine_sink_recovery_gate_reopen_disposition(
+                replayed_sink_state_after_uninitialized_source_recovery,
+                sink_status_publication_present,
+                &source_signals,
+                &sink_signals,
+                pretriggered_source_to_sink_convergence,
+                &deferred_local_sink_replay_signals,
             )
             .await?;
-        }
-        for signal in facade_publication_signals {
-            self.apply_facade_signal(signal).await?;
-        }
-        self.replay_suppressed_public_query_activates_after_publication()
-            .await?;
-        if !sink_cleanup_only_while_uninitialized {
-            self.ensure_runtime_proxy_endpoints_started().await?;
-        }
-        if let Some(expected_groups) =
-            replayed_sink_state_requires_local_status_republish.as_ref()
-        {
-            self.wait_for_local_sink_status_republish_after_recovery(expected_groups)
-                .await?;
-        }
-        if let Some(expected_groups) = mixed_recovery_expected_sink_groups.as_ref() {
-            self.wait_for_local_sink_status_republish_after_recovery(expected_groups)
-                .await?;
-        }
-        if let SinkRecoveryGateReopenDisposition::WaitForLocalSinkStatusRepublish {
-            expected_groups,
-        } = &sink_recovery_gate_reopen_disposition
-        {
-            let post_return_sink_replay_signals = self
-                .current_generation_retained_sink_replay_signals_for_local_republish()
-                .await;
-            Self::wait_for_local_sink_status_republish_after_recovery_requiring_probe_from_parts(
-                self.source.clone(),
-                self.sink.clone(),
-                expected_groups,
-                &post_return_sink_replay_signals,
+        if !source_cleanup_only_while_uninitialized {
+            self.apply_sink_recovery_tail_plan(
+                request_sensitive,
+                sink_cleanup_only_while_uninitialized,
+                sink_recovery_tail_plan,
+                deferred_local_sink_replay_signals,
+                facade_publication_signals,
             )
             .await?;
-        }
-        if request_sensitive && !sink_cleanup_only_while_uninitialized {
-            if let SinkRecoveryGateReopenDisposition::DeferGateReopenUntilSinkStatusReady {
-                expected_groups,
-            } = sink_recovery_gate_reopen_disposition
-            {
-                self.suppress_deferred_sink_owned_query_peer_publication_signals(
-                    &deferred_sink_owned_query_peer_publication_signals,
-                )
-                .await?;
-                let control_ready_after_republish = self.facade_publication_ready().await;
-                self.api_control_gate
-                    .set_ready(control_ready_after_republish);
-                let _ = self.current_facade_service_state().await;
-                Self::spawn_deferred_sink_owned_query_peer_publication_after_local_sink_status_ready(
-                    self.source.clone(),
-                    self.sink.clone(),
-                    expected_groups,
-                    deferred_local_sink_replay_signals,
-                    deferred_sink_owned_query_peer_publication_signals,
-                    self.facade_gate.clone(),
-                    self.mirrored_query_peer_routes.clone(),
-                    self.pending_facade.clone(),
-                    self.facade_pending_status.clone(),
-                    self.api_task.clone(),
-                    self.api_control_gate.clone(),
-                    self.facade_service_state.clone(),
-                    self.control_initialized.clone(),
-                    self.source_state_replay_required.clone(),
-                    self.sink_state_replay_required.clone(),
-                );
-            } else {
-                self.api_control_gate
-                    .set_ready(self.facade_publication_ready().await);
-                let _ = self.current_facade_service_state().await;
-            }
         }
         eprintln!("fs_meta_runtime_app: on_control_frame done");
         Ok(())
@@ -8315,8 +9675,27 @@ impl FSMetaApp {
         self.service_on_control_frame(envelopes).await
     }
 
+    async fn wait_for_conflicting_active_fixed_bind_facade_request_drain(&self) {
+        let Some(bind_addr) = self
+            .config
+            .api
+            .resolve_for_candidate_ids(&[self.config.api.facade_resource_id.clone()])
+            .map(|resolved| resolved.bind_addr)
+            .filter(|bind_addr| !facade_bind_addr_is_ephemeral(bind_addr))
+        else {
+            return;
+        };
+        let Some(owner) = active_fixed_bind_facade_owner_for(&bind_addr, self.instance_id) else {
+            return;
+        };
+        owner.api_request_tracker.wait_for_drain().await;
+        owner.api_control_gate.wait_for_facade_request_drain().await;
+    }
+
     async fn service_close(&self) -> Result<()> {
         self.api_request_tracker.wait_for_drain().await;
+        self.wait_for_conflicting_active_fixed_bind_facade_request_drain()
+            .await;
         self.retained_active_facade_continuity
             .store(false, Ordering::Release);
         self.pending_fixed_bind_has_suppressed_dependent_routes
@@ -8362,6 +9741,7 @@ impl FSMetaApp {
             clear_active_fixed_bind_facade_owner(&bind_addr, self.instance_id);
             clear_pending_fixed_bind_handoff_ready(&bind_addr);
         }
+        self.wait_for_shared_worker_control_handoff().await;
         self.source.close().await?;
         self.sink.close().await?;
         let mut endpoint_tasks = std::mem::take(&mut *self.runtime_endpoint_tasks.lock().await);

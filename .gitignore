@@ -9,3 +9,4 @@ fs-meta.query-keys.json
 
 fs-meta.query-keys.json
 .tmp/
+.tmp-target-status-owner/

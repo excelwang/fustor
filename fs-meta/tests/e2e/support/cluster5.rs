@@ -121,7 +121,8 @@ fn clear_reserved_bind_addrs(bind_addrs: &[String]) {
 }
 
 fn is_retryable_startup_bind_transport_failure(err: &str) -> bool {
-    err.contains("exited before socket ready") && err.contains("failed to bind transport 127.0.0.1:")
+    err.contains("exited before socket ready")
+        && err.contains("failed to bind transport 127.0.0.1:")
 }
 
 fn retry_cluster_start_after_bind_transport_conflict<T, F>(mut start_once: F) -> Result<T, String>
@@ -2324,9 +2325,9 @@ mod tests {
     }
 
     fn runtime_admin_ok_response_bytes(result: Value) -> Vec<u8> {
-        rmp_serde::to_vec_named(&RuntimeAdminEnvelope::AdminResult(RuntimeAdminResponse::ok(
-            result,
-        )))
+        rmp_serde::to_vec_named(&RuntimeAdminEnvelope::AdminResult(
+            RuntimeAdminResponse::ok(result),
+        ))
         .expect("encode runtime-admin response")
     }
 
@@ -2357,9 +2358,7 @@ mod tests {
                         stream
                             .write_all(&(body.len() as u32).to_le_bytes())
                             .expect("write response length");
-                        stream
-                            .write_all(&body)
-                            .expect("write response body");
+                        stream.write_all(&body).expect("write response body");
                         stream.flush().expect("flush response body");
                         return;
                     }
@@ -2387,9 +2386,7 @@ mod tests {
             .expect_err("plain file must not satisfy control socket readiness");
 
         assert!(
-            err.contains("control socket")
-                || err.contains("connectable")
-                || err.contains("socket"),
+            err.contains("control socket") || err.contains("connectable") || err.contains("socket"),
             "error should explain that the path was not a usable control socket: {err}"
         );
     }
@@ -2437,8 +2434,9 @@ mod tests {
         let bind_result = TcpListener::bind(&addrs[0]);
         clear_reserved_bind_addrs(&addrs);
 
-        bind_result
-            .expect_err("reserved bind addr must stay unavailable until cluster startup consumes it");
+        bind_result.expect_err(
+            "reserved bind addr must stay unavailable until cluster startup consumes it",
+        );
     }
 
     #[test]
@@ -2473,7 +2471,10 @@ mod tests {
             result.expect("cluster start should retry a retryable bind transport startup race"),
             "started"
         );
-        assert_eq!(attempts, 2, "retryable startup bind race should trigger one retry");
+        assert_eq!(
+            attempts, 2,
+            "retryable startup bind race should trigger one retry"
+        );
     }
 
     #[test]
@@ -2952,8 +2953,8 @@ mod tests {
             let live_dir = cluster_root.join("cluster-node-live");
             fs::create_dir_all(&live_dir).expect("create live dir");
             let socket_path = live_dir.join("core.sock");
-            let _listener = std::os::unix::net::UnixListener::bind(&socket_path)
-                .expect("bind live socket");
+            let _listener =
+                std::os::unix::net::UnixListener::bind(&socket_path).expect("bind live socket");
 
             cleanup_stale_cluster_artifacts_before_start().expect("cleanup cluster artifacts");
 

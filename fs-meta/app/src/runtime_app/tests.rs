@@ -129,6 +129,17 @@ fn fixed_bind_handoff_test_serial() -> &'static tokio::sync::Mutex<()> {
     CELL.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+pub(super) fn deferred_sink_owned_query_peer_publication_test_serial()
+-> &'static tokio::sync::Mutex<()> {
+    static CELL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    CELL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+pub(super) fn facade_deactivate_barrier_test_serial() -> &'static tokio::sync::Mutex<()> {
+    static CELL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    CELL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 include!("tests/external_worker_runtime_paths.rs");
 
 fn fs_meta_worker_module_path(path: &str) -> std::path::PathBuf {
@@ -1789,7 +1800,7 @@ fn trusted_root_selected_group_surviving_ready_cached_sink_status_outranks_regre
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
-            readiness: crate::sink::GroupReadinessState::Ready,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 9,
                 estimated_heap_bytes: 64,
             },
@@ -1806,7 +1817,7 @@ fn trusted_root_selected_group_surviving_ready_cached_sink_status_outranks_regre
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                readiness: crate::sink::GroupReadinessState::PendingAudit,
                 materialized_revision: 0,
                 estimated_heap_bytes: 0,
             },
@@ -1832,7 +1843,7 @@ fn trusted_root_selected_group_surviving_ready_cached_sink_status_outranks_regre
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
-            readiness: crate::sink::GroupReadinessState::Ready,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 9,
                 estimated_heap_bytes: 64,
             },
@@ -1849,7 +1860,7 @@ fn trusted_root_selected_group_surviving_ready_cached_sink_status_outranks_regre
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
-            readiness: crate::sink::GroupReadinessState::Ready,
+                readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 10,
                 estimated_heap_bytes: 64,
             },
@@ -2361,7 +2372,8 @@ fn current_facade_service_state_from_runtime_facts_requires_ready_publication_wi
 }
 
 #[test]
-fn control_gate_ready_from_runtime_facts_requires_initialized_or_facade_only_handoff_and_no_replay() {
+fn control_gate_ready_from_runtime_facts_requires_initialized_or_facade_only_handoff_and_no_replay()
+{
     assert_eq!(
         FSMetaApp::control_gate_ready_from_runtime_facts(
             RuntimeGateFacts {
@@ -2448,7 +2460,7 @@ fn facade_ready_tail_decision_allows_serving_after_facade_only_handoff_without_r
 
 #[test]
 fn facade_publication_readiness_decision_blocks_uninitialized_fixed_bind_handoff_while_suppressed_routes_remain()
-{
+ {
     assert_eq!(
         FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
             FacadePublicationReadinessDecisionInput {
@@ -2550,7 +2562,7 @@ fn fixed_bind_handoff_release_decision_blocks_non_control_pending_facade() {
 
 #[test]
 fn fixed_bind_handoff_release_decision_blocks_unconfirmed_control_route_while_suppressed_routes_remain()
-{
+ {
     assert_eq!(
         FSMetaApp::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
             handoff_ready_entry_present: true,
@@ -2582,7 +2594,7 @@ fn fixed_bind_handoff_release_decision_allows_confirmed_control_route_even_with_
 
 #[test]
 fn fixed_bind_handoff_release_decision_allows_unsuppressed_control_route_without_exposure_confirmation()
-{
+ {
     assert_eq!(
         FSMetaApp::fixed_bind_handoff_release_decision(FixedBindHandoffReleaseDecisionInput {
             handoff_ready_entry_present: true,
@@ -2597,8 +2609,196 @@ fn fixed_bind_handoff_release_decision_allows_unsuppressed_control_route_without
 }
 
 #[test]
-fn facade_publication_readiness_decision_requires_matching_active_control_stream_before_pending_control_route_is_ready()
+fn pending_fixed_bind_handoff_attempt_disposition_releases_active_owner_when_claim_conflict_is_confirmed()
+ {
+    assert_eq!(
+        FSMetaApp::pending_fixed_bind_handoff_attempt_disposition(
+            PendingFixedBindHandoffAttemptDecisionInput {
+                claim_conflict: true,
+                pending_runtime_exposure_confirmed: true,
+                active_owner_present: true,
+                conflicting_process_claim_owner_instance_id: Some(7),
+            },
+        ),
+        PendingFixedBindHandoffAttemptDisposition::ReleaseActiveOwner
+    );
+}
+
+#[test]
+fn pending_fixed_bind_handoff_attempt_disposition_releases_conflicting_process_claim_without_active_owner()
+ {
+    assert_eq!(
+        FSMetaApp::pending_fixed_bind_handoff_attempt_disposition(
+            PendingFixedBindHandoffAttemptDecisionInput {
+                claim_conflict: true,
+                pending_runtime_exposure_confirmed: true,
+                active_owner_present: false,
+                conflicting_process_claim_owner_instance_id: Some(11),
+            },
+        ),
+        PendingFixedBindHandoffAttemptDisposition::ReleaseConflictingProcessClaim {
+            owner_instance_id: 11,
+        }
+    );
+}
+
+#[test]
+fn pending_fixed_bind_handoff_attempt_disposition_blocks_without_runtime_exposure_confirmation() {
+    assert_eq!(
+        FSMetaApp::pending_fixed_bind_handoff_attempt_disposition(
+            PendingFixedBindHandoffAttemptDecisionInput {
+                claim_conflict: true,
+                pending_runtime_exposure_confirmed: false,
+                active_owner_present: true,
+                conflicting_process_claim_owner_instance_id: Some(7),
+            },
+        ),
+        PendingFixedBindHandoffAttemptDisposition::NoAttempt
+    );
+}
+
+#[test]
+fn pending_fixed_bind_handoff_completion_disposition_applies_ready_tail_once_pending_clears_and_control_stream_is_live()
+ {
+    assert_eq!(
+        FSMetaApp::pending_fixed_bind_handoff_completion_disposition(
+            PendingFixedBindHandoffCompletionDecisionInput {
+                pending_facade_present: false,
+                active_control_stream_present: true,
+                deadline_expired: false,
+            },
+        ),
+        PendingFixedBindHandoffCompletionDisposition::ApplyReadyTail
+    );
+}
+
+#[test]
+fn pending_fixed_bind_handoff_completion_disposition_aborts_after_deadline_when_completion_has_not_converged()
+ {
+    assert_eq!(
+        FSMetaApp::pending_fixed_bind_handoff_completion_disposition(
+            PendingFixedBindHandoffCompletionDecisionInput {
+                pending_facade_present: true,
+                active_control_stream_present: false,
+                deadline_expired: true,
+            },
+        ),
+        PendingFixedBindHandoffCompletionDisposition::Abort
+    );
+}
+
+#[test]
+fn pending_fixed_bind_handoff_completion_disposition_continues_polling_before_deadline_when_pending_or_control_stream_is_missing()
+ {
+    assert_eq!(
+        FSMetaApp::pending_fixed_bind_handoff_completion_disposition(
+            PendingFixedBindHandoffCompletionDecisionInput {
+                pending_facade_present: true,
+                active_control_stream_present: true,
+                deadline_expired: false,
+            },
+        ),
+        PendingFixedBindHandoffCompletionDisposition::ContinuePolling
+    );
+}
+
+#[test]
+fn facade_deactivate_continuity_disposition_retains_active_continuity_without_conflict_or_handoff_release()
+ {
+    assert_eq!(
+        FSMetaApp::facade_deactivate_continuity_disposition(
+            FacadeDeactivateContinuityDecisionInput {
+                retain_active_facade: true,
+                pending_fixed_bind_conflict: false,
+                release_for_fixed_bind_handoff: false,
+                retain_pending_spawn: false,
+            },
+        ),
+        FacadeDeactivateContinuityDisposition::RetainActiveContinuity
+    );
+}
+
+#[test]
+fn facade_deactivate_continuity_disposition_retains_active_facade_while_pending_fixed_bind_claim_conflict_remains()
+ {
+    assert_eq!(
+        FSMetaApp::facade_deactivate_continuity_disposition(
+            FacadeDeactivateContinuityDecisionInput {
+                retain_active_facade: true,
+                pending_fixed_bind_conflict: true,
+                release_for_fixed_bind_handoff: false,
+                retain_pending_spawn: false,
+            },
+        ),
+        FacadeDeactivateContinuityDisposition::RetainActiveWhilePendingFixedBindClaimConflict
+    );
+}
+
+#[test]
+fn facade_deactivate_continuity_disposition_retains_pending_facade_while_pending_fixed_bind_claim_conflict_remains()
+ {
+    assert_eq!(
+        FSMetaApp::facade_deactivate_continuity_disposition(
+            FacadeDeactivateContinuityDecisionInput {
+                retain_active_facade: false,
+                pending_fixed_bind_conflict: true,
+                release_for_fixed_bind_handoff: false,
+                retain_pending_spawn: false,
+            },
+        ),
+        FacadeDeactivateContinuityDisposition::RetainPendingWhilePendingFixedBindClaimConflict
+    );
+}
+
+#[test]
+fn facade_deactivate_continuity_disposition_releases_active_facade_for_fixed_bind_handoff() {
+    assert_eq!(
+        FSMetaApp::facade_deactivate_continuity_disposition(
+            FacadeDeactivateContinuityDecisionInput {
+                retain_active_facade: true,
+                pending_fixed_bind_conflict: false,
+                release_for_fixed_bind_handoff: true,
+                retain_pending_spawn: false,
+            },
+        ),
+        FacadeDeactivateContinuityDisposition::ReleaseActiveForFixedBindHandoff
+    );
+}
+
+#[test]
+fn facade_deactivate_continuity_disposition_retains_pending_facade_while_spawn_is_still_in_flight()
 {
+    assert_eq!(
+        FSMetaApp::facade_deactivate_continuity_disposition(
+            FacadeDeactivateContinuityDecisionInput {
+                retain_active_facade: false,
+                pending_fixed_bind_conflict: false,
+                release_for_fixed_bind_handoff: false,
+                retain_pending_spawn: true,
+            },
+        ),
+        FacadeDeactivateContinuityDisposition::RetainPendingWhileSpawnInFlight
+    );
+}
+
+#[test]
+fn facade_deactivate_continuity_disposition_shuts_down_when_no_continuity_lane_applies() {
+    assert_eq!(
+        FSMetaApp::facade_deactivate_continuity_disposition(
+            FacadeDeactivateContinuityDecisionInput {
+                retain_active_facade: false,
+                pending_fixed_bind_conflict: false,
+                release_for_fixed_bind_handoff: false,
+                retain_pending_spawn: false,
+            },
+        ),
+        FacadeDeactivateContinuityDisposition::Shutdown
+    );
+}
+
+#[test]
+fn facade_publication_readiness_decision_requires_matching_active_control_stream_before_pending_control_route_is_ready()
+ {
     assert_eq!(
         FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
             FacadePublicationReadinessDecisionInput {
@@ -2620,8 +2820,7 @@ fn facade_publication_readiness_decision_requires_matching_active_control_stream
 }
 
 #[test]
-fn facade_publication_readiness_decision_allows_facade_only_handoff_without_suppressed_routes()
-{
+fn facade_publication_readiness_decision_allows_facade_only_handoff_without_suppressed_routes() {
     assert_eq!(
         FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
             FacadePublicationReadinessDecisionInput {
@@ -2644,7 +2843,7 @@ fn facade_publication_readiness_decision_allows_facade_only_handoff_without_supp
 
 #[test]
 fn facade_publication_readiness_decision_allows_active_control_stream_during_fixed_bind_ready_tail_even_when_pending_facade_is_not_control_route()
-{
+ {
     assert_eq!(
         FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
             FacadePublicationReadinessDecisionInput {
@@ -2667,7 +2866,7 @@ fn facade_publication_readiness_decision_allows_active_control_stream_during_fix
 
 #[test]
 fn preferred_internal_query_endpoint_units_keeps_query_peer_as_fallback_when_both_query_lanes_are_active()
-{
+ {
     assert_eq!(
         preferred_internal_query_endpoint_units(true, true, false),
         vec![
@@ -2685,16 +2884,22 @@ fn classify_source_control_wave_disposition_detects_cleanup_only_uninitialized_f
     .expect("source signals");
 
     assert_eq!(
-        FSMetaApp::classify_source_control_wave_disposition(SourceControlWaveDecisionInput {
-            control_initialized_at_entry: false,
-            control_initialized_now: false,
-            source_state_replay_required: false,
-            cleanup_disposition: UninitializedCleanupDisposition::SourceOnly,
-            source_signals: &source_signals,
-            facade_claim_signals_present: false,
-            facade_publication_signals_present: false,
-            sink_signals_present: false,
-        }),
+        FSMetaApp::classify_source_control_wave_disposition(
+            ControlFrameWaveObservation {
+                control_initialized_at_entry: false,
+                control_initialized_now: false,
+                retained_sink_state_present_at_entry: false,
+                source_state_replay_required: false,
+                sink_state_replay_required: false,
+                sink_tick_fast_path_eligible: false,
+                cleanup_disposition: UninitializedCleanupDisposition::SourceOnly,
+                facade_claim_signals_present: false,
+                facade_publication_signals_present: false,
+                source_signals_present: !source_signals.is_empty(),
+                sink_signals_present: false,
+            },
+            &source_signals
+        ),
         SourceControlWaveDisposition::CleanupOnlyWhileUninitialized
     );
 }
@@ -2708,14 +2913,12 @@ fn classify_uninitialized_cleanup_disposition_detects_facade_only_cleanup_wave()
     .expect("split facade cleanup-only signals");
 
     assert_eq!(
-        FSMetaApp::classify_uninitialized_cleanup_disposition(
-            UninitializedCleanupDecisionInput {
-                control_initialized_now: false,
-                source_signals: &[],
-                sink_signals: &[],
-                facade_signals: &facade_signals,
-            },
-        ),
+        FSMetaApp::classify_uninitialized_cleanup_disposition(UninitializedCleanupDecisionInput {
+            control_initialized_now: false,
+            source_signals: &[],
+            sink_signals: &[],
+            facade_signals: &facade_signals,
+        },),
         UninitializedCleanupDisposition::FacadeOnly
     );
 }
@@ -2735,14 +2938,12 @@ fn classify_uninitialized_cleanup_disposition_detects_source_only_cleanup_wave()
         .expect("split source cleanup-only signals");
 
     assert_eq!(
-        FSMetaApp::classify_uninitialized_cleanup_disposition(
-            UninitializedCleanupDecisionInput {
-                control_initialized_now: false,
-                source_signals: &source_signals,
-                sink_signals: &[],
-                facade_signals: &[],
-            },
-        ),
+        FSMetaApp::classify_uninitialized_cleanup_disposition(UninitializedCleanupDecisionInput {
+            control_initialized_now: false,
+            source_signals: &source_signals,
+            sink_signals: &[],
+            facade_signals: &[],
+        },),
         UninitializedCleanupDisposition::SourceOnly
     );
 }
@@ -2757,14 +2958,12 @@ fn classify_uninitialized_cleanup_disposition_detects_sink_query_only_cleanup_wa
     .expect("split sink query cleanup-only signals");
 
     assert_eq!(
-        FSMetaApp::classify_uninitialized_cleanup_disposition(
-            UninitializedCleanupDecisionInput {
-                control_initialized_now: false,
-                source_signals: &[],
-                sink_signals: &sink_signals,
-                facade_signals: &[],
-            },
-        ),
+        FSMetaApp::classify_uninitialized_cleanup_disposition(UninitializedCleanupDecisionInput {
+            control_initialized_now: false,
+            source_signals: &[],
+            sink_signals: &sink_signals,
+            facade_signals: &[],
+        },),
         UninitializedCleanupDisposition::SinkOnly { query_only: true }
     );
 }
@@ -2834,16 +3033,22 @@ fn classify_source_control_wave_disposition_detects_steady_tick_noop() {
         .expect("source tick signals");
 
     assert_eq!(
-        FSMetaApp::classify_source_control_wave_disposition(SourceControlWaveDecisionInput {
-            control_initialized_at_entry: true,
-            control_initialized_now: true,
-            source_state_replay_required: false,
-            cleanup_disposition: UninitializedCleanupDisposition::None,
-            source_signals: &source_signals,
-            facade_claim_signals_present: false,
-            facade_publication_signals_present: false,
-            sink_signals_present: false,
-        }),
+        FSMetaApp::classify_source_control_wave_disposition(
+            ControlFrameWaveObservation {
+                control_initialized_at_entry: true,
+                control_initialized_now: true,
+                retained_sink_state_present_at_entry: false,
+                source_state_replay_required: false,
+                sink_state_replay_required: false,
+                sink_tick_fast_path_eligible: false,
+                cleanup_disposition: UninitializedCleanupDisposition::None,
+                facade_claim_signals_present: false,
+                facade_publication_signals_present: false,
+                source_signals_present: !source_signals.is_empty(),
+                sink_signals_present: false,
+            },
+            &source_signals
+        ),
         SourceControlWaveDisposition::SteadyTickNoop
     );
 }
@@ -2851,16 +3056,22 @@ fn classify_source_control_wave_disposition_detects_steady_tick_noop() {
 #[test]
 fn classify_source_control_wave_disposition_detects_replay_retained() {
     assert_eq!(
-        FSMetaApp::classify_source_control_wave_disposition(SourceControlWaveDecisionInput {
-            control_initialized_at_entry: true,
-            control_initialized_now: true,
-            source_state_replay_required: true,
-            cleanup_disposition: UninitializedCleanupDisposition::None,
-            source_signals: &[],
-            facade_claim_signals_present: false,
-            facade_publication_signals_present: false,
-            sink_signals_present: false,
-        }),
+        FSMetaApp::classify_source_control_wave_disposition(
+            ControlFrameWaveObservation {
+                control_initialized_at_entry: true,
+                control_initialized_now: true,
+                retained_sink_state_present_at_entry: false,
+                source_state_replay_required: true,
+                sink_state_replay_required: false,
+                sink_tick_fast_path_eligible: false,
+                cleanup_disposition: UninitializedCleanupDisposition::None,
+                facade_claim_signals_present: false,
+                facade_publication_signals_present: false,
+                source_signals_present: false,
+                sink_signals_present: false,
+            },
+            &[]
+        ),
         SourceControlWaveDisposition::ReplayRetained
     );
 }
@@ -2874,19 +3085,23 @@ fn classify_sink_control_wave_disposition_detects_initial_mixed_wave_before_sour
         .expect("sink signals");
 
     assert_eq!(
-        FSMetaApp::classify_sink_control_wave_disposition(SinkControlWaveDecisionInput {
-            control_initialized_at_entry: false,
-            control_initialized_now: false,
-            retained_sink_state_present_at_entry: false,
-            sink_state_replay_required: false,
-            sink_tick_fast_path_eligible: false,
-            cleanup_disposition: UninitializedCleanupDisposition::None,
-            source_wave_disposition: SourceControlWaveDisposition::ApplySignals,
-            source_signals_present: true,
-            facade_claim_signals_present: false,
-            facade_publication_signals_present: false,
-            sink_signals: &sink_signals,
-        }),
+        FSMetaApp::classify_sink_control_wave_disposition(
+            ControlFrameWaveObservation {
+                control_initialized_at_entry: false,
+                control_initialized_now: false,
+                retained_sink_state_present_at_entry: false,
+                source_state_replay_required: false,
+                sink_state_replay_required: false,
+                sink_tick_fast_path_eligible: false,
+                cleanup_disposition: UninitializedCleanupDisposition::None,
+                source_signals_present: true,
+                facade_claim_signals_present: false,
+                facade_publication_signals_present: false,
+                sink_signals_present: !sink_signals.is_empty(),
+            },
+            SourceControlWaveDisposition::ApplySignals,
+            &sink_signals
+        ),
         SinkControlWaveDisposition::ApplyBeforeInitialSourceWave
     );
 }
@@ -2901,19 +3116,23 @@ fn classify_sink_control_wave_disposition_marks_tick_recovery_apply_waiting_for_
         .expect("sink tick signals");
 
     assert_eq!(
-        FSMetaApp::classify_sink_control_wave_disposition(SinkControlWaveDecisionInput {
-            control_initialized_at_entry: true,
-            control_initialized_now: true,
-            retained_sink_state_present_at_entry: true,
-            sink_state_replay_required: false,
-            sink_tick_fast_path_eligible: false,
-            cleanup_disposition: UninitializedCleanupDisposition::None,
-            source_wave_disposition: SourceControlWaveDisposition::Idle,
-            source_signals_present: false,
-            facade_claim_signals_present: false,
-            facade_publication_signals_present: false,
-            sink_signals: &sink_signals,
-        }),
+        FSMetaApp::classify_sink_control_wave_disposition(
+            ControlFrameWaveObservation {
+                control_initialized_at_entry: true,
+                control_initialized_now: true,
+                retained_sink_state_present_at_entry: true,
+                source_state_replay_required: false,
+                sink_state_replay_required: false,
+                sink_tick_fast_path_eligible: false,
+                cleanup_disposition: UninitializedCleanupDisposition::None,
+                source_signals_present: false,
+                facade_claim_signals_present: false,
+                facade_publication_signals_present: false,
+                sink_signals_present: !sink_signals.is_empty(),
+            },
+            SourceControlWaveDisposition::Idle,
+            &sink_signals
+        ),
         SinkControlWaveDisposition::ApplySignals {
             wait_for_status_republish_after_apply: true,
         }
@@ -3037,7 +3256,7 @@ async fn published_facade_service_state_tracks_runtime_pending_activation_withou
 
 #[tokio::test]
 async fn facade_publication_ready_requires_active_control_stream_when_pending_facade_is_not_control_route()
-{
+ {
     let tmp = tempdir().expect("create temp dir");
     let mount = tmp.path().join("root-a");
     fs::create_dir_all(&mount).expect("create mount");
@@ -4574,7 +4793,8 @@ async fn try_spawn_pending_facade_same_resource_generation_refresh_keeps_publish
         handle: existing,
     });
     app.control_initialized.store(true, Ordering::Release);
-    app.sink_state_replay_required.store(true, Ordering::Release);
+    app.sink_state_replay_required
+        .store(true, Ordering::Release);
     app.api_control_gate.set_ready(true);
     *app.pending_facade.lock().await = Some(PendingFacadeActivation {
         route_key: facade_control_stream_route(),
@@ -9828,6 +10048,8 @@ async fn pending_fixed_bind_facade_claim_keeps_successor_not_ready_until_publica
 #[tokio::test]
 async fn pending_fixed_bind_facade_claim_survives_later_facade_deactivate_followup_until_publication_can_complete()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -11797,7 +12019,7 @@ async fn pending_fixed_bind_release_does_not_overwrite_pending_facade_state_with
 
 #[tokio::test]
 async fn pending_fixed_bind_release_reopens_control_gate_when_non_control_pending_reappears_before_handoff_completion()
-{
+ {
     let _serial = fixed_bind_handoff_test_serial().lock().await;
     struct ProcessFacadeClaimReset;
     struct PendingFixedBindHandoffCompletionGateReopenPauseHookReset;
@@ -12021,7 +12243,7 @@ async fn pending_fixed_bind_release_reopens_control_gate_when_non_control_pendin
 
 #[tokio::test]
 async fn pending_fixed_bind_release_keeps_facade_unavailable_when_active_control_stream_disappears_before_handoff_completion()
-{
+ {
     let _serial = fixed_bind_handoff_test_serial().lock().await;
     struct ProcessFacadeClaimReset;
     struct PendingFixedBindHandoffCompletionGateReopenPauseHookReset;
@@ -12183,12 +12405,10 @@ async fn pending_fixed_bind_release_keeps_facade_unavailable_when_active_control
         .await
         .expect("fixed-bind handoff completion must reach the gate-reopen pause");
 
-    let successor_active = successor
-        .api_task
-        .lock()
-        .await
-        .take()
-        .expect("precondition: handoff completion must have an active control stream before pause");
+    let successor_active =
+        successor.api_task.lock().await.take().expect(
+            "precondition: handoff completion must have an active control stream before pause",
+        );
     successor
         .facade_service_state
         .write()
@@ -12881,6 +13101,8 @@ async fn pending_fixed_bind_claim_suppresses_sink_owned_facade_dependent_query_r
 #[tokio::test]
 async fn retained_predecessor_fixed_bind_facade_deactivate_keeps_source_status_route_live_until_successor_claims_bind()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -14406,7 +14628,10 @@ async fn released_predecessor_fixed_bind_claim_mixed_followup_replays_suppressed
     assert!(
         successor
             .facade_gate
-            .route_active(execution_units::QUERY_PEER_RUNTIME_UNIT_ID, &source_find_route)
+            .route_active(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                &source_find_route
+            )
             .expect("query-peer source-find route state after mixed followup"),
         "mixed followup should replay the previously suppressed query-peer source-find route once fixed-bind publication completes"
     );
@@ -30498,6 +30723,10 @@ async fn peer_only_internal_query_routes_mirror_query_lane_activation_after_turn
 
 #[tokio::test]
 async fn deferred_sink_owned_query_peer_publication_restores_peer_first_mirror_after_suppression() {
+    let _serial = deferred_sink_owned_query_peer_publication_test_serial()
+        .lock()
+        .await;
+
     let app = FSMetaApp::with_boundaries(
         FSMetaConfig::default(),
         NodeId("node-c-29776147311333818169819137".into()),
@@ -30784,8 +31013,8 @@ async fn uninitialized_sink_query_cleanup_clears_source_query_routes_left_active
 }
 
 #[tokio::test]
-async fn uninitialized_sink_query_cleanup_followup_does_not_wait_for_inflight_source_control_handoff(
-) {
+async fn uninitialized_sink_query_cleanup_followup_does_not_wait_for_inflight_source_control_handoff()
+ {
     let app = Arc::new(
         FSMetaApp::with_boundaries(
             FSMetaConfig::default(),
@@ -30875,8 +31104,8 @@ async fn uninitialized_sink_query_cleanup_followup_does_not_wait_for_inflight_so
 }
 
 #[tokio::test]
-async fn uninitialized_cleanup_only_facade_deactivate_does_not_wait_for_inflight_shared_control_handoff(
-) {
+async fn uninitialized_cleanup_only_facade_deactivate_does_not_wait_for_inflight_shared_control_handoff()
+ {
     let app = Arc::new(
         FSMetaApp::with_boundaries(
             FSMetaConfig::default(),

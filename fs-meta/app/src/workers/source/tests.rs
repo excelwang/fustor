@@ -11,9 +11,9 @@ use capanix_app_sdk::runtime::{
 };
 use capanix_app_sdk::worker::WorkerMode;
 use capanix_runtime_entry_sdk::control::{
-    RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate,
-    RuntimeHostDescriptor, RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState,
-    RuntimeHostObjectType, RuntimeObjectDescriptor, RuntimeUnitTick, encode_runtime_exec_control,
+    RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeHostDescriptor,
+    RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState, RuntimeHostObjectType,
+    RuntimeObjectDescriptor, RuntimeUnitTick, encode_runtime_exec_control,
     encode_runtime_host_grant_change, encode_runtime_unit_tick,
 };
 use capanix_runtime_entry_sdk::worker_runtime::{
@@ -914,8 +914,8 @@ fn merge_non_empty_cached_groups_preserves_explicit_empty_node_groups_in_live_sn
 }
 
 #[test]
-fn normalize_node_groups_key_preserves_explicit_empty_groups_when_instance_suffix_collapses_to_stable_host_ref(
-) {
+fn normalize_node_groups_key_preserves_explicit_empty_groups_when_instance_suffix_collapses_to_stable_host_ref()
+ {
     let mut groups_by_node = std::collections::BTreeMap::from([
         (
             "node-b".to_string(),
@@ -941,8 +941,8 @@ fn normalize_node_groups_key_preserves_explicit_empty_groups_when_instance_suffi
 }
 
 #[test]
-fn normalize_observability_snapshot_scheduled_group_keys_preserves_explicit_empty_groups_for_cached_stable_host_ref(
-) {
+fn normalize_observability_snapshot_scheduled_group_keys_preserves_explicit_empty_groups_for_cached_stable_host_ref()
+ {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -1019,8 +1019,11 @@ fn merge_cached_local_scheduled_groups_preserves_explicit_empty_live_groups_for_
         vec!["nfs1".to_string(), "nfs2".to_string()],
     )]));
 
-    let merged =
-        merge_cached_local_scheduled_groups(&node_id, Some(std::collections::BTreeSet::new()), &cached);
+    let merged = merge_cached_local_scheduled_groups(
+        &node_id,
+        Some(std::collections::BTreeSet::new()),
+        &cached,
+    );
 
     assert_eq!(
         merged,
@@ -1031,7 +1034,7 @@ fn merge_cached_local_scheduled_groups_preserves_explicit_empty_live_groups_for_
 
 #[test]
 fn merge_cached_local_scheduled_groups_preserves_explicit_empty_live_groups_without_cached_fallback()
-{
+ {
     let node_id = NodeId("node-b".to_string());
 
     let merged = merge_cached_local_scheduled_groups(
@@ -5386,7 +5389,7 @@ async fn tick_only_followup_skips_external_worker_ipc_when_retained_active_route
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tick_only_followup_replays_retained_activates_before_forwarding_same_generation_tick_to_fresh_worker()
-{
+ {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -6812,11 +6815,9 @@ async fn generation_two_real_source_route_post_ack_schedule_refresh_schedule_rpc
     let _reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
     install_source_worker_scheduled_groups_refresh_error_queue_hook(
         SourceWorkerScheduledGroupsRefreshErrorQueueHook {
-            errs: std::iter::repeat_with(|| {
-                CnxError::PeerError("operation timed out".to_string())
-            })
-            .take(50_000)
-            .collect(),
+            errs: std::iter::repeat_with(|| CnxError::PeerError("operation timed out".to_string()))
+                .take(50_000)
+                .collect(),
             sticky_worker_instance_id: None,
             sticky_peer_err: None,
         },
@@ -9031,8 +9032,7 @@ async fn external_source_worker_nonblocking_observability_preserves_scheduled_gr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn nonblocking_observability_reissues_live_rpc_when_recent_cache_is_active_but_debug_empty()
-{
+async fn nonblocking_observability_reissues_live_rpc_when_recent_cache_is_active_but_debug_empty() {
     let _hook_reset = SourceWorkerObservabilityCallCountHookReset;
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
@@ -9108,8 +9108,7 @@ async fn nonblocking_observability_reissues_live_rpc_when_recent_cache_is_active
         Some(&vec!["nfs1".to_string(), "nfs2".to_string()])
     );
     assert!(
-        live
-            .last_control_frame_signals_by_node
+        live.last_control_frame_signals_by_node
             .get("node-a")
             .is_some_and(|signals| !signals.is_empty()),
         "live snapshot should carry accepted control summary before cache corruption: {:?}",
@@ -9163,6 +9162,136 @@ async fn nonblocking_observability_reissues_live_rpc_when_recent_cache_is_active
             .is_some_and(|signals| !signals.is_empty()),
         "nonblocking observability must reject active-but-debug-empty recent cache for control summary: {:?}",
         nonblocking.last_control_frame_signals_by_node
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nonblocking_observability_accepts_recent_active_cache_when_only_force_find_observability_remains()
+ {
+    let _hook_reset = SourceWorkerObservabilityCallCountHookReset;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: vec![
+            worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+            worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    let live = client
+        .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+        .await
+        .expect("prime complete live observability snapshot");
+    assert!(
+        source_observability_snapshot_has_active_state(&live),
+        "live snapshot must be active before recent-cache force-find preservation is checked"
+    );
+
+    let mut later_live = live.clone();
+    later_live.scheduled_source_groups_by_node.clear();
+    later_live.scheduled_scan_groups_by_node.clear();
+    later_live.last_control_frame_signals_by_node.clear();
+    later_live.published_batches_by_node.clear();
+    later_live.published_events_by_node.clear();
+    later_live.published_control_events_by_node.clear();
+    later_live.published_data_events_by_node.clear();
+    later_live.last_published_at_us_by_node.clear();
+    later_live.last_published_origins_by_node.clear();
+    later_live.published_origin_counts_by_node.clear();
+    later_live.published_path_capture_target = None;
+    later_live.enqueued_path_origin_counts_by_node.clear();
+    later_live.pending_path_origin_counts_by_node.clear();
+    later_live.yielded_path_origin_counts_by_node.clear();
+    later_live.summarized_path_origin_counts_by_node.clear();
+    later_live.published_path_origin_counts_by_node.clear();
+    later_live.last_force_find_runner_by_group =
+        std::collections::BTreeMap::from([("nfs1".to_string(), "node-a::nfs1".to_string())]);
+    later_live.force_find_inflight_groups = vec!["nfs1".to_string()];
+
+    client.update_cached_observability_snapshot(&live);
+    client.update_cached_observability_snapshot(&later_live);
+
+    let observability_rpc_count = Arc::new(AtomicUsize::new(0));
+    install_source_worker_observability_call_count_hook(SourceWorkerObservabilityCallCountHook {
+        count: observability_rpc_count.clone(),
+    });
+
+    let nonblocking = client.observability_snapshot_nonblocking().await;
+
+    assert_eq!(
+        observability_rpc_count.load(Ordering::Relaxed),
+        0,
+        "recent active cache with only force-find observability should not be treated like a debug-empty cache that forces a live RPC"
+    );
+    assert_eq!(
+        nonblocking.last_force_find_runner_by_group.get("nfs1"),
+        Some(&"node-a::nfs1".to_string()),
+        "recent active cache must preserve last force-find runner when it is the only remaining observability truth: {:?}",
+        nonblocking
+    );
+    assert_eq!(
+        nonblocking.force_find_inflight_groups,
+        vec!["nfs1".to_string()],
+        "recent active cache must preserve force-find inflight groups when they are the only remaining observability truth: {:?}",
+        nonblocking
     );
 
     client.close().await.expect("close source worker");
@@ -9250,18 +9379,12 @@ async fn recent_live_cache_preserves_last_control_summary_when_later_active_snap
 
     let mut later_live = first_live.clone();
     later_live.last_control_frame_signals_by_node.clear();
-    later_live.published_batches_by_node = std::collections::BTreeMap::from([(
-        "node-a".to_string(),
-        6,
-    )]);
-    later_live.published_events_by_node = std::collections::BTreeMap::from([(
-        "node-a".to_string(),
-        6,
-    )]);
-    later_live.published_control_events_by_node = std::collections::BTreeMap::from([(
-        "node-a".to_string(),
-        6,
-    )]);
+    later_live.published_batches_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 6)]);
+    later_live.published_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 6)]);
+    later_live.published_control_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 6)]);
 
     client.update_cached_observability_snapshot(&first_live);
     client.update_cached_observability_snapshot(&later_live);
@@ -9370,18 +9493,12 @@ async fn recent_live_cache_preserves_scheduled_groups_when_later_active_snapshot
     later_live.scheduled_source_groups_by_node.clear();
     later_live.scheduled_scan_groups_by_node.clear();
     later_live.last_control_frame_signals_by_node.clear();
-    later_live.published_batches_by_node = std::collections::BTreeMap::from([(
-        "node-a".to_string(),
-        6,
-    )]);
-    later_live.published_events_by_node = std::collections::BTreeMap::from([(
-        "node-a".to_string(),
-        6,
-    )]);
-    later_live.published_control_events_by_node = std::collections::BTreeMap::from([(
-        "node-a".to_string(),
-        6,
-    )]);
+    later_live.published_batches_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 6)]);
+    later_live.published_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 6)]);
+    later_live.published_control_events_by_node =
+        std::collections::BTreeMap::from([("node-a".to_string(), 6)]);
 
     client.update_cached_observability_snapshot(&first_live);
     client.update_cached_observability_snapshot(&later_live);
@@ -9410,7 +9527,7 @@ async fn recent_live_cache_preserves_scheduled_groups_when_later_active_snapshot
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_inflight_nonblocking_observability_preserves_published_maps_when_later_active_snapshot_omits_them()
-{
+ {
     let boundary = Arc::new(LoopbackWorkerBoundary::default());
     let state_boundary = in_memory_state_boundary();
     let worker_socket_dir = worker_socket_tempdir();
@@ -9506,10 +9623,8 @@ async fn control_inflight_nonblocking_observability_preserves_published_maps_whe
     later_live.yielded_path_origin_counts_by_node.clear();
     later_live.summarized_path_origin_counts_by_node.clear();
     later_live.published_path_origin_counts_by_node.clear();
-    later_live.last_force_find_runner_by_group = std::collections::BTreeMap::from([(
-        "nfs1".to_string(),
-        "node-a::nfs1".to_string(),
-    )]);
+    later_live.last_force_find_runner_by_group =
+        std::collections::BTreeMap::from([("nfs1".to_string(), "node-a::nfs1".to_string())]);
 
     client.update_cached_observability_snapshot(&first_live);
     client.update_cached_observability_snapshot(&later_live);
@@ -9554,13 +9669,19 @@ async fn control_inflight_nonblocking_observability_preserves_published_maps_whe
     );
     assert_eq!(
         degraded.last_published_origins_by_node.get("node-a"),
-        Some(&vec!["node-a::nfs1".to_string(), "node-a::nfs2".to_string()]),
+        Some(&vec![
+            "node-a::nfs1".to_string(),
+            "node-a::nfs2".to_string()
+        ]),
         "cached fallback must preserve last_published_origins when a later active snapshot omits them: {:?}",
         degraded
     );
     assert_eq!(
         degraded.published_origin_counts_by_node.get("node-a"),
-        Some(&vec!["node-a::nfs1=4".to_string(), "node-a::nfs2=5".to_string()]),
+        Some(&vec![
+            "node-a::nfs1=4".to_string(),
+            "node-a::nfs2=5".to_string()
+        ]),
         "cached fallback must preserve published_origin_counts when a later active snapshot omits them: {:?}",
         degraded
     );
@@ -9578,8 +9699,7 @@ async fn control_inflight_nonblocking_observability_preserves_published_maps_whe
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn recent_live_cache_preserves_published_observability_when_later_active_snapshot_omits_it()
-{
+async fn recent_live_cache_preserves_published_observability_when_later_active_snapshot_omits_it() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -9742,13 +9862,19 @@ async fn recent_live_cache_preserves_published_observability_when_later_active_s
     );
     assert_eq!(
         nonblocking.last_published_origins_by_node.get("node-a"),
-        Some(&vec!["node-a::nfs1".to_string(), "node-a::nfs2".to_string()]),
+        Some(&vec![
+            "node-a::nfs1".to_string(),
+            "node-a::nfs2".to_string()
+        ]),
         "recent live cache must preserve last_published_origins when a later active snapshot omits them: {:?}",
         nonblocking
     );
     assert_eq!(
         nonblocking.published_origin_counts_by_node.get("node-a"),
-        Some(&vec!["node-a::nfs1=4".to_string(), "node-a::nfs2=5".to_string()]),
+        Some(&vec![
+            "node-a::nfs1=4".to_string(),
+            "node-a::nfs2=5".to_string()
+        ]),
         "recent live cache must preserve published_origin_counts when a later active snapshot omits them: {:?}",
         nonblocking
     );
@@ -9802,9 +9928,222 @@ fn published_path_capture_target_only_snapshot_is_not_debug_maps_absent() {
     );
 }
 
+#[test]
+fn force_find_observability_only_snapshot_is_not_debug_maps_absent() {
+    let snapshot = SourceObservabilitySnapshot {
+        lifecycle_state: "ready".to_string(),
+        host_object_grants_version: 0,
+        grants: Vec::new(),
+        logical_roots: Vec::new(),
+        status: SourceStatusSnapshot::default(),
+        source_primary_by_group: std::collections::BTreeMap::new(),
+        last_force_find_runner_by_group: std::collections::BTreeMap::from([(
+            "nfs1".to_string(),
+            "node-a::nfs1".to_string(),
+        )]),
+        force_find_inflight_groups: vec!["nfs1".to_string()],
+        scheduled_source_groups_by_node: std::collections::BTreeMap::new(),
+        scheduled_scan_groups_by_node: std::collections::BTreeMap::new(),
+        last_control_frame_signals_by_node: std::collections::BTreeMap::new(),
+        published_batches_by_node: std::collections::BTreeMap::new(),
+        published_events_by_node: std::collections::BTreeMap::new(),
+        published_control_events_by_node: std::collections::BTreeMap::new(),
+        published_data_events_by_node: std::collections::BTreeMap::new(),
+        last_published_at_us_by_node: std::collections::BTreeMap::new(),
+        last_published_origins_by_node: std::collections::BTreeMap::new(),
+        published_origin_counts_by_node: std::collections::BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        pending_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        yielded_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        summarized_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        published_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+    };
+
+    assert!(
+        !source_observability_snapshot_debug_maps_absent(&snapshot),
+        "force-find runner/inflight observability should count as debug-map evidence instead of being treated like a debug-empty snapshot: {snapshot:?}"
+    );
+}
+
+#[test]
+fn force_find_observability_only_snapshot_counts_as_active_state() {
+    let snapshot = SourceObservabilitySnapshot {
+        lifecycle_state: "ready".to_string(),
+        host_object_grants_version: 0,
+        grants: Vec::new(),
+        logical_roots: Vec::new(),
+        status: SourceStatusSnapshot::default(),
+        source_primary_by_group: std::collections::BTreeMap::new(),
+        last_force_find_runner_by_group: std::collections::BTreeMap::from([(
+            "nfs1".to_string(),
+            "node-a::nfs1".to_string(),
+        )]),
+        force_find_inflight_groups: vec!["nfs1".to_string()],
+        scheduled_source_groups_by_node: std::collections::BTreeMap::new(),
+        scheduled_scan_groups_by_node: std::collections::BTreeMap::new(),
+        last_control_frame_signals_by_node: std::collections::BTreeMap::new(),
+        published_batches_by_node: std::collections::BTreeMap::new(),
+        published_events_by_node: std::collections::BTreeMap::new(),
+        published_control_events_by_node: std::collections::BTreeMap::new(),
+        published_data_events_by_node: std::collections::BTreeMap::new(),
+        last_published_at_us_by_node: std::collections::BTreeMap::new(),
+        last_published_origins_by_node: std::collections::BTreeMap::new(),
+        published_origin_counts_by_node: std::collections::BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        pending_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        yielded_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        summarized_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        published_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+    };
+
+    assert!(
+        source_observability_snapshot_has_active_state(&snapshot),
+        "force-find runner/inflight observability should count as active-state truth so omission-thin live snapshots can preserve control/published facts: {snapshot:?}"
+    );
+}
+
+#[test]
+fn merge_live_observability_snapshot_with_recent_cache_preserves_recent_control_and_published_observability_when_live_reply_omits_them()
+ {
+    let live = SourceObservabilitySnapshot {
+        lifecycle_state: "ready".to_string(),
+        host_object_grants_version: 0,
+        grants: Vec::new(),
+        logical_roots: Vec::new(),
+        status: SourceStatusSnapshot {
+            current_stream_generation: Some(7),
+            ..SourceStatusSnapshot::default()
+        },
+        source_primary_by_group: std::collections::BTreeMap::new(),
+        last_force_find_runner_by_group: std::collections::BTreeMap::from([(
+            "nfs1".to_string(),
+            "node-a::nfs1".to_string(),
+        )]),
+        force_find_inflight_groups: vec!["nfs1".to_string()],
+        scheduled_source_groups_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        scheduled_scan_groups_by_node: std::collections::BTreeMap::new(),
+        last_control_frame_signals_by_node: std::collections::BTreeMap::new(),
+        published_batches_by_node: std::collections::BTreeMap::new(),
+        published_events_by_node: std::collections::BTreeMap::new(),
+        published_control_events_by_node: std::collections::BTreeMap::new(),
+        published_data_events_by_node: std::collections::BTreeMap::new(),
+        last_published_at_us_by_node: std::collections::BTreeMap::new(),
+        last_published_origins_by_node: std::collections::BTreeMap::new(),
+        published_origin_counts_by_node: std::collections::BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        pending_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        yielded_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        summarized_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+        published_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+    };
+    let cache = SourceWorkerSnapshotCache {
+        lifecycle_state: Some("ready".to_string()),
+        status: Some(live.status.clone()),
+        last_control_frame_signals_by_node: Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["activate unit=runtime.exec.source".to_string()],
+        )])),
+        published_batches_by_node: Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            4,
+        )])),
+        published_events_by_node: Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            9,
+        )])),
+        published_control_events_by_node: Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            4,
+        )])),
+        published_data_events_by_node: Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            5,
+        )])),
+        last_published_at_us_by_node: Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            123_456,
+        )])),
+        last_published_origins_by_node: Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["node-a::nfs1".to_string(), "node-a::nfs2".to_string()],
+        )])),
+        published_origin_counts_by_node: Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["node-a::nfs1=4".to_string(), "node-a::nfs2=5".to_string()],
+        )])),
+        published_path_capture_target: Some("/force-find-stress".to_string()),
+        ..SourceWorkerSnapshotCache::default()
+    };
+
+    let merged = merge_live_observability_snapshot_with_recent_cache(&cache, &live);
+
+    assert_eq!(
+        merged.last_control_frame_signals_by_node.get("node-a"),
+        Some(&vec!["activate unit=runtime.exec.source".to_string()]),
+        "successful live omission-thin snapshots must preserve recent control summary instead of dropping to empty: {merged:?}"
+    );
+    assert_eq!(
+        merged.published_batches_by_node.get("node-a"),
+        Some(&4),
+        "successful live omission-thin snapshots must preserve recent published batch counters instead of dropping them: {merged:?}"
+    );
+    assert_eq!(
+        merged.published_events_by_node.get("node-a"),
+        Some(&9),
+        "successful live omission-thin snapshots must preserve recent published event counters instead of dropping them: {merged:?}"
+    );
+    assert_eq!(
+        merged.published_control_events_by_node.get("node-a"),
+        Some(&4),
+        "successful live omission-thin snapshots must preserve recent published control-event counters instead of dropping them: {merged:?}"
+    );
+    assert_eq!(
+        merged.published_data_events_by_node.get("node-a"),
+        Some(&5),
+        "successful live omission-thin snapshots must preserve recent published data-event counters instead of dropping them: {merged:?}"
+    );
+    assert_eq!(
+        merged.last_published_at_us_by_node.get("node-a"),
+        Some(&123_456),
+        "successful live omission-thin snapshots must preserve last_published_at_us instead of dropping it: {merged:?}"
+    );
+    assert_eq!(
+        merged.last_published_origins_by_node.get("node-a"),
+        Some(&vec![
+            "node-a::nfs1".to_string(),
+            "node-a::nfs2".to_string()
+        ]),
+        "successful live omission-thin snapshots must preserve last_published_origins instead of dropping them: {merged:?}"
+    );
+    assert_eq!(
+        merged.published_origin_counts_by_node.get("node-a"),
+        Some(&vec![
+            "node-a::nfs1=4".to_string(),
+            "node-a::nfs2=5".to_string()
+        ]),
+        "successful live omission-thin snapshots must preserve published_origin_counts instead of dropping them: {merged:?}"
+    );
+    assert_eq!(
+        merged.published_path_capture_target.as_deref(),
+        Some("/force-find-stress"),
+        "successful live omission-thin snapshots must preserve published_path_capture_target instead of dropping it: {merged:?}"
+    );
+    assert_eq!(
+        merged.last_force_find_runner_by_group.get("nfs1"),
+        Some(&"node-a::nfs1".to_string()),
+        "preserving recent control/published observability must not roll back stronger live force-find facts"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recent_live_cache_preserves_published_observability_when_later_live_snapshot_only_has_recovered_schedule_and_control_state()
-{
+ {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -9956,7 +10295,9 @@ async fn recent_live_cache_preserves_published_observability_when_later_live_sna
     );
     assert_eq!(
         nonblocking.last_control_frame_signals_by_node.get("node-a"),
-        Some(&vec!["recovered activate unit=runtime.exec.source".to_string()]),
+        Some(&vec![
+            "recovered activate unit=runtime.exec.source".to_string()
+        ]),
         "recent live cache must keep recovered control summary from the later live snapshot: {:?}",
         nonblocking
     );
@@ -9992,13 +10333,19 @@ async fn recent_live_cache_preserves_published_observability_when_later_live_sna
     );
     assert_eq!(
         nonblocking.last_published_origins_by_node.get("node-a"),
-        Some(&vec!["node-a::nfs1".to_string(), "node-a::nfs2".to_string()]),
+        Some(&vec![
+            "node-a::nfs1".to_string(),
+            "node-a::nfs2".to_string()
+        ]),
         "recent live cache must preserve last_published_origins when a later live snapshot only keeps recovered schedule/control truth: {:?}",
         nonblocking
     );
     assert_eq!(
         nonblocking.published_origin_counts_by_node.get("node-a"),
-        Some(&vec!["node-a::nfs1=4".to_string(), "node-a::nfs2=5".to_string()]),
+        Some(&vec![
+            "node-a::nfs1=4".to_string(),
+            "node-a::nfs2=5".to_string()
+        ]),
         "recent live cache must preserve published_origin_counts when a later live snapshot only keeps recovered schedule/control truth: {:?}",
         nonblocking
     );
@@ -10018,8 +10365,8 @@ async fn recent_live_cache_preserves_published_observability_when_later_live_sna
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn recent_live_cache_clears_published_path_observability_when_later_active_snapshot_explicitly_reports_zero_publication_counters(
-) {
+async fn recent_live_cache_clears_published_path_observability_when_later_active_snapshot_explicitly_reports_zero_publication_counters()
+ {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -10165,23 +10512,28 @@ async fn recent_live_cache_clears_published_path_observability_when_later_active
         nonblocking
     );
     assert!(
-        !nonblocking.last_published_at_us_by_node.contains_key("node-a"),
+        !nonblocking
+            .last_published_at_us_by_node
+            .contains_key("node-a"),
         "explicit zero published counters must clear stale last_published_at_us instead of replaying cached metadata: {:?}",
         nonblocking
     );
     assert!(
-        !nonblocking.last_published_origins_by_node.contains_key("node-a"),
+        !nonblocking
+            .last_published_origins_by_node
+            .contains_key("node-a"),
         "explicit zero published counters must clear stale last_published_origins instead of replaying cached metadata: {:?}",
         nonblocking
     );
     assert!(
-        !nonblocking.published_origin_counts_by_node.contains_key("node-a"),
+        !nonblocking
+            .published_origin_counts_by_node
+            .contains_key("node-a"),
         "explicit zero published counters must clear stale published_origin_counts instead of replaying cached metadata: {:?}",
         nonblocking
     );
     assert_eq!(
-        nonblocking.published_path_capture_target,
-        None,
+        nonblocking.published_path_capture_target, None,
         "explicit zero published counters must clear stale published_path_capture_target instead of replaying cached metadata: {:?}",
         nonblocking
     );
@@ -10216,7 +10568,7 @@ async fn recent_live_cache_clears_published_path_observability_when_later_active
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn observability_snapshot_nonblocking_fail_closes_incomplete_active_cache_when_worker_unavailable()
-{
+ {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -10423,7 +10775,7 @@ async fn on_control_frame_refresh_retries_transient_empty_scheduled_groups_befor
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_inflight_nonblocking_observability_primes_runtime_managed_groups_from_latest_activate_signals()
-{
+ {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -10558,7 +10910,7 @@ async fn control_inflight_nonblocking_observability_primes_runtime_managed_group
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_inflight_nonblocking_observability_preserves_latest_control_frame_signals_after_successful_activate_wave()
-{
+ {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -10682,7 +11034,7 @@ async fn control_inflight_nonblocking_observability_preserves_latest_control_fra
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_inflight_nonblocking_observability_primes_runtime_managed_groups_from_local_resource_ids_without_grant_change()
-{
+ {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -11023,7 +11375,7 @@ async fn control_inflight_nonblocking_observability_limits_bare_logical_scope_id
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn on_control_frame_does_not_exhaust_post_ack_schedule_refresh_when_mixed_cluster_grants_leave_no_local_runnable_groups()
-{
+ {
     let tmp = tempdir().expect("create temp dir");
     let node_a_nfs1 = tmp.path().join("node-a-nfs1");
     let node_a_nfs2 = tmp.path().join("node-a-nfs2");
@@ -11724,12 +12076,22 @@ async fn local_source_observability_preserves_published_maps_after_local_stream_
         .expect("fetch local source observability after local stream publish");
 
     assert!(
-        snapshot.published_batches_by_node.get("node-a").copied().unwrap_or(0) > 0,
+        snapshot
+            .published_batches_by_node
+            .get("node-a")
+            .copied()
+            .unwrap_or(0)
+            > 0,
         "local source observability must not report active scheduling/control truth with published_batches_by_node still empty after the local stream emitted batches: {:?}",
         snapshot
     );
     assert!(
-        snapshot.published_events_by_node.get("node-a").copied().unwrap_or(0) > 0,
+        snapshot
+            .published_events_by_node
+            .get("node-a")
+            .copied()
+            .unwrap_or(0)
+            > 0,
         "local source observability must preserve published event counts after local stream publish: {:?}",
         snapshot
     );
@@ -11772,7 +12134,7 @@ async fn local_source_observability_preserves_published_maps_after_local_stream_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recovered_active_local_status_yields_schedule_and_control_summary_when_runtime_state_is_empty()
-{
+ {
     let stable_host_ref = "node-d";
     let status = SourceStatusSnapshot {
         current_stream_generation: Some(7),
@@ -11822,16 +12184,14 @@ async fn recovered_active_local_status_yields_schedule_and_control_summary_when_
         degraded_roots: Vec::new(),
     };
 
-    let source_groups = recovered_scheduled_groups_by_node_from_active_status(
-        stable_host_ref,
-        &status,
-        |entry| entry.watch_enabled,
-    );
-    let scan_groups = recovered_scheduled_groups_by_node_from_active_status(
-        stable_host_ref,
-        &status,
-        |entry| entry.scan_enabled,
-    );
+    let source_groups =
+        recovered_scheduled_groups_by_node_from_active_status(stable_host_ref, &status, |entry| {
+            entry.watch_enabled
+        });
+    let scan_groups =
+        recovered_scheduled_groups_by_node_from_active_status(stable_host_ref, &status, |entry| {
+            entry.scan_enabled
+        });
     let control_signals = recovered_control_signals_by_node_from_active_status(
         stable_host_ref,
         &status,
@@ -12193,7 +12553,7 @@ async fn restarted_external_source_worker_preserves_runtime_host_grants_for_real
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restarted_external_source_worker_preserves_multi_root_observability_after_runtime_managed_upgrade_recovery()
-{
+ {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -12370,7 +12730,7 @@ async fn restarted_external_source_worker_preserves_multi_root_observability_aft
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restarted_external_source_worker_observability_preserves_last_control_frame_signals_after_runtime_managed_upgrade_recovery()
-{
+ {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -12515,7 +12875,7 @@ async fn restarted_external_source_worker_observability_preserves_last_control_f
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restarted_external_source_worker_preserves_single_root_observability_after_runtime_managed_upgrade_recovery()
-{
+ {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");

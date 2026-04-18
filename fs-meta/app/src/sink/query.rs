@@ -767,8 +767,8 @@ mod tests {
     }
 
     #[test]
-    fn rebased_directory_tree_synthesizes_existing_root_for_structural_placeholder_with_live_descendants(
-    ) {
+    fn rebased_directory_tree_synthesizes_existing_root_for_structural_placeholder_with_live_descendants()
+     {
         let tree = build_prefixed_tree_with_structural_placeholder_root();
         let clock = SinkClock::new();
 
@@ -800,8 +800,8 @@ mod tests {
     }
 
     #[test]
-    fn direct_directory_tree_synthesizes_existing_root_for_structural_placeholder_with_live_descendants(
-    ) {
+    fn direct_directory_tree_synthesizes_existing_root_for_structural_placeholder_with_live_descendants()
+     {
         let tree = build_tree_with_structural_placeholder_root();
         let clock = SinkClock::new();
 

@@ -226,10 +226,8 @@ mod tests {
         let status = child.wait().expect("wait for short-lived process");
         assert!(status.success(), "child must exit cleanly");
 
-        let pids_by_node = BTreeMap::from([(
-            "node-a".to_string(),
-            vec![std::process::id(), vanished_pid],
-        )]);
+        let pids_by_node =
+            BTreeMap::from([("node-a".to_string(), vec![std::process::id(), vanished_pid])]);
         let samples = sample_many(
             &pids_by_node,
             Duration::from_millis(20),

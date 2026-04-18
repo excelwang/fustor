@@ -2124,8 +2124,8 @@ impl Drop for SinkWorkerRetryResetHookReset {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn status_error_hook_scoped_to_target_worker_instance_is_not_consumed_by_unrelated_status_probe(
-) {
+async fn status_error_hook_scoped_to_target_worker_instance_is_not_consumed_by_unrelated_status_probe()
+ {
     let tmp = tempdir().expect("create temp dir");
     let first_root = tmp.path().join("first");
     let second_root = tmp.path().join("second");
@@ -2225,7 +2225,8 @@ async fn status_error_hook_scoped_to_target_worker_instance_is_not_consumed_by_u
     match second_result {
         Err(CnxError::PeerError(err))
             if err
-                == "targeted scoped sink status error should only hit the selected worker instance" => {}
+                == "targeted scoped sink status error should only hit the selected worker instance" =>
+            {}
         other => panic!(
             "targeted status error hook must remain available for the selected worker instance after an unrelated worker probes status: {other:?}"
         ),
@@ -2236,8 +2237,8 @@ async fn status_error_hook_scoped_to_target_worker_instance_is_not_consumed_by_u
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn status_snapshot_hook_scoped_to_target_worker_instance_is_not_consumed_by_unrelated_status_probe(
-) {
+async fn status_snapshot_hook_scoped_to_target_worker_instance_is_not_consumed_by_unrelated_status_probe()
+ {
     let tmp = tempdir().expect("create temp dir");
     let first_root = tmp.path().join("first-snapshot");
     let second_root = tmp.path().join("second-snapshot");
@@ -2321,8 +2322,7 @@ async fn status_snapshot_hook_scoped_to_target_worker_instance_is_not_consumed_b
         .await
         .expect("unrelated worker instance must not consume the targeted status snapshot hook");
     assert_ne!(
-        first_snapshot.live_nodes,
-        99,
+        first_snapshot.live_nodes, 99,
         "unrelated worker should not receive the targeted snapshot payload reserved for another worker instance: {first_snapshot:?}"
     );
 
