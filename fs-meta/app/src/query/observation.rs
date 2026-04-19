@@ -85,7 +85,7 @@ pub fn materialized_query_observation_evidence(
         if sink_group_blocks_materialized_observation(group) {
             initial_audit_groups.insert(group_id.clone());
         }
-        if group.overflow_pending_audit {
+        if group.overflow_pending_materialization {
             overflow_pending_groups.insert(group_id.clone());
         }
     }
@@ -137,7 +137,7 @@ pub fn candidate_group_observation_evidence(
     let mut overflow_pending_groups = BTreeSet::new();
     for group_id in candidate_groups {
         if let Some(group) = sink_groups.get(group_id.as_str()) {
-            if group.overflow_pending_audit {
+            if group.overflow_pending_materialization {
                 overflow_pending_groups.insert(group_id.clone());
             }
         }
@@ -226,9 +226,9 @@ mod tests {
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
         }
@@ -434,8 +434,8 @@ mod tests {
                 blind_spot_count: 0,
                 shadow_time_us: 10,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 7,
                 estimated_heap_bytes: 0,
@@ -473,8 +473,8 @@ mod tests {
                 blind_spot_count: 0,
                 shadow_time_us: 10,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 7,
                 estimated_heap_bytes: 0,

@@ -392,10 +392,7 @@ async fn wait_for_fixture_query_ready(app: &FSMetaApp) -> Result<(), Box<dyn std
             .map(|status| {
                 !status.groups.is_empty()
                     && status.live_nodes > 0
-                    && status
-                        .groups
-                        .iter()
-                        .all(|group| group.initial_audit_completed)
+                    && status.groups.iter().all(|group| group.is_ready())
             })
             .unwrap_or(false);
         let query_ready = match app.query_tree(&request).await {

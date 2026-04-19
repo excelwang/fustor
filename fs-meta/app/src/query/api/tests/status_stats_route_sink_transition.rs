@@ -59,9 +59,9 @@ async fn load_materialized_status_snapshots_preserves_cached_ready_groups_when_r
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -76,9 +76,9 @@ async fn load_materialized_status_snapshots_preserves_cached_ready_groups_when_r
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -129,7 +129,7 @@ async fn load_materialized_status_snapshots_preserves_cached_ready_groups_when_r
         .map(|group| {
             (
                 group.group_id.as_str(),
-                group.initial_audit_completed,
+                group.is_ready(),
                 group.total_nodes,
                 group.live_nodes,
                 group.shadow_time_us,

@@ -25,8 +25,7 @@ use crate::source::config::SourceConfig;
 use crate::workers::source::SourceObservabilitySnapshot;
 use crate::workers::source::SourceWorkerRpc;
 use crate::workers::source::{
-    SourceObservabilityLiveAugment, build_source_observability_live_source_context,
-    build_source_observability_snapshot_from_live_context, control_signals_by_node,
+    SourceObservabilityPublicationView, build_live_source_observability_snapshot,
 };
 use crate::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
 
@@ -629,145 +628,29 @@ fn source_observability_snapshot(
     last_control_frame_signals: &[String],
     published_stats: &Arc<StdMutex<PublishedBatchStats>>,
 ) -> SourceObservabilitySnapshot {
-    let context = build_source_observability_live_source_context(source);
     let published = lock_publish_stats(published_stats);
-    let stable_host_ref = context.recovery.stable_host_ref.clone();
-    let has_local_source_grants = context
-        .grants
-        .iter()
-        .any(|grant| grant.host_ref.eq_ignore_ascii_case(&stable_host_ref));
-    let allow_control_summary = context
-        .recovery
-        .allow_control_summary(has_local_source_grants);
-    let control_summary = if !last_control_frame_signals.is_empty() {
-        if allow_control_summary {
-            last_control_frame_signals.to_vec()
-        } else {
-            Vec::new()
-        }
-    } else if allow_control_summary {
-        context.last_control_frame_signals_snapshot.clone()
-    } else {
-        Vec::new()
-    };
     let enqueued_path_origin_counts = source.enqueued_path_origin_counts_snapshot();
     let pending_path_origin_counts = source.pending_path_origin_counts_snapshot();
     let yielded_path_origin_counts = source.yielded_path_origin_counts_snapshot();
-    let has_explicit_zero_publication_counters = published.batch_count == 0
-        && published.event_count == 0
-        && published.control_event_count == 0
-        && published.data_event_count == 0;
-    build_source_observability_snapshot_from_live_context(
-        context,
-        SourceObservabilityLiveAugment {
-            last_control_frame_signals_by_node: control_signals_by_node(
-                &stable_host_ref,
-                &control_summary,
-            ),
-            published_batches_by_node: std::collections::BTreeMap::from([(
-                stable_host_ref.clone(),
-                published.batch_count,
-            )]),
-            published_events_by_node: std::collections::BTreeMap::from([(
-                stable_host_ref.clone(),
-                published.event_count,
-            )]),
-            published_control_events_by_node: std::collections::BTreeMap::from([(
-                stable_host_ref.clone(),
-                published.control_event_count,
-            )]),
-            published_data_events_by_node: std::collections::BTreeMap::from([(
-                stable_host_ref.clone(),
-                published.data_event_count,
-            )]),
-            last_published_at_us_by_node: (!has_explicit_zero_publication_counters)
-                .then_some(published.last_published_at_us)
-                .flatten()
-                .map(|ts| std::collections::BTreeMap::from([(stable_host_ref.clone(), ts)]))
-                .unwrap_or_default(),
-            last_published_origins_by_node: (!has_explicit_zero_publication_counters
-                && !published.last_published_origins.is_empty())
-            .then_some({
-                std::collections::BTreeMap::from([(
-                    stable_host_ref.clone(),
-                    published.last_published_origins.clone(),
-                )])
-            })
-            .unwrap_or_default(),
-            published_origin_counts_by_node: (!has_explicit_zero_publication_counters
-                && !published.published_origin_counts.is_empty())
-            .then_some({
-                std::collections::BTreeMap::from([(
-                    stable_host_ref.clone(),
-                    published
-                        .published_origin_counts
-                        .iter()
-                        .map(|(origin, count)| format!("{origin}={count}"))
-                        .collect::<Vec<_>>(),
-                )])
-            })
-            .unwrap_or_default(),
+    build_live_source_observability_snapshot(
+        source,
+        SourceObservabilityPublicationView {
+            last_control_frame_signals: last_control_frame_signals.to_vec(),
+            keep_zero_publication_counters: true,
+            published_batch_count: published.batch_count,
+            published_event_count: published.event_count,
+            published_control_event_count: published.control_event_count,
+            published_data_event_count: published.data_event_count,
+            last_published_at_us: published.last_published_at_us,
+            last_published_origins: published.last_published_origins.clone(),
+            published_origin_counts: published.published_origin_counts.clone(),
             published_path_capture_target: debug_stream_path_capture_target()
                 .map(|target| String::from_utf8_lossy(&target).into_owned()),
-            enqueued_path_origin_counts_by_node: (!enqueued_path_origin_counts.is_empty())
-                .then(|| {
-                    std::collections::BTreeMap::from([(
-                        stable_host_ref.clone(),
-                        enqueued_path_origin_counts
-                            .iter()
-                            .map(|(origin, count)| format!("{origin}={count}"))
-                            .collect::<Vec<_>>(),
-                    )])
-                })
-                .unwrap_or_default(),
-            pending_path_origin_counts_by_node: (!pending_path_origin_counts.is_empty())
-                .then(|| {
-                    std::collections::BTreeMap::from([(
-                        stable_host_ref.clone(),
-                        pending_path_origin_counts
-                            .iter()
-                            .map(|(origin, count)| format!("{origin}={count}"))
-                            .collect::<Vec<_>>(),
-                    )])
-                })
-                .unwrap_or_default(),
-            yielded_path_origin_counts_by_node: (!yielded_path_origin_counts.is_empty())
-                .then(|| {
-                    std::collections::BTreeMap::from([(
-                        stable_host_ref.clone(),
-                        yielded_path_origin_counts
-                            .iter()
-                            .map(|(origin, count)| format!("{origin}={count}"))
-                            .collect::<Vec<_>>(),
-                    )])
-                })
-                .unwrap_or_default(),
-            summarized_path_origin_counts_by_node: (!has_explicit_zero_publication_counters
-                && !published.summarized_path_origin_counts.is_empty())
-            .then_some({
-                std::collections::BTreeMap::from([(
-                    stable_host_ref.clone(),
-                    published
-                        .summarized_path_origin_counts
-                        .iter()
-                        .map(|(origin, count)| format!("{origin}={count}"))
-                        .collect::<Vec<_>>(),
-                )])
-            })
-            .unwrap_or_default(),
-            published_path_origin_counts_by_node: (!has_explicit_zero_publication_counters
-                && !published.published_path_origin_counts.is_empty())
-            .then_some({
-                std::collections::BTreeMap::from([(
-                    stable_host_ref.clone(),
-                    published
-                        .published_path_origin_counts
-                        .iter()
-                        .map(|(origin, count)| format!("{origin}={count}"))
-                        .collect::<Vec<_>>(),
-                )])
-            })
-            .unwrap_or_default(),
+            enqueued_path_origin_counts,
+            pending_path_origin_counts,
+            yielded_path_origin_counts,
+            summarized_path_origin_counts: published.summarized_path_origin_counts.clone(),
+            published_path_origin_counts: published.published_path_origin_counts.clone(),
         },
     )
 }

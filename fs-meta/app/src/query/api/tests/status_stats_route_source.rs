@@ -320,7 +320,10 @@ async fn route_source_status_snapshot_retries_missing_route_state_without_blind_
             route_source_status_snapshot(
                 boundary,
                 NodeId("node-d".to_string()),
-                Duration::from_secs(5),
+                StatusRoutePlan::new(
+                    Duration::from_secs(5),
+                    STATUS_ROUTE_COLLECT_IDLE_GRACE,
+                ),
             )
             .await
         }
@@ -670,4 +673,3 @@ async fn load_materialized_status_snapshots_falls_back_to_local_source_when_rout
         "sink status route should still contribute the materialized group after source continuity fallback"
     );
 }
-

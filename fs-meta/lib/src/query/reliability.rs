@@ -43,9 +43,9 @@ impl ReliabilityAccumulator {
         }
     }
 
-    pub fn observe_overflow(&mut self, overflow_pending_audit: bool) {
-        if overflow_pending_audit {
-            self.observe_reason(UnreliableReason::WatchOverflowPendingAudit);
+    pub fn observe_overflow(&mut self, overflow_pending_materialization: bool) {
+        if overflow_pending_materialization {
+            self.observe_reason(UnreliableReason::WatchOverflowPendingMaterialization);
         }
     }
 

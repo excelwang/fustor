@@ -75,7 +75,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -89,7 +89,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
                     .groups
                     .iter()
                     .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-                    .all(|group| group.initial_audit_completed && group.live_nodes > 0) =>
+                    .all(|group| group.is_ready() && group.live_nodes > 0) =>
             {
                 break snapshot;
             }
@@ -107,7 +107,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before seeding a split stale cache: {live_snapshot:?}"
     );
 
@@ -118,7 +118,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
     )]);
     for group in &mut stale_snapshot.groups {
         if group.group_id == "nfs1" {
-            group.initial_audit_completed = false;
+            group.readiness = crate::sink::GroupReadinessState::PendingMaterialization;
             group.live_nodes = 0;
             group.total_nodes = 0;
             group.shadow_time_us = 0;
@@ -138,7 +138,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "status_snapshot_nonblocking must not return a partially stale split cache where one scheduled group regressed to zero while another stayed ready: stale={stale_snapshot:?} live={live_snapshot:?} returned={snapshot:?}"
     );
 
@@ -231,7 +231,7 @@ async fn status_snapshot_nonblocking_fails_closed_while_actual_second_wave_sink_
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -246,7 +246,7 @@ async fn status_snapshot_nonblocking_fails_closed_while_actual_second_wave_sink_
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must already be ready before pausing the second-wave sink apply: {ready_snapshot:?}"
     );
 
@@ -387,7 +387,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -402,7 +402,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before seeding a split stale cache: {live_snapshot:?}"
     );
 
@@ -413,7 +413,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
     )]);
     for group in &mut stale_snapshot.groups {
         if group.group_id == "nfs1" {
-            group.initial_audit_completed = false;
+            group.readiness = crate::sink::GroupReadinessState::PendingMaterialization;
             group.live_nodes = 0;
             group.total_nodes = 0;
             group.shadow_time_us = 0;
@@ -497,8 +497,8 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 11,
                 estimated_heap_bytes: 1,
@@ -514,8 +514,8 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 9,
                 estimated_heap_bytes: 1,
@@ -531,8 +531,8 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 7,
                 estimated_heap_bytes: 1,
@@ -560,9 +560,9 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 1,
             },
@@ -577,9 +577,9 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 1,
             },
@@ -594,8 +594,8 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 7,
                 estimated_heap_bytes: 1,
@@ -687,8 +687,8 @@ async fn status_snapshot_nonblocking_fails_closed_for_control_inflight_live_mixe
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 11,
             estimated_heap_bytes: 1,
@@ -715,8 +715,8 @@ async fn status_snapshot_nonblocking_fails_closed_for_control_inflight_live_mixe
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 9,
                 estimated_heap_bytes: 1,
@@ -732,9 +732,9 @@ async fn status_snapshot_nonblocking_fails_closed_for_control_inflight_live_mixe
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 1,
             },
@@ -845,7 +845,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -859,7 +859,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
                     .groups
                     .iter()
                     .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-                    .all(|group| group.initial_audit_completed && group.live_nodes > 0) =>
+                    .all(|group| group.is_ready() && group.live_nodes > 0) =>
             {
                 break snapshot;
             }
@@ -877,7 +877,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before seeding a split stale cache: {live_snapshot:?}"
     );
 
@@ -888,7 +888,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
     )]);
     for group in &mut stale_snapshot.groups {
         if group.group_id == "nfs1" {
-            group.initial_audit_completed = false;
+            group.readiness = crate::sink::GroupReadinessState::PendingMaterialization;
             group.live_nodes = 0;
             group.total_nodes = 0;
             group.shadow_time_us = 0;

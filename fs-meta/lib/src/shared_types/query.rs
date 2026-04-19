@@ -13,14 +13,14 @@ pub enum UnreliableReason {
     Unattested = 0,
     SuspectNodes = 1,
     BlindSpotsDetected = 2,
-    WatchOverflowPendingAudit = 3,
+    WatchOverflowPendingMaterialization = 3,
 }
 
 impl std::fmt::Display for UnreliableReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnreliableReason::WatchOverflowPendingAudit => {
-                write!(f, "watch overflow pending audit")
+            UnreliableReason::WatchOverflowPendingMaterialization => {
+                write!(f, "watch overflow pending materialization")
             }
             UnreliableReason::BlindSpotsDetected => write!(f, "blind spots detected"),
             UnreliableReason::SuspectNodes => write!(f, "suspect nodes detected"),

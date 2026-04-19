@@ -396,6 +396,30 @@ fn external_sink_worker_binding(socket_dir: &Path) -> RuntimeWorkerBinding {
     }
 }
 
+fn worker_stderr_excerpt(socket_dir: &Path) -> String {
+    let Ok(entries) = std::fs::read_dir(socket_dir) else {
+        return "<socket dir unreadable>".to_string();
+    };
+    let mut excerpts = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".stderr.log"))
+        {
+            let body =
+                std::fs::read_to_string(&path).unwrap_or_else(|_| "<unreadable>".to_string());
+            excerpts.push(format!("{}:\n{}", path.display(), body.trim()));
+        }
+    }
+    if excerpts.is_empty() {
+        "<no stderr logs>".to_string()
+    } else {
+        excerpts.join("\n---\n")
+    }
+}
+
 fn sink_worker_root(id: &str, path: &Path) -> RootSpec {
     let mut root = RootSpec::new(id, path);
     root.watch = false;
@@ -596,7 +620,12 @@ async fn external_sink_worker_materializes_each_local_primary_root_from_source_b
 
     tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
         .await
-        .expect("sink worker start timed out")
+        .unwrap_or_else(|_| {
+            panic!(
+                "sink worker start timed out: sink_stderr={}",
+                worker_stderr_excerpt(worker_socket_dir.path())
+            )
+        })
         .expect("start sink worker");
 
     let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1089,7 +1118,7 @@ async fn external_sink_worker_stream_endpoint_materializes_split_primary_mixed_c
         let ready_groups = snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed && group.live_nodes > 0)
+            .filter(|group| group.is_ready() && group.live_nodes > 0)
             .map(|group| group.group_id.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         if ready_groups == std::collections::BTreeSet::from(["nfs1", "nfs2", "nfs3"]) {
@@ -1287,7 +1316,7 @@ async fn external_sink_worker_initial_split_primary_wave_arms_stream_before_loca
         if let Ok(snapshot) = &last_wrapper_status {
             if snapshot.groups.iter().any(|group| {
                 group.group_id == "nfs3"
-                    && group.initial_audit_completed
+                    && group.is_ready()
                     && group.live_nodes > 0
                     && group.total_nodes > 0
             }) {
@@ -1335,7 +1364,7 @@ async fn external_sink_worker_initial_split_primary_wave_arms_stream_before_loca
             Ok(snapshot)
                 if snapshot.groups.iter().any(|group| {
                     group.group_id == "nfs3"
-                        && group.initial_audit_completed
+                        && group.is_ready()
                         && group.live_nodes > 0
                         && group.total_nodes > 0
                 })
@@ -2612,7 +2641,7 @@ async fn status_snapshot_nonblocking_fails_closed_from_stale_empty_cache_when_co
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -2626,7 +2655,7 @@ async fn status_snapshot_nonblocking_fails_closed_from_stale_empty_cache_when_co
                     .groups
                     .iter()
                     .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-                    .all(|group| group.initial_audit_completed && group.live_nodes > 0) =>
+                    .all(|group| group.is_ready() && group.live_nodes > 0) =>
             {
                 break snapshot;
             }
@@ -2644,7 +2673,7 @@ async fn status_snapshot_nonblocking_fails_closed_from_stale_empty_cache_when_co
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before seeding a stale empty cache: {live_snapshot:?}"
     );
 
@@ -2673,7 +2702,7 @@ async fn status_snapshot_nonblocking_fails_closed_from_stale_empty_cache_when_co
             let ready_groups = snapshot
                 .groups
                 .iter()
-                .filter(|group| group.initial_audit_completed)
+                .filter(|group| group.is_ready())
                 .map(|group| group.group_id.clone())
                 .collect::<std::collections::BTreeSet<_>>();
             assert_eq!(
@@ -2769,7 +2798,7 @@ async fn status_snapshot_nonblocking_returns_cached_ready_snapshot_when_control_
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -2783,7 +2812,7 @@ async fn status_snapshot_nonblocking_returns_cached_ready_snapshot_when_control_
                     .groups
                     .iter()
                     .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-                    .all(|group| group.initial_audit_completed && group.live_nodes > 0) =>
+                    .all(|group| group.is_ready() && group.live_nodes > 0) =>
             {
                 break snapshot;
             }
@@ -2825,7 +2854,7 @@ async fn status_snapshot_nonblocking_returns_cached_ready_snapshot_when_control_
     let ready_groups = snapshot
         .groups
         .iter()
-        .filter(|group| group.initial_audit_completed)
+        .filter(|group| group.is_ready())
         .map(|group| group.group_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
@@ -2915,7 +2944,7 @@ async fn status_snapshot_nonblocking_returns_cached_ready_selected_group_from_pa
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -2929,7 +2958,7 @@ async fn status_snapshot_nonblocking_returns_cached_ready_selected_group_from_pa
                     .groups
                     .iter()
                     .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-                    .all(|group| group.initial_audit_completed && group.live_nodes > 0) =>
+                    .all(|group| group.is_ready() && group.live_nodes > 0) =>
             {
                 break snapshot;
             }
@@ -2950,7 +2979,7 @@ async fn status_snapshot_nonblocking_returns_cached_ready_selected_group_from_pa
     )]);
     for group in &mut stale_snapshot.groups {
         if group.group_id == "nfs1" {
-            group.initial_audit_completed = false;
+            group.readiness = crate::sink::GroupReadinessState::PendingMaterialization;
             group.live_nodes = 0;
             group.total_nodes = 0;
             group.shadow_time_us = 0;
@@ -2976,7 +3005,7 @@ async fn status_snapshot_nonblocking_returns_cached_ready_selected_group_from_pa
         .find(|group| group.group_id == "nfs2")
         .expect("nfs2 group");
     assert!(
-        nfs2.initial_audit_completed && nfs2.live_nodes > 0,
+        nfs2.is_ready() && nfs2.live_nodes > 0,
         "status_snapshot_nonblocking must not fail closed when a cached scheduled group remains ready and the live control-inflight sink-status probe only timed out: stale={stale_snapshot:?} returned={snapshot:?}"
     );
 
@@ -3061,7 +3090,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -3192,7 +3221,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_zero_row_
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -3206,7 +3235,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_zero_row_
                     .groups
                     .iter()
                     .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-                    .all(|group| group.initial_audit_completed && group.live_nodes > 0) =>
+                    .all(|group| group.is_ready() && group.live_nodes > 0) =>
             {
                 break snapshot;
             }
@@ -3234,7 +3263,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_zero_row_
     let mut zero_row_snapshot = live_snapshot.clone();
     zero_row_snapshot.scheduled_groups_by_node.clear();
     for group in &mut zero_row_snapshot.groups {
-        group.initial_audit_completed = false;
+        group.readiness = crate::sink::GroupReadinessState::PendingMaterialization;
         group.live_nodes = 0;
         group.total_nodes = 0;
         group.shadow_time_us = 0;
@@ -3693,4 +3722,299 @@ async fn distinct_runtime_factories_do_not_share_started_sink_worker_client_on_s
         .close()
         .await
         .expect("close successor sink worker");
+}
+
+#[test]
+fn sink_status_scenario_outcome_returns_cached_for_control_inflight_replay_pending_with_cached_ready_truth()
+ {
+    let outcome = reduce_sink_status_scenario_outcome(
+        SinkStatusScenario::Live(SinkStatusLiveScenario::ControlInflight),
+        Some(SinkStatusConcern::ReplayPending),
+        Some(SinkStatusConcern::CoverageGap),
+        true,
+    );
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnCached);
+    assert_eq!(outcome.concern, Some(SinkStatusConcern::ReplayPending));
+    assert!(outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn sink_status_scenario_outcome_returns_cached_for_steady_mixed_readiness_with_cached_ready_truth()
+{
+    let outcome = reduce_sink_status_scenario_outcome(
+        SinkStatusScenario::Live(SinkStatusLiveScenario::Steady),
+        Some(SinkStatusConcern::MixedReadiness),
+        Some(SinkStatusConcern::CoverageGap),
+        true,
+    );
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnCached);
+    assert_eq!(outcome.concern, Some(SinkStatusConcern::MixedReadiness));
+    assert!(!outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn sink_status_scenario_outcome_fails_closed_after_retry_reset_replay_pending_without_cached_ready_truth()
+ {
+    let outcome = reduce_sink_status_scenario_outcome(
+        SinkStatusScenario::Live(SinkStatusLiveScenario::SteadyAfterRetryReset),
+        Some(SinkStatusConcern::ReplayPending),
+        None,
+        false,
+    );
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::FailClosed);
+    assert_eq!(outcome.concern, Some(SinkStatusConcern::ReplayPending));
+    assert!(!outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn sink_status_scenario_outcome_returns_live_for_steady_replay_pending_without_cached_ready_truth_when_cached_truth_is_preactivate_unscheduled()
+{
+    let outcome = reduce_sink_status_scenario_outcome_with_facts(
+        SinkStatusScenario::Live(SinkStatusLiveScenario::Steady),
+        SinkStatusScenarioFacts::new(
+            Some(SinkStatusConcern::ReplayPending),
+            None,
+            false,
+        )
+        .with_cached_preactivate_unscheduled(true),
+    );
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnLive);
+    assert_eq!(outcome.concern, Some(SinkStatusConcern::ReplayPending));
+    assert!(outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn sink_status_scenario_outcome_returns_live_for_steady_replay_pending_without_cached_ready_truth_when_cached_truth_is_stale_empty()
+{
+    let outcome = reduce_sink_status_scenario_outcome(
+        SinkStatusScenario::Live(SinkStatusLiveScenario::Steady),
+        Some(SinkStatusConcern::ReplayPending),
+        Some(SinkStatusConcern::StaleEmpty),
+        false,
+    );
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnLive);
+    assert_eq!(outcome.concern, Some(SinkStatusConcern::ReplayPending));
+    assert!(outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn sink_status_scenario_outcome_returns_live_after_retry_reset_replay_pending_without_cached_ready_truth_when_cached_truth_is_preactivate_unscheduled()
+{
+    let outcome = reduce_sink_status_scenario_outcome_with_facts(
+        SinkStatusScenario::Live(SinkStatusLiveScenario::SteadyAfterRetryReset),
+        SinkStatusScenarioFacts::new(
+            Some(SinkStatusConcern::ReplayPending),
+            None,
+            false,
+        )
+        .with_cached_preactivate_unscheduled(true),
+    );
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnLive);
+    assert_eq!(outcome.concern, Some(SinkStatusConcern::ReplayPending));
+    assert!(!outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn sink_status_scenario_outcome_returns_live_after_retry_reset_replay_pending_without_cached_ready_truth_when_cached_truth_is_stale_empty()
+{
+    let outcome = reduce_sink_status_scenario_outcome(
+        SinkStatusScenario::Live(SinkStatusLiveScenario::SteadyAfterRetryReset),
+        Some(SinkStatusConcern::ReplayPending),
+        Some(SinkStatusConcern::StaleEmpty),
+        false,
+    );
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnLive);
+    assert_eq!(outcome.concern, Some(SinkStatusConcern::ReplayPending));
+    assert!(!outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn sink_status_scenario_outcome_returns_live_after_retry_reset_replay_pending_without_cached_ready_truth_when_cached_truth_is_republished_zero_row_summary()
+{
+    let outcome = reduce_sink_status_scenario_outcome_with_facts(
+        SinkStatusScenario::Live(SinkStatusLiveScenario::SteadyAfterRetryReset),
+        SinkStatusScenarioFacts::new(
+            Some(SinkStatusConcern::ReplayPending),
+            None,
+            false,
+        )
+        .with_cached_preactivate_unscheduled(true),
+    );
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnLive);
+    assert_eq!(outcome.concern, Some(SinkStatusConcern::ReplayPending));
+    assert!(!outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn sink_status_scenario_outcome_returns_cached_for_worker_unavailable_replay_pending_cache() {
+    let outcome = reduce_sink_status_scenario_outcome(
+        SinkStatusScenario::Cached(SinkStatusCachedScenario::WorkerUnavailable),
+        Some(SinkStatusConcern::ReplayPending),
+        None,
+        false,
+    );
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnCached);
+    assert_eq!(outcome.concern, Some(SinkStatusConcern::ReplayPending));
+    assert!(!outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn sink_status_scenario_outcome_propagates_error_for_worker_unavailable_regressed_zero_uninitialized_with_delivery_evidence()
+{
+    let outcome = reduce_sink_status_scenario_outcome_with_facts(
+        SinkStatusScenario::Cached(SinkStatusCachedScenario::WorkerUnavailable),
+        SinkStatusScenarioFacts::new(None, None, false)
+            .with_worker_unavailable_delivery_backed_zero_uninitialized(true),
+    );
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::PropagateError);
+    assert_eq!(outcome.concern, None);
+    assert!(!outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_scheduled_waiting_for_materialized_root_cache()
+ {
+    let snapshot = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "".to_string(),
+            total_nodes: 0,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    let outcome =
+        evaluate_cached_sink_status_snapshot(&snapshot, SinkStatusAccessPath::WorkerUnavailable);
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnCached);
+    assert_eq!(
+        outcome.concern,
+        Some(SinkStatusConcern::WaitingForMaterializedRoot)
+    );
+    assert!(!outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn evaluate_cached_sink_status_snapshot_propagates_error_for_worker_unavailable_regressed_scheduled_zero_uninitialized_cache_with_delivery_evidence()
+ {
+    let snapshot = SinkStatusSnapshot {
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs1".to_string(),
+                primary_object_ref: "unassigned".to_string(),
+                total_nodes: 0,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs2".to_string(),
+                primary_object_ref: "unassigned".to_string(),
+                total_nodes: 0,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            },
+        ],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]),
+        received_events_by_node: std::collections::BTreeMap::from([("node-d".to_string(), 2)]),
+        received_origin_counts_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            vec!["node-d::nfs1=1".to_string(), "node-d::nfs2=1".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    let outcome =
+        evaluate_cached_sink_status_snapshot(&snapshot, SinkStatusAccessPath::WorkerUnavailable);
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::PropagateError);
+    assert_eq!(outcome.concern, None);
+    assert!(!outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn sink_status_scenario_outcome_republishes_zero_row_summary_for_worker_unavailable_stale_empty() {
+    let outcome = reduce_sink_status_scenario_outcome(
+        SinkStatusScenario::Cached(SinkStatusCachedScenario::WorkerUnavailable),
+        Some(SinkStatusConcern::StaleEmpty),
+        None,
+        false,
+    );
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::PropagateError);
+    assert_eq!(outcome.concern, Some(SinkStatusConcern::StaleEmpty));
+    assert!(!outcome.should_mark_replay_required);
+    assert!(outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn sink_status_scenario_outcome_returns_cached_for_not_started_coverage_gap_without_replay_mark() {
+    let outcome = reduce_sink_status_scenario_outcome(
+        SinkStatusScenario::Cached(SinkStatusCachedScenario::NotStarted),
+        Some(SinkStatusConcern::CoverageGap),
+        None,
+        false,
+    );
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnCached);
+    assert_eq!(outcome.concern, Some(SinkStatusConcern::CoverageGap));
+    assert!(!outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
 }

@@ -180,7 +180,7 @@ version: 3.0.0
    > Verification: initial baseline includes root directory metadata; audit mtime-pruning uses cached directory mtime and emits `audit_skipped=true` heartbeat for silent directories.
    > Verification: scan traversal tracks visited directory identity `(dev, ino)` and MUST skip symlink loops with warning instead of recursive dead-loop.
    > Verification: watch `IN_IGNORED` invalidation MUST purge wd/path internal mapping; if invalidation is on root watch, source MUST terminate `pub_()` stream promptly (no silent hang).
-   > Verification: watch queue overflow (`IN_Q_OVERFLOW`) MUST emit in-band overflow control marker and set sink group query response to `reliable=false` with `unreliable_reason=WatchOverflowPendingAudit`; overflow MUST NOT trigger immediate full rescan.
+   > Verification: watch queue overflow (`IN_Q_OVERFLOW`) MUST emit in-band overflow control marker and set sink group query response to `reliable=false` with `unreliable_reason=WatchOverflowPendingMaterialization`; overflow MUST NOT trigger immediate full rescan.
    > Verification: overflow-induced unreliability MUST clear only after next primary audit epoch boundary is processed.
    > Verification: source baseline/audit scan boundaries emit in-band `ControlEvent::EpochStart/EpochEnd` with per-group audit epoch progression, enabling sink epoch/MID lifecycle advancement without out-of-band coordination.
    > Verification: source data/control events emit `EventMetadata.timestamp_us` from drift-compensated observation time (`shadow_now_us`), decoupled from payload `modified_time_us`.

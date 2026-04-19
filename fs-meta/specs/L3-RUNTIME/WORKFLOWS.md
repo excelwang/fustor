@@ -41,9 +41,9 @@ User-visible and operator-visible state names consumed by these workflows are ow
 10. force-find 诊断错误标记事件不参与上述时间轴约束，可保留轻量诊断时间戳实现。
 11. root stream 启动前先探测 granted mount-root object 可用性；若根不可用则按 `1s→2s→...→300s` 指数退避重试，直到根恢复或收到 shutdown/close。
 12. 扫描遍历维护目录身份集合 `(dev, ino)`；命中回环 symlink 时记录告警并跳过，避免无限递归。
-13. watcher 收到 `IN_Q_OVERFLOW` 时发出 in-band `ControlEvent::WatchOverflow` 并置 sink 组级 `overflow_pending_audit`，查询响应立即标记 `reliable=false`。
+13. watcher 收到 `IN_Q_OVERFLOW` 时发出 in-band `ControlEvent::WatchOverflow` 并置 sink 组级 `overflow_pending_materialization`，查询响应立即标记 `reliable=false`。
 14. watcher 收到 `IN_IGNORED` 时必须立即清理 wd/path 映射；若对应根 watch 被移除（根被删除或卸载），立即关闭流并退出任务。
-15. overflow 处理在当前基线中不触发即时全盘补扫；`overflow_pending_audit` 仅在下一次 primary audit `EpochEnd` 后清除，并恢复可靠性标记。
+15. overflow 处理在当前基线中不触发即时全盘补扫；`overflow_pending_materialization` 仅在下一次 primary audit `EpochEnd` 后清除，并恢复可靠性标记。
 16. audit 扫描产生的文件级 `FileMetaRecord` 必须携带 `parent_path` 与 `parent_mtime_us`，供 sink 进行 parent-staleness 拒绝判定。
 17. source 通过 schema 约定输出 MessagePack `FileMetaRecord`：`path` 为 raw-bytes 且在 in-root emission 中保持 leading-slash 相对路径；`source` 字段按产出轨道显式标记 `Realtime/Scan`。
 
@@ -309,7 +309,7 @@ fn delete_aware_aggregate(records: &[FileMetaRecord]) -> Vec<FsMetaQueryNode>
 
 1. new generation receives current authoritative truth inputs: monitoring roots revision, runtime grants view, and authoritative journal continuation.
 2. source/sink rebuild observation state until the active scan-enabled primary groups have replayed current authoritative truth inputs into materialized state and satisfied the required first-audit/materialized health catch-up.
-3. status/health surfaces expose the current observation evidence through source audit timing, degraded roots, and per-group materialized readiness markers such as `initial_audit_completed` and `overflow_pending_audit`.
+3. status/health surfaces expose the current observation evidence through source audit timing, degraded roots, and per-group materialized readiness markers such as `initial_audit_completed` and `overflow_pending_materialization`.
 4. if facade activation is still pending after runtime proof or listener retry, status/health surfaces additionally expose optional `facade.pending` diagnostics (`reason`, `runtime_exposure_confirmed`, retry counters, and last error timing) so operators can tell cutover waiting from generic liveness.
 5. app computes `observation_eligible` from first-audit completion on active scan-enabled primary groups, materialized degraded/overflow state, and stale-writer fencing state.
 6. if `observation_eligible` is not yet satisfied, fs-meta keeps materialized `/tree` and `/stats` on the previous eligible generation or returns explicit not-ready/degraded observation state; query readability, internal route availability, or partial rebuild output are not sufficient to treat the generation as current truth. `/on-demand-force-find` stays a freshness path.

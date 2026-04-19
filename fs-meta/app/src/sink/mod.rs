@@ -348,18 +348,10 @@ pub struct SinkGroupStatusSnapshot {
     pub blind_spot_count: u64,
     pub shadow_time_us: u64,
     pub shadow_lag_us: u64,
-    pub overflow_pending_audit: bool,
+    pub overflow_pending_materialization: bool,
     pub readiness: GroupReadinessState,
-    pub initial_audit_completed: bool,
     pub materialized_revision: u64,
     pub estimated_heap_bytes: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GroupReadinessProjection {
-    readiness: GroupReadinessState,
-    initial_audit_completed: bool,
-    audit_epoch_completed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -406,13 +398,13 @@ impl<'a> GroupReadinessFacts<'a> {
             || self.primary_object_ref == self.group_id
     }
 
-    fn live_readiness(self, audit_epoch_completed: bool) -> GroupReadinessState {
-        if !audit_epoch_completed {
-            GroupReadinessState::PendingAudit
-        } else if self.ready_materialization_evidence {
-            GroupReadinessState::Ready
-        } else {
-            GroupReadinessState::WaitingForMaterializedRoot
+    fn normalized_live_readiness(self, readiness: GroupReadinessState) -> GroupReadinessState {
+        match readiness {
+            GroupReadinessState::PendingMaterialization => {
+                GroupReadinessState::PendingMaterialization
+            }
+            _ if self.ready_materialization_evidence => GroupReadinessState::Ready,
+            _ => GroupReadinessState::WaitingForMaterializedRoot,
         }
     }
 
@@ -425,136 +417,19 @@ impl<'a> GroupReadinessFacts<'a> {
                 if self.uses_placeholder_primary_truth() {
                     GroupReadinessState::WaitingForMaterializedRoot
                 } else {
-                    GroupReadinessState::PendingAudit
+                    GroupReadinessState::PendingMaterialization
                 }
             }
             _ => readiness,
         }
     }
 
-    fn legacy_snapshot_readiness(
-        self,
-        initial_audit_completed: Option<bool>,
-        audit_epoch_completed: Option<bool>,
-    ) -> GroupReadinessState {
-        let inferred = if matches!(audit_epoch_completed, Some(false)) {
-            GroupReadinessState::PendingAudit
-        } else if matches!(initial_audit_completed, Some(true)) {
-            GroupReadinessState::Ready
-        } else if matches!(audit_epoch_completed, Some(true)) {
-            self.live_readiness(true)
-        } else if self.ready_materialization_evidence {
-            GroupReadinessState::Ready
-        } else if self.uses_placeholder_primary_truth() {
-            GroupReadinessState::WaitingForMaterializedRoot
-        } else {
-            GroupReadinessState::PendingAudit
-        };
-
-        self.normalize_snapshot_readiness(inferred)
-    }
-
-    fn projection_from_normalized_snapshot(
-        self,
-        readiness: GroupReadinessState,
-    ) -> GroupReadinessProjection {
-        self.normalize_snapshot_readiness(readiness).projection()
-    }
-
-    fn projection_from_deserialized_snapshot(
-        self,
-        readiness: Option<GroupReadinessState>,
-        initial_audit_completed: Option<bool>,
-        audit_epoch_completed: Option<bool>,
-    ) -> GroupReadinessProjection {
-        readiness.map_or_else(
-            || {
-                self.legacy_snapshot_readiness(initial_audit_completed, audit_epoch_completed)
-                    .projection()
-            },
-            |readiness| self.normalize_snapshot_readiness(readiness).projection(),
-        )
-    }
-
-    fn projection_from_live_state(self, audit_epoch_completed: bool) -> GroupReadinessProjection {
-        self.live_readiness(audit_epoch_completed).projection()
-    }
-}
-
-impl GroupReadinessProjection {
-    fn from_readiness(readiness: GroupReadinessState) -> Self {
-        Self {
-            readiness,
-            initial_audit_completed: readiness.initial_audit_completed(),
-            audit_epoch_completed: readiness.audit_epoch_completed(),
-        }
-    }
-
-    fn normalized_snapshot(
-        group_id: &str,
-        primary_object_ref: &str,
-        total_nodes: u64,
-        live_nodes: u64,
-        readiness: GroupReadinessState,
-    ) -> Self {
-        GroupReadinessFacts::from_snapshot(group_id, primary_object_ref, total_nodes, live_nodes)
-            .projection_from_normalized_snapshot(readiness)
-    }
-
-    fn deserialized_snapshot(
-        group_id: &str,
-        primary_object_ref: &str,
-        total_nodes: u64,
-        live_nodes: u64,
-        readiness: Option<GroupReadinessState>,
-        initial_audit_completed: Option<bool>,
-        audit_epoch_completed: Option<bool>,
-    ) -> Self {
-        GroupReadinessFacts::from_snapshot(group_id, primary_object_ref, total_nodes, live_nodes)
-            .projection_from_deserialized_snapshot(
-                readiness,
-                initial_audit_completed,
-                audit_epoch_completed,
-            )
+    fn normalized_snapshot_readiness(self, readiness: GroupReadinessState) -> GroupReadinessState {
+        self.normalize_snapshot_readiness(readiness)
     }
 }
 
 impl SinkGroupStatusSnapshot {
-    fn from_projection(
-        group_id: String,
-        primary_object_ref: String,
-        total_nodes: u64,
-        live_nodes: u64,
-        tombstoned_count: u64,
-        attested_count: u64,
-        suspect_count: u64,
-        blind_spot_count: u64,
-        shadow_time_us: u64,
-        shadow_lag_us: u64,
-        overflow_pending_audit: bool,
-        readiness: GroupReadinessProjection,
-        materialized_revision: u64,
-        estimated_heap_bytes: u64,
-    ) -> Self {
-        Self {
-            group_id,
-            primary_object_ref,
-            total_nodes,
-            live_nodes,
-            tombstoned_count,
-            attested_count,
-            suspect_count,
-            blind_spot_count,
-            shadow_time_us,
-            shadow_lag_us,
-            overflow_pending_audit,
-            readiness: readiness.readiness,
-            initial_audit_completed: readiness.initial_audit_completed,
-            materialized_revision,
-            estimated_heap_bytes,
-        }
-    }
-
     fn from_status_fields(
         group_id: String,
         primary_object_ref: String,
@@ -566,19 +441,19 @@ impl SinkGroupStatusSnapshot {
         blind_spot_count: u64,
         shadow_time_us: u64,
         shadow_lag_us: u64,
-        overflow_pending_audit: bool,
+        overflow_pending_materialization: bool,
         readiness: GroupReadinessState,
         materialized_revision: u64,
         estimated_heap_bytes: u64,
     ) -> Self {
-        let readiness = GroupReadinessProjection::normalized_snapshot(
+        let readiness = GroupReadinessFacts::from_snapshot(
             &group_id,
             &primary_object_ref,
             total_nodes,
             live_nodes,
-            readiness,
-        );
-        Self::from_projection(
+        )
+        .normalized_snapshot_readiness(readiness);
+        Self {
             group_id,
             primary_object_ref,
             total_nodes,
@@ -589,29 +464,25 @@ impl SinkGroupStatusSnapshot {
             blind_spot_count,
             shadow_time_us,
             shadow_lag_us,
-            overflow_pending_audit,
+            overflow_pending_materialization,
             readiness,
             materialized_revision,
             estimated_heap_bytes,
-        )
+        }
     }
 
-    fn normalized_readiness_projection(&self) -> GroupReadinessProjection {
-        GroupReadinessProjection::normalized_snapshot(
+    pub(crate) fn normalized_readiness(&self) -> GroupReadinessState {
+        GroupReadinessFacts::from_snapshot(
             &self.group_id,
             &self.primary_object_ref,
             self.total_nodes,
             self.live_nodes,
-            self.readiness,
         )
+        .normalized_snapshot_readiness(self.readiness)
     }
 
-    pub(crate) fn normalized_readiness(&self) -> GroupReadinessState {
-        self.normalized_readiness_projection().readiness
-    }
-
-    pub fn audit_epoch_completed(&self) -> bool {
-        self.normalized_readiness_projection().audit_epoch_completed
+    pub fn is_ready(&self) -> bool {
+        matches!(self.normalized_readiness(), GroupReadinessState::Ready)
     }
 }
 
@@ -632,26 +503,14 @@ impl<'de> serde::Deserialize<'de> for SinkGroupStatusSnapshot {
             blind_spot_count: u64,
             shadow_time_us: u64,
             shadow_lag_us: u64,
-            overflow_pending_audit: bool,
-            #[serde(default)]
-            readiness: Option<GroupReadinessState>,
-            initial_audit_completed: Option<bool>,
-            audit_epoch_completed: Option<bool>,
+            overflow_pending_materialization: bool,
+            readiness: GroupReadinessState,
             materialized_revision: u64,
             estimated_heap_bytes: u64,
         }
 
         let raw = RawSinkGroupStatusSnapshot::deserialize(deserializer)?;
-        let readiness = GroupReadinessProjection::deserialized_snapshot(
-            &raw.group_id,
-            &raw.primary_object_ref,
-            raw.total_nodes,
-            raw.live_nodes,
-            raw.readiness,
-            raw.initial_audit_completed,
-            raw.audit_epoch_completed,
-        );
-        Ok(Self::from_projection(
+        Ok(Self::from_status_fields(
             raw.group_id,
             raw.primary_object_ref,
             raw.total_nodes,
@@ -662,8 +521,8 @@ impl<'de> serde::Deserialize<'de> for SinkGroupStatusSnapshot {
             raw.blind_spot_count,
             raw.shadow_time_us,
             raw.shadow_lag_us,
-            raw.overflow_pending_audit,
-            readiness,
+            raw.overflow_pending_materialization,
+            raw.readiness,
             raw.materialized_revision,
             raw.estimated_heap_bytes,
         ))
@@ -675,8 +534,8 @@ impl serde::Serialize for SinkGroupStatusSnapshot {
     where
         S: serde::Serializer,
     {
-        let readiness = self.normalized_readiness_projection();
-        let mut state = serializer.serialize_struct("SinkGroupStatusSnapshot", 16)?;
+        let readiness = self.normalized_readiness();
+        let mut state = serializer.serialize_struct("SinkGroupStatusSnapshot", 14)?;
         state.serialize_field("group_id", &self.group_id)?;
         state.serialize_field("primary_object_ref", &self.primary_object_ref)?;
         state.serialize_field("total_nodes", &self.total_nodes)?;
@@ -687,13 +546,11 @@ impl serde::Serialize for SinkGroupStatusSnapshot {
         state.serialize_field("blind_spot_count", &self.blind_spot_count)?;
         state.serialize_field("shadow_time_us", &self.shadow_time_us)?;
         state.serialize_field("shadow_lag_us", &self.shadow_lag_us)?;
-        state.serialize_field("overflow_pending_audit", &self.overflow_pending_audit)?;
-        state.serialize_field("readiness", &readiness.readiness)?;
-        state.serialize_field("audit_epoch_completed", &readiness.audit_epoch_completed)?;
         state.serialize_field(
-            "initial_audit_completed",
-            &readiness.initial_audit_completed,
+            "overflow_pending_materialization",
+            &self.overflow_pending_materialization,
         )?;
+        state.serialize_field("readiness", &readiness)?;
         state.serialize_field("materialized_revision", &self.materialized_revision)?;
         state.serialize_field("estimated_heap_bytes", &self.estimated_heap_bytes)?;
         state.end()
@@ -742,24 +599,34 @@ pub(crate) struct SinkStatusSnapshotReadinessSummary {
     pub(crate) scheduled_groups: BTreeSet<String>,
     pub(crate) ready_groups: BTreeSet<String>,
     pub(crate) waiting_for_materialized_root_groups: BTreeSet<String>,
-    pub(crate) pending_audit_groups: BTreeSet<String>,
+    pub(crate) pending_materialization_groups: BTreeSet<String>,
     pub(crate) missing_scheduled_groups: BTreeSet<String>,
     pub(crate) has_stream_group_evidence: bool,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SinkStatusSnapshotIssue {
     StaleEmpty,
     ScheduledMissingGroupRowsAfterStreamEvidence,
-    ScheduledPendingAuditWithoutStreamReceipts,
+    ScheduledPendingMaterializationWithoutStreamReceipts,
     ScheduledWaitingForMaterializedRoot,
     ScheduledMixedReadyAndUnready,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SinkStatusConcern {
+    CoverageGap,
+    ReplayPending,
+    WaitingForMaterializedRoot,
+    MixedReadiness,
+    StaleEmpty,
+}
+
 #[derive(Clone, Debug)]
-pub(crate) struct SinkStatusSnapshotIssueProjection {
+pub(crate) struct SinkStatusConcernProjection {
     pub(crate) summary: SinkStatusSnapshotReadinessSummary,
-    pub(crate) issue: Option<SinkStatusSnapshotIssue>,
+    pub(crate) concern: Option<SinkStatusConcern>,
 }
 
 impl SinkStatusSnapshot {
@@ -801,8 +668,10 @@ impl SinkStatusSnapshot {
                         .waiting_for_materialized_root_groups
                         .insert(group_id.clone());
                 }
-                GroupReadinessState::PendingAudit => {
-                    summary.pending_audit_groups.insert(group_id.clone());
+                GroupReadinessState::PendingMaterialization => {
+                    summary
+                        .pending_materialization_groups
+                        .insert(group_id.clone());
                 }
                 GroupReadinessState::Ready => {}
             }
@@ -816,7 +685,7 @@ impl SinkStatusSnapshot {
     }
 
     pub(crate) fn has_ready_scheduled_groups(&self) -> bool {
-        let projection = self.issue_projection();
+        let projection = self.concern_projection();
         !projection.summary.scheduled_groups.is_empty()
             && projection
                 .summary
@@ -832,31 +701,48 @@ impl SinkStatusSnapshot {
                 .all(|group| group.live_nodes == 0 && group.total_nodes == 0)
     }
 
-    pub(crate) fn issue_projection(&self) -> SinkStatusSnapshotIssueProjection {
+    pub(crate) fn concern_projection(&self) -> SinkStatusConcernProjection {
         let summary = self.readiness_summary();
-        let issue = if self.looks_stale_empty() {
-            Some(SinkStatusSnapshotIssue::StaleEmpty)
+        let concern = if self.looks_stale_empty() {
+            Some(SinkStatusConcern::StaleEmpty)
         } else if readiness_summary_looks_scheduled_missing_group_rows_after_stream_evidence(
             &summary,
         ) {
-            Some(SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence)
-        } else if readiness_summary_looks_scheduled_pending_audit_without_stream_receipts(
+            Some(SinkStatusConcern::CoverageGap)
+        } else if readiness_summary_looks_scheduled_pending_materialization_without_stream_receipts(
             &summary, self,
         ) {
-            Some(SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts)
+            Some(SinkStatusConcern::ReplayPending)
         } else if readiness_summary_looks_scheduled_waiting_for_materialized_root(&summary) {
-            Some(SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot)
+            Some(SinkStatusConcern::WaitingForMaterializedRoot)
         } else if readiness_summary_looks_scheduled_mixed_ready_and_unready(&summary) {
-            Some(SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready)
+            Some(SinkStatusConcern::MixedReadiness)
         } else {
             None
         };
 
-        SinkStatusSnapshotIssueProjection { summary, issue }
+        SinkStatusConcernProjection { summary, concern }
     }
 
+    #[cfg(test)]
     pub(crate) fn issue(&self) -> Option<SinkStatusSnapshotIssue> {
-        self.issue_projection().issue
+        self.concern_projection()
+            .concern
+            .map(|concern| match concern {
+                SinkStatusConcern::CoverageGap => {
+                    SinkStatusSnapshotIssue::ScheduledMissingGroupRowsAfterStreamEvidence
+                }
+                SinkStatusConcern::ReplayPending => {
+                    SinkStatusSnapshotIssue::ScheduledPendingMaterializationWithoutStreamReceipts
+                }
+                SinkStatusConcern::WaitingForMaterializedRoot => {
+                    SinkStatusSnapshotIssue::ScheduledWaitingForMaterializedRoot
+                }
+                SinkStatusConcern::MixedReadiness => {
+                    SinkStatusSnapshotIssue::ScheduledMixedReadyAndUnready
+                }
+                SinkStatusConcern::StaleEmpty => SinkStatusSnapshotIssue::StaleEmpty,
+            })
     }
 }
 
@@ -909,13 +795,13 @@ fn readiness_summary_looks_scheduled_waiting_for_materialized_root(
         && summary.waiting_for_materialized_root_groups.len() == summary.scheduled_groups.len()
 }
 
-fn readiness_summary_looks_scheduled_pending_audit_without_stream_receipts(
+fn readiness_summary_looks_scheduled_pending_materialization_without_stream_receipts(
     summary: &SinkStatusSnapshotReadinessSummary,
     snapshot: &SinkStatusSnapshot,
 ) -> bool {
     if summary.scheduled_groups.is_empty()
         || !summary.missing_scheduled_groups.is_empty()
-        || summary.pending_audit_groups.len() != summary.scheduled_groups.len()
+        || summary.pending_materialization_groups.len() != summary.scheduled_groups.len()
     {
         return false;
     }
@@ -953,7 +839,7 @@ fn readiness_summary_looks_scheduled_mixed_ready_and_unready(
     !summary.scheduled_groups.is_empty()
         && !summary.ready_groups.is_empty()
         && (!summary.waiting_for_materialized_root_groups.is_empty()
-            || !summary.pending_audit_groups.is_empty())
+            || !summary.pending_materialization_groups.is_empty())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1016,23 +902,9 @@ fn sample_visibility_lag(
 /// Internal per-group state of the sink app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GroupReadinessState {
-    PendingAudit,
+    PendingMaterialization,
     WaitingForMaterializedRoot,
     Ready,
-}
-
-impl GroupReadinessState {
-    fn projection(self) -> GroupReadinessProjection {
-        GroupReadinessProjection::from_readiness(self)
-    }
-
-    fn initial_audit_completed(self) -> bool {
-        matches!(self, Self::Ready)
-    }
-
-    fn audit_epoch_completed(self) -> bool {
-        !matches!(self, Self::PendingAudit)
-    }
 }
 
 pub(crate) struct GroupSinkState {
@@ -1041,8 +913,8 @@ pub(crate) struct GroupSinkState {
     pub(crate) epoch_manager: EpochManager,
     pub(crate) tombstone_policy: TombstonePolicy,
     pub(crate) primary_object_ref: String,
-    pub(crate) overflow_pending_audit: bool,
-    pub(crate) audit_epoch_completed: bool,
+    pub(crate) overflow_pending_materialization: bool,
+    pub(crate) readiness_state: GroupReadinessState,
     pub(crate) last_coverage_recovered_at: Option<Instant>,
     pub(crate) materialized_revision: u64,
     pub(crate) sentinel_health: BTreeMap<String, String>,
@@ -1056,8 +928,8 @@ impl GroupSinkState {
             epoch_manager: EpochManager::new(),
             tombstone_policy,
             primary_object_ref,
-            overflow_pending_audit: false,
-            audit_epoch_completed: false,
+            overflow_pending_materialization: false,
+            readiness_state: GroupReadinessState::PendingMaterialization,
             last_coverage_recovered_at: Some(Instant::now()),
             materialized_revision: 1,
             sentinel_health: BTreeMap::new(),
@@ -1070,24 +942,32 @@ impl GroupSinkState {
             .is_some_and(|aggregate| aggregate.total_nodes > 0)
     }
 
-    fn group_readiness_projection(&self) -> GroupReadinessProjection {
+    fn group_readiness_projection(&self) -> GroupReadinessState {
         GroupReadinessFacts::from_live_group_state(
             &self.primary_object_ref,
             self.has_live_materialized_nodes(),
         )
-        .projection_from_live_state(self.audit_epoch_completed)
+        .normalized_live_readiness(self.readiness_state)
     }
 
     fn group_readiness_state(&self) -> GroupReadinessState {
-        self.group_readiness_projection().readiness
+        self.group_readiness_projection()
     }
 
-    fn initial_audit_completed(&self) -> bool {
-        self.group_readiness_projection().initial_audit_completed
+    fn refresh_materialization_readiness(&mut self) {
+        self.readiness_state = self.group_readiness_projection();
+    }
+
+    fn mark_materialization_ready(&mut self) {
+        self.readiness_state = GroupReadinessFacts::from_live_group_state(
+            &self.primary_object_ref,
+            self.has_live_materialized_nodes(),
+        )
+        .normalized_live_readiness(GroupReadinessState::WaitingForMaterializedRoot);
     }
 
     fn preserves_materialized_state_for_omission_window(&self) -> bool {
-        let readiness = self.group_readiness_projection().readiness;
+        let readiness = self.group_readiness_state();
         matches!(
             readiness,
             GroupReadinessState::WaitingForMaterializedRoot | GroupReadinessState::Ready
@@ -1162,14 +1042,15 @@ impl PersistedFileMetaNode {
 struct PersistedGroupSinkState {
     group_id: String,
     primary_object_ref: String,
-    overflow_pending_audit: bool,
-    audit_epoch_completed: bool,
+    overflow_pending_materialization: bool,
+    readiness_state: GroupReadinessState,
     materialized_revision: u64,
     sentinel_health: BTreeMap<String, String>,
     shadow_time_high_us: u64,
     epoch_state_active: Option<u64>,
     completed_epochs: u64,
-    audit_start_age_ms: Option<u64>,
+    #[serde(alias = "audit_start_age_ms")]
+    materialization_start_age_ms: Option<u64>,
     last_coverage_recovered_age_ms: Option<u64>,
     nodes: Vec<PersistedFileMetaNode>,
 }
@@ -1180,8 +1061,8 @@ impl PersistedGroupSinkState {
         Self {
             group_id: group_id.to_string(),
             primary_object_ref: group.primary_object_ref.clone(),
-            overflow_pending_audit: group.overflow_pending_audit,
-            audit_epoch_completed: group.audit_epoch_completed,
+            overflow_pending_materialization: group.overflow_pending_materialization,
+            readiness_state: group.group_readiness_state(),
             materialized_revision: group.materialized_revision,
             sentinel_health: group.sentinel_health.clone(),
             shadow_time_high_us: group.clock.shadow_time_high_us,
@@ -1190,7 +1071,10 @@ impl PersistedGroupSinkState {
                 epoch::EpochState::Active(epoch_id) => Some(epoch_id),
             },
             completed_epochs: group.epoch_manager.completed_epochs,
-            audit_start_age_ms: encode_instant_age_ms(group.epoch_manager.audit_start_time, now),
+            materialization_start_age_ms: encode_instant_age_ms(
+                group.epoch_manager.audit_start_time,
+                now,
+            ),
             last_coverage_recovered_age_ms: encode_instant_age_ms(
                 group.last_coverage_recovered_at,
                 now,
@@ -1215,7 +1099,7 @@ impl PersistedGroupSinkState {
             .epoch_state_active
             .map(epoch::EpochState::Active)
             .unwrap_or(epoch::EpochState::Idle);
-        epoch_manager.audit_start_time = decode_instant_age_ms(self.audit_start_age_ms);
+        epoch_manager.audit_start_time = decode_instant_age_ms(self.materialization_start_age_ms);
         let mut restored = GroupSinkState {
             tree,
             clock: SinkClock {
@@ -1224,12 +1108,13 @@ impl PersistedGroupSinkState {
             epoch_manager,
             tombstone_policy,
             primary_object_ref: self.primary_object_ref,
-            overflow_pending_audit: self.overflow_pending_audit,
-            audit_epoch_completed: self.audit_epoch_completed,
+            overflow_pending_materialization: self.overflow_pending_materialization,
+            readiness_state: self.readiness_state,
             last_coverage_recovered_at: decode_instant_age_ms(self.last_coverage_recovered_age_ms),
             materialized_revision: self.materialized_revision,
             sentinel_health: self.sentinel_health,
         };
+        restored.refresh_materialization_readiness();
         restored
     }
 }
@@ -3198,7 +3083,7 @@ impl SinkFileMeta {
                     group.preserves_materialized_state_for_omission_window()
                         && !matches!(
                             group.group_readiness_state(),
-                            GroupReadinessState::PendingAudit
+                            GroupReadinessState::PendingMaterialization
                         )
                 })
                 .map(|(group_id, _)| group_id.clone())
@@ -3288,7 +3173,7 @@ impl SinkFileMeta {
                 } else {
                     now.saturating_sub(stats.shadow_time_us)
                 },
-                group.overflow_pending_audit,
+                group.overflow_pending_materialization,
                 group.group_readiness_state(),
                 group.materialized_revision,
                 estimated_heap_bytes,
@@ -3738,7 +3623,7 @@ impl SinkFileMeta {
                 control_events += 1;
                 match &control {
                     ControlEvent::WatchOverflow => {
-                        group_state.overflow_pending_audit = true;
+                        group_state.overflow_pending_materialization = true;
                     }
                     _ => {
                         if is_group_primary {
@@ -3752,6 +3637,7 @@ impl SinkFileMeta {
                                     &group_state.epoch_manager,
                                 );
                                 group_state.epoch_manager.clear_completed_audit_skip_state();
+                                group_state.refresh_materialization_readiness();
                             }
                             if matches!(
                                 control,
@@ -3760,13 +3646,13 @@ impl SinkFileMeta {
                                     ..
                                 }
                             ) {
-                                group_state.audit_epoch_completed = true;
-                                if group_state.overflow_pending_audit {
+                                group_state.mark_materialization_ready();
+                                if group_state.overflow_pending_materialization {
                                     group_state.last_coverage_recovered_at = Some(Instant::now());
                                     group_state.materialized_revision =
                                         group_state.materialized_revision.saturating_add(1);
                                 }
-                                group_state.overflow_pending_audit = false;
+                                group_state.overflow_pending_materialization = false;
                             }
                         }
                     }
@@ -3795,6 +3681,7 @@ impl SinkFileMeta {
                 group_state.tombstone_policy,
                 current_epoch,
             );
+            group_state.refresh_materialization_readiness();
             let write_significant = match outcome {
                 ProcessOutcome::UpsertCreated | ProcessOutcome::DeleteApplied => true,
                 ProcessOutcome::UpsertModified => {
@@ -3896,7 +3783,7 @@ impl SinkFileMeta {
                         &group.tree,
                         &dir_path,
                         &group.clock,
-                        group.overflow_pending_audit,
+                        group.overflow_pending_materialization,
                         request.scope.recursive,
                         request.scope.max_depth,
                         tree_options.read_class,
@@ -3909,15 +3796,14 @@ impl SinkFileMeta {
                             .map(|aggregate| aggregate.total_nodes)
                             .unwrap_or(0);
                         eprintln!(
-                            "fs_meta_sink: materialized_query group={} selected={:?} path={} recursive={} node_count={} live_nodes={} audit_epoch_completed={} initial_audit_completed={} root_exists={} entries={} has_children={}",
+                            "fs_meta_sink: materialized_query group={} selected={:?} path={} recursive={} node_count={} live_nodes={} readiness={:?} root_exists={} entries={} has_children={}",
                             group_id,
                             selected_group,
                             String::from_utf8_lossy(&dir_path),
                             request.scope.recursive,
                             group.tree.node_count(),
                             live_nodes,
-                            group.audit_epoch_completed,
-                            group.initial_audit_completed(),
+                            group.group_readiness_state(),
                             response.root.exists,
                             response.entries.len(),
                             response.root.has_children

@@ -36,13 +36,284 @@ const SOURCE_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
 const SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
 const SOURCE_WORKER_CLOSE_DRAIN_TIMEOUT: Duration = SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT;
-const SOURCE_WORKER_CLOSE_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
 const SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT: Duration = Duration::from_secs(5);
-const SOURCE_WORKER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const SOURCE_WORKER_NONBLOCKING_OBSERVABILITY_CACHE_TTL: Duration = Duration::from_secs(1);
 const SOURCE_WORKER_DEGRADED_STATE: &str = "degraded_worker_unreachable";
 const SOURCE_WORKER_DEGRADED_ROOT_KEY: &str = "source-worker";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceRefreshRuntimeAction {
+    Attempt {
+        timeout: Duration,
+        reconnect_before: bool,
+    },
+    ReturnTimeout,
+    WaitForProgress {
+        after: SourceProgressCursor,
+        accepted: SourceProgressMask,
+        deadline: std::time::Instant,
+    },
+    ReconnectAndWaitForProgress {
+        after: SourceProgressCursor,
+        accepted: SourceProgressMask,
+        deadline: std::time::Instant,
+    },
+}
+
+#[derive(Debug)]
+enum SourceRefreshFollowup {
+    Apply(SourceRefreshRuntimeAction),
+    ReturnErr(CnxError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceRefreshRuntime {
+    deadline: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceProgressReason {
+    WorkerClientReplaced,
+    ControlSignalsRetained,
+    HostObjectGrantsUpdated,
+    ScheduledGroupsUpdated,
+    ObservabilityUpdated,
+    Started,
+    LogicalRootsUpdated,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceProgressMask(u8);
+
+impl SourceProgressMask {
+    const NONE: Self = Self(0);
+    const CLIENT_RECONNECTED: Self = Self(1 << 0);
+    const CONTROL_RETAINED: Self = Self(1 << 1);
+    const HOST_GRANTS_UPDATED: Self = Self(1 << 2);
+    const SCHEDULED_GROUPS_UPDATED: Self = Self(1 << 3);
+    const OBSERVABILITY_UPDATED: Self = Self(1 << 4);
+    const STARTED: Self = Self(1 << 5);
+    const LOGICAL_ROOTS_UPDATED: Self = Self(1 << 6);
+
+    const CONTROL_FLOW_RETRY: Self =
+        Self(Self::CLIENT_RECONNECTED.0 | Self::CONTROL_RETAINED.0);
+    const SCHEDULED_GROUPS_REFRESH_RETRY: Self = Self(
+        Self::CLIENT_RECONNECTED.0
+            | Self::HOST_GRANTS_UPDATED.0
+            | Self::SCHEDULED_GROUPS_UPDATED.0,
+    );
+    const OBSERVABILITY_RETRY: Self =
+        Self(Self::CLIENT_RECONNECTED.0 | Self::OBSERVABILITY_UPDATED.0);
+    const START_RETRY: Self = Self(Self::CLIENT_RECONNECTED.0 | Self::STARTED.0);
+    const UPDATE_LOGICAL_ROOTS_RETRY: Self =
+        Self(Self::CLIENT_RECONNECTED.0 | Self::LOGICAL_ROOTS_UPDATED.0);
+    const FORCE_FIND_RETRY: Self = Self(
+        Self::CLIENT_RECONNECTED.0
+            | Self::CONTROL_RETAINED.0
+            | Self::SCHEDULED_GROUPS_UPDATED.0
+            | Self::STARTED.0
+            | Self::LOGICAL_ROOTS_UPDATED.0,
+    );
+
+    const fn contains(self, reason: SourceProgressReason) -> bool {
+        self.0 & reason.mask().0 != 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SourceProgressState {
+    worker_client_replaced_epoch: u64,
+    control_signals_retained_epoch: u64,
+    host_object_grants_updated_epoch: u64,
+    scheduled_groups_updated_epoch: u64,
+    observability_updated_epoch: u64,
+    started_epoch: u64,
+    logical_roots_updated_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SourceProgressCursor {
+    worker_client_replaced_epoch: u64,
+    control_signals_retained_epoch: u64,
+    host_object_grants_updated_epoch: u64,
+    scheduled_groups_updated_epoch: u64,
+    observability_updated_epoch: u64,
+    started_epoch: u64,
+    logical_roots_updated_epoch: u64,
+}
+
+impl SourceProgressReason {
+    const ALL: [Self; 7] = [
+        Self::WorkerClientReplaced,
+        Self::ControlSignalsRetained,
+        Self::HostObjectGrantsUpdated,
+        Self::ScheduledGroupsUpdated,
+        Self::ObservabilityUpdated,
+        Self::Started,
+        Self::LogicalRootsUpdated,
+    ];
+
+    const fn mask(self) -> SourceProgressMask {
+        match self {
+            Self::WorkerClientReplaced => SourceProgressMask::CLIENT_RECONNECTED,
+            Self::ControlSignalsRetained => SourceProgressMask::CONTROL_RETAINED,
+            Self::HostObjectGrantsUpdated => SourceProgressMask::HOST_GRANTS_UPDATED,
+            Self::ScheduledGroupsUpdated => SourceProgressMask::SCHEDULED_GROUPS_UPDATED,
+            Self::ObservabilityUpdated => SourceProgressMask::OBSERVABILITY_UPDATED,
+            Self::Started => SourceProgressMask::STARTED,
+            Self::LogicalRootsUpdated => SourceProgressMask::LOGICAL_ROOTS_UPDATED,
+        }
+    }
+
+    const fn epoch_in_state(self, state: SourceProgressState) -> u64 {
+        match self {
+            Self::WorkerClientReplaced => state.worker_client_replaced_epoch,
+            Self::ControlSignalsRetained => state.control_signals_retained_epoch,
+            Self::HostObjectGrantsUpdated => state.host_object_grants_updated_epoch,
+            Self::ScheduledGroupsUpdated => state.scheduled_groups_updated_epoch,
+            Self::ObservabilityUpdated => state.observability_updated_epoch,
+            Self::Started => state.started_epoch,
+            Self::LogicalRootsUpdated => state.logical_roots_updated_epoch,
+        }
+    }
+
+    const fn epoch_in_cursor(self, cursor: SourceProgressCursor) -> u64 {
+        match self {
+            Self::WorkerClientReplaced => cursor.worker_client_replaced_epoch,
+            Self::ControlSignalsRetained => cursor.control_signals_retained_epoch,
+            Self::HostObjectGrantsUpdated => cursor.host_object_grants_updated_epoch,
+            Self::ScheduledGroupsUpdated => cursor.scheduled_groups_updated_epoch,
+            Self::ObservabilityUpdated => cursor.observability_updated_epoch,
+            Self::Started => cursor.started_epoch,
+            Self::LogicalRootsUpdated => cursor.logical_roots_updated_epoch,
+        }
+    }
+}
+
+impl SourceProgressState {
+    fn cursor(self) -> SourceProgressCursor {
+        SourceProgressCursor {
+            worker_client_replaced_epoch: self.worker_client_replaced_epoch,
+            control_signals_retained_epoch: self.control_signals_retained_epoch,
+            host_object_grants_updated_epoch: self.host_object_grants_updated_epoch,
+            scheduled_groups_updated_epoch: self.scheduled_groups_updated_epoch,
+            observability_updated_epoch: self.observability_updated_epoch,
+            started_epoch: self.started_epoch,
+            logical_roots_updated_epoch: self.logical_roots_updated_epoch,
+        }
+    }
+
+    fn advanced_past(self, after: SourceProgressCursor, accepted: SourceProgressMask) -> bool {
+        SourceProgressReason::ALL.into_iter().any(|reason| {
+            accepted.contains(reason)
+                && reason.epoch_in_state(self) > reason.epoch_in_cursor(after)
+        })
+    }
+
+    fn bump(&mut self, reason: SourceProgressReason) {
+        match reason {
+            SourceProgressReason::WorkerClientReplaced => {
+                self.worker_client_replaced_epoch += 1;
+            }
+            SourceProgressReason::ControlSignalsRetained => {
+                self.control_signals_retained_epoch += 1;
+            }
+            SourceProgressReason::HostObjectGrantsUpdated => {
+                self.host_object_grants_updated_epoch += 1;
+            }
+            SourceProgressReason::ScheduledGroupsUpdated => {
+                self.scheduled_groups_updated_epoch += 1;
+            }
+            SourceProgressReason::ObservabilityUpdated => {
+                self.observability_updated_epoch += 1;
+            }
+            SourceProgressReason::Started => {
+                self.started_epoch += 1;
+            }
+            SourceProgressReason::LogicalRootsUpdated => {
+                self.logical_roots_updated_epoch += 1;
+            }
+        }
+    }
+}
+
+impl SourceRefreshRuntime {
+    fn new(deadline: std::time::Instant, budget: Duration) -> Self {
+        Self {
+            deadline: clip_retry_deadline(deadline, budget),
+        }
+    }
+
+    fn deadline(self) -> std::time::Instant {
+        self.deadline
+    }
+
+    fn attempt_action(
+        self,
+        attempt_timeout_cap: Duration,
+        reconnect_before: bool,
+    ) -> SourceRefreshRuntimeAction {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            SourceRefreshRuntimeAction::ReturnTimeout
+        } else {
+            SourceRefreshRuntimeAction::Attempt {
+                timeout: attempt_timeout_cap.min(remaining),
+                reconnect_before,
+            }
+        }
+    }
+
+    fn retry_action(
+        self,
+        reconnect: bool,
+        after: SourceProgressCursor,
+        accepted: SourceProgressMask,
+    ) -> SourceRefreshRuntimeAction {
+        if self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .is_zero()
+        {
+            return SourceRefreshRuntimeAction::ReturnTimeout;
+        }
+        if reconnect {
+            SourceRefreshRuntimeAction::ReconnectAndWaitForProgress {
+                after,
+                accepted,
+                deadline: self.deadline,
+            }
+        } else {
+            SourceRefreshRuntimeAction::WaitForProgress {
+                after,
+                accepted,
+                deadline: self.deadline,
+            }
+        }
+    }
+
+    fn followup_after(
+        self,
+        err: CnxError,
+        reconnect: bool,
+        is_retryable: fn(&CnxError) -> bool,
+        after: SourceProgressCursor,
+        accepted: SourceProgressMask,
+    ) -> SourceRefreshFollowup {
+        if !is_retryable(&err) {
+            return SourceRefreshFollowup::ReturnErr(err);
+        }
+        match self.retry_action(reconnect, after, accepted) {
+            SourceRefreshRuntimeAction::ReturnTimeout => {
+                SourceRefreshFollowup::ReturnErr(CnxError::Timeout)
+            }
+            action => SourceRefreshFollowup::Apply(action),
+        }
+    }
+}
 
 fn clip_retry_deadline(deadline: std::time::Instant, budget: Duration) -> std::time::Instant {
     std::cmp::min(deadline, std::time::Instant::now() + budget)
@@ -496,13 +767,23 @@ fn merge_cached_local_scheduled_groups(
     node_id: &NodeId,
     live_groups: Option<std::collections::BTreeSet<String>>,
     groups_by_node: &Option<std::collections::BTreeMap<String, Vec<String>>>,
+    replay_recovery_groups_by_node: &Option<std::collections::BTreeMap<String, Vec<String>>>,
 ) -> Option<std::collections::BTreeSet<String>> {
     if live_groups.as_ref().is_some_and(|groups| groups.is_empty()) {
+        if let Some(recovery_groups) =
+            cached_local_scheduled_groups(node_id, replay_recovery_groups_by_node)
+        {
+            return Some(recovery_groups);
+        }
         return Some(std::collections::BTreeSet::new());
     }
     let mut groups = live_groups.unwrap_or_default();
     if let Some(cached) = cached_local_scheduled_groups(node_id, groups_by_node) {
         groups.extend(cached);
+    }
+    if let Some(recovery) = cached_local_scheduled_groups(node_id, replay_recovery_groups_by_node)
+    {
+        groups.extend(recovery);
     }
     if groups.is_empty() {
         None
@@ -651,6 +932,94 @@ fn prime_cached_schedule_from_control_signals(
         saw_activate_with_bound_scopes: saw_source_activate || saw_scan_activate,
         has_local_runnable_groups,
     }
+}
+
+fn bound_scope_matches_local_grant(
+    bound_scope: &RuntimeBoundScope,
+    node_id: &NodeId,
+    grants: &[GrantedMountRoot],
+) -> bool {
+    bound_scope.resource_ids.iter().any(|resource_id| {
+        host_ref_from_resource_id(resource_id)
+            .is_some_and(|host_ref| host_ref_matches_node_id(host_ref, node_id))
+    }) || grants.iter().any(|grant| {
+        host_ref_matches_node_id(&grant.host_ref, node_id)
+            && (runtime_scope_resource_matches_logical_root(&grant.object_ref, &bound_scope.scope_id)
+                || runtime_scope_resource_matches_logical_root(&grant.fs_source, &bound_scope.scope_id))
+    })
+}
+
+fn prime_cached_schedule_from_control_signals_for_replay_recovery(
+    cache: &mut SourceWorkerSnapshotCache,
+    node_id: &NodeId,
+    signals: &[SourceControlSignal],
+    fallback_grants: &[GrantedMountRoot],
+) {
+    let grants = cache
+        .grants
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| fallback_grants.to_vec());
+    let stable_host_ref = {
+        let stable = stable_host_ref_for_node_id(node_id, &grants);
+        if stable != node_id.0 {
+            stable
+        } else {
+            stable_host_ref_from_cached_scheduled_groups(node_id, cache).unwrap_or(stable)
+        }
+    };
+    let mut desired_source = std::collections::BTreeSet::new();
+    let mut desired_scan = std::collections::BTreeSet::new();
+    for signal in signals {
+        let SourceControlSignal::Activate {
+            unit, bound_scopes, ..
+        } = signal
+        else {
+            continue;
+        };
+        for scope in bound_scopes {
+            if !bound_scope_matches_local_grant(scope, node_id, &grants) {
+                continue;
+            }
+            match unit {
+                SourceRuntimeUnit::Source => {
+                    desired_source.insert(scope.scope_id.clone());
+                }
+                SourceRuntimeUnit::Scan => {
+                    desired_scan.insert(scope.scope_id.clone());
+                }
+            }
+        }
+    }
+
+    let replace_groups = |
+        slot: &mut Option<std::collections::BTreeMap<String, Vec<String>>>,
+        groups: std::collections::BTreeSet<String>,
+    | {
+        if let Some(groups_by_node) = slot.as_mut() {
+            groups_by_node.retain(|host_ref, _| !host_ref_matches_node_id(host_ref, node_id));
+            if groups_by_node.is_empty() {
+                *slot = None;
+            }
+        }
+        if groups.is_empty() {
+            return;
+        }
+        let groups_by_node = slot.get_or_insert_with(std::collections::BTreeMap::new);
+        groups_by_node.insert(
+            stable_host_ref.clone(),
+            groups.into_iter().collect::<Vec<_>>(),
+        );
+    };
+
+    replace_groups(
+        &mut cache.replay_recovery_scheduled_source_groups_by_node,
+        desired_source,
+    );
+    replace_groups(
+        &mut cache.replay_recovery_scheduled_scan_groups_by_node,
+        desired_scan,
+    );
 }
 
 fn prime_cached_control_summary_from_control_signals(
@@ -1275,6 +1644,10 @@ struct SourceWorkerSnapshotCache {
     force_find_inflight_groups: Option<Vec<String>>,
     scheduled_source_groups_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
     scheduled_scan_groups_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    replay_recovery_scheduled_source_groups_by_node:
+        Option<std::collections::BTreeMap<String, Vec<String>>>,
+    replay_recovery_scheduled_scan_groups_by_node:
+        Option<std::collections::BTreeMap<String, Vec<String>>>,
     last_control_frame_signals_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
     published_batches_by_node: Option<std::collections::BTreeMap<String, u64>>,
     published_events_by_node: Option<std::collections::BTreeMap<String, u64>>,
@@ -1300,30 +1673,38 @@ pub struct SourceWorkerClientHandle {
     _shared: Arc<SharedSourceWorkerHandleState>,
     manual_rescan_signal: SignalCell,
     cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
-    retained_control_state: Arc<tokio::sync::Mutex<RetainedSourceWorkerControlState>>,
-    control_state_replay_required: Arc<std::sync::atomic::AtomicBool>,
+    control_state: Arc<tokio::sync::Mutex<SourceControlState>>,
     start_serial: Arc<tokio::sync::Mutex<()>>,
     control_ops_inflight: Arc<AtomicUsize>,
+    control_ops_state_tx: tokio::sync::watch::Sender<usize>,
+    control_ops_state: tokio::sync::watch::Receiver<usize>,
+    source_progress_state_current: Arc<Mutex<SourceProgressState>>,
+    source_progress_state_tx: tokio::sync::watch::Sender<SourceProgressState>,
+    source_progress_state: tokio::sync::watch::Receiver<SourceProgressState>,
     control_ops_serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct InflightControlOpGuard {
     counter: Arc<AtomicUsize>,
+    state: tokio::sync::watch::Sender<usize>,
 }
 
 impl Drop for InflightControlOpGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
+        let next = self.counter.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+        let _ = self.state.send_replace(next);
     }
 }
 
 struct SharedSourceWorkerHandleState {
     worker: tokio::sync::Mutex<SharedSourceWorkerClient>,
     cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
-    retained_control_state: Arc<tokio::sync::Mutex<RetainedSourceWorkerControlState>>,
-    control_state_replay_required: Arc<std::sync::atomic::AtomicBool>,
+    control_state: Arc<tokio::sync::Mutex<SourceControlState>>,
     start_serial: Arc<tokio::sync::Mutex<()>>,
     control_ops_inflight: Arc<AtomicUsize>,
+    control_ops_state: tokio::sync::watch::Sender<usize>,
+    source_progress_state_current: Arc<Mutex<SourceProgressState>>,
+    source_progress_state: tokio::sync::watch::Sender<SourceProgressState>,
     control_ops_serial: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -1333,7 +1714,7 @@ struct ScheduledGroupsRefreshFailure {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RetainedTickOnlyWaveDisposition {
+enum SourceControlTickDisposition {
     FastPath,
     ReplayInPlace,
     ReconnectAndReplay,
@@ -1344,10 +1725,160 @@ struct SharedSourceWorkerClient {
     client: Arc<TypedRuntimeWorkerClient<SourceWorkerRpc, SourceConfig>>,
 }
 
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceControlReplayState {
+    #[default]
+    Clear,
+    Required,
+}
+
 #[derive(Default, Clone)]
-struct RetainedSourceWorkerControlState {
-    latest_host_grant_change: Option<SourceControlSignal>,
-    active_by_route: std::collections::BTreeMap<(String, String), SourceControlSignal>,
+pub(crate) struct SourceControlState {
+    pub(crate) replay_state: SourceControlReplayState,
+    pub(crate) latest_host_grant_change: Option<SourceControlSignal>,
+    pub(crate) active_by_route: std::collections::BTreeMap<(String, String), SourceControlSignal>,
+}
+
+impl SourceControlState {
+    fn replay_required(&self) -> bool {
+        self.replay_state == SourceControlReplayState::Required
+    }
+
+    fn arm_replay(&mut self) {
+        self.replay_state = SourceControlReplayState::Required;
+    }
+
+    fn take_replay_requirement(&mut self) -> bool {
+        if self.replay_required() {
+            self.replay_state = SourceControlReplayState::Clear;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn retain_signals(&mut self, signals: &[SourceControlSignal]) {
+        for signal in signals {
+            match signal {
+                SourceControlSignal::RuntimeHostGrantChange { .. } => {
+                    self.latest_host_grant_change = Some(signal.clone());
+                }
+                SourceControlSignal::Activate {
+                    unit, route_key, ..
+                }
+                | SourceControlSignal::Deactivate {
+                    unit, route_key, ..
+                } => {
+                    self.active_by_route.insert(
+                        (unit.unit_id().to_string(), route_key.clone()),
+                        signal.clone(),
+                    );
+                }
+                SourceControlSignal::Tick { .. }
+                | SourceControlSignal::ManualRescan { .. }
+                | SourceControlSignal::Passthrough(_) => {}
+            }
+        }
+    }
+
+    fn matches_generation_one_activate_wave(&self, signals: &[SourceControlSignal]) -> bool {
+        if !source_control_signals_are_generation_one_activate_only(signals) {
+            return false;
+        }
+        !self.active_by_route.is_empty()
+            && signals.iter().all(|signal| match signal {
+                SourceControlSignal::Activate {
+                    unit,
+                    route_key,
+                    bound_scopes,
+                    ..
+                } => self
+                    .active_by_route
+                    .get(&(unit.unit_id().to_string(), route_key.clone()))
+                    .is_some_and(|retained_signal| match retained_signal {
+                        SourceControlSignal::Activate {
+                            generation,
+                            bound_scopes: retained_bound_scopes,
+                            ..
+                        } => *generation == 1 && retained_bound_scopes == bound_scopes,
+                        _ => false,
+                    }),
+                _ => false,
+            })
+    }
+
+    fn classify_tick_only_wave(
+        &self,
+        signals: &[SourceControlSignal],
+    ) -> Option<SourceControlTickDisposition> {
+        if signals.is_empty()
+            || !signals
+                .iter()
+                .all(|signal| matches!(signal, SourceControlSignal::Tick { .. }))
+        {
+            return None;
+        }
+        if self.active_by_route.is_empty() {
+            return None;
+        }
+        let mut saw_generation_mismatch = false;
+        for signal in signals {
+            let SourceControlSignal::Tick {
+                unit,
+                route_key,
+                generation,
+                ..
+            } = signal
+            else {
+                return None;
+            };
+            let Some(retained_signal) = self
+                .active_by_route
+                .get(&(unit.unit_id().to_string(), route_key.clone()))
+            else {
+                return None;
+            };
+            let SourceControlSignal::Activate {
+                generation: retained_generation,
+                ..
+            } = retained_signal
+            else {
+                return None;
+            };
+            if retained_generation != generation {
+                saw_generation_mismatch = true;
+            }
+        }
+        if saw_generation_mismatch {
+            Some(SourceControlTickDisposition::ReconnectAndReplay)
+        } else if self.replay_required() {
+            Some(SourceControlTickDisposition::ReplayInPlace)
+        } else {
+            Some(SourceControlTickDisposition::FastPath)
+        }
+    }
+
+    fn replay_envelopes(&self) -> Vec<ControlEnvelope> {
+        let mut envelopes = Vec::new();
+        if let Some(host_grant_change) = self.latest_host_grant_change.as_ref() {
+            envelopes.push(host_grant_change.envelope());
+        }
+        envelopes.extend(
+            self.active_by_route
+                .values()
+                .map(SourceControlSignal::envelope),
+        );
+        envelopes
+    }
+
+    pub(crate) fn replay_signals(&self) -> Vec<SourceControlSignal> {
+        let mut signals = Vec::new();
+        if let Some(host_grant_change) = self.latest_host_grant_change.as_ref() {
+            signals.push(host_grant_change.clone());
+        }
+        signals.extend(self.active_by_route.values().cloned());
+        signals
+    }
 }
 
 fn next_shared_source_worker_instance_id() -> u64 {
@@ -2348,6 +2879,10 @@ impl SourceWorkerClientHandle {
             if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
                 existing
             } else {
+                let (control_ops_state, _control_ops_state_rx) = tokio::sync::watch::channel(0);
+                let initial_progress_state = SourceProgressState::default();
+                let (source_progress_state, _source_progress_state_rx) =
+                    tokio::sync::watch::channel(initial_progress_state);
                 let shared = Arc::new(SharedSourceWorkerHandleState {
                     worker: tokio::sync::Mutex::new(SharedSourceWorkerClient {
                         instance_id: next_shared_source_worker_instance_id(),
@@ -2362,14 +2897,12 @@ impl SourceWorkerClientHandle {
                         logical_roots: Some(config.roots.clone()),
                         ..SourceWorkerSnapshotCache::default()
                     })),
-                    retained_control_state: Arc::new(tokio::sync::Mutex::new(
-                        RetainedSourceWorkerControlState::default(),
-                    )),
-                    control_state_replay_required: Arc::new(std::sync::atomic::AtomicBool::new(
-                        false,
-                    )),
+                    control_state: Arc::new(tokio::sync::Mutex::new(SourceControlState::default())),
                     start_serial: Arc::new(tokio::sync::Mutex::new(())),
                     control_ops_inflight: Arc::new(AtomicUsize::new(0)),
+                    control_ops_state,
+                    source_progress_state_current: Arc::new(Mutex::new(initial_progress_state)),
+                    source_progress_state,
                     control_ops_serial: Arc::new(tokio::sync::Mutex::new(())),
                 });
                 registry.insert(key, Arc::downgrade(&shared));
@@ -2391,10 +2924,14 @@ impl SourceWorkerClientHandle {
             worker_binding,
             manual_rescan_signal,
             cache: shared.cache.clone(),
-            retained_control_state: shared.retained_control_state.clone(),
-            control_state_replay_required: shared.control_state_replay_required.clone(),
+            control_state: shared.control_state.clone(),
             start_serial: shared.start_serial.clone(),
             control_ops_inflight: shared.control_ops_inflight.clone(),
+            control_ops_state_tx: shared.control_ops_state.clone(),
+            control_ops_state: shared.control_ops_state.subscribe(),
+            source_progress_state_current: shared.source_progress_state_current.clone(),
+            source_progress_state_tx: shared.source_progress_state.clone(),
+            source_progress_state: shared.source_progress_state.subscribe(),
             control_ops_serial: shared.control_ops_serial.clone(),
             config,
         })
@@ -2436,22 +2973,14 @@ impl SourceWorkerClientHandle {
             *guard = replacement;
             stale
         };
-        self.control_state_replay_required
-            .store(true, Ordering::Release);
+        self.control_state.lock().await.arm_replay();
+        self.bump_source_progress(SourceProgressReason::WorkerClientReplaced);
         Ok(stale_client)
     }
 
     async fn reconnect_shared_worker_client(&self) -> Result<()> {
         let stale_client = self.replace_shared_worker_client().await?;
         let _ = stale_client.shutdown(Duration::from_millis(250)).await;
-        Ok(())
-    }
-
-    async fn reconnect_shared_worker_client_detached(&self) -> Result<()> {
-        let stale_client = self.replace_shared_worker_client().await?;
-        tokio::spawn(async move {
-            let _ = stale_client.shutdown(Duration::from_millis(250)).await;
-        });
         Ok(())
     }
 
@@ -2466,154 +2995,59 @@ impl SourceWorkerClientHandle {
     }
 
     async fn retain_control_signals(&self, signals: &[SourceControlSignal]) {
-        let mut retained = self.retained_control_state.lock().await;
-        for signal in signals {
-            match signal {
-                SourceControlSignal::RuntimeHostGrantChange { .. } => {
-                    retained.latest_host_grant_change = Some(signal.clone());
-                }
-                SourceControlSignal::Activate {
-                    unit, route_key, ..
-                } => {
-                    retained.active_by_route.insert(
-                        (unit.unit_id().to_string(), route_key.clone()),
-                        signal.clone(),
-                    );
-                }
-                SourceControlSignal::Deactivate {
-                    unit, route_key, ..
-                } => {
-                    retained
-                        .active_by_route
-                        .remove(&(unit.unit_id().to_string(), route_key.clone()));
-                }
-                SourceControlSignal::Tick { .. }
-                | SourceControlSignal::ManualRescan { .. }
-                | SourceControlSignal::Passthrough(_) => {}
-            }
-        }
+        self.control_state.lock().await.retain_signals(signals);
+        self.bump_source_progress(SourceProgressReason::ControlSignalsRetained);
     }
 
     async fn generation_one_activate_wave_matches_retained_state(
         &self,
         signals: &[SourceControlSignal],
     ) -> bool {
-        if !source_control_signals_are_generation_one_activate_only(signals) {
-            return false;
-        }
-        let retained = self.retained_control_state.lock().await;
-        !retained.active_by_route.is_empty()
-            && signals.iter().all(|signal| match signal {
-                SourceControlSignal::Activate {
-                    unit,
-                    route_key,
-                    bound_scopes,
-                    ..
-                } => retained
-                    .active_by_route
-                    .get(&(unit.unit_id().to_string(), route_key.clone()))
-                    .is_some_and(|retained_signal| match retained_signal {
-                        SourceControlSignal::Activate {
-                            generation,
-                            bound_scopes: retained_bound_scopes,
-                            ..
-                        } => *generation == 1 && retained_bound_scopes == bound_scopes,
-                        _ => false,
-                    }),
-                _ => false,
-            })
+        self.control_state
+            .lock()
+            .await
+            .matches_generation_one_activate_wave(signals)
     }
 
     async fn classify_tick_only_wave_against_retained_state(
         &self,
         signals: &[SourceControlSignal],
-    ) -> Option<RetainedTickOnlyWaveDisposition> {
-        if signals.is_empty()
-            || !signals
-                .iter()
-                .all(|signal| matches!(signal, SourceControlSignal::Tick { .. }))
-        {
-            return None;
-        }
-        let replay_required = self.control_state_replay_required.load(Ordering::Acquire);
-        let retained = self.retained_control_state.lock().await;
-        if retained.active_by_route.is_empty() {
-            return None;
-        }
-        let mut saw_generation_mismatch = false;
-        for signal in signals {
-            let SourceControlSignal::Tick {
-                unit,
-                route_key,
-                generation,
-                ..
-            } = signal
-            else {
-                return None;
-            };
-            let Some(retained_signal) = retained
-                .active_by_route
-                .get(&(unit.unit_id().to_string(), route_key.clone()))
-            else {
-                return None;
-            };
-            let SourceControlSignal::Activate {
-                generation: retained_generation,
-                ..
-            } = retained_signal
-            else {
-                return None;
-            };
-            if retained_generation != generation {
-                saw_generation_mismatch = true;
-            }
-        }
-        if saw_generation_mismatch {
-            Some(RetainedTickOnlyWaveDisposition::ReconnectAndReplay)
-        } else if !replay_required {
-            Some(RetainedTickOnlyWaveDisposition::FastPath)
-        } else {
-            Some(RetainedTickOnlyWaveDisposition::ReplayInPlace)
-        }
+    ) -> Option<SourceControlTickDisposition> {
+        self.control_state
+            .lock()
+            .await
+            .classify_tick_only_wave(signals)
     }
 
     async fn replay_retained_control_state_if_needed_for_refresh_until(
         &self,
         deadline: std::time::Instant,
     ) -> Result<()> {
-        if self
-            .control_state_replay_required
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(());
-        }
-
         let envelopes = {
-            let retained = self.retained_control_state.lock().await;
-            let mut envelopes = Vec::new();
-            if let Some(host_grant_change) = retained.latest_host_grant_change.as_ref() {
-                envelopes.push(host_grant_change.envelope());
+            let mut control_state = self.control_state.lock().await;
+            if !control_state.take_replay_requirement() {
+                return Ok(());
             }
-            envelopes.extend(
-                retained
-                    .active_by_route
-                    .values()
-                    .map(SourceControlSignal::envelope),
-            );
-            envelopes
+            control_state.replay_envelopes()
         };
         if envelopes.is_empty() {
             return Ok(());
         }
 
-        let deadline = clip_retry_deadline(deadline, SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT);
+        let runtime =
+            SourceRefreshRuntime::new(deadline, SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT);
         loop {
-            let attempt_timeout = match Self::schedule_refresh_call_timeout(deadline) {
+            let attempt_timeout = match self
+                .source_refresh_attempt_timeout_for(
+                    runtime,
+                    SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                    false,
+                )
+                .await
+            {
                 Ok(timeout) => timeout,
                 Err(err) => {
-                    self.control_state_replay_required
-                        .store(true, Ordering::Release);
+                    self.control_state.lock().await.arm_replay();
                     return Err(err);
                 }
             };
@@ -2640,38 +3074,39 @@ impl SourceWorkerClientHandle {
                 Err(_) => Err(CnxError::Timeout),
             };
             match rpc_result {
-                Ok(SourceWorkerResponse::Ack) => {
-                    self.control_state_replay_required
-                        .store(false, Ordering::Release);
-                    return Ok(());
-                }
+                Ok(SourceWorkerResponse::Ack) => return Ok(()),
                 Ok(other) => {
-                    self.control_state_replay_required
-                        .store(true, Ordering::Release);
+                    self.control_state.lock().await.arm_replay();
                     return Err(CnxError::ProtocolViolation(format!(
                         "unexpected source worker response while replaying retained control state: {:?}",
                         other
                     )));
                 }
-                Err(err)
-                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
-                {
-                    self.reconnect_shared_worker_client().await?;
-                    Self::sleep_retry_backoff_with_deadline(deadline).await?;
-                }
                 Err(err) => {
-                    self.control_state_replay_required
-                        .store(true, Ordering::Release);
-                    return Err(err);
+                    if let Err(err) = self
+                        .continue_source_refresh_after(
+                            runtime,
+                            err,
+                            true,
+                            can_retry_on_control_frame,
+                            SourceProgressMask::CONTROL_FLOW_RETRY,
+                        )
+                        .await
+                    {
+                        self.control_state.lock().await.arm_replay();
+                        return Err(err);
+                    }
                 }
             }
         }
     }
 
     fn begin_control_op(&self) -> InflightControlOpGuard {
-        self.control_ops_inflight.fetch_add(1, Ordering::Relaxed);
+        let next = self.control_ops_inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.control_ops_state_tx.send_replace(next);
         InflightControlOpGuard {
             counter: self.control_ops_inflight.clone(),
+            state: self.control_ops_state_tx.clone(),
         }
     }
 
@@ -2680,10 +3115,75 @@ impl SourceWorkerClientHandle {
     }
 
     pub(crate) async fn wait_for_control_ops_to_drain(&self, timeout: Duration) {
-        let deadline = tokio::time::Instant::now() + timeout;
-        while self.control_op_inflight() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(SOURCE_WORKER_CLOSE_DRAIN_POLL_INTERVAL).await;
+        if !self.control_op_inflight() {
+            return;
         }
+        let mut state = self.control_ops_state.clone();
+        let wait_for_drain = async {
+            while self.control_op_inflight() {
+                if state.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(timeout, wait_for_drain).await;
+    }
+
+    fn current_source_progress_cursor(&self) -> SourceProgressCursor {
+        let guard = match self.source_progress_state_current.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::warn!("source progress state lock poisoned; recovering progress wait state");
+                poisoned.into_inner()
+            }
+        };
+        guard.cursor()
+    }
+
+    fn bump_source_progress(&self, reason: SourceProgressReason) {
+        let next = {
+            let mut guard = match self.source_progress_state_current.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    log::warn!(
+                        "source progress state lock poisoned; recovering progress publish state"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            guard.bump(reason);
+            *guard
+        };
+        let _ = self.source_progress_state_tx.send_replace(next);
+    }
+
+    async fn wait_for_source_progress_after(
+        &self,
+        after: SourceProgressCursor,
+        accepted: SourceProgressMask,
+        deadline: std::time::Instant,
+    ) {
+        if self
+            .source_progress_state_current
+            .lock()
+            .map(|guard| guard.advanced_past(after, accepted))
+            .unwrap_or_else(|poisoned| poisoned.into_inner().advanced_past(after, accepted))
+        {
+            return;
+        }
+        let mut state = self.source_progress_state.clone();
+        if state.borrow().advanced_past(after, accepted) {
+            return;
+        }
+        let wait_for_progress = async {
+            while !state.borrow().advanced_past(after, accepted) {
+                if state.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        let _ = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), wait_for_progress)
+            .await;
     }
 
     fn with_cache_mut<T>(&self, f: impl FnOnce(&mut SourceWorkerSnapshotCache) -> T) -> T {
@@ -2713,24 +3213,99 @@ impl SourceWorkerClientHandle {
 
     fn update_cached_observability_snapshot(&self, snapshot: &SourceObservabilitySnapshot) {
         self.with_cache_mut(|cache| apply_observability_snapshot_to_cache(cache, snapshot));
+        self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
     }
 
-    fn schedule_refresh_call_timeout(deadline: std::time::Instant) -> Result<Duration> {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            Err(CnxError::Timeout)
-        } else {
-            Ok(std::cmp::min(SOURCE_WORKER_CONTROL_RPC_TIMEOUT, remaining))
+    async fn source_refresh_attempt_timeout(
+        &self,
+        action: SourceRefreshRuntimeAction,
+    ) -> Result<Duration> {
+        match action {
+            SourceRefreshRuntimeAction::Attempt {
+                timeout,
+                reconnect_before,
+            } => {
+                if reconnect_before {
+                    self.reconnect_shared_worker_client().await?;
+                }
+                Ok(timeout)
+            }
+            SourceRefreshRuntimeAction::ReturnTimeout => Err(CnxError::Timeout),
+            other => Err(CnxError::Internal(format!(
+                "unexpected source refresh runtime attempt action: {other:?}"
+            ))),
         }
     }
 
-    async fn sleep_retry_backoff_with_deadline(deadline: std::time::Instant) -> Result<()> {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(CnxError::Timeout);
+    async fn source_refresh_attempt_timeout_for(
+        &self,
+        runtime: SourceRefreshRuntime,
+        attempt_timeout_cap: Duration,
+        reconnect_before: bool,
+    ) -> Result<Duration> {
+        self.source_refresh_attempt_timeout(
+            runtime.attempt_action(attempt_timeout_cap, reconnect_before),
+        )
+        .await
+    }
+
+    async fn apply_source_refresh_runtime_action(
+        &self,
+        action: SourceRefreshRuntimeAction,
+    ) -> Result<()> {
+        match action {
+            SourceRefreshRuntimeAction::ReturnTimeout => Err(CnxError::Timeout),
+            SourceRefreshRuntimeAction::WaitForProgress {
+                after,
+                accepted,
+                deadline,
+            } => {
+                self.wait_for_source_progress_after(after, accepted, deadline)
+                    .await;
+                Ok(())
+            }
+            SourceRefreshRuntimeAction::ReconnectAndWaitForProgress {
+                after,
+                accepted,
+                deadline,
+            } => {
+                self.reconnect_shared_worker_client().await?;
+                self.wait_for_source_progress_after(after, accepted, deadline)
+                    .await;
+                Ok(())
+            }
+            other => Err(CnxError::Internal(format!(
+                "unexpected source refresh runtime followup action: {other:?}"
+            ))),
         }
-        tokio::time::sleep(std::cmp::min(SOURCE_WORKER_RETRY_BACKOFF, remaining)).await;
-        Ok(())
+    }
+
+    async fn apply_source_refresh_followup(
+        &self,
+        followup: SourceRefreshFollowup,
+    ) -> Result<()> {
+        match followup {
+            SourceRefreshFollowup::Apply(action) => self.apply_source_refresh_runtime_action(action).await,
+            SourceRefreshFollowup::ReturnErr(err) => Err(err),
+        }
+    }
+
+    async fn continue_source_refresh_after(
+        &self,
+        runtime: SourceRefreshRuntime,
+        err: CnxError,
+        reconnect: bool,
+        is_retryable: fn(&CnxError) -> bool,
+        accepted: SourceProgressMask,
+    ) -> Result<()> {
+        self.apply_source_refresh_followup(runtime.followup_after(
+            err,
+            reconnect,
+            is_retryable,
+            self.current_source_progress_cursor(),
+            accepted,
+        ))
+            .await
     }
 
     async fn refresh_cached_scheduled_groups_from_live_worker_until(
@@ -2741,18 +3316,25 @@ impl SourceWorkerClientHandle {
             "fs_meta_source_worker_client: refresh_cached_scheduled_groups begin node={}",
             self.node_id.0
         );
-        let replay_required_recovery = self.control_state_replay_required.load(Ordering::Acquire);
+        let replay_required_recovery = self.control_state.lock().await.replay_required();
         let mut recovered_live_worker_during_refresh = false;
-        let deadline = clip_retry_deadline(deadline, SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT);
+        let runtime =
+            SourceRefreshRuntime::new(deadline, SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT);
         loop {
             let worker = self.worker_client().await;
+            let ensure_started_timeout = self
+                .source_refresh_attempt_timeout_for(
+                    runtime,
+                    SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                    false,
+                )
+                .await
+                .map_err(|err| ScheduledGroupsRefreshFailure {
+                    err,
+                    recovered_live_worker_during_refresh,
+                })?;
             let ensure_started_result = match tokio::time::timeout(
-                Self::schedule_refresh_call_timeout(deadline).map_err(|err| {
-                    ScheduledGroupsRefreshFailure {
-                        err,
-                        recovered_live_worker_during_refresh,
-                    }
-                })?,
+                ensure_started_timeout,
                 worker.ensure_started(),
             )
             .await
@@ -2762,20 +3344,18 @@ impl SourceWorkerClientHandle {
             };
             match ensure_started_result {
                 Ok(()) => {}
-                Err(err)
-                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
-                {
+                Err(err) => {
                     eprintln!(
                         "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry ensure_started node={} err={}",
                         self.node_id.0, err
                     );
-                    self.reconnect_shared_worker_client().await.map_err(|err| {
-                        ScheduledGroupsRefreshFailure {
-                            err,
-                            recovered_live_worker_during_refresh,
-                        }
-                    })?;
-                    Self::sleep_retry_backoff_with_deadline(deadline)
+                    self.continue_source_refresh_after(
+                        runtime,
+                        err,
+                        true,
+                        can_retry_on_control_frame,
+                        SourceProgressMask::SCHEDULED_GROUPS_REFRESH_RETRY,
+                    )
                         .await
                         .map_err(|err| ScheduledGroupsRefreshFailure {
                             err,
@@ -2783,18 +3363,8 @@ impl SourceWorkerClientHandle {
                         })?;
                     continue;
                 }
-                Err(err) => {
-                    eprintln!(
-                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups err ensure_started node={} err={}",
-                        self.node_id.0, err
-                    );
-                    return Err(ScheduledGroupsRefreshFailure {
-                        err,
-                        recovered_live_worker_during_refresh,
-                    });
-                }
             }
-            self.replay_retained_control_state_if_needed_for_refresh_until(deadline)
+            self.replay_retained_control_state_if_needed_for_refresh_until(runtime.deadline())
                 .await
                 .map_err(|err| ScheduledGroupsRefreshFailure {
                     err,
@@ -2806,20 +3376,18 @@ impl SourceWorkerClientHandle {
             let worker = self.worker_client().await;
             let client = match worker.client().await {
                 Ok(client) => client,
-                Err(err)
-                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
-                {
+                Err(err) => {
                     eprintln!(
                         "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry client node={} err={}",
                         self.node_id.0, err
                     );
-                    self.reconnect_shared_worker_client().await.map_err(|err| {
-                        ScheduledGroupsRefreshFailure {
-                            err,
-                            recovered_live_worker_during_refresh,
-                        }
-                    })?;
-                    Self::sleep_retry_backoff_with_deadline(deadline)
+                    self.continue_source_refresh_after(
+                        runtime,
+                        err,
+                        true,
+                        can_retry_on_control_frame,
+                        SourceProgressMask::SCHEDULED_GROUPS_REFRESH_RETRY,
+                    )
                         .await
                         .map_err(|err| ScheduledGroupsRefreshFailure {
                             err,
@@ -2827,21 +3395,17 @@ impl SourceWorkerClientHandle {
                         })?;
                     continue;
                 }
-                Err(err) => {
-                    eprintln!(
-                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups err client node={} err={}",
-                        self.node_id.0, err
-                    );
-                    return Err(ScheduledGroupsRefreshFailure {
-                        err,
-                        recovered_live_worker_during_refresh,
-                    });
-                }
             };
             let grants = match Self::call_worker(
                 &client,
                 SourceWorkerRequest::HostObjectGrantsSnapshot,
-                Self::schedule_refresh_call_timeout(deadline).map_err(|err| {
+                self.source_refresh_attempt_timeout_for(
+                    runtime,
+                    SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                    false,
+                )
+                .await
+                .map_err(|err| {
                     ScheduledGroupsRefreshFailure {
                         err,
                         recovered_live_worker_during_refresh,
@@ -2854,6 +3418,7 @@ impl SourceWorkerClientHandle {
                     self.with_cache_mut(|cache| {
                         cache.grants = Some(grants.clone());
                     });
+                    self.bump_source_progress(SourceProgressReason::HostObjectGrantsUpdated);
                     grants
                 }
                 Ok(other) => {
@@ -2871,36 +3436,24 @@ impl SourceWorkerClientHandle {
                         err,
                         recovered_live_worker_during_refresh,
                     })?,
-                Err(err)
-                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
-                {
+                Err(err) => {
                     eprintln!(
                         "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry grants node={} err={}",
                         self.node_id.0, err
                     );
-                    self.reconnect_shared_worker_client().await.map_err(|err| {
-                        ScheduledGroupsRefreshFailure {
-                            err,
-                            recovered_live_worker_during_refresh,
-                        }
-                    })?;
-                    Self::sleep_retry_backoff_with_deadline(deadline)
+                    self.continue_source_refresh_after(
+                        runtime,
+                        err,
+                        true,
+                        can_retry_on_control_frame,
+                        SourceProgressMask::SCHEDULED_GROUPS_REFRESH_RETRY,
+                    )
                         .await
                         .map_err(|err| ScheduledGroupsRefreshFailure {
                             err,
                             recovered_live_worker_during_refresh,
                         })?;
                     continue;
-                }
-                Err(err) => {
-                    eprintln!(
-                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups err grants node={} err={}",
-                        self.node_id.0, err
-                    );
-                    return Err(ScheduledGroupsRefreshFailure {
-                        err,
-                        recovered_live_worker_during_refresh,
-                    });
                 }
             };
             let stable_host_ref = {
@@ -2922,59 +3475,35 @@ impl SourceWorkerClientHandle {
                 if let Some(err) = injected {
                     Err(err)
                 } else {
-                    self.fetch_scheduled_groups_refresh_attempt(&client, &stable_host_ref, deadline)
+                    self.fetch_scheduled_groups_refresh_attempt(&client, &stable_host_ref, runtime)
                         .await
                 }
             };
             #[cfg(not(test))]
             let refresh_attempt = self
-                .fetch_scheduled_groups_refresh_attempt(&client, &stable_host_ref, deadline)
+                .fetch_scheduled_groups_refresh_attempt(&client, &stable_host_ref, runtime)
                 .await;
             let (scheduled_source, scheduled_scan) = match refresh_attempt {
                 Ok(groups) => groups,
-                Err(err)
-                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
-                {
+                Err(err) => {
                     eprintln!(
                         "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry schedule node={} err={}",
                         self.node_id.0, err
                     );
-                    if replay_required_recovery {
-                        // A replay-required refresh timeout means the freshly re-acquired worker
-                        // still has not become live enough to answer scheduled-group refresh RPCs.
-                        // Recover by rotating to another live worker candidate instead of
-                        // exhausting the replay-required path on the same stalled instance.
-                        self.reconnect_shared_worker_client().await.map_err(|err| {
-                            ScheduledGroupsRefreshFailure {
-                                err,
-                                recovered_live_worker_during_refresh,
-                            }
-                        })?;
-                    } else {
-                        self.reconnect_shared_worker_client().await.map_err(|err| {
-                            ScheduledGroupsRefreshFailure {
-                                err,
-                                recovered_live_worker_during_refresh,
-                            }
-                        })?;
-                    }
-                    Self::sleep_retry_backoff_with_deadline(deadline)
+                    let _ = replay_required_recovery;
+                    self.continue_source_refresh_after(
+                        runtime,
+                        err,
+                        true,
+                        can_retry_on_control_frame,
+                        SourceProgressMask::SCHEDULED_GROUPS_REFRESH_RETRY,
+                    )
                         .await
                         .map_err(|err| ScheduledGroupsRefreshFailure {
                             err,
                             recovered_live_worker_during_refresh,
                         })?;
                     continue;
-                }
-                Err(err) => {
-                    eprintln!(
-                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups err schedule node={} err={}",
-                        self.node_id.0, err
-                    );
-                    return Err(ScheduledGroupsRefreshFailure {
-                        err,
-                        recovered_live_worker_during_refresh,
-                    });
                 }
             };
             let cache_empty = self.with_cache_mut(|cache| {
@@ -2990,9 +3519,16 @@ impl SourceWorkerClientHandle {
             if scheduled_source.values().all(|groups| groups.is_empty())
                 && scheduled_scan.values().all(|groups| groups.is_empty())
                 && cache_empty
-                && std::time::Instant::now() < deadline
             {
-                Self::sleep_retry_backoff_with_deadline(deadline)
+                self.continue_source_refresh_after(
+                    runtime,
+                    CnxError::Internal(
+                        "scheduled-groups refresh returned no local runnable groups yet".into(),
+                    ),
+                    false,
+                    |_| true,
+                    SourceProgressMask::SCHEDULED_GROUPS_REFRESH_RETRY,
+                )
                     .await
                     .map_err(|err| ScheduledGroupsRefreshFailure {
                         err,
@@ -3007,6 +3543,7 @@ impl SourceWorkerClientHandle {
                     scheduled_scan,
                 );
             });
+            self.bump_source_progress(SourceProgressReason::ScheduledGroupsUpdated);
             eprintln!(
                 "fs_meta_source_worker_client: refresh_cached_scheduled_groups ok node={}",
                 self.node_id.0
@@ -3019,7 +3556,7 @@ impl SourceWorkerClientHandle {
         &self,
         client: &TypedWorkerClient<SourceWorkerRpc>,
         stable_host_ref: &str,
-        deadline: std::time::Instant,
+        runtime: SourceRefreshRuntime,
     ) -> Result<(
         std::collections::BTreeMap<String, Vec<String>>,
         std::collections::BTreeMap<String, Vec<String>>,
@@ -3044,7 +3581,12 @@ impl SourceWorkerClientHandle {
         let scheduled_source = match Self::call_worker(
             client,
             SourceWorkerRequest::ScheduledSourceGroupIds,
-            Self::schedule_refresh_call_timeout(deadline)?,
+            self.source_refresh_attempt_timeout_for(
+                runtime,
+                SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                false,
+            )
+            .await?,
         )
         .await?
         {
@@ -3066,7 +3608,12 @@ impl SourceWorkerClientHandle {
         let scheduled_scan = match Self::call_worker(
             client,
             SourceWorkerRequest::ScheduledScanGroupIds,
-            Self::schedule_refresh_call_timeout(deadline)?,
+            self.source_refresh_attempt_timeout_for(
+                runtime,
+                SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                false,
+            )
+            .await?,
         )
         .await?
         {
@@ -3116,13 +3663,11 @@ impl SourceWorkerClientHandle {
         &self,
         timeout: Duration,
     ) -> Result<SourceObservabilitySnapshot> {
-        let deadline = std::time::Instant::now() + timeout;
+        let runtime = SourceRefreshRuntime::new(std::time::Instant::now() + timeout, timeout);
         let response = loop {
-            let now = std::time::Instant::now();
-            let attempt_timeout = timeout.min(deadline.saturating_duration_since(now));
-            if attempt_timeout.is_zero() {
-                return Err(CnxError::Timeout);
-            }
+            let attempt_timeout = self
+                .source_refresh_attempt_timeout_for(runtime, timeout, false)
+                .await?;
             let rpc_result = self
                 .with_started_retry(|client| async move {
                     #[cfg(test)]
@@ -3141,13 +3686,16 @@ impl SourceWorkerClientHandle {
                 .await;
             match rpc_result {
                 Ok(response) => break response,
-                Err(err)
-                    if can_retry_update_logical_roots(&err)
-                        && std::time::Instant::now() < deadline =>
-                {
-                    tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
+                Err(err) => {
+                    self.continue_source_refresh_after(
+                        runtime,
+                        err,
+                        false,
+                        can_retry_update_logical_roots,
+                        SourceProgressMask::OBSERVABILITY_RETRY,
+                    )
+                    .await?;
                 }
-                Err(err) => return Err(err),
             }
         };
         match response {
@@ -3187,16 +3735,18 @@ impl SourceWorkerClientHandle {
 
     pub async fn start(&self) -> Result<()> {
         let _start_serial = self.start_serial.lock().await;
-        let deadline = std::time::Instant::now() + SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT;
+        let runtime = SourceRefreshRuntime::new(
+            std::time::Instant::now() + SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
+            SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
+        );
         loop {
-            let now = std::time::Instant::now();
-            let attempt_timeout = std::cmp::min(
-                SOURCE_WORKER_START_ATTEMPT_TIMEOUT,
-                deadline.saturating_duration_since(now),
-            );
-            if attempt_timeout.is_zero() {
-                return Err(CnxError::Timeout);
-            }
+            let attempt_timeout = self
+                .source_refresh_attempt_timeout_for(
+                    runtime,
+                    SOURCE_WORKER_START_ATTEMPT_TIMEOUT,
+                    false,
+                )
+                .await?;
             eprintln!(
                 "fs_meta_source_worker_client: ensure_started begin node={}",
                 self.node_id.0
@@ -3233,19 +3783,23 @@ impl SourceWorkerClientHandle {
                         "fs_meta_source_worker_client: ensure_started ok node={}",
                         self.node_id.0
                     );
+                    self.bump_source_progress(SourceProgressReason::Started);
                     return Ok(());
                 }
-                Err(err)
-                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
-                {
+                Err(err) => {
                     eprintln!(
                         "fs_meta_source_worker_client: on_control_frame retry node={} err={}",
                         self.node_id.0, err
                     );
-                    self.reconnect_shared_worker_client().await?;
-                    tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
+                    self.continue_source_refresh_after(
+                        runtime,
+                        err,
+                        true,
+                        can_retry_on_control_frame,
+                        SourceProgressMask::START_RETRY,
+                    )
+                        .await?;
                 }
-                Err(err) => return Err(err),
             }
         }
     }
@@ -3258,16 +3812,18 @@ impl SourceWorkerClientHandle {
             self.node_id.0,
             roots.len()
         );
-        let deadline = std::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT;
+        let runtime = SourceRefreshRuntime::new(
+            std::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT,
+            SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT,
+        );
         loop {
-            let now = std::time::Instant::now();
-            let attempt_timeout = std::cmp::min(
-                SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
-                deadline.saturating_duration_since(now),
-            );
-            if attempt_timeout.is_zero() {
-                return Err(CnxError::Timeout);
-            }
+            let attempt_timeout = self
+                .source_refresh_attempt_timeout_for(
+                    runtime,
+                    SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
+                    false,
+                )
+                .await?;
             let rpc_result = self
                 .with_started_retry(|client| {
                     let roots = roots.clone();
@@ -3294,6 +3850,7 @@ impl SourceWorkerClientHandle {
                     self.with_cache_mut(|cache| {
                         cache.logical_roots = Some(roots.clone());
                     });
+                    self.bump_source_progress(SourceProgressReason::LogicalRootsUpdated);
                     eprintln!(
                         "fs_meta_source_worker_client: update_logical_roots ok node={} roots={}",
                         self.node_id.0,
@@ -3310,13 +3867,16 @@ impl SourceWorkerClientHandle {
                         other
                     )));
                 }
-                Err(err)
-                    if can_retry_update_logical_roots(&err)
-                        && std::time::Instant::now() < deadline =>
-                {
-                    tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
+                Err(err) => {
+                    self.continue_source_refresh_after(
+                        runtime,
+                        err,
+                        false,
+                        can_retry_update_logical_roots,
+                        SourceProgressMask::UPDATE_LOGICAL_ROOTS_RETRY,
+                    )
+                    .await?;
                 }
-                Err(err) => return Err(err),
             }
         }
     }
@@ -3500,6 +4060,7 @@ impl SourceWorkerClientHandle {
                     &self.node_id,
                     groups.map(|groups| groups.into_iter().collect()),
                     &cache.scheduled_source_groups_by_node,
+                    &cache.replay_recovery_scheduled_source_groups_by_node,
                 )
             })),
             other => Err(CnxError::ProtocolViolation(format!(
@@ -3521,6 +4082,7 @@ impl SourceWorkerClientHandle {
                     &self.node_id,
                     groups.map(|groups| groups.into_iter().collect()),
                     &cache.scheduled_scan_groups_by_node,
+                    &cache.replay_recovery_scheduled_scan_groups_by_node,
                 )
             })),
             other => Err(CnxError::ProtocolViolation(format!(
@@ -3534,14 +4096,18 @@ impl SourceWorkerClientHandle {
         &self,
         request: SourceWorkerRequest,
     ) -> Result<SourceWorkerResponse> {
-        let deadline = std::time::Instant::now() + SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT;
+        let runtime = SourceRefreshRuntime::new(
+            std::time::Instant::now() + SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
+            SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
+        );
         loop {
-            let now = std::time::Instant::now();
-            let attempt_timeout =
-                SOURCE_WORKER_CONTROL_RPC_TIMEOUT.min(deadline.saturating_duration_since(now));
-            if attempt_timeout.is_zero() {
-                return Err(CnxError::Timeout);
-            }
+            let attempt_timeout = self
+                .source_refresh_attempt_timeout_for(
+                    runtime,
+                    SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                    false,
+                )
+                .await?;
             let rpc_result = self
                 .with_started_retry(|client| {
                     let request = request.clone();
@@ -3556,13 +4122,16 @@ impl SourceWorkerClientHandle {
                 .await;
             match rpc_result {
                 Ok(response) => return Ok(response),
-                Err(err)
-                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
-                {
-                    self.reconnect_shared_worker_client().await?;
-                    tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
+                Err(err) => {
+                    self.continue_source_refresh_after(
+                        runtime,
+                        err,
+                        true,
+                        can_retry_on_control_frame,
+                        SourceProgressMask::CONTROL_FLOW_RETRY,
+                    )
+                        .await?;
                 }
-                Err(err) => return Err(err),
             }
         }
     }
@@ -3657,14 +4226,18 @@ impl SourceWorkerClientHandle {
 
     pub async fn force_find(&self, params: InternalQueryRequest) -> Result<Vec<Event>> {
         let target_node = self.node_id.clone();
-        let deadline = std::time::Instant::now() + SOURCE_WORKER_FORCE_FIND_TIMEOUT;
+        let runtime = SourceRefreshRuntime::new(
+            std::time::Instant::now() + SOURCE_WORKER_FORCE_FIND_TIMEOUT,
+            SOURCE_WORKER_FORCE_FIND_TIMEOUT,
+        );
         loop {
-            let now = std::time::Instant::now();
-            let attempt_timeout =
-                SOURCE_WORKER_FORCE_FIND_TIMEOUT.min(deadline.saturating_duration_since(now));
-            if attempt_timeout.is_zero() {
-                return Err(CnxError::Timeout);
-            }
+            let attempt_timeout = self
+                .source_refresh_attempt_timeout_for(
+                    runtime,
+                    SOURCE_WORKER_FORCE_FIND_TIMEOUT,
+                    false,
+                )
+                .await?;
             #[cfg(test)]
             let worker_instance_id = self.worker_instance_id_for_tests().await;
             let rpc_result = self
@@ -3730,10 +4303,16 @@ impl SourceWorkerClientHandle {
                     let _ = self.last_force_find_runner_by_group_snapshot().await;
                     return Ok(events);
                 }
-                Err(err) if can_retry_force_find(&err) && std::time::Instant::now() < deadline => {
-                    tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
+                Err(err) => {
+                    self.continue_source_refresh_after(
+                        runtime,
+                        err,
+                        false,
+                        can_retry_force_find,
+                        SourceProgressMask::FORCE_FIND_RETRY,
+                    )
+                        .await?;
                 }
-                Err(err) => return Err(err),
             }
         }
     }
@@ -3805,14 +4384,14 @@ impl SourceWorkerClientHandle {
             }
         }
         if let Some(retained_tick_disposition) = retained_tick_only_wave {
-            if retained_tick_disposition == RetainedTickOnlyWaveDisposition::FastPath {
+            if retained_tick_disposition == SourceControlTickDisposition::FastPath {
                 eprintln!(
                     "fs_meta_source_worker_client: on_control_frame done node={} ok=true retained_tick_fast_path=true",
                     self.node_id.0
                 );
                 return Ok(());
             }
-            if retained_tick_disposition == RetainedTickOnlyWaveDisposition::ReconnectAndReplay {
+            if retained_tick_disposition == SourceControlTickDisposition::ReconnectAndReplay {
                 self.reconnect_shared_worker_client().await?;
             }
             self.replay_retained_control_state_if_needed_for_refresh_until(
@@ -3825,12 +4404,12 @@ impl SourceWorkerClientHandle {
             );
             return Ok(());
         }
-        let deadline = std::time::Instant::now() + total_timeout;
+        let runtime =
+            SourceRefreshRuntime::new(std::time::Instant::now() + total_timeout, total_timeout);
         let fail_fast_short_caller_budget_bridge_reset =
             total_timeout <= SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT;
         let mut saw_timeout_like_generation_one_reset = false;
         loop {
-            let now = std::time::Instant::now();
             let worker = self.worker_client().await;
             let prefer_short_existing_client_attempt =
                 decoded_signals.as_ref().is_some_and(|signals| {
@@ -3843,11 +4422,9 @@ impl SourceWorkerClientHandle {
             } else {
                 rpc_timeout
             };
-            let attempt_timeout =
-                std::cmp::min(rpc_attempt_budget, deadline.saturating_duration_since(now));
-            if attempt_timeout.is_zero() {
-                return Err(CnxError::Timeout);
-            }
+            let attempt_timeout = self
+                .source_refresh_attempt_timeout_for(runtime, rpc_attempt_budget, false)
+                .await?;
             #[cfg(test)]
             let rpc_result = {
                 let worker_instance_id = self.worker_instance_id_for_tests().await;
@@ -3928,6 +4505,12 @@ impl SourceWorkerClientHandle {
                                 signals,
                                 &self.config.host_object_grants,
                             );
+                            prime_cached_schedule_from_control_signals_for_replay_recovery(
+                                cache,
+                                &self.node_id,
+                                signals,
+                                &self.config.host_object_grants,
+                            );
                             primed_local_schedule
                         });
                         source_control_signals_require_post_ack_schedule_refresh(signals)
@@ -3937,10 +4520,15 @@ impl SourceWorkerClientHandle {
                         true
                     };
                     if should_refresh_cached_schedule {
+                        if decoded_signals.is_some() {
+                            self.control_state.lock().await.arm_replay();
+                        }
                         let replay_required_before_refresh =
-                            self.control_state_replay_required.load(Ordering::Acquire);
+                            self.control_state.lock().await.replay_required();
                         if let Err(failure) = self
-                            .refresh_cached_scheduled_groups_from_live_worker_until(deadline)
+                            .refresh_cached_scheduled_groups_from_live_worker_until(
+                                runtime.deadline(),
+                            )
                             .await
                         {
                             let ScheduledGroupsRefreshFailure {
@@ -3997,7 +4585,7 @@ impl SourceWorkerClientHandle {
                             CnxError::TransportClosed(_) | CnxError::ChannelClosed
                         ) || is_retryable_worker_bridge_peer_error(&err)) =>
                 {
-                    self.reconnect_shared_worker_client_detached().await?;
+                    self.reconnect_shared_worker_client().await?;
                     eprintln!(
                         "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={} fail_fast_on_control_frame_bridge_reset=true",
                         self.node_id.0, err
@@ -4017,23 +4605,28 @@ impl SourceWorkerClientHandle {
                     );
                     return Err(err);
                 }
-                Err(err)
-                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
-                {
+                Err(err) => {
                     if generation_one_activate_only && is_timeout_like_worker_control_reset(&err) {
                         saw_timeout_like_generation_one_reset = true;
-                        self.reconnect_shared_worker_client_detached().await?;
+                        self.reconnect_shared_worker_client().await?;
                         continue;
                     }
-                    self.reconnect_shared_worker_client().await?;
-                    tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
-                }
-                Err(err) => {
-                    eprintln!(
-                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={}",
-                        self.node_id.0, err
-                    );
-                    return Err(err);
+                    if let Err(err) = self
+                        .continue_source_refresh_after(
+                            runtime,
+                            err,
+                            true,
+                            can_retry_on_control_frame,
+                            SourceProgressMask::CONTROL_FLOW_RETRY,
+                        )
+                        .await
+                    {
+                        eprintln!(
+                            "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={}",
+                            self.node_id.0, err
+                        );
+                        return Err(err);
+                    }
                 }
             }
         }
@@ -4254,6 +4847,25 @@ pub(crate) struct SourceObservabilityLiveAugment {
     pub published_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
 }
 
+#[derive(Default)]
+pub(crate) struct SourceObservabilityPublicationView {
+    pub last_control_frame_signals: Vec<String>,
+    pub keep_zero_publication_counters: bool,
+    pub published_batch_count: u64,
+    pub published_event_count: u64,
+    pub published_control_event_count: u64,
+    pub published_data_event_count: u64,
+    pub last_published_at_us: Option<u64>,
+    pub last_published_origins: Vec<String>,
+    pub published_origin_counts: std::collections::BTreeMap<String, u64>,
+    pub published_path_capture_target: Option<String>,
+    pub enqueued_path_origin_counts: std::collections::BTreeMap<String, u64>,
+    pub pending_path_origin_counts: std::collections::BTreeMap<String, u64>,
+    pub yielded_path_origin_counts: std::collections::BTreeMap<String, u64>,
+    pub summarized_path_origin_counts: std::collections::BTreeMap<String, u64>,
+    pub published_path_origin_counts: std::collections::BTreeMap<String, u64>,
+}
+
 pub(crate) fn build_source_observability_snapshot_from_parts(
     parts: SourceObservabilitySnapshotParts,
 ) -> SourceObservabilitySnapshot {
@@ -4347,18 +4959,153 @@ pub(crate) fn build_source_observability_snapshot_from_live_context(
     })
 }
 
-#[derive(Default)]
-struct RecoveredPublishedObservability {
-    published_batches_by_node: std::collections::BTreeMap<String, u64>,
-    published_events_by_node: std::collections::BTreeMap<String, u64>,
-    published_control_events_by_node: std::collections::BTreeMap<String, u64>,
-    published_data_events_by_node: std::collections::BTreeMap<String, u64>,
-    last_published_at_us_by_node: std::collections::BTreeMap<String, u64>,
-    last_published_origins_by_node: std::collections::BTreeMap<String, Vec<String>>,
-    published_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
-    published_path_capture_target: Option<String>,
-    summarized_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
-    published_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+fn source_observability_counter_by_node(
+    stable_host_ref: &str,
+    count: u64,
+    keep_zero_count: bool,
+) -> std::collections::BTreeMap<String, u64> {
+    (count > 0 || keep_zero_count)
+        .then(|| std::collections::BTreeMap::from([(stable_host_ref.to_string(), count)]))
+        .unwrap_or_default()
+}
+
+fn source_observability_count_strings_by_node(
+    stable_host_ref: &str,
+    counts: &std::collections::BTreeMap<String, u64>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    (!counts.is_empty())
+        .then(|| {
+            std::collections::BTreeMap::from([(
+                stable_host_ref.to_string(),
+                counts
+                    .iter()
+                    .map(|(origin, count)| format!("{origin}={count}"))
+                    .collect::<Vec<_>>(),
+            )])
+        })
+        .unwrap_or_default()
+}
+
+fn source_observability_control_signals_by_node(
+    context: &SourceObservabilityLiveSourceContext,
+    last_control_frame_signals: &[String],
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let stable_host_ref = &context.recovery.stable_host_ref;
+    let has_local_source_grants = context
+        .grants
+        .iter()
+        .any(|grant| grant.host_ref.eq_ignore_ascii_case(stable_host_ref));
+    let allow_control_summary = context
+        .recovery
+        .allow_control_summary(has_local_source_grants);
+    let control_summary = if !last_control_frame_signals.is_empty() {
+        if allow_control_summary {
+            last_control_frame_signals.to_vec()
+        } else {
+            Vec::new()
+        }
+    } else if allow_control_summary {
+        context.last_control_frame_signals_snapshot.clone()
+    } else {
+        Vec::new()
+    };
+    let explicit = control_signals_by_node(stable_host_ref, &control_summary);
+    if explicit.is_empty() {
+        recovered_control_signals_by_node_from_projection(&context.recovery, &context.status)
+    } else {
+        explicit
+    }
+}
+
+pub(crate) fn build_live_source_observability_snapshot(
+    source: &FSMetaSource,
+    publication: SourceObservabilityPublicationView,
+) -> SourceObservabilitySnapshot {
+    let context = build_source_observability_live_source_context(source);
+    let stable_host_ref = context.recovery.stable_host_ref.clone();
+    let last_control_frame_signals_by_node = source_observability_control_signals_by_node(
+        &context,
+        &publication.last_control_frame_signals,
+    );
+    let has_explicit_zero_publication_counters = publication.published_batch_count == 0
+        && publication.published_event_count == 0
+        && publication.published_control_event_count == 0
+        && publication.published_data_event_count == 0;
+    build_source_observability_snapshot_from_live_context(
+        context,
+        SourceObservabilityLiveAugment {
+            last_control_frame_signals_by_node,
+            published_batches_by_node: source_observability_counter_by_node(
+                &stable_host_ref,
+                publication.published_batch_count,
+                publication.keep_zero_publication_counters,
+            ),
+            published_events_by_node: source_observability_counter_by_node(
+                &stable_host_ref,
+                publication.published_event_count,
+                publication.keep_zero_publication_counters,
+            ),
+            published_control_events_by_node: source_observability_counter_by_node(
+                &stable_host_ref,
+                publication.published_control_event_count,
+                publication.keep_zero_publication_counters,
+            ),
+            published_data_events_by_node: source_observability_counter_by_node(
+                &stable_host_ref,
+                publication.published_data_event_count,
+                publication.keep_zero_publication_counters,
+            ),
+            last_published_at_us_by_node: (!has_explicit_zero_publication_counters)
+                .then_some(publication.last_published_at_us)
+                .flatten()
+                .map(|ts| std::collections::BTreeMap::from([(stable_host_ref.clone(), ts)]))
+                .unwrap_or_default(),
+            last_published_origins_by_node: (!has_explicit_zero_publication_counters
+                && !publication.last_published_origins.is_empty())
+            .then_some(std::collections::BTreeMap::from([(
+                stable_host_ref.clone(),
+                publication.last_published_origins,
+            )]))
+            .unwrap_or_default(),
+            published_origin_counts_by_node: (!has_explicit_zero_publication_counters)
+                .then(|| {
+                    source_observability_count_strings_by_node(
+                        &stable_host_ref,
+                        &publication.published_origin_counts,
+                    )
+                })
+                .unwrap_or_default(),
+            published_path_capture_target: publication.published_path_capture_target,
+            enqueued_path_origin_counts_by_node: source_observability_count_strings_by_node(
+                &stable_host_ref,
+                &publication.enqueued_path_origin_counts,
+            ),
+            pending_path_origin_counts_by_node: source_observability_count_strings_by_node(
+                &stable_host_ref,
+                &publication.pending_path_origin_counts,
+            ),
+            yielded_path_origin_counts_by_node: source_observability_count_strings_by_node(
+                &stable_host_ref,
+                &publication.yielded_path_origin_counts,
+            ),
+            summarized_path_origin_counts_by_node: (!has_explicit_zero_publication_counters)
+                .then(|| {
+                    source_observability_count_strings_by_node(
+                        &stable_host_ref,
+                        &publication.summarized_path_origin_counts,
+                    )
+                })
+                .unwrap_or_default(),
+            published_path_origin_counts_by_node: (!has_explicit_zero_publication_counters)
+                .then(|| {
+                    source_observability_count_strings_by_node(
+                        &stable_host_ref,
+                        &publication.published_path_origin_counts,
+                    )
+                })
+                .unwrap_or_default(),
+        },
+    )
 }
 
 fn scheduled_groups_by_node(
@@ -4451,9 +5198,9 @@ pub(crate) fn recovered_control_signals_by_node_from_projection(
 }
 
 fn recovered_published_observability_from_active_status(
-    stable_host_ref: &str,
+    _stable_host_ref: &str,
     status: &SourceStatusSnapshot,
-) -> RecoveredPublishedObservability {
+) -> SourceObservabilityPublicationView {
     let mut published_batch_count = 0u64;
     let mut published_event_count = 0u64;
     let mut published_control_event_count = 0u64;
@@ -4499,115 +5246,29 @@ fn recovered_published_observability_from_active_status(
         }
     }
 
-    let published_origin_counts = (!published_origin_counts.is_empty())
-        .then(|| {
-            std::collections::BTreeMap::from([(
-                stable_host_ref.to_string(),
-                published_origin_counts
-                    .iter()
-                    .map(|(origin, count)| format!("{origin}={count}"))
-                    .collect::<Vec<_>>(),
-            )])
-        })
-        .unwrap_or_default();
-    let path_origin_counts = (!path_origin_counts.is_empty())
-        .then(|| {
-            std::collections::BTreeMap::from([(
-                stable_host_ref.to_string(),
-                path_origin_counts
-                    .iter()
-                    .map(|(origin, count)| format!("{origin}={count}"))
-                    .collect::<Vec<_>>(),
-            )])
-        })
-        .unwrap_or_default();
-
-    RecoveredPublishedObservability {
-        published_batches_by_node: (published_batch_count > 0)
-            .then(|| {
-                std::collections::BTreeMap::from([(
-                    stable_host_ref.to_string(),
-                    published_batch_count,
-                )])
-            })
-            .unwrap_or_default(),
-        published_events_by_node: (published_event_count > 0)
-            .then(|| {
-                std::collections::BTreeMap::from([(
-                    stable_host_ref.to_string(),
-                    published_event_count,
-                )])
-            })
-            .unwrap_or_default(),
-        published_control_events_by_node: (published_control_event_count > 0)
-            .then(|| {
-                std::collections::BTreeMap::from([(
-                    stable_host_ref.to_string(),
-                    published_control_event_count,
-                )])
-            })
-            .unwrap_or_default(),
-        published_data_events_by_node: (published_data_event_count > 0)
-            .then(|| {
-                std::collections::BTreeMap::from([(
-                    stable_host_ref.to_string(),
-                    published_data_event_count,
-                )])
-            })
-            .unwrap_or_default(),
-        last_published_at_us_by_node: last_published_at_us
-            .map(|ts| std::collections::BTreeMap::from([(stable_host_ref.to_string(), ts)]))
-            .unwrap_or_default(),
-        last_published_origins_by_node: (!last_published_origins.is_empty())
-            .then(|| {
-                std::collections::BTreeMap::from([(
-                    stable_host_ref.to_string(),
-                    last_published_origins.into_iter().collect::<Vec<_>>(),
-                )])
-            })
-            .unwrap_or_default(),
-        published_origin_counts_by_node: published_origin_counts,
+    SourceObservabilityPublicationView {
+        published_batch_count,
+        published_event_count,
+        published_control_event_count,
+        published_data_event_count,
+        last_published_at_us,
+        last_published_origins: last_published_origins.into_iter().collect::<Vec<_>>(),
+        published_origin_counts,
         published_path_capture_target,
-        summarized_path_origin_counts_by_node: path_origin_counts.clone(),
-        published_path_origin_counts_by_node: path_origin_counts,
+        summarized_path_origin_counts: path_origin_counts.clone(),
+        published_path_origin_counts: path_origin_counts,
+        ..Default::default()
     }
 }
 
 fn build_local_source_observability_snapshot(source: &FSMetaSource) -> SourceObservabilitySnapshot {
     let context = build_source_observability_live_source_context(source);
-    let last_control_frame_signals_by_node = {
-        let explicit = control_signals_by_node(
+    build_live_source_observability_snapshot(
+        source,
+        recovered_published_observability_from_active_status(
             &context.recovery.stable_host_ref,
-            &context.last_control_frame_signals_snapshot,
-        );
-        if explicit.is_empty() {
-            recovered_control_signals_by_node_from_projection(&context.recovery, &context.status)
-        } else {
-            explicit
-        }
-    };
-    let published = recovered_published_observability_from_active_status(
-        &context.recovery.stable_host_ref,
-        &context.status,
-    );
-    build_source_observability_snapshot_from_live_context(
-        context,
-        SourceObservabilityLiveAugment {
-            last_control_frame_signals_by_node,
-            published_batches_by_node: published.published_batches_by_node,
-            published_events_by_node: published.published_events_by_node,
-            published_control_events_by_node: published.published_control_events_by_node,
-            published_data_events_by_node: published.published_data_events_by_node,
-            last_published_at_us_by_node: published.last_published_at_us_by_node,
-            last_published_origins_by_node: published.last_published_origins_by_node,
-            published_origin_counts_by_node: published.published_origin_counts_by_node,
-            published_path_capture_target: published.published_path_capture_target,
-            enqueued_path_origin_counts_by_node: std::collections::BTreeMap::new(),
-            pending_path_origin_counts_by_node: std::collections::BTreeMap::new(),
-            yielded_path_origin_counts_by_node: std::collections::BTreeMap::new(),
-            summarized_path_origin_counts_by_node: published.summarized_path_origin_counts_by_node,
-            published_path_origin_counts_by_node: published.published_path_origin_counts_by_node,
-        },
+            &context.status,
+        ),
     )
 }
 
@@ -4810,6 +5471,35 @@ impl SourceFacade {
                     )
                     .await
             }
+        }
+    }
+
+    pub(crate) async fn control_signals_with_replay(
+        &self,
+        signals: &[SourceControlSignal],
+    ) -> Vec<SourceControlSignal> {
+        match self {
+            Self::Local(source) => source.control_signals_with_replay(signals).await,
+            Self::Worker(client) => {
+                let mut desired = client.control_state.lock().await.clone();
+                desired.retain_signals(signals);
+                desired.replay_signals()
+            }
+        }
+    }
+
+    pub(crate) async fn record_retained_control_signals(&self, signals: &[SourceControlSignal]) {
+        match self {
+            Self::Local(source) => source.record_retained_control_signals(signals).await,
+            Self::Worker(client) => client.retain_control_signals(signals).await,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retained_control_state_for_tests(&self) -> SourceControlState {
+        match self {
+            Self::Local(source) => source.retained_control_state_for_tests().await,
+            Self::Worker(client) => client.control_state.lock().await.clone(),
         }
     }
 

@@ -899,7 +899,7 @@
             let ready_groups = snapshot
                 .groups
                 .iter()
-                .filter(|group| group.initial_audit_completed)
+                .filter(|group| group.is_ready())
                 .map(|group| group.group_id.clone())
                 .collect::<std::collections::BTreeSet<_>>();
             if ready_groups == expected_groups {
@@ -983,7 +983,7 @@
                 let ready_groups = snapshot
                     .groups
                     .iter()
-                    .filter(|group| group.initial_audit_completed)
+                    .filter(|group| group.is_ready())
                     .map(|group| group.group_id.as_str())
                     .collect::<std::collections::BTreeSet<_>>();
                 ready_groups == std::collections::BTreeSet::from(["nfs1", "nfs2"])
@@ -1301,7 +1301,7 @@
             let ready_groups = snapshot
                 .groups
                 .iter()
-                .filter(|group| group.initial_audit_completed)
+                .filter(|group| group.is_ready())
                 .map(|group| group.group_id.clone())
                 .collect::<std::collections::BTreeSet<_>>();
             if ready_groups == expected_groups {
@@ -1336,7 +1336,7 @@
                 let ready_groups = snapshot
                     .groups
                     .iter()
-                    .filter(|group| group.initial_audit_completed)
+                    .filter(|group| group.is_ready())
                     .map(|group| group.group_id.as_str())
                     .collect::<std::collections::BTreeSet<_>>();
                 ready_groups == std::collections::BTreeSet::from(["nfs1", "nfs2"])

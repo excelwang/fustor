@@ -20,8 +20,8 @@ fn sink_status_snapshot_ready_for_expected_groups_trusts_exported_readiness_over
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -207,7 +207,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
                 let ready_groups = snapshot
                     .groups
                     .iter()
-                    .filter(|group| group.initial_audit_completed)
+                    .filter(|group| group.is_ready())
                     .map(|group| group.group_id.clone())
                     .collect::<std::collections::BTreeSet<_>>();
                 if ready_groups
@@ -259,7 +259,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
                         let ready_groups = snapshot
                             .groups
                             .iter()
-                            .filter(|group| group.initial_audit_completed)
+                            .filter(|group| group.is_ready())
                             .map(|group| group.group_id.clone())
                             .collect::<std::collections::BTreeSet<_>>();
                         if ready_groups
@@ -518,7 +518,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
             let local_ready_groups = local_sink_snapshot
                 .groups
                 .iter()
-                .filter(|group| group.initial_audit_completed)
+                .filter(|group| group.is_ready())
                 .map(|group| group.group_id.as_str())
                 .collect::<std::collections::BTreeSet<_>>();
             assert_eq!(
@@ -640,7 +640,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
     let local_ready_groups = local_sink_snapshot
         .groups
         .iter()
-        .filter(|group| group.initial_audit_completed)
+        .filter(|group| group.is_ready())
         .map(|group| group.group_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
@@ -820,7 +820,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 let ready_groups = snapshot
                     .groups
                     .iter()
-                    .filter(|group| group.initial_audit_completed)
+                    .filter(|group| group.is_ready())
                     .map(|group| group.group_id.clone())
                     .collect::<std::collections::BTreeSet<_>>();
                 if ready_groups
@@ -872,7 +872,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                         let ready_groups = snapshot
                             .groups
                             .iter()
-                            .filter(|group| group.initial_audit_completed)
+                            .filter(|group| group.is_ready())
                             .map(|group| group.group_id.clone())
                             .collect::<std::collections::BTreeSet<_>>();
                         if ready_groups
@@ -1035,8 +1035,8 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
@@ -1052,9 +1052,9 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -1224,8 +1224,8 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
@@ -1241,8 +1241,8 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
@@ -1305,7 +1305,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
     let local_ready_groups = local_sink_snapshot
         .groups
         .iter()
-        .filter(|group| group.initial_audit_completed)
+        .filter(|group| group.is_ready())
         .map(|group| group.group_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
@@ -1496,7 +1496,6 @@ async fn wait_for_sink_status_republish_readiness_after_recovery_accepts_expecte
         )
         .expect("init app"),
     );
-
     let source_wave = |generation| {
         vec![
             activate_envelope_with_route_key_and_scope_rows(
@@ -1621,8 +1620,8 @@ async fn wait_for_sink_status_republish_readiness_after_recovery_accepts_expecte
                         blind_spot_count: 0,
                         shadow_time_us: 0,
                         shadow_lag_us: 0,
-                        overflow_pending_audit: false,
-                        initial_audit_completed: true,
+                        overflow_pending_materialization: false,
+
                         readiness: crate::sink::GroupReadinessState::Ready,
                         materialized_revision: 1,
                         estimated_heap_bytes: 0,
@@ -1638,8 +1637,8 @@ async fn wait_for_sink_status_republish_readiness_after_recovery_accepts_expecte
                         blind_spot_count: 0,
                         shadow_time_us: 0,
                         shadow_lag_us: 0,
-                        overflow_pending_audit: false,
-                        initial_audit_completed: true,
+                        overflow_pending_materialization: false,
+
                         readiness: crate::sink::GroupReadinessState::Ready,
                         materialized_revision: 1,
                         estimated_heap_bytes: 0,
@@ -1655,8 +1654,8 @@ async fn wait_for_sink_status_republish_readiness_after_recovery_accepts_expecte
                         blind_spot_count: 0,
                         shadow_time_us: 0,
                         shadow_lag_us: 0,
-                        overflow_pending_audit: false,
-                        initial_audit_completed: true,
+                        overflow_pending_materialization: false,
+
                         readiness: crate::sink::GroupReadinessState::Ready,
                         materialized_revision: 1,
                         estimated_heap_bytes: 0,
@@ -1732,7 +1731,7 @@ async fn wait_for_local_sink_status_republish_requiring_probe_checks_first_probe
             external_runtime_worker_binding("sink", &sink_socket_dir),
             NodeId("node-c-require-probe-helper".into()),
             Some(boundary.clone()),
-            Some(boundary),
+            Some(boundary.clone()),
             state_boundary,
         )
         .expect("init app"),
@@ -2006,7 +2005,7 @@ async fn wait_for_local_sink_status_republish_requiring_probe_replays_retained_s
             external_runtime_worker_binding("sink", &sink_socket_dir),
             NodeId("node-c-require-probe-replay".into()),
             Some(boundary.clone()),
-            Some(boundary),
+            Some(boundary.clone()),
             state_boundary,
         )
         .expect("init app"),
@@ -2118,7 +2117,26 @@ async fn wait_for_local_sink_status_republish_requiring_probe_replays_retained_s
                 {
                     break;
                 }
-                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
+                Ok(Ok(snapshot)) => {
+                    eprintln!(
+                        "require-probe replay precondition not ready snapshot={:?} cached={:?}",
+                        snapshot,
+                        app.sink.cached_status_snapshot().ok()
+                    );
+                }
+                Ok(Err(err)) => {
+                    eprintln!(
+                        "require-probe replay precondition status_snapshot_nonblocking err={} cached={:?}",
+                        err,
+                        app.sink.cached_status_snapshot().ok()
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "require-probe replay precondition status_snapshot_nonblocking timeout cached={:?}",
+                        app.sink.cached_status_snapshot().ok()
+                    );
+                }
             }
         }
         assert!(
@@ -3914,7 +3932,7 @@ async fn source_led_uninitialized_mixed_recovery_keeps_control_gate_closed_until
                 let ready_groups = snapshot
                     .groups
                     .iter()
-                    .filter(|group| group.initial_audit_completed)
+                    .filter(|group| group.is_ready())
                     .map(|group| group.group_id.clone())
                     .collect::<std::collections::BTreeSet<_>>();
                 if ready_groups == expected_groups {
@@ -4290,7 +4308,7 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
                 let ready_groups = snapshot
                     .groups
                     .iter()
-                    .filter(|group| group.initial_audit_completed)
+                    .filter(|group| group.is_ready())
                     .map(|group| group.group_id.clone())
                     .collect::<std::collections::BTreeSet<_>>();
                 if ready_groups == expected_groups {
@@ -4589,7 +4607,7 @@ async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_f
                 let ready_groups = snapshot
                     .groups
                     .iter()
-                    .filter(|group| group.initial_audit_completed)
+                    .filter(|group| group.is_ready())
                     .map(|group| group.group_id.clone())
                     .collect::<std::collections::BTreeSet<_>>();
                 if ready_groups == expected_groups {

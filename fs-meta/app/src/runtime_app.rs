@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
+use std::future::Future;
+use std::pin::Pin;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -195,15 +197,165 @@ enum FacadePublicationReadinessDecision {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RuntimeGateFacts {
-    control_initialized: bool,
-    source_state_replay_required: bool,
-    sink_state_replay_required: bool,
+enum RuntimeLifecyclePhase {
+    Bootstrapping,
+    Live,
 }
 
-impl RuntimeGateFacts {
-    fn from_state_cell(state: &Arc<StdMutex<RuntimeGateFacts>>) -> Self {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeControlState {
+    lifecycle: RuntimeLifecyclePhase,
+    source_replay_required: bool,
+    sink_replay_required: bool,
+}
+
+impl RuntimeControlState {
+    const fn bootstrapping(
+        source_replay_required: bool,
+        sink_replay_required: bool,
+    ) -> Self {
+        Self {
+            lifecycle: RuntimeLifecyclePhase::Bootstrapping,
+            source_replay_required,
+            sink_replay_required,
+        }
+    }
+
+    #[cfg(test)]
+    const fn live(source_replay_required: bool, sink_replay_required: bool) -> Self {
+        Self {
+            lifecycle: RuntimeLifecyclePhase::Live,
+            source_replay_required,
+            sink_replay_required,
+        }
+    }
+
+    fn from_state_cell(state: &Arc<StdMutex<RuntimeControlState>>) -> Self {
         *state.lock().expect("lock runtime gate state")
+    }
+
+    const fn control_initialized(self) -> bool {
+        matches!(self.lifecycle, RuntimeLifecyclePhase::Live)
+    }
+
+    const fn source_state_replay_required(self) -> bool {
+        self.source_replay_required
+    }
+
+    const fn sink_state_replay_required(self) -> bool {
+        self.sink_replay_required
+    }
+
+    const fn replay_fully_cleared(self) -> bool {
+        !self.source_replay_required && !self.sink_replay_required
+    }
+
+    const fn control_gate_ready(self, allow_facade_only_handoff: bool) -> bool {
+        self.replay_fully_cleared() && (self.control_initialized() || allow_facade_only_handoff)
+    }
+
+    const fn current_facade_service_state(
+        self,
+        pending_facade_present: bool,
+        publication_ready: bool,
+        allow_facade_only_handoff: bool,
+    ) -> FacadeServiceState {
+        if pending_facade_present {
+            FacadeServiceState::Pending
+        } else if self.control_gate_ready(allow_facade_only_handoff) && publication_ready {
+            FacadeServiceState::Serving
+        } else {
+            FacadeServiceState::Unavailable
+        }
+    }
+
+    const fn facade_ready_tail_decision(
+        self,
+        publication_ready: bool,
+        pending_facade_present: bool,
+        allow_facade_only_handoff: bool,
+    ) -> FacadeReadyTailDecision {
+        FacadeReadyTailDecision {
+            control_gate_ready: publication_ready
+                && self.control_gate_ready(allow_facade_only_handoff),
+            published_state: self.current_facade_service_state(
+                pending_facade_present,
+                publication_ready,
+                allow_facade_only_handoff,
+            ),
+        }
+    }
+
+    const fn facade_publication_readiness_decision(
+        self,
+        pending_facade_present: bool,
+        pending_facade_is_control_route: bool,
+        active_control_stream_present: bool,
+        active_pending_control_stream_present: bool,
+        allow_facade_only_handoff: bool,
+    ) -> FacadePublicationReadinessDecision {
+        if !self.control_gate_ready(allow_facade_only_handoff) {
+            return FacadePublicationReadinessDecision::BlockedControlGate;
+        }
+        if !pending_facade_present {
+            return if active_control_stream_present {
+                FacadePublicationReadinessDecision::Ready
+            } else {
+                FacadePublicationReadinessDecision::BlockedWithoutActiveControlStream
+            };
+        }
+        if !pending_facade_is_control_route {
+            return if active_control_stream_present {
+                FacadePublicationReadinessDecision::Ready
+            } else {
+                FacadePublicationReadinessDecision::BlockedWithoutActiveControlStream
+            };
+        }
+        if active_pending_control_stream_present {
+            FacadePublicationReadinessDecision::Ready
+        } else {
+            FacadePublicationReadinessDecision::FixedBindHandoffPending
+        }
+    }
+
+    #[cfg(test)]
+    fn require_source_replay(&mut self) {
+        self.source_replay_required = true;
+    }
+
+    fn require_sink_replay(&mut self) {
+        self.sink_replay_required = true;
+    }
+
+    fn clear_source_replay(&mut self) {
+        self.source_replay_required = false;
+    }
+
+    fn clear_sink_replay(&mut self) {
+        self.sink_replay_required = false;
+    }
+
+    #[cfg(test)]
+    fn set_control_initialized(&mut self, control_initialized: bool) {
+        if control_initialized {
+            self.mark_initialized();
+        } else {
+            self.mark_uninitialized_preserving_replay();
+        }
+    }
+
+    fn mark_initialized(&mut self) {
+        self.lifecycle = RuntimeLifecyclePhase::Live;
+    }
+
+    fn mark_uninitialized_with_full_replay(&mut self) {
+        self.lifecycle = RuntimeLifecyclePhase::Bootstrapping;
+        self.source_replay_required = true;
+        self.sink_replay_required = true;
+    }
+
+    fn mark_uninitialized_preserving_replay(&mut self) {
+        self.lifecycle = RuntimeLifecyclePhase::Bootstrapping;
     }
 }
 
@@ -216,21 +368,10 @@ struct FacadeServiceStateDecisionInput {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FacadeReadyTailDecisionInput {
-    runtime: RuntimeGateFacts,
+    runtime: RuntimeControlState,
     allow_facade_only_handoff: bool,
     publication_ready: bool,
     pending_facade_present: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FacadePublicationReadinessDecisionInput {
-    runtime: RuntimeGateFacts,
-    allow_facade_only_handoff: bool,
-    pending_facade_present: bool,
-    pending_facade_is_control_route: bool,
-    pending_fixed_bind_has_suppressed_dependent_routes: bool,
-    active_control_stream_present: bool,
-    active_pending_control_stream_present: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -258,11 +399,10 @@ enum FacadeOnlyHandoffObservationPolicy {
 
 #[derive(Clone)]
 struct FacadeGateObservation {
-    runtime: RuntimeGateFacts,
+    runtime: RuntimeControlState,
     current_pending: Option<PendingFacadeActivation>,
     pending_facade_present: bool,
     pending_facade_is_control_route: bool,
-    pending_fixed_bind_has_suppressed_dependent_routes: bool,
     active_control_stream_present: bool,
     active_pending_control_stream_present: bool,
     allow_facade_only_handoff: bool,
@@ -353,25 +493,165 @@ struct ActiveFixedBindShutdownContinuation {
     pending_handoff: Option<PendingFixedBindHandoffContinuation>,
 }
 
-impl ActiveFixedBindShutdownContinuation {
-    async fn complete_after_shutdown(self, owner_instance_id: u64) {
-        clear_active_fixed_bind_facade_owner(&self.bind_addr, owner_instance_id);
-        if let Some(handoff) = self.pending_handoff {
-            let _ = handoff.complete_after_release().await;
-        }
-    }
-}
-
 #[derive(Clone)]
 struct PendingFixedBindHandoffContinuation {
     bind_addr: String,
     registrant: PendingFixedBindHandoffRegistrant,
 }
 
-impl PendingFixedBindHandoffContinuation {
-    async fn completion_ready_after_release(&self) -> bool {
-        let pending_facade_present = self.registrant.pending_facade.lock().await.is_some();
-        let active_control_stream_present = self
+#[derive(Clone)]
+struct FixedBindHandoffDriver {
+    gate: FacadeGateObservation,
+    pending_fixed_bind_publication: PendingFixedBindPublicationState,
+    release_handoff: Option<PendingFixedBindHandoffContinuation>,
+    shutdown_handoff: Option<ActiveFixedBindShutdownContinuation>,
+}
+
+enum FixedBindHandoffAction {
+    Deactivate {
+        route_key: String,
+        generation: u64,
+        retain_active_facade: bool,
+        retain_pending_spawn: bool,
+    },
+    Publication,
+    Shutdown,
+    AfterRelease {
+        handoff: PendingFixedBindHandoffContinuation,
+    },
+}
+
+enum FixedBindHandoffExecution {
+    Completed,
+    PublicationReady(bool),
+    AfterReleaseCompleted(bool),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FixedBindAfterReleaseRuntime {
+    deadline: tokio::time::Instant,
+    last_retry_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FixedBindAfterReleaseAction {
+    SpawnAttempt,
+    WaitForProgress(Duration),
+    Complete,
+    ReturnTimeout,
+}
+
+impl FixedBindAfterReleaseRuntime {
+    fn new() -> Self {
+        Self::new_with_deadline(tokio::time::Instant::now() + Duration::from_secs(8))
+    }
+
+    fn new_with_deadline(deadline: tokio::time::Instant) -> Self {
+        Self {
+            deadline,
+            last_retry_error: None,
+        }
+    }
+
+    fn remaining_at(&self, now: tokio::time::Instant) -> Duration {
+        self.deadline.saturating_duration_since(now)
+    }
+
+    fn spawn_attempt_action(&self) -> FixedBindAfterReleaseAction {
+        self.spawn_attempt_action_at(tokio::time::Instant::now())
+    }
+
+    fn spawn_attempt_action_at(&self, now: tokio::time::Instant) -> FixedBindAfterReleaseAction {
+        if self.remaining_at(now).is_zero() {
+            FixedBindAfterReleaseAction::ReturnTimeout
+        } else {
+            FixedBindAfterReleaseAction::SpawnAttempt
+        }
+    }
+
+    fn note_spawn_success(mut self) -> Self {
+        self.last_retry_error = None;
+        self
+    }
+
+    fn note_spawn_failure(mut self, err: impl std::fmt::Display) -> Self {
+        self.last_retry_error = Some(err.to_string());
+        self
+    }
+
+    fn post_spawn_action(&self, completion_ready: bool) -> FixedBindAfterReleaseAction {
+        self.post_spawn_action_at(tokio::time::Instant::now(), completion_ready)
+    }
+
+    fn post_spawn_action_at(
+        &self,
+        now: tokio::time::Instant,
+        completion_ready: bool,
+    ) -> FixedBindAfterReleaseAction {
+        if completion_ready {
+            FixedBindAfterReleaseAction::Complete
+        } else {
+            let remaining = self.remaining_at(now);
+            if remaining.is_zero() {
+                FixedBindAfterReleaseAction::ReturnTimeout
+            } else {
+                FixedBindAfterReleaseAction::WaitForProgress(remaining)
+            }
+        }
+    }
+
+    fn last_retry_error_message(&self) -> Option<&str> {
+        self.last_retry_error.as_deref()
+    }
+}
+
+#[test]
+fn fixed_bind_after_release_runtime_owns_deadline_and_retry_wait() {
+    let now = tokio::time::Instant::now();
+    let live_runtime =
+        FixedBindAfterReleaseRuntime::new_with_deadline(now + Duration::from_secs(1))
+            .note_spawn_failure("bind busy");
+    let expired_runtime = FixedBindAfterReleaseRuntime::new_with_deadline(now);
+
+    assert_eq!(
+        live_runtime.spawn_attempt_action_at(now),
+        FixedBindAfterReleaseAction::SpawnAttempt,
+        "after-release handoff should keep spawn-attempt eligibility inside the runtime instead of leaving execute(...) to compare raw instants inline",
+    );
+    assert_eq!(
+        live_runtime.post_spawn_action_at(now + Duration::from_millis(200), false),
+        FixedBindAfterReleaseAction::WaitForProgress(Duration::from_millis(800)),
+        "after-release handoff should derive wait duration from the runtime-owned deadline instead of leaving the outer loop to re-budget progress waits",
+    );
+    assert_eq!(
+        live_runtime.last_retry_error_message(),
+        Some("bind busy"),
+        "after-release runtime should retain the last retry failure message so timeout logging stays owned by the runtime flow instead of an outer helper-local variable",
+    );
+    assert_eq!(
+        expired_runtime.spawn_attempt_action_at(now),
+        FixedBindAfterReleaseAction::ReturnTimeout,
+        "after-release timeout should come from the runtime-owned deadline instead of a helper-local deadline loop",
+    );
+}
+
+#[test]
+fn fixed_bind_after_release_runtime_promotes_completion_without_outer_branching() {
+    let now = tokio::time::Instant::now();
+    let runtime = FixedBindAfterReleaseRuntime::new_with_deadline(now + Duration::from_secs(1))
+        .note_spawn_success();
+
+    assert_eq!(
+        runtime.post_spawn_action_at(now, true),
+        FixedBindAfterReleaseAction::Complete,
+        "after-release handoff should surface completion through a runtime-owned action instead of leaving execute(...) to branch on completion-ready inline",
+    );
+}
+
+impl FixedBindHandoffDriver {
+    async fn completion_ready_after_release(handoff: &PendingFixedBindHandoffContinuation) -> bool {
+        let pending_facade_present = handoff.registrant.pending_facade.lock().await.is_some();
+        let active_control_stream_present = handoff
             .registrant
             .api_task
             .lock()
@@ -383,57 +663,362 @@ impl PendingFixedBindHandoffContinuation {
         !pending_facade_present && active_control_stream_present
     }
 
-    async fn wait_for_completion_progress_until(
-        &self,
-        deadline: tokio::time::Instant,
-        last_retry_error: &Option<anyhow::Error>,
+    async fn wait_for_completion_progress(
+        handoff: &PendingFixedBindHandoffContinuation,
+        remaining: Duration,
+        last_retry_error: Option<&str>,
     ) -> bool {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             if let Some(err) = last_retry_error {
                 eprintln!(
                     "fs_meta_runtime_app: fixed-bind handoff completion retry failed bind_addr={} err={}",
-                    self.bind_addr, err
+                    handoff.bind_addr, err
                 );
             }
             return false;
         }
-        let _ =
-            tokio::time::timeout(remaining, self.registrant.runtime_state_changed.notified()).await;
+        let _ = tokio::time::timeout(
+            remaining,
+            handoff.registrant.runtime_state_changed.notified(),
+        )
+        .await;
         true
     }
 
-    async fn complete_after_release(self) -> bool {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-        let mut last_retry_error = None::<anyhow::Error>;
-        loop {
-            match self.registrant.try_spawn_pending_facade().await {
-                Ok(_) => {
-                    last_retry_error = None;
-                    if self.completion_ready_after_release().await {
-                        #[cfg(test)]
-                        maybe_pause_before_pending_fixed_bind_handoff_completion_gate_reopen()
-                            .await;
-                        let _ = self
-                            .registrant
-                            .apply_forced_handoff_ready_tail(&self.bind_addr)
-                            .await;
-                        #[cfg(test)]
-                        notify_pending_fixed_bind_handoff_completion_completion();
-                        return true;
-                    }
-                }
-                Err(err) => {
-                    last_retry_error = Some(err.into());
-                }
-            }
-            if !self
-                .wait_for_completion_progress_until(deadline, &last_retry_error)
-                .await
-            {
-                return false;
+    async fn release_handoff_blocker_for_publication(
+        app: &FSMetaApp,
+        pending: &PendingFacadeActivation,
+    ) -> Option<PendingFixedBindHandoffContinuation> {
+        let bind_addr = pending.resolved.bind_addr.clone();
+        let registrant = app.pending_fixed_bind_handoff_registrant();
+        mark_pending_fixed_bind_handoff_ready_with_registrant(&bind_addr, registrant.clone());
+        let state = registrant
+            .observe_pending_fixed_bind_publication_state_for_pending(pending)
+            .await;
+        if !state.claim_conflict() || !pending.runtime_exposure_confirmed {
+            return None;
+        }
+        if let Some(owner) = active_fixed_bind_facade_owner_for(&bind_addr, app.instance_id) {
+            owner.release_for_handoff(&bind_addr).await;
+            return Some(registrant.handoff_continuation(&bind_addr));
+        }
+        if let Some(owner_instance_id) = state
+            .conflicting_process_claim_for_handoff()
+            .map(|claim| claim.owner_instance_id)
+        {
+            clear_process_facade_claim_for_bind_addr(&bind_addr, owner_instance_id);
+            return Some(registrant.handoff_continuation(&bind_addr));
+        }
+        None
+    }
+
+    async fn drive_shutdown_handoff(
+        self,
+        app: &FSMetaApp,
+        handoff: Option<ActiveFixedBindShutdownContinuation>,
+    ) -> Result<()> {
+        app.api_request_tracker.wait_for_drain().await;
+        app.api_control_gate.wait_for_facade_request_drain().await;
+        #[cfg(test)]
+        notify_facade_shutdown_started();
+        eprintln!("fs_meta_runtime_app: shutdown_active_facade");
+        if let Some(current) = app.api_task.lock().await.take() {
+            eprintln!(
+                "fs_meta_runtime_app: shutting down previous active facade generation={}",
+                current.generation
+            );
+            current
+                .handle
+                .shutdown(ACTIVE_FACADE_SHUTDOWN_TIMEOUT)
+                .await;
+        }
+        clear_owned_process_facade_claim(app.instance_id);
+        if let Some(handoff) = handoff {
+            clear_active_fixed_bind_facade_owner(&handoff.bind_addr, app.instance_id);
+            if let Some(pending_handoff) = handoff.pending_handoff {
+                let _ = self
+                    .clone()
+                    .execute(
+                        app,
+                        FixedBindHandoffAction::AfterRelease {
+                            handoff: pending_handoff,
+                        },
+                    )
+                    .await?;
             }
         }
+        if let Some(pending) = app.pending_facade.lock().await.clone() {
+            clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
+        }
+        let _ = app.current_facade_service_state().await;
+        Ok(())
+    }
+
+    fn publication_readiness_decision(&self) -> FacadePublicationReadinessDecision {
+        self.gate.publication_readiness_decision()
+    }
+
+    fn publication_ready_bind_addr_to_clear(&self) -> Option<&str> {
+        self.gate.current_pending.as_ref().and_then(|pending| {
+            (self.gate.pending_facade_is_control_route
+                && self.gate.active_pending_control_stream_present)
+                .then_some(pending.resolved.bind_addr.as_str())
+        })
+    }
+
+    fn pending_publication_handoff(&self) -> Option<PendingFacadeActivation> {
+        self.gate
+            .current_pending
+            .clone()
+            .filter(|pending| !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr))
+    }
+
+    fn execute<'a>(
+        self,
+        app: &'a FSMetaApp,
+        action: FixedBindHandoffAction,
+    ) -> Pin<Box<dyn Future<Output = Result<FixedBindHandoffExecution>> + Send + 'a>> {
+        Box::pin(async move {
+            match action {
+                FixedBindHandoffAction::Deactivate {
+                    route_key,
+                    generation,
+                    retain_active_facade,
+                    retain_pending_spawn,
+                } => {
+                    match self
+                        .clone()
+                        .deactivate_decision(retain_active_facade, retain_pending_spawn)
+                    {
+                        FacadeDeactivateContinuityExecutionPlan::RetainActiveContinuity => {
+                            app.retained_active_facade_continuity
+                                .store(true, Ordering::Release);
+                            eprintln!(
+                                "fs_meta_runtime_app: retain active facade during continuity-preserving deactivate route_key={} generation={}",
+                                route_key, generation
+                            );
+                        }
+                        FacadeDeactivateContinuityExecutionPlan::RetainActiveWhilePendingFixedBindClaimConflict => {
+                            app.retained_active_facade_continuity
+                                .store(true, Ordering::Release);
+                            eprintln!(
+                                "fs_meta_runtime_app: retain active facade while pending fixed-bind claim remains owned elsewhere route_key={} generation={}",
+                                route_key, generation
+                            );
+                        }
+                        FacadeDeactivateContinuityExecutionPlan::RetainPendingWhilePendingFixedBindClaimConflict => {
+                            eprintln!(
+                                "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
+                                route_key, generation
+                            );
+                        }
+                        FacadeDeactivateContinuityExecutionPlan::ReleaseActiveForFixedBindHandoff {
+                            handoff,
+                        } => {
+                            eprintln!(
+                                "fs_meta_runtime_app: release active facade for fixed-bind handoff route_key={} generation={}",
+                                route_key, generation
+                            );
+                            app.retained_active_facade_continuity
+                                .store(false, Ordering::Release);
+                            *app.pending_facade.lock().await = None;
+                            FSMetaApp::clear_pending_facade_status(&app.facade_pending_status);
+                            let _ = app.current_facade_service_state().await;
+                            let _ = app.current_facade_service_state().await;
+                            app.wait_for_shared_worker_control_handoff().await;
+                            self.clone()
+                                .drive_shutdown_handoff(app, Some(handoff))
+                                .await?;
+                        }
+                        FacadeDeactivateContinuityExecutionPlan::RetainPendingForFixedBindHandoff => {
+                            eprintln!(
+                                "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
+                                route_key, generation
+                            );
+                        }
+                        FacadeDeactivateContinuityExecutionPlan::RetainPendingWhileSpawnInFlight => {
+                            eprintln!(
+                                "fs_meta_runtime_app: retain pending facade during in-flight spawn route_key={} generation={}",
+                                route_key, generation
+                            );
+                        }
+                        FacadeDeactivateContinuityExecutionPlan::Shutdown { handoff } => {
+                            app.retained_active_facade_continuity
+                                .store(false, Ordering::Release);
+                            *app.pending_facade.lock().await = None;
+                            FSMetaApp::clear_pending_facade_status(&app.facade_pending_status);
+                            let _ = app.current_facade_service_state().await;
+                            let _ = app.current_facade_service_state().await;
+                            app.wait_for_shared_worker_control_handoff().await;
+                            self.clone().drive_shutdown_handoff(app, handoff).await?;
+                        }
+                    }
+                    Ok(FixedBindHandoffExecution::Completed)
+                }
+                FixedBindHandoffAction::Publication => {
+                    let publication_ready = match self.publication_readiness_decision() {
+                        FacadePublicationReadinessDecision::BlockedControlGate
+                        | FacadePublicationReadinessDecision::BlockedWithoutActiveControlStream => {
+                            false
+                        }
+                        FacadePublicationReadinessDecision::Ready => {
+                            if let Some(bind_addr) = self.publication_ready_bind_addr_to_clear() {
+                                clear_pending_fixed_bind_handoff_ready(bind_addr);
+                            }
+                            true
+                        }
+                        FacadePublicationReadinessDecision::FixedBindHandoffPending => {
+                            let Some(pending) = self.pending_publication_handoff() else {
+                                return Ok(FixedBindHandoffExecution::PublicationReady(false));
+                            };
+                            let bind_addr = pending.resolved.bind_addr.clone();
+                            let Some(handoff) =
+                                Self::release_handoff_blocker_for_publication(app, &pending).await
+                            else {
+                                return Ok(FixedBindHandoffExecution::PublicationReady(false));
+                            };
+                            let after_release_completed = match self
+                                .clone()
+                                .execute(app, FixedBindHandoffAction::AfterRelease { handoff })
+                                .await?
+                            {
+                                FixedBindHandoffExecution::AfterReleaseCompleted(completed) => {
+                                    completed
+                                }
+                                _ => false,
+                            };
+                            if !after_release_completed {
+                                return Ok(FixedBindHandoffExecution::PublicationReady(false));
+                            }
+                            if app
+                                .api_task
+                                .lock()
+                                .await
+                                .as_ref()
+                                .is_some_and(|active| pending.matches_active(active))
+                            {
+                                clear_pending_fixed_bind_handoff_ready(&bind_addr);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    Ok(FixedBindHandoffExecution::PublicationReady(
+                        publication_ready,
+                    ))
+                }
+                FixedBindHandoffAction::Shutdown => {
+                    self.clone()
+                        .drive_shutdown_handoff(app, self.shutdown_handoff)
+                        .await?;
+                    Ok(FixedBindHandoffExecution::Completed)
+                }
+                FixedBindHandoffAction::AfterRelease { handoff } => {
+                    let mut runtime = FixedBindAfterReleaseRuntime::new();
+                    loop {
+                        match runtime.spawn_attempt_action() {
+                            FixedBindAfterReleaseAction::ReturnTimeout => {
+                                return Ok(FixedBindHandoffExecution::AfterReleaseCompleted(false));
+                            }
+                            FixedBindAfterReleaseAction::SpawnAttempt => {
+                                runtime = match handoff.registrant.try_spawn_pending_facade().await
+                                {
+                                    Ok(_) => runtime.note_spawn_success(),
+                                    Err(err) => runtime.note_spawn_failure(err),
+                                };
+                            }
+                            FixedBindAfterReleaseAction::WaitForProgress(_)
+                            | FixedBindAfterReleaseAction::Complete => {
+                                unreachable!("after-release runtime produced a non-entry action")
+                            }
+                        }
+                        match runtime
+                            .post_spawn_action(Self::completion_ready_after_release(&handoff).await)
+                        {
+                            FixedBindAfterReleaseAction::Complete => {
+                                #[cfg(test)]
+                                maybe_pause_before_pending_fixed_bind_handoff_completion_gate_reopen()
+                                    .await;
+                                let _ = handoff
+                                    .registrant
+                                    .apply_forced_handoff_ready_tail(&handoff.bind_addr)
+                                    .await;
+                                #[cfg(test)]
+                                notify_pending_fixed_bind_handoff_completion_completion();
+                                return Ok(FixedBindHandoffExecution::AfterReleaseCompleted(true));
+                            }
+                            FixedBindAfterReleaseAction::WaitForProgress(remaining) => {
+                                if !Self::wait_for_completion_progress(
+                                    &handoff,
+                                    remaining,
+                                    runtime.last_retry_error_message(),
+                                )
+                                .await
+                                {
+                                    return Ok(FixedBindHandoffExecution::AfterReleaseCompleted(
+                                        false,
+                                    ));
+                                }
+                            }
+                            FixedBindAfterReleaseAction::ReturnTimeout => {
+                                return Ok(FixedBindHandoffExecution::AfterReleaseCompleted(false));
+                            }
+                            FixedBindAfterReleaseAction::SpawnAttempt => {
+                                unreachable!(
+                                    "after-release runtime post-spawn action regressed to spawn"
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn deactivate_decision(
+        self,
+        retain_active_facade: bool,
+        retain_pending_spawn: bool,
+    ) -> FacadeDeactivateContinuityExecutionPlan {
+        let pending_fixed_bind_conflict = self.pending_fixed_bind_publication.claim_conflict();
+        if retain_active_facade && !pending_fixed_bind_conflict && self.release_handoff.is_none() {
+            return FacadeDeactivateContinuityExecutionPlan::RetainActiveContinuity;
+        }
+        if pending_fixed_bind_conflict {
+            return if retain_active_facade {
+                FacadeDeactivateContinuityExecutionPlan::RetainActiveWhilePendingFixedBindClaimConflict
+            } else {
+                FacadeDeactivateContinuityExecutionPlan::RetainPendingWhilePendingFixedBindClaimConflict
+            };
+        }
+        if let Some(handoff) = self.release_handoff {
+            return if retain_active_facade {
+                FacadeDeactivateContinuityExecutionPlan::ReleaseActiveForFixedBindHandoff {
+                    handoff: ActiveFixedBindShutdownContinuation {
+                        bind_addr: handoff.bind_addr.clone(),
+                        pending_handoff: Some(handoff),
+                    },
+                }
+            } else {
+                FacadeDeactivateContinuityExecutionPlan::RetainPendingForFixedBindHandoff
+            };
+        }
+        if retain_pending_spawn {
+            return FacadeDeactivateContinuityExecutionPlan::RetainPendingWhileSpawnInFlight;
+        }
+        FacadeDeactivateContinuityExecutionPlan::Shutdown {
+            handoff: self.shutdown_handoff,
+        }
+    }
+
+    #[cfg(test)]
+    fn deactivate_plan(
+        self,
+        retain_active_facade: bool,
+        retain_pending_spawn: bool,
+    ) -> FacadeDeactivateContinuityExecutionPlan {
+        self.deactivate_decision(retain_active_facade, retain_pending_spawn)
     }
 }
 
@@ -452,22 +1037,13 @@ impl FacadeOnlyHandoffAllowanceDecision {
 }
 
 impl FacadeGateObservation {
-    fn publication_readiness_input(&self) -> FacadePublicationReadinessDecisionInput {
-        FacadePublicationReadinessDecisionInput {
-            runtime: self.runtime,
-            allow_facade_only_handoff: self.allow_facade_only_handoff,
-            pending_facade_present: self.current_pending.is_some(),
-            pending_facade_is_control_route: self.pending_facade_is_control_route,
-            pending_fixed_bind_has_suppressed_dependent_routes: self
-                .pending_fixed_bind_has_suppressed_dependent_routes,
-            active_control_stream_present: self.active_control_stream_present,
-            active_pending_control_stream_present: self.active_pending_control_stream_present,
-        }
-    }
-
     fn publication_readiness_decision(&self) -> FacadePublicationReadinessDecision {
-        FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
-            self.publication_readiness_input(),
+        self.runtime.facade_publication_readiness_decision(
+            self.current_pending.is_some(),
+            self.pending_facade_is_control_route,
+            self.active_control_stream_present,
+            self.active_pending_control_stream_present,
+            self.allow_facade_only_handoff,
         )
     }
 
@@ -479,12 +1055,11 @@ impl FacadeGateObservation {
     }
 
     fn ready_tail_decision(&self, publication_ready: bool) -> FacadeReadyTailDecision {
-        FSMetaApp::facade_ready_tail_decision_from_runtime_facts(FacadeReadyTailDecisionInput {
-            runtime: self.runtime,
-            allow_facade_only_handoff: self.allow_facade_only_handoff,
+        self.runtime.facade_ready_tail_decision(
             publication_ready,
-            pending_facade_present: self.pending_facade_present,
-        })
+            self.pending_facade_present,
+            self.allow_facade_only_handoff,
+        )
     }
 }
 
@@ -574,64 +1149,6 @@ impl PendingFixedBindPublicationProjection {
                 bind_addr: pending.resolved.bind_addr.clone(),
                 claim_release_followup_required: self.claim_release_followup_required,
             })
-    }
-}
-
-impl FacadeDeactivateContinuityExecutionPlan {
-    fn from_parts(
-        retain_active_facade: bool,
-        retain_pending_spawn: bool,
-        pending_fixed_bind_publication: PendingFixedBindPublicationState,
-        release_handoff: Option<PendingFixedBindHandoffContinuation>,
-        shutdown_handoff: Option<ActiveFixedBindShutdownContinuation>,
-    ) -> Self {
-        let pending_fixed_bind_conflict = pending_fixed_bind_publication.claim_conflict();
-        let release_for_fixed_bind_handoff = release_handoff;
-
-        if retain_active_facade
-            && !pending_fixed_bind_conflict
-            && release_for_fixed_bind_handoff.is_none()
-        {
-            return Self::RetainActiveContinuity;
-        }
-        if pending_fixed_bind_conflict {
-            return if retain_active_facade {
-                Self::RetainActiveWhilePendingFixedBindClaimConflict
-            } else {
-                Self::RetainPendingWhilePendingFixedBindClaimConflict
-            };
-        }
-        if let Some(handoff) = release_for_fixed_bind_handoff {
-            return if retain_active_facade {
-                Self::ReleaseActiveForFixedBindHandoff {
-                    handoff: ActiveFixedBindShutdownContinuation {
-                        bind_addr: handoff.bind_addr.clone(),
-                        pending_handoff: Some(handoff),
-                    },
-                }
-            } else {
-                Self::RetainPendingForFixedBindHandoff
-            };
-        }
-        if retain_pending_spawn {
-            return Self::RetainPendingWhileSpawnInFlight;
-        }
-        Self::Shutdown {
-            handoff: shutdown_handoff,
-        }
-    }
-}
-
-impl FacadeReadyTailDecisionInput {
-    fn facade_service_state_input(
-        self,
-        control_gate_ready: bool,
-    ) -> FacadeServiceStateDecisionInput {
-        FacadeServiceStateDecisionInput {
-            control_gate_ready,
-            publication_ready: self.publication_ready,
-            pending_facade_present: self.pending_facade_present,
-        }
     }
 }
 
@@ -854,20 +1371,6 @@ enum RuntimeScopeConvergenceExpectation<'a> {
     ExpectedGroups(&'a RuntimeScopeExpectedGroups),
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RuntimeScopeConvergenceWaitDecisionInput<'a> {
-    observation: &'a RuntimeScopeConvergenceObservation,
-    expectation: RuntimeScopeConvergenceExpectation<'a>,
-    deadline_expired: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RuntimeScopeConvergenceWaitDecision {
-    Wait,
-    Converged,
-    ReturnTimeout,
-}
-
 impl RuntimeScopeConvergenceObservation {
     fn is_nonempty_fully_converged(&self) -> bool {
         !self.source_groups.is_empty()
@@ -941,18 +1444,6 @@ impl RuntimeScopeExpectedGroups {
     }
 }
 
-impl RuntimeScopeConvergenceWaitDecisionInput<'_> {
-    fn decide(self) -> RuntimeScopeConvergenceWaitDecision {
-        if self.observation.matches_expectation(self.expectation) {
-            RuntimeScopeConvergenceWaitDecision::Converged
-        } else if self.deadline_expired {
-            RuntimeScopeConvergenceWaitDecision::ReturnTimeout
-        } else {
-            RuntimeScopeConvergenceWaitDecision::Wait
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PostRecoveryScopeConvergenceTriggerState {
     InitialNotTriggered,
@@ -972,20 +1463,22 @@ struct PostRecoverySinkStatusReadinessWaitState {
     sink_timeout_retry_state: PostRecoverySinkStatusTimeoutRetryState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostRecoveryScopeConvergenceAction {
+    Converged,
+    TriggerInitialAndWait,
+    Wait,
+    ReturnTimeout,
+}
+
 #[derive(Debug)]
-struct LocalSinkStatusRepublishWaitState {
+struct LocalSinkStatusRepublishMachine {
+    deadline: tokio::time::Instant,
     retrigger_state: LocalSinkStatusRepublishRetriggerState,
     manual_rescan_state: LocalSinkStatusRepublishManualRescanState,
     retained_sink_replay_state: LocalSinkStatusRepublishRetainedSinkReplayState,
     #[cfg(test)]
     first_sink_probe_pending: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalSinkStatusRepublishPendingStep {
-    TriggerSourceToSinkConvergence,
-    ReplayRetainedSinkWave,
-    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1008,42 +1501,20 @@ enum LocalSinkStatusRepublishRetainedSinkReplayState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LocalSinkStatusRepublishIterationDecisionInput {
-    runtime_scope_converged: bool,
+struct LocalSinkStatusRepublishObservation {
+    scope_converged: bool,
     cached_ready_fast_path_satisfied: bool,
-    deadline_expired: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalSinkStatusRepublishIterationDecision {
+enum LocalSinkStatusRepublishStep {
     WaitForRuntimeScopeConvergence,
     ReturnReady,
-    DrivePendingStepsAndProbe,
-    ReturnTimeout,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalSinkStatusRepublishPostProbeDecision {
-    ReturnReady,
+    TriggerSourceToSinkConvergence,
     ReplayRetainedSinkWave,
-    PublishManualRescanFallback,
+    ProbeReadiness,
+    PublishManualRescanFallbackAndWait,
     ReturnTimeout,
-}
-
-impl LocalSinkStatusRepublishIterationDecisionInput {
-    fn decide(self) -> LocalSinkStatusRepublishIterationDecision {
-        if !self.runtime_scope_converged {
-            return LocalSinkStatusRepublishIterationDecision::WaitForRuntimeScopeConvergence;
-        }
-        if self.cached_ready_fast_path_satisfied {
-            return LocalSinkStatusRepublishIterationDecision::ReturnReady;
-        }
-        if self.deadline_expired {
-            LocalSinkStatusRepublishIterationDecision::ReturnTimeout
-        } else {
-            LocalSinkStatusRepublishIterationDecision::DrivePendingStepsAndProbe
-        }
-    }
 }
 
 impl ControlFrameWaveObservation {
@@ -1155,9 +1626,17 @@ impl LocalSinkStatusRepublishRetainedSinkReplayState {
     }
 }
 
-impl LocalSinkStatusRepublishWaitState {
+impl LocalSinkStatusRepublishMachine {
     fn new(mode: LocalSinkStatusRepublishWaitMode) -> Self {
+        Self::new_with_deadline(mode, tokio::time::Instant::now() + Duration::from_secs(5))
+    }
+
+    fn new_with_deadline(
+        mode: LocalSinkStatusRepublishWaitMode,
+        deadline: tokio::time::Instant,
+    ) -> Self {
         Self {
+            deadline,
             retrigger_state: match mode {
                 LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath => {
                     LocalSinkStatusRepublishRetriggerState::Pending { count: 0 }
@@ -1180,6 +1659,36 @@ impl LocalSinkStatusRepublishWaitState {
         }
     }
 
+    fn remaining(&self) -> Duration {
+        self.deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_default()
+    }
+
+    fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+
+    fn step_for_observation(
+        &self,
+        observation: &LocalSinkStatusRepublishObservation,
+    ) -> LocalSinkStatusRepublishStep {
+        if !observation.scope_converged {
+            return if self.remaining().is_zero() {
+                LocalSinkStatusRepublishStep::ReturnTimeout
+            } else {
+                LocalSinkStatusRepublishStep::WaitForRuntimeScopeConvergence
+            };
+        }
+        if observation.cached_ready_fast_path_satisfied {
+            return LocalSinkStatusRepublishStep::ReturnReady;
+        }
+        if self.remaining().is_zero() {
+            return LocalSinkStatusRepublishStep::ReturnTimeout;
+        }
+        self.next_step_after_scope_convergence()
+    }
+
     async fn trigger_source_to_sink_convergence(
         &mut self,
         source: &Arc<SourceFacade>,
@@ -1191,30 +1700,18 @@ impl LocalSinkStatusRepublishWaitState {
         Ok(())
     }
 
-    async fn apply_pending_steps(
+    async fn replay_retained_sink_wave(
         &mut self,
-        source: &Arc<SourceFacade>,
         sink: &Arc<SinkFacade>,
         post_return_sink_replay_signals: &[SinkControlSignal],
-        remaining: Duration,
     ) -> Result<()> {
-        loop {
-            match self.next_pending_step() {
-                LocalSinkStatusRepublishPendingStep::TriggerSourceToSinkConvergence => {
-                    self.trigger_source_to_sink_convergence(source).await?;
-                }
-                LocalSinkStatusRepublishPendingStep::ReplayRetainedSinkWave => {
-                    sink.apply_orchestration_signals_with_total_timeout(
-                        post_return_sink_replay_signals,
-                        remaining,
-                    )
-                    .await?;
-                    self.retained_sink_replay_state =
-                        LocalSinkStatusRepublishRetainedSinkReplayState::None;
-                }
-                LocalSinkStatusRepublishPendingStep::None => return Ok(()),
-            }
-        }
+        sink.apply_orchestration_signals_with_total_timeout(
+            post_return_sink_replay_signals,
+            self.remaining(),
+        )
+        .await?;
+        self.retained_sink_replay_state = LocalSinkStatusRepublishRetainedSinkReplayState::None;
+        Ok(())
     }
 
     async fn maybe_pause_before_probe(&mut self) {
@@ -1253,12 +1750,11 @@ impl LocalSinkStatusRepublishWaitState {
         Ok(())
     }
 
-    fn post_probe_decision(
+    fn probe_action(
         &mut self,
         probe_outcome: LocalSinkStatusRepublishProbeOutcome,
         post_return_sink_replay_signals: &[SinkControlSignal],
-        deadline_expired: bool,
-    ) -> LocalSinkStatusRepublishPostProbeDecision {
+    ) -> LocalSinkStatusRepublishStep {
         match probe_outcome {
             LocalSinkStatusRepublishProbeOutcome::Ready => match self.retained_sink_replay_state {
                 LocalSinkStatusRepublishRetainedSinkReplayState::RequireReadyProbe => {
@@ -1269,31 +1765,186 @@ impl LocalSinkStatusRepublishWaitState {
                         LocalSinkStatusRepublishRetainedSinkReplayState::Pending
                     };
                     if self.retained_sink_replay_state.is_pending() {
-                        LocalSinkStatusRepublishPostProbeDecision::ReplayRetainedSinkWave
+                        LocalSinkStatusRepublishStep::ReplayRetainedSinkWave
                     } else {
-                        LocalSinkStatusRepublishPostProbeDecision::ReturnReady
+                        LocalSinkStatusRepublishStep::ReturnReady
                     }
                 }
-                _ => LocalSinkStatusRepublishPostProbeDecision::ReturnReady,
+                _ => LocalSinkStatusRepublishStep::ReturnReady,
             },
-            LocalSinkStatusRepublishProbeOutcome::NotReady if deadline_expired => {
-                LocalSinkStatusRepublishPostProbeDecision::ReturnTimeout
+            LocalSinkStatusRepublishProbeOutcome::NotReady if self.remaining().is_zero() => {
+                LocalSinkStatusRepublishStep::ReturnTimeout
             }
             LocalSinkStatusRepublishProbeOutcome::NotReady => {
-                LocalSinkStatusRepublishPostProbeDecision::PublishManualRescanFallback
+                LocalSinkStatusRepublishStep::PublishManualRescanFallbackAndWait
             }
         }
     }
 
-    fn next_pending_step(&self) -> LocalSinkStatusRepublishPendingStep {
+    fn next_step_after_scope_convergence(&self) -> LocalSinkStatusRepublishStep {
         if self.retrigger_state.is_pending() {
-            return LocalSinkStatusRepublishPendingStep::TriggerSourceToSinkConvergence;
+            return LocalSinkStatusRepublishStep::TriggerSourceToSinkConvergence;
         }
         if self.retained_sink_replay_state.is_pending() {
-            return LocalSinkStatusRepublishPendingStep::ReplayRetainedSinkWave;
+            return LocalSinkStatusRepublishStep::ReplayRetainedSinkWave;
         }
-        LocalSinkStatusRepublishPendingStep::None
+        LocalSinkStatusRepublishStep::ProbeReadiness
     }
+}
+
+#[test]
+fn local_sink_status_republish_runtime_owns_deadline_for_iteration_and_probe_timeout() {
+    let live_runtime = LocalSinkStatusRepublishMachine::new_with_deadline(
+        LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    );
+    let expired_runtime = LocalSinkStatusRepublishMachine::new_with_deadline(
+        LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
+        tokio::time::Instant::now(),
+    );
+
+    assert_eq!(
+        live_runtime.step_for_observation(&LocalSinkStatusRepublishObservation {
+            scope_converged: false,
+            cached_ready_fast_path_satisfied: false,
+        }),
+        LocalSinkStatusRepublishStep::WaitForRuntimeScopeConvergence,
+        "local republish waits should keep using the runtime-owned deadline while scope convergence is still pending",
+    );
+    assert_eq!(
+        expired_runtime.step_for_observation(&LocalSinkStatusRepublishObservation {
+            scope_converged: true,
+            cached_ready_fast_path_satisfied: false,
+        }),
+        LocalSinkStatusRepublishStep::ReturnTimeout,
+        "local republish timeout should come from the runtime-owned deadline instead of outer helper-local deadline booleans",
+    );
+    let mut expired_probe_runtime = expired_runtime;
+    assert_eq!(
+        expired_probe_runtime.probe_action(LocalSinkStatusRepublishProbeOutcome::NotReady, &[]),
+        LocalSinkStatusRepublishStep::ReturnTimeout,
+        "post-probe timeout should also come from the same runtime-owned deadline",
+    );
+}
+
+#[test]
+fn local_sink_status_republish_runtime_require_probe_mode_promotes_first_ready_probe_internally() {
+    let mut runtime = LocalSinkStatusRepublishMachine::new_with_deadline(
+        LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    );
+
+    assert_eq!(
+        runtime.probe_action(LocalSinkStatusRepublishProbeOutcome::Ready, &[]),
+        LocalSinkStatusRepublishStep::ReturnReady,
+        "require-probe mode should resolve the first ready probe inside the runtime instead of bouncing through outer post-probe helper decisions",
+    );
+    assert_eq!(
+        runtime.retained_sink_replay_state,
+        LocalSinkStatusRepublishRetainedSinkReplayState::None,
+        "the runtime should clear the synthetic require-probe latch once the first ready probe lands",
+    );
+}
+
+#[test]
+fn local_sink_status_republish_runtime_not_ready_probe_requests_manual_rescan_wait() {
+    let mut runtime = LocalSinkStatusRepublishMachine::new_with_deadline(
+        LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    );
+
+    assert_eq!(
+        runtime.probe_action(LocalSinkStatusRepublishProbeOutcome::NotReady, &[]),
+        LocalSinkStatusRepublishStep::PublishManualRescanFallbackAndWait,
+        "local republish runtime should own the manual-rescan publish-plus-wait lane instead of leaving the outer helper loop to glue together a probe decision, a fallback publication, and a separate wait branch",
+    );
+}
+
+#[test]
+fn local_sink_status_republish_runtime_next_action_owns_pending_step_and_probe_followup() {
+    let expected = RuntimeScopeExpectedGroups {
+        source_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        scan_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        sink_groups: std::collections::BTreeSet::from([String::from("g1")]),
+    };
+    let converged = RuntimeScopeConvergenceObservation {
+        source_groups: expected.source_groups.clone(),
+        scan_groups: expected.scan_groups.clone(),
+        sink_groups: expected.sink_groups.clone(),
+    };
+    let mut runtime = LocalSinkStatusRepublishMachine::new_with_deadline(
+        LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    );
+
+    assert_eq!(
+        runtime.step_for_observation(&LocalSinkStatusRepublishObservation {
+            scope_converged: converged
+                .matches_expectation(RuntimeScopeConvergenceExpectation::ExpectedGroups(&expected)),
+            cached_ready_fast_path_satisfied: false,
+        }),
+        LocalSinkStatusRepublishStep::TriggerSourceToSinkConvergence,
+        "local republish runtime should own the first pending step directly instead of collapsing it into an outer helper-local apply-pending-steps bundle",
+    );
+
+    runtime.retrigger_state = LocalSinkStatusRepublishRetriggerState::Idle { count: 1 };
+    assert_eq!(
+        runtime.step_for_observation(&LocalSinkStatusRepublishObservation {
+            scope_converged: converged
+                .matches_expectation(RuntimeScopeConvergenceExpectation::ExpectedGroups(&expected)),
+            cached_ready_fast_path_satisfied: false,
+        }),
+        LocalSinkStatusRepublishStep::ProbeReadiness,
+        "once pending steps clear, the runtime should advance directly into probe readiness instead of forcing the outer helper to decide when probing starts",
+    );
+
+    assert_eq!(
+        runtime.probe_action(LocalSinkStatusRepublishProbeOutcome::NotReady, &[]),
+        LocalSinkStatusRepublishStep::PublishManualRescanFallbackAndWait,
+        "post-probe not-ready handling should also stay inside the runtime instead of bouncing back out to an outer post-probe branch",
+    );
+}
+
+#[test]
+fn local_sink_status_republish_runtime_scope_action_owns_expected_group_convergence() {
+    let runtime = LocalSinkStatusRepublishMachine::new_with_deadline(
+        LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    );
+    let expected = RuntimeScopeExpectedGroups {
+        source_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        scan_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        sink_groups: std::collections::BTreeSet::from([String::from("g1")]),
+    };
+    let missing_sink = RuntimeScopeConvergenceObservation {
+        source_groups: expected.source_groups.clone(),
+        scan_groups: expected.scan_groups.clone(),
+        sink_groups: std::collections::BTreeSet::new(),
+    };
+    let converged = RuntimeScopeConvergenceObservation {
+        source_groups: expected.source_groups.clone(),
+        scan_groups: expected.scan_groups.clone(),
+        sink_groups: expected.sink_groups.clone(),
+    };
+
+    assert_eq!(
+        runtime.step_for_observation(&LocalSinkStatusRepublishObservation {
+            scope_converged: missing_sink
+                .matches_expectation(RuntimeScopeConvergenceExpectation::ExpectedGroups(&expected)),
+            cached_ready_fast_path_satisfied: false,
+        }),
+        LocalSinkStatusRepublishStep::WaitForRuntimeScopeConvergence,
+        "local republish should derive expected-group convergence inside the runtime instead of relying on an outer convergence decision helper",
+    );
+    assert_eq!(
+        runtime.step_for_observation(&LocalSinkStatusRepublishObservation {
+            scope_converged: converged
+                .matches_expectation(RuntimeScopeConvergenceExpectation::ExpectedGroups(&expected)),
+            cached_ready_fast_path_satisfied: true,
+        }),
+        LocalSinkStatusRepublishStep::ReturnReady,
+        "once expected groups converge, the runtime should promote the cached-ready fast path itself",
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1311,6 +1962,25 @@ impl PostRecoverySinkStatusReadinessWaitState {
                 PostRecoveryScopeConvergenceTriggerState::InitialNotTriggered
             },
             sink_timeout_retry_state: PostRecoverySinkStatusTimeoutRetryState::NotRetried,
+        }
+    }
+
+    fn scope_action(
+        &self,
+        observation: &RuntimeScopeConvergenceObservation,
+        deadline: tokio::time::Instant,
+    ) -> PostRecoveryScopeConvergenceAction {
+        if observation.is_nonempty_fully_converged() {
+            PostRecoveryScopeConvergenceAction::Converged
+        } else if tokio::time::Instant::now() >= deadline {
+            PostRecoveryScopeConvergenceAction::ReturnTimeout
+        } else if matches!(
+            self.scope_trigger_state,
+            PostRecoveryScopeConvergenceTriggerState::InitialNotTriggered
+        ) {
+            PostRecoveryScopeConvergenceAction::TriggerInitialAndWait
+        } else {
+            PostRecoveryScopeConvergenceAction::Wait
         }
     }
 
@@ -1366,6 +2036,39 @@ impl PostRecoverySinkStatusReadinessWaitState {
         self.scope_trigger_state = PostRecoveryScopeConvergenceTriggerState::RetryPending;
         Ok(true)
     }
+}
+
+#[test]
+fn post_recovery_sink_status_readiness_wait_state_scope_action_owns_deadline_and_trigger_lane() {
+    let waiting = PostRecoverySinkStatusReadinessWaitState::new(false);
+    let pretriggered = PostRecoverySinkStatusReadinessWaitState::new(true);
+    let observation = RuntimeScopeConvergenceObservation {
+        source_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        scan_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        sink_groups: std::collections::BTreeSet::new(),
+    };
+
+    assert_eq!(
+        waiting.scope_action(
+            &observation,
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        ),
+        PostRecoveryScopeConvergenceAction::TriggerInitialAndWait,
+        "post-recovery readiness waits should derive the initial convergence trigger lane from the wait state itself",
+    );
+    assert_eq!(
+        pretriggered.scope_action(
+            &observation,
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        ),
+        PostRecoveryScopeConvergenceAction::Wait,
+        "once pretriggered, the wait state should stay in pure wait mode without reopening the initial trigger helper seam",
+    );
+    assert_eq!(
+        pretriggered.scope_action(&observation, tokio::time::Instant::now()),
+        PostRecoveryScopeConvergenceAction::ReturnTimeout,
+        "post-recovery scope convergence timeout should come from the wait-state-owned deadline check",
+    );
 }
 
 fn sink_group_status_counts_as_ready(group: &crate::sink::SinkGroupStatusSnapshot) -> bool {
@@ -1455,7 +2158,7 @@ struct PendingFixedBindHandoffRegistrant {
     facade_service_state: SharedFacadeServiceStateCell,
     api_request_tracker: Arc<ApiRequestTracker>,
     api_control_gate: Arc<ApiControlGate>,
-    runtime_gate_state: Arc<StdMutex<RuntimeGateFacts>>,
+    runtime_gate_state: Arc<StdMutex<RuntimeControlState>>,
     runtime_state_changed: Arc<tokio::sync::Notify>,
     node_id: NodeId,
     runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
@@ -1486,7 +2189,7 @@ impl PendingFixedBindHandoffRegistrant {
         facade_service_state: SharedFacadeServiceStateCell,
         api_request_tracker: Arc<ApiRequestTracker>,
         api_control_gate: Arc<ApiControlGate>,
-        runtime_gate_state: Arc<StdMutex<RuntimeGateFacts>>,
+        runtime_gate_state: Arc<StdMutex<RuntimeControlState>>,
         runtime_state_changed: Arc<tokio::sync::Notify>,
         node_id: NodeId,
         runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
@@ -1517,8 +2220,8 @@ impl PendingFixedBindHandoffRegistrant {
         }
     }
 
-    fn runtime_gate_facts(&self) -> RuntimeGateFacts {
-        RuntimeGateFacts::from_state_cell(&self.runtime_gate_state)
+    fn runtime_control_state(&self) -> RuntimeControlState {
+        RuntimeControlState::from_state_cell(&self.runtime_gate_state)
     }
 
     fn notify_runtime_state_changed(&self) {
@@ -1539,6 +2242,7 @@ impl PendingFixedBindHandoffRegistrant {
         .await
     }
 
+    #[cfg(test)]
     async fn release_handoff_blocker_for_publication(
         &self,
         pending: &PendingFacadeActivation,
@@ -1563,27 +2267,6 @@ impl PendingFixedBindHandoffRegistrant {
             return Some(self.handoff_continuation(&bind_addr));
         }
         None
-    }
-
-    async fn complete_handoff_for_publication(&self, pending: PendingFacadeActivation) -> bool {
-        let bind_addr = pending.resolved.bind_addr.clone();
-        let Some(handoff) = self.release_handoff_blocker_for_publication(&pending).await else {
-            return false;
-        };
-        if !handoff.complete_after_release().await {
-            return false;
-        }
-        if self
-            .api_task
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|active| pending.matches_active(active))
-        {
-            clear_pending_fixed_bind_handoff_ready(&bind_addr);
-            return true;
-        }
-        false
     }
 
     async fn try_spawn_pending_facade(&self) -> Result<bool> {
@@ -1634,7 +2317,7 @@ impl PendingFixedBindHandoffRegistrant {
             &self.facade_service_state,
             &self.api_control_gate,
             FacadeReadyTailDecisionInput {
-                runtime: self.runtime_gate_facts(),
+                runtime: self.runtime_control_state(),
                 allow_facade_only_handoff: false,
                 publication_ready: true,
                 pending_facade_present: false,
@@ -1651,7 +2334,7 @@ impl PendingFixedBindHandoffRegistrant {
             Some(&self.facade_pending_status),
             &self.facade_service_state,
             &self.api_control_gate,
-            self.runtime_gate_facts(),
+            self.runtime_control_state(),
             self.pending_fixed_bind_has_suppressed_dependent_routes
                 .load(Ordering::Acquire),
             FacadeOnlyHandoffObservationPolicy::ForceAllowed,
@@ -3834,8 +4517,7 @@ pub struct FSMetaApp {
     facade_service_state: SharedFacadeServiceStateCell,
     facade_gate: RuntimeUnitGate,
     mirrored_query_peer_routes: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
-    runtime_gate_state: Arc<StdMutex<RuntimeGateFacts>>,
-    retained_source_control_state: Mutex<RetainedSourceControlState>,
+    runtime_gate_state: Arc<StdMutex<RuntimeControlState>>,
     retained_sink_control_state: Mutex<RetainedSinkControlState>,
     runtime_state_changed: Arc<tokio::sync::Notify>,
     retained_suppressed_public_query_activates:
@@ -3845,12 +4527,6 @@ pub struct FSMetaApp {
     control_frame_lease_path: Option<std::path::PathBuf>,
     control_init_lock: Mutex<()>,
     closing: AtomicBool,
-}
-
-#[derive(Default, Clone)]
-struct RetainedSourceControlState {
-    latest_host_grant_change: Option<SourceControlSignal>,
-    active_by_route: std::collections::BTreeMap<(String, String), SourceControlSignal>,
 }
 
 #[derive(Default, Clone)]
@@ -3918,26 +4594,28 @@ impl FSMetaApp {
                     .await?;
                 let scope_observation =
                     Self::observe_runtime_scope_convergence(&self.source, &self.sink).await?;
-                match (RuntimeScopeConvergenceWaitDecisionInput {
-                    observation: &scope_observation,
-                    expectation: RuntimeScopeConvergenceExpectation::NonemptyFullyConverged,
-                    deadline_expired: tokio::time::Instant::now() >= scope_convergence_deadline,
-                })
-                .decide()
-                {
-                    RuntimeScopeConvergenceWaitDecision::Converged => {
+                match wait_state.scope_action(&scope_observation, scope_convergence_deadline) {
+                    PostRecoveryScopeConvergenceAction::Converged => {
                         break scope_observation.sink_groups;
                     }
-                    RuntimeScopeConvergenceWaitDecision::ReturnTimeout => {
+                    PostRecoveryScopeConvergenceAction::ReturnTimeout => {
                         return Err(CnxError::Internal(format!(
                             "runtime scope convergence not observed after retained replay: {}",
                             scope_observation.timeout_context()
                         )));
                     }
-                    RuntimeScopeConvergenceWaitDecision::Wait => {
+                    PostRecoveryScopeConvergenceAction::TriggerInitialAndWait => {
                         wait_state
                             .maybe_trigger_initial_scope_convergence(&self.source)
                             .await?;
+                        Self::wait_for_runtime_or_sink_progress_until(
+                            &self.runtime_state_changed,
+                            &self.sink,
+                            scope_convergence_deadline,
+                        )
+                        .await;
+                    }
+                    PostRecoveryScopeConvergenceAction::Wait => {
                         Self::wait_for_runtime_or_sink_progress_until(
                             &self.runtime_state_changed,
                             &self.sink,
@@ -4036,7 +4714,7 @@ impl FSMetaApp {
         }
     }
 
-    async fn wait_for_local_sink_status_republish_after_recovery_from_parts_with_mode(
+    async fn execute_local_sink_status_republish_until_terminal(
         source: Arc<SourceFacade>,
         sink: Arc<SinkFacade>,
         runtime_state_changed: Arc<tokio::sync::Notify>,
@@ -4051,90 +4729,116 @@ impl FSMetaApp {
                 .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
                 .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"))
         };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut wait_state = LocalSinkStatusRepublishWaitState::new(mode);
+        let mut republish_machine = LocalSinkStatusRepublishMachine::new(mode);
         loop {
             let expected_scope_groups = RuntimeScopeExpectedGroups::from_logical_roots(
                 &source.logical_roots_snapshot().await?,
                 expected_groups,
             );
             let scope_observation = Self::observe_runtime_scope_convergence(&source, &sink).await?;
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let runtime_scope_wait_decision = (RuntimeScopeConvergenceWaitDecisionInput {
-                observation: &scope_observation,
-                expectation: RuntimeScopeConvergenceExpectation::ExpectedGroups(
-                    &expected_scope_groups,
+            let observation = LocalSinkStatusRepublishObservation {
+                scope_converged: scope_observation.matches_expectation(
+                    RuntimeScopeConvergenceExpectation::ExpectedGroups(&expected_scope_groups),
                 ),
-                deadline_expired: remaining.is_zero(),
-            })
-            .decide();
-            let runtime_scope_converged = matches!(
-                runtime_scope_wait_decision,
-                RuntimeScopeConvergenceWaitDecision::Converged
-            );
-            let cached_ready_fast_path_satisfied = runtime_scope_converged
-                && matches!(
+                cached_ready_fast_path_satisfied: matches!(
                     mode,
                     LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath
-                )
-                && Self::cached_sink_status_ready_for_expected_groups(&sink, expected_groups);
-            match (LocalSinkStatusRepublishIterationDecisionInput {
-                runtime_scope_converged: matches!(
-                    runtime_scope_wait_decision,
-                    RuntimeScopeConvergenceWaitDecision::Converged
-                ),
-                cached_ready_fast_path_satisfied,
-                deadline_expired: matches!(
-                    runtime_scope_wait_decision,
-                    RuntimeScopeConvergenceWaitDecision::ReturnTimeout
-                ),
-            })
-            .decide()
-            {
-                LocalSinkStatusRepublishIterationDecision::WaitForRuntimeScopeConvergence => {
+                ) && Self::cached_sink_status_ready_for_expected_groups(&sink, expected_groups),
+            };
+            let step = republish_machine.step_for_observation(&observation);
+            let outcome = Self::dispatch_local_sink_status_republish_step(
+                &source,
+                &sink,
+                &runtime_state_changed,
+                &mut republish_machine,
+                expected_groups,
+                post_return_sink_replay_signals,
+                step,
+            )
+            .await;
+            match outcome {
+                std::ops::ControlFlow::Continue(()) => continue,
+                std::ops::ControlFlow::Break(Ok(())) => return Ok(()),
+                std::ops::ControlFlow::Break(Err(CnxError::Timeout)) => {
+                    return Err(CnxError::Internal(format!(
+                        "local sink status republish not restored after retained replay once runtime scope converged: expected_groups={expected_groups:?} {}",
+                        summarize_cached_sink_status(&sink)
+                    )));
+                }
+                std::ops::ControlFlow::Break(Err(err)) => return Err(err),
+            }
+        }
+    }
+
+    async fn dispatch_local_sink_status_republish_step(
+        source: &Arc<SourceFacade>,
+        sink: &Arc<SinkFacade>,
+        runtime_state_changed: &Arc<tokio::sync::Notify>,
+        republish_machine: &mut LocalSinkStatusRepublishMachine,
+        expected_groups: &std::collections::BTreeSet<String>,
+        post_return_sink_replay_signals: &[SinkControlSignal],
+        mut step: LocalSinkStatusRepublishStep,
+    ) -> std::ops::ControlFlow<Result<()>> {
+        loop {
+            match step {
+                LocalSinkStatusRepublishStep::WaitForRuntimeScopeConvergence => {
                     Self::wait_for_runtime_or_sink_progress_until(
-                        &runtime_state_changed,
-                        &sink,
-                        deadline,
+                        runtime_state_changed,
+                        sink,
+                        republish_machine.deadline(),
                     )
                     .await;
-                    continue;
+                    return std::ops::ControlFlow::Continue(());
                 }
-                LocalSinkStatusRepublishIterationDecision::ReturnReady => return Ok(()),
-                LocalSinkStatusRepublishIterationDecision::DrivePendingStepsAndProbe => {}
-                LocalSinkStatusRepublishIterationDecision::ReturnTimeout => {
-                    return Err(CnxError::Internal(format!(
-                        "local sink status republish not restored after retained replay once runtime scope converged: expected_groups={expected_groups:?} {}",
-                        summarize_cached_sink_status(&sink)
-                    )));
+                LocalSinkStatusRepublishStep::ReturnReady => {
+                    return std::ops::ControlFlow::Break(Ok(()));
+                }
+                LocalSinkStatusRepublishStep::TriggerSourceToSinkConvergence => {
+                    match republish_machine.trigger_source_to_sink_convergence(source).await {
+                        Ok(()) => return std::ops::ControlFlow::Continue(()),
+                        Err(err) => return std::ops::ControlFlow::Break(Err(err)),
+                    }
+                }
+                LocalSinkStatusRepublishStep::ReplayRetainedSinkWave => {
+                    return republish_machine
+                        .replay_retained_sink_wave(sink, post_return_sink_replay_signals)
+                        .await
+                        .map_or_else(
+                            |err| std::ops::ControlFlow::Break(Err(err)),
+                            |_| std::ops::ControlFlow::Continue(()),
+                        );
+                }
+                LocalSinkStatusRepublishStep::ProbeReadiness => {
+                    republish_machine.maybe_pause_before_probe().await;
+                    step = republish_machine.probe_action(
+                        Self::probe_local_sink_status_republish_readiness(
+                            sink,
+                            expected_groups,
+                            republish_machine.deadline(),
+                        )
+                        .await,
+                        post_return_sink_replay_signals,
+                    );
+                }
+                LocalSinkStatusRepublishStep::PublishManualRescanFallbackAndWait => {
+                    if let Err(err) = republish_machine
+                        .schedule_manual_rescan_fallback(source, post_return_sink_replay_signals)
+                        .await
+                    {
+                        return std::ops::ControlFlow::Break(Err(err));
+                    }
+                    Self::wait_for_runtime_or_sink_progress_until(
+                        runtime_state_changed,
+                        sink,
+                        republish_machine.deadline(),
+                    )
+                    .await;
+                    return std::ops::ControlFlow::Continue(());
+                }
+                LocalSinkStatusRepublishStep::ReturnTimeout => {
+                    return std::ops::ControlFlow::Break(Err(CnxError::Timeout));
                 }
             }
-            wait_state
-                .apply_pending_steps(&source, &sink, post_return_sink_replay_signals, remaining)
-                .await?;
-            wait_state.maybe_pause_before_probe().await;
-            let post_probe_decision = wait_state.post_probe_decision(
-                Self::probe_local_sink_status_republish_readiness(&sink, expected_groups, deadline)
-                    .await,
-                post_return_sink_replay_signals,
-                tokio::time::Instant::now() >= deadline,
-            );
-            match post_probe_decision {
-                LocalSinkStatusRepublishPostProbeDecision::ReplayRetainedSinkWave => continue,
-                LocalSinkStatusRepublishPostProbeDecision::ReturnReady => return Ok(()),
-                LocalSinkStatusRepublishPostProbeDecision::PublishManualRescanFallback => {}
-                LocalSinkStatusRepublishPostProbeDecision::ReturnTimeout => {
-                    return Err(CnxError::Internal(format!(
-                        "local sink status republish not restored after retained replay once runtime scope converged: expected_groups={expected_groups:?} {}",
-                        summarize_cached_sink_status(&sink)
-                    )));
-                }
-            }
-            wait_state
-                .schedule_manual_rescan_fallback(&source, post_return_sink_replay_signals)
-                .await?;
-            Self::wait_for_runtime_or_sink_progress_until(&runtime_state_changed, &sink, deadline)
-                .await;
         }
     }
 
@@ -4145,7 +4849,7 @@ impl FSMetaApp {
         expected_groups: &std::collections::BTreeSet<String>,
         post_return_sink_replay_signals: &[SinkControlSignal],
     ) -> Result<()> {
-        Self::wait_for_local_sink_status_republish_after_recovery_from_parts_with_mode(
+        Self::execute_local_sink_status_republish_until_terminal(
             source,
             sink,
             runtime_state_changed,
@@ -4241,7 +4945,7 @@ impl FSMetaApp {
         expected_groups: &std::collections::BTreeSet<String>,
         post_return_sink_replay_signals: &[SinkControlSignal],
     ) -> Result<()> {
-        Self::wait_for_local_sink_status_republish_after_recovery_from_parts_with_mode(
+        Self::execute_local_sink_status_republish_until_terminal(
             source,
             sink,
             runtime_state_changed,
@@ -4569,7 +5273,7 @@ impl FSMetaApp {
         api_task: Arc<Mutex<Option<FacadeActivation>>>,
         api_control_gate: Arc<ApiControlGate>,
         facade_service_state: SharedFacadeServiceStateCell,
-        runtime_gate_state: Arc<StdMutex<RuntimeGateFacts>>,
+        runtime_gate_state: Arc<StdMutex<RuntimeControlState>>,
         runtime_state_changed: Arc<tokio::sync::Notify>,
         pending_fixed_bind_has_suppressed_dependent_routes: Arc<AtomicBool>,
     ) {
@@ -4614,7 +5318,7 @@ impl FSMetaApp {
                 Some(&facade_pending_status),
                 &facade_service_state,
                 &api_control_gate,
-                RuntimeGateFacts::from_state_cell(&runtime_gate_state),
+                RuntimeControlState::from_state_cell(&runtime_gate_state),
                 pending_fixed_bind_has_suppressed_dependent_routes.load(Ordering::Acquire),
                 FacadeOnlyHandoffObservationPolicy::ForceBlocked,
                 None,
@@ -4822,12 +5526,9 @@ impl FSMetaApp {
                 ],
             ),
             mirrored_query_peer_routes: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
-            runtime_gate_state: Arc::new(StdMutex::new(RuntimeGateFacts {
-                control_initialized: false,
-                source_state_replay_required: false,
-                sink_state_replay_required: false,
-            })),
-            retained_source_control_state: Mutex::new(RetainedSourceControlState::default()),
+            runtime_gate_state: Arc::new(StdMutex::new(RuntimeControlState::bootstrapping(
+                false, false,
+            ))),
             retained_sink_control_state: Mutex::new(RetainedSinkControlState::default()),
             runtime_state_changed: Arc::new(tokio::sync::Notify::new()),
             retained_suppressed_public_query_activates: Mutex::new(
@@ -4842,27 +5543,27 @@ impl FSMetaApp {
     }
 
     fn control_initialized(&self) -> bool {
-        self.runtime_gate_facts().control_initialized
+        self.runtime_control_state().control_initialized()
     }
 
     #[cfg(test)]
     fn source_state_replay_required(&self) -> bool {
-        self.runtime_gate_facts().source_state_replay_required
+        self.runtime_control_state().source_state_replay_required()
     }
 
     #[cfg(test)]
     fn sink_state_replay_required(&self) -> bool {
-        self.runtime_gate_facts().sink_state_replay_required
+        self.runtime_control_state().sink_state_replay_required()
     }
 
-    fn runtime_gate_facts(&self) -> RuntimeGateFacts {
-        RuntimeGateFacts::from_state_cell(&self.runtime_gate_state)
+    fn runtime_control_state(&self) -> RuntimeControlState {
+        RuntimeControlState::from_state_cell(&self.runtime_gate_state)
     }
 
-    fn update_runtime_gate_facts(
+    fn update_runtime_control_state(
         &self,
-        update: impl FnOnce(&mut RuntimeGateFacts),
-    ) -> RuntimeGateFacts {
+        update: impl FnOnce(&mut RuntimeControlState),
+    ) -> RuntimeControlState {
         let mut state = self
             .runtime_gate_state
             .lock()
@@ -4874,53 +5575,15 @@ impl FSMetaApp {
     }
 
     #[cfg(test)]
-    fn update_runtime_gate_facts_for_tests(
+    fn update_runtime_control_state_for_tests(
         &self,
-        update: impl FnOnce(&mut RuntimeGateFacts),
-    ) -> RuntimeGateFacts {
-        self.update_runtime_gate_facts(update)
+        update: impl FnOnce(&mut RuntimeControlState),
+    ) -> RuntimeControlState {
+        self.update_runtime_control_state(update)
     }
 
     fn notify_runtime_state_changed(&self) {
         self.runtime_state_changed.notify_waiters();
-    }
-
-    fn control_gate_ready_from_runtime_facts(
-        runtime: RuntimeGateFacts,
-        allow_facade_only_handoff: bool,
-    ) -> bool {
-        !runtime.source_state_replay_required
-            && !runtime.sink_state_replay_required
-            && (runtime.control_initialized || allow_facade_only_handoff)
-    }
-
-    fn current_facade_service_state_from_runtime_facts(
-        input: FacadeServiceStateDecisionInput,
-    ) -> FacadeServiceState {
-        if input.pending_facade_present {
-            FacadeServiceState::Pending
-        } else if input.control_gate_ready && input.publication_ready {
-            FacadeServiceState::Serving
-        } else {
-            FacadeServiceState::Unavailable
-        }
-    }
-
-    fn facade_ready_tail_decision_from_runtime_facts(
-        input: FacadeReadyTailDecisionInput,
-    ) -> FacadeReadyTailDecision {
-        let control_gate_ready = input.publication_ready
-            && Self::control_gate_ready_from_runtime_facts(
-                input.runtime,
-                input.allow_facade_only_handoff,
-            );
-        let published_state = Self::current_facade_service_state_from_runtime_facts(
-            input.facade_service_state_input(control_gate_ready),
-        );
-        FacadeReadyTailDecision {
-            control_gate_ready,
-            published_state,
-        }
     }
 
     fn apply_facade_ready_tail_decision(
@@ -4944,39 +5607,12 @@ impl FSMetaApp {
         Self::apply_facade_ready_tail_decision(
             api_control_gate,
             facade_service_state,
-            Self::facade_ready_tail_decision_from_runtime_facts(input),
+            input.runtime.facade_ready_tail_decision(
+                input.publication_ready,
+                input.pending_facade_present,
+                input.allow_facade_only_handoff,
+            ),
         );
-    }
-
-    fn facade_publication_readiness_decision_from_runtime_facts(
-        input: FacadePublicationReadinessDecisionInput,
-    ) -> FacadePublicationReadinessDecision {
-        let control_gate_ready = Self::control_gate_ready_from_runtime_facts(
-            input.runtime,
-            input.allow_facade_only_handoff,
-        );
-        if !control_gate_ready {
-            return FacadePublicationReadinessDecision::BlockedControlGate;
-        }
-        if !input.pending_facade_present {
-            return if input.active_control_stream_present {
-                FacadePublicationReadinessDecision::Ready
-            } else {
-                FacadePublicationReadinessDecision::BlockedWithoutActiveControlStream
-            };
-        }
-        if !input.pending_facade_is_control_route {
-            return if input.active_control_stream_present {
-                FacadePublicationReadinessDecision::Ready
-            } else {
-                FacadePublicationReadinessDecision::BlockedWithoutActiveControlStream
-            };
-        }
-        if input.active_pending_control_stream_present {
-            FacadePublicationReadinessDecision::Ready
-        } else {
-            FacadePublicationReadinessDecision::FixedBindHandoffPending
-        }
     }
 
     fn facade_only_handoff_allowance_decision(
@@ -5140,11 +5776,17 @@ impl FSMetaApp {
         }
     }
 
-    fn publish_facade_service_state_from_runtime_facts(
+    fn publish_facade_service_state_from_runtime_state(
         facade_service_state: &SharedFacadeServiceStateCell,
         input: FacadeServiceStateDecisionInput,
     ) -> FacadeServiceState {
-        let state = Self::current_facade_service_state_from_runtime_facts(input);
+        let state = if input.pending_facade_present {
+            FacadeServiceState::Pending
+        } else if input.control_gate_ready && input.publication_ready {
+            FacadeServiceState::Serving
+        } else {
+            FacadeServiceState::Unavailable
+        };
         *facade_service_state
             .write()
             .expect("write published facade service state") = state;
@@ -5156,7 +5798,7 @@ impl FSMetaApp {
         api_task: Arc<Mutex<Option<FacadeActivation>>>,
         pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
         facade_pending_status: Option<&SharedFacadePendingStatusCell>,
-        runtime: RuntimeGateFacts,
+        runtime: RuntimeControlState,
         pending_fixed_bind_has_suppressed_dependent_routes: bool,
         handoff_policy: FacadeOnlyHandoffObservationPolicy,
     ) -> FacadeGateObservation {
@@ -5212,7 +5854,6 @@ impl FSMetaApp {
             current_pending,
             pending_facade_present,
             pending_facade_is_control_route,
-            pending_fixed_bind_has_suppressed_dependent_routes,
             active_control_stream_present,
             active_pending_control_stream_present,
             allow_facade_only_handoff,
@@ -5226,7 +5867,7 @@ impl FSMetaApp {
         facade_pending_status: Option<&SharedFacadePendingStatusCell>,
         facade_service_state: &SharedFacadeServiceStateCell,
         api_control_gate: &ApiControlGate,
-        runtime: RuntimeGateFacts,
+        runtime: RuntimeControlState,
         pending_fixed_bind_has_suppressed_dependent_routes: bool,
         handoff_policy: FacadeOnlyHandoffObservationPolicy,
         active_fixed_bind_owner: Option<(&str, ActiveFixedBindFacadeRegistrant)>,
@@ -5262,7 +5903,7 @@ impl FSMetaApp {
             self.api_task.clone(),
             self.pending_facade.clone(),
             Some(&self.facade_pending_status),
-            self.runtime_gate_facts(),
+            self.runtime_control_state(),
             self.pending_fixed_bind_has_suppressed_dependent_routes
                 .load(Ordering::Acquire),
             handoff_policy,
@@ -5278,7 +5919,7 @@ impl FSMetaApp {
                 .ok()
                 .is_some_and(|status| status.is_some());
         let publication_ready = self.facade_publication_ready().await;
-        Self::publish_facade_service_state_from_runtime_facts(
+        Self::publish_facade_service_state_from_runtime_state(
             &self.facade_service_state,
             FacadeServiceStateDecisionInput {
                 control_gate_ready: self.api_control_gate.is_ready(),
@@ -5542,9 +6183,7 @@ impl FSMetaApp {
             ensure_endpoints.await?;
         }
         eprintln!("fs_meta_runtime_app: initialize_from_control endpoints ok");
-        self.update_runtime_gate_facts(|state| {
-            state.control_initialized = true;
-        });
+        self.update_runtime_control_state(|state| state.mark_initialized());
         self.api_control_gate
             .set_ready(self.facade_publication_ready().await);
         let _ = self.current_facade_service_state().await;
@@ -5919,10 +6558,10 @@ impl FSMetaApp {
                                             }
                                         }
                                         if matches!(terminal_err, CnxError::Timeout)
-                                            && RuntimeGateFacts::from_state_cell(
+                                            && RuntimeControlState::from_state_cell(
                                                 &runtime_gate_state,
                                             )
-                                            .control_initialized
+                                            .control_initialized()
                                         {
                                             let route_still_active =
                                                 internal_query_route_still_active(
@@ -6798,7 +7437,7 @@ impl FSMetaApp {
         facade_service_state: SharedFacadeServiceStateCell,
         api_request_tracker: Arc<ApiRequestTracker>,
         api_control_gate: Arc<ApiControlGate>,
-        runtime_gate_state: Arc<StdMutex<RuntimeGateFacts>>,
+        runtime_gate_state: Arc<StdMutex<RuntimeControlState>>,
         node_id: NodeId,
         runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
         source: Arc<SourceFacade>,
@@ -7794,42 +8433,13 @@ impl FSMetaApp {
         Ok(())
     }
 
-    async fn shutdown_active_facade_with_continuation(
-        &self,
-        handoff: Option<ActiveFixedBindShutdownContinuation>,
-    ) {
-        self.api_request_tracker.wait_for_drain().await;
-        self.api_control_gate.wait_for_facade_request_drain().await;
-        #[cfg(test)]
-        notify_facade_shutdown_started();
-        eprintln!("fs_meta_runtime_app: shutdown_active_facade");
-        if let Some(current) = self.api_task.lock().await.take() {
-            eprintln!(
-                "fs_meta_runtime_app: shutting down previous active facade generation={}",
-                current.generation
-            );
-            current
-                .handle
-                .shutdown(ACTIVE_FACADE_SHUTDOWN_TIMEOUT)
-                .await;
-        }
-        clear_owned_process_facade_claim(self.instance_id);
-        if let Some(handoff) = handoff {
-            handoff.complete_after_shutdown(self.instance_id).await;
-        }
-        if let Some(pending) = self.pending_facade.lock().await.clone() {
-            clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
-        }
-        let _ = self.current_facade_service_state().await;
-    }
-
     #[cfg(test)]
     async fn shutdown_active_facade(&self) {
-        let handoff = self
-            .observe_active_fixed_bind_handoffs()
+        self.observe_fixed_bind_handoff_driver()
             .await
-            .map(|(_, shutdown_handoff)| shutdown_handoff);
-        self.shutdown_active_facade_with_continuation(handoff).await;
+            .execute(self, FixedBindHandoffAction::Shutdown)
+            .await
+            .expect("shutdown handoff should complete");
     }
 
     async fn withdraw_uninitialized_query_routes(&self) {
@@ -7874,10 +8484,8 @@ impl FSMetaApp {
     }
 
     async fn reinitialize_after_control_reset(&self) -> Result<()> {
-        self.update_runtime_gate_facts(|state| {
-            state.control_initialized = false;
-            state.source_state_replay_required = true;
-            state.sink_state_replay_required = true;
+        self.update_runtime_control_state(|state| {
+            state.mark_uninitialized_with_full_replay();
         });
         self.api_control_gate.set_ready(false);
         let _ = self.current_facade_service_state().await;
@@ -7888,10 +8496,8 @@ impl FSMetaApp {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
-        self.update_runtime_gate_facts(|state| {
-            state.control_initialized = false;
-            state.source_state_replay_required = true;
-            state.sink_state_replay_required = true;
+        self.update_runtime_control_state(|state| {
+            state.mark_uninitialized_with_full_replay();
         });
         self.api_control_gate.set_ready(false);
         let _ = self.current_facade_service_state().await;
@@ -7900,10 +8506,8 @@ impl FSMetaApp {
     }
 
     async fn mark_control_uninitialized_after_failure(&self) {
-        self.update_runtime_gate_facts(|state| {
-            state.control_initialized = false;
-            state.source_state_replay_required = true;
-            state.sink_state_replay_required = true;
+        self.update_runtime_control_state(|state| {
+            state.mark_uninitialized_with_full_replay();
         });
         self.api_control_gate.set_ready(false);
         let _ = self.current_facade_service_state().await;
@@ -7918,7 +8522,7 @@ impl FSMetaApp {
         &self,
         source_signals: &[SourceControlSignal],
     ) -> Vec<SourceControlSignal> {
-        if !self.runtime_gate_facts().source_state_replay_required {
+        if !self.runtime_control_state().source_state_replay_required() {
             return source_signals.to_vec();
         }
 
@@ -7926,52 +8530,12 @@ impl FSMetaApp {
             return source_signals.to_vec();
         }
 
-        let mut desired = self.retained_source_control_state.lock().await.clone();
-        Self::apply_source_signals_to_state(&mut desired, source_signals);
-        let mut replayed = Self::source_signals_from_state(&desired);
+        let mut replayed = self
+            .source
+            .control_signals_with_replay(source_signals)
+            .await;
         replayed.extend(Self::source_transient_followup_signals(source_signals));
         replayed
-    }
-
-    async fn record_retained_source_control_state(&self, source_signals: &[SourceControlSignal]) {
-        let mut retained = self.retained_source_control_state.lock().await;
-        Self::apply_source_signals_to_state(&mut retained, source_signals);
-    }
-
-    fn apply_source_signals_to_state(
-        state: &mut RetainedSourceControlState,
-        source_signals: &[SourceControlSignal],
-    ) {
-        for signal in source_signals {
-            match signal {
-                SourceControlSignal::Activate {
-                    unit, route_key, ..
-                }
-                | SourceControlSignal::Deactivate {
-                    unit, route_key, ..
-                } => {
-                    state.active_by_route.insert(
-                        (unit.unit_id().to_string(), route_key.clone()),
-                        signal.clone(),
-                    );
-                }
-                SourceControlSignal::RuntimeHostGrantChange { .. } => {
-                    state.latest_host_grant_change = Some(signal.clone());
-                }
-                SourceControlSignal::Tick { .. }
-                | SourceControlSignal::ManualRescan { .. }
-                | SourceControlSignal::Passthrough(_) => {}
-            }
-        }
-    }
-
-    fn source_signals_from_state(state: &RetainedSourceControlState) -> Vec<SourceControlSignal> {
-        let mut merged = Vec::new();
-        if let Some(changed) = state.latest_host_grant_change.clone() {
-            merged.push(changed);
-        }
-        merged.extend(state.active_by_route.values().cloned());
-        merged
     }
 
     fn source_signals_are_host_grant_change_only(source_signals: &[SourceControlSignal]) -> bool {
@@ -8153,7 +8717,7 @@ impl FSMetaApp {
             .await;
         if control_initialized_at_entry
             && self.control_initialized()
-            && !self.runtime_gate_facts().source_state_replay_required
+            && !self.runtime_control_state().source_state_replay_required()
             && !filtered_source_signals.is_empty()
             && filtered_source_signals
                 .iter()
@@ -8168,10 +8732,11 @@ impl FSMetaApp {
                 .all(Self::source_signal_is_restart_deferred_retire_pending);
         let defer_retained_state_until_success = fail_closed_restart_deferred_retire_pending;
         if !defer_retained_state_until_success {
-            self.record_retained_source_control_state(&filtered_source_signals)
+            self.source
+                .record_retained_control_signals(&filtered_source_signals)
                 .await;
         }
-        let replay_followup_signals = if self.runtime_gate_facts().source_state_replay_required
+        let replay_followup_signals = if self.runtime_control_state().source_state_replay_required()
             && Self::source_signals_are_transient_followup_only(&filtered_source_signals)
         {
             let followups = Self::source_transient_followup_signals(&filtered_source_signals);
@@ -8183,7 +8748,7 @@ impl FSMetaApp {
         let deadline = tokio::time::Instant::now() + SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT;
         loop {
             let replaying_retained_state_only =
-                self.runtime_gate_facts().source_state_replay_required
+                self.runtime_control_state().source_state_replay_required()
                     && replay_followup_pending.is_some();
             let effective_source_signals = if replaying_retained_state_only {
                 self.source_signals_with_replay(&[]).await
@@ -8196,9 +8761,7 @@ impl FSMetaApp {
             if effective_source_signals.is_empty() {
                 self.record_shared_source_route_claims(&effective_source_signals)
                     .await;
-                self.update_runtime_gate_facts(|state| {
-                    state.source_state_replay_required = false;
-                });
+                self.update_runtime_control_state(|state| state.clear_source_replay());
                 if replaying_retained_state_only && replay_followup_pending.is_some() {
                     continue;
                 }
@@ -8227,14 +8790,13 @@ impl FSMetaApp {
             match source_apply_result {
                 Ok(()) => {
                     if defer_retained_state_until_success {
-                        self.record_retained_source_control_state(&filtered_source_signals)
+                        self.source
+                            .record_retained_control_signals(&filtered_source_signals)
                             .await;
                     }
                     self.record_shared_source_route_claims(&effective_source_signals)
                         .await;
-                    self.update_runtime_gate_facts(|state| {
-                        state.source_state_replay_required = false;
-                    });
+                    self.update_runtime_control_state(|state| state.clear_source_replay());
                     if replaying_retained_state_only {
                         continue;
                     }
@@ -8246,6 +8808,9 @@ impl FSMetaApp {
                         "fs_meta_runtime_app: source control fail-closed restart_deferred_retire_pending err={}",
                         err
                     );
+                    self.source
+                        .record_retained_control_signals(&filtered_source_signals)
+                        .await;
                     let _ = self
                         .source
                         .reconnect_after_fail_closed_control_error()
@@ -8277,7 +8842,7 @@ impl FSMetaApp {
         &self,
         sink_signals: &[SinkControlSignal],
     ) -> Vec<SinkControlSignal> {
-        let replay_retained = self.runtime_gate_facts().sink_state_replay_required
+        let replay_retained = self.runtime_control_state().sink_state_replay_required()
             || (!sink_signals.is_empty()
                 && sink_signals
                     .iter()
@@ -8556,7 +9121,7 @@ impl FSMetaApp {
             )
             .await;
         if self.control_initialized()
-            && !self.runtime_gate_facts().sink_state_replay_required
+            && !self.runtime_control_state().sink_state_replay_required()
             && self.sink.current_generation_tick_fast_path_eligible().await
             && !filtered_sink_signals.is_empty()
             && filtered_sink_signals
@@ -8581,9 +9146,7 @@ impl FSMetaApp {
                 self.record_shared_sink_route_claims(&effective_sink_signals)
                     .await;
                 if replay_retained_state {
-                    self.update_runtime_gate_facts(|state| {
-                        state.sink_state_replay_required = false;
-                    });
+                    self.update_runtime_control_state(|state| state.clear_sink_replay());
                 }
                 return Ok(());
             }
@@ -8613,9 +9176,7 @@ impl FSMetaApp {
                             .await;
                     }
                     if replay_retained_state && self.control_initialized() {
-                        self.update_runtime_gate_facts(|state| {
-                            state.sink_state_replay_required = false;
-                        });
+                        self.update_runtime_control_state(|state| state.clear_sink_replay());
                     }
                     return Ok(());
                 }
@@ -8766,79 +9327,26 @@ impl FSMetaApp {
         if !matches!(unit, FacadeRuntimeUnit::Facade) || route_key != facade_control_route_key {
             return Ok(());
         }
-        match self
-            .plan_facade_deactivate_continuity(route_key, generation)
+        let retain_active_facade = {
+            let active_guard = self.api_task.lock().await;
+            active_guard.as_ref().is_some_and(|active| {
+                active.route_key == route_key && generation >= active.generation
+            })
+        };
+        let retain_pending_spawn = self.pending_spawn_in_flight_for_route_key(route_key).await;
+        self.observe_fixed_bind_handoff_driver()
             .await
-        {
-            FacadeDeactivateContinuityExecutionPlan::RetainActiveContinuity => {
-                self.retained_active_facade_continuity
-                    .store(true, Ordering::Release);
-                eprintln!(
-                    "fs_meta_runtime_app: retain active facade during continuity-preserving deactivate route_key={} generation={}",
-                    route_key, generation
-                );
-                return Ok(());
-            }
-            FacadeDeactivateContinuityExecutionPlan::RetainActiveWhilePendingFixedBindClaimConflict => {
-                self.retained_active_facade_continuity
-                    .store(true, Ordering::Release);
-                eprintln!(
-                    "fs_meta_runtime_app: retain active facade while pending fixed-bind claim remains owned elsewhere route_key={} generation={}",
-                    route_key, generation
-                );
-                return Ok(());
-            }
-            FacadeDeactivateContinuityExecutionPlan::RetainPendingWhilePendingFixedBindClaimConflict => {
-                eprintln!(
-                    "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
-                    route_key, generation
-                );
-                return Ok(());
-            }
-            FacadeDeactivateContinuityExecutionPlan::ReleaseActiveForFixedBindHandoff {
-                handoff,
-            } => {
-                eprintln!(
-                    "fs_meta_runtime_app: release active facade for fixed-bind handoff route_key={} generation={}",
-                    route_key, generation
-                );
-                self.retained_active_facade_continuity
-                    .store(false, Ordering::Release);
-                *self.pending_facade.lock().await = None;
-                Self::clear_pending_facade_status(&self.facade_pending_status);
-                let _ = self.current_facade_service_state().await;
-                let _ = self.current_facade_service_state().await;
-                self.wait_for_shared_worker_control_handoff().await;
-                self.shutdown_active_facade_with_continuation(Some(handoff))
-                    .await;
-                return Ok(());
-            }
-            FacadeDeactivateContinuityExecutionPlan::RetainPendingForFixedBindHandoff => {
-                eprintln!(
-                    "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
-                    route_key, generation
-                );
-                return Ok(());
-            }
-            FacadeDeactivateContinuityExecutionPlan::RetainPendingWhileSpawnInFlight => {
-                eprintln!(
-                    "fs_meta_runtime_app: retain pending facade during in-flight spawn route_key={} generation={}",
-                    route_key, generation
-                );
-                return Ok(());
-            }
-            FacadeDeactivateContinuityExecutionPlan::Shutdown { handoff } => {
-                self.retained_active_facade_continuity
-                    .store(false, Ordering::Release);
-                *self.pending_facade.lock().await = None;
-                Self::clear_pending_facade_status(&self.facade_pending_status);
-                let _ = self.current_facade_service_state().await;
-                let _ = self.current_facade_service_state().await;
-                self.wait_for_shared_worker_control_handoff().await;
-                self.shutdown_active_facade_with_continuation(handoff).await;
-                return Ok(());
-            }
-        }
+            .execute(
+                self,
+                FixedBindHandoffAction::Deactivate {
+                    route_key: route_key.to_string(),
+                    generation,
+                    retain_active_facade,
+                    retain_pending_spawn,
+                },
+            )
+            .await
+            .map(|_| ())
     }
 
     fn accept_facade_tick(
@@ -8980,6 +9488,26 @@ impl FSMetaApp {
         )
     }
 
+    async fn observe_fixed_bind_handoff_driver(&self) -> FixedBindHandoffDriver {
+        let gate = self
+            .observe_facade_gate(FacadeOnlyHandoffObservationPolicy::DeriveFromPendingBind)
+            .await;
+        let (release_handoff, shutdown_handoff) = self
+            .observe_active_fixed_bind_handoffs()
+            .await
+            .map_or((None, None), |(release_handoff, shutdown_handoff)| {
+                (release_handoff, Some(shutdown_handoff))
+            });
+        FixedBindHandoffDriver {
+            gate,
+            pending_fixed_bind_publication: self
+                .observe_pending_fixed_bind_publication_state()
+                .await,
+            release_handoff,
+            shutdown_handoff,
+        }
+    }
+
     #[cfg(test)]
     async fn fixed_bind_handoff_ready_for_release(&self) -> bool {
         self.observe_active_fixed_bind_handoffs()
@@ -9002,32 +9530,6 @@ impl FSMetaApp {
             .await
             .as_ref()
             .is_some_and(|inflight| inflight.matches_pending(&pending))
-    }
-
-    async fn plan_facade_deactivate_continuity(
-        &self,
-        route_key: &str,
-        generation: u64,
-    ) -> FacadeDeactivateContinuityExecutionPlan {
-        let retain_active_facade = {
-            let active_guard = self.api_task.lock().await;
-            active_guard.as_ref().is_some_and(|active| {
-                active.route_key == route_key && generation >= active.generation
-            })
-        };
-        let (release_handoff, shutdown_handoff) = self
-            .observe_active_fixed_bind_handoffs()
-            .await
-            .map_or((None, None), |(release_handoff, shutdown_handoff)| {
-                (release_handoff, Some(shutdown_handoff))
-            });
-        FacadeDeactivateContinuityExecutionPlan::from_parts(
-            retain_active_facade,
-            self.pending_spawn_in_flight_for_route_key(route_key).await,
-            self.observe_pending_fixed_bind_publication_state().await,
-            release_handoff,
-            shutdown_handoff,
-        )
     }
 
     fn pending_fixed_bind_handoff_registrant(&self) -> PendingFixedBindHandoffRegistrant {
@@ -9083,38 +9585,23 @@ impl FSMetaApp {
     }
 
     async fn facade_publication_ready(&self) -> bool {
-        let observation = self
-            .observe_facade_gate(FacadeOnlyHandoffObservationPolicy::DeriveFromPendingBind)
-            .await;
-        match observation.publication_readiness_decision() {
-            FacadePublicationReadinessDecision::BlockedControlGate
-            | FacadePublicationReadinessDecision::BlockedWithoutActiveControlStream => {
-                return false;
-            }
-            FacadePublicationReadinessDecision::Ready => {
-                if let Some(pending) = observation.current_pending.as_ref()
-                    && observation.pending_facade_is_control_route
-                    && observation.active_pending_control_stream_present
-                {
-                    clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
-                }
-                return true;
-            }
-            FacadePublicationReadinessDecision::FixedBindHandoffPending => {}
-        }
-        let Some(pending) = observation.current_pending else {
-            return false;
-        };
-        if !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
-            if self
-                .pending_fixed_bind_handoff_registrant()
-                .complete_handoff_for_publication(pending)
-                .await
-            {
-                return true;
+        match self
+            .observe_fixed_bind_handoff_driver()
+            .await
+            .execute(self, FixedBindHandoffAction::Publication)
+            .await
+        {
+            Ok(FixedBindHandoffExecution::PublicationReady(publication_ready)) => publication_ready,
+            Ok(FixedBindHandoffExecution::AfterReleaseCompleted(_)) => false,
+            Ok(FixedBindHandoffExecution::Completed) => false,
+            Err(err) => {
+                eprintln!(
+                    "fs_meta_runtime_app: facade publication readiness execution failed err={}",
+                    err
+                );
+                false
             }
         }
-        false
     }
 
     async fn service_on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
@@ -9137,15 +9624,14 @@ impl FSMetaApp {
         {
             false
         } else {
-            let runtime_gate = self.runtime_gate_facts();
+            let runtime_gate = self.runtime_control_state();
             !source_signals.is_empty()
                 || !sink_signals.is_empty()
                 || self.control_initialized()
                 || facade_signals
                     .iter()
                     .any(Self::facade_signal_requires_shared_serial_while_uninitialized)
-                || (!runtime_gate.source_state_replay_required
-                    && !runtime_gate.sink_state_replay_required)
+                || runtime_gate.replay_fully_cleared()
         };
         let _serial_guard = self.control_frame_serial.lock().await;
         let _shared_serial_guard = if requires_shared_serial {
@@ -9309,13 +9795,13 @@ impl FSMetaApp {
         }
         let sink_tick_fast_path_eligible =
             self.sink.current_generation_tick_fast_path_eligible().await;
-        let runtime_gate = self.runtime_gate_facts();
+        let runtime_gate = self.runtime_control_state();
         let control_wave_observation = ControlFrameWaveObservation {
             control_initialized_at_entry,
             control_initialized_now: self.control_initialized(),
             retained_sink_state_present_at_entry,
-            source_state_replay_required: runtime_gate.source_state_replay_required,
-            sink_state_replay_required: runtime_gate.sink_state_replay_required,
+            source_state_replay_required: runtime_gate.source_state_replay_required(),
+            sink_state_replay_required: runtime_gate.sink_state_replay_required(),
             sink_tick_fast_path_eligible,
             cleanup_disposition: uninitialized_cleanup_disposition,
             facade_claim_signals_present,
@@ -9380,9 +9866,7 @@ impl FSMetaApp {
                     .active_by_route
                     .is_empty()
                 {
-                    self.update_runtime_gate_facts(|state| {
-                        state.sink_state_replay_required = true;
-                    });
+                    self.update_runtime_control_state(|state| state.require_sink_replay());
                 }
                 eprintln!(
                     "fs_meta_runtime_app: on_control_frame source cleanup-only followup left runtime uninitialized"
@@ -9417,6 +9901,23 @@ impl FSMetaApp {
                 eprintln!(
                     "fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals ok"
                 );
+                if !control_initialized_at_entry && !sink_signals.is_empty() {
+                    let initial_mixed_expected_groups =
+                        Self::runtime_scoped_facade_group_ids(&self.source, &self.sink)
+                            .await?
+                            .into_iter()
+                            .collect::<std::collections::BTreeSet<_>>();
+                    if !initial_mixed_expected_groups.is_empty() {
+                        // Initial mixed source/sink activation can leave the local sink
+                        // with only scheduled-group truth unless we explicitly kick the
+                        // first source->sink convergence pass after the source worker
+                        // finishes applying its control wave. This must not depend on a
+                        // facade sink-status publication lane because local sink readiness
+                        // can be required before any facade publication exists.
+                        self.source.trigger_rescan_when_ready().await?;
+                        pretriggered_source_to_sink_convergence = true;
+                    }
+                }
                 if !control_initialized_at_entry && sink_signals.is_empty() {
                     let retained_sink_routes_present = !self
                         .retained_sink_control_state
@@ -9433,9 +9934,7 @@ impl FSMetaApp {
                         // worker has replayed its retained control state into the current
                         // generation. Keep the sink replay armed so peer status/query routes do
                         // not resume against a zero-state sink snapshot.
-                        self.update_runtime_gate_facts(|state| {
-                            state.sink_state_replay_required = true;
-                        });
+                        self.update_runtime_control_state(|state| state.require_sink_replay());
                     }
                 }
             }
@@ -9631,18 +10130,16 @@ impl FSMetaApp {
         {
             fixed_bind_addrs.insert(pending_bind_addr);
         }
-        let active_handoff = self
-            .observe_active_fixed_bind_handoffs()
-            .await
-            .map(|(_, shutdown_handoff)| shutdown_handoff);
+        let handoff_driver = self.observe_fixed_bind_handoff_driver().await;
         *self.pending_facade.lock().await = None;
         *self.facade_spawn_in_progress.lock().await = None;
         Self::clear_pending_facade_status(&self.facade_pending_status);
-        self.shutdown_active_facade_with_continuation(active_handoff)
-            .await;
+        handoff_driver
+            .execute(self, FixedBindHandoffAction::Shutdown)
+            .await?;
         self.closing.store(true, Ordering::Release);
-        self.update_runtime_gate_facts(|state| {
-            state.control_initialized = false;
+        self.update_runtime_control_state(|state| {
+            state.mark_uninitialized_preserving_replay();
         });
         self.api_control_gate.set_ready(false);
         let _ = self.current_facade_service_state().await;

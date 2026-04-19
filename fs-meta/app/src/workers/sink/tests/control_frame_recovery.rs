@@ -1881,7 +1881,7 @@ async fn update_logical_roots_does_not_clear_cached_ready_status_for_surviving_g
                     || group.group_id == "nfs3"
                     || group.group_id == "nfs4"
             })
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: nfs2/nfs3/nfs4 must be ready before retiring nfs3 from logical roots: {primed_snapshot:?}"
     );
 
@@ -1905,7 +1905,7 @@ async fn update_logical_roots_does_not_clear_cached_ready_status_for_surviving_g
     let ready_groups = cached
         .groups
         .iter()
-        .filter(|group| group.initial_audit_completed && group.live_nodes > 0)
+        .filter(|group| group.is_ready() && group.live_nodes > 0)
         .map(|group| group.group_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     let scheduled_groups = cached

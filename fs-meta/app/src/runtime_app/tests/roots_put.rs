@@ -1156,8 +1156,8 @@
             "same-frame fail-closed source-only recovery may leave runtime uninitialized for later authoritative source replay",
         );
         match app
-            .retained_source_control_state
-            .lock()
+            .source
+            .retained_control_state_for_tests()
             .await
             .active_by_route
             .get(&source_roots_route)

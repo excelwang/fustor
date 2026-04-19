@@ -85,6 +85,9 @@ const LATER_RANKED_TRUSTED_GROUP_STAGE_BUDGET: Duration = Duration::from_millis(
 // replies a little more time to settle before closing the collect window.
 const STATUS_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(2);
 const LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE: Duration = Duration::from_millis(250);
+const STATUS_ROUTE_ATTEMPT_TIMEOUT_CAP: Duration = Duration::from_secs(5);
+const STATUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(30);
+const SELECTED_GROUP_PROXY_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 // Force-find is intentionally a slower freshness path. Keep a larger collection
 // window here so the request remains in-flight long enough for overlap guards
 // and multi-runner aggregation scenarios.
@@ -393,6 +396,30 @@ struct PitSession {
     estimated_bytes: usize,
 }
 
+struct PitSessionParts {
+    mode: CursorQueryMode,
+    scope: PitScope,
+    read_class: ReadClass,
+    observation_status: ObservationStatus,
+    groups: Vec<GroupPitSnapshot>,
+}
+
+impl PitSessionParts {
+    fn into_session(self) -> PitSession {
+        let estimated_bytes =
+            self.groups.iter().map(estimated_group_bytes).sum::<usize>() + std::mem::size_of::<PitSession>();
+        PitSession {
+            mode: self.mode,
+            scope: self.scope,
+            read_class: self.read_class,
+            observation_status: self.observation_status,
+            groups: self.groups,
+            expires_at_ms: unix_now_ms() + PIT_TTL_MS_DEFAULT,
+            estimated_bytes,
+        }
+    }
+}
+
 #[derive(Default)]
 struct QueryPitStore {
     sessions: HashMap<String, Arc<PitSession>>,
@@ -627,41 +654,174 @@ fn source_concrete_root_merge_score(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StatusRoutePlan {
+    route_timeout: Duration,
+    attempt_timeout_cap: Duration,
+    collect_idle_grace: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StatusRouteRuntime {
+    plan: StatusRoutePlan,
+    route_deadline: tokio::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StatusRouteAttemptRuntime {
+    attempt_timeout: Duration,
+    collect_idle_grace: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusRouteAction {
+    ReturnTimeout,
+    QueryAttempt(StatusRouteAttemptRuntime),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusRouteRetryAction {
+    WaitUntil(tokio::time::Instant),
+    ReturnTimeout,
+    ReturnCurrentError,
+}
+
+impl StatusRoutePlan {
+    pub(crate) fn new(route_timeout: Duration, collect_idle_grace: Duration) -> Self {
+        Self {
+            route_timeout,
+            attempt_timeout_cap: std::cmp::min(STATUS_ROUTE_ATTEMPT_TIMEOUT_CAP, route_timeout),
+            collect_idle_grace,
+        }
+    }
+
+    fn caller_capped(route_timeout: Duration, collect_idle_grace: Duration) -> Self {
+        Self::new(
+            std::cmp::min(route_timeout, STATUS_ROUTE_ATTEMPT_TIMEOUT_CAP),
+            collect_idle_grace,
+        )
+    }
+
+    fn attempt_timeout(self, remaining: Duration) -> Duration {
+        std::cmp::min(remaining, self.attempt_timeout_cap)
+    }
+
+    fn route_timeout(self) -> Duration {
+        self.route_timeout
+    }
+
+    fn collect_idle_grace(self) -> Duration {
+        self.collect_idle_grace
+    }
+
+    fn rebudget(self, route_timeout: Duration) -> Self {
+        Self::new(route_timeout, self.collect_idle_grace)
+    }
+
+    fn runtime(self) -> StatusRouteRuntime {
+        self.runtime_from_now(tokio::time::Instant::now())
+    }
+
+    fn runtime_from_now(self, now: tokio::time::Instant) -> StatusRouteRuntime {
+        StatusRouteRuntime {
+            plan: self,
+            route_deadline: now + self.route_timeout,
+        }
+    }
+}
+
+impl StatusRouteRuntime {
+    fn attempt_action_at(self, now: tokio::time::Instant) -> StatusRouteAction {
+        let remaining = self
+            .route_deadline
+            .checked_duration_since(now)
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            StatusRouteAction::ReturnTimeout
+        } else {
+            StatusRouteAction::QueryAttempt(StatusRouteAttemptRuntime {
+                attempt_timeout: self.plan.attempt_timeout(remaining),
+                collect_idle_grace: self.plan.collect_idle_grace(),
+            })
+        }
+    }
+
+    fn retry_action_at(self, now: tokio::time::Instant) -> StatusRouteRetryAction {
+        let remaining = self
+            .route_deadline
+            .checked_duration_since(now)
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            StatusRouteRetryAction::ReturnTimeout
+        } else {
+            StatusRouteRetryAction::WaitUntil(
+                now + std::cmp::min(STATUS_ROUTE_RETRY_BACKOFF, remaining),
+            )
+        }
+    }
+
+    fn followup_action_at(
+        self,
+        now: tokio::time::Instant,
+        err: &CnxError,
+        is_retryable_gap: fn(&CnxError) -> bool,
+    ) -> StatusRouteRetryAction {
+        if !is_retryable_gap(err) {
+            StatusRouteRetryAction::ReturnCurrentError
+        } else {
+            self.retry_action_at(now)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MaterializedStatusLoadPlan {
+    source_route: StatusRoutePlan,
+    sink_route: StatusRoutePlan,
+    explicit_empty_sink_recollect: StatusRoutePlan,
+}
+
+impl Default for MaterializedStatusLoadPlan {
+    fn default() -> Self {
+        Self {
+            source_route: StatusRoutePlan::new(
+                Duration::from_secs(30),
+                STATUS_ROUTE_COLLECT_IDLE_GRACE,
+            ),
+            sink_route: StatusRoutePlan::new(
+                Duration::from_secs(30),
+                LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE,
+            ),
+            explicit_empty_sink_recollect: StatusRoutePlan::new(
+                EXPLICIT_EMPTY_SINK_STATUS_RECOLLECT_BUDGET,
+                LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE,
+            ),
+        }
+    }
+}
+
+impl MaterializedStatusLoadPlan {
+    fn request_source_refresh_plan(self, caller_timeout: Duration) -> StatusRoutePlan {
+        self.source_route.rebudget(
+            StatusRoutePlan::caller_capped(caller_timeout, self.source_route.collect_idle_grace())
+                .route_timeout(),
+        )
+    }
+}
+
 async fn route_source_status_snapshot(
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
-    timeout: Duration,
+    plan: StatusRoutePlan,
 ) -> Result<SourceStatusSnapshot, CnxError> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut last_err = None::<CnxError>;
-    let events = loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break Err(last_err.unwrap_or(CnxError::Timeout));
-        }
-        let attempt_timeout = remaining.min(Duration::from_secs(5));
-        let adapter = exchange_host_adapter(
-            boundary.clone(),
-            origin_id.clone(),
-            default_route_bindings(),
-        );
-        match adapter
-            .call_collect(
-                ROUTE_TOKEN_FS_META_INTERNAL,
-                METHOD_SOURCE_STATUS,
-                internal_status_request_payload(),
-                attempt_timeout,
-                STATUS_ROUTE_COLLECT_IDLE_GRACE,
-            )
-            .await
-        {
-            Ok(events) => break Ok(events),
-            Err(err) if is_retryable_source_status_continuity_gap(&err) => {
-                last_err = Some(err);
-            }
-            Err(err) => break Err(err),
-        }
-    }?;
+    let events = execute_status_route_collect(
+        boundary,
+        origin_id,
+        plan.runtime(),
+        METHOD_SOURCE_STATUS,
+        is_retryable_source_status_continuity_gap,
+    )
+    .await?;
     let snapshots = events
         .into_iter()
         .map(|event| {
@@ -694,53 +854,16 @@ fn is_retryable_source_status_continuity_gap(err: &CnxError) -> bool {
 pub(crate) async fn route_sink_status_snapshot(
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
-    timeout: Duration,
+    plan: StatusRoutePlan,
 ) -> Result<SinkStatusSnapshot, CnxError> {
-    route_sink_status_snapshot_with_idle_grace(
+    let events = execute_status_route_collect(
         boundary,
         origin_id,
-        timeout,
-        STATUS_ROUTE_COLLECT_IDLE_GRACE,
+        plan.runtime(),
+        METHOD_SINK_STATUS,
+        is_retryable_sink_status_continuity_gap,
     )
-    .await
-}
-
-async fn route_sink_status_snapshot_with_idle_grace(
-    boundary: Arc<dyn ChannelIoSubset>,
-    origin_id: NodeId,
-    timeout: Duration,
-    idle_grace: Duration,
-) -> Result<SinkStatusSnapshot, CnxError> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut last_err = None::<CnxError>;
-    let events = loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break Err(last_err.unwrap_or(CnxError::Timeout));
-        }
-        let attempt_timeout = remaining.min(Duration::from_secs(5));
-        let adapter = exchange_host_adapter(
-            boundary.clone(),
-            origin_id.clone(),
-            default_route_bindings(),
-        );
-        match adapter
-            .call_collect(
-                ROUTE_TOKEN_FS_META_INTERNAL,
-                METHOD_SINK_STATUS,
-                internal_status_request_payload(),
-                attempt_timeout,
-                idle_grace,
-            )
-            .await
-        {
-            Ok(events) => break Ok(events),
-            Err(err) if is_retryable_sink_status_continuity_gap(&err) => {
-                last_err = Some(err);
-            }
-            Err(err) => break Err(err),
-        }
-    }?;
+    .await?;
     let snapshots = events
         .into_iter()
         .map(|event| {
@@ -763,6 +886,70 @@ async fn route_sink_status_snapshot_with_idle_grace(
     Ok(merge_sink_status_snapshots(snapshots))
 }
 
+async fn execute_status_route_collect(
+    boundary: Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    runtime: StatusRouteRuntime,
+    method: &'static str,
+    is_retryable_gap: fn(&CnxError) -> bool,
+) -> Result<Vec<Event>, CnxError> {
+    execute_runtime_collect_loop(
+        runtime.attempt_action_at(tokio::time::Instant::now()),
+        |_last_err| async move { Ok(runtime.attempt_action_at(tokio::time::Instant::now())) },
+        |action, last_err| {
+            let boundary = boundary.clone();
+            let origin_id = origin_id.clone();
+            async move {
+                match action {
+                    StatusRouteAction::ReturnTimeout => Ok(RuntimeCollectLoopStep::Return(Err(
+                        take_last_route_error_or(last_err, || CnxError::Timeout),
+                    ))),
+                    StatusRouteAction::QueryAttempt(attempt) => {
+                        let adapter = exchange_host_adapter(
+                            boundary,
+                            origin_id,
+                            default_route_bindings(),
+                        );
+                        match adapter
+                            .call_collect(
+                                ROUTE_TOKEN_FS_META_INTERNAL,
+                                method,
+                                internal_status_request_payload(),
+                                attempt.attempt_timeout,
+                                attempt.collect_idle_grace,
+                            )
+                            .await
+                        {
+                            Ok(events) => Ok(RuntimeCollectLoopStep::Return(Ok(events))),
+                            Err(err) => {
+                                let last_err = Some(err);
+                                Ok(match runtime.followup_action_at(
+                                    tokio::time::Instant::now(),
+                                    last_err
+                                        .as_ref()
+                                        .expect("status route followup owns current error"),
+                                    is_retryable_gap,
+                                ) {
+                                    StatusRouteRetryAction::WaitUntil(until) => {
+                                        RuntimeCollectLoopStep::WaitUntil { until, last_err }
+                                    }
+                                    StatusRouteRetryAction::ReturnTimeout
+                                    | StatusRouteRetryAction::ReturnCurrentError => {
+                                        RuntimeCollectLoopStep::Return(Err(
+                                            take_last_route_error_or(last_err, || CnxError::Timeout),
+                                        ))
+                                    }
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+    .await
+}
+
 fn is_retryable_sink_status_continuity_gap(err: &CnxError) -> bool {
     matches!(
         err,
@@ -776,6 +963,7 @@ fn is_retryable_sink_status_continuity_gap(err: &CnxError) -> bool {
 async fn load_materialized_status_snapshots(
     state: &ApiState,
 ) -> Result<(SourceStatusSnapshot, SinkStatusSnapshot), CnxError> {
+    let status_load_plan = MaterializedStatusLoadPlan::default();
     let (Some(source), Some(sink)) = (&state.readiness_source, &state.readiness_sink) else {
         return Ok((
             SourceStatusSnapshot::default(),
@@ -790,7 +978,7 @@ async fn load_materialized_status_snapshots(
         } => match route_source_status_snapshot(
             boundary.clone(),
             origin_id.clone(),
-            Duration::from_secs(30),
+            status_load_plan.source_route,
         )
         .await
         {
@@ -810,11 +998,10 @@ async fn load_materialized_status_snapshots(
             origin_id,
             ..
         } => {
-            let mut snapshot = match route_sink_status_snapshot_with_idle_grace(
+            let mut snapshot = match route_sink_status_snapshot(
                 boundary.clone(),
                 origin_id.clone(),
-                Duration::from_secs(30),
-                LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE,
+                status_load_plan.sink_route,
             )
             .await
             {
@@ -831,11 +1018,10 @@ async fn load_materialized_status_snapshots(
                 &snapshot,
                 &readiness_groups,
             ) {
-                if let Ok(retry_snapshot) = route_sink_status_snapshot_with_idle_grace(
+                if let Ok(retry_snapshot) = route_sink_status_snapshot(
                     boundary.clone(),
                     origin_id.clone(),
-                    EXPLICIT_EMPTY_SINK_STATUS_RECOLLECT_BUDGET,
-                    LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE,
+                    status_load_plan.explicit_empty_sink_recollect,
                 )
                 .await
                 {
@@ -904,7 +1090,7 @@ async fn load_materialized_status_snapshots(
 
 async fn load_request_scoped_materialized_sink_status_snapshot(
     state: &ApiState,
-    timeout: Duration,
+    plan: TreePitRequestScopedSinkStatusPlan,
 ) -> Option<SinkStatusSnapshot> {
     let readiness_groups = scan_enabled_readiness_groups(state).ok()?;
     match &state.backend {
@@ -915,7 +1101,7 @@ async fn load_request_scoped_materialized_sink_status_snapshot(
         } => route_sink_status_snapshot(
             boundary.clone(),
             origin_id.clone(),
-            std::cmp::min(timeout, REQUEST_SCOPED_SINK_STATUS_LOAD_BUDGET),
+            StatusRoutePlan::new(plan.route_timeout(), STATUS_ROUTE_COLLECT_IDLE_GRACE),
         )
         .await
         .ok()
@@ -2175,7 +2361,7 @@ async fn query_materialized_events_with_sink_status_snapshot(
                     route_sink_status_snapshot(
                         boundary.clone(),
                         origin_id.clone(),
-                        std::cmp::min(timeout, Duration::from_secs(5)),
+                        StatusRoutePlan::caller_capped(timeout, STATUS_ROUTE_COLLECT_IDLE_GRACE),
                     )
                     .await
                     .ok()
@@ -2205,7 +2391,7 @@ async fn query_materialized_events_with_sink_status_snapshot(
                     boundary.clone(),
                     node_id.clone(),
                     params.clone(),
-                    timeout,
+                    SelectedGroupOwnerRoutePlan::new(timeout),
                 )
                 .await;
                 eprintln!(
@@ -2257,7 +2443,7 @@ async fn route_materialized_events_via_node(
     boundary: Arc<dyn ChannelIoSubset>,
     node_id: NodeId,
     params: InternalQueryRequest,
-    timeout: Duration,
+    plan: SelectedGroupOwnerRoutePlan,
 ) -> Result<Vec<Event>, CnxError> {
     let owner_node = node_id.0.clone();
     let adapter = exchange_host_adapter(
@@ -2272,19 +2458,18 @@ async fn route_materialized_events_via_node(
             params.scope.selected_group,
             params.scope.recursive,
             String::from_utf8_lossy(&params.scope.path),
-            timeout.as_millis()
+            plan.route_timeout().as_millis()
         );
     }
     let payload = rmp_serde::to_vec(&params)
         .map_err(|err| CnxError::Internal(format!("encode materialized query failed: {err}")))?;
-    let collect_idle_grace = std::cmp::min(SELECTED_GROUP_OWNER_ROUTE_COLLECT_IDLE_GRACE, timeout);
     let result = adapter
         .call_collect(
             ROUTE_TOKEN_FS_META_INTERNAL,
             METHOD_SINK_QUERY,
             Bytes::from(payload),
-            timeout,
-            collect_idle_grace,
+            plan.route_timeout(),
+            plan.collect_idle_grace(),
         )
         .await;
     if debug_materialized_route_capture_enabled() {
@@ -2618,54 +2803,26 @@ fn selected_group_empty_ready_tree_requires_primary_owner_reroute(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TrustedMaterializedGroupRescueDecisionInput {
+struct SelectedGroupTreePitPlanInput {
     read_class: ReadClass,
     observation_state: ObservationState,
     selected_group_sink_reports_live_materialized: bool,
     prior_materialized_group_decoded: bool,
+    is_last_ranked_group: bool,
+    selected_group_sink_unready_empty: bool,
     empty_root_requires_fail_closed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TrustedMaterializedGroupRescueDecision {
-    ready_group: bool,
+struct SelectedGroupTreePitPlan {
+    prior_materialized_group_decoded: bool,
+    trusted_materialized_ready_group: bool,
     requires_rescue: bool,
     allow_empty_owner_retry: bool,
     should_resolve_selected_group_owner: bool,
     empty_root_requires_fail_closed: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TrustedMaterializedOwnerRetryPolicy {
-    Skip,
-    SelectedGroupBudget,
-    LaterNonRootBudget,
-    RemainingBudget,
-}
-
-impl TrustedMaterializedOwnerRetryPolicy {
-    fn timeout(self, remaining: Duration) -> Duration {
-        match self {
-            Self::Skip => Duration::ZERO,
-            Self::SelectedGroupBudget => {
-                std::cmp::min(TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET, remaining)
-            }
-            Self::LaterNonRootBudget => {
-                std::cmp::min(TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET, remaining)
-            }
-            Self::RemainingBudget => remaining,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TrustedMaterializedEmptyResponseRescueDecisionInput {
-    ready_group: bool,
-    prior_materialized_group_decoded: bool,
-    prior_materialized_exact_file_decoded: bool,
-    selected_group_owner_known: bool,
-    allow_empty_owner_retry: bool,
-    empty_root_requires_fail_closed: bool,
+    stage_timeout_policy: TreePitStageTimeoutPolicy,
+    reserve_proxy_budget: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2686,16 +2843,10 @@ struct EmptyTreeRescueLaneFacts {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EmptyTreeProxyErrorDisposition {
-    Ignore,
-    FailClosedUnavailable,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TrustedMaterializedEmptyResponseRescueDecision {
+struct TrustedMaterializedEmptyResponseRescuePlan {
     lane: EmptyTreeRescueLane,
-    owner_retry_policy: TrustedMaterializedOwnerRetryPolicy,
-    proxy_error_disposition: EmptyTreeProxyErrorDisposition,
+    owner_retry_timeout: Duration,
+    fail_closed_on_proxy_error: bool,
     fail_closed_on_final_empty_response: bool,
     defer_first_ranked_empty_non_root_group: bool,
 }
@@ -2789,133 +2940,1192 @@ impl SelectedGroupOwnerRouteGapProxyPolicy {
     }
 }
 
+impl SelectedGroupTreePitPlan {
+    fn new(input: SelectedGroupTreePitPlanInput) -> Self {
+        let trusted_materialized_ready_group = input.read_class == ReadClass::TrustedMaterialized
+            && input.selected_group_sink_reports_live_materialized;
+        let requires_rescue = trusted_materialized_ready_group
+            || (input.read_class == ReadClass::TrustedMaterialized
+                && input.observation_state == ObservationState::TrustedMaterialized
+                && input.prior_materialized_group_decoded
+                && !input.empty_root_requires_fail_closed);
+        let stage_timeout_policy = if input.read_class != ReadClass::TrustedMaterialized
+            && input.is_last_ranked_group
+            && input.prior_materialized_group_decoded
+        {
+            TreePitStageTimeoutPolicy::UseRemainingForLastNonTrustedAfterPriorDecode
+        } else if input.read_class == ReadClass::TrustedMaterialized
+            && trusted_materialized_ready_group
+            && !input.prior_materialized_group_decoded
+        {
+            TreePitStageTimeoutPolicy::FirstRankedTrustedReadyBudget
+        } else if input.read_class == ReadClass::TrustedMaterialized && requires_rescue {
+            TreePitStageTimeoutPolicy::LaterRankedTrustedGroupBudget
+        } else if input.read_class != ReadClass::TrustedMaterialized
+            && input.selected_group_sink_unready_empty
+        {
+            TreePitStageTimeoutPolicy::UnreadySelectedGroupRouteBudget
+        } else {
+            TreePitStageTimeoutPolicy::DefaultCollectIdleGraceCap
+        };
+        let reserve_proxy_budget = if input.read_class == ReadClass::TrustedMaterialized
+            && trusted_materialized_ready_group
+            && !input.prior_materialized_group_decoded
+        {
+            !input.empty_root_requires_fail_closed
+        } else {
+            !(input.read_class != ReadClass::TrustedMaterialized
+                && input.is_last_ranked_group
+                && input.prior_materialized_group_decoded)
+        };
+
+        Self {
+            prior_materialized_group_decoded: input.prior_materialized_group_decoded,
+            trusted_materialized_ready_group,
+            requires_rescue,
+            allow_empty_owner_retry: trusted_materialized_ready_group
+                && !input.prior_materialized_group_decoded,
+            should_resolve_selected_group_owner: requires_rescue,
+            empty_root_requires_fail_closed: input.empty_root_requires_fail_closed,
+            stage_timeout_policy,
+            reserve_proxy_budget,
+        }
+    }
+
+    fn stage_timeout(self, remaining: Duration, caller_timeout: Duration) -> Duration {
+        self.stage_timeout_policy.timeout(remaining, caller_timeout)
+    }
+
+    fn owner_route_gap_proxy_policy(
+        self,
+        trusted_materialized_tree_query: bool,
+    ) -> SelectedGroupOwnerRouteGapProxyPolicy {
+        if self.reserve_proxy_budget
+            && trusted_materialized_tree_query
+            && !self.allow_empty_owner_retry
+            && self.empty_root_requires_fail_closed
+        {
+            SelectedGroupOwnerRouteGapProxyPolicy::FailClosedAfterProxyGap
+        } else {
+            SelectedGroupOwnerRouteGapProxyPolicy::UseRemainingBudget
+        }
+    }
+
+    fn stats_rescue_lane(
+        self,
+        root_path: bool,
+        owner_stats_zeroish: bool,
+        proxy_available: bool,
+    ) -> SelectedGroupStatsRescueLane {
+        if !self.trusted_materialized_ready_group || !owner_stats_zeroish {
+            return SelectedGroupStatsRescueLane::ReturnCurrent;
+        }
+
+        if root_path {
+            if proxy_available {
+                SelectedGroupStatsRescueLane::ProxyFallbackThenFailClosed
+            } else {
+                SelectedGroupStatsRescueLane::FailClosed
+            }
+        } else if proxy_available {
+            SelectedGroupStatsRescueLane::ProxyFallback
+        } else {
+            SelectedGroupStatsRescueLane::ReturnCurrent
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SelectedGroupOwnerRouteGapDecisionInput {
-    reserve_proxy_budget: bool,
+struct TreePitSessionPlan {
+    caller_timeout: Duration,
+    total_ranked_groups: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TreePitSessionRuntime {
+    plan: TreePitSessionPlan,
+    session_deadline: tokio::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TreePitStageRuntime {
+    session_deadline: tokio::time::Instant,
+    stage_deadline: tokio::time::Instant,
+    remaining_session: Duration,
+    stage_timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreePitStagePreparation {
+    Ready(TreePitStageRuntime),
+    Unavailable(TreePitUnavailableStageLane),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreePitUnavailableStageLane {
+    PushEmptySnapshot,
+    FailClosedUnavailable,
+    FailClosedEmptyRoot,
+}
+
+#[derive(Debug)]
+enum TreePitStageEntryAction {
+    Query(TreePitStageRuntime),
+    PushEmptySnapshot,
+    ReturnError(CnxError),
+}
+
+#[derive(Debug)]
+enum TreePitStageQueryFailureAction {
+    RetryableGap {
+        runtime: RetryableTreePitStageErrorRuntime,
+        err: CnxError,
+    },
+    Fatal(CnxError),
+}
+
+#[derive(Debug)]
+enum TreePitStageDecodeErrorAction {
+    PushEmptySnapshot,
+    PushErrorSnapshot(CnxError),
+    ReturnError(CnxError),
+}
+
+#[derive(Debug)]
+enum TreePitStageExecutionAction {
+    PushPayload {
+        response: TreeGroupPayload,
+        empty_response_plan: TrustedMaterializedEmptyResponseRescuePlan,
+    },
+    PushEmptySnapshot,
+    PushErrorSnapshot(CnxError),
+    ReturnError(CnxError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RetryableTreePitStageErrorRuntime {
+    group_plan: TreePitGroupPlan,
+    session_deadline: tokio::time::Instant,
+    stage_deadline: tokio::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForceFindSessionPlan {
+    caller_timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForceFindRoutePlan {
+    route_timeout: Duration,
+    collect_idle_grace: Duration,
+    retry_backoff: Duration,
+    min_inflight_hold: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForceFindRouteRuntime {
+    plan: ForceFindRoutePlan,
+    route_deadline: tokio::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForceFindRouteAttemptRuntime {
+    route_plan: ForceFindRoutePlan,
+    remaining: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForceFindTreeRouteErrorLane {
+    Fail,
+    RetryCurrentRoute,
+    FallbackThenRetry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ForceFindTreeRouteAction {
+    ReturnTimeout,
+    ReturnCurrentError,
+    QueryViaSelectedRunner {
+        node_id: NodeId,
+        route_plan: ForceFindRoutePlan,
+    },
+    QueryGenericFallback {
+        route_plan: ForceFindRoutePlan,
+        after_runner_gap: bool,
+    },
+    WaitUntil(tokio::time::Instant),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForceFindRouteMachineTerminal {
+    Timeout,
+    CurrentError,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ForceFindRouteMachinePhase {
+    PlanSelectedRunner,
+    AttemptSelectedRunner {
+        node_id: NodeId,
+        route_plan: ForceFindRoutePlan,
+    },
+    FallbackToGeneric {
+        route_plan: ForceFindRoutePlan,
+        after_runner_gap: bool,
+    },
+    WaitForForceFindReadiness(tokio::time::Instant),
+    Failed(ForceFindRouteMachineTerminal),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ForceFindRouteMachine {
+    runtime: ForceFindRouteRuntime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForceFindInFlightHoldAction {
+    ReturnNow,
+    WaitUntil(tokio::time::Instant),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreePitProxyRouteAction {
+    ReturnTimeout,
+    ReturnCurrentError,
+    QueryAttempt(TreePitProxyAttemptRuntime),
+    WaitUntil(tokio::time::Instant),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TreePitRequestScopedSinkStatusPlan {
+    route_timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectedGroupOwnerRoutePlan {
+    route_timeout: Duration,
+    collect_idle_grace: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TreePitProxyRoutePlan {
+    route_timeout: Duration,
+    collect_idle_grace: Duration,
+    retry_backoff: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TreePitProxyRouteRuntime {
+    plan: TreePitProxyRoutePlan,
+    route_deadline: tokio::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TreePitProxyAttemptRuntime {
+    attempt_timeout: Duration,
+    collect_idle_grace: Duration,
+    retry_backoff: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TreePitGroupPlanInput {
+    read_class: ReadClass,
+    observation_state: ObservationState,
+    selected_group_sink_reports_live_materialized: bool,
+    prior_materialized_group_decoded: bool,
+    prior_materialized_exact_file_decoded: bool,
+    rank_index: usize,
+    is_last_ranked_group: bool,
+    selected_group_sink_unready_empty: bool,
+    empty_root_requires_fail_closed: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TreePitOwnerSnapshotPlanInput {
     trusted_materialized_tree_query: bool,
+    reserve_proxy_budget: bool,
     allow_empty_owner_retry: bool,
     empty_root_requires_fail_closed: bool,
 }
 
-fn selected_group_owner_route_gap_proxy_policy(
-    input: SelectedGroupOwnerRouteGapDecisionInput,
-) -> SelectedGroupOwnerRouteGapProxyPolicy {
-    if input.reserve_proxy_budget
-        && input.trusted_materialized_tree_query
-        && !input.allow_empty_owner_retry
-        && input.empty_root_requires_fail_closed
-    {
-        SelectedGroupOwnerRouteGapProxyPolicy::FailClosedAfterProxyGap
-    } else {
-        SelectedGroupOwnerRouteGapProxyPolicy::UseRemainingBudget
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TreePitStageTimeoutDecisionInput {
+struct TreePitGroupPlan {
     read_class: ReadClass,
-    is_last_ranked_group: bool,
-    prior_materialized_group_decoded: bool,
-    trusted_materialized_ready_group: bool,
-    trusted_materialized_group_requires_rescue: bool,
-    selected_group_sink_unready_empty: bool,
+    caller_timeout: Duration,
+    stage_plan: SelectedGroupTreePitPlan,
+    prior_materialized_exact_file_decoded: bool,
+    rank_index: usize,
+    total_ranked_groups: usize,
 }
 
-fn tree_pit_stage_timeout_policy(
-    input: TreePitStageTimeoutDecisionInput,
-) -> TreePitStageTimeoutPolicy {
-    if input.read_class != ReadClass::TrustedMaterialized
-        && input.is_last_ranked_group
-        && input.prior_materialized_group_decoded
-    {
-        TreePitStageTimeoutPolicy::UseRemainingForLastNonTrustedAfterPriorDecode
-    } else if input.read_class == ReadClass::TrustedMaterialized
-        && input.trusted_materialized_ready_group
-        && !input.prior_materialized_group_decoded
-    {
-        TreePitStageTimeoutPolicy::FirstRankedTrustedReadyBudget
-    } else if input.read_class == ReadClass::TrustedMaterialized
-        && input.trusted_materialized_group_requires_rescue
-    {
-        TreePitStageTimeoutPolicy::LaterRankedTrustedGroupBudget
-    } else if input.read_class != ReadClass::TrustedMaterialized
-        && input.selected_group_sink_unready_empty
-    {
-        TreePitStageTimeoutPolicy::UnreadySelectedGroupRouteBudget
-    } else {
-        TreePitStageTimeoutPolicy::DefaultCollectIdleGraceCap
+impl TreePitSessionPlan {
+    fn new(caller_timeout: Duration, total_ranked_groups: usize) -> Self {
+        Self {
+            caller_timeout,
+            total_ranked_groups,
+        }
     }
-}
 
-fn trusted_materialized_group_rescue_decision(
-    input: TrustedMaterializedGroupRescueDecisionInput,
-) -> TrustedMaterializedGroupRescueDecision {
-    let ready_group = input.read_class == ReadClass::TrustedMaterialized
-        && input.selected_group_sink_reports_live_materialized;
-    let non_root_rescue_required = input.read_class == ReadClass::TrustedMaterialized
-        && input.observation_state == ObservationState::TrustedMaterialized
-        && input.prior_materialized_group_decoded
-        && !input.empty_root_requires_fail_closed;
-    let requires_rescue = ready_group || non_root_rescue_required;
-
-    TrustedMaterializedGroupRescueDecision {
-        ready_group,
-        requires_rescue,
-        allow_empty_owner_retry: ready_group && !input.prior_materialized_group_decoded,
-        should_resolve_selected_group_owner: requires_rescue,
-        empty_root_requires_fail_closed: input.empty_root_requires_fail_closed,
+    fn request_scoped_sink_status_plan(self) -> TreePitRequestScopedSinkStatusPlan {
+        TreePitRequestScopedSinkStatusPlan {
+            route_timeout: std::cmp::min(
+                self.caller_timeout,
+                REQUEST_SCOPED_SINK_STATUS_LOAD_BUDGET,
+            ),
+        }
     }
-}
 
-fn trusted_materialized_empty_response_rescue_decision(
-    input: TrustedMaterializedEmptyResponseRescueDecisionInput,
-) -> TrustedMaterializedEmptyResponseRescueDecision {
-    let settle_after_prior_exact_file_decode = input.ready_group
-        && input.prior_materialized_exact_file_decoded
-        && !input.empty_root_requires_fail_closed;
-    let settle_after_initial_empty_retry_path =
-        input.allow_empty_owner_retry && !input.empty_root_requires_fail_closed;
-    let owner_retry_policy = if settle_after_initial_empty_retry_path
-        || settle_after_prior_exact_file_decode
-        || !input.selected_group_owner_known
-    {
-        TrustedMaterializedOwnerRetryPolicy::Skip
-    } else if input.empty_root_requires_fail_closed && input.prior_materialized_group_decoded {
-        TrustedMaterializedOwnerRetryPolicy::RemainingBudget
-    } else if input.prior_materialized_group_decoded {
-        TrustedMaterializedOwnerRetryPolicy::LaterNonRootBudget
-    } else {
-        TrustedMaterializedOwnerRetryPolicy::SelectedGroupBudget
-    };
-    let attempt_generic_proxy_fallback = input.selected_group_owner_known
-        && !input.empty_root_requires_fail_closed
-        && !settle_after_initial_empty_retry_path
-        && !settle_after_prior_exact_file_decode;
-    let lane = decide_empty_tree_rescue_lane(EmptyTreeRescueLaneFacts {
-        allow_owner_retry: owner_retry_policy != TrustedMaterializedOwnerRetryPolicy::Skip,
-        settle_after_owner_retry: !attempt_generic_proxy_fallback,
-        attempt_proxy_fallback: attempt_generic_proxy_fallback,
-        fail_closed_without_proxy_budget: input.empty_root_requires_fail_closed
-            && input.ready_group,
-    });
+    fn selected_group_stage_plan(self, input: TreePitGroupPlanInput) -> TreePitGroupPlan {
+        TreePitGroupPlan {
+            read_class: input.read_class,
+            caller_timeout: self.caller_timeout,
+            stage_plan: SelectedGroupTreePitPlan::new(SelectedGroupTreePitPlanInput {
+                read_class: input.read_class,
+                observation_state: input.observation_state,
+                selected_group_sink_reports_live_materialized: input
+                    .selected_group_sink_reports_live_materialized,
+                prior_materialized_group_decoded: input.prior_materialized_group_decoded,
+                is_last_ranked_group: input.is_last_ranked_group,
+                selected_group_sink_unready_empty: input.selected_group_sink_unready_empty,
+                empty_root_requires_fail_closed: input.empty_root_requires_fail_closed,
+            }),
+            prior_materialized_exact_file_decoded: input.prior_materialized_exact_file_decoded,
+            rank_index: input.rank_index,
+            total_ranked_groups: self.total_ranked_groups,
+        }
+    }
 
-    TrustedMaterializedEmptyResponseRescueDecision {
-        lane,
-        owner_retry_policy,
-        proxy_error_disposition: if input.ready_group
-            && input.prior_materialized_group_decoded
-            && attempt_generic_proxy_fallback
-        {
-            EmptyTreeProxyErrorDisposition::FailClosedUnavailable
+    fn runtime(
+        self,
+        ranking_started_at: tokio::time::Instant,
+        ranking_retryable_failure: bool,
+    ) -> TreePitSessionRuntime {
+        self.runtime_from_now(
+            ranking_started_at,
+            ranking_retryable_failure,
+            tokio::time::Instant::now(),
+        )
+    }
+
+    fn runtime_from_now(
+        self,
+        ranking_started_at: tokio::time::Instant,
+        ranking_retryable_failure: bool,
+        now: tokio::time::Instant,
+    ) -> TreePitSessionRuntime {
+        let session_deadline = if ranking_retryable_failure {
+            ranking_started_at + self.caller_timeout
         } else {
-            EmptyTreeProxyErrorDisposition::Ignore
-        },
-        fail_closed_on_final_empty_response: input.ready_group
-            && input.empty_root_requires_fail_closed,
-        defer_first_ranked_empty_non_root_group: input.ready_group
-            && !input.prior_materialized_group_decoded
-            && !input.prior_materialized_exact_file_decoded
-            && !input.empty_root_requires_fail_closed,
+            now + self.caller_timeout
+        };
+        TreePitSessionRuntime {
+            plan: self,
+            session_deadline,
+        }
+    }
+
+    #[cfg(test)]
+    fn selected_group_owner_snapshot_plan(
+        self,
+        input: TreePitOwnerSnapshotPlanInput,
+    ) -> TreePitGroupPlan {
+        let base_plan = self.selected_group_stage_plan(TreePitGroupPlanInput {
+            read_class: if input.trusted_materialized_tree_query {
+                ReadClass::TrustedMaterialized
+            } else {
+                ReadClass::Materialized
+            },
+            observation_state: if input.trusted_materialized_tree_query {
+                ObservationState::TrustedMaterialized
+            } else {
+                ObservationState::MaterializedUntrusted
+            },
+            selected_group_sink_reports_live_materialized: input.trusted_materialized_tree_query,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: input.empty_root_requires_fail_closed,
+        });
+        TreePitGroupPlan {
+            stage_plan: SelectedGroupTreePitPlan {
+                allow_empty_owner_retry: input.allow_empty_owner_retry,
+                reserve_proxy_budget: input.reserve_proxy_budget,
+                requires_rescue: input.trusted_materialized_tree_query
+                    || input.allow_empty_owner_retry,
+                should_resolve_selected_group_owner: input.trusted_materialized_tree_query
+                    || input.allow_empty_owner_retry,
+                ..base_plan.stage_plan
+            },
+            ..base_plan
+        }
+    }
+}
+
+impl TreePitSessionRuntime {
+    fn entry_action_for(
+        self,
+        group_plan: TreePitGroupPlan,
+        group_key: &str,
+    ) -> TreePitStageEntryAction {
+        self.entry_action_for_at(group_plan, group_key, tokio::time::Instant::now())
+    }
+
+    fn entry_action_for_at(
+        self,
+        group_plan: TreePitGroupPlan,
+        group_key: &str,
+        now: tokio::time::Instant,
+    ) -> TreePitStageEntryAction {
+        match self.prepare_stage_for_at(group_plan, now) {
+            TreePitStagePreparation::Ready(stage_runtime) => {
+                TreePitStageEntryAction::Query(stage_runtime)
+            }
+            TreePitStagePreparation::Unavailable(TreePitUnavailableStageLane::PushEmptySnapshot) => {
+                TreePitStageEntryAction::PushEmptySnapshot
+            }
+            TreePitStagePreparation::Unavailable(
+                TreePitUnavailableStageLane::FailClosedUnavailable,
+            ) => TreePitStageEntryAction::ReturnError(
+                trusted_materialized_unavailable_selected_group_tree_error(group_key),
+            ),
+            TreePitStagePreparation::Unavailable(
+                TreePitUnavailableStageLane::FailClosedEmptyRoot,
+            ) => TreePitStageEntryAction::ReturnError(
+                trusted_materialized_empty_selected_group_tree_error(group_key),
+            ),
+        }
+    }
+
+    fn prepare_stage_for(self, group_plan: TreePitGroupPlan) -> TreePitStagePreparation {
+        self.prepare_stage_for_at(group_plan, tokio::time::Instant::now())
+    }
+
+    fn prepare_stage_for_at(
+        self,
+        group_plan: TreePitGroupPlan,
+        now: tokio::time::Instant,
+    ) -> TreePitStagePreparation {
+        self.stage_runtime_for_at(group_plan, now)
+            .map(TreePitStagePreparation::Ready)
+            .unwrap_or_else(|| {
+                TreePitStagePreparation::Unavailable(group_plan.unavailable_stage_lane())
+            })
+    }
+
+    fn remaining_at(self, now: tokio::time::Instant) -> Duration {
+        self.session_deadline
+            .checked_duration_since(now)
+            .unwrap_or_default()
+    }
+
+    fn stage_runtime_for_at(
+        self,
+        group_plan: TreePitGroupPlan,
+        now: tokio::time::Instant,
+    ) -> Option<TreePitStageRuntime> {
+        let remaining_session = self.remaining_at(now);
+        if remaining_session.is_zero() {
+            return None;
+        }
+        let stage_timeout = group_plan.stage_timeout(remaining_session);
+        Some(TreePitStageRuntime {
+            session_deadline: self.session_deadline,
+            stage_deadline: now + stage_timeout,
+            remaining_session,
+            stage_timeout,
+        })
+    }
+}
+
+impl TreePitStageRuntime {
+    fn empty_response_rescue_plan(
+        self,
+        group_plan: TreePitGroupPlan,
+        selected_group_owner_known: bool,
+    ) -> TrustedMaterializedEmptyResponseRescuePlan {
+        group_plan.empty_response_rescue_plan(selected_group_owner_known, self.remaining_session)
+    }
+
+    fn retryable_error_runtime(
+        self,
+        group_plan: TreePitGroupPlan,
+    ) -> RetryableTreePitStageErrorRuntime {
+        RetryableTreePitStageErrorRuntime {
+            group_plan,
+            session_deadline: self.session_deadline,
+            stage_deadline: self.stage_deadline,
+        }
+    }
+
+    fn query_failure_action(
+        self,
+        group_plan: TreePitGroupPlan,
+        err: CnxError,
+    ) -> TreePitStageQueryFailureAction {
+        match &err {
+            CnxError::Timeout | CnxError::TransportClosed(_) | CnxError::ProtocolViolation(_) => {
+                TreePitStageQueryFailureAction::RetryableGap {
+                    runtime: self.retryable_error_runtime(group_plan),
+                    err,
+                }
+            }
+            _ => TreePitStageQueryFailureAction::Fatal(err),
+        }
+    }
+
+    fn decode_failure_action(
+        self,
+        group_plan: TreePitGroupPlan,
+        group_key: &str,
+        query_path: &[u8],
+        request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
+        err: CnxError,
+    ) -> TreePitStageDecodeErrorAction {
+        let missing_same_path_payload =
+            decode_materialized_selected_group_response_missing_same_path_payload(&err);
+        let root_path_request_scoped_omitted_ready_group = group_plan.read_class
+            == ReadClass::TrustedMaterialized
+            && (query_path.is_empty() || query_path == b"/")
+            && request_scoped_schedule_omitted_ready_groups
+                .is_some_and(|groups| groups.contains(group_key))
+            && missing_same_path_payload;
+        if root_path_request_scoped_omitted_ready_group {
+            return TreePitStageDecodeErrorAction::PushEmptySnapshot;
+        }
+
+        if group_plan.read_class == ReadClass::TrustedMaterialized
+            && group_plan.stage_plan.prior_materialized_group_decoded
+            && group_plan.stage_plan.trusted_materialized_ready_group
+        {
+            if group_plan.stage_plan.empty_root_requires_fail_closed
+                && matches!(&err, CnxError::Timeout)
+            {
+                return TreePitStageDecodeErrorAction::ReturnError(err);
+            }
+            if !group_plan.stage_plan.empty_root_requires_fail_closed && missing_same_path_payload {
+                return TreePitStageDecodeErrorAction::PushEmptySnapshot;
+            }
+            return TreePitStageDecodeErrorAction::ReturnError(
+                trusted_materialized_unavailable_selected_group_tree_error(group_key),
+            );
+        }
+
+        if group_plan.read_class == ReadClass::TrustedMaterialized
+            && group_plan.prior_materialized_exact_file_decoded
+            && group_plan.stage_plan.trusted_materialized_ready_group
+            && missing_same_path_payload
+        {
+            return TreePitStageDecodeErrorAction::PushEmptySnapshot;
+        }
+
+        TreePitStageDecodeErrorAction::PushErrorSnapshot(err)
+    }
+}
+
+impl RetryableTreePitStageErrorRuntime {
+    fn remaining_session_at(self, now: tokio::time::Instant) -> Duration {
+        self.session_deadline
+            .checked_duration_since(now)
+            .unwrap_or_default()
+    }
+
+    fn remaining_stage_at(self, now: tokio::time::Instant) -> Duration {
+        self.stage_deadline
+            .checked_duration_since(now)
+            .unwrap_or_default()
+    }
+
+    fn owner_retry_timeout_at(self, now: tokio::time::Instant) -> Duration {
+        self.group_plan
+            .retryable_gap_owner_retry_timeout(self.remaining_session_at(now))
+    }
+
+    fn proxy_route_runtime_at(self, now: tokio::time::Instant) -> Option<TreePitProxyRouteRuntime> {
+        let plan = self.group_plan.retryable_gap_proxy_route_plan(
+            self.remaining_session_at(now),
+            self.remaining_stage_at(now),
+        );
+        if plan.route_timeout().is_zero() {
+            None
+        } else {
+            Some(plan.runtime_from_now(now))
+        }
+    }
+
+    fn fail_closed_after_retryable_gap(self) -> bool {
+        self.group_plan.fail_closed_after_retryable_gap()
+    }
+}
+
+impl ForceFindSessionPlan {
+    fn new(caller_timeout: Duration) -> Self {
+        Self { caller_timeout }
+    }
+
+    fn route_plan(self) -> ForceFindRoutePlan {
+        ForceFindRoutePlan::new(self.caller_timeout)
+    }
+}
+
+impl ForceFindRoutePlan {
+    fn new(route_timeout: Duration) -> Self {
+        Self {
+            route_timeout,
+            collect_idle_grace: std::cmp::min(FORCE_FIND_ROUTE_COLLECT_IDLE_GRACE, route_timeout),
+            retry_backoff: std::cmp::min(FORCE_FIND_ROUTE_RETRY_BACKOFF, route_timeout),
+            min_inflight_hold: std::cmp::min(FORCE_FIND_MIN_INFLIGHT_HOLD, route_timeout),
+        }
+    }
+
+    fn route_timeout(self) -> Duration {
+        self.route_timeout
+    }
+
+    fn collect_idle_grace(self) -> Duration {
+        self.collect_idle_grace
+    }
+
+    fn retry_backoff(self) -> Duration {
+        self.retry_backoff
+    }
+
+    fn min_inflight_hold(self) -> Duration {
+        self.min_inflight_hold
+    }
+
+    fn inflight_hold_action(self, inflight: bool) -> ForceFindInFlightHoldAction {
+        self.inflight_hold_action_at(tokio::time::Instant::now(), inflight)
+    }
+
+    fn inflight_hold_action_at(
+        self,
+        now: tokio::time::Instant,
+        inflight: bool,
+    ) -> ForceFindInFlightHoldAction {
+        if !inflight || self.min_inflight_hold().is_zero() {
+            ForceFindInFlightHoldAction::ReturnNow
+        } else {
+            ForceFindInFlightHoldAction::WaitUntil(now + self.min_inflight_hold())
+        }
+    }
+
+    fn rebudget(self, route_timeout: Duration) -> Self {
+        Self::new(route_timeout)
+    }
+
+    fn runtime(self) -> ForceFindRouteRuntime {
+        self.runtime_from_now(tokio::time::Instant::now())
+    }
+
+    fn runtime_from_now(self, now: tokio::time::Instant) -> ForceFindRouteRuntime {
+        ForceFindRouteRuntime {
+            plan: self,
+            route_deadline: now + self.route_timeout,
+        }
+    }
+
+    fn tree_route_error_lane(
+        self,
+        err: &CnxError,
+        selected_runner_attempt: bool,
+        remaining: Duration,
+    ) -> ForceFindTreeRouteErrorLane {
+        if remaining.is_zero() {
+            return ForceFindTreeRouteErrorLane::Fail;
+        }
+        let retryable =
+            is_retryable_force_find_route_error(err) || is_retryable_force_find_runner_gap(err);
+        if !retryable {
+            return ForceFindTreeRouteErrorLane::Fail;
+        }
+        if selected_runner_attempt {
+            ForceFindTreeRouteErrorLane::FallbackThenRetry
+        } else {
+            ForceFindTreeRouteErrorLane::RetryCurrentRoute
+        }
+    }
+}
+
+impl ForceFindRouteRuntime {
+    fn tree_entry_action_at(
+        self,
+        now: tokio::time::Instant,
+        selected_runner: Option<NodeId>,
+    ) -> ForceFindTreeRouteAction {
+        let Some(attempt_runtime) = self.attempt_at(now) else {
+            return ForceFindTreeRouteAction::ReturnTimeout;
+        };
+        let route_plan = attempt_runtime.route_plan();
+        if let Some(node_id) = selected_runner {
+            ForceFindTreeRouteAction::QueryViaSelectedRunner {
+                node_id,
+                route_plan,
+            }
+        } else {
+            ForceFindTreeRouteAction::QueryGenericFallback {
+                route_plan,
+                after_runner_gap: false,
+            }
+        }
+    }
+
+    fn attempt_at(self, now: tokio::time::Instant) -> Option<ForceFindRouteAttemptRuntime> {
+        let remaining = self
+            .route_deadline
+            .checked_duration_since(now)
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            return None;
+        }
+        Some(ForceFindRouteAttemptRuntime {
+            route_plan: self.plan.rebudget(remaining),
+            remaining,
+        })
+    }
+
+    fn tree_followup_action_at(
+        self,
+        now: tokio::time::Instant,
+        err: &CnxError,
+        selected_runner_attempt: bool,
+    ) -> ForceFindTreeRouteAction {
+        let Some(attempt_runtime) = self.attempt_at(now) else {
+            return ForceFindTreeRouteAction::ReturnTimeout;
+        };
+        match attempt_runtime.tree_route_error_lane(err, selected_runner_attempt) {
+            ForceFindTreeRouteErrorLane::Fail => ForceFindTreeRouteAction::ReturnCurrentError,
+            ForceFindTreeRouteErrorLane::RetryCurrentRoute => ForceFindTreeRouteAction::WaitUntil(
+                now + attempt_runtime.route_plan().retry_backoff(),
+            ),
+            ForceFindTreeRouteErrorLane::FallbackThenRetry => {
+                ForceFindTreeRouteAction::QueryGenericFallback {
+                    route_plan: attempt_runtime.route_plan(),
+                    after_runner_gap: true,
+                }
+            }
+        }
+    }
+}
+
+impl ForceFindRouteMachine {
+    fn new(runtime: ForceFindRouteRuntime) -> Self {
+        Self { runtime }
+    }
+
+    fn entry_phase(self) -> ForceFindRouteMachinePhase {
+        ForceFindRouteMachinePhase::PlanSelectedRunner
+    }
+
+    fn phase_for_selected_runner_at(
+        self,
+        now: tokio::time::Instant,
+        selected_runner: Option<NodeId>,
+    ) -> ForceFindRouteMachinePhase {
+        self.phase_from_action(self.runtime.tree_entry_action_at(now, selected_runner))
+    }
+
+    fn followup_phase_at(
+        self,
+        now: tokio::time::Instant,
+        err: &CnxError,
+        selected_runner_attempt: bool,
+    ) -> ForceFindRouteMachinePhase {
+        self.phase_from_action(
+            self.runtime
+                .tree_followup_action_at(now, err, selected_runner_attempt),
+        )
+    }
+
+    fn phase_after_wait(self) -> ForceFindRouteMachinePhase {
+        ForceFindRouteMachinePhase::PlanSelectedRunner
+    }
+
+    fn phase_from_action(self, action: ForceFindTreeRouteAction) -> ForceFindRouteMachinePhase {
+        match action {
+            ForceFindTreeRouteAction::ReturnTimeout => {
+                ForceFindRouteMachinePhase::Failed(ForceFindRouteMachineTerminal::Timeout)
+            }
+            ForceFindTreeRouteAction::ReturnCurrentError => {
+                ForceFindRouteMachinePhase::Failed(ForceFindRouteMachineTerminal::CurrentError)
+            }
+            ForceFindTreeRouteAction::QueryViaSelectedRunner { node_id, route_plan } => {
+                ForceFindRouteMachinePhase::AttemptSelectedRunner { node_id, route_plan }
+            }
+            ForceFindTreeRouteAction::QueryGenericFallback {
+                route_plan,
+                after_runner_gap,
+            } => ForceFindRouteMachinePhase::FallbackToGeneric {
+                route_plan,
+                after_runner_gap,
+            },
+            ForceFindTreeRouteAction::WaitUntil(until) => {
+                ForceFindRouteMachinePhase::WaitForForceFindReadiness(until)
+            }
+        }
+    }
+}
+
+impl ForceFindRouteAttemptRuntime {
+    fn route_plan(self) -> ForceFindRoutePlan {
+        self.route_plan
+    }
+
+    fn tree_route_error_lane(
+        self,
+        err: &CnxError,
+        selected_runner_attempt: bool,
+    ) -> ForceFindTreeRouteErrorLane {
+        self.route_plan
+            .tree_route_error_lane(err, selected_runner_attempt, self.remaining)
+    }
+}
+
+impl TreePitRequestScopedSinkStatusPlan {
+    fn route_timeout(self) -> Duration {
+        self.route_timeout
+    }
+}
+
+impl SelectedGroupOwnerRoutePlan {
+    fn new(route_timeout: Duration) -> Self {
+        Self {
+            route_timeout,
+            collect_idle_grace: std::cmp::min(
+                SELECTED_GROUP_OWNER_ROUTE_COLLECT_IDLE_GRACE,
+                route_timeout,
+            ),
+        }
+    }
+
+    fn route_timeout(self) -> Duration {
+        self.route_timeout
+    }
+
+    fn collect_idle_grace(self) -> Duration {
+        self.collect_idle_grace
+    }
+}
+
+impl TreePitProxyRoutePlan {
+    fn new(route_timeout: Duration) -> Self {
+        Self {
+            route_timeout,
+            collect_idle_grace: std::cmp::min(
+                SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE,
+                route_timeout,
+            ),
+            retry_backoff: std::cmp::min(SELECTED_GROUP_PROXY_ROUTE_RETRY_BACKOFF, route_timeout),
+        }
+    }
+
+    fn route_timeout(self) -> Duration {
+        self.route_timeout
+    }
+
+    fn collect_idle_grace(self) -> Duration {
+        self.collect_idle_grace
+    }
+
+    fn retry_backoff(self) -> Duration {
+        self.retry_backoff
+    }
+
+    fn runtime(self) -> TreePitProxyRouteRuntime {
+        self.runtime_from_now(tokio::time::Instant::now())
+    }
+
+    fn runtime_from_now(self, now: tokio::time::Instant) -> TreePitProxyRouteRuntime {
+        TreePitProxyRouteRuntime {
+            plan: self,
+            route_deadline: now + self.route_timeout,
+        }
+    }
+}
+
+impl TreePitProxyRouteRuntime {
+    fn route_timeout(self) -> Duration {
+        self.plan.route_timeout()
+    }
+
+    fn attempt(self) -> Option<TreePitProxyAttemptRuntime> {
+        self.attempt_at(tokio::time::Instant::now())
+    }
+
+    fn attempt_at(self, now: tokio::time::Instant) -> Option<TreePitProxyAttemptRuntime> {
+        let attempt_timeout = self
+            .route_deadline
+            .checked_duration_since(now)
+            .unwrap_or_default();
+        if attempt_timeout.is_zero() {
+            return None;
+        }
+        Some(TreePitProxyAttemptRuntime {
+            attempt_timeout,
+            collect_idle_grace: std::cmp::min(self.plan.collect_idle_grace(), attempt_timeout),
+            retry_backoff: std::cmp::min(self.plan.retry_backoff(), attempt_timeout),
+        })
+    }
+
+    fn entry_action(self) -> TreePitProxyRouteAction {
+        self.entry_action_at(tokio::time::Instant::now())
+    }
+
+    fn entry_action_at(self, now: tokio::time::Instant) -> TreePitProxyRouteAction {
+        match self.attempt_at(now) {
+            Some(attempt_runtime) => TreePitProxyRouteAction::QueryAttempt(attempt_runtime),
+            None => TreePitProxyRouteAction::ReturnTimeout,
+        }
+    }
+
+    fn retry_action(self) -> TreePitProxyRouteAction {
+        self.retry_action_at(tokio::time::Instant::now())
+    }
+
+    fn retry_action_at(self, now: tokio::time::Instant) -> TreePitProxyRouteAction {
+        let Some(attempt_runtime) = self.attempt_at(now) else {
+            return TreePitProxyRouteAction::ReturnTimeout;
+        };
+        TreePitProxyRouteAction::WaitUntil(now + attempt_runtime.retry_backoff)
+    }
+
+    fn followup_action_at(self, now: tokio::time::Instant, err: &CnxError) -> TreePitProxyRouteAction {
+        if !is_retryable_materialized_proxy_continuity_gap(err) {
+            TreePitProxyRouteAction::ReturnCurrentError
+        } else {
+            self.retry_action_at(now)
+        }
+    }
+}
+
+impl TreePitGroupPlan {
+    fn unavailable_stage_lane(self) -> TreePitUnavailableStageLane {
+        if self.stage_plan.trusted_materialized_ready_group {
+            if self.stage_plan.empty_root_requires_fail_closed {
+                TreePitUnavailableStageLane::FailClosedEmptyRoot
+            } else {
+                TreePitUnavailableStageLane::FailClosedUnavailable
+            }
+        } else {
+            TreePitUnavailableStageLane::PushEmptySnapshot
+        }
+    }
+
+    fn remaining_ranked_groups(self) -> usize {
+        self.total_ranked_groups.saturating_sub(self.rank_index)
+    }
+
+    fn is_last_ranked_group(self) -> bool {
+        self.rank_index + 1 == self.total_ranked_groups
+    }
+
+    fn stage_timeout(self, remaining_session: Duration) -> Duration {
+        self.stage_plan
+            .stage_timeout(remaining_session, self.caller_timeout)
+    }
+
+    fn owner_attempt_timeout(self, remaining_session: Duration) -> Duration {
+        if remaining_session.is_zero() {
+            return Duration::ZERO;
+        }
+        if !self.stage_plan.reserve_proxy_budget {
+            return remaining_session;
+        }
+
+        let owner_min_budget = std::cmp::min(
+            remaining_session,
+            if self.stage_plan.empty_root_requires_fail_closed {
+                TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET
+            } else {
+                TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET
+            },
+        );
+        let proxy_reserve = std::cmp::min(
+            remaining_session.checked_div(2).unwrap_or_default(),
+            std::cmp::min(remaining_session, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET),
+        );
+        let capped_proxy_reserve = std::cmp::min(
+            proxy_reserve,
+            remaining_session.saturating_sub(owner_min_budget),
+        );
+        remaining_session.saturating_sub(capped_proxy_reserve)
+    }
+
+    fn owner_empty_tree_retry_timeout(self, remaining_session: Duration) -> Duration {
+        std::cmp::min(remaining_session, TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET)
+    }
+
+    fn owner_route_plan(self, remaining_session: Duration) -> SelectedGroupOwnerRoutePlan {
+        SelectedGroupOwnerRoutePlan::new(self.owner_attempt_timeout(remaining_session))
+    }
+
+    fn owner_empty_tree_rescue_plan(
+        self,
+        facts: SelectedGroupOwnerEmptyTreeRescueFacts,
+    ) -> SelectedGroupOwnerEmptyTreeRescuePlan {
+        let lane = decide_empty_tree_rescue_lane(EmptyTreeRescueLaneFacts {
+            allow_owner_retry: facts.owner_response_is_empty
+                && !facts.requires_proxy_fallback
+                && self.stage_plan.allow_empty_owner_retry
+                && facts.selected_group_sink_reports_live_materialized,
+            // First-ranked trusted non-root lanes still need the generic proxy
+            // after the bounded owner retry. The PIT layer can later settle an
+            // empty proxy payload for legitimate missing-subtree/exact-file
+            // cases without short-circuiting recovery here.
+            settle_after_owner_retry: false,
+            attempt_proxy_fallback: (facts.requires_proxy_fallback
+                && (self.stage_plan.reserve_proxy_budget
+                    || self.stage_plan.allow_empty_owner_retry))
+                || (facts.owner_response_is_empty
+                    && !facts.requires_proxy_fallback
+                    && self.stage_plan.allow_empty_owner_retry
+                    && facts.selected_group_sink_reports_live_materialized),
+            fail_closed_without_proxy_budget: facts.requires_proxy_fallback
+                && !self.stage_plan.reserve_proxy_budget
+                && !self.stage_plan.allow_empty_owner_retry,
+        });
+
+        SelectedGroupOwnerEmptyTreeRescuePlan {
+            lane,
+            attempt_primary_owner_reroute: facts.requires_primary_owner_reroute,
+        }
+    }
+
+    fn empty_response_rescue_plan(
+        self,
+        selected_group_owner_known: bool,
+        remaining_session: Duration,
+    ) -> TrustedMaterializedEmptyResponseRescuePlan {
+        let settle_after_prior_exact_file_decode = self.stage_plan.trusted_materialized_ready_group
+            && self.prior_materialized_exact_file_decoded
+            && !self.stage_plan.empty_root_requires_fail_closed;
+        let settle_after_initial_empty_retry_path = self.stage_plan.allow_empty_owner_retry
+            && !self.stage_plan.empty_root_requires_fail_closed;
+        let owner_retry_timeout = if settle_after_initial_empty_retry_path
+            || settle_after_prior_exact_file_decode
+            || !selected_group_owner_known
+        {
+            Duration::ZERO
+        } else if self.stage_plan.empty_root_requires_fail_closed
+            && self.stage_plan.prior_materialized_group_decoded
+        {
+            remaining_session
+        } else if self.stage_plan.prior_materialized_group_decoded {
+            std::cmp::min(
+                remaining_session,
+                TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET,
+            )
+        } else {
+            std::cmp::min(remaining_session, TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET)
+        };
+        let attempt_generic_proxy_fallback = selected_group_owner_known
+            && !self.stage_plan.empty_root_requires_fail_closed
+            && !settle_after_initial_empty_retry_path
+            && !settle_after_prior_exact_file_decode;
+        let lane = decide_empty_tree_rescue_lane(EmptyTreeRescueLaneFacts {
+            allow_owner_retry: !owner_retry_timeout.is_zero(),
+            settle_after_owner_retry: !attempt_generic_proxy_fallback,
+            attempt_proxy_fallback: attempt_generic_proxy_fallback,
+            fail_closed_without_proxy_budget: self.stage_plan.empty_root_requires_fail_closed
+                && self.stage_plan.trusted_materialized_ready_group,
+        });
+
+        TrustedMaterializedEmptyResponseRescuePlan {
+            lane,
+            owner_retry_timeout,
+            fail_closed_on_proxy_error: self.stage_plan.trusted_materialized_ready_group
+                && self.stage_plan.prior_materialized_group_decoded
+                && attempt_generic_proxy_fallback,
+            fail_closed_on_final_empty_response: self.stage_plan.trusted_materialized_ready_group
+                && self.stage_plan.empty_root_requires_fail_closed,
+            defer_first_ranked_empty_non_root_group: self
+                .stage_plan
+                .trusted_materialized_ready_group
+                && !self.stage_plan.prior_materialized_group_decoded
+                && !self.prior_materialized_exact_file_decoded
+                && !self.stage_plan.empty_root_requires_fail_closed,
+        }
+    }
+
+    fn empty_response_proxy_retry_timeout(self, remaining_session: Duration) -> Duration {
+        if self.is_last_ranked_group() {
+            std::cmp::min(remaining_session, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET)
+        } else {
+            let shared_budget_ceiling = remaining_session
+                .checked_div(self.remaining_ranked_groups().max(1) as u32)
+                .unwrap_or_default();
+            std::cmp::min(
+                std::cmp::min(remaining_session, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET),
+                shared_budget_ceiling,
+            )
+        }
+    }
+
+    fn retryable_gap_owner_retry_timeout(self, remaining_session: Duration) -> Duration {
+        if self.stage_plan.empty_root_requires_fail_closed
+            && self.stage_plan.prior_materialized_group_decoded
+        {
+            std::cmp::min(remaining_session, LATER_RANKED_TRUSTED_GROUP_STAGE_BUDGET)
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    fn retryable_gap_proxy_timeout(
+        self,
+        remaining_session: Duration,
+        remaining_stage: Duration,
+    ) -> Duration {
+        let remaining = if !self.stage_plan.empty_root_requires_fail_closed {
+            remaining_session + MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE
+        } else {
+            remaining_stage
+        };
+        std::cmp::min(remaining, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET)
+    }
+
+    fn fail_closed_after_retryable_gap(self) -> bool {
+        self.stage_plan.prior_materialized_group_decoded
+            || self.stage_plan.empty_root_requires_fail_closed
+    }
+
+    fn stats_proxy_retry_timeout(self, remaining_session: Duration) -> Duration {
+        self.empty_response_proxy_retry_timeout(remaining_session)
+    }
+
+    fn empty_response_proxy_route_plan(self, remaining_session: Duration) -> TreePitProxyRoutePlan {
+        TreePitProxyRoutePlan::new(self.empty_response_proxy_retry_timeout(remaining_session))
+    }
+
+    fn retryable_gap_proxy_route_plan(
+        self,
+        remaining_session: Duration,
+        remaining_stage: Duration,
+    ) -> TreePitProxyRoutePlan {
+        TreePitProxyRoutePlan::new(
+            self.retryable_gap_proxy_timeout(remaining_session, remaining_stage),
+        )
+    }
+
+    fn stats_proxy_route_plan(self, remaining_session: Duration) -> TreePitProxyRoutePlan {
+        TreePitProxyRoutePlan::new(self.stats_proxy_retry_timeout(remaining_session))
+    }
+
+    fn owner_route_gap_proxy_route_plan(
+        self,
+        remaining_session: Duration,
+        trusted_materialized_tree_query: bool,
+    ) -> TreePitProxyRoutePlan {
+        let policy = self
+            .stage_plan
+            .owner_route_gap_proxy_policy(trusted_materialized_tree_query);
+        TreePitProxyRoutePlan::new(policy.proxy_timeout(remaining_session))
+    }
+
+    fn direct_proxy_route_plan(self, remaining_session: Duration) -> TreePitProxyRoutePlan {
+        TreePitProxyRoutePlan::new(remaining_session)
     }
 }
 
@@ -2953,37 +4163,26 @@ struct TrustedMaterializedEmptyTreeResponseRescueInput<'a> {
     policy: &'a ProjectionPolicy,
     tree_params: InternalQueryRequest,
     selected_group_sink_status: Option<&'a SinkStatusSnapshot>,
-    rescue_decision: TrustedMaterializedGroupRescueDecision,
-    empty_response_decision: TrustedMaterializedEmptyResponseRescueDecision,
+    group_plan: TreePitGroupPlan,
+    empty_response_plan: TrustedMaterializedEmptyResponseRescuePlan,
     group_key: &'a str,
     query_path: &'a [u8],
     session_deadline: tokio::time::Instant,
-    is_last_ranked_group: bool,
-    total_ranked_groups: usize,
-    rank_index: usize,
 }
 
 async fn rescue_trusted_materialized_empty_tree_response(
     input: TrustedMaterializedEmptyTreeResponseRescueInput<'_>,
     response: &mut TreeGroupPayload,
 ) -> Result<(), CnxError> {
-    let remaining = input
-        .session_deadline
-        .checked_duration_since(tokio::time::Instant::now())
-        .unwrap_or_default();
-    let owner_retry_timeout = input
-        .empty_response_decision
-        .owner_retry_policy
-        .timeout(remaining);
-    if !owner_retry_timeout.is_zero() {
+    if !input.empty_response_plan.owner_retry_timeout.is_zero() {
         match run_timed_query(
             query_materialized_events_via_selected_group_owner_direct(
                 input.state,
                 input.tree_params.clone(),
-                owner_retry_timeout,
+                input.empty_response_plan.owner_retry_timeout,
                 input.selected_group_sink_status,
             ),
-            owner_retry_timeout,
+            input.empty_response_plan.owner_retry_timeout,
         )
         .await
         {
@@ -3009,7 +4208,7 @@ async fn rescue_trusted_materialized_empty_tree_response(
             Err(CnxError::Timeout)
             | Err(CnxError::TransportClosed(_))
             | Err(CnxError::ProtocolViolation(_))
-                if input.rescue_decision.empty_root_requires_fail_closed =>
+                if input.group_plan.stage_plan.empty_root_requires_fail_closed =>
             {
                 return Err(trusted_materialized_empty_selected_group_tree_error(
                     input.group_key,
@@ -3023,7 +4222,7 @@ async fn rescue_trusted_materialized_empty_tree_response(
     }
 
     if matches!(
-        input.empty_response_decision.lane,
+        input.empty_response_plan.lane,
         EmptyTreeRescueLane::OwnerRetryThenProxyFallback | EmptyTreeRescueLane::ProxyFallback
     ) && trusted_materialized_tree_payload_is_empty(response)
         && let QueryBackend::Route {
@@ -3037,25 +4236,12 @@ async fn rescue_trusted_materialized_empty_tree_response(
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or_default();
         if !remaining.is_zero() {
-            let proxy_retry_timeout = if input.is_last_ranked_group {
-                std::cmp::min(remaining, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET)
-            } else {
-                let shared_budget_ceiling = remaining
-                    .checked_div(input.total_ranked_groups.saturating_sub(input.rank_index) as u32)
-                    .unwrap_or_default();
-                std::cmp::min(
-                    std::cmp::min(remaining, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET),
-                    shared_budget_ceiling,
-                )
-            };
-            match run_timed_query(
-                query_materialized_events_via_generic_proxy(
-                    boundary.clone(),
-                    origin_id.clone(),
-                    input.tree_params.clone(),
-                    proxy_retry_timeout,
-                ),
-                proxy_retry_timeout,
+            let proxy_route_plan = input.group_plan.empty_response_proxy_route_plan(remaining);
+            match query_materialized_events_via_generic_proxy(
+                boundary.clone(),
+                origin_id.clone(),
+                input.tree_params.clone(),
+                proxy_route_plan.runtime(),
             )
             .await
             {
@@ -3077,12 +4263,7 @@ async fn rescue_trusted_materialized_empty_tree_response(
                             *response = proxy_response;
                         }
                     }
-                    Err(err)
-                        if matches!(
-                            input.empty_response_decision.proxy_error_disposition,
-                            EmptyTreeProxyErrorDisposition::FailClosedUnavailable
-                        ) =>
-                    {
+                    Err(err) if input.empty_response_plan.fail_closed_on_proxy_error => {
                         if debug_materialized_route_capture_enabled() {
                             eprintln!(
                                 "fs_meta_query_api: pit_group_stage proxy_fallback_decode_failed group={} path={} err={}",
@@ -3100,10 +4281,7 @@ async fn rescue_trusted_materialized_empty_tree_response(
                 Err(CnxError::Timeout)
                 | Err(CnxError::TransportClosed(_))
                 | Err(CnxError::ProtocolViolation(_))
-                    if matches!(
-                        input.empty_response_decision.proxy_error_disposition,
-                        EmptyTreeProxyErrorDisposition::FailClosedUnavailable
-                    ) =>
+                    if input.empty_response_plan.fail_closed_on_proxy_error =>
                 {
                     if debug_materialized_route_capture_enabled() {
                         eprintln!(
@@ -3124,6 +4302,85 @@ async fn rescue_trusted_materialized_empty_tree_response(
     Ok(())
 }
 
+struct TreePitStageExecutionInput<'a> {
+    state: &'a ApiState,
+    policy: &'a ProjectionPolicy,
+    tree_params: InternalQueryRequest,
+    events: &'a [Event],
+    selected_group_sink_status: Option<&'a SinkStatusSnapshot>,
+    group_plan: TreePitGroupPlan,
+    stage_runtime: TreePitStageRuntime,
+    selected_group_owner_known: bool,
+    group_key: &'a str,
+    query_path: &'a [u8],
+    request_scoped_schedule_omitted_ready_groups: Option<&'a BTreeSet<String>>,
+}
+
+async fn resolve_tree_pit_stage_execution_action(
+    input: TreePitStageExecutionInput<'_>,
+) -> TreePitStageExecutionAction {
+    match decode_materialized_selected_group_response(
+        input.events,
+        input.policy,
+        input.group_key,
+        input.query_path,
+    ) {
+        Ok(mut response) => {
+            let empty_response_plan = input
+                .stage_runtime
+                .empty_response_rescue_plan(input.group_plan, input.selected_group_owner_known);
+            maybe_promote_richer_same_path_materialized_tree_response(
+                input.events,
+                input.policy,
+                input.group_key,
+                input.query_path,
+                &mut response,
+            );
+            if input.group_plan.stage_plan.requires_rescue
+                && trusted_materialized_tree_payload_is_empty(&response)
+                && let Err(err) = rescue_trusted_materialized_empty_tree_response(
+                    TrustedMaterializedEmptyTreeResponseRescueInput {
+                        state: input.state,
+                        policy: input.policy,
+                        tree_params: input.tree_params,
+                        selected_group_sink_status: input.selected_group_sink_status,
+                        group_plan: input.group_plan,
+                        empty_response_plan,
+                        group_key: input.group_key,
+                        query_path: input.query_path,
+                        session_deadline: input.stage_runtime.session_deadline,
+                    },
+                    &mut response,
+                )
+                .await
+            {
+                return TreePitStageExecutionAction::ReturnError(err);
+            }
+            TreePitStageExecutionAction::PushPayload {
+                response,
+                empty_response_plan,
+            }
+        }
+        Err(err) => match input.stage_runtime.decode_failure_action(
+            input.group_plan,
+            input.group_key,
+            input.query_path,
+            input.request_scoped_schedule_omitted_ready_groups,
+            err,
+        ) {
+            TreePitStageDecodeErrorAction::PushEmptySnapshot => {
+                TreePitStageExecutionAction::PushEmptySnapshot
+            }
+            TreePitStageDecodeErrorAction::PushErrorSnapshot(err) => {
+                TreePitStageExecutionAction::PushErrorSnapshot(err)
+            }
+            TreePitStageDecodeErrorAction::ReturnError(err) => {
+                TreePitStageExecutionAction::ReturnError(err)
+            }
+        },
+    }
+}
+
 fn finalize_trusted_materialized_tree_group_response(
     groups: &mut Vec<GroupPitSnapshot>,
     group_rank_metrics: &mut BTreeMap<String, Option<u64>>,
@@ -3131,11 +4388,11 @@ fn finalize_trusted_materialized_tree_group_response(
     read_class: ReadClass,
     group_key: String,
     response: TreeGroupPayload,
-    empty_response_decision: TrustedMaterializedEmptyResponseRescueDecision,
+    empty_response_plan: TrustedMaterializedEmptyResponseRescuePlan,
     rank_index: usize,
     deferred_first_ranked_empty_trusted_non_root_group: &mut Option<String>,
 ) -> Result<(), CnxError> {
-    if empty_response_decision.fail_closed_on_final_empty_response
+    if empty_response_plan.fail_closed_on_final_empty_response
         && trusted_materialized_tree_payload_is_empty(&response)
     {
         return Err(trusted_materialized_empty_selected_group_tree_error(
@@ -3145,7 +4402,7 @@ fn finalize_trusted_materialized_tree_group_response(
 
     let deferred_empty_group_decision = trusted_materialized_deferred_empty_group_decision(
         TrustedMaterializedDeferredEmptyGroupDecisionInput {
-            defer_first_ranked_empty_non_root_group: empty_response_decision
+            defer_first_ranked_empty_non_root_group: empty_response_plan
                 .defer_first_ranked_empty_non_root_group,
             rank_index,
             response_is_empty: trusted_materialized_tree_payload_is_empty(&response),
@@ -3174,20 +4431,61 @@ fn finalize_trusted_materialized_tree_group_response(
     Ok(())
 }
 
+fn apply_tree_pit_stage_execution_action(
+    action: TreePitStageExecutionAction,
+    groups: &mut Vec<GroupPitSnapshot>,
+    group_rank_metrics: &mut BTreeMap<String, Option<u64>>,
+    group_order: GroupOrder,
+    read_class: ReadClass,
+    group_key: String,
+    query_path: &[u8],
+    rank_index: usize,
+    deferred_first_ranked_empty_trusted_non_root_group: &mut Option<String>,
+) -> Result<(), CnxError> {
+    match action {
+        TreePitStageExecutionAction::PushPayload {
+            response,
+            empty_response_plan,
+        } => finalize_trusted_materialized_tree_group_response(
+            groups,
+            group_rank_metrics,
+            group_order,
+            read_class,
+            group_key,
+            response,
+            empty_response_plan,
+            rank_index,
+            deferred_first_ranked_empty_trusted_non_root_group,
+        ),
+        TreePitStageExecutionAction::PushEmptySnapshot => {
+            push_empty_materialized_tree_group_snapshot(
+                groups,
+                group_rank_metrics,
+                group_order,
+                read_class,
+                group_key,
+                query_path,
+            );
+            Ok(())
+        }
+        TreePitStageExecutionAction::PushErrorSnapshot(err) => {
+            push_materialized_tree_group_error_snapshot(groups, read_class, group_key, err);
+            Ok(())
+        }
+        TreePitStageExecutionAction::ReturnError(err) => Err(err),
+    }
+}
+
 struct RetryableTreePitStageErrorInput<'a> {
     state: &'a ApiState,
     policy: &'a ProjectionPolicy,
     tree_params: InternalQueryRequest,
     selected_group_sink_status: Option<&'a SinkStatusSnapshot>,
-    rescue_decision: TrustedMaterializedGroupRescueDecision,
+    retryable_error_runtime: RetryableTreePitStageErrorRuntime,
     group_key: String,
     query_path: &'a [u8],
     read_class: ReadClass,
     group_order: GroupOrder,
-    trusted_materialized_ready_group: bool,
-    prior_materialized_group_decoded: bool,
-    session_deadline: tokio::time::Instant,
-    stage_deadline: tokio::time::Instant,
 }
 
 async fn handle_retryable_tree_pit_stage_error(
@@ -3196,19 +4494,15 @@ async fn handle_retryable_tree_pit_stage_error(
     groups: &mut Vec<GroupPitSnapshot>,
     group_rank_metrics: &mut BTreeMap<String, Option<u64>>,
 ) -> Result<(), CnxError> {
-    if input.rescue_decision.requires_rescue {
-        let empty_root_requires_fail_closed = input.rescue_decision.empty_root_requires_fail_closed;
-        let fail_closed_after_retryable_gap =
-            input.prior_materialized_group_decoded || empty_root_requires_fail_closed;
-        if empty_root_requires_fail_closed
-            && input.prior_materialized_group_decoded
-            && let outer_owner_retry_timeout = input
-                .session_deadline
-                .checked_duration_since(tokio::time::Instant::now())
-                .unwrap_or_default()
-                .min(LATER_RANKED_TRUSTED_GROUP_STAGE_BUDGET)
-            && !outer_owner_retry_timeout.is_zero()
-        {
+    let group_plan = input.retryable_error_runtime.group_plan;
+    if group_plan.stage_plan.requires_rescue {
+        let now = tokio::time::Instant::now();
+        let empty_root_requires_fail_closed = group_plan.stage_plan.empty_root_requires_fail_closed;
+        let fail_closed_after_retryable_gap = input
+            .retryable_error_runtime
+            .fail_closed_after_retryable_gap();
+        let outer_owner_retry_timeout = input.retryable_error_runtime.owner_retry_timeout_at(now);
+        if !outer_owner_retry_timeout.is_zero() {
             if debug_materialized_route_capture_enabled() {
                 eprintln!(
                     "fs_meta_query_api: pit_group_stage owner_retry_after_proxy_gap group={} path={} owner_retry_timeout_ms={}",
@@ -3260,136 +4554,115 @@ async fn handle_retryable_tree_pit_stage_error(
             ..
         } = &input.state.backend
         {
-            let remaining = if !empty_root_requires_fail_closed {
-                input
-                    .session_deadline
-                    .checked_duration_since(tokio::time::Instant::now())
-                    .unwrap_or_default()
-                    + MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE
-            } else {
-                input
-                    .stage_deadline
-                    .checked_duration_since(tokio::time::Instant::now())
-                    .unwrap_or_default()
-            };
-            if !remaining.is_zero() {
-                let proxy_retry_timeout =
-                    std::cmp::min(remaining, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET);
+            if let Some(proxy_retry_runtime) =
+                input.retryable_error_runtime.proxy_route_runtime_at(now)
+            {
                 if debug_materialized_route_capture_enabled() {
                     eprintln!(
                         "fs_meta_query_api: pit_group_stage proxy_fallback_after_owner_timeout group={} path={} proxy_timeout_ms={} remaining_ms={}",
                         input.group_key,
                         String::from_utf8_lossy(input.query_path),
-                        proxy_retry_timeout.as_millis(),
-                        remaining.as_millis()
+                        proxy_retry_runtime.route_timeout().as_millis(),
+                        proxy_retry_runtime.route_timeout().as_millis(),
                     );
                 }
-                if !proxy_retry_timeout.is_zero() {
-                    match run_timed_query(
-                        query_materialized_events_via_generic_proxy(
-                            boundary.clone(),
-                            origin_id.clone(),
-                            input.tree_params.clone(),
-                            proxy_retry_timeout,
-                        ),
-                        proxy_retry_timeout,
-                    )
-                    .await
-                    {
-                        Ok(proxy_events) => {
-                            match decode_materialized_selected_group_response(
-                                &proxy_events,
-                                input.policy,
-                                &input.group_key,
-                                input.query_path,
-                            ) {
-                                Ok(mut proxy_response) => {
-                                    maybe_promote_richer_same_path_materialized_tree_response(
-                                        &proxy_events,
-                                        input.policy,
-                                        &input.group_key,
-                                        input.query_path,
-                                        &mut proxy_response,
-                                    );
-                                    if debug_materialized_route_capture_enabled() {
-                                        eprintln!(
-                                            "fs_meta_query_api: pit_group_stage proxy_fallback_decode group={} root_exists={} entries={} has_children={}",
-                                            input.group_key,
-                                            proxy_response.root.exists,
-                                            proxy_response.entries.len(),
-                                            proxy_response.root.has_children
-                                        );
-                                    }
-                                    if !empty_root_requires_fail_closed
-                                        || !trusted_materialized_tree_payload_is_empty(
-                                            &proxy_response,
-                                        )
-                                    {
-                                        push_materialized_tree_group_payload(
-                                            groups,
-                                            group_rank_metrics,
-                                            input.group_order,
-                                            input.read_class,
-                                            input.group_key,
-                                            proxy_response,
-                                        );
-                                        return Ok(());
-                                    }
-                                }
-                                Err(err) if fail_closed_after_retryable_gap => {
-                                    if debug_materialized_route_capture_enabled() {
-                                        eprintln!(
-                                            "fs_meta_query_api: pit_group_stage proxy_fallback_decode_failed group={} path={} err={}",
-                                            input.group_key,
-                                            String::from_utf8_lossy(input.query_path),
-                                            err
-                                        );
-                                    }
-                                    return Err(
-                                        trusted_materialized_unavailable_selected_group_tree_error(
-                                            &input.group_key,
-                                        ),
-                                    );
-                                }
-                                Err(_) => {}
-                            }
-                        }
-                        Err(CnxError::Timeout)
-                            if fail_closed_after_retryable_gap
-                                && input.trusted_materialized_ready_group
-                                && trusted_materialized_empty_group_root_requires_fail_closed(
-                                    input.query_path,
-                                ) =>
-                        {
-                            if debug_materialized_route_capture_enabled() {
-                                eprintln!(
-                                    "fs_meta_query_api: pit_group_stage proxy_fallback_failed group={} path={} err=timeout-preserved",
-                                    input.group_key,
-                                    String::from_utf8_lossy(input.query_path),
-                                );
-                            }
-                            return Err(CnxError::Timeout);
-                        }
-                        Err(CnxError::Timeout)
-                        | Err(CnxError::TransportClosed(_))
-                        | Err(CnxError::ProtocolViolation(_))
-                            if fail_closed_after_retryable_gap =>
-                        {
-                            if debug_materialized_route_capture_enabled() {
-                                eprintln!(
-                                    "fs_meta_query_api: pit_group_stage proxy_fallback_failed group={} path={} err=retryable-proxy-failure",
-                                    input.group_key,
-                                    String::from_utf8_lossy(input.query_path),
-                                );
-                            }
-                            return Err(
-                                trusted_materialized_unavailable_selected_group_tree_error(
+                match query_materialized_events_via_generic_proxy(
+                    boundary.clone(),
+                    origin_id.clone(),
+                    input.tree_params.clone(),
+                    proxy_retry_runtime,
+                )
+                .await
+                {
+                    Ok(proxy_events) => {
+                        match decode_materialized_selected_group_response(
+                            &proxy_events,
+                            input.policy,
+                            &input.group_key,
+                            input.query_path,
+                        ) {
+                            Ok(mut proxy_response) => {
+                                maybe_promote_richer_same_path_materialized_tree_response(
+                                    &proxy_events,
+                                    input.policy,
                                     &input.group_key,
-                                ),
+                                    input.query_path,
+                                    &mut proxy_response,
+                                );
+                                if debug_materialized_route_capture_enabled() {
+                                    eprintln!(
+                                        "fs_meta_query_api: pit_group_stage proxy_fallback_decode group={} root_exists={} entries={} has_children={}",
+                                        input.group_key,
+                                        proxy_response.root.exists,
+                                        proxy_response.entries.len(),
+                                        proxy_response.root.has_children
+                                    );
+                                }
+                                if !empty_root_requires_fail_closed
+                                    || !trusted_materialized_tree_payload_is_empty(&proxy_response)
+                                {
+                                    push_materialized_tree_group_payload(
+                                        groups,
+                                        group_rank_metrics,
+                                        input.group_order,
+                                        input.read_class,
+                                        input.group_key,
+                                        proxy_response,
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                            Err(err) if fail_closed_after_retryable_gap => {
+                                if debug_materialized_route_capture_enabled() {
+                                    eprintln!(
+                                        "fs_meta_query_api: pit_group_stage proxy_fallback_decode_failed group={} path={} err={}",
+                                        input.group_key,
+                                        String::from_utf8_lossy(input.query_path),
+                                        err
+                                    );
+                                }
+                                return Err(
+                                    trusted_materialized_unavailable_selected_group_tree_error(
+                                        &input.group_key,
+                                    ),
+                                );
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    Err(CnxError::Timeout)
+                        if fail_closed_after_retryable_gap
+                            && group_plan.stage_plan.trusted_materialized_ready_group
+                            && trusted_materialized_empty_group_root_requires_fail_closed(
+                                input.query_path,
+                            ) =>
+                    {
+                        if debug_materialized_route_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_query_api: pit_group_stage proxy_fallback_failed group={} path={} err=timeout-preserved",
+                                input.group_key,
+                                String::from_utf8_lossy(input.query_path),
                             );
                         }
-                        Err(_) => {}
+                        return Err(CnxError::Timeout);
                     }
+                    Err(CnxError::Timeout)
+                    | Err(CnxError::TransportClosed(_))
+                    | Err(CnxError::ProtocolViolation(_))
+                        if fail_closed_after_retryable_gap =>
+                    {
+                        if debug_materialized_route_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_query_api: pit_group_stage proxy_fallback_failed group={} path={} err=retryable-proxy-failure",
+                                input.group_key,
+                                String::from_utf8_lossy(input.query_path),
+                            );
+                        }
+                        return Err(trusted_materialized_unavailable_selected_group_tree_error(
+                            &input.group_key,
+                        ));
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -3402,7 +4675,7 @@ async fn handle_retryable_tree_pit_stage_error(
                     err
                 );
             }
-            if input.trusted_materialized_ready_group
+            if group_plan.stage_plan.trusted_materialized_ready_group
                 && trusted_materialized_empty_group_root_requires_fail_closed(input.query_path)
                 && matches!(err, CnxError::Timeout)
             {
@@ -3436,87 +4709,245 @@ async fn handle_retryable_tree_pit_stage_error(
     Ok(())
 }
 
-struct MaterializedTreeDecodeErrorInput<'a> {
-    read_class: ReadClass,
-    group_order: GroupOrder,
-    group_key: String,
-    query_path: &'a [u8],
+struct TreePitRankedGroupExecutionInput<'a> {
+    state: &'a ApiState,
+    policy: &'a ProjectionPolicy,
+    params: &'a NormalizedApiParams,
+    request_sink_status: Option<&'a SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<&'a BTreeSet<String>>,
-    prior_materialized_group_decoded: bool,
-    prior_materialized_exact_file_decoded: bool,
-    trusted_materialized_ready_group: bool,
+    observation_state: ObservationState,
+    session_plan: TreePitSessionPlan,
+    session_runtime: TreePitSessionRuntime,
+    read_class: ReadClass,
+    total_ranked_groups: usize,
 }
 
-fn handle_materialized_tree_decode_error(
-    input: MaterializedTreeDecodeErrorInput<'_>,
-    err: CnxError,
+async fn execute_tree_pit_ranked_group(
+    input: &TreePitRankedGroupExecutionInput<'_>,
+    rank_index: usize,
+    group_key: String,
     groups: &mut Vec<GroupPitSnapshot>,
     group_rank_metrics: &mut BTreeMap<String, Option<u64>>,
+    deferred_first_ranked_empty_trusted_non_root_group: &mut Option<String>,
 ) -> Result<(), CnxError> {
-    let root_path_request_scoped_omitted_ready_group = input.read_class
-        == ReadClass::TrustedMaterialized
-        && (input.query_path.is_empty() || input.query_path == b"/")
-        && input
-            .request_scoped_schedule_omitted_ready_groups
-            .is_some_and(|groups| groups.contains(&input.group_key))
-        && decode_materialized_selected_group_response_missing_same_path_payload(&err);
-    if root_path_request_scoped_omitted_ready_group {
-        push_empty_materialized_tree_group_snapshot(
-            groups,
-            group_rank_metrics,
-            input.group_order,
-            input.read_class,
-            input.group_key,
-            input.query_path,
-        );
-        return Ok(());
-    }
-
-    if input.read_class == ReadClass::TrustedMaterialized
-        && input.prior_materialized_group_decoded
-        && input.trusted_materialized_ready_group
-    {
-        if trusted_materialized_empty_group_root_requires_fail_closed(input.query_path)
-            && matches!(err, CnxError::Timeout)
-        {
-            return Err(CnxError::Timeout);
-        }
-        if !trusted_materialized_empty_group_root_requires_fail_closed(input.query_path)
-            && decode_materialized_selected_group_response_missing_same_path_payload(&err)
-        {
+    let tree_params = build_materialized_tree_request(
+        &input.params.path,
+        input.params.recursive,
+        input.params.max_depth,
+        input.read_class,
+        Some(group_key.clone()),
+    );
+    let selected_group_sink_status = if let Some(snapshot) = input.request_sink_status {
+        Some(filter_sink_status_snapshot(
+            snapshot.clone(),
+            &BTreeSet::from([group_key.clone()]),
+        ))
+    } else {
+        let allowed_groups = BTreeSet::from([group_key.clone()]);
+        let cache = input
+            .state
+            .materialized_sink_status_cache
+            .lock()
+            .map_err(|_| CnxError::Internal("materialized sink status cache lock poisoned".into()))?;
+        cache
+            .as_ref()
+            .map(|cached| filter_sink_status_snapshot(cached.snapshot.clone(), &allowed_groups))
+    };
+    let prior_materialized_group_decoded =
+        groups.iter().any(group_counts_as_prior_materialized_tree_decode);
+    let prior_materialized_exact_file_decoded =
+        groups.iter().any(group_counts_as_prior_materialized_exact_file_decode);
+    let is_last_ranked_group = rank_index + 1 == input.total_ranked_groups;
+    let group_plan = input.session_plan.selected_group_stage_plan(TreePitGroupPlanInput {
+        read_class: input.read_class,
+        observation_state: input.observation_state,
+        selected_group_sink_reports_live_materialized:
+            selected_group_sink_status_reports_live_materialized_group(
+                selected_group_sink_status.as_ref(),
+                &group_key,
+            ),
+        prior_materialized_group_decoded,
+        prior_materialized_exact_file_decoded,
+        rank_index,
+        is_last_ranked_group,
+        selected_group_sink_unready_empty: selected_group_sink_status_is_unready_empty(
+            selected_group_sink_status.as_ref(),
+            &group_key,
+        ),
+        empty_root_requires_fail_closed:
+            trusted_materialized_empty_group_root_requires_fail_closed(&input.params.path),
+    });
+    let selected_group_owner_known =
+        if group_plan.stage_plan.should_resolve_selected_group_owner {
+            match &input.state.backend {
+                QueryBackend::Route { source, .. } => materialized_owner_node_for_group(
+                    source.as_ref(),
+                    selected_group_sink_status.as_ref(),
+                    &group_key,
+                    MaterializedOwnerOmissionPolicy::Authoritative,
+                )
+                .await?
+                .is_some(),
+                QueryBackend::Local { .. } => true,
+            }
+        } else {
+            false
+        };
+    let stage_runtime = match input.session_runtime.entry_action_for(group_plan, &group_key) {
+        TreePitStageEntryAction::Query(stage_runtime) => stage_runtime,
+        TreePitStageEntryAction::PushEmptySnapshot => {
             push_empty_materialized_tree_group_snapshot(
                 groups,
                 group_rank_metrics,
-                input.group_order,
+                input.params.group_order,
                 input.read_class,
-                input.group_key,
-                input.query_path,
+                group_key,
+                &input.params.path,
             );
             return Ok(());
         }
-        return Err(trusted_materialized_unavailable_selected_group_tree_error(
-            &input.group_key,
-        ));
-    }
-
-    if input.read_class == ReadClass::TrustedMaterialized
-        && input.prior_materialized_exact_file_decoded
-        && input.trusted_materialized_ready_group
-        && decode_materialized_selected_group_response_missing_same_path_payload(&err)
-    {
-        push_empty_materialized_tree_group_snapshot(
-            groups,
-            group_rank_metrics,
-            input.group_order,
-            input.read_class,
-            input.group_key,
-            input.query_path,
+        TreePitStageEntryAction::ReturnError(err) => return Err(err),
+    };
+    let stage_timeout = stage_runtime.stage_timeout;
+    if debug_materialized_route_capture_enabled() {
+        let sink_group_summary = selected_group_sink_status
+            .as_ref()
+            .and_then(|snapshot| snapshot.groups.first())
+            .map(|group| {
+                format!(
+                    "group={} init={} live={} total={} primary={}",
+                    group.group_id,
+                    group.is_ready(),
+                    group.live_nodes,
+                    group.total_nodes,
+                    group.primary_object_ref
+                )
+            })
+            .unwrap_or_else(|| "group=<missing>".to_string());
+        eprintln!(
+            "fs_meta_query_api: pit_group_stage group={} path={} trusted_ready={} prior_decoded={} last_ranked={} stage_timeout_ms={} remaining_ms={} sink_status={}",
+            group_key,
+            String::from_utf8_lossy(&input.params.path),
+            group_plan.stage_plan.trusted_materialized_ready_group,
+            group_plan.stage_plan.prior_materialized_group_decoded,
+            is_last_ranked_group,
+            stage_timeout.as_millis(),
+            stage_runtime.remaining_session.as_millis(),
+            sink_group_summary
         );
-        return Ok(());
     }
-
-    push_materialized_tree_group_error_snapshot(groups, input.read_class, input.group_key, err);
+    let events = match run_timed_query(
+        query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
+            input.state,
+            input.policy,
+            tree_params.clone(),
+            stage_timeout,
+            selected_group_sink_status.clone(),
+            input.request_scoped_schedule_omitted_ready_groups,
+            group_plan,
+        ),
+        stage_timeout,
+    )
+    .await
+    {
+        Ok(events) => events,
+        Err(err) => match stage_runtime.query_failure_action(group_plan, err) {
+            TreePitStageQueryFailureAction::RetryableGap {
+                runtime: retryable_error_runtime,
+                err,
+            } => {
+                handle_retryable_tree_pit_stage_error(
+                    RetryableTreePitStageErrorInput {
+                        state: input.state,
+                        policy: input.policy,
+                        tree_params: tree_params.clone(),
+                        selected_group_sink_status: selected_group_sink_status.as_ref(),
+                        retryable_error_runtime,
+                        group_key,
+                        query_path: &input.params.path,
+                        read_class: input.read_class,
+                        group_order: input.params.group_order,
+                    },
+                    err,
+                    groups,
+                    group_rank_metrics,
+                )
+                .await?;
+                return Ok(());
+            }
+            TreePitStageQueryFailureAction::Fatal(err) => {
+                if debug_materialized_route_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_query_api: pit_group_stage fatal group={} path={} err={}",
+                        group_key,
+                        String::from_utf8_lossy(&input.params.path),
+                        err
+                    );
+                }
+                return Err(err);
+            }
+        },
+    };
+    apply_tree_pit_stage_execution_action(
+        resolve_tree_pit_stage_execution_action(TreePitStageExecutionInput {
+            state: input.state,
+            policy: input.policy,
+            tree_params: tree_params.clone(),
+            events: &events,
+            selected_group_sink_status: selected_group_sink_status.as_ref(),
+            group_plan,
+            stage_runtime,
+            selected_group_owner_known,
+            group_key: &group_key,
+            query_path: &input.params.path,
+            request_scoped_schedule_omitted_ready_groups: input
+                .request_scoped_schedule_omitted_ready_groups,
+        })
+        .await,
+        groups,
+        group_rank_metrics,
+        input.params.group_order,
+        input.read_class,
+        group_key,
+        &input.params.path,
+        rank_index,
+        deferred_first_ranked_empty_trusted_non_root_group,
+    )?;
     Ok(())
+}
+
+macro_rules! execute_ranked_group_loop {
+    ($state:expr, $items:expr, |$state_ident:ident, $item:pat_param| $body:block) => {{
+        let mut state = $state;
+        for $item in $items {
+            let $state_ident = &mut state;
+            $body
+        }
+        state
+    }};
+}
+
+async fn execute_tree_pit_ranked_groups(
+    input: TreePitRankedGroupExecutionInput<'_>,
+    rankings: Vec<GroupRank>,
+) -> Result<Vec<GroupPitSnapshot>, CnxError> {
+    let group_order = input.params.group_order;
+    let state = execute_ranked_group_loop!(
+        TreePitRankedGroupsState::new(&rankings),
+        rankings.into_iter().enumerate(),
+        |state, (rank_index, rank)| {
+            execute_tree_pit_ranked_group(
+                &input,
+                rank_index,
+                rank.group_key,
+                &mut state.groups,
+                &mut state.group_rank_metrics,
+                &mut state.deferred_first_ranked_empty_trusted_non_root_group,
+            )
+            .await?;
+        }
+    );
+    Ok(state.finalize(group_order))
 }
 
 fn sink_primary_owner_node_for_group(
@@ -3565,8 +4996,8 @@ fn selected_group_sink_status_reports_live_materialized_group_requires_positive_
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 9,
             estimated_heap_bytes: 0,
@@ -3595,8 +5026,8 @@ fn selected_group_sink_status_reports_live_materialized_group_prefers_exported_r
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 9,
             estimated_heap_bytes: 0,
@@ -3625,8 +5056,8 @@ fn selected_group_sink_status_is_unready_empty_prefers_exported_readiness_over_l
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
             materialized_revision: 9,
             estimated_heap_bytes: 0,
@@ -3641,90 +5072,103 @@ fn selected_group_sink_status_is_unready_empty_prefers_exported_readiness_over_l
 }
 
 #[test]
-fn trusted_materialized_group_rescue_decision_allows_empty_owner_retry_only_for_first_ready_group()
-{
-    let decision =
-        trusted_materialized_group_rescue_decision(TrustedMaterializedGroupRescueDecisionInput {
-            read_class: ReadClass::TrustedMaterialized,
-            observation_state: ObservationState::TrustedMaterialized,
-            selected_group_sink_reports_live_materialized: true,
-            prior_materialized_group_decoded: false,
-            empty_root_requires_fail_closed: false,
-        });
+fn selected_group_tree_pit_plan_allows_empty_owner_retry_only_for_first_ready_group() {
+    let plan = SelectedGroupTreePitPlan::new(SelectedGroupTreePitPlanInput {
+        read_class: ReadClass::TrustedMaterialized,
+        observation_state: ObservationState::TrustedMaterialized,
+        selected_group_sink_reports_live_materialized: true,
+        prior_materialized_group_decoded: false,
+        is_last_ranked_group: false,
+        selected_group_sink_unready_empty: false,
+        empty_root_requires_fail_closed: false,
+    });
 
     assert_eq!(
-        decision,
-        TrustedMaterializedGroupRescueDecision {
-            ready_group: true,
+        plan,
+        SelectedGroupTreePitPlan {
+            prior_materialized_group_decoded: false,
+            trusted_materialized_ready_group: true,
             requires_rescue: true,
             allow_empty_owner_retry: true,
             should_resolve_selected_group_owner: true,
             empty_root_requires_fail_closed: false,
+            stage_timeout_policy: TreePitStageTimeoutPolicy::FirstRankedTrustedReadyBudget,
+            reserve_proxy_budget: true,
         },
         "first-ranked trusted ready group should fold to a single rescue decision that keeps one empty-owner retry and selected-owner resolution"
     );
 }
 
 #[test]
-fn trusted_materialized_group_rescue_decision_keeps_owner_resolution_for_later_non_root_rescue_without_empty_owner_retry()
+fn selected_group_tree_pit_plan_keeps_owner_resolution_for_later_non_root_rescue_without_empty_owner_retry()
  {
-    let decision =
-        trusted_materialized_group_rescue_decision(TrustedMaterializedGroupRescueDecisionInput {
-            read_class: ReadClass::TrustedMaterialized,
-            observation_state: ObservationState::TrustedMaterialized,
-            selected_group_sink_reports_live_materialized: false,
-            prior_materialized_group_decoded: true,
-            empty_root_requires_fail_closed: false,
-        });
+    let plan = SelectedGroupTreePitPlan::new(SelectedGroupTreePitPlanInput {
+        read_class: ReadClass::TrustedMaterialized,
+        observation_state: ObservationState::TrustedMaterialized,
+        selected_group_sink_reports_live_materialized: false,
+        prior_materialized_group_decoded: true,
+        is_last_ranked_group: false,
+        selected_group_sink_unready_empty: false,
+        empty_root_requires_fail_closed: false,
+    });
 
     assert_eq!(
-        decision,
-        TrustedMaterializedGroupRescueDecision {
-            ready_group: false,
+        plan,
+        SelectedGroupTreePitPlan {
+            prior_materialized_group_decoded: true,
+            trusted_materialized_ready_group: false,
             requires_rescue: true,
             allow_empty_owner_retry: false,
             should_resolve_selected_group_owner: true,
             empty_root_requires_fail_closed: false,
+            stage_timeout_policy: TreePitStageTimeoutPolicy::LaterRankedTrustedGroupBudget,
+            reserve_proxy_budget: true,
         },
         "later-ranked trusted non-root rescue should still resolve the selected-group owner, but must not reopen the first-ranked empty-owner retry lane"
     );
 }
 
 #[test]
-fn trusted_materialized_group_rescue_decision_disables_non_root_rescue_when_empty_root_must_fail_closed()
- {
-    let decision =
-        trusted_materialized_group_rescue_decision(TrustedMaterializedGroupRescueDecisionInput {
-            read_class: ReadClass::TrustedMaterialized,
-            observation_state: ObservationState::TrustedMaterialized,
-            selected_group_sink_reports_live_materialized: false,
-            prior_materialized_group_decoded: true,
-            empty_root_requires_fail_closed: true,
-        });
+fn selected_group_tree_pit_plan_disables_non_root_rescue_when_empty_root_must_fail_closed() {
+    let plan = SelectedGroupTreePitPlan::new(SelectedGroupTreePitPlanInput {
+        read_class: ReadClass::TrustedMaterialized,
+        observation_state: ObservationState::TrustedMaterialized,
+        selected_group_sink_reports_live_materialized: false,
+        prior_materialized_group_decoded: true,
+        is_last_ranked_group: false,
+        selected_group_sink_unready_empty: false,
+        empty_root_requires_fail_closed: true,
+    });
 
     assert_eq!(
-        decision,
-        TrustedMaterializedGroupRescueDecision {
-            ready_group: false,
+        plan,
+        SelectedGroupTreePitPlan {
+            prior_materialized_group_decoded: true,
+            trusted_materialized_ready_group: false,
             requires_rescue: false,
             allow_empty_owner_retry: false,
             should_resolve_selected_group_owner: false,
             empty_root_requires_fail_closed: true,
+            stage_timeout_policy: TreePitStageTimeoutPolicy::DefaultCollectIdleGraceCap,
+            reserve_proxy_budget: true,
         },
         "empty-root fail-closed paths must not inherit the later-ranked non-root rescue lane"
     );
 }
 
 #[test]
-fn selected_group_owner_route_gap_proxy_policy_fail_closes_only_for_trusted_root_without_empty_owner_retry()
+fn selected_group_tree_pit_plan_fail_closes_route_gap_only_for_trusted_root_without_empty_owner_retry()
  {
-    let policy =
-        selected_group_owner_route_gap_proxy_policy(SelectedGroupOwnerRouteGapDecisionInput {
-            reserve_proxy_budget: true,
-            trusted_materialized_tree_query: true,
-            allow_empty_owner_retry: false,
-            empty_root_requires_fail_closed: true,
-        });
+    let policy = SelectedGroupTreePitPlan::new(SelectedGroupTreePitPlanInput {
+        read_class: ReadClass::TrustedMaterialized,
+        observation_state: ObservationState::TrustedMaterialized,
+        selected_group_sink_reports_live_materialized: true,
+        prior_materialized_group_decoded: true,
+        is_last_ranked_group: false,
+        selected_group_sink_unready_empty: false,
+        empty_root_requires_fail_closed: true,
+    })
+    .owner_route_gap_proxy_policy(true);
 
     assert_eq!(
         policy,
@@ -3739,14 +5183,17 @@ fn selected_group_owner_route_gap_proxy_policy_fail_closes_only_for_trusted_root
 }
 
 #[test]
-fn selected_group_owner_route_gap_proxy_policy_uses_remaining_budget_for_non_fail_closed_paths() {
-    let policy =
-        selected_group_owner_route_gap_proxy_policy(SelectedGroupOwnerRouteGapDecisionInput {
-            reserve_proxy_budget: true,
-            trusted_materialized_tree_query: true,
-            allow_empty_owner_retry: true,
-            empty_root_requires_fail_closed: true,
-        });
+fn selected_group_tree_pit_plan_uses_remaining_budget_for_non_fail_closed_route_gap_paths() {
+    let policy = SelectedGroupTreePitPlan::new(SelectedGroupTreePitPlanInput {
+        read_class: ReadClass::TrustedMaterialized,
+        observation_state: ObservationState::TrustedMaterialized,
+        selected_group_sink_reports_live_materialized: true,
+        prior_materialized_group_decoded: false,
+        is_last_ranked_group: false,
+        selected_group_sink_unready_empty: false,
+        empty_root_requires_fail_closed: true,
+    })
+    .owner_route_gap_proxy_policy(true);
 
     assert_eq!(
         policy,
@@ -3757,6 +5204,1162 @@ fn selected_group_owner_route_gap_proxy_policy_uses_remaining_budget_for_non_fai
         policy.proxy_timeout(Duration::from_secs(5)),
         Duration::from_secs(5),
         "non-fail-closed owner route gap lanes should keep the remaining proxy budget intact"
+    );
+}
+
+#[test]
+fn tree_pit_group_plan_splits_proxy_budget_across_remaining_groups() {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 3).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: true,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 1,
+            is_last_ranked_group: false,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        plan.empty_response_proxy_retry_timeout(Duration::from_millis(1800)),
+        Duration::from_millis(900),
+        "middle-ranked PIT groups should share the remaining proxy budget instead of each reopening the full fallback lane"
+    );
+}
+
+#[test]
+fn tree_pit_group_plan_caps_retryable_gap_owner_retry_for_fail_closed_prior_decode() {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 2).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: true,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 1,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: true,
+        },
+    );
+
+    assert_eq!(
+        plan.retryable_gap_owner_retry_timeout(Duration::from_secs(5)),
+        LATER_RANKED_TRUSTED_GROUP_STAGE_BUDGET,
+        "fail-closed later-ranked retry lanes should stay capped to the later-ranked trusted stage budget"
+    );
+}
+
+#[test]
+fn tree_pit_group_plan_extends_retryable_gap_proxy_budget_with_idle_grace_for_non_fail_closed_paths()
+ {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 2).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: true,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 1,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        plan.retryable_gap_proxy_timeout(Duration::from_millis(1100), Duration::from_millis(50)),
+        Duration::from_millis(1600),
+        "non-fail-closed retryable gaps should keep the session budget plus collect grace instead of collapsing to the expired stage window"
+    );
+
+    assert_eq!(
+        plan.retryable_gap_proxy_route_plan(Duration::from_millis(1100), Duration::from_millis(50)),
+        TreePitProxyRoutePlan {
+            route_timeout: Duration::from_millis(1600),
+            collect_idle_grace: SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE,
+            retry_backoff: SELECTED_GROUP_PROXY_ROUTE_RETRY_BACKOFF,
+        },
+        "retryable-gap proxy lanes should keep proxy collect-idle-grace and retry-backoff inside the planner-owned route plan",
+    );
+}
+
+#[test]
+fn tree_pit_retryable_stage_error_runtime_owns_owner_retry_timeout_from_remaining_session() {
+    let now = tokio::time::Instant::now();
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 2).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: true,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 1,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: true,
+        },
+    );
+    let runtime = TreePitStageRuntime {
+        session_deadline: now + Duration::from_millis(600),
+        stage_deadline: now + Duration::from_millis(200),
+        remaining_session: Duration::from_millis(600),
+        stage_timeout: Duration::from_millis(200),
+    }
+    .retryable_error_runtime(plan);
+
+    assert_eq!(
+        runtime.owner_retry_timeout_at(now + Duration::from_millis(100)),
+        Duration::from_millis(500),
+        "retryable stage-error owner retries should come from runtime-owned remaining-session budget instead of each error helper recomputing deadline deltas inline",
+    );
+}
+
+#[test]
+fn tree_pit_retryable_stage_error_runtime_owns_proxy_route_runtime_from_deadlines() {
+    let now = tokio::time::Instant::now();
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 2).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: true,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 1,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+    let runtime = TreePitStageRuntime {
+        session_deadline: now + Duration::from_millis(1100),
+        stage_deadline: now + Duration::from_millis(50),
+        remaining_session: Duration::from_millis(1100),
+        stage_timeout: Duration::from_millis(50),
+    }
+    .retryable_error_runtime(plan);
+
+    assert_eq!(
+        runtime.proxy_route_runtime_at(now + Duration::from_millis(300)),
+        Some(TreePitProxyRouteRuntime {
+            plan: TreePitProxyRoutePlan {
+                route_timeout: Duration::from_millis(1300),
+                collect_idle_grace: SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE,
+                retry_backoff: SELECTED_GROUP_PROXY_ROUTE_RETRY_BACKOFF,
+            },
+            route_deadline: now + Duration::from_millis(1600),
+        }),
+        "retryable stage-error proxy fallback should use runtime-owned session/stage deadlines instead of re-deriving remaining budgets inside the error helper",
+    );
+}
+
+#[test]
+fn tree_pit_group_plan_uses_stage_budget_for_fail_closed_retryable_gap_proxy_timeout() {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 2).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: true,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 1,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: true,
+        },
+    );
+
+    assert_eq!(
+        plan.retryable_gap_proxy_timeout(Duration::from_secs(4), Duration::from_millis(300)),
+        Duration::from_millis(300),
+        "fail-closed retryable gaps must stay inside the current stage budget instead of borrowing from the outer session"
+    );
+}
+
+#[test]
+fn tree_pit_group_plan_stats_rescue_proxy_fallback_then_fail_closed_for_trusted_ready_root() {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        plan.stage_plan.stats_rescue_lane(true, true, true),
+        SelectedGroupStatsRescueLane::ProxyFallbackThenFailClosed
+    );
+}
+
+#[test]
+fn tree_pit_group_plan_stats_rescue_proxy_fallback_for_trusted_ready_non_root() {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        plan.stage_plan.stats_rescue_lane(false, true, true),
+        SelectedGroupStatsRescueLane::ProxyFallback
+    );
+}
+
+#[test]
+fn tree_pit_group_plan_stats_rescue_returns_current_without_trusted_ready_group() {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        plan.stage_plan.stats_rescue_lane(true, true, true),
+        SelectedGroupStatsRescueLane::ReturnCurrent
+    );
+}
+
+#[test]
+fn tree_pit_group_plan_owner_snapshot_override_stays_inside_planner() {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 1)
+        .selected_group_owner_snapshot_plan(TreePitOwnerSnapshotPlanInput {
+            trusted_materialized_tree_query: false,
+            reserve_proxy_budget: false,
+            allow_empty_owner_retry: true,
+            empty_root_requires_fail_closed: false,
+        });
+
+    assert_eq!(
+        plan.stage_plan,
+        SelectedGroupTreePitPlan {
+            prior_materialized_group_decoded: false,
+            trusted_materialized_ready_group: false,
+            requires_rescue: true,
+            allow_empty_owner_retry: true,
+            should_resolve_selected_group_owner: true,
+            empty_root_requires_fail_closed: false,
+            stage_timeout_policy: TreePitStageTimeoutPolicy::DefaultCollectIdleGraceCap,
+            reserve_proxy_budget: false,
+        },
+        "owner-snapshot selected-group plans should fold owner-retry and proxy-reserve overrides inside the planner instead of mutating stage plan at the call site",
+    );
+}
+
+#[test]
+fn tree_pit_session_plan_caps_request_scoped_sink_status_load_budget() {
+    assert_eq!(
+        TreePitSessionPlan::new(Duration::from_secs(5), 1)
+            .request_scoped_sink_status_plan()
+            .route_timeout(),
+        REQUEST_SCOPED_SINK_STATUS_LOAD_BUDGET,
+        "request-scoped sink-status loads should stay inside the planner-owned load budget instead of re-capping query timeout at the helper call site",
+    );
+    assert_eq!(
+        TreePitSessionPlan::new(Duration::from_millis(250), 1)
+            .request_scoped_sink_status_plan()
+            .route_timeout(),
+        Duration::from_millis(250),
+        "planner-owned request-scoped sink-status loads should preserve smaller caller budgets",
+    );
+}
+
+#[test]
+fn tree_pit_session_runtime_uses_ranking_started_budget_after_retryable_rankings() {
+    let started_at = tokio::time::Instant::now();
+    let now = started_at + Duration::from_millis(200);
+    let runtime =
+        TreePitSessionPlan::new(Duration::from_secs(1), 1).runtime_from_now(started_at, true, now);
+
+    assert_eq!(
+        runtime.remaining_at(now),
+        Duration::from_millis(800),
+        "retryable ranking failures must keep PIT session timing anchored to ranking start instead of reopening a fresh session deadline after rankings complete",
+    );
+}
+
+#[test]
+fn tree_pit_session_runtime_owns_stage_deadline_from_remaining_session_budget() {
+    let now = tokio::time::Instant::now();
+    let runtime =
+        TreePitSessionPlan::new(Duration::from_secs(5), 1).runtime_from_now(now, false, now);
+    let group_plan = TreePitSessionPlan::new(Duration::from_secs(5), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        runtime.stage_runtime_for_at(group_plan, now + Duration::from_millis(300)),
+        Some(TreePitStageRuntime {
+            session_deadline: now + Duration::from_secs(5),
+            stage_deadline: now + Duration::from_millis(2800),
+            remaining_session: Duration::from_millis(4700),
+            stage_timeout: FIRST_RANKED_TRUSTED_READY_GROUP_STAGE_BUDGET,
+        }),
+        "tree PIT runtime should own remaining-session and stage-deadline calculation instead of leaving build_tree_pit_session to re-derive them inline",
+    );
+}
+
+#[test]
+fn tree_pit_session_runtime_prepares_unavailable_trusted_group_lane_from_group_plan() {
+    let now = tokio::time::Instant::now();
+    let runtime =
+        TreePitSessionPlan::new(Duration::from_millis(10), 1).runtime_from_now(now, false, now);
+    let unavailable_group = TreePitSessionPlan::new(Duration::from_millis(10), 1)
+        .selected_group_stage_plan(TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        });
+    let empty_root_group = TreePitSessionPlan::new(Duration::from_millis(10), 1)
+        .selected_group_stage_plan(TreePitGroupPlanInput {
+            empty_root_requires_fail_closed: true,
+            ..TreePitGroupPlanInput {
+                read_class: ReadClass::TrustedMaterialized,
+                observation_state: ObservationState::TrustedMaterialized,
+                selected_group_sink_reports_live_materialized: true,
+                prior_materialized_group_decoded: false,
+                prior_materialized_exact_file_decoded: false,
+                rank_index: 0,
+                is_last_ranked_group: true,
+                selected_group_sink_unready_empty: false,
+                empty_root_requires_fail_closed: false,
+            }
+        });
+
+    assert_eq!(
+        runtime.prepare_stage_for_at(unavailable_group, now + Duration::from_millis(20)),
+        TreePitStagePreparation::Unavailable(TreePitUnavailableStageLane::FailClosedUnavailable),
+        "tree PIT runtime should own the trusted-group unavailable lane instead of leaving build_tree_pit_session to branch on missing stage runtime inline",
+    );
+    assert_eq!(
+        runtime.prepare_stage_for_at(empty_root_group, now + Duration::from_millis(20)),
+        TreePitStagePreparation::Unavailable(TreePitUnavailableStageLane::FailClosedEmptyRoot),
+        "tree PIT runtime should own the trusted empty-root fail-closed lane instead of leaving build_tree_pit_session to branch on helper-local empty-root booleans",
+    );
+}
+
+#[test]
+fn tree_pit_session_runtime_prepares_unavailable_untrusted_group_as_empty_snapshot() {
+    let now = tokio::time::Instant::now();
+    let runtime =
+        TreePitSessionPlan::new(Duration::from_millis(10), 1).runtime_from_now(now, false, now);
+    let group_plan = TreePitSessionPlan::new(Duration::from_millis(10), 1)
+        .selected_group_stage_plan(TreePitGroupPlanInput {
+            read_class: ReadClass::Materialized,
+            observation_state: ObservationState::MaterializedUntrusted,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        });
+
+    assert_eq!(
+        runtime.prepare_stage_for_at(group_plan, now + Duration::from_millis(20)),
+        TreePitStagePreparation::Unavailable(TreePitUnavailableStageLane::PushEmptySnapshot),
+        "tree PIT runtime should own the untrusted empty-snapshot lane instead of leaving the main loop to special-case a missing stage runtime",
+    );
+}
+
+#[test]
+fn tree_pit_session_runtime_promotes_stage_entry_action_without_outer_lane_branching() {
+    let now = tokio::time::Instant::now();
+    let runtime =
+        TreePitSessionPlan::new(Duration::from_millis(10), 1).runtime_from_now(now, false, now);
+    let unavailable_group = TreePitSessionPlan::new(Duration::from_millis(10), 1)
+        .selected_group_stage_plan(TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        });
+    let untrusted_group = TreePitSessionPlan::new(Duration::from_millis(10), 1)
+        .selected_group_stage_plan(TreePitGroupPlanInput {
+            read_class: ReadClass::Materialized,
+            observation_state: ObservationState::MaterializedUntrusted,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        });
+
+    assert!(
+        matches!(
+            runtime.entry_action_for_at(
+                unavailable_group,
+                "group-a",
+                now + Duration::from_millis(20),
+            ),
+            TreePitStageEntryAction::ReturnError(CnxError::NotReady(message))
+                if message.contains("group-a")
+        ),
+        "tree PIT session runtime should convert unavailable trusted-group lanes into a single stage-entry action instead of leaving build_tree_pit_session to branch on raw unavailable lanes inline",
+    );
+    assert!(
+        matches!(
+            runtime.entry_action_for_at(
+                untrusted_group,
+                "group-b",
+                now + Duration::from_millis(20),
+            ),
+            TreePitStageEntryAction::PushEmptySnapshot
+        ),
+        "tree PIT session runtime should also map untrusted unavailable groups into the canonical push-empty entry action",
+    );
+}
+
+#[test]
+fn tree_pit_stage_runtime_classifies_retryable_failures_through_runtime() {
+    let now = tokio::time::Instant::now();
+    let stage_runtime = TreePitStageRuntime {
+        session_deadline: now + Duration::from_secs(2),
+        stage_deadline: now + Duration::from_millis(500),
+        remaining_session: Duration::from_secs(2),
+        stage_timeout: Duration::from_millis(500),
+    };
+    let group_plan = TreePitSessionPlan::new(Duration::from_secs(2), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert!(
+        matches!(
+            stage_runtime.query_failure_action(group_plan, CnxError::Timeout),
+            TreePitStageQueryFailureAction::RetryableGap {
+                runtime,
+                err: CnxError::Timeout,
+            } if runtime == stage_runtime.retryable_error_runtime(group_plan)
+        ),
+        "tree PIT stage runtime should own retryable timeout classification instead of leaving the main loop to pattern-match raw CnxError variants inline",
+    );
+    assert!(
+        matches!(
+            stage_runtime.query_failure_action(group_plan, CnxError::AccessDenied("denied".into())),
+            TreePitStageQueryFailureAction::Fatal(CnxError::AccessDenied(message)) if message == "denied"
+        ),
+        "tree PIT stage runtime should keep fatal-error classification in one place instead of leaving the main loop to special-case every non-retryable stage failure",
+    );
+}
+
+#[test]
+fn tree_pit_stage_runtime_routes_request_scoped_omitted_root_decode_gaps_to_empty_snapshot() {
+    let stage_runtime = TreePitStageRuntime {
+        session_deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+        stage_deadline: tokio::time::Instant::now() + Duration::from_millis(500),
+        remaining_session: Duration::from_secs(2),
+        stage_timeout: Duration::from_millis(500),
+    };
+    let group_plan = TreePitSessionPlan::new(Duration::from_secs(2), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+    let omitted_ready_groups = BTreeSet::from([String::from("group-a")]);
+
+    assert!(
+        matches!(
+            stage_runtime.decode_failure_action(
+                group_plan,
+                "group-a",
+                b"/",
+                Some(&omitted_ready_groups),
+                CnxError::Internal("tree query returned no payload for requested group".into()),
+            ),
+            TreePitStageDecodeErrorAction::PushEmptySnapshot
+        ),
+        "tree PIT stage runtime should own the request-scoped omitted-root decode-gap lane instead of leaving the main loop to funnel raw booleans through a helper-local decode-error state machine",
+    );
+}
+
+#[test]
+fn tree_pit_stage_runtime_fail_closes_trusted_ready_nonempty_decode_error_after_prior_group_decode()
+{
+    let stage_runtime = TreePitStageRuntime {
+        session_deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+        stage_deadline: tokio::time::Instant::now() + Duration::from_millis(500),
+        remaining_session: Duration::from_secs(2),
+        stage_timeout: Duration::from_millis(500),
+    };
+    let group_plan = TreePitSessionPlan::new(Duration::from_secs(2), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: true,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert!(
+        matches!(
+            stage_runtime.decode_failure_action(
+                group_plan,
+                "group-b",
+                b"/subtree",
+                None,
+                CnxError::Internal("corrupt tree payload".into()),
+            ),
+            TreePitStageDecodeErrorAction::ReturnError(CnxError::NotReady(message))
+                if message.contains("trusted-materialized selected-group tree remained unavailable")
+                    && message.contains("group-b")
+        ),
+        "tree PIT stage runtime should own the trusted-ready decode-error fail-closed lane instead of leaving build_tree_pit_session to branch on helper-local prior-decode booleans",
+    );
+}
+
+#[test]
+fn tree_pit_stage_runtime_settles_exact_file_decode_gap_as_empty_snapshot() {
+    let stage_runtime = TreePitStageRuntime {
+        session_deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+        stage_deadline: tokio::time::Instant::now() + Duration::from_millis(500),
+        remaining_session: Duration::from_secs(2),
+        stage_timeout: Duration::from_millis(500),
+    };
+    let group_plan = TreePitSessionPlan::new(Duration::from_secs(2), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: true,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert!(
+        matches!(
+            stage_runtime.decode_failure_action(
+                group_plan,
+                "group-c",
+                b"/exact-file",
+                None,
+                CnxError::Internal("tree query returned no payload for requested group".into()),
+            ),
+            TreePitStageDecodeErrorAction::PushEmptySnapshot
+        ),
+        "tree PIT stage runtime should own the exact-file decode-gap settle lane instead of leaving build_tree_pit_session to special-case prior exact-file decode flags through a helper-local decode handler",
+    );
+}
+
+#[test]
+fn status_route_plan_caps_attempt_timeout_to_canonical_cap() {
+    let plan = StatusRoutePlan::new(Duration::from_secs(30), STATUS_ROUTE_COLLECT_IDLE_GRACE);
+    let caller_capped =
+        StatusRoutePlan::caller_capped(Duration::from_secs(30), STATUS_ROUTE_COLLECT_IDLE_GRACE);
+
+    assert_eq!(
+        plan.attempt_timeout(Duration::from_secs(30)),
+        STATUS_ROUTE_ATTEMPT_TIMEOUT_CAP,
+        "status-route attempts should stay capped to the canonical attempt timeout instead of each caller re-applying its own min(...) seam",
+    );
+    assert_eq!(
+        plan.attempt_timeout(Duration::from_secs(3)),
+        Duration::from_secs(3),
+        "status-route planning should preserve smaller remaining budgets",
+    );
+    assert_eq!(
+        caller_capped.route_timeout(),
+        STATUS_ROUTE_ATTEMPT_TIMEOUT_CAP,
+        "caller-capped routed status helpers should funnel through StatusRoutePlan instead of open-coding min(timeout, cap) at each call site",
+    );
+}
+
+#[test]
+fn status_route_runtime_owns_attempt_budget_and_retry_followup() {
+    let now = tokio::time::Instant::now();
+    let runtime = StatusRoutePlan::new(Duration::from_secs(30), STATUS_ROUTE_COLLECT_IDLE_GRACE)
+        .runtime_from_now(now);
+
+    assert_eq!(
+        runtime.attempt_action_at(now),
+        StatusRouteAction::QueryAttempt(StatusRouteAttemptRuntime {
+            attempt_timeout: STATUS_ROUTE_ATTEMPT_TIMEOUT_CAP,
+            collect_idle_grace: STATUS_ROUTE_COLLECT_IDLE_GRACE,
+        }),
+        "routed status runtime should own the canonical attempt budget instead of leaving helper loops to recompute remaining and attempt timeout inline",
+    );
+    assert_eq!(
+        runtime.attempt_action_at(now + Duration::from_secs(29) + Duration::from_millis(980)),
+        StatusRouteAction::QueryAttempt(StatusRouteAttemptRuntime {
+            attempt_timeout: Duration::from_millis(20),
+            collect_idle_grace: STATUS_ROUTE_COLLECT_IDLE_GRACE,
+        }),
+        "routed status runtime should preserve the final remaining route budget for the last attempt instead of leaving helpers to open-code deadline math",
+    );
+    assert_eq!(
+        runtime.retry_action_at(now),
+        StatusRouteRetryAction::WaitUntil(now + STATUS_ROUTE_RETRY_BACKOFF),
+        "routed status runtime should own the retry wait followup instead of leaving helper loops to hot-spin on retryable continuity gaps",
+    );
+    assert_eq!(
+        runtime.retry_action_at(now + Duration::from_secs(29) + Duration::from_millis(995)),
+        StatusRouteRetryAction::WaitUntil(now + Duration::from_secs(30)),
+        "routed status runtime should cap the retry wait followup to the remaining route budget instead of letting helpers sleep past the deadline",
+    );
+    assert_eq!(
+        runtime.retry_action_at(now + Duration::from_secs(30)),
+        StatusRouteRetryAction::ReturnTimeout,
+        "routed status runtime should also own the retry followup timeout cut-off instead of leaving helper loops to branch on remaining.is_zero() after each retryable continuity gap",
+    );
+}
+
+#[test]
+fn materialized_status_load_plan_owns_canonical_route_timing() {
+    let plan = MaterializedStatusLoadPlan::default();
+
+    assert_eq!(
+        plan.source_route,
+        StatusRoutePlan::new(Duration::from_secs(30), STATUS_ROUTE_COLLECT_IDLE_GRACE),
+        "materialized status-load planning should own the canonical routed source-status timing",
+    );
+    assert_eq!(
+        plan.sink_route,
+        StatusRoutePlan::new(
+            Duration::from_secs(30),
+            LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE,
+        ),
+        "materialized status-load planning should own the canonical routed sink-status timing",
+    );
+    assert_eq!(
+        plan.explicit_empty_sink_recollect,
+        StatusRoutePlan::new(
+            EXPLICIT_EMPTY_SINK_STATUS_RECOLLECT_BUDGET,
+            LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE,
+        ),
+        "explicit-empty sink-status recollect should stay inside the planner instead of helper-local timing constants",
+    );
+}
+
+#[test]
+fn status_route_runtime_owns_non_retryable_followup_lane() {
+    let now = tokio::time::Instant::now();
+    let runtime = StatusRoutePlan::new(Duration::from_secs(30), STATUS_ROUTE_COLLECT_IDLE_GRACE)
+        .runtime_from_now(now);
+
+    assert_eq!(
+        runtime.followup_action_at(
+            now,
+            &CnxError::AccessDenied("non-retryable".into()),
+            is_retryable_source_status_continuity_gap,
+        ),
+        StatusRouteRetryAction::ReturnCurrentError,
+        "routed status runtime should own the non-retryable followup lane instead of leaving the helper loop to branch directly on the raw error",
+    );
+}
+
+#[test]
+fn materialized_status_load_plan_request_source_refresh_caps_and_preserves_caller_budget() {
+    let plan = MaterializedStatusLoadPlan::default();
+
+    assert_eq!(
+        plan.request_source_refresh_plan(Duration::from_secs(30)),
+        StatusRoutePlan::new(
+            STATUS_ROUTE_ATTEMPT_TIMEOUT_CAP,
+            STATUS_ROUTE_COLLECT_IDLE_GRACE,
+        ),
+        "request-scoped source refresh should cap larger caller budgets inside the planner",
+    );
+    assert_eq!(
+        plan.request_source_refresh_plan(Duration::from_millis(250)),
+        StatusRoutePlan::new(Duration::from_millis(250), STATUS_ROUTE_COLLECT_IDLE_GRACE),
+        "request-scoped source refresh should preserve smaller caller budgets inside the planner",
+    );
+}
+
+#[test]
+fn tree_pit_group_plan_empty_response_proxy_route_plan_caps_small_timeout() {
+    let plan = TreePitSessionPlan::new(Duration::from_millis(80), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        plan.empty_response_proxy_route_plan(Duration::from_millis(80)),
+        TreePitProxyRoutePlan {
+            route_timeout: Duration::from_millis(80),
+            collect_idle_grace: Duration::from_millis(80),
+            retry_backoff: Duration::from_millis(80),
+        },
+        "proxy route planning should cap collect-idle-grace and retry-backoff to the remaining proxy timeout instead of letting the helper own extra timing",
+    );
+}
+
+#[test]
+fn tree_pit_proxy_route_runtime_owns_attempt_budget_and_retry_backoff() {
+    let now = tokio::time::Instant::now();
+    let runtime = TreePitProxyRoutePlan::new(Duration::from_secs(3)).runtime_from_now(now);
+
+    assert_eq!(
+        runtime.attempt_at(now + Duration::from_millis(200)),
+        Some(TreePitProxyAttemptRuntime {
+            attempt_timeout: Duration::from_millis(2800),
+            collect_idle_grace: SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE,
+            retry_backoff: SELECTED_GROUP_PROXY_ROUTE_RETRY_BACKOFF,
+        }),
+        "generic-proxy route runtime should own attempt timeout, collect-idle-grace, and retry-backoff from the remaining route budget instead of recomputing them inline inside the helper loop",
+    );
+
+    assert_eq!(
+        runtime.attempt_at(now + Duration::from_millis(2970)),
+        Some(TreePitProxyAttemptRuntime {
+            attempt_timeout: Duration::from_millis(30),
+            collect_idle_grace: Duration::from_millis(30),
+            retry_backoff: Duration::from_millis(30),
+        }),
+        "generic-proxy route runtime should cap collect-idle-grace and retry-backoff to the final remaining route budget",
+    );
+}
+
+#[test]
+fn tree_pit_proxy_route_runtime_owns_retry_wait_action() {
+    let now = tokio::time::Instant::now();
+    let runtime = TreePitProxyRoutePlan::new(Duration::from_millis(30)).runtime_from_now(now);
+
+    assert_eq!(
+        runtime.retry_action_at(now),
+        TreePitProxyRouteAction::WaitUntil(now + Duration::from_millis(30)),
+        "generic-proxy runtime should hand product code a canonical wait-until retry action instead of leaving the helper loop to sleep on a bare backoff duration",
+    );
+}
+
+#[test]
+fn tree_pit_proxy_route_runtime_owns_non_retryable_followup_lane() {
+    let now = tokio::time::Instant::now();
+    let runtime = TreePitProxyRoutePlan::new(Duration::from_millis(30)).runtime_from_now(now);
+
+    assert_eq!(
+        runtime.followup_action_at(now, &CnxError::ProtocolViolation("bad payload".into())),
+        TreePitProxyRouteAction::ReturnCurrentError,
+        "generic-proxy runtime should own the non-retryable followup lane instead of leaving the helper loop to branch directly on the raw error",
+    );
+}
+
+#[test]
+fn tree_pit_group_plan_owner_attempt_timeout_reserves_proxy_budget_for_non_fail_closed_ready_group()
+{
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        plan.owner_attempt_timeout(Duration::from_millis(250)),
+        Duration::from_millis(125),
+        "selected-group owner attempts should keep proxy reserve inside the planner for non-fail-closed ready-root lanes instead of helper-local timeout math",
+    );
+}
+
+#[test]
+fn tree_pit_group_plan_owner_attempt_timeout_preserves_small_fail_closed_budget() {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: true,
+        },
+    );
+
+    assert_eq!(
+        plan.owner_attempt_timeout(Duration::from_millis(250)),
+        Duration::from_millis(250),
+        "fail-closed ready-root lanes must keep the full remaining owner budget instead of reserving proxy time that cannot be spent",
+    );
+}
+
+#[test]
+fn tree_pit_group_plan_owner_route_plan_owns_owner_route_collect_idle_grace() {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        plan.owner_route_plan(Duration::from_millis(250)),
+        SelectedGroupOwnerRoutePlan {
+            route_timeout: Duration::from_millis(125),
+            collect_idle_grace: SELECTED_GROUP_OWNER_ROUTE_COLLECT_IDLE_GRACE,
+        },
+        "selected-group owner route planning should own the owner attempt timeout and collect-idle-grace together instead of leaving the route helper to recalculate collect-idle-grace from a bare timeout",
+    );
+
+    assert_eq!(
+        plan.owner_route_plan(Duration::from_millis(80)),
+        SelectedGroupOwnerRoutePlan {
+            route_timeout: Duration::from_millis(80),
+            collect_idle_grace: Duration::from_millis(80),
+        },
+        "planner-owned owner route timing should preserve smaller remaining budgets when the capped owner attempt is below the canonical collect-idle-grace",
+    );
+}
+
+#[test]
+fn tree_pit_group_plan_owner_empty_tree_retry_timeout_caps_to_selected_group_budget() {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert_eq!(
+        plan.owner_empty_tree_retry_timeout(Duration::from_secs(5)),
+        TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET,
+        "owner empty-tree retries should use the planner-owned selected-group retry budget instead of helper-local caps",
+    );
+    assert_eq!(
+        plan.owner_empty_tree_retry_timeout(Duration::from_millis(80)),
+        Duration::from_millis(80),
+        "planner-owned owner empty-tree retries should preserve smaller remaining budgets",
+    );
+}
+
+#[test]
+fn force_find_session_plan_caps_route_timing_to_caller_timeout() {
+    assert_eq!(
+        ForceFindSessionPlan::new(Duration::from_millis(80)).route_plan(),
+        ForceFindRoutePlan {
+            route_timeout: Duration::from_millis(80),
+            collect_idle_grace: Duration::from_millis(80),
+            retry_backoff: Duration::from_millis(80),
+            min_inflight_hold: Duration::from_millis(80),
+        },
+        "force-find planner should cap collect-idle-grace, retry-backoff, and inflight-hold to the caller timeout instead of leaving helper-local timing seams",
+    );
+    assert_eq!(
+        ForceFindSessionPlan::new(Duration::from_secs(10)).route_plan(),
+        ForceFindRoutePlan {
+            route_timeout: Duration::from_secs(10),
+            collect_idle_grace: FORCE_FIND_ROUTE_COLLECT_IDLE_GRACE,
+            retry_backoff: FORCE_FIND_ROUTE_RETRY_BACKOFF,
+            min_inflight_hold: FORCE_FIND_MIN_INFLIGHT_HOLD,
+        },
+        "force-find planner should preserve the canonical route timing when the caller budget is large enough",
+    );
+}
+
+#[test]
+fn force_find_route_runtime_owns_remaining_budget_and_retry_lane() {
+    let now = tokio::time::Instant::now();
+    let runtime = ForceFindSessionPlan::new(Duration::from_secs(3))
+        .route_plan()
+        .runtime_from_now(now);
+
+    assert_eq!(
+        runtime.attempt_at(now + Duration::from_millis(200)),
+        Some(ForceFindRouteAttemptRuntime {
+            route_plan: ForceFindRoutePlan {
+                route_timeout: Duration::from_millis(2800),
+                collect_idle_grace: Duration::from_millis(2800),
+                retry_backoff: FORCE_FIND_ROUTE_RETRY_BACKOFF,
+                min_inflight_hold: FORCE_FIND_MIN_INFLIGHT_HOLD,
+            },
+            remaining: Duration::from_millis(2800),
+        }),
+        "force-find route runtime should own remaining route budget instead of leaving the main loop to re-derive rebudgeted route timing inline",
+    );
+
+    let final_attempt = runtime
+        .attempt_at(now + Duration::from_millis(2970))
+        .expect("final force-find attempt runtime");
+    assert_eq!(
+        final_attempt,
+        ForceFindRouteAttemptRuntime {
+            route_plan: ForceFindRoutePlan {
+                route_timeout: Duration::from_millis(30),
+                collect_idle_grace: Duration::from_millis(30),
+                retry_backoff: Duration::from_millis(30),
+                min_inflight_hold: Duration::from_millis(30),
+            },
+            remaining: Duration::from_millis(30),
+        },
+        "force-find route runtime should cap collect-idle-grace, retry-backoff, and inflight-hold to the final remaining route budget",
+    );
+    assert_eq!(
+        final_attempt.tree_route_error_lane(&CnxError::Timeout, false),
+        ForceFindTreeRouteErrorLane::RetryCurrentRoute,
+        "force-find runtime should keep retry-lane ownership with the attempt runtime instead of helper-local remaining-budget math",
+    );
+}
+
+#[test]
+fn force_find_route_runtime_owns_tree_followup_action_and_backoff() {
+    let now = tokio::time::Instant::now();
+    let runtime = ForceFindSessionPlan::new(Duration::from_secs(3))
+        .route_plan()
+        .runtime_from_now(now);
+
+    assert_eq!(
+        runtime.tree_followup_action_at(
+            now,
+            &CnxError::PeerError("selected_group matched no group".into()),
+            true,
+        ),
+        ForceFindTreeRouteAction::QueryGenericFallback {
+            route_plan: ForceFindRoutePlan {
+                route_timeout: Duration::from_secs(3),
+                collect_idle_grace: Duration::from_secs(3),
+                retry_backoff: FORCE_FIND_ROUTE_RETRY_BACKOFF,
+                min_inflight_hold: FORCE_FIND_MIN_INFLIGHT_HOLD,
+            },
+            after_runner_gap: true,
+        },
+        "force-find runtime should hand product code a canonical fallback action instead of making the helper loop re-derive the runner-gap route pivot from remaining budget plus raw error",
+    );
+
+    let final_runtime = ForceFindSessionPlan::new(Duration::from_millis(30))
+        .route_plan()
+        .runtime_from_now(now);
+    assert_eq!(
+        final_runtime.tree_followup_action_at(now, &CnxError::Timeout, false),
+        ForceFindTreeRouteAction::WaitUntil(now + Duration::from_millis(30)),
+        "force-find runtime should own retry wait-until capping for the last route budget instead of leaving the helper loop to recompute sleep timing inline",
+    );
+}
+
+#[test]
+fn force_find_route_plan_owns_inflight_hold_wait_action() {
+    let now = tokio::time::Instant::now();
+    let plan = ForceFindSessionPlan::new(Duration::from_millis(30)).route_plan();
+
+    assert_eq!(
+        plan.inflight_hold_action_at(now, true),
+        ForceFindInFlightHoldAction::WaitUntil(now + Duration::from_millis(30)),
+        "force-find route planning should own the inflight hold wait action instead of leaving product code to sleep on a bare hold duration",
+    );
+    assert_eq!(
+        plan.inflight_hold_action_at(now, false),
+        ForceFindInFlightHoldAction::ReturnNow,
+        "force-find route planning should skip inflight hold when no group lock is actually shared",
+    );
+}
+
+#[test]
+fn force_find_route_machine_replans_selected_runner_after_wait() {
+    let now = tokio::time::Instant::now();
+    let machine = ForceFindRouteMachine::new(
+        ForceFindSessionPlan::new(Duration::from_secs(3))
+            .route_plan()
+            .runtime_from_now(now),
+    );
+
+    assert_eq!(
+        machine.followup_phase_at(now, &CnxError::Timeout, false),
+        ForceFindRouteMachinePhase::WaitForForceFindReadiness(
+            now + FORCE_FIND_ROUTE_RETRY_BACKOFF
+        ),
+        "force-find route machine should own the fallback retry wait phase instead of leaving retry timing in the generic collect loop",
+    );
+    assert_eq!(
+        machine.phase_after_wait(),
+        ForceFindRouteMachinePhase::PlanSelectedRunner,
+        "force-find route machine should return to planner-owned runner selection after a retry wait instead of resuming through a generic action loop",
+    );
+}
+
+#[test]
+fn force_find_route_machine_routes_selected_runner_gap_to_generic_fallback() {
+    let now = tokio::time::Instant::now();
+    let machine = ForceFindRouteMachine::new(
+        ForceFindSessionPlan::new(Duration::from_secs(3))
+            .route_plan()
+            .runtime_from_now(now),
+    );
+
+    assert_eq!(
+        machine.followup_phase_at(
+            now,
+            &CnxError::PeerError("selected_group matched no group".into()),
+            true,
+        ),
+        ForceFindRouteMachinePhase::FallbackToGeneric {
+            route_plan: ForceFindRoutePlan {
+                route_timeout: Duration::from_secs(3),
+                collect_idle_grace: Duration::from_secs(3),
+                retry_backoff: FORCE_FIND_ROUTE_RETRY_BACKOFF,
+                min_inflight_hold: FORCE_FIND_MIN_INFLIGHT_HOLD,
+            },
+            after_runner_gap: true,
+        },
+        "force-find route machine should own the selected-runner-gap fallback phase instead of leaving reroute branching in the executor body",
+    );
+}
+
+#[test]
+fn force_find_route_runtime_owns_tree_entry_action() {
+    let now = tokio::time::Instant::now();
+    let runtime = ForceFindSessionPlan::new(Duration::from_secs(3))
+        .route_plan()
+        .runtime_from_now(now);
+
+    assert_eq!(
+        runtime.tree_entry_action_at(now, Some(NodeId("node-a".into()))),
+        ForceFindTreeRouteAction::QueryViaSelectedRunner {
+            node_id: NodeId("node-a".into()),
+            route_plan: ForceFindRoutePlan {
+                route_timeout: Duration::from_secs(3),
+                collect_idle_grace: Duration::from_secs(3),
+                retry_backoff: FORCE_FIND_ROUTE_RETRY_BACKOFF,
+                min_inflight_hold: FORCE_FIND_MIN_INFLIGHT_HOLD,
+            },
+        },
+        "force-find runtime should own the selected-runner route entry plan instead of leaving the helper loop to re-derive route timeout from remaining budget inline",
+    );
+    assert_eq!(
+        runtime.tree_entry_action_at(now, None),
+        ForceFindTreeRouteAction::QueryGenericFallback {
+            route_plan: ForceFindRoutePlan {
+                route_timeout: Duration::from_secs(3),
+                collect_idle_grace: Duration::from_secs(3),
+                retry_backoff: FORCE_FIND_ROUTE_RETRY_BACKOFF,
+                min_inflight_hold: FORCE_FIND_MIN_INFLIGHT_HOLD,
+            },
+            after_runner_gap: false,
+        },
+        "force-find runtime should own the generic fallback entry plan instead of leaving the helper loop to branch on selected-runner presence and open-code the same route plan",
+    );
+}
+
+#[test]
+fn force_find_route_plan_tree_error_lane_routes_runner_gaps_through_canonical_fallback() {
+    let plan = ForceFindSessionPlan::new(Duration::from_secs(5)).route_plan();
+
+    assert_eq!(
+        plan.tree_route_error_lane(
+            &CnxError::PeerError("selected_group matched no group".into()),
+            true,
+            Duration::from_secs(2),
+        ),
+        ForceFindTreeRouteErrorLane::FallbackThenRetry,
+        "force-find tree runner gaps should route through the planner-owned generic fallback lane instead of leaving the main loop to special-case runner-gap recovery",
+    );
+    assert_eq!(
+        plan.tree_route_error_lane(&CnxError::Timeout, false, Duration::from_secs(2)),
+        ForceFindTreeRouteErrorLane::RetryCurrentRoute,
+        "force-find tree fallback retries should stay inside the planner-owned retry-current-route lane for retryable fallback errors",
+    );
+    assert_eq!(
+        plan.tree_route_error_lane(
+            &CnxError::AccessDenied("denied".into()),
+            true,
+            Duration::from_secs(2),
+        ),
+        ForceFindTreeRouteErrorLane::Fail,
+        "non-retryable force-find tree route errors must fail directly instead of reopening fallback or retry lanes",
     );
 }
 
@@ -3779,8 +6382,8 @@ fn merge_request_scoped_materialized_sink_status_snapshot_prefers_later_ready_ow
             blind_spot_count: 0,
             shadow_time_us: 9,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 7,
             estimated_heap_bytes: 0,
@@ -3803,8 +6406,8 @@ fn merge_request_scoped_materialized_sink_status_snapshot_prefers_later_ready_ow
             blind_spot_count: 0,
             shadow_time_us: 9,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 7,
             estimated_heap_bytes: 0,
@@ -3847,8 +6450,8 @@ fn merge_request_scoped_materialized_sink_status_snapshot_keeps_loaded_owner_whe
             blind_spot_count: 0,
             shadow_time_us: 9,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 7,
             estimated_heap_bytes: 0,
@@ -3867,8 +6470,8 @@ fn merge_request_scoped_materialized_sink_status_snapshot_keeps_loaded_owner_whe
             blind_spot_count: 0,
             shadow_time_us: 9,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 7,
             estimated_heap_bytes: 0,
@@ -3911,8 +6514,8 @@ fn request_scoped_schedule_omitted_ready_groups_includes_loaded_ready_group_when
             blind_spot_count: 0,
             shadow_time_us: 9,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 7,
             estimated_heap_bytes: 0,
@@ -3935,9 +6538,9 @@ fn request_scoped_schedule_omitted_ready_groups_includes_loaded_ready_group_when
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 7,
             estimated_heap_bytes: 0,
         }],
@@ -4102,8 +6705,8 @@ fn materialized_owner_node_for_group_falls_back_to_source_primary_when_request_s
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -4130,58 +6733,6 @@ fn materialized_owner_node_for_group_falls_back_to_source_primary_when_request_s
     );
 }
 
-fn selected_group_owner_attempt_timeout_from_remaining(
-    remaining: Duration,
-    prefer_proxy_budget: bool,
-) -> Duration {
-    if remaining.is_zero() {
-        return Duration::ZERO;
-    }
-    let owner_min_budget = std::cmp::min(
-        remaining,
-        if prefer_proxy_budget {
-            TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET
-        } else {
-            TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET
-        },
-    );
-    let proxy_reserve = std::cmp::min(
-        remaining.checked_div(2).unwrap_or_default(),
-        std::cmp::min(remaining, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET),
-    );
-    let capped_proxy_reserve =
-        std::cmp::min(proxy_reserve, remaining.saturating_sub(owner_min_budget));
-    remaining.saturating_sub(capped_proxy_reserve)
-}
-
-fn selected_group_owner_attempt_timeout(
-    deadline: tokio::time::Instant,
-    prefer_proxy_budget: bool,
-) -> Duration {
-    let remaining = deadline
-        .checked_duration_since(tokio::time::Instant::now())
-        .unwrap_or_default();
-    selected_group_owner_attempt_timeout_from_remaining(remaining, prefer_proxy_budget)
-}
-
-fn selected_group_stage_reserves_proxy_budget(
-    read_class: ReadClass,
-    trusted_materialized_ready_group: bool,
-    prior_materialized_group_decoded: bool,
-    is_last_ranked_group: bool,
-    path: &[u8],
-) -> bool {
-    if read_class == ReadClass::TrustedMaterialized
-        && trusted_materialized_ready_group
-        && !prior_materialized_group_decoded
-    {
-        return !trusted_materialized_empty_group_root_requires_fail_closed(path);
-    }
-    !(read_class != ReadClass::TrustedMaterialized
-        && is_last_ranked_group
-        && prior_materialized_group_decoded)
-}
-
 fn group_counts_as_prior_materialized_tree_decode(group: &GroupPitSnapshot) -> bool {
     group.status == "ok"
         && group
@@ -4206,61 +6757,18 @@ fn decode_materialized_selected_group_response_missing_same_path_payload(err: &C
     )
 }
 
-fn selected_group_empty_ready_tree_settles_after_initial_owner_retry(
-    allow_empty_owner_retry: bool,
-    _path: &[u8],
-) -> bool {
-    // First-ranked trusted non-root lanes still need the generic proxy after the
-    // bounded owner retry. The PIT layer can later settle an empty proxy payload
-    // for legitimate missing-subtree/exact-file cases without short-circuiting
-    // recovery here.
-    let _ = allow_empty_owner_retry;
-    false
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SelectedGroupOwnerEmptyTreeRescueDecision {
+struct SelectedGroupOwnerEmptyTreeRescuePlan {
     lane: EmptyTreeRescueLane,
     attempt_primary_owner_reroute: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SelectedGroupOwnerEmptyTreeRescueDecisionInput {
+struct SelectedGroupOwnerEmptyTreeRescueFacts {
     owner_response_is_empty: bool,
     requires_proxy_fallback: bool,
     requires_primary_owner_reroute: bool,
     selected_group_sink_reports_live_materialized: bool,
-    reserve_proxy_budget: bool,
-    allow_empty_owner_retry: bool,
-    settle_after_initial_owner_retry: bool,
-}
-
-fn selected_group_owner_empty_tree_rescue_decision(
-    input: SelectedGroupOwnerEmptyTreeRescueDecisionInput,
-) -> SelectedGroupOwnerEmptyTreeRescueDecision {
-    let attempt_primary_owner_reroute = input.requires_primary_owner_reroute;
-    let lane = decide_empty_tree_rescue_lane(EmptyTreeRescueLaneFacts {
-        allow_owner_retry: input.owner_response_is_empty
-            && !input.requires_proxy_fallback
-            && input.allow_empty_owner_retry
-            && input.selected_group_sink_reports_live_materialized,
-        settle_after_owner_retry: input.settle_after_initial_owner_retry,
-        attempt_proxy_fallback: (input.requires_proxy_fallback
-            && (input.reserve_proxy_budget || input.allow_empty_owner_retry))
-            || (input.owner_response_is_empty
-                && !input.requires_proxy_fallback
-                && input.allow_empty_owner_retry
-                && input.selected_group_sink_reports_live_materialized
-                && !input.settle_after_initial_owner_retry),
-        fail_closed_without_proxy_budget: input.requires_proxy_fallback
-            && !input.reserve_proxy_budget
-            && !input.allow_empty_owner_retry,
-    });
-
-    SelectedGroupOwnerEmptyTreeRescueDecision {
-        lane,
-        attempt_primary_owner_reroute,
-    }
 }
 
 fn selected_group_events_require_proxy_fallback(
@@ -4307,9 +6815,13 @@ async fn maybe_reroute_selected_group_primary_owner(
     if remaining.is_zero() {
         return Ok(None);
     }
-    let primary_events =
-        route_materialized_events_via_node(boundary, primary_node_id, params.clone(), remaining)
-            .await?;
+    let primary_events = route_materialized_events_via_node(
+        boundary,
+        primary_node_id,
+        params.clone(),
+        SelectedGroupOwnerRoutePlan::new(remaining),
+    )
+    .await?;
     if selected_group_events_require_proxy_fallback(
         policy,
         params,
@@ -4333,6 +6845,7 @@ async fn proxy_selected_group_empty_tree_rescue(
     selected_group_sink_status: Option<&SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
     group_id: &str,
+    group_plan: TreePitGroupPlan,
     owner_attempt: &SelectedGroupOwnerAttempt,
     allow_empty_owner_retry: bool,
     return_none_when_proxy_budget_exhausted: bool,
@@ -4350,11 +6863,12 @@ async fn proxy_selected_group_empty_tree_rescue(
         };
     }
 
+    let proxy_route_plan = group_plan.empty_response_proxy_route_plan(remaining);
     let proxy_events = query_materialized_events_via_generic_proxy(
         boundary.clone(),
         origin_id.clone(),
         params.clone(),
-        remaining,
+        proxy_route_plan.runtime(),
     )
     .await?;
     if !selected_group_events_require_proxy_fallback(
@@ -4375,8 +6889,7 @@ async fn proxy_selected_group_empty_tree_rescue(
         .checked_duration_since(tokio::time::Instant::now())
         .unwrap_or_default();
     if !remaining.is_zero() {
-        let retry_owner_timeout =
-            std::cmp::min(remaining, TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET);
+        let retry_owner_timeout = group_plan.owner_empty_tree_retry_timeout(remaining);
         if !retry_owner_timeout.is_zero() {
             let retry_events = query_materialized_events_via_selected_group_owner_attempt(
                 owner_attempt,
@@ -4414,12 +6927,13 @@ async fn execute_selected_group_owner_empty_tree_rescue(
     selected_group_sink_status: Option<&SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
     group_id: &str,
+    group_plan: TreePitGroupPlan,
     owner_attempt: &SelectedGroupOwnerAttempt,
-    rescue_decision: SelectedGroupOwnerEmptyTreeRescueDecision,
+    rescue_plan: SelectedGroupOwnerEmptyTreeRescuePlan,
     events: Vec<Event>,
     allow_empty_owner_retry: bool,
 ) -> Result<Vec<Event>, CnxError> {
-    match rescue_decision.lane {
+    match rescue_plan.lane {
         EmptyTreeRescueLane::ReturnCurrent => Ok(events),
         EmptyTreeRescueLane::FailClosed => Err(
             trusted_materialized_empty_selected_group_tree_error(group_id),
@@ -4432,8 +6946,7 @@ async fn execute_selected_group_owner_empty_tree_rescue(
             if remaining.is_zero() {
                 return Ok(events);
             }
-            let retry_owner_timeout =
-                std::cmp::min(remaining, TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET);
+            let retry_owner_timeout = group_plan.owner_empty_tree_retry_timeout(remaining);
             if retry_owner_timeout.is_zero() {
                 return Ok(events);
             }
@@ -4455,10 +6968,7 @@ async fn execute_selected_group_owner_empty_tree_rescue(
                     ) {
                         return Ok(retry_events);
                     }
-                    if matches!(
-                        rescue_decision.lane,
-                        EmptyTreeRescueLane::OwnerRetryThenSettle
-                    ) {
+                    if matches!(rescue_plan.lane, EmptyTreeRescueLane::OwnerRetryThenSettle) {
                         return Ok(retry_events);
                     }
                     match proxy_selected_group_empty_tree_rescue(
@@ -4471,6 +6981,7 @@ async fn execute_selected_group_owner_empty_tree_rescue(
                         selected_group_sink_status,
                         request_scoped_schedule_omitted_ready_groups,
                         group_id,
+                        group_plan,
                         owner_attempt,
                         allow_empty_owner_retry,
                         true,
@@ -4484,10 +6995,7 @@ async fn execute_selected_group_owner_empty_tree_rescue(
                 Err(CnxError::Timeout)
                 | Err(CnxError::TransportClosed(_))
                 | Err(CnxError::ProtocolViolation(_)) => {
-                    if matches!(
-                        rescue_decision.lane,
-                        EmptyTreeRescueLane::OwnerRetryThenSettle
-                    ) {
+                    if matches!(rescue_plan.lane, EmptyTreeRescueLane::OwnerRetryThenSettle) {
                         return Ok(events);
                     }
                     match proxy_selected_group_empty_tree_rescue(
@@ -4500,6 +7008,7 @@ async fn execute_selected_group_owner_empty_tree_rescue(
                         selected_group_sink_status,
                         request_scoped_schedule_omitted_ready_groups,
                         group_id,
+                        group_plan,
                         owner_attempt,
                         allow_empty_owner_retry,
                         true,
@@ -4523,6 +7032,7 @@ async fn execute_selected_group_owner_empty_tree_rescue(
             selected_group_sink_status,
             request_scoped_schedule_omitted_ready_groups,
             group_id,
+            group_plan,
             owner_attempt,
             allow_empty_owner_retry,
             false,
@@ -4536,7 +7046,7 @@ async fn query_materialized_events_via_generic_proxy(
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
     params: InternalQueryRequest,
-    timeout: Duration,
+    runtime: TreePitProxyRouteRuntime,
 ) -> Result<Vec<Event>, CnxError> {
     if debug_materialized_route_capture_enabled() {
         eprintln!(
@@ -4544,71 +7054,100 @@ async fn query_materialized_events_via_generic_proxy(
             params.scope.selected_group,
             params.scope.recursive,
             String::from_utf8_lossy(&params.scope.path),
-            timeout.as_millis()
+            runtime.route_timeout().as_millis()
         );
     }
     let payload = rmp_serde::to_vec(&params)
         .map_err(|err| CnxError::Internal(format!("encode materialized query failed: {err}")))?;
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut last_err = None::<CnxError>;
-    loop {
-        let remaining = deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .unwrap_or_default();
-        if remaining.is_zero() {
-            return Err(last_err.unwrap_or(CnxError::Timeout));
-        }
-        let collect_idle_grace =
-            std::cmp::min(SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE, remaining);
-        let adapter = exchange_host_adapter(
-            boundary.clone(),
-            origin_id.clone(),
-            default_route_bindings(),
-        );
-        match adapter
-            .call_collect(
-                ROUTE_TOKEN_FS_META_INTERNAL,
-                METHOD_SINK_QUERY_PROXY,
-                Bytes::from(payload.clone()),
-                remaining,
-                collect_idle_grace,
-            )
-            .await
-        {
+    let result = execute_tree_pit_proxy_route_collect(
+        boundary,
+        origin_id,
+        Bytes::from(payload),
+        runtime,
+    )
+    .await;
+    if debug_materialized_route_capture_enabled() {
+        match &result {
             Ok(events) => {
-                if debug_materialized_route_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_query_api: materialized_proxy_capture done selected_group={:?} events={} origins={:?}",
-                        params.scope.selected_group,
-                        events.len(),
-                        summarize_event_counts_by_origin(&events)
-                    );
-                }
-                return Ok(events);
-            }
-            Err(err) if is_retryable_materialized_proxy_continuity_gap(&err) => {
-                if debug_materialized_route_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_query_api: materialized_proxy_capture retry selected_group={:?} remaining_ms={} err={}",
-                        params.scope.selected_group,
-                        remaining.as_millis(),
-                        err
-                    );
-                }
-                last_err = Some(err);
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                eprintln!(
+                    "fs_meta_query_api: materialized_proxy_capture done selected_group={:?} events={} origins={:?}",
+                    params.scope.selected_group,
+                    events.len(),
+                    summarize_event_counts_by_origin(events)
+                );
             }
             Err(err) => {
-                if debug_materialized_route_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_query_api: materialized_proxy_capture failed selected_group={:?} err={}",
-                        params.scope.selected_group, err
-                    );
-                }
-                return Err(err);
+                eprintln!(
+                    "fs_meta_query_api: materialized_proxy_capture failed selected_group={:?} err={}",
+                    params.scope.selected_group, err
+                );
             }
         }
     }
+    result
+}
+
+async fn execute_tree_pit_proxy_route_collect(
+    boundary: Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    payload: Bytes,
+    runtime: TreePitProxyRouteRuntime,
+) -> Result<Vec<Event>, CnxError> {
+    execute_runtime_collect_loop(
+        runtime.entry_action(),
+        |_last_err| async move { Ok(runtime.entry_action()) },
+        |action, last_err| {
+            let boundary = boundary.clone();
+            let origin_id = origin_id.clone();
+            let payload = payload.clone();
+            async move {
+                match action {
+                    TreePitProxyRouteAction::ReturnTimeout
+                    | TreePitProxyRouteAction::ReturnCurrentError => {
+                        Ok(RuntimeCollectLoopStep::Return(Err(take_last_route_error_or(
+                            last_err,
+                            || CnxError::Timeout,
+                        ))))
+                    }
+                    TreePitProxyRouteAction::WaitUntil(until) => {
+                        Ok(RuntimeCollectLoopStep::WaitUntil { until, last_err })
+                    }
+                    TreePitProxyRouteAction::QueryAttempt(attempt_runtime) => {
+                        let adapter = exchange_host_adapter(
+                            boundary,
+                            origin_id,
+                            default_route_bindings(),
+                        );
+                        match adapter
+                            .call_collect(
+                                ROUTE_TOKEN_FS_META_INTERNAL,
+                                METHOD_SINK_QUERY_PROXY,
+                                payload,
+                                attempt_runtime.attempt_timeout,
+                                attempt_runtime.collect_idle_grace,
+                            )
+                            .await
+                        {
+                            Ok(events) => Ok(RuntimeCollectLoopStep::Return(Ok(events))),
+                            Err(err) => {
+                                let last_err = Some(err);
+                                Ok(RuntimeCollectLoopStep::Continue {
+                                    next_action: runtime.followup_action_at(
+                                        tokio::time::Instant::now(),
+                                        last_err
+                                            .as_ref()
+                                            .expect("generic-proxy followup owns current error"),
+                                    ),
+                                    last_err,
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+    .await
 }
 
 fn is_retryable_materialized_proxy_continuity_gap(err: &CnxError) -> bool {
@@ -4625,6 +7164,7 @@ fn is_retryable_materialized_proxy_continuity_gap(err: &CnxError) -> bool {
         )
 }
 
+#[cfg(test)]
 async fn query_materialized_events_with_selected_group_owner_snapshot(
     state: &ApiState,
     policy: &ProjectionPolicy,
@@ -4634,6 +7174,20 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
     reserve_proxy_budget: bool,
     allow_empty_owner_retry: bool,
 ) -> Result<Vec<Event>, CnxError> {
+    let trusted_materialized_tree_query = matches!(params.op, QueryOp::Tree)
+        && params
+            .tree_options
+            .as_ref()
+            .is_some_and(|options| options.read_class == ReadClass::TrustedMaterialized);
+    let group_plan = TreePitSessionPlan::new(timeout, 1).selected_group_owner_snapshot_plan(
+        TreePitOwnerSnapshotPlanInput {
+            trusted_materialized_tree_query,
+            reserve_proxy_budget,
+            allow_empty_owner_retry,
+            empty_root_requires_fail_closed: trusted_materialized_tree_query
+                && trusted_materialized_empty_group_root_requires_fail_closed(&params.scope.path),
+        },
+    );
     query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
         state,
         policy,
@@ -4641,9 +7195,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
         timeout,
         selected_group_sink_status,
         None,
-        reserve_proxy_budget,
-        allow_empty_owner_retry,
-        false,
+        group_plan,
     )
     .await
 }
@@ -4675,8 +7227,13 @@ async fn query_materialized_events_via_selected_group_owner_attempt(
             run_timed_query(sink.materialized_query(params), timeout).await
         }
         SelectedGroupOwnerAttempt::Routed(node_id) => {
-            route_materialized_events_via_node(boundary, node_id.clone(), params.clone(), timeout)
-                .await
+            route_materialized_events_via_node(
+                boundary,
+                node_id.clone(),
+                params.clone(),
+                SelectedGroupOwnerRoutePlan::new(timeout),
+            )
+            .await
         }
     }
 }
@@ -4693,15 +7250,13 @@ async fn finalize_selected_group_owner_success(
     group_id: &str,
     owner_attempt: &SelectedGroupOwnerAttempt,
     events: Vec<Event>,
-    reserve_proxy_budget: bool,
-    allow_empty_owner_retry: bool,
-    prior_materialized_exact_file_decoded: bool,
+    group_plan: TreePitGroupPlan,
 ) -> Result<Vec<Event>, CnxError> {
     if trusted_materialized_exact_file_lane_settles_empty_after_prior_decode(
         params,
         selected_group_sink_status,
         group_id,
-        prior_materialized_exact_file_decoded,
+        group_plan.prior_materialized_exact_file_decoded,
     ) {
         if selected_group_materialized_tree_payload_is_empty(
             policy,
@@ -4754,22 +7309,13 @@ async fn finalize_selected_group_owner_success(
             selected_group_sink_status,
             group_id,
         );
-    let settle_after_initial_owner_retry =
-        selected_group_empty_ready_tree_settles_after_initial_owner_retry(
-            allow_empty_owner_retry,
-            &params.scope.path,
-        );
-    let rescue_decision = selected_group_owner_empty_tree_rescue_decision(
-        SelectedGroupOwnerEmptyTreeRescueDecisionInput {
+    let rescue_plan =
+        group_plan.owner_empty_tree_rescue_plan(SelectedGroupOwnerEmptyTreeRescueFacts {
             owner_response_is_empty,
             requires_proxy_fallback,
             requires_primary_owner_reroute,
             selected_group_sink_reports_live_materialized,
-            reserve_proxy_budget,
-            allow_empty_owner_retry,
-            settle_after_initial_owner_retry,
-        },
-    );
+        });
     let owner_node_id = owner_attempt.owner_node_id(&origin_id);
 
     if let Some(primary_events) = maybe_reroute_selected_group_primary_owner(
@@ -4781,7 +7327,7 @@ async fn finalize_selected_group_owner_success(
         request_scoped_schedule_omitted_ready_groups,
         group_id,
         &owner_node_id,
-        rescue_decision.attempt_primary_owner_reroute,
+        rescue_plan.attempt_primary_owner_reroute,
     )
     .await?
     {
@@ -4798,10 +7344,11 @@ async fn finalize_selected_group_owner_success(
         selected_group_sink_status,
         request_scoped_schedule_omitted_ready_groups,
         group_id,
+        group_plan,
         owner_attempt,
-        rescue_decision,
+        rescue_plan,
         events,
-        allow_empty_owner_retry,
+        group_plan.stage_plan.allow_empty_owner_retry,
     )
     .await
 }
@@ -4813,9 +7360,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
     timeout: Duration,
     selected_group_sink_status: Option<SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
-    reserve_proxy_budget: bool,
-    allow_empty_owner_retry: bool,
-    prior_materialized_exact_file_decoded: bool,
+    group_plan: TreePitGroupPlan,
 ) -> Result<Vec<Event>, CnxError> {
     match &state.backend {
         QueryBackend::Route {
@@ -4850,18 +7395,11 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                 .await?
             {
                 if node_id == *origin_id {
-                    let owner_attempt_timeout = if reserve_proxy_budget {
-                        selected_group_owner_attempt_timeout(
-                            deadline,
-                            !trusted_materialized_empty_group_root_requires_fail_closed(
-                                &params.scope.path,
-                            ),
-                        )
-                    } else {
+                    let owner_attempt_timeout = group_plan.owner_attempt_timeout(
                         deadline
                             .checked_duration_since(tokio::time::Instant::now())
-                            .unwrap_or_default()
-                    };
+                            .unwrap_or_default(),
+                    );
                     let events = query_materialized_events_via_selected_group_owner_attempt(
                         &SelectedGroupOwnerAttempt::Local,
                         sink,
@@ -4882,29 +7420,20 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                         group_id,
                         &SelectedGroupOwnerAttempt::Local,
                         events,
-                        reserve_proxy_budget,
-                        allow_empty_owner_retry,
-                        prior_materialized_exact_file_decoded,
+                        group_plan,
                     )
                     .await;
                 }
-                let owner_attempt_timeout = if reserve_proxy_budget {
-                    selected_group_owner_attempt_timeout(
-                        deadline,
-                        !trusted_materialized_empty_group_root_requires_fail_closed(
-                            &params.scope.path,
-                        ),
-                    )
-                } else {
+                let owner_route_plan = group_plan.owner_route_plan(
                     deadline
                         .checked_duration_since(tokio::time::Instant::now())
-                        .unwrap_or_default()
-                };
+                        .unwrap_or_default(),
+                );
                 match route_materialized_events_via_node(
                     boundary.clone(),
                     node_id.clone(),
                     params.clone(),
-                    owner_attempt_timeout,
+                    owner_route_plan,
                 )
                 .await
                 {
@@ -4921,9 +7450,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                             group_id,
                             &SelectedGroupOwnerAttempt::Routed(node_id.clone()),
                             events,
-                            reserve_proxy_budget,
-                            allow_empty_owner_retry,
-                            prior_materialized_exact_file_decoded,
+                            group_plan,
                         )
                         .await;
                     }
@@ -4940,26 +7467,21 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                             && params.tree_options.as_ref().is_some_and(|options| {
                                 options.read_class == ReadClass::TrustedMaterialized
                             });
-                        let route_gap_proxy_policy = selected_group_owner_route_gap_proxy_policy(
-                            SelectedGroupOwnerRouteGapDecisionInput {
-                                reserve_proxy_budget,
-                                trusted_materialized_tree_query,
-                                allow_empty_owner_retry,
-                                empty_root_requires_fail_closed:
-                                    trusted_materialized_empty_group_root_requires_fail_closed(
-                                        &params.scope.path,
-                                    ),
-                            },
+                        let route_gap_proxy_policy = group_plan
+                            .stage_plan
+                            .owner_route_gap_proxy_policy(trusted_materialized_tree_query);
+                        let proxy_timeout = group_plan.owner_route_gap_proxy_route_plan(
+                            remaining,
+                            trusted_materialized_tree_query,
                         );
-                        let proxy_timeout = route_gap_proxy_policy.proxy_timeout(remaining);
-                        if proxy_timeout.is_zero() {
+                        if proxy_timeout.route_timeout().is_zero() {
                             return Err(CnxError::Timeout);
                         }
                         let proxy_events = match query_materialized_events_via_generic_proxy(
                             boundary.clone(),
                             origin_id.clone(),
                             params.clone(),
-                            proxy_timeout,
+                            proxy_timeout.runtime(),
                         )
                         .await
                         {
@@ -5002,7 +7524,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                                     boundary.clone(),
                                     primary_node_id,
                                     params.clone(),
-                                    remaining,
+                                    SelectedGroupOwnerRoutePlan::new(remaining),
                                 )
                                 .await?;
                                 if !selected_group_materialized_tree_payload_is_empty(
@@ -5048,11 +7570,12 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                 if remaining.is_zero() {
                     return Err(CnxError::Timeout);
                 }
+                let proxy_route_plan = group_plan.direct_proxy_route_plan(remaining);
                 return query_materialized_events_via_generic_proxy(
                     boundary.clone(),
                     origin_id.clone(),
                     params,
-                    remaining,
+                    proxy_route_plan.runtime(),
                 )
                 .await;
             }
@@ -5093,7 +7616,7 @@ async fn query_materialized_events_via_selected_group_owner_direct(
                     boundary.clone(),
                     node_id,
                     params,
-                    timeout,
+                    SelectedGroupOwnerRoutePlan::new(timeout),
                 )
                 .await;
             }
@@ -5108,7 +7631,7 @@ async fn query_materialized_events_via_selected_group_owner_direct(
 async fn query_force_find_events(
     backend: QueryBackend,
     params: InternalQueryRequest,
-    timeout: Duration,
+    route_plan: ForceFindRoutePlan,
 ) -> Result<Vec<Event>, CnxError> {
     eprintln!(
         "fs_meta_query_api: query_force_find_events start selected_group={:?} recursive={} path={}",
@@ -5118,7 +7641,8 @@ async fn query_force_find_events(
     );
     match backend {
         QueryBackend::Local { source, .. } => {
-            let result = run_timed_query(source.force_find(&params), timeout).await;
+            let result =
+                run_timed_query(source.force_find(&params), route_plan.route_timeout()).await;
             eprintln!(
                 "fs_meta_query_api: query_force_find_events local done ok={}",
                 result.is_ok()
@@ -5140,8 +7664,8 @@ async fn query_force_find_events(
                     ROUTE_TOKEN_FS_META_INTERNAL,
                     METHOD_SOURCE_FIND,
                     Bytes::from(payload),
-                    timeout,
-                    FORCE_FIND_ROUTE_COLLECT_IDLE_GRACE,
+                    route_plan.route_timeout(),
+                    route_plan.collect_idle_grace(),
                 )
                 .await
             .map_err(|err| {
@@ -5168,7 +7692,7 @@ async fn route_force_find_events_via_node(
     boundary: Arc<dyn ChannelIoSubset>,
     node_id: NodeId,
     params: InternalQueryRequest,
-    timeout: Duration,
+    route_plan: ForceFindRoutePlan,
 ) -> Result<Vec<Event>, CnxError> {
     let adapter = exchange_host_adapter(boundary, node_id, default_route_bindings());
     let payload = rmp_serde::to_vec_named(&params)
@@ -5178,8 +7702,8 @@ async fn route_force_find_events_via_node(
             ROUTE_TOKEN_FS_META_INTERNAL,
             METHOD_SOURCE_FIND,
             Bytes::from(payload),
-            timeout,
-            FORCE_FIND_ROUTE_COLLECT_IDLE_GRACE,
+            route_plan.route_timeout(),
+            route_plan.collect_idle_grace(),
         )
         .await
 }
@@ -5317,7 +7841,7 @@ async fn collect_group_rankings(
                         state,
                         path,
                         recursive,
-                        query_timeout,
+                        ForceFindSessionPlan::new(query_timeout).route_plan(),
                         &group_key,
                         explicit_group == Some(group_key.as_str()),
                     )
@@ -5488,7 +8012,7 @@ async fn materialized_target_groups(
             ) => route_sink_status_snapshot(
                 boundary.clone(),
                 origin_id.clone(),
-                std::cmp::min(timeout, Duration::from_secs(5)),
+                StatusRoutePlan::caller_capped(timeout, STATUS_ROUTE_COLLECT_IDLE_GRACE),
             )
             .await
             .ok()
@@ -5692,7 +8216,7 @@ async fn query_force_find_group_stats(
     state: &ApiState,
     path: &[u8],
     recursive: bool,
-    timeout: Duration,
+    route_plan: ForceFindRoutePlan,
     group_id: &str,
     strict_conflict: bool,
 ) -> Result<Vec<Event>, CnxError> {
@@ -5702,119 +8226,77 @@ async fn query_force_find_group_stats(
         Err(err) => return Err(err),
     };
     let request = build_force_find_stats_request(path, recursive, Some(group_id.to_string()));
-    let events = match &state.backend {
+    let events =
+        execute_force_find_group_stats_collect(state, request, route_plan, group_id, recursive)
+            .await?;
+    apply_force_find_inflight_hold(route_plan, !_guard.groups.is_empty()).await;
+    Ok(events)
+}
+
+async fn execute_force_find_group_stats_collect(
+    state: &ApiState,
+    request: InternalQueryRequest,
+    route_plan: ForceFindRoutePlan,
+    group_id: &str,
+    recursive: bool,
+) -> Result<Vec<Event>, CnxError> {
+    match &state.backend {
         QueryBackend::Route {
             boundary, source, ..
-        } => {
-            if let Some(node_id) =
-                select_force_find_runner_node_for_group(state, source.as_ref(), group_id).await?
-            {
-                if debug_force_find_route_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_query_api: force-find stats via_node begin group={} node={} recursive={} path={}",
-                        group_id,
-                        node_id.0,
-                        recursive,
-                        String::from_utf8_lossy(path)
-                    );
-                }
-                let result = run_timed_query(
-                    route_force_find_events_via_node(
-                        boundary.clone(),
-                        node_id.clone(),
-                        request.clone(),
-                        timeout,
-                    ),
-                    timeout,
-                )
-                .await;
-                match result {
-                    Ok(events) => {
-                        if debug_force_find_route_capture_enabled() {
-                            eprintln!(
-                                "fs_meta_query_api: force-find stats via_node done group={} node={} events={} origins={:?}",
-                                group_id,
-                                node_id.0,
-                                events.len(),
-                                summarize_event_counts_by_origin(&events)
-                            );
-                        }
-                        events
-                    }
-                    Err(err) => {
-                        if debug_force_find_route_capture_enabled() {
-                            eprintln!(
-                                "fs_meta_query_api: force-find stats via_node failed group={} node={} err={}",
-                                group_id, node_id.0, err
-                            );
-                        }
-                        return Err(err);
-                    }
-                }
-            } else {
-                if debug_force_find_route_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_query_api: force-find stats route_fallback begin group={} recursive={} path={}",
-                        group_id,
-                        recursive,
-                        String::from_utf8_lossy(path)
-                    );
-                }
-                let result = query_force_find_events(state.backend.clone(), request, timeout).await;
-                match result {
-                    Ok(events) => {
-                        if debug_force_find_route_capture_enabled() {
-                            eprintln!(
-                                "fs_meta_query_api: force-find stats route_fallback done group={} events={} origins={:?}",
-                                group_id,
-                                events.len(),
-                                summarize_event_counts_by_origin(&events)
-                            );
-                        }
-                        events
-                    }
-                    Err(err) => {
-                        if debug_force_find_route_capture_enabled() {
-                            eprintln!(
-                                "fs_meta_query_api: force-find stats route_fallback failed group={} err={}",
-                                group_id, err
-                            );
-                        }
-                        return Err(err);
-                    }
-                }
-            }
-        }
+        } => execute_force_find_group_stats_route_collect(
+            state,
+            boundary.clone(),
+            source.as_ref(),
+            request,
+            route_plan,
+            group_id,
+            recursive,
+        )
+        .await,
         _ => {
-            let result = query_force_find_events(state.backend.clone(), request, timeout).await;
-            match result {
-                Ok(events) => {
-                    if debug_force_find_route_capture_enabled() {
+            let result = query_force_find_events(state.backend.clone(), request, route_plan).await;
+            if debug_force_find_route_capture_enabled() {
+                match &result {
+                    Ok(events) => {
                         eprintln!(
                             "fs_meta_query_api: force-find stats local done group={} events={} origins={:?}",
                             group_id,
                             events.len(),
-                            summarize_event_counts_by_origin(&events)
+                            summarize_event_counts_by_origin(events)
                         );
                     }
-                    events
-                }
-                Err(err) => {
-                    if debug_force_find_route_capture_enabled() {
+                    Err(err) => {
                         eprintln!(
                             "fs_meta_query_api: force-find stats local failed group={} err={}",
                             group_id, err
                         );
                     }
-                    return Err(err);
                 }
             }
+            result
         }
-    };
-    if !_guard.groups.is_empty() {
-        tokio::time::sleep(FORCE_FIND_MIN_INFLIGHT_HOLD).await;
     }
-    Ok(events)
+}
+
+async fn execute_force_find_group_stats_route_collect(
+    state: &ApiState,
+    boundary: Arc<dyn ChannelIoSubset>,
+    source: &SourceFacade,
+    request: InternalQueryRequest,
+    route_plan: ForceFindRoutePlan,
+    group_id: &str,
+    recursive: bool,
+) -> Result<Vec<Event>, CnxError> {
+    execute_force_find_group_route_collect(
+        state,
+        boundary,
+        source,
+        request,
+        route_plan.runtime(),
+        group_id,
+        ForceFindRouteCollectKind::Stats { recursive },
+    )
+    .await
 }
 
 fn is_retryable_force_find_route_error(err: &CnxError) -> bool {
@@ -5828,12 +8310,302 @@ fn is_retryable_force_find_runner_gap(err: &CnxError) -> bool {
     matches!(err, CnxError::PeerError(message) if message.contains("selected_group matched no group"))
 }
 
+async fn query_force_find_group_tree_on_route(
+    state: &ApiState,
+    boundary: Arc<dyn ChannelIoSubset>,
+    source: &SourceFacade,
+    request: InternalQueryRequest,
+    route_plan: ForceFindRoutePlan,
+    group_id: &str,
+    recursive: bool,
+    max_depth: Option<usize>,
+    strict_conflict: bool,
+) -> Result<Vec<Event>, CnxError> {
+    execute_force_find_group_route_collect(
+        state,
+        boundary,
+        source,
+        request,
+        route_plan.runtime(),
+        group_id,
+        ForceFindRouteCollectKind::Tree {
+            recursive,
+            max_depth,
+            strict_conflict,
+        },
+    )
+    .await
+}
+
+async fn plan_force_find_group_route_phase(
+    state: &ApiState,
+    source: &SourceFacade,
+    machine: ForceFindRouteMachine,
+    group_id: &str,
+) -> Result<ForceFindRouteMachinePhase, CnxError> {
+    Ok(machine.phase_for_selected_runner_at(
+        tokio::time::Instant::now(),
+        select_force_find_runner_node_for_group(state, source, group_id).await?,
+    ))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ForceFindRouteCollectKind {
+    Tree {
+        recursive: bool,
+        max_depth: Option<usize>,
+        strict_conflict: bool,
+    },
+    Stats {
+        recursive: bool,
+    },
+}
+
+impl ForceFindRouteCollectKind {
+    fn label(self) -> &'static str {
+        match self {
+            ForceFindRouteCollectKind::Tree { .. } => "tree",
+            ForceFindRouteCollectKind::Stats { .. } => "stats",
+        }
+    }
+
+    fn recursive(self) -> bool {
+        match self {
+            ForceFindRouteCollectKind::Tree { recursive, .. }
+            | ForceFindRouteCollectKind::Stats { recursive } => recursive,
+        }
+    }
+
+    fn max_depth(self) -> Option<usize> {
+        match self {
+            ForceFindRouteCollectKind::Tree { max_depth, .. } => max_depth,
+            ForceFindRouteCollectKind::Stats { .. } => None,
+        }
+    }
+
+    fn strict_conflict(self) -> bool {
+        match self {
+            ForceFindRouteCollectKind::Tree {
+                strict_conflict, ..
+            } => strict_conflict,
+            ForceFindRouteCollectKind::Stats { .. } => false,
+        }
+    }
+}
+
+async fn execute_force_find_group_route_collect(
+    state: &ApiState,
+    boundary: Arc<dyn ChannelIoSubset>,
+    source: &SourceFacade,
+    request: InternalQueryRequest,
+    runtime: ForceFindRouteRuntime,
+    group_id: &str,
+    kind: ForceFindRouteCollectKind,
+) -> Result<Vec<Event>, CnxError> {
+    let machine = ForceFindRouteMachine::new(runtime);
+    let mut phase = machine.entry_phase();
+    let mut last_err = None::<CnxError>;
+    loop {
+        match phase {
+            ForceFindRouteMachinePhase::PlanSelectedRunner => {
+                phase = plan_force_find_group_route_phase(state, source, machine, group_id).await?;
+            }
+            ForceFindRouteMachinePhase::AttemptSelectedRunner {
+                node_id,
+                route_plan,
+            } => {
+                let remaining = route_plan.route_timeout();
+                if debug_force_find_route_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_query_api: force-find {} via_node begin group={} node={} recursive={} max_depth={:?} strict_conflict={} path={} timeout_ms={}",
+                        kind.label(),
+                        group_id,
+                        node_id.0,
+                        kind.recursive(),
+                        kind.max_depth(),
+                        kind.strict_conflict(),
+                        String::from_utf8_lossy(&request.scope.path),
+                        remaining.as_millis(),
+                    );
+                }
+                match run_timed_query(
+                    route_force_find_events_via_node(
+                        boundary.clone(),
+                        node_id.clone(),
+                        request.clone(),
+                        route_plan,
+                    ),
+                    route_plan.route_timeout(),
+                )
+                .await
+                {
+                    Ok(events) => {
+                        if debug_force_find_route_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_query_api: force-find {} via_node done group={} node={} events={} origins={:?}",
+                                kind.label(),
+                                group_id,
+                                node_id.0,
+                                events.len(),
+                                summarize_event_counts_by_origin(&events)
+                            );
+                        }
+                        return Ok(events);
+                    }
+                    Err(err) => {
+                        let next_phase =
+                            machine.followup_phase_at(tokio::time::Instant::now(), &err, true);
+                        if debug_force_find_route_capture_enabled() {
+                            match &next_phase {
+                                ForceFindRouteMachinePhase::FallbackToGeneric {
+                                    route_plan: fallback_route_plan,
+                                    after_runner_gap,
+                                } => {
+                                    let route_action = if is_retryable_force_find_runner_gap(&err) {
+                                        "reroute"
+                                    } else {
+                                        "retry"
+                                    };
+                                    eprintln!(
+                                        "fs_meta_query_api: force-find {} via_node {} group={} node={} err={}",
+                                        kind.label(),
+                                        route_action,
+                                        group_id,
+                                        node_id.0,
+                                        err
+                                    );
+                                    eprintln!(
+                                        "fs_meta_query_api: force-find {} route_fallback begin group={} recursive={} max_depth={:?} strict_conflict={} path={} timeout_ms={} after_runner_gap={}",
+                                        kind.label(),
+                                        group_id,
+                                        kind.recursive(),
+                                        kind.max_depth(),
+                                        kind.strict_conflict(),
+                                        String::from_utf8_lossy(&request.scope.path),
+                                        fallback_route_plan.route_timeout().as_millis(),
+                                        after_runner_gap,
+                                    );
+                                }
+                                ForceFindRouteMachinePhase::Failed(_)
+                                | ForceFindRouteMachinePhase::WaitForForceFindReadiness(_) => {
+                                    eprintln!(
+                                        "fs_meta_query_api: force-find {} via_node failed group={} node={} err={}",
+                                        kind.label(),
+                                        group_id,
+                                        node_id.0,
+                                        err
+                                    );
+                                }
+                                ForceFindRouteMachinePhase::PlanSelectedRunner
+                                | ForceFindRouteMachinePhase::AttemptSelectedRunner { .. } => {}
+                            }
+                        }
+                        last_err = Some(err);
+                        phase = next_phase;
+                    }
+                }
+            }
+            ForceFindRouteMachinePhase::FallbackToGeneric {
+                route_plan,
+                after_runner_gap,
+            } => {
+                let remaining = route_plan.route_timeout();
+                if debug_force_find_route_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_query_api: force-find {} route_fallback begin group={} recursive={} max_depth={:?} strict_conflict={} path={} timeout_ms={} after_runner_gap={}",
+                        kind.label(),
+                        group_id,
+                        kind.recursive(),
+                        kind.max_depth(),
+                        kind.strict_conflict(),
+                        String::from_utf8_lossy(&request.scope.path),
+                        remaining.as_millis(),
+                        after_runner_gap,
+                    );
+                }
+                match query_force_find_events(state.backend.clone(), request.clone(), route_plan)
+                    .await
+                {
+                    Ok(events) => {
+                        if debug_force_find_route_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_query_api: force-find {} route_fallback done group={} events={} origins={:?} after_runner_gap={}",
+                                kind.label(),
+                                group_id,
+                                events.len(),
+                                summarize_event_counts_by_origin(&events),
+                                after_runner_gap,
+                            );
+                        }
+                        return Ok(events);
+                    }
+                    Err(err) => {
+                        let next_phase =
+                            machine.followup_phase_at(tokio::time::Instant::now(), &err, false);
+                        if debug_force_find_route_capture_enabled() {
+                            let route_action = if is_retryable_force_find_runner_gap(&err) {
+                                "reroute"
+                            } else {
+                                "retry"
+                            };
+                            match &next_phase {
+                                ForceFindRouteMachinePhase::WaitForForceFindReadiness(_) => {
+                                    eprintln!(
+                                        "fs_meta_query_api: force-find {} route_fallback {} group={} err={} after_runner_gap={}",
+                                        kind.label(),
+                                        route_action,
+                                        group_id,
+                                        err,
+                                        after_runner_gap
+                                    );
+                                }
+                                ForceFindRouteMachinePhase::Failed(_) => {
+                                    eprintln!(
+                                        "fs_meta_query_api: force-find {} route_fallback failed group={} err={} after_runner_gap={}",
+                                        kind.label(),
+                                        group_id,
+                                        err,
+                                        after_runner_gap
+                                    );
+                                }
+                                ForceFindRouteMachinePhase::PlanSelectedRunner
+                                | ForceFindRouteMachinePhase::AttemptSelectedRunner { .. }
+                                | ForceFindRouteMachinePhase::FallbackToGeneric { .. } => {}
+                            }
+                        }
+                        last_err = Some(err);
+                        phase = next_phase;
+                    }
+                }
+            }
+            ForceFindRouteMachinePhase::WaitForForceFindReadiness(until) => {
+                tokio::time::sleep_until(until).await;
+                phase = machine.phase_after_wait();
+            }
+            ForceFindRouteMachinePhase::Failed(terminal) => {
+                return Err(match terminal {
+                    ForceFindRouteMachineTerminal::Timeout => {
+                        take_last_route_error_or(last_err, || CnxError::Timeout)
+                    }
+                    ForceFindRouteMachineTerminal::CurrentError => {
+                        take_last_route_error_or(last_err, || {
+                            CnxError::Internal(
+                                "force-find route machine escaped its source error context".into(),
+                            )
+                        })
+                    }
+                });
+            }
+        }
+    }
+}
+
 async fn query_force_find_group_tree(
     state: &ApiState,
     path: &[u8],
     recursive: bool,
     max_depth: Option<usize>,
-    timeout: Duration,
+    route_plan: ForceFindRoutePlan,
     group_id: &str,
     strict_conflict: bool,
 ) -> Result<Vec<Event>, CnxError> {
@@ -5844,198 +8616,25 @@ async fn query_force_find_group_tree(
     };
     let request =
         build_force_find_tree_request(path, recursive, max_depth, Some(group_id.to_string()));
-    let deadline = tokio::time::Instant::now() + timeout;
     let events = match &state.backend {
         QueryBackend::Route {
             boundary, source, ..
-        } => loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(CnxError::Timeout);
-            }
-            if let Some(node_id) =
-                select_force_find_runner_node_for_group(state, source.as_ref(), group_id).await?
-            {
-                if debug_force_find_route_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_query_api: force-find tree via_node begin group={} node={} recursive={} max_depth={:?} strict_conflict={} path={} timeout_ms={}",
-                        group_id,
-                        node_id.0,
-                        recursive,
-                        max_depth,
-                        strict_conflict,
-                        String::from_utf8_lossy(path),
-                        remaining.as_millis(),
-                    );
-                }
-                let result = run_timed_query(
-                    route_force_find_events_via_node(
-                        boundary.clone(),
-                        node_id.clone(),
-                        request.clone(),
-                        remaining,
-                    ),
-                    remaining,
-                )
-                .await;
-                match result {
-                    Ok(events) => {
-                        if debug_force_find_route_capture_enabled() {
-                            eprintln!(
-                                "fs_meta_query_api: force-find tree via_node done group={} node={} events={} origins={:?}",
-                                group_id,
-                                node_id.0,
-                                events.len(),
-                                summarize_event_counts_by_origin(&events)
-                            );
-                        }
-                        break events;
-                    }
-                    Err(err)
-                        if (is_retryable_force_find_route_error(&err)
-                            || is_retryable_force_find_runner_gap(&err))
-                            && tokio::time::Instant::now() < deadline =>
-                    {
-                        if debug_force_find_route_capture_enabled() {
-                            let action = if is_retryable_force_find_runner_gap(&err) {
-                                "reroute"
-                            } else {
-                                "retry"
-                            };
-                            eprintln!(
-                                "fs_meta_query_api: force-find tree via_node {} group={} node={} err={}",
-                                action, group_id, node_id.0, err
-                            );
-                        }
-                        let fallback_remaining =
-                            deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if fallback_remaining.is_zero() {
-                            return Err(err);
-                        }
-                        if debug_force_find_route_capture_enabled() {
-                            eprintln!(
-                                "fs_meta_query_api: force-find tree route_fallback begin group={} recursive={} max_depth={:?} strict_conflict={} path={} timeout_ms={} after_runner_gap=true",
-                                group_id,
-                                recursive,
-                                max_depth,
-                                strict_conflict,
-                                String::from_utf8_lossy(path),
-                                fallback_remaining.as_millis(),
-                            );
-                        }
-                        match query_force_find_events(
-                            state.backend.clone(),
-                            request.clone(),
-                            fallback_remaining,
-                        )
-                        .await
-                        {
-                            Ok(events) => {
-                                if debug_force_find_route_capture_enabled() {
-                                    eprintln!(
-                                        "fs_meta_query_api: force-find tree route_fallback done group={} events={} origins={:?} after_runner_gap=true",
-                                        group_id,
-                                        events.len(),
-                                        summarize_event_counts_by_origin(&events)
-                                    );
-                                }
-                                break events;
-                            }
-                            Err(fallback_err)
-                                if (is_retryable_force_find_route_error(&fallback_err)
-                                    || is_retryable_force_find_runner_gap(&fallback_err))
-                                    && tokio::time::Instant::now() < deadline =>
-                            {
-                                if debug_force_find_route_capture_enabled() {
-                                    eprintln!(
-                                        "fs_meta_query_api: force-find tree route_fallback retry group={} err={} after_runner_gap=true",
-                                        group_id, fallback_err
-                                    );
-                                }
-                            }
-                            Err(fallback_err) => {
-                                if debug_force_find_route_capture_enabled() {
-                                    eprintln!(
-                                        "fs_meta_query_api: force-find tree route_fallback failed group={} err={} after_runner_gap=true",
-                                        group_id, fallback_err
-                                    );
-                                }
-                                return Err(fallback_err);
-                            }
-                        }
-                        tokio::time::sleep(FORCE_FIND_ROUTE_RETRY_BACKOFF).await;
-                        continue;
-                    }
-                    Err(err) => {
-                        if debug_force_find_route_capture_enabled() {
-                            eprintln!(
-                                "fs_meta_query_api: force-find tree via_node failed group={} node={} err={}",
-                                group_id, node_id.0, err
-                            );
-                        }
-                        return Err(err);
-                    }
-                }
-            } else {
-                if debug_force_find_route_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_query_api: force-find tree route_fallback begin group={} recursive={} max_depth={:?} strict_conflict={} path={} timeout_ms={}",
-                        group_id,
-                        recursive,
-                        max_depth,
-                        strict_conflict,
-                        String::from_utf8_lossy(path),
-                        remaining.as_millis(),
-                    );
-                }
-                let result =
-                    query_force_find_events(state.backend.clone(), request.clone(), remaining)
-                        .await;
-                match result {
-                    Ok(events) => {
-                        if debug_force_find_route_capture_enabled() {
-                            eprintln!(
-                                "fs_meta_query_api: force-find tree route_fallback done group={} events={} origins={:?}",
-                                group_id,
-                                events.len(),
-                                summarize_event_counts_by_origin(&events)
-                            );
-                        }
-                        break events;
-                    }
-                    Err(err)
-                        if (is_retryable_force_find_route_error(&err)
-                            || is_retryable_force_find_runner_gap(&err))
-                            && tokio::time::Instant::now() < deadline =>
-                    {
-                        if debug_force_find_route_capture_enabled() {
-                            let action = if is_retryable_force_find_runner_gap(&err) {
-                                "reroute"
-                            } else {
-                                "retry"
-                            };
-                            eprintln!(
-                                "fs_meta_query_api: force-find tree route_fallback {} group={} err={}",
-                                action, group_id, err
-                            );
-                        }
-                        tokio::time::sleep(FORCE_FIND_ROUTE_RETRY_BACKOFF).await;
-                        continue;
-                    }
-                    Err(err) => {
-                        if debug_force_find_route_capture_enabled() {
-                            eprintln!(
-                                "fs_meta_query_api: force-find tree route_fallback failed group={} err={}",
-                                group_id, err
-                            );
-                        }
-                        return Err(err);
-                    }
-                }
-            }
-        },
+        } => {
+            query_force_find_group_tree_on_route(
+                state,
+                boundary.clone(),
+                source.as_ref(),
+                request.clone(),
+                route_plan,
+                group_id,
+                recursive,
+                max_depth,
+                strict_conflict,
+            )
+            .await?
+        }
         _ => {
-            let result = query_force_find_events(state.backend.clone(), request, timeout).await;
+            let result = query_force_find_events(state.backend.clone(), request, route_plan).await;
             match result {
                 Ok(events) => {
                     if debug_force_find_route_capture_enabled() {
@@ -6060,10 +8659,151 @@ async fn query_force_find_group_tree(
             }
         }
     };
-    if !_guard.groups.is_empty() {
-        tokio::time::sleep(FORCE_FIND_MIN_INFLIGHT_HOLD).await;
-    }
+    apply_force_find_inflight_hold(route_plan, !_guard.groups.is_empty()).await;
     Ok(events)
+}
+
+async fn apply_force_find_inflight_hold(route_plan: ForceFindRoutePlan, inflight: bool) {
+    match route_plan.inflight_hold_action(inflight) {
+        ForceFindInFlightHoldAction::ReturnNow => {}
+        ForceFindInFlightHoldAction::WaitUntil(until) => {
+            tokio::time::sleep_until(until).await;
+        }
+    }
+}
+
+fn build_force_find_group_error_snapshot(group_key: String, err: CnxError) -> GroupPitSnapshot {
+    GroupPitSnapshot {
+        group: group_key,
+        status: "error",
+        reliable: false,
+        unreliable_reason: None,
+        stability: TreeStability::not_evaluated(),
+        meta: PitMetadata {
+            read_class: ReadClass::Fresh,
+            metadata_available: false,
+            withheld_reason: Some("group-payload-missing"),
+        },
+        root: None,
+        entries: Vec::new(),
+        errors: vec![err.to_string()],
+    }
+}
+
+struct ForceFindRankedGroupExecutionInput<'a> {
+    state: &'a ApiState,
+    policy: &'a ProjectionPolicy,
+    params: &'a NormalizedApiParams,
+    route_plan: ForceFindRoutePlan,
+}
+
+async fn execute_force_find_ranked_group(
+    input: &ForceFindRankedGroupExecutionInput<'_>,
+    rank: GroupRank,
+) -> Result<GroupPitSnapshot, CnxError> {
+    let strict_conflict = input.params.group.as_deref() == Some(rank.group_key.as_str());
+    let group_key = rank.group_key;
+    let events = match query_force_find_group_tree(
+        input.state,
+        &input.params.path,
+        input.params.recursive,
+        input.params.max_depth,
+        input.route_plan,
+        &group_key,
+        strict_conflict,
+    )
+    .await
+    {
+        Ok(events) => {
+            if debug_force_find_route_capture_enabled() {
+                eprintln!(
+                    "fs_meta_query_api: force-find group_tree result group={} events={} origins={:?}",
+                    group_key,
+                    events.len(),
+                    summarize_event_counts_by_origin(&events)
+                );
+            }
+            events
+        }
+        Err(err) => {
+            if debug_force_find_route_capture_enabled() {
+                eprintln!(
+                    "fs_meta_query_api: force-find group_tree error group={} strict_conflict={} err={}",
+                    group_key, strict_conflict, err
+                );
+            }
+            return if strict_conflict {
+                Err(err)
+            } else {
+                Ok(build_force_find_group_error_snapshot(group_key, err))
+            };
+        }
+    };
+    match decode_force_find_selected_group_response(
+        &events,
+        input.policy,
+        &group_key,
+        &input.params.path,
+    ) {
+        Ok(payload) => {
+            if debug_force_find_route_capture_enabled() {
+                eprintln!(
+                    "fs_meta_query_api: force-find group_decode ok group={} root_exists={} has_children={} entries={} reliable={} errors=0",
+                    group_key,
+                    payload.root.exists,
+                    payload.root.has_children,
+                    payload.entries.len(),
+                    payload.reliability.reliable
+                );
+            }
+            Ok(GroupPitSnapshot {
+                group: group_key,
+                status: "ok",
+                reliable: payload.reliability.reliable,
+                unreliable_reason: payload.reliability.unreliable_reason,
+                stability: payload.stability,
+                meta: PitMetadata {
+                    read_class: ReadClass::Fresh,
+                    metadata_available: true,
+                    withheld_reason: None,
+                },
+                root: Some(payload.root),
+                entries: payload.entries,
+                errors: Vec::new(),
+            })
+        }
+        Err(err) => {
+            if debug_force_find_route_capture_enabled() {
+                eprintln!(
+                    "fs_meta_query_api: force-find group_decode failed group={} strict_conflict={} err={} events={} origins={:?}",
+                    group_key,
+                    strict_conflict,
+                    err,
+                    events.len(),
+                    summarize_event_counts_by_origin(&events)
+                );
+            }
+            if strict_conflict {
+                Err(err)
+            } else {
+                Ok(build_force_find_group_error_snapshot(group_key, err))
+            }
+        }
+    }
+}
+
+async fn execute_force_find_ranked_groups(
+    input: ForceFindRankedGroupExecutionInput<'_>,
+    rankings: Vec<GroupRank>,
+) -> Result<Vec<GroupPitSnapshot>, CnxError> {
+    let rankings_len = rankings.len();
+    Ok(execute_ranked_group_loop!(
+        Vec::with_capacity(rankings_len),
+        rankings,
+        |groups, rank| {
+            groups.push(execute_force_find_ranked_group(&input, rank).await?);
+        }
+    ))
 }
 
 fn decode_materialized_selected_group_response(
@@ -6595,6 +9335,7 @@ fn render_pit_response(
     Ok(serde_json::Value::Object(body))
 }
 
+#[cfg(test)]
 async fn build_tree_pit_session(
     state: &ApiState,
     policy: &ProjectionPolicy,
@@ -6624,11 +9365,41 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
     request_sink_status: Option<&SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
 ) -> Result<PitSession, CnxError> {
-    eprintln!(
-        "fs_meta_query_api: build_tree_pit_session start path={} recursive={}",
-        String::from_utf8_lossy(&params.path),
-        params.recursive
-    );
+    prepare_tree_pit_ranked_session(
+        state,
+        policy,
+        params,
+        timeout,
+        observation_status,
+        request_sink_status,
+        request_scoped_schedule_omitted_ready_groups,
+    )
+    .await?
+    .execute()
+    .await
+}
+
+struct PreparedTreePitRankedSession<'a> {
+    input: TreePitRankedGroupExecutionInput<'a>,
+    rankings: Vec<GroupRank>,
+    observation_status: ObservationStatus,
+}
+
+impl PreparedTreePitRankedSession<'_> {
+    async fn execute(self) -> Result<PitSession, CnxError> {
+        execute_tree_pit_ranked_session(self.input, self.rankings, self.observation_status).await
+    }
+}
+
+async fn prepare_tree_pit_ranked_session<'a>(
+    state: &'a ApiState,
+    policy: &'a ProjectionPolicy,
+    params: &'a NormalizedApiParams,
+    timeout: Duration,
+    observation_status: ObservationStatus,
+    request_sink_status: Option<&'a SinkStatusSnapshot>,
+    request_scoped_schedule_omitted_ready_groups: Option<&'a BTreeSet<String>>,
+) -> Result<PreparedTreePitRankedSession<'a>, CnxError> {
     let ranking_started_at = tokio::time::Instant::now();
     let target_groups = materialized_target_groups(
         state,
@@ -6653,332 +9424,39 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
         &target_groups,
         None,
     )
-    .await?;
-    eprintln!(
-        "fs_meta_query_api: build_tree_pit_session rankings groups={}",
-        rankings.len()
-    );
-    let mut group_rank_metrics = rankings
-        .iter()
-        .map(|rank| (rank.group_key.clone(), rank.rank_metric))
-        .collect::<BTreeMap<_, _>>();
-    let mut groups = Vec::with_capacity(rankings.len());
+        .await?;
     let read_class = tree_read_class(params);
-    let session_deadline = if ranking_retryable_failure {
-        ranking_started_at + timeout
-    } else {
-        tokio::time::Instant::now() + timeout
-    };
     let total_ranked_groups = rankings.len();
-    let mut deferred_first_ranked_empty_trusted_non_root_group = None::<String>;
-    for (rank_index, rank) in rankings.into_iter().enumerate() {
-        let group_key = rank.group_key.clone();
-        let tree_params = build_materialized_tree_request(
-            &params.path,
-            params.recursive,
-            params.max_depth,
+    let session_plan = TreePitSessionPlan::new(timeout, total_ranked_groups);
+    let session_runtime = session_plan.runtime(ranking_started_at, ranking_retryable_failure);
+    Ok(PreparedTreePitRankedSession {
+        input: TreePitRankedGroupExecutionInput {
+            state,
+            policy,
+            params,
+            request_sink_status,
+            request_scoped_schedule_omitted_ready_groups,
+            observation_state: observation_status.state,
+            session_plan,
+            session_runtime,
             read_class,
-            Some(group_key.clone()),
-        );
-        let selected_group_sink_status = if let Some(snapshot) = request_sink_status {
-            Some(filter_sink_status_snapshot(
-                snapshot.clone(),
-                &BTreeSet::from([group_key.clone()]),
-            ))
-        } else {
-            let allowed_groups = BTreeSet::from([group_key.clone()]);
-            let cache = state.materialized_sink_status_cache.lock().map_err(|_| {
-                CnxError::Internal("materialized sink status cache lock poisoned".into())
-            })?;
-            cache
-                .as_ref()
-                .map(|cached| filter_sink_status_snapshot(cached.snapshot.clone(), &allowed_groups))
-        };
-        let prior_materialized_group_decoded = groups
-            .iter()
-            .any(group_counts_as_prior_materialized_tree_decode);
-        let prior_materialized_exact_file_decoded = groups
-            .iter()
-            .any(group_counts_as_prior_materialized_exact_file_decode);
-        let rescue_decision = trusted_materialized_group_rescue_decision(
-            TrustedMaterializedGroupRescueDecisionInput {
-                read_class,
-                observation_state: observation_status.state,
-                selected_group_sink_reports_live_materialized:
-                    selected_group_sink_status_reports_live_materialized_group(
-                        selected_group_sink_status.as_ref(),
-                        &group_key,
-                    ),
-                prior_materialized_group_decoded,
-                empty_root_requires_fail_closed:
-                    trusted_materialized_empty_group_root_requires_fail_closed(&params.path),
-            },
-        );
-        let trusted_materialized_ready_group = rescue_decision.ready_group;
-        let trusted_materialized_group_requires_rescue = rescue_decision.requires_rescue;
-        let is_last_ranked_group = rank_index + 1 == total_ranked_groups;
-        let allow_empty_owner_retry = rescue_decision.allow_empty_owner_retry;
-        let selected_group_owner_known = if rescue_decision.should_resolve_selected_group_owner {
-            match &state.backend {
-                QueryBackend::Route { source, .. } => materialized_owner_node_for_group(
-                    source.as_ref(),
-                    selected_group_sink_status.as_ref(),
-                    &group_key,
-                    MaterializedOwnerOmissionPolicy::Authoritative,
-                )
-                .await?
-                .is_some(),
-                QueryBackend::Local { .. } => true,
-            }
-        } else {
-            false
-        };
-        let remaining = session_deadline
-            .checked_duration_since(tokio::time::Instant::now())
-            .unwrap_or_default();
-        if remaining.is_zero() {
-            if trusted_materialized_ready_group {
-                if trusted_materialized_empty_group_root_requires_fail_closed(&params.path) {
-                    return Err(trusted_materialized_empty_selected_group_tree_error(
-                        &group_key,
-                    ));
-                }
-                return Err(trusted_materialized_unavailable_selected_group_tree_error(
-                    &group_key,
-                ));
-            }
-            push_empty_materialized_tree_group_snapshot(
-                &mut groups,
-                &mut group_rank_metrics,
-                params.group_order,
-                read_class,
-                group_key,
-                &params.path,
-            );
-            continue;
-        }
-        let stage_timeout = tree_pit_stage_timeout_policy(TreePitStageTimeoutDecisionInput {
-            read_class,
-            is_last_ranked_group,
-            prior_materialized_group_decoded,
-            trusted_materialized_ready_group,
-            trusted_materialized_group_requires_rescue,
-            selected_group_sink_unready_empty: selected_group_sink_status_is_unready_empty(
-                selected_group_sink_status.as_ref(),
-                &group_key,
-            ),
-        })
-        .timeout(remaining, timeout);
-        if debug_materialized_route_capture_enabled() {
-            let sink_group_summary = selected_group_sink_status
-                .as_ref()
-                .and_then(|snapshot| snapshot.groups.first())
-                .map(|group| {
-                    format!(
-                        "group={} init={} live={} total={} primary={}",
-                        group.group_id,
-                        group.initial_audit_completed,
-                        group.live_nodes,
-                        group.total_nodes,
-                        group.primary_object_ref
-                    )
-                })
-                .unwrap_or_else(|| "group=<missing>".to_string());
-            eprintln!(
-                "fs_meta_query_api: pit_group_stage group={} path={} trusted_ready={} prior_decoded={} last_ranked={} stage_timeout_ms={} remaining_ms={} sink_status={}",
-                group_key,
-                String::from_utf8_lossy(&params.path),
-                trusted_materialized_ready_group,
-                prior_materialized_group_decoded,
-                is_last_ranked_group,
-                stage_timeout.as_millis(),
-                remaining.as_millis(),
-                sink_group_summary
-            );
-        }
-        let stage_deadline = tokio::time::Instant::now() + stage_timeout;
-        let reserve_proxy_budget = selected_group_stage_reserves_proxy_budget(
-            read_class,
-            trusted_materialized_ready_group,
-            prior_materialized_group_decoded,
-            is_last_ranked_group,
-            &params.path,
-        );
-        let events = match run_timed_query(
-            query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
-                state,
-                policy,
-                tree_params.clone(),
-                stage_timeout,
-                selected_group_sink_status.clone(),
-                request_scoped_schedule_omitted_ready_groups,
-                reserve_proxy_budget,
-                allow_empty_owner_retry,
-                prior_materialized_exact_file_decoded,
-            ),
-            stage_timeout,
-        )
-        .await
-        {
-            Ok(events) => events,
-            Err(err)
-                if matches!(
-                    &err,
-                    CnxError::Timeout
-                        | CnxError::TransportClosed(_)
-                        | CnxError::ProtocolViolation(_)
-                ) =>
-            {
-                handle_retryable_tree_pit_stage_error(
-                    RetryableTreePitStageErrorInput {
-                        state,
-                        policy,
-                        tree_params: tree_params.clone(),
-                        selected_group_sink_status: selected_group_sink_status.as_ref(),
-                        rescue_decision,
-                        group_key,
-                        query_path: &params.path,
-                        read_class,
-                        group_order: params.group_order,
-                        trusted_materialized_ready_group,
-                        prior_materialized_group_decoded,
-                        session_deadline,
-                        stage_deadline,
-                    },
-                    err,
-                    &mut groups,
-                    &mut group_rank_metrics,
-                )
-                .await?;
-                continue;
-            }
-            Err(err) => {
-                if debug_materialized_route_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_query_api: pit_group_stage fatal group={} path={} err={}",
-                        group_key,
-                        String::from_utf8_lossy(&params.path),
-                        err
-                    );
-                }
-                return Err(err);
-            }
-        };
-        match decode_materialized_selected_group_response(&events, policy, &group_key, &params.path)
-        {
-            Ok(mut response) => {
-                let empty_response_decision = trusted_materialized_empty_response_rescue_decision(
-                    TrustedMaterializedEmptyResponseRescueDecisionInput {
-                        ready_group: trusted_materialized_ready_group,
-                        prior_materialized_group_decoded,
-                        prior_materialized_exact_file_decoded,
-                        selected_group_owner_known,
-                        allow_empty_owner_retry,
-                        empty_root_requires_fail_closed: rescue_decision
-                            .empty_root_requires_fail_closed,
-                    },
-                );
-                maybe_promote_richer_same_path_materialized_tree_response(
-                    &events,
-                    policy,
-                    &group_key,
-                    &params.path,
-                    &mut response,
-                );
-                if trusted_materialized_group_requires_rescue
-                    && trusted_materialized_tree_payload_is_empty(&response)
-                {
-                    rescue_trusted_materialized_empty_tree_response(
-                        TrustedMaterializedEmptyTreeResponseRescueInput {
-                            state,
-                            policy,
-                            tree_params: tree_params.clone(),
-                            selected_group_sink_status: selected_group_sink_status.as_ref(),
-                            rescue_decision,
-                            empty_response_decision,
-                            group_key: &group_key,
-                            query_path: &params.path,
-                            session_deadline,
-                            is_last_ranked_group,
-                            total_ranked_groups,
-                            rank_index,
-                        },
-                        &mut response,
-                    )
-                    .await?;
-                }
-                finalize_trusted_materialized_tree_group_response(
-                    &mut groups,
-                    &mut group_rank_metrics,
-                    params.group_order,
-                    read_class,
-                    group_key,
-                    response,
-                    empty_response_decision,
-                    rank_index,
-                    &mut deferred_first_ranked_empty_trusted_non_root_group,
-                )?;
-            }
-            Err(err) => {
-                handle_materialized_tree_decode_error(
-                    MaterializedTreeDecodeErrorInput {
-                        read_class,
-                        group_order: params.group_order,
-                        group_key,
-                        query_path: &params.path,
-                        request_scoped_schedule_omitted_ready_groups,
-                        prior_materialized_group_decoded,
-                        prior_materialized_exact_file_decoded,
-                        trusted_materialized_ready_group,
-                    },
-                    err,
-                    &mut groups,
-                    &mut group_rank_metrics,
-                )?;
-                continue;
-            }
-        }
-    }
-    if matches!(
-        params.group_order,
-        GroupOrder::FileCount | GroupOrder::FileAge
-    ) {
-        groups.sort_by(|left, right| {
-            let left_rank = group_rank_metrics
-                .get(&left.group)
-                .copied()
-                .flatten()
-                .or_else(|| observed_rank_metric_from_tree_snapshot(params.group_order, left))
-                .unwrap_or(0);
-            let right_rank = group_rank_metrics
-                .get(&right.group)
-                .copied()
-                .flatten()
-                .or_else(|| observed_rank_metric_from_tree_snapshot(params.group_order, right))
-                .unwrap_or(0);
-            right_rank
-                .cmp(&left_rank)
-                .then_with(|| left.group.cmp(&right.group))
-        });
-    }
-    let estimated_bytes =
-        groups.iter().map(estimated_group_bytes).sum::<usize>() + std::mem::size_of::<PitSession>();
-    Ok(PitSession {
-        mode: CursorQueryMode::Tree,
-        scope: PitScope::Tree(TreePitScope {
-            path: params.path.clone(),
-            group: params.group.clone(),
-            recursive: params.recursive,
-            max_depth: params.max_depth,
-            group_order: params.group_order,
-            read_class,
-        }),
-        read_class,
+            total_ranked_groups,
+        },
+        rankings,
         observation_status,
-        groups,
-        expires_at_ms: unix_now_ms() + PIT_TTL_MS_DEFAULT,
-        estimated_bytes,
     })
+}
+
+async fn execute_tree_pit_ranked_session(
+    input: TreePitRankedGroupExecutionInput<'_>,
+    rankings: Vec<GroupRank>,
+    observation_status: ObservationStatus,
+) -> Result<PitSession, CnxError> {
+    Ok(
+        execute_tree_pit_ranked_session_parts(input, rankings, observation_status)
+            .await?
+            .into_session(),
+    )
 }
 
 async fn build_force_find_pit_session(
@@ -6987,6 +9465,29 @@ async fn build_force_find_pit_session(
     params: &NormalizedApiParams,
     timeout: Duration,
 ) -> Result<PitSession, CnxError> {
+    prepare_force_find_ranked_session(state, policy, params, timeout)
+        .await?
+        .execute()
+        .await
+}
+
+struct PreparedForceFindRankedSession<'a> {
+    input: ForceFindRankedGroupExecutionInput<'a>,
+    rankings: Vec<GroupRank>,
+}
+
+impl PreparedForceFindRankedSession<'_> {
+    async fn execute(self) -> Result<PitSession, CnxError> {
+        execute_force_find_ranked_session(self.input, self.rankings).await
+    }
+}
+
+async fn prepare_force_find_ranked_session<'a>(
+    state: &'a ApiState,
+    policy: &'a ProjectionPolicy,
+    params: &'a NormalizedApiParams,
+    timeout: Duration,
+) -> Result<PreparedForceFindRankedSession<'a>, CnxError> {
     let target_groups = resolve_force_find_groups(state, params).await?;
     let rankings = if params.group_order == GroupOrder::GroupKey {
         let mut ordered = target_groups.clone();
@@ -7015,141 +9516,183 @@ async fn build_force_find_pit_session(
         .await?
         .0
     };
-    let mut groups = Vec::with_capacity(rankings.len());
-    for rank in rankings {
-        let strict_conflict = params.group.as_deref() == Some(rank.group_key.as_str());
-        let events = match query_force_find_group_tree(
+    Ok(PreparedForceFindRankedSession {
+        input: ForceFindRankedGroupExecutionInput {
             state,
-            &params.path,
-            params.recursive,
-            params.max_depth,
-            timeout,
-            &rank.group_key,
-            strict_conflict,
-        )
-        .await
-        {
-            Ok(events) => {
-                if debug_force_find_route_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_query_api: force-find group_tree result group={} events={} origins={:?}",
-                        rank.group_key,
-                        events.len(),
-                        summarize_event_counts_by_origin(&events)
-                    );
-                }
-                events
-            }
-            Err(err) => {
-                if debug_force_find_route_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_query_api: force-find group_tree error group={} strict_conflict={} err={}",
-                        rank.group_key, strict_conflict, err
-                    );
-                }
-                if strict_conflict {
-                    return Err(err);
-                }
-                groups.push(GroupPitSnapshot {
-                    group: rank.group_key,
-                    status: "error",
-                    reliable: false,
-                    unreliable_reason: None,
-                    stability: TreeStability::not_evaluated(),
-                    meta: PitMetadata {
-                        read_class: ReadClass::Fresh,
-                        metadata_available: false,
-                        withheld_reason: Some("group-payload-missing"),
-                    },
-                    root: None,
-                    entries: Vec::new(),
-                    errors: vec![err.to_string()],
-                });
-                continue;
-            }
-        };
-        match decode_force_find_selected_group_response(
-            &events,
             policy,
-            &rank.group_key,
-            &params.path,
-        ) {
-            Ok(payload) => {
-                if debug_force_find_route_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_query_api: force-find group_decode ok group={} root_exists={} has_children={} entries={} reliable={} errors=0",
-                        rank.group_key,
-                        payload.root.exists,
-                        payload.root.has_children,
-                        payload.entries.len(),
-                        payload.reliability.reliable
-                    );
-                }
-                groups.push(GroupPitSnapshot {
-                    group: rank.group_key,
-                    status: "ok",
-                    reliable: payload.reliability.reliable,
-                    unreliable_reason: payload.reliability.unreliable_reason,
-                    stability: payload.stability,
-                    meta: PitMetadata {
-                        read_class: ReadClass::Fresh,
-                        metadata_available: true,
-                        withheld_reason: None,
-                    },
-                    root: Some(payload.root),
-                    entries: payload.entries,
-                    errors: Vec::new(),
-                });
-            }
-            Err(err) => {
-                if debug_force_find_route_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_query_api: force-find group_decode failed group={} strict_conflict={} err={} events={} origins={:?}",
-                        rank.group_key,
-                        strict_conflict,
-                        err,
-                        events.len(),
-                        summarize_event_counts_by_origin(&events)
-                    );
-                }
-                if strict_conflict {
-                    return Err(err);
-                }
-                groups.push(GroupPitSnapshot {
-                    group: rank.group_key,
-                    status: "error",
-                    reliable: false,
-                    unreliable_reason: None,
-                    stability: TreeStability::not_evaluated(),
-                    meta: PitMetadata {
-                        read_class: ReadClass::Fresh,
-                        metadata_available: false,
-                        withheld_reason: Some("group-payload-missing"),
-                    },
-                    root: None,
-                    entries: Vec::new(),
-                    errors: vec![err.to_string()],
-                });
-            }
+            params,
+            route_plan: ForceFindSessionPlan::new(timeout).route_plan(),
+        },
+        rankings,
+    })
+}
+
+async fn execute_force_find_ranked_session(
+    input: ForceFindRankedGroupExecutionInput<'_>,
+    rankings: Vec<GroupRank>,
+) -> Result<PitSession, CnxError> {
+    Ok(
+        execute_force_find_ranked_session_parts(input, rankings)
+            .await?
+            .into_session(),
+    )
+}
+
+async fn execute_tree_pit_ranked_session_parts(
+    input: TreePitRankedGroupExecutionInput<'_>,
+    rankings: Vec<GroupRank>,
+    observation_status: ObservationStatus,
+) -> Result<PitSessionParts, CnxError> {
+    let read_class = input.read_class;
+    let scope = TreePitScope {
+        path: input.params.path.clone(),
+        group: input.params.group.clone(),
+        recursive: input.params.recursive,
+        max_depth: input.params.max_depth,
+        group_order: input.params.group_order,
+        read_class,
+    };
+    Ok(build_pit_session_parts(
+        CursorQueryMode::Tree,
+        PitScope::Tree(scope),
+        read_class,
+        observation_status,
+        execute_tree_pit_ranked_groups(input, rankings).await?,
+    ))
+}
+
+async fn execute_force_find_ranked_session_parts(
+    input: ForceFindRankedGroupExecutionInput<'_>,
+    rankings: Vec<GroupRank>,
+) -> Result<PitSessionParts, CnxError> {
+    let scope = ForceFindPitScope {
+        path: input.params.path.clone(),
+        group: input.params.group.clone(),
+        recursive: input.params.recursive,
+        max_depth: input.params.max_depth,
+        group_order: input.params.group_order,
+    };
+    Ok(build_pit_session_parts(
+        CursorQueryMode::ForceFind,
+        PitScope::ForceFind(scope),
+        ReadClass::Fresh,
+        ObservationStatus::fresh_only(),
+        execute_force_find_ranked_groups(input, rankings).await?,
+    ))
+}
+
+fn build_pit_session_parts(
+    mode: CursorQueryMode,
+    scope: PitScope,
+    read_class: ReadClass,
+    observation_status: ObservationStatus,
+    groups: Vec<GroupPitSnapshot>,
+) -> PitSessionParts {
+    PitSessionParts {
+        mode,
+        scope,
+        read_class,
+        observation_status,
+        groups,
+    }
+}
+
+struct TreePitRankedGroupsState {
+    groups: Vec<GroupPitSnapshot>,
+    group_rank_metrics: BTreeMap<String, Option<u64>>,
+    deferred_first_ranked_empty_trusted_non_root_group: Option<String>,
+}
+
+impl TreePitRankedGroupsState {
+    fn new(rankings: &[GroupRank]) -> Self {
+        Self {
+            groups: Vec::with_capacity(rankings.len()),
+            group_rank_metrics: rankings
+                .iter()
+                .map(|rank| (rank.group_key.clone(), rank.rank_metric))
+                .collect(),
+            deferred_first_ranked_empty_trusted_non_root_group: None,
         }
     }
-    let estimated_bytes =
-        groups.iter().map(estimated_group_bytes).sum::<usize>() + std::mem::size_of::<PitSession>();
-    Ok(PitSession {
-        mode: CursorQueryMode::ForceFind,
-        scope: PitScope::ForceFind(ForceFindPitScope {
-            path: params.path.clone(),
-            group: params.group.clone(),
-            recursive: params.recursive,
-            max_depth: params.max_depth,
-            group_order: params.group_order,
-        }),
-        read_class: ReadClass::Fresh,
-        observation_status: ObservationStatus::fresh_only(),
-        groups,
-        expires_at_ms: unix_now_ms() + PIT_TTL_MS_DEFAULT,
-        estimated_bytes,
-    })
+
+    fn finalize(mut self, group_order: GroupOrder) -> Vec<GroupPitSnapshot> {
+        if matches!(group_order, GroupOrder::FileCount | GroupOrder::FileAge) {
+            self.groups.sort_by(|left, right| {
+                let left_rank = self
+                    .group_rank_metrics
+                    .get(&left.group)
+                    .copied()
+                    .flatten()
+                    .or_else(|| observed_rank_metric_from_tree_snapshot(group_order, left))
+                    .unwrap_or(0);
+                let right_rank = self
+                    .group_rank_metrics
+                    .get(&right.group)
+                    .copied()
+                    .flatten()
+                    .or_else(|| observed_rank_metric_from_tree_snapshot(group_order, right))
+                    .unwrap_or(0);
+                right_rank
+                    .cmp(&left_rank)
+                    .then_with(|| left.group.cmp(&right.group))
+            });
+        }
+        self.groups
+    }
+}
+
+enum RuntimeCollectLoopStep<TAction, TOutput> {
+    Continue {
+        next_action: TAction,
+        last_err: Option<CnxError>,
+    },
+    WaitUntil {
+        until: tokio::time::Instant,
+        last_err: Option<CnxError>,
+    },
+    Return(Result<TOutput, CnxError>),
+}
+
+async fn execute_runtime_collect_loop<TAction, TOutput, TStep, TStepFut, TAfterWait, TAfterWaitFut>(
+    initial_action: TAction,
+    mut action_after_wait: TAfterWait,
+    mut step: TStep,
+) -> Result<TOutput, CnxError>
+where
+    TStep: FnMut(TAction, Option<CnxError>) -> TStepFut,
+    TStepFut: std::future::Future<Output = Result<RuntimeCollectLoopStep<TAction, TOutput>, CnxError>>,
+    TAfterWait: FnMut(Option<&CnxError>) -> TAfterWaitFut,
+    TAfterWaitFut: std::future::Future<Output = Result<TAction, CnxError>>,
+{
+    let mut action = initial_action;
+    let mut last_err = None::<CnxError>;
+    loop {
+        match step(action, last_err).await? {
+            RuntimeCollectLoopStep::Continue {
+                next_action,
+                last_err: next_last_err,
+            } => {
+                action = next_action;
+                last_err = next_last_err;
+            }
+            RuntimeCollectLoopStep::WaitUntil {
+                until,
+                last_err: next_last_err,
+            } => {
+                last_err = next_last_err;
+                tokio::time::sleep_until(until).await;
+                action = action_after_wait(last_err.as_ref()).await?;
+            }
+            RuntimeCollectLoopStep::Return(result) => return result,
+        }
+    }
+}
+
+fn take_last_route_error_or(
+    last_err: Option<CnxError>,
+    fallback: impl FnOnce() -> CnxError,
+) -> CnxError {
+    last_err.unwrap_or_else(fallback)
 }
 
 async fn query_tree_page_response(
@@ -7598,69 +10141,36 @@ fn stats_group_looks_zeroish(group: &serde_json::Value) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SelectedGroupZeroishStatsRescueLane {
+enum SelectedGroupStatsRescueLane {
     ReturnCurrent,
     ProxyFallback,
     ProxyFallbackThenFailClosed,
     FailClosed,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SelectedGroupZeroishStatsRescueDecision {
-    lane: SelectedGroupZeroishStatsRescueLane,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SelectedGroupZeroishStatsRescueDecisionInput {
-    trusted_materialized: bool,
-    root_path: bool,
-    selected_group_sink_reports_live_materialized: bool,
-    owner_stats_zeroish: bool,
-    proxy_available: bool,
-}
-
-fn selected_group_zeroish_stats_rescue_decision(
-    input: SelectedGroupZeroishStatsRescueDecisionInput,
-) -> SelectedGroupZeroishStatsRescueDecision {
-    if !input.trusted_materialized
-        || !input.selected_group_sink_reports_live_materialized
-        || !input.owner_stats_zeroish
-    {
-        return SelectedGroupZeroishStatsRescueDecision {
-            lane: SelectedGroupZeroishStatsRescueLane::ReturnCurrent,
-        };
-    }
-
-    let lane = if input.root_path {
-        if input.proxy_available {
-            SelectedGroupZeroishStatsRescueLane::ProxyFallbackThenFailClosed
-        } else {
-            SelectedGroupZeroishStatsRescueLane::FailClosed
-        }
-    } else if input.proxy_available {
-        SelectedGroupZeroishStatsRescueLane::ProxyFallback
-    } else {
-        SelectedGroupZeroishStatsRescueLane::ReturnCurrent
-    };
-
-    SelectedGroupZeroishStatsRescueDecision { lane }
-}
-
-async fn execute_selected_group_zeroish_stats_rescue(
+async fn execute_selected_group_stats_rescue(
     state: &ApiState,
     policy: &ProjectionPolicy,
     materialized_request: &InternalQueryRequest,
     group_id: &str,
-    rescue_decision: SelectedGroupZeroishStatsRescueDecision,
+    group_plan: TreePitGroupPlan,
+    deadline: tokio::time::Instant,
     mut targeted: serde_json::Map<String, serde_json::Value>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, CnxError> {
-    match rescue_decision.lane {
-        SelectedGroupZeroishStatsRescueLane::ReturnCurrent => Ok(targeted),
-        SelectedGroupZeroishStatsRescueLane::FailClosed => Err(
+    let rescue_lane = group_plan.stage_plan.stats_rescue_lane(
+        materialized_request.scope.path.is_empty() || materialized_request.scope.path == b"/",
+        targeted
+            .get(group_id)
+            .is_some_and(stats_group_looks_zeroish),
+        matches!(&state.backend, QueryBackend::Route { .. }),
+    );
+
+    match rescue_lane {
+        SelectedGroupStatsRescueLane::ReturnCurrent => Ok(targeted),
+        SelectedGroupStatsRescueLane::FailClosed => Err(
             trusted_materialized_unavailable_selected_group_stats_error(group_id),
         ),
-        SelectedGroupZeroishStatsRescueLane::ProxyFallback
-        | SelectedGroupZeroishStatsRescueLane::ProxyFallbackThenFailClosed => {
+        SelectedGroupStatsRescueLane::ProxyFallback
+        | SelectedGroupStatsRescueLane::ProxyFallbackThenFailClosed => {
             let QueryBackend::Route {
                 boundary,
                 origin_id,
@@ -7668,8 +10178,8 @@ async fn execute_selected_group_zeroish_stats_rescue(
             } = &state.backend
             else {
                 return if matches!(
-                    rescue_decision.lane,
-                    SelectedGroupZeroishStatsRescueLane::ProxyFallbackThenFailClosed
+                    rescue_lane,
+                    SelectedGroupStatsRescueLane::ProxyFallbackThenFailClosed
                 ) {
                     Err(trusted_materialized_unavailable_selected_group_stats_error(
                         group_id,
@@ -7679,11 +10189,38 @@ async fn execute_selected_group_zeroish_stats_rescue(
                 };
             };
 
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return if matches!(
+                    rescue_lane,
+                    SelectedGroupStatsRescueLane::ProxyFallbackThenFailClosed
+                ) {
+                    Err(trusted_materialized_unavailable_selected_group_stats_error(
+                        group_id,
+                    ))
+                } else {
+                    Ok(targeted)
+                };
+            }
+            let proxy_timeout = group_plan.stats_proxy_route_plan(remaining);
+            if proxy_timeout.route_timeout().is_zero() {
+                return if matches!(
+                    rescue_lane,
+                    SelectedGroupStatsRescueLane::ProxyFallbackThenFailClosed
+                ) {
+                    Err(trusted_materialized_unavailable_selected_group_stats_error(
+                        group_id,
+                    ))
+                } else {
+                    Ok(targeted)
+                };
+            }
+
             match query_materialized_events_via_generic_proxy(
                 boundary.clone(),
                 origin_id.clone(),
                 materialized_request.clone(),
-                policy.query_timeout(),
+                proxy_timeout.runtime(),
             )
             .await
             {
@@ -7713,8 +10250,8 @@ async fn execute_selected_group_zeroish_stats_rescue(
             }
 
             if matches!(
-                rescue_decision.lane,
-                SelectedGroupZeroishStatsRescueLane::ProxyFallbackThenFailClosed
+                rescue_lane,
+                SelectedGroupStatsRescueLane::ProxyFallbackThenFailClosed
             ) && targeted
                 .get(group_id)
                 .is_some_and(stats_group_looks_zeroish)
@@ -7759,6 +10296,28 @@ async fn collect_materialized_stats_groups(
             params.recursive,
             Some(group_id.clone()),
         );
+        let group_plan = TreePitSessionPlan::new(policy.query_timeout(), 1)
+            .selected_group_stage_plan(TreePitGroupPlanInput {
+                read_class,
+                observation_state: match read_class {
+                    ReadClass::TrustedMaterialized => ObservationState::TrustedMaterialized,
+                    ReadClass::Materialized => ObservationState::MaterializedUntrusted,
+                    ReadClass::Fresh => {
+                        unreachable!("fresh stats do not build materialized PIT group plans")
+                    }
+                },
+                selected_group_sink_reports_live_materialized:
+                    selected_group_sink_status_reports_live_materialized_group(
+                        request_sink_status,
+                        &group_id,
+                    ),
+                prior_materialized_group_decoded: false,
+                prior_materialized_exact_file_decoded: false,
+                rank_index: 0,
+                is_last_ranked_group: true,
+                selected_group_sink_unready_empty: false,
+                empty_root_requires_fail_closed: false,
+            });
         let events = match read_class {
             ReadClass::Fresh => {
                 let strict_conflict = params.group.as_deref() == Some(group_id.as_str());
@@ -7766,7 +10325,7 @@ async fn collect_materialized_stats_groups(
                     state,
                     &params.path,
                     params.recursive,
-                    policy.force_find_timeout(),
+                    ForceFindSessionPlan::new(policy.force_find_timeout()).route_plan(),
                     &group_id,
                     strict_conflict,
                 )
@@ -7781,9 +10340,7 @@ async fn collect_materialized_stats_groups(
                         policy.query_timeout(),
                         Some(snapshot.clone()),
                         None,
-                        true,
-                        false,
-                        false,
+                        group_plan,
                     )
                     .await?
                 } else {
@@ -7797,27 +10354,13 @@ async fn collect_materialized_stats_groups(
             }
         };
         let mut targeted = decode_stats_groups(events, policy, Some(&group_id), read_class);
-        let rescue_decision = selected_group_zeroish_stats_rescue_decision(
-            SelectedGroupZeroishStatsRescueDecisionInput {
-                trusted_materialized: read_class == ReadClass::TrustedMaterialized,
-                root_path: params.path.is_empty() || params.path == b"/",
-                selected_group_sink_reports_live_materialized:
-                    selected_group_sink_status_reports_live_materialized_group(
-                        request_sink_status,
-                        &group_id,
-                    ),
-                owner_stats_zeroish: targeted
-                    .get(&group_id)
-                    .is_some_and(stats_group_looks_zeroish),
-                proxy_available: matches!(&state.backend, QueryBackend::Route { .. }),
-            },
-        );
-        targeted = execute_selected_group_zeroish_stats_rescue(
+        targeted = execute_selected_group_stats_rescue(
             state,
             policy,
             &materialized_request,
             &group_id,
-            rescue_decision,
+            group_plan,
+            tokio::time::Instant::now() + policy.query_timeout(),
             targeted,
         )
         .await?;
@@ -7864,6 +10407,7 @@ async fn get_stats(
             }
             request_source_status = Some(
                 if params.group.is_none() && !params.path.is_empty() && params.path != b"/" {
+                    let status_load_plan = MaterializedStatusLoadPlan::default();
                     match &state.backend {
                         QueryBackend::Route {
                             boundary,
@@ -7874,7 +10418,8 @@ async fn get_stats(
                             route_source_status_snapshot(
                                 boundary.clone(),
                                 origin_id.clone(),
-                                std::cmp::min(policy.query_timeout(), Duration::from_secs(5)),
+                                status_load_plan
+                                    .request_source_refresh_plan(policy.query_timeout()),
                             )
                             .await
                             .unwrap_or_else(|_| source_status.clone()),
@@ -7969,47 +10514,48 @@ async fn get_tree(
             trusted_materialized_not_ready_message(&observation_status)
         );
     }
-    let (request_sink_status, request_scoped_schedule_omitted_ready_groups) = if read_class
-        == ReadClass::TrustedMaterialized
-    {
-        let request_scoped =
-            load_request_scoped_materialized_sink_status_snapshot(&state, policy.query_timeout())
-                .await
-                .unwrap_or_else(|| sink_status.clone());
-        let request_scoped_schedule_omitted_ready_groups =
-            request_scoped_schedule_omitted_ready_groups(&sink_status, &request_scoped);
-        let merged = merge_request_scoped_materialized_sink_status_snapshot(
-            &sink_status,
-            request_scoped.clone(),
-        );
-        let preserved_omission =
+    let (request_sink_status, request_scoped_schedule_omitted_ready_groups) =
+        if read_class == ReadClass::TrustedMaterialized {
+            let request_scoped_plan = TreePitSessionPlan::new(policy.query_timeout(), 1)
+                .request_scoped_sink_status_plan();
+            let request_scoped =
+                load_request_scoped_materialized_sink_status_snapshot(&state, request_scoped_plan)
+                    .await
+                    .unwrap_or_else(|| sink_status.clone());
+            let request_scoped_schedule_omitted_ready_groups =
+                request_scoped_schedule_omitted_ready_groups(&sink_status, &request_scoped);
+            let merged = merge_request_scoped_materialized_sink_status_snapshot(
+                &sink_status,
+                request_scoped.clone(),
+            );
+            let preserved_omission =
             preserve_request_loaded_ready_groups_across_partial_request_scoped_schedule_omission(
                 merged,
                 &sink_status,
                 &request_scoped,
             );
-        let preserved =
-            preserve_request_loaded_ready_groups_across_explicit_empty_request_scoped_drift(
-                preserved_omission,
-                &sink_status,
-                &request_scoped,
-            );
-        if trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
-            && sink_status_snapshot_omits_all_groups_from_schedule(&request_scoped)
-        {
-            (
-                request_scoped,
-                Some(request_scoped_schedule_omitted_ready_groups),
-            )
+            let preserved =
+                preserve_request_loaded_ready_groups_across_explicit_empty_request_scoped_drift(
+                    preserved_omission,
+                    &sink_status,
+                    &request_scoped,
+                );
+            if trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
+                && sink_status_snapshot_omits_all_groups_from_schedule(&request_scoped)
+            {
+                (
+                    request_scoped,
+                    Some(request_scoped_schedule_omitted_ready_groups),
+                )
+            } else {
+                (
+                    preserved,
+                    Some(request_scoped_schedule_omitted_ready_groups),
+                )
+            }
         } else {
-            (
-                preserved,
-                Some(request_scoped_schedule_omitted_ready_groups),
-            )
-        }
-    } else {
-        (sink_status.clone(), None)
-    };
+            (sink_status.clone(), None)
+        };
     match query_tree_page_response(
         &state,
         &policy,

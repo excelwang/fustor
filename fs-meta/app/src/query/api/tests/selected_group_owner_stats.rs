@@ -72,8 +72,8 @@ async fn collect_materialized_stats_groups_trusted_fails_closed_when_ready_root_
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -235,8 +235,8 @@ async fn collect_materialized_stats_groups_trusted_prefers_richer_proxy_stats_wh
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -408,8 +408,8 @@ async fn collect_materialized_stats_groups_trusted_fails_closed_when_ready_root_
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -602,8 +602,8 @@ async fn collect_materialized_stats_groups_trusted_file_path_keeps_zero_groups_w
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,

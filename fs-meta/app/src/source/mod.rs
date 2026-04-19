@@ -63,6 +63,7 @@ use crate::source::sentinel::{HealthSignal, Sentinel, SentinelAction, SentinelCo
 use crate::source::watcher::WatchManager;
 use crate::state::cell::{AuthorityJournal, HostObjectGrantsCell, LogicalRootsCell, SignalCell};
 use crate::state::commit_boundary::CommitBoundary;
+use crate::workers::source::SourceControlState;
 
 #[cfg(test)]
 use crate::runtime::routes::ROUTE_KEY_QUERY;
@@ -555,6 +556,8 @@ pub struct FSMetaSource {
     force_find_last_runner: Arc<Mutex<BTreeMap<String, String>>>,
     /// Last accepted runtime control summary for local observability snapshots.
     last_control_frame_signals: Arc<Mutex<Vec<String>>>,
+    /// Canonical retained source control state for local/runtime replay.
+    control_state: Arc<tokio::sync::Mutex<SourceControlState>>,
     /// Coalesced runtime-topology refresh trigger.
     runtime_refresh_dirty: Arc<AtomicBool>,
     /// Pending rescan request coupled to topology refresh.
@@ -1083,6 +1086,24 @@ impl FSMetaSource {
             self.schedule_runtime_refresh(true);
         }
         Ok(())
+    }
+
+    pub(crate) async fn control_signals_with_replay(
+        &self,
+        signals: &[SourceControlSignal],
+    ) -> Vec<SourceControlSignal> {
+        let mut desired = self.control_state.lock().await.clone();
+        desired.retain_signals(signals);
+        desired.replay_signals()
+    }
+
+    pub(crate) async fn record_retained_control_signals(&self, signals: &[SourceControlSignal]) {
+        self.control_state.lock().await.retain_signals(signals);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retained_control_state_for_tests(&self) -> SourceControlState {
+        self.control_state.lock().await.clone()
     }
 
     fn schedule_runtime_refresh(&self, trigger_rescan: bool) {
@@ -2199,6 +2220,7 @@ impl FSMetaSource {
             force_find_inflight: Arc::new(Mutex::new(HashSet::new())),
             force_find_last_runner: Arc::new(Mutex::new(BTreeMap::new())),
             last_control_frame_signals: Arc::new(Mutex::new(Vec::new())),
+            control_state: Arc::new(tokio::sync::Mutex::new(SourceControlState::default())),
             runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
             runtime_refresh_rescan: Arc::new(AtomicBool::new(false)),
             runtime_refresh_running: Arc::new(AtomicBool::new(false)),
@@ -4633,6 +4655,7 @@ impl FSMetaSource {
     pub async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
         let signals = source_control_signals_from_envelopes(envelopes)?;
         self.apply_orchestration_signals(&signals).await?;
+        self.record_retained_control_signals(&signals).await;
         *lock_or_recover(
             &self.last_control_frame_signals,
             "source.on_control_frame.last_control_frame_signals",

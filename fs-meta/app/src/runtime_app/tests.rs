@@ -141,20 +141,46 @@ pub(super) fn facade_deactivate_barrier_test_serial() -> &'static tokio::sync::M
 }
 
 fn set_control_initialized_for_tests(app: &FSMetaApp, control_initialized: bool) {
-    app.update_runtime_gate_facts_for_tests(|state| {
-        state.control_initialized = control_initialized;
+    app.update_runtime_control_state_for_tests(|state| {
+        state.set_control_initialized(control_initialized);
     });
 }
 
+fn runtime_control_state_for_tests(
+    control_initialized: bool,
+    source_state_replay_required: bool,
+    sink_state_replay_required: bool,
+) -> RuntimeControlState {
+    if control_initialized {
+        RuntimeControlState::live(
+            source_state_replay_required,
+            sink_state_replay_required,
+        )
+    } else {
+        RuntimeControlState::bootstrapping(
+            source_state_replay_required,
+            sink_state_replay_required,
+        )
+    }
+}
+
 fn set_source_replay_required_for_tests(app: &FSMetaApp, source_state_replay_required: bool) {
-    app.update_runtime_gate_facts_for_tests(|state| {
-        state.source_state_replay_required = source_state_replay_required;
+    app.update_runtime_control_state_for_tests(|state| {
+        if source_state_replay_required {
+            state.require_source_replay();
+        } else {
+            state.clear_source_replay();
+        }
     });
 }
 
 fn set_sink_replay_required_for_tests(app: &FSMetaApp, sink_state_replay_required: bool) {
-    app.update_runtime_gate_facts_for_tests(|state| {
-        state.sink_state_replay_required = sink_state_replay_required;
+    app.update_runtime_control_state_for_tests(|state| {
+        if sink_state_replay_required {
+            state.require_sink_replay();
+        } else {
+            state.clear_sink_replay();
+        }
     });
 }
 
@@ -800,9 +826,10 @@ impl RuntimeProxyFallbackUnitBoundary {
 impl ChannelIoSubset for LoopbackWorkerBoundary {
     async fn channel_send(&self, _ctx: BoundaryContext, request: ChannelSendRequest) -> Result<()> {
         {
+            let route_key = request.channel_key.0.clone();
             let mut channels = self.channels.lock().expect("loopback channels lock");
             channels
-                .entry(request.channel_key.0)
+                .entry(route_key)
                 .or_default()
                 .extend(request.events);
         }
@@ -815,6 +842,7 @@ impl ChannelIoSubset for LoopbackWorkerBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> Result<Vec<Event>> {
+        let route_key = request.channel_key.0.clone();
         let deadline = request
             .timeout_ms
             .map(Duration::from_millis)
@@ -828,7 +856,7 @@ impl ChannelIoSubset for LoopbackWorkerBoundary {
             .await;
             {
                 let mut channels = self.channels.lock().expect("loopback channels lock");
-                if let Some(events) = channels.remove(&request.channel_key.0)
+                if let Some(events) = channels.remove(&route_key)
                     && !events.is_empty()
                 {
                     return Ok(events);
@@ -836,7 +864,7 @@ impl ChannelIoSubset for LoopbackWorkerBoundary {
             }
             {
                 let closed = self.closed.lock().expect("loopback closed lock");
-                if closed.contains(&request.channel_key.0) {
+                if closed.contains(&route_key) {
                     return Err(CnxError::ChannelClosed);
                 }
             }
@@ -1047,13 +1075,31 @@ fn fs_meta_runtime_lib_filename() -> &'static str {
     }
 }
 
-fn runtime_test_worker_module_path_candidates(root: &Path, lib_name: &str) -> [PathBuf; 4] {
-    [
-        root.join("target/debug").join(lib_name),
-        root.join("target/debug/deps").join(lib_name),
-        root.join(".target/debug").join(lib_name),
-        root.join(".target/debug/deps").join(lib_name),
-    ]
+fn runtime_test_worker_module_target_roots(root: &Path) -> Vec<PathBuf> {
+    let mut target_roots = Vec::new();
+    if let Some(path) = std::env::var_os("CARGO_TARGET_DIR") {
+        let target_dir = PathBuf::from(path);
+        target_roots.push(if target_dir.is_absolute() {
+            target_dir
+        } else {
+            root.join(target_dir)
+        });
+    }
+    target_roots.push(root.join("target"));
+    target_roots.push(root.join(".target"));
+    target_roots
+}
+
+fn runtime_test_worker_module_path_candidates(root: &Path, lib_name: &str) -> Vec<PathBuf> {
+    runtime_test_worker_module_target_roots(root)
+        .into_iter()
+        .flat_map(|target_root| {
+            [
+                target_root.join("debug").join(lib_name),
+                target_root.join("debug/deps").join(lib_name),
+            ]
+        })
+        .collect()
 }
 
 fn newest_existing_runtime_test_worker_module_path(
@@ -1085,6 +1131,48 @@ fn resolve_runtime_test_worker_module_path_from_workspace_root(root: &Path) -> O
         root,
         fs_meta_runtime_lib_filename(),
     ))
+}
+
+#[test]
+fn resolve_runtime_test_worker_module_path_from_workspace_root_prefers_cargo_target_dir() {
+    static ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    let _guard = ENV_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .expect("lock cargo target dir env for runtime worker module path test");
+
+    let tmp = tempdir().expect("create temp dir");
+    let workspace_root = tmp.path().join("workspace");
+    let cargo_target_dir = tmp.path().join("custom-target");
+    let target_dir = workspace_root.join("target");
+    fs::create_dir_all(target_dir.join("debug")).expect("create workspace target/debug");
+    fs::create_dir_all(cargo_target_dir.join("debug")).expect("create custom target/debug");
+
+    let lib_name = fs_meta_runtime_lib_filename();
+    let workspace_lib = target_dir.join("debug").join(lib_name);
+    let cargo_target_lib = cargo_target_dir.join("debug").join(lib_name);
+    fs::write(&workspace_lib, b"workspace").expect("write workspace runtime module");
+    fs::write(&cargo_target_lib, b"custom-target").expect("write cargo target runtime module");
+
+    let previous = std::env::var_os("CARGO_TARGET_DIR");
+    unsafe {
+        std::env::set_var("CARGO_TARGET_DIR", &cargo_target_dir);
+    }
+    let resolved = resolve_runtime_test_worker_module_path_from_workspace_root(&workspace_root);
+    match previous {
+        Some(value) => unsafe {
+            std::env::set_var("CARGO_TARGET_DIR", value);
+        },
+        None => unsafe {
+            std::env::remove_var("CARGO_TARGET_DIR");
+        },
+    }
+
+    assert_eq!(
+        resolved.as_deref(),
+        Some(cargo_target_lib.as_path()),
+        "runtime_app external worker tests must honor CARGO_TARGET_DIR when resolving the fs-meta worker module"
+    );
 }
 
 fn runtime_test_worker_module_path() -> PathBuf {
@@ -1684,9 +1772,9 @@ fn selected_group_bridge_eligibility_skips_group_with_zero_live_nodes() {
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
         }],
@@ -1722,8 +1810,8 @@ fn selected_group_bridge_eligibility_requires_live_nodes() {
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 2,
             estimated_heap_bytes: 64,
@@ -1762,8 +1850,8 @@ fn trusted_root_selected_group_bridge_eligibility_accepts_ready_root_with_only_t
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 2,
             estimated_heap_bytes: 64,
@@ -1806,8 +1894,8 @@ fn trusted_root_selected_group_ready_sink_status_uses_owner_scoped_sink_query_ro
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 10,
             estimated_heap_bytes: 64,
@@ -1858,8 +1946,8 @@ fn trusted_root_selected_group_surviving_ready_cached_sink_status_outranks_regre
                 blind_spot_count: 0,
                 shadow_time_us: 1,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 9,
                 estimated_heap_bytes: 64,
@@ -1875,9 +1963,9 @@ fn trusted_root_selected_group_surviving_ready_cached_sink_status_outranks_regre
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 0,
                 estimated_heap_bytes: 0,
             },
@@ -1901,8 +1989,8 @@ fn trusted_root_selected_group_surviving_ready_cached_sink_status_outranks_regre
                 blind_spot_count: 0,
                 shadow_time_us: 1,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 9,
                 estimated_heap_bytes: 64,
@@ -1918,8 +2006,8 @@ fn trusted_root_selected_group_surviving_ready_cached_sink_status_outranks_regre
                 blind_spot_count: 0,
                 shadow_time_us: 1,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 10,
                 estimated_heap_bytes: 64,
@@ -1977,9 +2065,9 @@ fn trusted_root_selected_group_ready_cached_sink_status_outranks_live_stale_owne
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 0,
             estimated_heap_bytes: 64,
         }],
@@ -2001,8 +2089,8 @@ fn trusted_root_selected_group_ready_cached_sink_status_outranks_live_stale_owne
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 11,
             estimated_heap_bytes: 64,
@@ -2374,103 +2462,77 @@ async fn current_facade_service_state_reads_pending_runtime_facts() {
 }
 
 #[test]
-fn current_facade_service_state_from_runtime_facts_prefers_pending_over_ready_publication() {
+fn runtime_control_state_current_facade_service_state_prefers_pending_over_ready_publication() {
     assert_eq!(
-        FSMetaApp::current_facade_service_state_from_runtime_facts(
-            FacadeServiceStateDecisionInput {
-                control_gate_ready: true,
-                publication_ready: true,
-                pending_facade_present: true,
-            },
-        ),
+        runtime_control_state_for_tests(false, false, false)
+            .current_facade_service_state(true, true, true),
         FacadeServiceState::Pending
     );
 }
 
 #[test]
-fn current_facade_service_state_from_runtime_facts_requires_ready_publication_without_pending() {
+fn runtime_control_state_current_facade_service_state_requires_ready_publication_without_pending() {
     assert_eq!(
-        FSMetaApp::current_facade_service_state_from_runtime_facts(
-            FacadeServiceStateDecisionInput {
-                control_gate_ready: true,
-                publication_ready: false,
-                pending_facade_present: false,
-            },
-        ),
+        runtime_control_state_for_tests(false, false, false)
+            .current_facade_service_state(false, false, true),
         FacadeServiceState::Unavailable
     );
     assert_eq!(
-        FSMetaApp::current_facade_service_state_from_runtime_facts(
-            FacadeServiceStateDecisionInput {
-                control_gate_ready: false,
-                publication_ready: true,
-                pending_facade_present: false,
-            },
-        ),
+        runtime_control_state_for_tests(true, false, true)
+            .current_facade_service_state(false, true, true),
         FacadeServiceState::Unavailable
     );
     assert_eq!(
-        FSMetaApp::current_facade_service_state_from_runtime_facts(
-            FacadeServiceStateDecisionInput {
-                control_gate_ready: true,
-                publication_ready: false,
-                pending_facade_present: false,
-            },
-        ),
+        runtime_control_state_for_tests(false, false, false)
+            .current_facade_service_state(false, false, true),
         FacadeServiceState::Unavailable
     );
     assert_eq!(
-        FSMetaApp::current_facade_service_state_from_runtime_facts(
-            FacadeServiceStateDecisionInput {
-                control_gate_ready: true,
-                publication_ready: true,
-                pending_facade_present: false,
-            },
-        ),
+        runtime_control_state_for_tests(false, false, false)
+            .current_facade_service_state(false, true, true),
         FacadeServiceState::Serving
     );
 }
 
 #[test]
-fn control_gate_ready_from_runtime_facts_requires_initialized_or_facade_only_handoff_and_no_replay()
-{
-    assert_eq!(
-        FSMetaApp::control_gate_ready_from_runtime_facts(
-            RuntimeGateFacts {
-                control_initialized: false,
-                source_state_replay_required: false,
-                sink_state_replay_required: false,
-            },
-            true,
-        ),
-        true
-    );
-    assert_eq!(
-        FSMetaApp::control_gate_ready_from_runtime_facts(
-            RuntimeGateFacts {
-                control_initialized: true,
-                source_state_replay_required: false,
-                sink_state_replay_required: true,
-            },
-            true,
-        ),
-        false
-    );
+fn runtime_control_state_control_gate_ready_requires_initialized_or_facade_only_handoff_and_no_replay()
+ {
+    assert!(runtime_control_state_for_tests(false, false, false).control_gate_ready(true));
+    assert!(!runtime_control_state_for_tests(true, false, true).control_gate_ready(true));
+}
+
+#[test]
+fn runtime_control_state_transitions_preserve_initialized_and_replay_semantics() {
+    let mut state = runtime_control_state_for_tests(false, false, false);
+    assert_eq!(state, RuntimeControlState::bootstrapping(false, false));
+
+    state.require_source_replay();
+    assert_eq!(state, RuntimeControlState::bootstrapping(true, false));
+
+    state.require_sink_replay();
+    assert_eq!(state, RuntimeControlState::bootstrapping(true, true));
+
+    state.mark_initialized();
+    assert_eq!(state, RuntimeControlState::live(true, true));
+
+    state.clear_source_replay();
+    assert_eq!(state, RuntimeControlState::live(false, true));
+
+    state.clear_sink_replay();
+    assert_eq!(state, RuntimeControlState::live(false, false));
+
+    state.mark_uninitialized_preserving_replay();
+    assert_eq!(state, RuntimeControlState::bootstrapping(false, false));
+
+    state.mark_uninitialized_with_full_replay();
+    assert_eq!(state, RuntimeControlState::bootstrapping(true, true));
 }
 
 #[test]
 fn facade_ready_tail_decision_prefers_pending_over_ready_publication() {
     assert_eq!(
-        FSMetaApp::facade_ready_tail_decision_from_runtime_facts(FacadeReadyTailDecisionInput {
-            runtime: RuntimeGateFacts {
-                control_initialized: false,
-                source_state_replay_required: false,
-                sink_state_replay_required: false,
-            },
-            allow_facade_only_handoff: true,
-            publication_ready: true,
-            pending_facade_present: true,
-        }),
+        runtime_control_state_for_tests(false, false, false)
+            .facade_ready_tail_decision(true, true, true,),
         FacadeReadyTailDecision {
             control_gate_ready: true,
             published_state: FacadeServiceState::Pending,
@@ -2481,16 +2543,8 @@ fn facade_ready_tail_decision_prefers_pending_over_ready_publication() {
 #[test]
 fn facade_ready_tail_decision_keeps_unavailable_while_sink_replay_required_remains() {
     assert_eq!(
-        FSMetaApp::facade_ready_tail_decision_from_runtime_facts(FacadeReadyTailDecisionInput {
-            runtime: RuntimeGateFacts {
-                control_initialized: true,
-                source_state_replay_required: false,
-                sink_state_replay_required: true,
-            },
-            allow_facade_only_handoff: true,
-            publication_ready: true,
-            pending_facade_present: false,
-        }),
+        runtime_control_state_for_tests(true, false, true)
+            .facade_ready_tail_decision(true, false, true,),
         FacadeReadyTailDecision {
             control_gate_ready: false,
             published_state: FacadeServiceState::Unavailable,
@@ -2501,16 +2555,8 @@ fn facade_ready_tail_decision_keeps_unavailable_while_sink_replay_required_remai
 #[test]
 fn facade_ready_tail_decision_allows_serving_after_facade_only_handoff_without_replay() {
     assert_eq!(
-        FSMetaApp::facade_ready_tail_decision_from_runtime_facts(FacadeReadyTailDecisionInput {
-            runtime: RuntimeGateFacts {
-                control_initialized: false,
-                source_state_replay_required: false,
-                sink_state_replay_required: false,
-            },
-            allow_facade_only_handoff: true,
-            publication_ready: true,
-            pending_facade_present: false,
-        }),
+        runtime_control_state_for_tests(false, false, false)
+            .facade_ready_tail_decision(true, false, true,),
         FacadeReadyTailDecision {
             control_gate_ready: true,
             published_state: FacadeServiceState::Serving,
@@ -2522,21 +2568,8 @@ fn facade_ready_tail_decision_allows_serving_after_facade_only_handoff_without_r
 fn facade_publication_readiness_decision_blocks_uninitialized_fixed_bind_handoff_while_suppressed_routes_remain()
  {
     assert_eq!(
-        FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
-            FacadePublicationReadinessDecisionInput {
-                runtime: RuntimeGateFacts {
-                    control_initialized: false,
-                    source_state_replay_required: false,
-                    sink_state_replay_required: false,
-                },
-                allow_facade_only_handoff: false,
-                pending_facade_present: true,
-                pending_facade_is_control_route: true,
-                pending_fixed_bind_has_suppressed_dependent_routes: true,
-                active_control_stream_present: false,
-                active_pending_control_stream_present: false,
-            },
-        ),
+        runtime_control_state_for_tests(false, false, false)
+            .facade_publication_readiness_decision(true, true, false, false, false),
         FacadePublicationReadinessDecision::BlockedControlGate
     );
 }
@@ -2770,6 +2803,27 @@ async fn pending_fixed_bind_handoff_continuation_for_tests(
     }
 }
 
+fn fixed_bind_handoff_driver_for_tests(
+    pending_fixed_bind_publication: PendingFixedBindPublicationState,
+    release_handoff: Option<PendingFixedBindHandoffContinuation>,
+    shutdown_handoff: Option<ActiveFixedBindShutdownContinuation>,
+) -> FixedBindHandoffDriver {
+    FixedBindHandoffDriver {
+        gate: FacadeGateObservation {
+            runtime: runtime_control_state_for_tests(false, false, false),
+            current_pending: None,
+            pending_facade_present: false,
+            pending_facade_is_control_route: false,
+            active_control_stream_present: false,
+            active_pending_control_stream_present: false,
+            allow_facade_only_handoff: false,
+        },
+        pending_fixed_bind_publication,
+        release_handoff,
+        shutdown_handoff,
+    }
+}
+
 async fn facade_deactivate_continuity_execution_plan_for_tests(
     retain_active_facade: bool,
     pending_fixed_bind_conflict: bool,
@@ -2781,9 +2835,7 @@ async fn facade_deactivate_continuity_execution_plan_for_tests(
     } else {
         None
     };
-    FacadeDeactivateContinuityExecutionPlan::from_parts(
-        retain_active_facade,
-        retain_pending_spawn,
+    fixed_bind_handoff_driver_for_tests(
         PendingFixedBindPublicationState::new(
             pending_fixed_bind_conflict.then(|| PendingFacadeActivation {
                 route_key: format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
@@ -2812,6 +2864,7 @@ async fn facade_deactivate_continuity_execution_plan_for_tests(
             pending_handoff: release_handoff,
         }),
     )
+    .deactivate_plan(retain_active_facade, retain_pending_spawn)
 }
 
 #[tokio::test]
@@ -2869,16 +2922,15 @@ async fn facade_deactivate_continuity_execution_plan_shuts_down_when_no_continui
 
 #[tokio::test]
 async fn facade_deactivate_continuity_execution_plan_reuses_observed_handoff_state_for_release() {
-    let plan = FacadeDeactivateContinuityExecutionPlan::from_parts(
-        true,
-        false,
+    let plan = fixed_bind_handoff_driver_for_tests(
         PendingFixedBindPublicationState::inactive(false),
         Some(pending_fixed_bind_handoff_continuation_for_tests("127.0.0.1:4100").await),
         Some(ActiveFixedBindShutdownContinuation {
             bind_addr: "127.0.0.1:4100".to_string(),
             pending_handoff: None,
         }),
-    );
+    )
+    .deactivate_plan(true, false);
 
     assert!(matches!(
         plan,
@@ -2889,16 +2941,15 @@ async fn facade_deactivate_continuity_execution_plan_reuses_observed_handoff_sta
 
 #[tokio::test]
 async fn facade_deactivate_continuity_execution_plan_reuses_observed_handoff_state_for_shutdown() {
-    let plan = FacadeDeactivateContinuityExecutionPlan::from_parts(
-        false,
-        false,
+    let plan = fixed_bind_handoff_driver_for_tests(
         PendingFixedBindPublicationState::inactive(false),
         None,
         Some(ActiveFixedBindShutdownContinuation {
             bind_addr: "127.0.0.1:4100".to_string(),
             pending_handoff: None,
         }),
-    );
+    )
+    .deactivate_plan(false, false);
 
     assert!(matches!(
         plan,
@@ -2911,21 +2962,8 @@ async fn facade_deactivate_continuity_execution_plan_reuses_observed_handoff_sta
 fn facade_publication_readiness_decision_requires_matching_active_control_stream_before_pending_control_route_is_ready()
  {
     assert_eq!(
-        FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
-            FacadePublicationReadinessDecisionInput {
-                runtime: RuntimeGateFacts {
-                    control_initialized: true,
-                    source_state_replay_required: false,
-                    sink_state_replay_required: false,
-                },
-                allow_facade_only_handoff: false,
-                pending_facade_present: true,
-                pending_facade_is_control_route: true,
-                pending_fixed_bind_has_suppressed_dependent_routes: true,
-                active_control_stream_present: true,
-                active_pending_control_stream_present: false,
-            },
-        ),
+        runtime_control_state_for_tests(true, false, false)
+            .facade_publication_readiness_decision(true, true, true, false, false),
         FacadePublicationReadinessDecision::FixedBindHandoffPending
     );
 }
@@ -2933,21 +2971,8 @@ fn facade_publication_readiness_decision_requires_matching_active_control_stream
 #[test]
 fn facade_publication_readiness_decision_allows_facade_only_handoff_without_suppressed_routes() {
     assert_eq!(
-        FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
-            FacadePublicationReadinessDecisionInput {
-                runtime: RuntimeGateFacts {
-                    control_initialized: false,
-                    source_state_replay_required: false,
-                    sink_state_replay_required: false,
-                },
-                allow_facade_only_handoff: true,
-                pending_facade_present: true,
-                pending_facade_is_control_route: true,
-                pending_fixed_bind_has_suppressed_dependent_routes: false,
-                active_control_stream_present: false,
-                active_pending_control_stream_present: false,
-            },
-        ),
+        runtime_control_state_for_tests(false, false, false)
+            .facade_publication_readiness_decision(true, true, false, false, true),
         FacadePublicationReadinessDecision::FixedBindHandoffPending
     );
 }
@@ -2956,21 +2981,8 @@ fn facade_publication_readiness_decision_allows_facade_only_handoff_without_supp
 fn facade_publication_readiness_decision_allows_active_control_stream_during_fixed_bind_ready_tail_even_when_pending_facade_is_not_control_route()
  {
     assert_eq!(
-        FSMetaApp::facade_publication_readiness_decision_from_runtime_facts(
-            FacadePublicationReadinessDecisionInput {
-                runtime: RuntimeGateFacts {
-                    control_initialized: false,
-                    source_state_replay_required: false,
-                    sink_state_replay_required: false,
-                },
-                allow_facade_only_handoff: true,
-                pending_facade_present: true,
-                pending_facade_is_control_route: false,
-                pending_fixed_bind_has_suppressed_dependent_routes: true,
-                active_control_stream_present: true,
-                active_pending_control_stream_present: false,
-            },
-        ),
+        runtime_control_state_for_tests(false, false, false)
+            .facade_publication_readiness_decision(true, false, true, false, true),
         FacadePublicationReadinessDecision::Ready
     );
 }
@@ -6340,7 +6352,7 @@ async fn external_worker_status_reports_serving_facade_state_after_remote_collec
         resource_ids: vec!["listener-a".to_string()],
         handle: active_facade,
     });
-    FSMetaApp::publish_facade_service_state_from_runtime_facts(
+    FSMetaApp::publish_facade_service_state_from_runtime_state(
         &app.facade_service_state,
         FacadeServiceStateDecisionInput {
             control_gate_ready: true,
@@ -20691,7 +20703,7 @@ async fn cleanup_only_sink_query_tail_preserves_retained_sink_activate_before_la
         let ready_groups = snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         if sink_groups == expected_groups && ready_groups == expected_groups {
@@ -20982,7 +20994,7 @@ async fn cleanup_only_sink_query_tail_later_node_a_mixed_recovery_settles_after_
         let ready_groups = snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         if sink_groups == expected_groups && ready_groups == expected_groups {
@@ -21908,7 +21920,7 @@ async fn source_cleanup_only_and_query_peer_cleanup_tails_preserve_sink_converge
         let ready_groups = snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         if sink_groups == expected_groups && ready_groups == expected_groups {
@@ -25611,7 +25623,7 @@ async fn exact_shaped_sink_nine_wave_survives_late_sink_events_deactivate_reset(
         sink_status_snapshots.iter().any(|snapshot| {
             snapshot.groups.iter().all(|group| {
                 (group.group_id == "nfs1" || group.group_id == "nfs2")
-                    && group.initial_audit_completed
+                    && group.is_ready()
                     && group.total_nodes > 0
             })
         }),
@@ -26540,7 +26552,8 @@ async fn filtered_stale_shared_source_deactivate_does_not_clear_desired_source_s
             2,
         )])
         .expect("split initial source activate");
-    app.record_retained_source_control_state(&initial_source_signals)
+    app.source
+        .record_retained_control_signals(&initial_source_signals)
         .await;
 
     app.shared_source_route_claims.lock().await.insert(
@@ -26561,8 +26574,8 @@ async fn filtered_stale_shared_source_deactivate_does_not_clear_desired_source_s
         .expect("stale source deactivate should be filtered");
 
     match app
-        .retained_source_control_state
-        .lock()
+        .source
+        .retained_control_state_for_tests()
         .await
         .active_by_route
         .get(&route_id)
@@ -26600,7 +26613,8 @@ async fn source_reconcile_retains_latest_deactivate_directive_after_reset() {
             2,
         )])
         .expect("split initial source activate");
-    app.record_retained_source_control_state(&initial_source_signals)
+    app.source
+        .record_retained_control_signals(&initial_source_signals)
         .await;
     set_source_replay_required_for_tests(&app, true);
 
@@ -26611,7 +26625,8 @@ async fn source_reconcile_retains_latest_deactivate_directive_after_reset() {
             3,
         )])
         .expect("split source deactivate");
-    app.record_retained_source_control_state(&deactivate_source_signals)
+    app.source
+        .record_retained_control_signals(&deactivate_source_signals)
         .await;
 
     let replayed = app.source_signals_with_replay(&[]).await;
@@ -26688,7 +26703,8 @@ async fn generation_cutover_restart_deferred_cleanup_tail_fail_closes_before_rep
     ];
     let (seed_source_signals, _, _) =
         split_app_control_signals(&seed_envelopes).expect("split seeded source replay state");
-    app.record_retained_source_control_state(&seed_source_signals)
+    app.source
+        .record_retained_control_signals(&seed_source_signals)
         .await;
     set_source_replay_required_for_tests(&app, true);
     set_control_initialized_for_tests(&app, true);
@@ -28904,7 +28920,8 @@ async fn replay_required_source_control_retains_active_routes_per_unit_not_just_
     ];
     let (initial_source, _, _) =
         split_app_control_signals(&initial).expect("split initial source control");
-    app.record_retained_source_control_state(&initial_source)
+    app.source
+        .record_retained_control_signals(&initial_source)
         .await;
     set_source_replay_required_for_tests(&app, true);
 
@@ -31636,7 +31653,7 @@ async fn observation_eligibility_ignores_unbound_sink_overflow_for_listener_only
         sink_status
             .groups
             .iter()
-            .any(|group| group.group_id == "root-b" && group.overflow_pending_audit),
+            .any(|group| group.group_id == "root-b" && group.overflow_pending_materialization),
         "unbound group should retain overflow evidence in sink status"
     );
 
@@ -32182,7 +32199,7 @@ async fn external_runtime_app_selected_group_proxy_rematerializes_each_local_pri
                 let ready_groups = snapshot
                     .groups
                     .iter()
-                    .filter(|group| group.initial_audit_completed)
+                    .filter(|group| group.is_ready())
                     .map(|group| group.group_id.clone())
                     .collect::<std::collections::BTreeSet<_>>();
                 if ready_groups == expected_groups {
@@ -32439,7 +32456,7 @@ async fn current_generation_sink_events_tick_after_sink_worker_reset_and_manual_
         let ready_groups = snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         if ready_groups == expected_groups {

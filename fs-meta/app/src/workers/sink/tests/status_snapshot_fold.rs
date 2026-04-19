@@ -122,8 +122,8 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_waiting_for_materialize
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -157,8 +157,8 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_mixed_ready_and_unready
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 7,
                 estimated_heap_bytes: 1,
@@ -174,8 +174,8 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_mixed_ready_and_unready
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
@@ -196,7 +196,7 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_mixed_ready_and_unready
 }
 
 #[test]
-fn classify_sink_status_snapshot_issue_detects_scheduled_pending_audit_without_stream_receipts_regardless_of_replay_required()
+fn classify_sink_status_snapshot_issue_detects_scheduled_pending_materialization_without_stream_receipts_regardless_of_replay_required()
  {
     let snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
@@ -210,9 +210,9 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_pending_audit_without_s
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 7,
             estimated_heap_bytes: 1,
         }],
@@ -225,13 +225,14 @@ fn classify_sink_status_snapshot_issue_detects_scheduled_pending_audit_without_s
 
     assert_eq!(
         classify_sink_status_snapshot_issue(&snapshot),
-        Some(SinkStatusSnapshotIssue::ScheduledPendingAuditWithoutStreamReceipts),
-        "scheduled zero-state pending-audit snapshots must classify as pending-audit without stream receipts even before replay_required is armed"
+        Some(SinkStatusSnapshotIssue::ScheduledPendingMaterializationWithoutStreamReceipts),
+        "scheduled zero-state pending-materialization snapshots must classify as pending-materialization without stream receipts even before replay_required is armed"
     );
 }
 
 #[test]
-fn sink_group_status_readiness_distinguishes_waiting_for_materialized_root_from_pending_audit() {
+fn sink_group_status_readiness_distinguishes_waiting_for_materialized_root_from_pending_materialization()
+ {
     let waiting_for_materialized_root = crate::sink::SinkGroupStatusSnapshot {
         group_id: "nfs3".to_string(),
         primary_object_ref: "unassigned".to_string(),
@@ -243,13 +244,13 @@ fn sink_group_status_readiness_distinguishes_waiting_for_materialized_root_from_
         blind_spot_count: 0,
         shadow_time_us: 0,
         shadow_lag_us: 0,
-        overflow_pending_audit: false,
-        initial_audit_completed: false,
+        overflow_pending_materialization: false,
+
         readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
         materialized_revision: 1,
         estimated_heap_bytes: 0,
     };
-    let pending_audit = crate::sink::SinkGroupStatusSnapshot {
+    let pending_materialization = crate::sink::SinkGroupStatusSnapshot {
         group_id: "nfs3".to_string(),
         primary_object_ref: "node-b::nfs3".to_string(),
         total_nodes: 6,
@@ -260,9 +261,9 @@ fn sink_group_status_readiness_distinguishes_waiting_for_materialized_root_from_
         blind_spot_count: 0,
         shadow_time_us: 0,
         shadow_lag_us: 0,
-        overflow_pending_audit: false,
-        initial_audit_completed: false,
-        readiness: crate::sink::GroupReadinessState::PendingAudit,
+        overflow_pending_materialization: false,
+
+        readiness: crate::sink::GroupReadinessState::PendingMaterialization,
         materialized_revision: 7,
         estimated_heap_bytes: 1,
     };
@@ -272,8 +273,8 @@ fn sink_group_status_readiness_distinguishes_waiting_for_materialized_root_from_
         crate::sink::GroupReadinessState::WaitingForMaterializedRoot
     );
     assert_eq!(
-        pending_audit.normalized_readiness(),
-        crate::sink::GroupReadinessState::PendingAudit
+        pending_materialization.normalized_readiness(),
+        crate::sink::GroupReadinessState::PendingMaterialization
     );
 }
 
@@ -290,8 +291,8 @@ fn classify_sink_group_status_readiness_prefers_exported_group_readiness_over_le
         blind_spot_count: 0,
         shadow_time_us: 0,
         shadow_lag_us: 0,
-        overflow_pending_audit: false,
-        initial_audit_completed: false,
+        overflow_pending_materialization: false,
+
         readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
         materialized_revision: 7,
         estimated_heap_bytes: 1,
@@ -318,8 +319,8 @@ fn classify_sink_group_status_readiness_treats_zero_row_with_placeholder_primary
         blind_spot_count: 0,
         shadow_time_us: 0,
         shadow_lag_us: 0,
-        overflow_pending_audit: false,
-        initial_audit_completed: false,
+        overflow_pending_materialization: false,
+
         readiness: crate::sink::GroupReadinessState::Ready,
         materialized_revision: 1,
         estimated_heap_bytes: 0,
@@ -333,7 +334,7 @@ fn classify_sink_group_status_readiness_treats_zero_row_with_placeholder_primary
 }
 
 #[test]
-fn classify_sink_group_status_readiness_treats_zero_row_with_bound_primary_as_pending_audit_even_when_exported_readiness_is_ready()
+fn classify_sink_group_status_readiness_treats_zero_row_with_bound_primary_as_pending_materialization_even_when_exported_readiness_is_ready()
  {
     let exported_ready_zero_row = crate::sink::SinkGroupStatusSnapshot {
         group_id: "nfs1".to_string(),
@@ -346,8 +347,8 @@ fn classify_sink_group_status_readiness_treats_zero_row_with_bound_primary_as_pe
         blind_spot_count: 0,
         shadow_time_us: 0,
         shadow_lag_us: 0,
-        overflow_pending_audit: false,
-        initial_audit_completed: false,
+        overflow_pending_materialization: false,
+
         readiness: crate::sink::GroupReadinessState::Ready,
         materialized_revision: 1,
         estimated_heap_bytes: 0,
@@ -355,8 +356,8 @@ fn classify_sink_group_status_readiness_treats_zero_row_with_bound_primary_as_pe
 
     assert_eq!(
         exported_ready_zero_row.normalized_readiness(),
-        crate::sink::GroupReadinessState::PendingAudit,
-        "structural zero rows with a bound primary must override stale exported readiness=Ready and stay pending-audit"
+        crate::sink::GroupReadinessState::PendingMaterialization,
+        "structural zero rows with a bound primary must override stale exported readiness=Ready and stay pending-materialization"
     );
 }
 
@@ -374,8 +375,8 @@ fn classify_sink_group_status_readiness_preserves_exported_waiting_for_materiali
         blind_spot_count: 0,
         shadow_time_us: 0,
         shadow_lag_us: 0,
-        overflow_pending_audit: false,
-        initial_audit_completed: false,
+        overflow_pending_materialization: false,
+
         readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
         materialized_revision: 1,
         estimated_heap_bytes: 0,
@@ -402,8 +403,8 @@ fn classify_sink_group_status_readiness_normalizes_live_row_waiting_for_material
         blind_spot_count: 0,
         shadow_time_us: 0,
         shadow_lag_us: 0,
-        overflow_pending_audit: false,
-        initial_audit_completed: false,
+        overflow_pending_materialization: false,
+
         readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
         materialized_revision: 1,
         estimated_heap_bytes: 0,
@@ -430,8 +431,8 @@ fn ready_groups_from_snapshot_prefers_exported_readiness_over_legacy_initial_aud
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 7,
             estimated_heap_bytes: 1,
@@ -460,8 +461,8 @@ fn snapshot_looks_stale_empty_prefers_exported_readiness_over_legacy_initial_aud
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -490,8 +491,8 @@ fn republish_scheduled_groups_into_zero_row_summary_prefers_exported_readiness_o
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -513,6 +514,63 @@ fn republish_scheduled_groups_into_zero_row_summary_prefers_exported_readiness_o
 }
 
 #[test]
+fn republish_scheduled_groups_into_zero_row_summary_republishes_when_live_rows_cover_cached_schedule()
+ {
+    let mut snapshot = SinkStatusSnapshot {
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs1".to_string(),
+                primary_object_ref: "node-b::nfs1".to_string(),
+                total_nodes: 2,
+                live_nodes: 1,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 4,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::Ready,
+                materialized_revision: 3,
+                estimated_heap_bytes: 749,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs2".to_string(),
+                primary_object_ref: "node-b::nfs2".to_string(),
+                total_nodes: 2,
+                live_nodes: 1,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 8,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::Ready,
+                materialized_revision: 3,
+                estimated_heap_bytes: 749,
+            },
+        ],
+        ..SinkStatusSnapshot::default()
+    };
+
+    republish_scheduled_groups_into_zero_row_summary(
+        &mut snapshot,
+        &NodeId("node-b".to_string()),
+        &std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+    );
+
+    assert_eq!(
+        snapshot.scheduled_groups_by_node,
+        std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]),
+        "when live rows already cover the converged cached schedule, the republish helper must carry that schedule back into the status summary instead of leaving it empty"
+    );
+}
+
+#[test]
 fn fold_live_sink_status_snapshot_returns_cached_for_control_inflight_scheduled_zero_when_cached_ready_truth_survives()
  {
     let cached_snapshot = SinkStatusSnapshot {
@@ -527,8 +585,8 @@ fn fold_live_sink_status_snapshot_returns_cached_for_control_inflight_scheduled_
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 7,
             estimated_heap_bytes: 1,
@@ -551,9 +609,9 @@ fn fold_live_sink_status_snapshot_returns_cached_for_control_inflight_scheduled_
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
         }],
@@ -562,13 +620,18 @@ fn fold_live_sink_status_snapshot_returns_cached_for_control_inflight_scheduled_
     };
 
     assert_eq!(
-        fold_live_sink_status_snapshot_with_projection(
-            &live_snapshot.issue_projection(),
-            &cached_snapshot.issue_projection(),
+        evaluate_live_sink_status_snapshot(
+            &live_snapshot,
+            &cached_snapshot,
             None,
-            SinkStatusLiveFoldMode::ControlInflight,
+            SinkStatusAccessPath::ControlInflight,
         ),
-        SinkStatusLiveFoldOutcome::ReturnCached,
+        SinkStatusSnapshotOutcome {
+            kind: SinkStatusOutcomeKind::ReturnCached,
+            concern: Some(SinkStatusConcern::ReplayPending),
+            should_mark_replay_required: true,
+            should_republish_zero_row_summary: false,
+        },
         "control-inflight live scheduled-zero regressions must fall back to cached ready truth instead of reopening the zero snapshot",
     );
 }
@@ -590,13 +653,18 @@ fn fold_live_sink_status_snapshot_fails_closed_for_blocking_missing_group_rows_a
     };
 
     assert_eq!(
-        fold_live_sink_status_snapshot_with_projection(
-            &live_snapshot.issue_projection(),
-            &cached_snapshot.issue_projection(),
+        evaluate_live_sink_status_snapshot(
+            &live_snapshot,
+            &cached_snapshot,
             None,
-            SinkStatusLiveFoldMode::Blocking,
+            SinkStatusAccessPath::Blocking,
         ),
-        SinkStatusLiveFoldOutcome::FailClosed,
+        SinkStatusSnapshotOutcome {
+            kind: SinkStatusOutcomeKind::FailClosed,
+            concern: Some(SinkStatusConcern::CoverageGap),
+            should_mark_replay_required: false,
+            should_republish_zero_row_summary: false,
+        },
         "blocking status truth must fail close on scheduled missing-group rows once stream evidence proves the schedule already existed instead of publishing a structurally incomplete live snapshot",
     );
 }
@@ -616,8 +684,8 @@ fn fold_live_sink_status_snapshot_fails_closed_for_control_inflight_missing_grou
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 7,
             estimated_heap_bytes: 1,
@@ -641,19 +709,24 @@ fn fold_live_sink_status_snapshot_fails_closed_for_control_inflight_missing_grou
     };
 
     assert_eq!(
-        fold_live_sink_status_snapshot_with_projection(
-            &live_snapshot.issue_projection(),
-            &cached_snapshot.issue_projection(),
+        evaluate_live_sink_status_snapshot(
+            &live_snapshot,
+            &cached_snapshot,
             None,
-            SinkStatusLiveFoldMode::ControlInflight,
+            SinkStatusAccessPath::ControlInflight,
         ),
-        SinkStatusLiveFoldOutcome::FailClosed,
+        SinkStatusSnapshotOutcome {
+            kind: SinkStatusOutcomeKind::FailClosed,
+            concern: Some(SinkStatusConcern::CoverageGap),
+            should_mark_replay_required: false,
+            should_republish_zero_row_summary: false,
+        },
         "control-inflight fallback must not reuse cached ready truth from a different scheduled group when the live missing-group-rows regression targets a new schedule"
     );
 }
 
 #[test]
-fn evaluate_live_sink_status_snapshot_marks_replay_required_for_pending_audit_without_stream_receipts()
+fn evaluate_live_sink_status_snapshot_marks_replay_required_for_pending_materialization_without_stream_receipts()
  {
     let cached_snapshot = SinkStatusSnapshot::default();
     let live_snapshot = SinkStatusSnapshot {
@@ -668,9 +741,9 @@ fn evaluate_live_sink_status_snapshot_marks_replay_required_for_pending_audit_wi
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 7,
             estimated_heap_bytes: 1,
         }],
@@ -685,20 +758,17 @@ fn evaluate_live_sink_status_snapshot_marks_replay_required_for_pending_audit_wi
         &live_snapshot,
         &cached_snapshot,
         None,
-        SinkStatusLiveFoldMode::Steady,
+        SinkStatusAccessPath::Steady,
     );
 
-    assert_eq!(
-        evaluation.decision,
-        SinkStatusAvailabilityDecision::FailClosed
-    );
+    assert_eq!(evaluation.kind, SinkStatusOutcomeKind::FailClosed);
     assert!(
         evaluation.should_mark_replay_required,
-        "pending-audit live snapshots without stream receipts must request replay before the caller decides how to surface the failure",
+        "pending-materialization live snapshots without stream receipts must request replay before the caller decides how to surface the failure",
     );
     assert!(
         !evaluation.should_republish_zero_row_summary,
-        "live pending-audit snapshots must not request zero-row republish side effects"
+        "live pending-materialization snapshots must not request zero-row republish side effects"
     );
 }
 
@@ -718,9 +788,9 @@ fn evaluate_live_sink_status_snapshot_returns_live_for_steady_after_retry_reset_
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
         }],
@@ -735,12 +805,12 @@ fn evaluate_live_sink_status_snapshot_returns_live_for_steady_after_retry_reset_
         &live_snapshot,
         &cached_snapshot,
         None,
-        SinkStatusLiveFoldMode::SteadyAfterRetryReset,
+        SinkStatusAccessPath::SteadyAfterRetryReset,
     );
 
     assert_eq!(
-        evaluation.decision,
-        SinkStatusAvailabilityDecision::ReturnLive,
+        evaluation.kind,
+        SinkStatusOutcomeKind::ReturnLive,
         "a fresh scheduled waiting-for-materialized-root snapshot recovered after retry-reset should surface live schedule truth instead of failing closed as an ordinary steady zero-state regression",
     );
     assert!(
@@ -750,7 +820,7 @@ fn evaluate_live_sink_status_snapshot_returns_live_for_steady_after_retry_reset_
 }
 
 #[test]
-fn evaluate_live_sink_status_snapshot_returns_cached_for_steady_after_retry_reset_pending_audit_when_cached_ready_groups_cover_live_schedule()
+fn evaluate_live_sink_status_snapshot_returns_cached_for_steady_after_retry_reset_pending_materialization_when_cached_ready_groups_cover_live_schedule()
  {
     let cached_snapshot = SinkStatusSnapshot {
         groups: vec![
@@ -765,8 +835,8 @@ fn evaluate_live_sink_status_snapshot_returns_cached_for_steady_after_retry_rese
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 3,
                 estimated_heap_bytes: 1,
@@ -782,8 +852,8 @@ fn evaluate_live_sink_status_snapshot_returns_cached_for_steady_after_retry_rese
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 3,
                 estimated_heap_bytes: 1,
@@ -808,9 +878,9 @@ fn evaluate_live_sink_status_snapshot_returns_cached_for_steady_after_retry_rese
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -825,9 +895,9 @@ fn evaluate_live_sink_status_snapshot_returns_cached_for_steady_after_retry_rese
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -843,18 +913,124 @@ fn evaluate_live_sink_status_snapshot_returns_cached_for_steady_after_retry_rese
         &live_snapshot,
         &cached_snapshot,
         None,
-        SinkStatusLiveFoldMode::SteadyAfterRetryReset,
+        SinkStatusAccessPath::SteadyAfterRetryReset,
     );
 
     assert_eq!(
-        evaluation.decision,
-        SinkStatusAvailabilityDecision::ReturnCached,
-        "retry-reset steady pending-audit live snapshots should preserve cached ready truth when the cached ready groups still cover the current live schedule",
+        evaluation.kind,
+        SinkStatusOutcomeKind::ReturnCached,
+        "retry-reset steady pending-materialization live snapshots should preserve cached ready truth when the cached ready groups still cover the current live schedule",
     );
     assert!(
         !evaluation.should_mark_replay_required,
-        "retry-reset steady pending-audit fallback should not re-arm replay-required once replay already succeeded"
+        "retry-reset steady pending-materialization fallback should not re-arm replay-required once replay already succeeded"
     );
+}
+
+#[test]
+fn evaluate_live_sink_status_snapshot_returns_live_for_steady_after_retry_reset_pending_materialization_when_cached_snapshot_is_stale_empty()
+ {
+    let cached_snapshot = SinkStatusSnapshot::default();
+    let live_snapshot = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-d::nfs1".to_string(),
+            total_nodes: 0,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    let evaluation = evaluate_live_sink_status_snapshot(
+        &live_snapshot,
+        &cached_snapshot,
+        None,
+        SinkStatusAccessPath::SteadyAfterRetryReset,
+    );
+
+    assert_eq!(
+        evaluation.kind,
+        SinkStatusOutcomeKind::ReturnLive,
+        "retry-reset steady pending-materialization snapshots should surface the republished live schedule when cached truth is only a stale-empty zero state",
+    );
+    assert_eq!(evaluation.concern, Some(SinkStatusConcern::ReplayPending));
+    assert!(!evaluation.should_mark_replay_required);
+}
+
+#[test]
+fn evaluate_live_sink_status_snapshot_returns_live_for_steady_after_retry_reset_pending_materialization_when_cached_snapshot_is_pre_activate_unscheduled()
+ {
+    let cached_snapshot = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-d::nfs1".to_string(),
+            total_nodes: 0,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+    let live_snapshot = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-d::nfs1".to_string(),
+            total_nodes: 0,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-d".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    let evaluation = evaluate_live_sink_status_snapshot(
+        &live_snapshot,
+        &cached_snapshot,
+        None,
+        SinkStatusAccessPath::SteadyAfterRetryReset,
+    );
+
+    assert_eq!(
+        evaluation.kind,
+        SinkStatusOutcomeKind::ReturnLive,
+        "retry-reset steady pending-materialization snapshots should surface the fresh republished live schedule even when the cached snapshot still reflects the pre-activate unscheduled zero-state",
+    );
+    assert_eq!(evaluation.concern, Some(SinkStatusConcern::ReplayPending));
+    assert!(!evaluation.should_mark_replay_required);
 }
 
 #[test]
@@ -864,13 +1040,18 @@ fn fold_live_sink_status_snapshot_fails_closed_for_steady_stale_empty_without_ca
     let live_snapshot = SinkStatusSnapshot::default();
 
     assert_eq!(
-        fold_live_sink_status_snapshot_with_projection(
-            &live_snapshot.issue_projection(),
-            &cached_snapshot.issue_projection(),
+        evaluate_live_sink_status_snapshot(
+            &live_snapshot,
+            &cached_snapshot,
             None,
-            SinkStatusLiveFoldMode::Steady,
+            SinkStatusAccessPath::Steady,
         ),
-        SinkStatusLiveFoldOutcome::FailClosed,
+        SinkStatusSnapshotOutcome {
+            kind: SinkStatusOutcomeKind::FailClosed,
+            concern: Some(SinkStatusConcern::StaleEmpty),
+            should_mark_replay_required: false,
+            should_republish_zero_row_summary: false,
+        },
         "steady stale-empty live snapshots must fail closed unless the cached issue explicitly proves the missing-group-rows retry-reset escape hatch",
     );
 }
@@ -891,12 +1072,12 @@ fn fold_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_missin
     };
 
     assert_eq!(
-        project_cached_sink_status_snapshot_fold(
-            &cached_snapshot.issue_projection(),
-            SinkStatusCachedFoldMode::WorkerUnavailable,
+        evaluate_cached_sink_status_snapshot(
+            &cached_snapshot,
+            SinkStatusAccessPath::WorkerUnavailable,
         )
-        .outcome,
-        SinkStatusCachedFoldOutcome::ReturnCached,
+        .kind,
+        SinkStatusOutcomeKind::ReturnCached,
         "worker-unavailable paths should still be allowed to return cached missing-group rows when stream evidence proves the schedule was already alive",
     );
 }
@@ -906,18 +1087,15 @@ fn fold_cached_sink_status_snapshot_fails_closed_for_not_started_stale_empty_cac
     let cached_snapshot = SinkStatusSnapshot::default();
 
     assert_eq!(
-        project_cached_sink_status_snapshot_fold(
-            &cached_snapshot.issue_projection(),
-            SinkStatusCachedFoldMode::NotStarted,
-        )
-        .outcome,
-        SinkStatusCachedFoldOutcome::FailClosed,
+        evaluate_cached_sink_status_snapshot(&cached_snapshot, SinkStatusAccessPath::NotStarted)
+            .kind,
+        SinkStatusOutcomeKind::FailClosed,
         "not-started paths must fail closed on stale-empty cached snapshots instead of treating them as usable sink truth",
     );
 }
 
 #[test]
-fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_pending_audit_without_stream_receipts()
+fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_pending_materialization_without_stream_receipts()
  {
     let cached_snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
@@ -931,9 +1109,9 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_pe
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 7,
             estimated_heap_bytes: 1,
         }],
@@ -946,26 +1124,26 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_pe
 
     let evaluation = evaluate_cached_sink_status_snapshot(
         &cached_snapshot,
-        SinkStatusCachedFoldMode::WorkerUnavailable,
+        SinkStatusAccessPath::WorkerUnavailable,
     );
 
     assert_eq!(
-        evaluation.decision,
-        SinkStatusAvailabilityDecision::ReturnCached,
-        "worker-unavailable cached pending-audit snapshots should preserve the existing cached snapshot fallback instead of propagating the worker error",
+        evaluation.kind,
+        SinkStatusOutcomeKind::ReturnCached,
+        "worker-unavailable cached pending-materialization snapshots should preserve the existing cached snapshot fallback instead of propagating the worker error",
     );
     assert!(
         !evaluation.should_republish_zero_row_summary,
-        "worker-unavailable cached pending-audit snapshots must not request zero-row republish"
+        "worker-unavailable cached pending-materialization snapshots must not request zero-row republish"
     );
     assert!(
         !evaluation.should_mark_replay_required,
-        "cached pending-audit snapshots should not arm replay-required from the cached fold path"
+        "cached pending-materialization snapshots should not arm replay-required from the cached fold path"
     );
 }
 
 #[test]
-fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_pending_audit_without_stream_receipts()
+fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_pending_materialization_without_stream_receipts()
  {
     let cached_snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
@@ -979,9 +1157,9 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_pending_a
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 7,
             estimated_heap_bytes: 1,
         }],
@@ -992,23 +1170,21 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_pending_a
         ..SinkStatusSnapshot::default()
     };
 
-    let evaluation = evaluate_cached_sink_status_snapshot(
-        &cached_snapshot,
-        SinkStatusCachedFoldMode::NotStarted,
-    );
+    let evaluation =
+        evaluate_cached_sink_status_snapshot(&cached_snapshot, SinkStatusAccessPath::NotStarted);
 
     assert_eq!(
-        evaluation.decision,
-        SinkStatusAvailabilityDecision::ReturnCached,
-        "not-started cached pending-audit snapshots should preserve the cached scheduled-zero truth instead of failing closed as stale cache",
+        evaluation.kind,
+        SinkStatusOutcomeKind::ReturnCached,
+        "not-started cached pending-materialization snapshots should preserve the cached scheduled-zero truth instead of failing closed as stale cache",
     );
     assert!(
         !evaluation.should_republish_zero_row_summary,
-        "not-started cached pending-audit snapshots must not request zero-row republish"
+        "not-started cached pending-materialization snapshots must not request zero-row republish"
     );
     assert!(
         !evaluation.should_mark_replay_required,
-        "cached pending-audit snapshots should not arm replay-required from the cached fold path"
+        "cached pending-materialization snapshots should not arm replay-required from the cached fold path"
     );
 }
 
@@ -1027,8 +1203,8 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_wa
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
             materialized_revision: 7,
             estimated_heap_bytes: 1,
@@ -1042,12 +1218,12 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_wa
 
     let evaluation = evaluate_cached_sink_status_snapshot(
         &cached_snapshot,
-        SinkStatusCachedFoldMode::WorkerUnavailable,
+        SinkStatusAccessPath::WorkerUnavailable,
     );
 
     assert_eq!(
-        evaluation.decision,
-        SinkStatusAvailabilityDecision::ReturnCached,
+        evaluation.kind,
+        SinkStatusOutcomeKind::ReturnCached,
         "worker-unavailable cached waiting-for-root snapshots should preserve the stable cached unready truth instead of propagating the worker error",
     );
     assert!(
@@ -1075,8 +1251,8 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_waiting_f
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
             materialized_revision: 7,
             estimated_heap_bytes: 1,
@@ -1088,14 +1264,12 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_waiting_f
         ..SinkStatusSnapshot::default()
     };
 
-    let evaluation = evaluate_cached_sink_status_snapshot(
-        &cached_snapshot,
-        SinkStatusCachedFoldMode::NotStarted,
-    );
+    let evaluation =
+        evaluate_cached_sink_status_snapshot(&cached_snapshot, SinkStatusAccessPath::NotStarted);
 
     assert_eq!(
-        evaluation.decision,
-        SinkStatusAvailabilityDecision::ReturnCached,
+        evaluation.kind,
+        SinkStatusOutcomeKind::ReturnCached,
         "not-started cached waiting-for-root snapshots should preserve the stable cached unready truth instead of failing closed as stale cache",
     );
     assert!(
@@ -1147,14 +1321,12 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_missing_g
         ..SinkStatusSnapshot::default()
     };
 
-    let evaluation = evaluate_cached_sink_status_snapshot(
-        &cached_snapshot,
-        SinkStatusCachedFoldMode::NotStarted,
-    );
+    let evaluation =
+        evaluate_cached_sink_status_snapshot(&cached_snapshot, SinkStatusAccessPath::NotStarted);
 
     assert_eq!(
-        evaluation.decision,
-        SinkStatusAvailabilityDecision::ReturnCached,
+        evaluation.kind,
+        SinkStatusOutcomeKind::ReturnCached,
         "not-started cached missing-group-row snapshots with stream evidence should preserve the cached scheduled truth instead of failing closed as stale cache",
     );
     assert!(
@@ -1168,7 +1340,7 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_not_started_missing_g
 }
 
 #[test]
-fn evaluate_cached_sink_status_snapshot_returns_cached_for_control_inflight_no_client_pending_audit_without_stream_receipts()
+fn evaluate_cached_sink_status_snapshot_returns_cached_for_control_inflight_no_client_pending_materialization_without_stream_receipts()
  {
     let cached_snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
@@ -1182,9 +1354,9 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_control_inflight_no_c
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 7,
             estimated_heap_bytes: 1,
         }],
@@ -1197,21 +1369,21 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_control_inflight_no_c
 
     let evaluation = evaluate_cached_sink_status_snapshot(
         &cached_snapshot,
-        SinkStatusCachedFoldMode::ControlInflightNoClient,
+        SinkStatusAccessPath::ControlInflightNoClient,
     );
 
     assert_eq!(
-        evaluation.decision,
-        SinkStatusAvailabilityDecision::ReturnCached,
-        "control-inflight cached pending-audit snapshots should preserve the cached scheduled-zero truth instead of failing closed as stale cache",
+        evaluation.kind,
+        SinkStatusOutcomeKind::ReturnCached,
+        "control-inflight cached pending-materialization snapshots should preserve the cached scheduled-zero truth instead of failing closed as stale cache",
     );
     assert!(
         !evaluation.should_republish_zero_row_summary,
-        "control-inflight cached pending-audit snapshots must not request zero-row republish"
+        "control-inflight cached pending-materialization snapshots must not request zero-row republish"
     );
     assert!(
         !evaluation.should_mark_replay_required,
-        "cached pending-audit snapshots should not arm replay-required from the cached fold path"
+        "cached pending-materialization snapshots should not arm replay-required from the cached fold path"
     );
 }
 
@@ -1219,15 +1391,10 @@ fn evaluate_cached_sink_status_snapshot_returns_cached_for_control_inflight_no_c
 fn evaluate_cached_sink_status_snapshot_requests_zero_row_republish_for_stale_empty_cache() {
     let cached_snapshot = SinkStatusSnapshot::default();
 
-    let evaluation = evaluate_cached_sink_status_snapshot(
-        &cached_snapshot,
-        SinkStatusCachedFoldMode::NotStarted,
-    );
+    let evaluation =
+        evaluate_cached_sink_status_snapshot(&cached_snapshot, SinkStatusAccessPath::NotStarted);
 
-    assert_eq!(
-        evaluation.decision,
-        SinkStatusAvailabilityDecision::FailClosed
-    );
+    assert_eq!(evaluation.kind, SinkStatusOutcomeKind::FailClosed);
     assert!(
         evaluation.should_republish_zero_row_summary,
         "stale-empty cached snapshots must request zero-row republish before callers fail closed",
@@ -1245,12 +1412,12 @@ fn evaluate_cached_sink_status_snapshot_propagates_error_for_control_inflight_no
 
     let evaluation = evaluate_cached_sink_status_snapshot(
         &cached_snapshot,
-        SinkStatusCachedFoldMode::ControlInflightNoClient,
+        SinkStatusAccessPath::ControlInflightNoClient,
     );
 
     assert_eq!(
-        evaluation.decision,
-        SinkStatusAvailabilityDecision::PropagateError,
+        evaluation.kind,
+        SinkStatusOutcomeKind::PropagateError,
         "control-inflight stale-empty cached snapshots must preserve the live probe error instead of flattening it into fail-closed timeout",
     );
     assert!(

@@ -122,7 +122,7 @@ QueryObservationState =
    2. `FacadeServiceState=pending`
    3. the target group is outside current service scope (`GroupServiceState=not-selected|retired`)
    4. no fresh source execution path is currently available for the target group
-3. `/on-demand-force-find` MUST NOT be blocked solely by materialized-observation trust gates such as initial-audit incompleteness, overflow-pending-audit, or the absence of `trusted-materialized` observation.
+3. `/on-demand-force-find` MUST NOT be blocked solely by materialized-observation trust gates such as initial-audit incompleteness, overflow-pending-materialization, or the absence of `trusted-materialized` observation.
 4. materialized `/tree` and `/stats` requests (`read_class=materialized`) use a narrower availability window than `/on-demand-force-find`. They are available only when all of the following hold:
    1. `FacadeServiceState=serving|degraded`
    2. the target group remains inside current service scope (`GroupServiceState` is not `not-selected` or `retired`)

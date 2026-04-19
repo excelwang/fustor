@@ -321,7 +321,7 @@ async fn peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_
     let local_ready_groups = local_sink_snapshot
         .groups
         .iter()
-        .filter(|group| group.initial_audit_completed)
+        .filter(|group| group.is_ready())
         .map(|group| group.group_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
@@ -350,7 +350,7 @@ async fn peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_
             let ready_groups = snapshot
                 .groups
                 .iter()
-                .filter(|group| group.initial_audit_completed)
+                .filter(|group| group.is_ready())
                 .map(|group| group.group_id.as_str())
                 .collect::<std::collections::BTreeSet<_>>();
             ready_groups == std::collections::BTreeSet::from(["nfs1", "nfs2"])
@@ -809,7 +809,7 @@ async fn peer_only_sink_status_route_triggers_source_rescan_before_sink_readines
             if snapshot
                 .groups
                 .iter()
-                .filter(|group| group.initial_audit_completed)
+                .filter(|group| group.is_ready())
                 .map(|group| group.group_id.clone())
                 .collect::<std::collections::BTreeSet<_>>()
                 == expected_local_ready_groups
@@ -940,7 +940,7 @@ async fn peer_only_sink_status_route_triggers_source_rescan_before_sink_readines
     let local_ready_groups = local_sink_snapshot
         .groups
         .iter()
-        .filter(|group| group.initial_audit_completed)
+        .filter(|group| group.is_ready())
         .map(|group| group.group_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
@@ -1181,7 +1181,7 @@ async fn generation_one_mixed_runtime_control_returns_before_deferred_local_sink
             Ok(Ok(snapshot)) => snapshot
                 .groups
                 .iter()
-                .filter(|group| group.initial_audit_completed)
+                .filter(|group| group.is_ready())
                 .map(|group| group.group_id.clone())
                 .collect::<std::collections::BTreeSet<_>>(),
             Ok(Err(_)) | Err(_) => std::collections::BTreeSet::new(),
@@ -1354,7 +1354,7 @@ async fn sink_status_route_reuses_cached_ready_snapshot_when_replay_required_pro
             Err(err) => panic!("prime ready local sink status: {err}"),
         };
         if snapshot.groups.iter().any(|group| {
-            group.group_id == "nfs2" && group.initial_audit_completed && group.total_nodes > 0
+            group.group_id == "nfs2" && group.is_ready() && group.total_nodes > 0
         }) {
             break;
         }
@@ -1408,9 +1408,9 @@ async fn sink_status_route_reuses_cached_ready_snapshot_when_replay_required_pro
                     blind_spot_count: 0,
                     shadow_time_us: 0,
                     shadow_lag_us: 0,
-                    overflow_pending_audit: false,
-                    initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                    overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                     materialized_revision: 1,
                     estimated_heap_bytes: 0,
                 }],
@@ -1439,7 +1439,7 @@ async fn sink_status_route_reuses_cached_ready_snapshot_when_replay_required_pro
     assert!(
         sink_status_snapshots.iter().any(|snapshot| {
             snapshot.groups.iter().any(|group| {
-                group.group_id == "nfs2" && group.initial_audit_completed && group.total_nodes > 0
+                group.group_id == "nfs2" && group.is_ready() && group.total_nodes > 0
             })
         }),
         "sink-status route must preserve the cached ready nfs2 snapshot instead of timing out on a replay-required transient not-ready probe: {sink_status_snapshots:?}"

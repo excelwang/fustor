@@ -683,8 +683,8 @@ async fn build_tree_pit_session_prefers_cached_sink_primary_when_later_sink_stat
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,

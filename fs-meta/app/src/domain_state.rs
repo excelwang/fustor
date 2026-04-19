@@ -3,17 +3,6 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum GroupServiceState {
-    NotSelected,
-    SelectedPending,
-    ServingTrusted,
-    ServingDegraded,
-    Retiring,
-    Retired,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub(crate) enum QueryObservationState {
     Unavailable,
     FreshOnly,
@@ -28,28 +17,6 @@ pub(crate) enum FacadeServiceState {
     Pending,
     Serving,
     Degraded,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum RolloutGenerationState {
-    CatchUp,
-    Eligible,
-    Cutover,
-    Drain,
-    Retire,
-    Stable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum NodeParticipationState {
-    Absent,
-    Joining,
-    Serving,
-    Degraded,
-    Retiring,
-    Retired,
 }
 
 impl QueryObservationState {

@@ -3403,7 +3403,7 @@ async fn selected_group_force_find_route_uses_source_find_endpoint_for_chosen_no
         b"/force-find-stress",
         true,
         None,
-        Duration::from_secs(2),
+        ForceFindSessionPlan::new(Duration::from_secs(2)).route_plan(),
         "nfs1",
         true,
     )
@@ -3466,7 +3466,7 @@ async fn selected_group_force_find_route_retries_protocol_violation_and_reaches_
         b"/force-find-stress",
         true,
         None,
-        Duration::from_secs(2),
+        ForceFindSessionPlan::new(Duration::from_secs(2)).route_plan(),
         "nfs1",
         true,
     )
@@ -3558,7 +3558,7 @@ async fn selected_group_force_find_route_reroutes_when_chosen_runner_reports_sel
         b"/force-find-stress",
         true,
         None,
-        Duration::from_secs(2),
+        ForceFindSessionPlan::new(Duration::from_secs(2)).route_plan(),
         "nfs1",
         true,
     )
@@ -3630,7 +3630,7 @@ async fn selected_group_force_find_route_falls_back_when_single_candidate_runner
         b"/force-find-stress",
         true,
         None,
-        Duration::from_millis(450),
+        ForceFindSessionPlan::new(Duration::from_millis(450)).route_plan(),
         "nfs2",
         true,
     )
@@ -3857,7 +3857,7 @@ async fn selected_group_materialized_route_targets_owner_scoped_internal_route()
             ReadClass::Materialized,
             Some("nfs2".to_string()),
         ),
-        Duration::from_millis(250),
+        SelectedGroupOwnerRoutePlan::new(Duration::from_millis(250)),
     )
     .await;
 
@@ -3922,7 +3922,7 @@ async fn selected_group_materialized_route_waits_for_owner_payload_instead_of_se
             ReadClass::Materialized,
             Some("nfs1".to_string()),
         ),
-        Duration::from_secs(2),
+        SelectedGroupOwnerRoutePlan::new(Duration::from_secs(2)),
     )
     .await
     .expect("route selected-group materialized query");
@@ -4055,8 +4055,8 @@ async fn selected_group_materialized_route_falls_back_to_generic_proxy_when_owne
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -4118,8 +4118,8 @@ async fn selected_group_materialized_route_falls_back_to_generic_proxy_when_owne
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -4227,8 +4227,8 @@ async fn selected_group_trusted_materialized_route_falls_back_to_generic_proxy_w
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -4290,8 +4290,8 @@ async fn selected_group_trusted_materialized_route_falls_back_to_generic_proxy_w
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -4356,7 +4356,7 @@ async fn query_materialized_events_via_generic_proxy_retries_missing_channel_buf
             ReadClass::TrustedMaterialized,
             Some("nfs4".to_string()),
         ),
-        Duration::from_millis(1200),
+        TreePitProxyRoutePlan::new(Duration::from_millis(1200)).runtime(),
     )
     .await;
 
@@ -4427,7 +4427,7 @@ async fn query_materialized_events_via_generic_proxy_accepts_immediate_reply_wit
             ReadClass::TrustedMaterialized,
             Some("nfs4".to_string()),
         ),
-        TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET,
+        TreePitProxyRoutePlan::new(TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET).runtime(),
     )
     .await;
 
@@ -4532,9 +4532,11 @@ async fn load_request_scoped_materialized_sink_status_snapshot_accepts_immediate
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
 
-    let result =
-        load_request_scoped_materialized_sink_status_snapshot(&state, Duration::from_millis(250))
-            .await;
+    let result = load_request_scoped_materialized_sink_status_snapshot(
+        &state,
+        TreePitSessionPlan::new(Duration::from_millis(250), 1).request_scoped_sink_status_plan(),
+    )
+    .await;
 
     assert!(
         result.is_some(),
@@ -4600,7 +4602,7 @@ async fn query_materialized_events_via_generic_proxy_does_not_retry_protocol_vio
             ReadClass::TrustedMaterialized,
             Some("nfs4".to_string()),
         ),
-        Duration::from_millis(450),
+        TreePitProxyRoutePlan::new(Duration::from_millis(450)).runtime(),
     )
     .await;
 
@@ -4667,7 +4669,7 @@ async fn query_materialized_events_via_generic_proxy_does_not_hold_delayed_reply
                 ReadClass::TrustedMaterialized,
                 Some("nfs4".to_string()),
             ),
-            Duration::from_millis(1150),
+            TreePitProxyRoutePlan::new(Duration::from_millis(1150)).runtime(),
         ),
     )
     .await;
@@ -4734,7 +4736,7 @@ async fn route_materialized_events_via_node_accepts_immediate_reply_with_timeout
             ReadClass::TrustedMaterialized,
             Some("nfs4".to_string()),
         ),
-        TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET,
+        SelectedGroupOwnerRoutePlan::new(TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET),
     )
     .await;
 
@@ -4807,7 +4809,7 @@ async fn route_materialized_events_via_node_does_not_hold_immediate_reply_open_f
                 ReadClass::TrustedMaterialized,
                 Some("nfs4".to_string()),
             ),
-            Duration::from_millis(800),
+            SelectedGroupOwnerRoutePlan::new(Duration::from_millis(800)),
         ),
     )
     .await;
@@ -4927,8 +4929,8 @@ async fn selected_group_materialized_route_falls_back_to_generic_proxy_when_owne
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -5078,8 +5080,8 @@ async fn selected_group_trusted_materialized_route_reserves_proxy_budget_after_o
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -5231,8 +5233,8 @@ async fn selected_group_trusted_materialized_route_reserves_enough_proxy_budget_
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -5348,8 +5350,8 @@ async fn selected_group_trusted_materialized_route_preserves_timeout_when_owner_
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -5505,8 +5507,8 @@ async fn selected_group_materialized_route_fails_closed_when_owner_and_proxy_bot
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -5665,8 +5667,8 @@ async fn selected_group_materialized_route_falls_back_to_generic_proxy_when_owne
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -5767,8 +5769,8 @@ async fn selected_group_materialized_route_settles_request_scoped_omitted_ready_
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -5791,9 +5793,19 @@ async fn selected_group_materialized_route_settles_request_scoped_omitted_ready_
             Duration::from_millis(1200),
             Some(selected_group_sink_status),
             Some(&omitted_ready_groups),
-            true,
-            true,
-            false,
+            TreePitSessionPlan::new(Duration::from_millis(1200), 1).selected_group_stage_plan(
+                TreePitGroupPlanInput {
+                    read_class: ReadClass::TrustedMaterialized,
+                    observation_state: ObservationState::TrustedMaterialized,
+                    selected_group_sink_reports_live_materialized: true,
+                    prior_materialized_group_decoded: false,
+                    prior_materialized_exact_file_decoded: false,
+                    rank_index: 0,
+                    is_last_ranked_group: true,
+                    selected_group_sink_unready_empty: false,
+                    empty_root_requires_fail_closed: false,
+                },
+            ),
         )
         .await;
 
@@ -5894,8 +5906,8 @@ async fn selected_group_materialized_route_falls_back_to_generic_proxy_after_fir
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -6132,8 +6144,8 @@ async fn selected_group_materialized_route_reroutes_to_sink_primary_object_ref_w
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -6353,8 +6365,8 @@ async fn selected_group_materialized_route_reroutes_to_sink_primary_object_ref_w
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,

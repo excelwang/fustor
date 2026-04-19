@@ -46,7 +46,7 @@ async fn sequential_selected_group_materialized_route_reaches_owner_twice_for_sa
             ReadClass::Materialized,
             Some("nfs1".to_string()),
         ),
-        Duration::from_secs(2),
+        SelectedGroupOwnerRoutePlan::new(Duration::from_secs(2)),
     )
     .await;
     let second = route_materialized_events_via_node(
@@ -59,7 +59,7 @@ async fn sequential_selected_group_materialized_route_reaches_owner_twice_for_sa
             ReadClass::Materialized,
             Some("nfs2".to_string()),
         ),
-        Duration::from_secs(2),
+        SelectedGroupOwnerRoutePlan::new(Duration::from_secs(2)),
     )
     .await;
 

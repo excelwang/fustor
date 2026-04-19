@@ -164,7 +164,7 @@ async fn load_materialized_status_snapshots_supplements_missing_route_sink_group
     let groups = sink_status
         .groups
         .iter()
-        .map(|group| (group.group_id.as_str(), group.initial_audit_completed))
+        .map(|group| (group.group_id.as_str(), group.is_ready()))
         .collect::<Vec<_>>();
     assert_eq!(
         groups,
@@ -388,9 +388,8 @@ async fn load_materialized_status_snapshots_retries_routed_sink_status_when_firs
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -405,9 +404,8 @@ async fn load_materialized_status_snapshots_retries_routed_sink_status_when_firs
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -482,7 +480,7 @@ async fn load_materialized_status_snapshots_retries_routed_sink_status_when_firs
     let groups = sink_status
         .groups
         .iter()
-        .map(|group| (group.group_id.as_str(), group.initial_audit_completed))
+        .map(|group| (group.group_id.as_str(), group.is_ready()))
         .collect::<Vec<_>>();
     assert_eq!(groups, vec![("nfs1", true), ("nfs2", true)]);
     assert!(
@@ -640,9 +638,8 @@ async fn load_materialized_status_snapshots_retries_routed_sink_status_when_firs
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -700,7 +697,7 @@ async fn load_materialized_status_snapshots_retries_routed_sink_status_when_firs
     let groups = sink_status
         .groups
         .iter()
-        .map(|group| (group.group_id.as_str(), group.initial_audit_completed))
+        .map(|group| (group.group_id.as_str(), group.is_ready()))
         .collect::<Vec<_>>();
     assert_eq!(groups, vec![("nfs1", true), ("nfs2", true), ("nfs3", true)]);
     assert!(
@@ -909,7 +906,7 @@ async fn load_materialized_status_snapshots_retries_routed_sink_status_when_firs
     let groups = sink_status
         .groups
         .iter()
-        .map(|group| (group.group_id.as_str(), group.initial_audit_completed))
+        .map(|group| (group.group_id.as_str(), group.is_ready()))
         .collect::<Vec<_>>();
     assert_eq!(groups, vec![("nfs1", true), ("nfs2", true), ("nfs3", true)]);
     assert!(
@@ -1119,7 +1116,7 @@ async fn load_materialized_status_snapshots_retries_routed_sink_status_when_firs
     let groups = sink_status
         .groups
         .iter()
-        .map(|group| (group.group_id.as_str(), group.initial_audit_completed))
+        .map(|group| (group.group_id.as_str(), group.is_ready()))
         .collect::<Vec<_>>();
     assert_eq!(groups, vec![("nfs1", true), ("nfs2", true), ("nfs3", true)]);
     assert!(
@@ -1328,9 +1325,8 @@ async fn load_materialized_status_snapshots_bounds_second_routed_sink_status_rec
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -1345,9 +1341,8 @@ async fn load_materialized_status_snapshots_bounds_second_routed_sink_status_rec
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -1582,7 +1577,7 @@ async fn load_materialized_status_snapshots_supplements_empty_route_sink_groups_
     let groups = sink_status
         .groups
         .iter()
-        .map(|group| (group.group_id.as_str(), group.initial_audit_completed))
+        .map(|group| (group.group_id.as_str(), group.is_ready()))
         .collect::<Vec<_>>();
     assert_eq!(
         groups,
@@ -1616,7 +1611,7 @@ async fn route_sink_status_snapshot_retries_transient_internal_collect_gap() {
     let snapshot = route_sink_status_snapshot(
         boundary.clone(),
         NodeId("node-d".to_string()),
-        Duration::from_secs(5),
+        StatusRoutePlan::new(Duration::from_secs(5), STATUS_ROUTE_COLLECT_IDLE_GRACE),
     )
     .await
     .expect("sink-status collection should retry transient internal collect gap");
@@ -1655,7 +1650,7 @@ async fn route_sink_status_snapshot_retries_transient_internal_collect_gap_witho
         route_sink_status_snapshot(
             boundary.clone(),
             NodeId("node-d".to_string()),
-            Duration::from_secs(5),
+            StatusRoutePlan::new(Duration::from_secs(5), STATUS_ROUTE_COLLECT_IDLE_GRACE),
         ),
     )
     .await
@@ -1702,7 +1697,7 @@ async fn route_sink_status_snapshot_retries_peer_transport_close() {
     let snapshot = route_sink_status_snapshot(
         boundary.clone(),
         NodeId("node-d".to_string()),
-        Duration::from_secs(5),
+        StatusRoutePlan::new(Duration::from_secs(5), STATUS_ROUTE_COLLECT_IDLE_GRACE),
     )
     .await
     .expect("sink-status collection should retry peer transport close");

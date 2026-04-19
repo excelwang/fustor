@@ -348,7 +348,7 @@ fn test_unified_audit_scan_and_drift_timestamp_contracts_are_migrated_to_main_sp
     assert!(l1.contains("visited directory identity `(dev, ino)`"));
     assert!(l1.contains("`IN_IGNORED` invalidation MUST purge wd/path"));
     assert!(l1.contains("`IN_Q_OVERFLOW`"));
-    assert!(l1.contains("WatchOverflowPendingAudit"));
+    assert!(l1.contains("WatchOverflowPendingMaterialization"));
     assert!(l1.contains("MUST NOT trigger immediate full rescan"));
     assert!(l1.contains("shadow_now_us"));
     assert!(l1.contains("error-marker events are excluded"));
@@ -405,10 +405,10 @@ fn test_unified_audit_scan_and_drift_timestamp_contracts_are_migrated_to_main_sp
     assert!(source_mod.contains("logical_ts: None"));
 
     let sink_mod = read_fs_meta_spec_file("fs-meta/app/src/sink/mod.rs");
-    assert!(sink_mod.contains("overflow_pending_audit"));
+    assert!(sink_mod.contains("overflow_pending_materialization"));
     assert!(sink_mod.contains("ControlEvent::WatchOverflow"));
 
-    assert!(l1.contains("WatchOverflowPendingAudit"));
+    assert!(l1.contains("WatchOverflowPendingMaterialization"));
 }
 
 // @verify_spec("CONTRACTS.INDEX_LIFECYCLE.GROUP_PARTITIONED_SINK_STATE", mode="system")
@@ -1006,7 +1006,7 @@ fn test_fs_meta_http_api_boundary_contract() {
     assert!(l3.contains("QueryApiKeyManagementEndpoints"));
     assert!(l3.contains("last_audit_completed_at_us"));
     assert!(l3.contains("groups[].initial_audit_completed"));
-    assert!(l3.contains("groups[].overflow_pending_audit"));
+    assert!(l3.contains("groups[].overflow_pending_materialization"));
     assert!(l3.contains("observation-evidence boundary"));
     assert!(l3.contains("optional facade-pending diagnostics"));
     assert!(l3.contains("`facade.pending`"));

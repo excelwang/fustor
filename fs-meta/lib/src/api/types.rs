@@ -152,7 +152,7 @@ pub struct StatusSourceDebug {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StatusSinkGroupReadiness {
-    PendingAudit,
+    PendingMaterialization,
     WaitingForMaterializedRoot,
     Ready,
 }
@@ -169,10 +169,15 @@ pub struct StatusSinkGroup {
     pub blind_spot_count: u64,
     pub shadow_time_us: u64,
     pub shadow_lag_us: u64,
-    pub overflow_pending_audit: bool,
+    pub overflow_pending_materialization: bool,
     pub readiness: StatusSinkGroupReadiness,
-    pub initial_audit_completed: bool,
     pub estimated_heap_bytes: u64,
+}
+
+impl StatusSinkGroup {
+    pub fn is_ready(&self) -> bool {
+        matches!(self.readiness, StatusSinkGroupReadiness::Ready)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

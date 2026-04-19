@@ -765,7 +765,7 @@ async fn second_exact_shaped_sink_nine_wave_first_post_replay_status_snapshot_no
                     .iter()
                     .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
                     .all(|group| {
-                        group.initial_audit_completed
+                        group.is_ready()
                             && group.live_nodes > 0
                             && group.total_nodes > 0
                             && group.materialized_revision > 1
@@ -997,7 +997,7 @@ async fn second_exact_shaped_sink_nine_wave_first_post_replay_status_snapshot_re
                     .iter()
                     .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
                     .all(|group| {
-                        group.initial_audit_completed
+                        group.is_ready()
                             && group.live_nodes > 0
                             && group.total_nodes > 0
                             && group.materialized_revision > 1

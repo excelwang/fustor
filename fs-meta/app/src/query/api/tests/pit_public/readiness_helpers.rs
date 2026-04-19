@@ -56,8 +56,8 @@ fn materialized_owner_node_for_group_prefers_scheduled_owner_when_primary_object
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -216,8 +216,8 @@ fn materialized_owner_node_for_group_does_not_fallback_to_source_primary_when_ex
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
@@ -306,26 +306,54 @@ fn materialized_owner_node_for_group_falls_back_to_source_primary_when_first_sin
     );
 }
 
-#[test]
-fn trusted_materialized_empty_response_rescue_decision_defers_first_ranked_non_root_empty_after_initial_owner_retry_lane()
- {
-    let decision = trusted_materialized_empty_response_rescue_decision(
-        TrustedMaterializedEmptyResponseRescueDecisionInput {
-            ready_group: true,
-            prior_materialized_group_decoded: false,
+fn trusted_materialized_tree_pit_plan_for_test(
+    selected_group_sink_reports_live_materialized: bool,
+    prior_materialized_group_decoded: bool,
+    empty_root_requires_fail_closed: bool,
+) -> SelectedGroupTreePitPlan {
+    SelectedGroupTreePitPlan::new(SelectedGroupTreePitPlanInput {
+        read_class: ReadClass::TrustedMaterialized,
+        observation_state: ObservationState::TrustedMaterialized,
+        selected_group_sink_reports_live_materialized,
+        prior_materialized_group_decoded,
+        is_last_ranked_group: false,
+        selected_group_sink_unready_empty: false,
+        empty_root_requires_fail_closed,
+    })
+}
+
+fn trusted_materialized_tree_group_plan_for_test(
+    selected_group_sink_reports_live_materialized: bool,
+    prior_materialized_group_decoded: bool,
+    empty_root_requires_fail_closed: bool,
+) -> TreePitGroupPlan {
+    TreePitSessionPlan::new(Duration::from_secs(5), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized,
+            prior_materialized_group_decoded,
             prior_materialized_exact_file_decoded: false,
-            selected_group_owner_known: true,
-            allow_empty_owner_retry: true,
-            empty_root_requires_fail_closed: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed,
         },
-    );
+    )
+}
+
+#[test]
+fn trusted_materialized_empty_response_rescue_plan_defers_first_ranked_non_root_empty_after_initial_owner_retry_lane()
+{
+    let plan = trusted_materialized_tree_group_plan_for_test(true, false, false)
+        .empty_response_rescue_plan(true, Duration::from_secs(5));
 
     assert_eq!(
-        decision,
-        TrustedMaterializedEmptyResponseRescueDecision {
+        plan,
+        TrustedMaterializedEmptyResponseRescuePlan {
             lane: EmptyTreeRescueLane::ReturnCurrent,
-            owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::Skip,
-            proxy_error_disposition: EmptyTreeProxyErrorDisposition::Ignore,
+            owner_retry_timeout: Duration::ZERO,
+            fail_closed_on_proxy_error: false,
             fail_closed_on_final_empty_response: false,
             defer_first_ranked_empty_non_root_group: true,
         },
@@ -334,25 +362,17 @@ fn trusted_materialized_empty_response_rescue_decision_defers_first_ranked_non_r
 }
 
 #[test]
-fn trusted_materialized_empty_response_rescue_decision_retries_later_non_root_owner_then_proxy_when_owner_known()
- {
-    let decision = trusted_materialized_empty_response_rescue_decision(
-        TrustedMaterializedEmptyResponseRescueDecisionInput {
-            ready_group: false,
-            prior_materialized_group_decoded: true,
-            prior_materialized_exact_file_decoded: false,
-            selected_group_owner_known: true,
-            allow_empty_owner_retry: false,
-            empty_root_requires_fail_closed: false,
-        },
-    );
+fn trusted_materialized_empty_response_rescue_plan_retries_later_non_root_owner_then_proxy_when_owner_known()
+{
+    let plan = trusted_materialized_tree_group_plan_for_test(false, true, false)
+        .empty_response_rescue_plan(true, Duration::from_secs(5));
 
     assert_eq!(
-        decision,
-        TrustedMaterializedEmptyResponseRescueDecision {
+        plan,
+        TrustedMaterializedEmptyResponseRescuePlan {
             lane: EmptyTreeRescueLane::OwnerRetryThenProxyFallback,
-            owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::LaterNonRootBudget,
-            proxy_error_disposition: EmptyTreeProxyErrorDisposition::Ignore,
+            owner_retry_timeout: TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET,
+            fail_closed_on_proxy_error: false,
             fail_closed_on_final_empty_response: false,
             defer_first_ranked_empty_non_root_group: false,
         },
@@ -361,25 +381,17 @@ fn trusted_materialized_empty_response_rescue_decision_retries_later_non_root_ow
 }
 
 #[test]
-fn trusted_materialized_empty_response_rescue_decision_fail_closes_proxy_gap_for_later_ready_group_after_prior_decode()
- {
-    let decision = trusted_materialized_empty_response_rescue_decision(
-        TrustedMaterializedEmptyResponseRescueDecisionInput {
-            ready_group: true,
-            prior_materialized_group_decoded: true,
-            prior_materialized_exact_file_decoded: false,
-            selected_group_owner_known: true,
-            allow_empty_owner_retry: false,
-            empty_root_requires_fail_closed: false,
-        },
-    );
+fn trusted_materialized_empty_response_rescue_plan_fail_closes_proxy_gap_for_later_ready_group_after_prior_decode()
+{
+    let plan = trusted_materialized_tree_group_plan_for_test(true, true, false)
+        .empty_response_rescue_plan(true, Duration::from_secs(5));
 
     assert_eq!(
-        decision,
-        TrustedMaterializedEmptyResponseRescueDecision {
+        plan,
+        TrustedMaterializedEmptyResponseRescuePlan {
             lane: EmptyTreeRescueLane::OwnerRetryThenProxyFallback,
-            owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::LaterNonRootBudget,
-            proxy_error_disposition: EmptyTreeProxyErrorDisposition::FailClosedUnavailable,
+            owner_retry_timeout: TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET,
+            fail_closed_on_proxy_error: true,
             fail_closed_on_final_empty_response: false,
             defer_first_ranked_empty_non_root_group: false,
         },
@@ -388,25 +400,17 @@ fn trusted_materialized_empty_response_rescue_decision_fail_closes_proxy_gap_for
 }
 
 #[test]
-fn trusted_materialized_empty_response_rescue_decision_uses_remaining_budget_for_fail_closed_ready_root()
- {
-    let decision = trusted_materialized_empty_response_rescue_decision(
-        TrustedMaterializedEmptyResponseRescueDecisionInput {
-            ready_group: true,
-            prior_materialized_group_decoded: true,
-            prior_materialized_exact_file_decoded: false,
-            selected_group_owner_known: true,
-            allow_empty_owner_retry: false,
-            empty_root_requires_fail_closed: true,
-        },
-    );
+fn trusted_materialized_empty_response_rescue_plan_uses_remaining_budget_for_fail_closed_ready_root()
+{
+    let plan = trusted_materialized_tree_group_plan_for_test(true, true, true)
+        .empty_response_rescue_plan(true, Duration::from_secs(5));
 
     assert_eq!(
-        decision,
-        TrustedMaterializedEmptyResponseRescueDecision {
+        plan,
+        TrustedMaterializedEmptyResponseRescuePlan {
             lane: EmptyTreeRescueLane::OwnerRetryThenSettle,
-            owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::RemainingBudget,
-            proxy_error_disposition: EmptyTreeProxyErrorDisposition::Ignore,
+            owner_retry_timeout: Duration::from_secs(5),
+            fail_closed_on_proxy_error: false,
             fail_closed_on_final_empty_response: true,
             defer_first_ranked_empty_non_root_group: false,
         },
@@ -508,24 +512,27 @@ fn group_counts_as_prior_materialized_tree_decode_keeps_directory_truth() {
 }
 
 #[test]
-fn trusted_materialized_empty_response_rescue_decision_skips_proxy_after_prior_exact_file_decode() {
-    let decision = trusted_materialized_empty_response_rescue_decision(
-        TrustedMaterializedEmptyResponseRescueDecisionInput {
-            ready_group: true,
+fn trusted_materialized_empty_response_rescue_plan_skips_proxy_after_prior_exact_file_decode() {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 1)
+        .selected_group_stage_plan(TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: true,
             prior_materialized_group_decoded: false,
             prior_materialized_exact_file_decoded: true,
-            selected_group_owner_known: true,
-            allow_empty_owner_retry: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: false,
             empty_root_requires_fail_closed: false,
-        },
-    );
+        })
+        .empty_response_rescue_plan(true, Duration::from_secs(5));
 
     assert_eq!(
-        decision,
-        TrustedMaterializedEmptyResponseRescueDecision {
+        plan,
+        TrustedMaterializedEmptyResponseRescuePlan {
             lane: EmptyTreeRescueLane::ReturnCurrent,
-            owner_retry_policy: TrustedMaterializedOwnerRetryPolicy::Skip,
-            proxy_error_disposition: EmptyTreeProxyErrorDisposition::Ignore,
+            owner_retry_timeout: Duration::ZERO,
+            fail_closed_on_proxy_error: false,
             fail_closed_on_final_empty_response: false,
             defer_first_ranked_empty_non_root_group: false,
         },
@@ -536,10 +543,8 @@ fn trusted_materialized_empty_response_rescue_decision_skips_proxy_after_prior_e
 #[test]
 fn selected_group_owner_attempt_timeout_preserves_meaningful_owner_budget_within_shared_stage_budget()
  {
-    let timeout = selected_group_owner_attempt_timeout(
-        tokio::time::Instant::now() + Duration::from_millis(1500),
-        true,
-    );
+    let timeout = trusted_materialized_tree_group_plan_for_test(true, false, false)
+        .owner_attempt_timeout(Duration::from_millis(1500));
 
     assert!(
         timeout >= Duration::from_millis(600),
@@ -553,10 +558,8 @@ fn selected_group_owner_attempt_timeout_preserves_meaningful_owner_budget_within
 
 #[test]
 fn selected_group_owner_attempt_timeout_caps_proxy_reserve_to_configured_fallback_budget() {
-    let timeout = selected_group_owner_attempt_timeout(
-        tokio::time::Instant::now() + Duration::from_secs(10),
-        true,
-    );
+    let timeout = trusted_materialized_tree_group_plan_for_test(true, false, false)
+        .owner_attempt_timeout(Duration::from_secs(10));
 
     assert!(
         timeout >= Duration::from_secs(7),
@@ -684,8 +687,8 @@ fn request_scoped_schedule_omitted_ready_groups_keeps_loaded_ready_groups_when_r
                 blind_spot_count: 0,
                 shadow_time_us: 1,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 7,
                 estimated_heap_bytes: 0,
@@ -701,8 +704,8 @@ fn request_scoped_schedule_omitted_ready_groups_keeps_loaded_ready_groups_when_r
                 blind_spot_count: 0,
                 shadow_time_us: 1,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 7,
                 estimated_heap_bytes: 0,
@@ -793,51 +796,49 @@ fn trusted_materialized_deferred_empty_group_decision_keeps_waiting_when_later_g
 }
 
 #[test]
-fn selected_group_owner_empty_tree_rescue_decision_retries_owner_then_proxies_for_trusted_non_root_empty_owner_response()
+fn selected_group_owner_empty_tree_rescue_plan_retries_owner_then_proxies_for_trusted_non_root_empty_owner_response()
  {
-    let decision = selected_group_owner_empty_tree_rescue_decision(
-        SelectedGroupOwnerEmptyTreeRescueDecisionInput {
+    let plan = trusted_materialized_tree_group_plan_for_test(true, false, false)
+        .owner_empty_tree_rescue_plan(SelectedGroupOwnerEmptyTreeRescueFacts {
             owner_response_is_empty: true,
             requires_proxy_fallback: false,
             requires_primary_owner_reroute: false,
             selected_group_sink_reports_live_materialized: true,
-            reserve_proxy_budget: true,
-            allow_empty_owner_retry: true,
-            settle_after_initial_owner_retry: false,
-        },
-    );
+        });
 
     assert_eq!(
-        decision,
-        SelectedGroupOwnerEmptyTreeRescueDecision {
+        plan,
+        SelectedGroupOwnerEmptyTreeRescuePlan {
             lane: EmptyTreeRescueLane::OwnerRetryThenProxyFallback,
             attempt_primary_owner_reroute: false,
         },
-        "trusted non-root empty owner responses must stay on the bounded owner-retry then generic-proxy lane instead of settling empty after the first retry"
+        "trusted non-root empty owner responses must stay on the planner-owned bounded owner-retry then generic-proxy lane instead of settling empty after the first retry",
     );
 }
 
 #[test]
-fn selected_group_owner_empty_tree_rescue_decision_fail_closes_ready_root_without_proxy_budget() {
-    let decision = selected_group_owner_empty_tree_rescue_decision(
-        SelectedGroupOwnerEmptyTreeRescueDecisionInput {
+fn selected_group_owner_empty_tree_rescue_plan_fail_closes_ready_root_without_proxy_budget() {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(5), 1)
+        .selected_group_owner_snapshot_plan(TreePitOwnerSnapshotPlanInput {
+            trusted_materialized_tree_query: true,
+            reserve_proxy_budget: false,
+            allow_empty_owner_retry: false,
+            empty_root_requires_fail_closed: true,
+        })
+        .owner_empty_tree_rescue_plan(SelectedGroupOwnerEmptyTreeRescueFacts {
             owner_response_is_empty: true,
             requires_proxy_fallback: true,
             requires_primary_owner_reroute: true,
             selected_group_sink_reports_live_materialized: true,
-            reserve_proxy_budget: false,
-            allow_empty_owner_retry: false,
-            settle_after_initial_owner_retry: false,
-        },
-    );
+        });
 
     assert_eq!(
-        decision,
-        SelectedGroupOwnerEmptyTreeRescueDecision {
+        plan,
+        SelectedGroupOwnerEmptyTreeRescuePlan {
             lane: EmptyTreeRescueLane::FailClosed,
             attempt_primary_owner_reroute: true,
         },
-        "ready root empty-owner rescue must fail closed when neither proxy budget nor bounded owner retry is available, while still preserving the primary-owner reroute signal"
+        "ready root empty-owner rescue must fail closed when neither planner-owned proxy budget nor bounded owner retry is available, while still preserving the primary-owner reroute signal",
     );
 }
 
@@ -1034,10 +1035,10 @@ fn max_total_files_from_stats_events_uses_highest_total_files() {
 }
 
 #[test]
-fn selected_group_owner_attempt_timeout_from_remaining_splits_sub_proxy_min_budget_evenly_for_later_ranked_groups()
+fn selected_group_owner_attempt_timeout_splits_sub_proxy_min_budget_evenly_for_later_ranked_groups()
  {
-    let timeout =
-        selected_group_owner_attempt_timeout_from_remaining(Duration::from_millis(1800), true);
+    let timeout = trusted_materialized_tree_group_plan_for_test(true, false, false)
+        .owner_attempt_timeout(Duration::from_millis(1800));
 
     assert_eq!(
         timeout,
@@ -1047,42 +1048,31 @@ fn selected_group_owner_attempt_timeout_from_remaining_splits_sub_proxy_min_budg
 }
 
 #[test]
-fn selected_group_owner_attempt_timeout_from_remaining_splits_root_stage_budget_after_prior_decode()
+fn selected_group_owner_attempt_timeout_preserves_full_fail_closed_root_budget()
 {
-    let timeout =
-        selected_group_owner_attempt_timeout_from_remaining(Duration::from_millis(1200), false);
+    let timeout = trusted_materialized_tree_group_plan_for_test(true, false, true)
+        .owner_attempt_timeout(Duration::from_millis(1200));
 
     assert_eq!(
         timeout,
-        Duration::from_millis(600),
-        "decoded+stalled root groups should share one PIT budget instead of reserving almost the entire remainder for a proxy lane"
+        Duration::from_millis(1200),
+        "fail-closed ready-root selected-group owner attempts should keep the full remaining PIT budget instead of reserving proxy time that cannot be spent"
     );
 }
 
 #[test]
-fn selected_group_stage_reserves_proxy_budget_for_first_ranked_trusted_ready_non_root() {
+fn selected_group_tree_pit_plan_reserves_proxy_budget_for_first_ranked_trusted_ready_non_root() {
     assert!(
-        selected_group_stage_reserves_proxy_budget(
-            ReadClass::TrustedMaterialized,
-            true,
-            false,
-            false,
-            b"/nested/child/deep.txt",
-        ),
+        trusted_materialized_tree_pit_plan_for_test(true, false, false).reserve_proxy_budget,
         "first-ranked trusted-ready non-root queries must keep proxy budget available when the owner stalls"
     );
 }
 
 #[test]
-fn selected_group_stage_does_not_reserve_proxy_budget_for_first_ranked_trusted_ready_root() {
+fn selected_group_tree_pit_plan_does_not_reserve_proxy_budget_for_first_ranked_trusted_ready_root()
+{
     assert!(
-        !selected_group_stage_reserves_proxy_budget(
-            ReadClass::TrustedMaterialized,
-            true,
-            false,
-            false,
-            b"/",
-        ),
+        !trusted_materialized_tree_pit_plan_for_test(true, false, true).reserve_proxy_budget,
         "first-ranked trusted-ready root queries should still spend the full owner stage instead of pre-reserving a proxy lane"
     );
 }
@@ -1483,9 +1473,9 @@ fn materialized_query_readiness_waits_for_initial_audit_completion() {
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
         }],
@@ -1577,9 +1567,9 @@ fn cached_sink_status_drops_cached_ready_group_when_fresh_snapshot_explicitly_re
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
         }],
@@ -1594,7 +1584,7 @@ fn cached_sink_status_drops_cached_ready_group_when_fresh_snapshot_explicitly_re
         .map(|group| {
             (
                 group.group_id.as_str(),
-                group.initial_audit_completed,
+                group.is_ready(),
                 group.total_nodes,
                 group.live_nodes,
                 group.shadow_time_us,
@@ -3961,8 +3951,8 @@ fn materialized_query_readiness_ignores_stale_source_groups_outside_current_root
             blind_spot_count: 0,
             shadow_time_us: 1,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 1,
             estimated_heap_bytes: 1,

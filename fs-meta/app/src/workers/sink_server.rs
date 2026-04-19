@@ -281,8 +281,8 @@ fn summarize_sink_snapshot_groups(snapshot: &crate::sink::SinkStatusSnapshot) ->
                 group.group_id,
                 group.total_nodes,
                 group.live_nodes,
-                group.overflow_pending_audit,
-                group.initial_audit_completed
+                group.overflow_pending_materialization,
+                group.is_ready()
             )
         })
         .collect()

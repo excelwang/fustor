@@ -75,7 +75,7 @@ async fn status_snapshot_nonblocking_does_not_return_scheduled_zero_uninitialize
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -90,7 +90,7 @@ async fn status_snapshot_nonblocking_does_not_return_scheduled_zero_uninitialize
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before seeding a scheduled zero cache: {live_snapshot:?}"
     );
 
@@ -102,7 +102,7 @@ async fn status_snapshot_nonblocking_does_not_return_scheduled_zero_uninitialize
     for group in &mut zero_snapshot.groups {
         if group.group_id == "nfs1" || group.group_id == "nfs2" {
             group.primary_object_ref = "unassigned".to_string();
-            group.initial_audit_completed = false;
+            group.readiness = crate::sink::GroupReadinessState::PendingMaterialization;
             group.live_nodes = 0;
             group.total_nodes = 0;
             group.tombstoned_count = 0;
@@ -111,7 +111,7 @@ async fn status_snapshot_nonblocking_does_not_return_scheduled_zero_uninitialize
             group.blind_spot_count = 0;
             group.shadow_time_us = 0;
             group.shadow_lag_us = 0;
-            group.overflow_pending_audit = false;
+            group.overflow_pending_materialization = false;
             group.materialized_revision = 1;
             group.estimated_heap_bytes = 0;
         }
@@ -184,9 +184,9 @@ async fn blocking_status_snapshot_test_hook_short_circuits_before_replay_and_fai
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
         }],
@@ -217,7 +217,7 @@ async fn blocking_status_snapshot_test_hook_short_circuits_before_replay_and_fai
 
     assert_eq!(
         snapshot.scheduled_groups_by_node, hooked_snapshot.scheduled_groups_by_node,
-        "blocking status_snapshot hook should preserve the hooked scheduled-group summary instead of timing out on the pending-audit fail-closed shape: {snapshot:?}"
+        "blocking status_snapshot hook should preserve the hooked scheduled-group summary instead of timing out on the pending-materialization fail-closed shape: {snapshot:?}"
     );
     assert_eq!(
         snapshot.groups.len(),
@@ -229,7 +229,7 @@ async fn blocking_status_snapshot_test_hook_short_circuits_before_replay_and_fai
         "blocking status_snapshot hook should return the hooked group row: {snapshot:?}"
     );
     assert!(
-        !snapshot.groups[0].initial_audit_completed,
+        !snapshot.groups[0].is_ready(),
         "blocking status_snapshot hook should keep the hooked not-ready row intact: {snapshot:?}"
     );
     assert_eq!(
@@ -250,7 +250,7 @@ async fn blocking_status_snapshot_test_hook_short_circuits_before_replay_and_fai
         "blocking status_snapshot hook should still seed the cached sink status with the hooked group row: {cached_snapshot:?}"
     );
     assert!(
-        !cached_snapshot.groups[0].initial_audit_completed,
+        !cached_snapshot.groups[0].is_ready(),
         "blocking status_snapshot hook should still seed the cached sink status with the hooked not-ready row: {cached_snapshot:?}"
     );
 
@@ -334,7 +334,7 @@ async fn status_snapshot_nonblocking_steady_probe_uses_local_probe_budget_when_l
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -349,7 +349,7 @@ async fn status_snapshot_nonblocking_steady_probe_uses_local_probe_budget_when_l
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before observing nonblocking steady timeout budget: {ready_snapshot:?}"
     );
 
@@ -548,7 +548,7 @@ async fn status_snapshot_nonblocking_does_not_publish_unscheduled_zero_uninitial
     assert!(
         !raw_snapshot.groups.is_empty()
             && raw_snapshot.groups.iter().all(|group| {
-                !group.initial_audit_completed
+                !group.is_ready()
                     && group.live_nodes == 0
                     && group.total_nodes == 0
                     && group.materialized_revision <= 1
@@ -648,7 +648,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -663,7 +663,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before probing local sink-status republish: {ready_snapshot:?}"
     );
 
@@ -770,8 +770,8 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 7,
             estimated_heap_bytes: 1,
@@ -950,9 +950,9 @@ async fn status_snapshot_nonblocking_returns_cached_missing_group_rows_with_stre
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 1,
             estimated_heap_bytes: 249,
         }],
@@ -1040,8 +1040,8 @@ async fn status_snapshot_nonblocking_returns_cached_waiting_for_materialized_roo
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
             materialized_revision: 7,
             estimated_heap_bytes: 1,
@@ -1251,7 +1251,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -1266,7 +1266,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before restarting the sink worker: {ready_snapshot:?}"
     );
 
@@ -1288,7 +1288,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "status_snapshot_nonblocking must not regress previously ready groups to a replay-only zero-state snapshot after worker restart: ready={ready_snapshot:?} returned={snapshot:?}"
     );
 
@@ -1438,7 +1438,7 @@ async fn status_snapshot_nonblocking_restores_persisted_root_id_ready_state_afte
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before restarting the no-grant sink worker: {ready_snapshot:?}"
     );
 
@@ -1466,7 +1466,7 @@ async fn status_snapshot_nonblocking_restores_persisted_root_id_ready_state_afte
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "status_snapshot_nonblocking must restore durably persisted root-id ready state after worker restart and retained replay instead of reopening with scheduled zero groups: ready={ready_snapshot:?} returned={snapshot:?}"
     );
 
@@ -1615,7 +1615,7 @@ async fn status_snapshot_nonblocking_restores_persisted_root_id_ready_state_afte
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before retry reset: {ready_snapshot:?}"
     );
 
@@ -1650,7 +1650,7 @@ async fn status_snapshot_nonblocking_restores_persisted_root_id_ready_state_afte
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "status_snapshot_nonblocking must restore durably persisted root-id ready state after retry reset and retained replay instead of reopening with scheduled zero groups: ready={ready_snapshot:?} returned={snapshot:?}"
     );
 
@@ -1799,7 +1799,7 @@ async fn status_snapshot_nonblocking_restores_persisted_root_id_ready_state_afte
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before same-instance retained replay: {ready_snapshot:?}"
     );
 
@@ -1820,7 +1820,7 @@ async fn status_snapshot_nonblocking_restores_persisted_root_id_ready_state_afte
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "status_snapshot_nonblocking must restore durably persisted root-id ready state after same-instance retained replay instead of leaving the local sink-status summary empty: ready={ready_snapshot:?} returned={snapshot:?}"
     );
 
@@ -1969,7 +1969,7 @@ async fn status_snapshot_nonblocking_settles_within_runtime_app_probe_budget_aft
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before same-instance retained replay: {ready_snapshot:?}"
     );
 
@@ -1993,7 +1993,7 @@ async fn status_snapshot_nonblocking_settles_within_runtime_app_probe_budget_aft
                 .groups
                 .iter()
                 .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-                .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+                .all(|group| group.is_ready() && group.live_nodes > 0),
             "status_snapshot_nonblocking must either restore ready state within the probe budget or fail-close, not return a degraded snapshot: ready={ready_snapshot:?} returned={snapshot:?}"
         ),
         Err(CnxError::Timeout) => {}
@@ -2147,7 +2147,7 @@ async fn status_snapshot_nonblocking_settles_within_runtime_app_probe_budget_aft
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before same-instance retained replay: {ready_snapshot:?}"
     );
 
@@ -2174,7 +2174,7 @@ async fn status_snapshot_nonblocking_settles_within_runtime_app_probe_budget_aft
                 .groups
                 .iter()
                 .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-                .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+                .all(|group| group.is_ready() && group.live_nodes > 0),
             "status_snapshot_nonblocking after replay completion must restore ready state within the probe budget or fail-close, not return a degraded snapshot: ready={ready_snapshot:?} returned={snapshot:?}"
         ),
         Err(CnxError::Timeout) => {}
@@ -2328,7 +2328,7 @@ async fn status_snapshot_nonblocking_eventually_restores_ready_groups_after_seco
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before second same-instance retained replay: {ready_snapshot:?}"
     );
 
@@ -2369,7 +2369,7 @@ async fn status_snapshot_nonblocking_eventually_restores_ready_groups_after_seco
                 let ready_groups = snapshot
                     .groups
                     .iter()
-                    .filter(|group| group.initial_audit_completed)
+                    .filter(|group| group.is_ready())
                     .map(|group| group.group_id.clone())
                     .collect::<std::collections::BTreeSet<_>>();
                 if ready_groups == expected_groups {
@@ -2571,7 +2571,7 @@ async fn status_snapshot_nonblocking_restores_ready_groups_after_explicit_same_i
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before explicit same-instance replay wave: {ready_snapshot:?}"
     );
 
@@ -2605,7 +2605,7 @@ async fn status_snapshot_nonblocking_restores_ready_groups_after_explicit_same_i
                 let ready_groups = snapshot
                     .groups
                     .iter()
-                    .filter(|group| group.initial_audit_completed)
+                    .filter(|group| group.is_ready())
                     .map(|group| group.group_id.clone())
                     .collect::<std::collections::BTreeSet<_>>();
                 if ready_groups == expected_groups {
@@ -2777,7 +2777,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before probing post-replay local status cancellation seam: {ready_snapshot:?}"
     );
 
@@ -2966,7 +2966,7 @@ async fn status_snapshot_restores_persisted_root_id_ready_state_after_retry_rese
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "precondition: both nfs1 and nfs2 must be ready before retry reset: {ready_snapshot:?}"
     );
 
@@ -2999,7 +2999,7 @@ async fn status_snapshot_restores_persisted_root_id_ready_state_after_retry_rese
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0),
+            .all(|group| group.is_ready() && group.live_nodes > 0),
         "blocking status_snapshot must restore durably persisted root-id ready state after retry reset and retained replay instead of timing out or reopening with not-ready groups: ready={ready_snapshot:?} returned={snapshot:?}"
     );
 
@@ -3079,8 +3079,8 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 7,
                 estimated_heap_bytes: 1,
@@ -3096,8 +3096,8 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 6,
                 estimated_heap_bytes: 1,
@@ -3113,8 +3113,8 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 8,
                 estimated_heap_bytes: 1,
@@ -3167,7 +3167,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     let ready_groups = ready_snapshot
         .groups
         .iter()
-        .filter(|group| group.initial_audit_completed)
+        .filter(|group| group.is_ready())
         .map(|group| group.group_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
@@ -3188,9 +3188,9 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 7,
                 estimated_heap_bytes: 1,
             },
@@ -3205,9 +3205,9 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 8,
                 estimated_heap_bytes: 1,
             },
@@ -3240,7 +3240,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     let returned_ready_groups = snapshot
         .groups
         .iter()
-        .filter(|group| group.initial_audit_completed)
+        .filter(|group| group.is_ready())
         .map(|group| group.group_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
@@ -3254,7 +3254,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     let cached_ready_groups = cached_after
         .groups
         .iter()
-        .filter(|group| group.initial_audit_completed)
+        .filter(|group| group.is_ready())
         .map(|group| group.group_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
@@ -3451,7 +3451,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     let ready_groups = ready_snapshot
         .groups
         .iter()
-        .filter(|group| group.initial_audit_completed)
+        .filter(|group| group.is_ready())
         .map(|group| group.group_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
@@ -3517,7 +3517,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     let returned_ready_groups = snapshot
         .groups
         .iter()
-        .filter(|group| group.initial_audit_completed)
+        .filter(|group| group.is_ready())
         .map(|group| group.group_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
@@ -3716,7 +3716,7 @@ async fn status_snapshot_nonblocking_retries_single_control_inflight_retryable_s
         ready_snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from([
@@ -3802,7 +3802,7 @@ async fn status_snapshot_nonblocking_retries_single_control_inflight_retryable_s
         snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
@@ -4010,7 +4010,7 @@ async fn status_snapshot_nonblocking_retries_single_noninflight_retryable_status
         ready_snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from([
@@ -4090,7 +4090,7 @@ async fn status_snapshot_nonblocking_retries_single_noninflight_retryable_status
         snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
@@ -4162,8 +4162,8 @@ async fn status_snapshot_nonblocking_retries_ack_reply_after_retained_replay_and
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: true,
+            overflow_pending_materialization: false,
+
             readiness: crate::sink::GroupReadinessState::Ready,
             materialized_revision: 0,
             estimated_heap_bytes: 0,
@@ -4400,7 +4400,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
         ready_snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from([
@@ -4431,7 +4431,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
         cached_after_retire
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
@@ -4461,9 +4461,9 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -4478,9 +4478,9 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -4535,7 +4535,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
         snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
@@ -4736,7 +4736,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
         ready_snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from([
@@ -4767,7 +4767,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
         cached_after_retire
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
@@ -4797,9 +4797,9 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -4814,9 +4814,9 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -4871,7 +4871,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
         snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
@@ -5072,7 +5072,7 @@ async fn status_snapshot_nonblocking_fails_closed_after_logical_root_retire_when
         ready_snapshot
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from([
@@ -5103,7 +5103,7 @@ async fn status_snapshot_nonblocking_fails_closed_after_logical_root_retire_when
         cached_after_retire
             .groups
             .iter()
-            .filter(|group| group.initial_audit_completed)
+            .filter(|group| group.is_ready())
             .map(|group| group.group_id.clone())
             .collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
@@ -5133,9 +5133,9 @@ async fn status_snapshot_nonblocking_fails_closed_after_logical_root_retire_when
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 7,
                 estimated_heap_bytes: 1,
             },
@@ -5150,9 +5150,9 @@ async fn status_snapshot_nonblocking_fails_closed_after_logical_root_retire_when
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 6,
                 estimated_heap_bytes: 1,
             },
@@ -5352,7 +5352,7 @@ async fn status_snapshot_does_not_publish_scheduled_zero_uninitialized_snapshot_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn status_snapshot_rearms_replay_required_after_pending_audit_without_stream_receipts_fail_closed()
+async fn status_snapshot_rearms_replay_required_after_pending_materialization_without_stream_receipts_fail_closed()
  {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
@@ -5398,9 +5398,9 @@ async fn status_snapshot_rearms_replay_required_after_pending_audit_without_stre
         .expect("encode sink activate"),
     ])
     .await
-    .expect("apply retained sink control before blocking pending-audit status");
+    .expect("apply retained sink control before blocking pending-materialization status");
 
-    let pending_audit_snapshot = SinkStatusSnapshot {
+    let pending_materialization_snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs1".to_string(),
             primary_object_ref: "node-d::nfs1".to_string(),
@@ -5412,9 +5412,9 @@ async fn status_snapshot_rearms_replay_required_after_pending_audit_without_stre
             blind_spot_count: 0,
             shadow_time_us: 0,
             shadow_lag_us: 0,
-            overflow_pending_audit: false,
-            initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
             materialized_revision: 1,
             estimated_heap_bytes: 0,
         }],
@@ -5430,22 +5430,22 @@ async fn status_snapshot_rearms_replay_required_after_pending_audit_without_stre
     let _reply_reset = SinkWorkerStatusResponseQueueHookReset;
     install_sink_worker_status_response_queue_hook(SinkWorkerStatusResponseQueueHook {
         replies: std::collections::VecDeque::from([Ok(SinkWorkerResponse::StatusSnapshot(
-            pending_audit_snapshot.clone(),
+            pending_materialization_snapshot.clone(),
         ))]),
     });
 
     let err = sink.status_snapshot().await.expect_err(
-        "blocking status_snapshot must fail close on pending-audit-without-stream-receipts",
+        "blocking status_snapshot must fail close on pending-materialization-without-stream-receipts",
     );
 
     assert!(
         matches!(err, CnxError::Timeout),
-        "blocking status_snapshot must fail close on a pending-audit snapshot without stream receipts: {err:?}"
+        "blocking status_snapshot must fail close on a pending-materialization snapshot without stream receipts: {err:?}"
     );
     assert_eq!(
         sink.control_state_replay_required.load(Ordering::Acquire),
         1,
-        "blocking status_snapshot must preserve the evaluator's replay-required side effect after a pending-audit fail-close instead of silently clearing retained replay state",
+        "blocking status_snapshot must preserve the evaluator's replay-required side effect after a pending-materialization fail-close instead of silently clearing retained replay state",
     );
 
     sink.close().await.expect("close sink worker");
@@ -5528,7 +5528,7 @@ async fn status_snapshot_does_not_publish_unscheduled_zero_uninitialized_snapsho
             .groups
             .iter()
             .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-            .all(|group| group.initial_audit_completed && group.live_nodes > 0);
+            .all(|group| group.is_ready() && group.live_nodes > 0);
         if both_ready {
             break;
         }
@@ -5542,7 +5542,7 @@ async fn status_snapshot_does_not_publish_unscheduled_zero_uninitialized_snapsho
                     .groups
                     .iter()
                     .filter(|group| group.group_id == "nfs1" || group.group_id == "nfs2")
-                    .all(|group| group.initial_audit_completed && group.live_nodes > 0) =>
+                    .all(|group| group.is_ready() && group.live_nodes > 0) =>
             {
                 break snapshot;
             }
@@ -5577,7 +5577,7 @@ async fn status_snapshot_does_not_publish_unscheduled_zero_uninitialized_snapsho
     zero_snapshot.scheduled_groups_by_node.clear();
     for group in &mut zero_snapshot.groups {
         if group.group_id == "nfs1" || group.group_id == "nfs2" {
-            group.initial_audit_completed = false;
+            group.readiness = crate::sink::GroupReadinessState::PendingMaterialization;
             group.live_nodes = 0;
             group.total_nodes = 0;
             group.tombstoned_count = 0;
@@ -5586,7 +5586,7 @@ async fn status_snapshot_does_not_publish_unscheduled_zero_uninitialized_snapsho
             group.blind_spot_count = 0;
             group.shadow_time_us = 0;
             group.shadow_lag_us = 0;
-            group.overflow_pending_audit = false;
+            group.overflow_pending_materialization = false;
             group.materialized_revision = 1;
             group.estimated_heap_bytes = 0;
         }
@@ -5710,7 +5710,7 @@ async fn status_snapshot_nonblocking_fails_closed_when_live_snapshot_is_single_s
         "precondition: raw live sink snapshot must already carry scheduled nfs3"
     );
     assert!(
-        !raw_group.initial_audit_completed
+        !raw_group.is_ready()
             && raw_group.live_nodes == 0
             && raw_group.total_nodes == 0
             && raw_group.materialized_revision <= 1,
@@ -5736,12 +5736,12 @@ async fn status_snapshot_nonblocking_fails_closed_when_live_snapshot_is_single_s
             .status_snapshot_nonblocking()
             .await
             .expect_err(
-                "status_snapshot_nonblocking must fail close instead of publishing a single scheduled zero/pending-audit group whose live primary_object_ref is a concrete bound grant ref after replay_required already cleared",
+                "status_snapshot_nonblocking must fail close instead of publishing a single scheduled zero/pending-materialization group whose live primary_object_ref is a concrete bound grant ref after replay_required already cleared",
             );
 
     assert!(
         matches!(err, CnxError::Timeout),
-        "single scheduled zero/pending-audit group with a bound primary_object_ref must fail close with timeout even after replay_required clears instead of reaching runtime-app as an ok empty-root summary: err={err:?}"
+        "single scheduled zero/pending-materialization group with a bound primary_object_ref must fail close with timeout even after replay_required clears instead of reaching runtime-app as an ok empty-root summary: err={err:?}"
     );
 
     sink.close().await.expect("close sink worker");
@@ -5938,7 +5938,7 @@ async fn raw_worker_status_snapshot_settles_during_split_primary_mixed_cluster_c
         "precondition: raw live sink snapshot must still report scheduled local nfs3 during split-primary control inflight: {raw_snapshot:?}"
     );
     assert!(
-        !raw_group.initial_audit_completed
+        !raw_group.is_ready()
             && raw_group.live_nodes == 0
             && raw_group.total_nodes == 0
             && raw_group.materialized_revision <= 1,
@@ -6327,8 +6327,8 @@ async fn status_snapshot_uses_test_hook_before_replaying_retained_control_state(
                     blind_spot_count: 0,
                     shadow_time_us: 0,
                     shadow_lag_us: 0,
-                    overflow_pending_audit: false,
-                    initial_audit_completed: true,
+                    overflow_pending_materialization: false,
+
                     readiness: crate::sink::GroupReadinessState::Ready,
                     materialized_revision: 1,
                     estimated_heap_bytes: 0,
@@ -6353,7 +6353,7 @@ async fn status_snapshot_uses_test_hook_before_replaying_retained_control_state(
         snapshot
             .groups
             .iter()
-            .any(|group| group.group_id == "nfs1" && group.initial_audit_completed),
+            .any(|group| group.group_id == "nfs1" && group.is_ready()),
         "blocking status_snapshot should publish the injected hooked snapshot instead of stalling on replay: {snapshot:?}"
     );
     assert!(
@@ -6370,7 +6370,7 @@ async fn status_snapshot_uses_test_hook_before_replaying_retained_control_state(
         cached_snapshot
             .groups
             .iter()
-            .any(|group| group.group_id == "nfs1" && group.initial_audit_completed),
+            .any(|group| group.group_id == "nfs1" && group.is_ready()),
         "blocking status_snapshot should also cache the injected hooked snapshot: {cached_snapshot:?}"
     );
 

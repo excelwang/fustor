@@ -1935,7 +1935,7 @@ fn validate_materialized_tree_group_dynamic_fields(value: &Value) -> Result<(), 
                             "Unattested"
                                 | "SuspectNodes"
                                 | "BlindSpotsDetected"
-                                | "WatchOverflowPendingAudit"
+                                | "WatchOverflowPendingMaterialization"
                         ) => {}
                     Some(other) => {
                         return Err(format!(

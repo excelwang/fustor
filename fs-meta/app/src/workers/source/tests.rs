@@ -81,6 +81,82 @@ impl Drop for SourceWorkerLogicalRootsSnapshotHookReset {
     }
 }
 
+#[test]
+fn source_refresh_runtime_owns_retry_followup_lane() {
+    let now = std::time::Instant::now();
+    let runtime = SourceRefreshRuntime::new(now + Duration::from_millis(250), Duration::from_secs(5));
+    let after = SourceProgressCursor::default();
+
+    assert!(
+        matches!(
+            runtime.followup_after(
+                CnxError::Timeout,
+                true,
+                can_retry_on_control_frame,
+                after,
+                SourceProgressMask::CONTROL_FLOW_RETRY,
+            ),
+            SourceRefreshFollowup::Apply(SourceRefreshRuntimeAction::ReconnectAndWaitForProgress {
+                after: observed_after,
+                accepted,
+                ..
+            }) if observed_after == after && accepted == SourceProgressMask::CONTROL_FLOW_RETRY,
+        ),
+        "source refresh runtime should own reconnect-and-wait-for-progress followup for retryable control-frame errors, including the accepted progress reasons, instead of leaving call sites to branch on deadline, reconnect policy, or unrelated progress release lanes",
+    );
+}
+
+#[test]
+fn source_refresh_runtime_owns_non_retryable_followup_lane() {
+    let now = std::time::Instant::now();
+    let runtime = SourceRefreshRuntime::new(now + Duration::from_millis(250), Duration::from_secs(5));
+
+    match runtime.followup_after(
+        CnxError::InvalidInput("bad request".into()),
+        false,
+        can_retry_update_logical_roots,
+        SourceProgressCursor::default(),
+        SourceProgressMask::UPDATE_LOGICAL_ROOTS_RETRY,
+    ) {
+        SourceRefreshFollowup::ReturnErr(CnxError::InvalidInput(message)) => {
+            assert_eq!(message, "bad request");
+        }
+        other => panic!(
+            "source refresh runtime should own the non-retryable followup lane instead of leaving call sites to branch directly on the raw error: {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn source_progress_state_only_bumps_relevant_wait_reason_mask() {
+    let mut state = SourceProgressState::default();
+    let baseline = state.cursor();
+    state.bump(SourceProgressReason::ObservabilityUpdated);
+
+    assert!(
+        state.advanced_past(baseline, SourceProgressMask::OBSERVABILITY_RETRY),
+        "observability progress should release observability waits via the accepted reason mask",
+    );
+    assert!(
+        !state.advanced_past(baseline, SourceProgressMask::CONTROL_FLOW_RETRY),
+        "observability refresh should not accidentally release control-flow retries",
+    );
+
+    let observability_only = state.cursor();
+    state.bump(SourceProgressReason::WorkerClientReplaced);
+    assert!(
+        state.advanced_past(observability_only, SourceProgressMask::CONTROL_FLOW_RETRY),
+        "worker replacement should release control-flow retries",
+    );
+    assert!(
+        state.advanced_past(
+            observability_only,
+            SourceProgressMask::UPDATE_LOGICAL_ROOTS_RETRY,
+        ),
+        "worker replacement should release update-roots retries",
+    );
+}
+
 struct SourceWorkerControlFrameErrorHookReset;
 
 impl Drop for SourceWorkerControlFrameErrorHookReset {
@@ -460,6 +536,167 @@ fn prime_cached_schedule_from_control_signals_respects_watch_and_scan_flags() {
 }
 
 #[test]
+fn replay_recovery_cached_schedule_primes_desired_local_groups_from_grants() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let roots = vec![worker_source_root("nfs1", &nfs1)];
+    let grants = vec![
+        worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1),
+        worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2),
+    ];
+    let signals = source_control_signals_from_envelopes(&[
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+            ],
+        }))
+        .expect("encode source activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+            ],
+        }))
+        .expect("encode source scan activate"),
+    ])
+    .expect("decode source control signals");
+
+    let mut cache = SourceWorkerSnapshotCache {
+        logical_roots: Some(roots.clone()),
+        grants: Some(grants.clone()),
+        ..SourceWorkerSnapshotCache::default()
+    };
+    let _summary = prime_cached_schedule_from_control_signals(
+        &mut cache,
+        &NodeId("node-a".to_string()),
+        &signals,
+        &roots,
+        &grants,
+    );
+
+    assert!(
+        cache
+            .scheduled_source_groups_by_node
+            .as_ref()
+            .is_none_or(|groups| groups.is_empty()),
+        "control-signal priming should still respect watch-disabled roots before replay recovery"
+    );
+
+    prime_cached_schedule_from_control_signals_for_replay_recovery(
+        &mut cache,
+        &NodeId("node-a".to_string()),
+        &signals,
+        &grants,
+    );
+
+    assert_eq!(
+        cache.replay_recovery_scheduled_source_groups_by_node,
+        Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )])),
+        "replay-recovery bridge should preserve desired source groups from local grants"
+    );
+    assert_eq!(
+        cache.replay_recovery_scheduled_scan_groups_by_node,
+        Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )])),
+        "replay-recovery bridge should preserve desired scan groups from local grants"
+    );
+}
+
+#[test]
+fn merge_cached_local_scheduled_groups_prefers_replay_recovery_bridge_over_live_empty() {
+    let live_groups = Some(std::collections::BTreeSet::new());
+    let cached = Some(std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["stale".to_string()],
+    )]));
+    let replay_recovery = Some(std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["nfs1".to_string(), "nfs2".to_string()],
+    )]));
+
+    assert_eq!(
+        merge_cached_local_scheduled_groups(
+            &NodeId("node-a".to_string()),
+            live_groups,
+            &cached,
+            &replay_recovery,
+        ),
+        Some(std::collections::BTreeSet::from([
+            "nfs1".to_string(),
+            "nfs2".to_string(),
+        ])),
+        "explicit empty live groups should not erase the replay-recovery schedule bridge"
+    );
+}
+
+#[test]
+fn prime_cached_schedule_from_control_signals_for_replay_recovery_replaces_prior_local_groups() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    let roots = vec![worker_watch_scan_root("nfs1", &nfs1)];
+    let grants = vec![worker_source_export("node-a::nfs1", "node-a", "127.0.0.1", nfs1)];
+    let signals = source_control_signals_from_envelopes(&[
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+        }))
+        .expect("encode source activate"),
+    ])
+    .expect("decode source control signals");
+
+    let mut cache = SourceWorkerSnapshotCache {
+        logical_roots: Some(roots),
+        grants: Some(grants.clone()),
+        replay_recovery_scheduled_source_groups_by_node: Some(std::collections::BTreeMap::from([
+            ("node-a".to_string(), vec!["stale".to_string()]),
+            ("node-b".to_string(), vec!["other".to_string()]),
+        ])),
+        ..SourceWorkerSnapshotCache::default()
+    };
+
+    prime_cached_schedule_from_control_signals_for_replay_recovery(
+        &mut cache,
+        &NodeId("node-a".to_string()),
+        &signals,
+        &grants,
+    );
+
+    assert_eq!(
+        cache.replay_recovery_scheduled_source_groups_by_node,
+        Some(std::collections::BTreeMap::from([
+            ("node-a".to_string(), vec!["nfs1".to_string()]),
+            ("node-b".to_string(), vec!["other".to_string()]),
+        ])),
+        "latest replay-recovery priming should replace stale local groups without disturbing other nodes"
+    );
+}
+
+#[test]
 fn fs_meta_worker_module_path_prefers_newer_debug_deps_cdylib_over_stale_top_level_debug_cdylib() {
     let tmp = tempdir().expect("create temp dir");
     let lib_name = fs_meta_runtime_lib_filename();
@@ -808,6 +1045,8 @@ fn degraded_worker_observability_uses_cached_snapshot() {
             "node-a".to_string(),
             vec!["group-a".to_string()],
         )])),
+        replay_recovery_scheduled_source_groups_by_node: None,
+        replay_recovery_scheduled_scan_groups_by_node: None,
         last_control_frame_signals_by_node: Some(std::collections::BTreeMap::new()),
         published_batches_by_node: Some(std::collections::BTreeMap::new()),
         published_events_by_node: Some(std::collections::BTreeMap::new()),
@@ -1102,6 +1341,7 @@ fn merge_cached_local_scheduled_groups_preserves_explicit_empty_live_groups_for_
         &node_id,
         Some(std::collections::BTreeSet::new()),
         &cached,
+        &None,
     );
 
     assert_eq!(
@@ -1119,6 +1359,7 @@ fn merge_cached_local_scheduled_groups_preserves_explicit_empty_live_groups_with
     let merged = merge_cached_local_scheduled_groups(
         &node_id,
         Some(std::collections::BTreeSet::new()),
+        &None,
         &None,
     );
 
@@ -1228,6 +1469,239 @@ fn post_ack_schedule_refresh_stays_enabled_for_activate_waves() {
     assert!(
         source_control_signals_require_post_ack_schedule_refresh(&signals),
         "activate waves must keep driving post-ack scheduled-group refresh so stale shared clients are still discarded on replay-owned continuity gaps",
+    );
+}
+
+fn source_control_state_test_activate_signal(
+    unit: SourceRuntimeUnit,
+    route_key: &str,
+    generation: u64,
+    bound_scopes: Vec<RuntimeBoundScope>,
+) -> SourceControlSignal {
+    SourceControlSignal::Activate {
+        unit,
+        route_key: route_key.to_string(),
+        generation,
+        bound_scopes,
+        envelope: ControlEnvelope::Frame(ControlFrame {
+            kind: format!("test.activate.{route_key}.{generation}"),
+            payload: Vec::new(),
+        }),
+    }
+}
+
+fn source_control_state_test_tick_signal(
+    unit: SourceRuntimeUnit,
+    route_key: &str,
+    generation: u64,
+) -> SourceControlSignal {
+    SourceControlSignal::Tick {
+        unit,
+        route_key: route_key.to_string(),
+        generation,
+        envelope: ControlEnvelope::Frame(ControlFrame {
+            kind: format!("test.tick.{route_key}.{generation}"),
+            payload: Vec::new(),
+        }),
+    }
+}
+
+fn source_control_state_envelope_kinds(envelopes: Vec<ControlEnvelope>) -> Vec<String> {
+    envelopes
+        .into_iter()
+        .map(|envelope| match envelope {
+            ControlEnvelope::Frame(frame) => frame.kind,
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn source_control_state_tracks_replay_requirement_and_retained_envelopes() {
+    let host_grant = SourceControlSignal::RuntimeHostGrantChange {
+        changed: RuntimeHostGrantChange {
+            version: 7,
+            grants: Vec::new(),
+        },
+        envelope: ControlEnvelope::Frame(ControlFrame {
+            kind: "test.host-grant".to_string(),
+            payload: Vec::new(),
+        }),
+    };
+    let source_activate = source_control_state_test_activate_signal(
+        SourceRuntimeUnit::Source,
+        "query.stream",
+        2,
+        vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+    );
+    let scan_activate = source_control_state_test_activate_signal(
+        SourceRuntimeUnit::Scan,
+        "query.stream",
+        2,
+        vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+    );
+    let source_deactivate = SourceControlSignal::Deactivate {
+        unit: SourceRuntimeUnit::Source,
+        route_key: "query.stream".to_string(),
+        generation: 3,
+        envelope: ControlEnvelope::Frame(ControlFrame {
+            kind: "test.deactivate.query.stream.3".to_string(),
+            payload: Vec::new(),
+        }),
+    };
+
+    let mut state = SourceControlState::default();
+    assert!(
+        !state.replay_required(),
+        "fresh source control state must start replay-clear",
+    );
+
+    state.arm_replay();
+    assert!(
+        state.replay_required(),
+        "replacing or recovering a shared source worker must arm replay on the canonical control state",
+    );
+    assert!(
+        state.take_replay_requirement(),
+        "the first retained replay attempt must observe and clear the replay requirement",
+    );
+    assert!(
+        !state.replay_required(),
+        "taking the replay requirement must clear it until a later reconnect re-arms it",
+    );
+    assert!(
+        !state.take_replay_requirement(),
+        "replay take must be edge-triggered rather than repeatedly reporting stale replay work",
+    );
+
+    state.retain_signals(&[
+        host_grant.clone(),
+        source_activate.clone(),
+        scan_activate.clone(),
+    ]);
+    assert_eq!(
+        source_control_state_envelope_kinds(state.replay_envelopes()),
+        vec![
+            "test.host-grant".to_string(),
+            "test.activate.query.stream.2".to_string(),
+            "test.activate.query.stream.2".to_string(),
+        ],
+        "retained replay must be rebuilt from the canonical control state in host-grant then active-route order",
+    );
+
+    state.retain_signals(&[source_deactivate]);
+    assert_eq!(
+        source_control_state_envelope_kinds(state.replay_envelopes()),
+        vec![
+            "test.host-grant".to_string(),
+            "test.activate.query.stream.2".to_string(),
+            "test.deactivate.query.stream.3".to_string(),
+        ],
+        "canonical source control state must retain the latest directive per route so replay can carry deactivates without a shadow retained-state machine",
+    );
+
+    state.arm_replay();
+    state.arm_replay();
+    assert!(
+        state.replay_required(),
+        "replay arming must stay sticky even if multiple reconnect paths race to require replay",
+    );
+}
+
+#[test]
+fn source_control_state_classifies_tick_only_replay_paths_from_canonical_state() {
+    let activate = source_control_state_test_activate_signal(
+        SourceRuntimeUnit::Source,
+        "query.stream",
+        2,
+        vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+    );
+    let matching_tick =
+        source_control_state_test_tick_signal(SourceRuntimeUnit::Source, "query.stream", 2);
+    let mismatched_tick =
+        source_control_state_test_tick_signal(SourceRuntimeUnit::Source, "query.stream", 3);
+
+    let mut state = SourceControlState::default();
+    state.retain_signals(&[activate.clone()]);
+
+    assert_eq!(
+        state.classify_tick_only_wave(&[matching_tick.clone()]),
+        Some(SourceControlTickDisposition::FastPath),
+        "matching-generation tick-only followups should stay local when replay is already clear",
+    );
+
+    state.arm_replay();
+    assert_eq!(
+        state.classify_tick_only_wave(&[matching_tick]),
+        Some(SourceControlTickDisposition::ReplayInPlace),
+        "matching-generation tick-only followups must replay retained control state when replay remains armed",
+    );
+    assert_eq!(
+        state.classify_tick_only_wave(&[mismatched_tick]),
+        Some(SourceControlTickDisposition::ReconnectAndReplay),
+        "generation-mismatched tick-only followups must reconnect and replay from canonical state",
+    );
+    assert_eq!(
+        state.classify_tick_only_wave(&[activate]),
+        None,
+        "non-tick waves must not be misclassified as tick-only replay paths",
+    );
+}
+
+#[test]
+fn source_control_state_retains_latest_deactivate_directive_for_replay() {
+    let source_activate = source_control_state_test_activate_signal(
+        SourceRuntimeUnit::Source,
+        "query.stream",
+        2,
+        vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+    );
+    let source_deactivate = SourceControlSignal::Deactivate {
+        unit: SourceRuntimeUnit::Source,
+        route_key: "query.stream".to_string(),
+        generation: 3,
+        envelope: ControlEnvelope::Frame(ControlFrame {
+            kind: "test.deactivate.query.stream.3".to_string(),
+            payload: Vec::new(),
+        }),
+    };
+
+    let mut state = SourceControlState::default();
+    state.retain_signals(std::slice::from_ref(&source_activate));
+    state.retain_signals(std::slice::from_ref(&source_deactivate));
+
+    assert_eq!(
+        source_control_state_envelope_kinds(state.replay_envelopes()),
+        vec!["test.deactivate.query.stream.3".to_string()],
+        "canonical source control state must retain the latest deactivate directive so downstream runtime recovery does not need a shadow retained-state machine",
+    );
+}
+
+#[test]
+fn source_control_state_matches_generation_one_activate_wave_from_canonical_state() {
+    let retained_activate = source_control_state_test_activate_signal(
+        SourceRuntimeUnit::Source,
+        "query.stream",
+        1,
+        vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+    );
+    let mismatched_activate = source_control_state_test_activate_signal(
+        SourceRuntimeUnit::Source,
+        "query.stream",
+        1,
+        vec![bound_scope_with_resources("nfs2", &["node-a::nfs2"])],
+    );
+
+    let mut state = SourceControlState::default();
+    state.retain_signals(std::slice::from_ref(&retained_activate));
+
+    assert!(
+        state.matches_generation_one_activate_wave(std::slice::from_ref(&retained_activate)),
+        "generation-one activate replays should match directly against the canonical source control state",
+    );
+    assert!(
+        !state.matches_generation_one_activate_wave(std::slice::from_ref(&mismatched_activate)),
+        "generation-one fast-path replay must reject activate waves whose bound scopes diverge from retained canonical state",
     );
 }
 
@@ -12209,6 +12683,51 @@ async fn local_source_observability_preserves_published_maps_after_local_stream_
     );
 
     source.close().await.expect("close local source");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_source_observability_does_not_fall_back_to_source_control_summary_without_recovered_active_state()
+ {
+    let source = Arc::new(
+        FSMetaSource::new(SourceConfig::default(), NodeId("node-a".to_string()))
+            .expect("init source"),
+    );
+    let activate =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: crate::runtime::routes::ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: "nfs1".to_string(),
+                resource_ids: vec!["node-a::nfs1".to_string()],
+            }],
+        }))
+        .expect("encode source activate");
+    source
+        .on_control_frame(&[activate])
+        .await
+        .expect("apply source activate");
+
+    assert!(
+        !source.last_control_frame_signals_snapshot().is_empty(),
+        "fixture must keep a non-empty source-owned control summary before active-state gating is checked"
+    );
+
+    let snapshot = SourceFacade::Local(source)
+        .observability_snapshot()
+        .await
+        .expect("fetch local observability");
+
+    assert!(
+        snapshot.last_control_frame_signals_by_node.is_empty(),
+        "local observability must not fall back to stale source-owned control summary when no recovered active state exists: status={:?} source={:?} scan={:?} control={:?}",
+        snapshot.status,
+        snapshot.scheduled_source_groups_by_node,
+        snapshot.scheduled_scan_groups_by_node,
+        snapshot.last_control_frame_signals_by_node
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

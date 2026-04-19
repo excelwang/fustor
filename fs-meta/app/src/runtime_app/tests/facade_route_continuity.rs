@@ -180,8 +180,8 @@ async fn mark_control_uninitialized_clears_retained_active_facade_continuity_bef
         resource_ids: vec!["listener-a".to_string()],
         handle: active_facade,
     });
-    app.update_runtime_gate_facts_for_tests(|state| {
-        state.control_initialized = true;
+    app.update_runtime_control_state_for_tests(|state| {
+        state.set_control_initialized(true);
     });
     app.api_control_gate.set_ready(true);
 
@@ -690,8 +690,8 @@ async fn initialized_same_generation_facade_deactivate_without_successor_keeps_l
         resource_ids: vec!["listener-a".to_string()],
         handle: active_facade,
     });
-    app.update_runtime_gate_facts_for_tests(|state| {
-        state.control_initialized = true;
+    app.update_runtime_control_state_for_tests(|state| {
+        state.set_control_initialized(true);
     });
 
     let shutdown_started = Arc::new(Notify::new());

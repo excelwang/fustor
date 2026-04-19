@@ -42,7 +42,7 @@ pub fn get_directory_tree(
     tree: &MaterializedTree,
     dir_path: &[u8],
     _clock: &SinkClock,
-    overflow_pending_audit: bool,
+    overflow_pending_materialization: bool,
     recursive: bool,
     max_depth: Option<usize>,
 ) -> RawQueryResult {
@@ -86,7 +86,7 @@ pub fn get_directory_tree(
         consider_node(path, node);
     }
 
-    reliability.observe_overflow(overflow_pending_audit);
+    reliability.observe_overflow(overflow_pending_materialization);
     let reliability = reliability.finish();
 
     RawQueryResult {
@@ -101,7 +101,9 @@ fn blocked_reason(reason: &UnreliableReason) -> &'static str {
         UnreliableReason::Unattested => "unattested_nodes",
         UnreliableReason::SuspectNodes => "suspect_nodes",
         UnreliableReason::BlindSpotsDetected => "blind_spots_detected",
-        UnreliableReason::WatchOverflowPendingAudit => "watch_overflow_pending_audit",
+        UnreliableReason::WatchOverflowPendingMaterialization => {
+            "watch_overflow_pending_materialization"
+        }
     }
 }
 
@@ -137,7 +139,7 @@ fn quiet_anchor_for_direct_query(tree: &MaterializedTree, dir_path: &[u8]) -> Op
 
 fn evaluate_tree_stability(
     response: &RawQueryResult,
-    overflow_pending_audit: bool,
+    overflow_pending_materialization: bool,
     stability_mode: StabilityMode,
     quiet_window_ms: Option<u64>,
     quiet_anchor: Option<Instant>,
@@ -149,8 +151,8 @@ fn evaluate_tree_stability(
 
     let mut blocked_reasons = Vec::<String>::new();
     let mut state = StabilityState::Stable;
-    if overflow_pending_audit {
-        blocked_reasons.push("watch_overflow_pending_audit".to_string());
+    if overflow_pending_materialization {
+        blocked_reasons.push("watch_overflow_pending_materialization".to_string());
         state = StabilityState::Unknown;
     }
     if let Some(reason) = response.unreliable_reason.as_ref() {
@@ -159,7 +161,7 @@ fn evaluate_tree_stability(
             UnreliableReason::SuspectNodes => StabilityState::Unstable,
             UnreliableReason::Unattested
             | UnreliableReason::BlindSpotsDetected
-            | UnreliableReason::WatchOverflowPendingAudit => StabilityState::Unknown,
+            | UnreliableReason::WatchOverflowPendingMaterialization => StabilityState::Unknown,
         };
     }
 
@@ -401,7 +403,7 @@ fn page_entries_from_rebased_nodes(
 fn query_response_from_rebased_nodes(
     nodes: &[RebasedNode<'_>],
     query_root: &[u8],
-    overflow_pending_audit: bool,
+    overflow_pending_materialization: bool,
     recursive: bool,
     max_depth: Option<usize>,
 ) -> RawQueryResult {
@@ -445,7 +447,7 @@ fn query_response_from_rebased_nodes(
         consider_node(&mapped.path, mapped.node);
     }
 
-    reliability.observe_overflow(overflow_pending_audit);
+    reliability.observe_overflow(overflow_pending_materialization);
     let reliability = reliability.finish();
 
     RawQueryResult {
@@ -459,7 +461,7 @@ pub fn get_materialized_tree_payload(
     tree: &MaterializedTree,
     dir_path: &[u8],
     clock: &SinkClock,
-    overflow_pending_audit: bool,
+    overflow_pending_materialization: bool,
     recursive: bool,
     max_depth: Option<usize>,
     read_class: ReadClass,
@@ -478,13 +480,13 @@ pub fn get_materialized_tree_payload(
             tree,
             dir_path,
             clock,
-            overflow_pending_audit,
+            overflow_pending_materialization,
             recursive,
             max_depth,
         );
         let stability = evaluate_tree_stability(
             &direct,
-            overflow_pending_audit,
+            overflow_pending_materialization,
             stability_mode,
             quiet_window_ms,
             quiet_anchor_for_direct_query(tree, dir_path),
@@ -508,13 +510,13 @@ pub fn get_materialized_tree_payload(
     let query = query_response_from_rebased_nodes(
         &rebased,
         dir_path,
-        overflow_pending_audit,
+        overflow_pending_materialization,
         recursive,
         max_depth,
     );
     let stability = evaluate_tree_stability(
         &query,
-        overflow_pending_audit,
+        overflow_pending_materialization,
         stability_mode,
         quiet_window_ms,
         quiet_anchor_for_rebased_nodes(&rebased),
@@ -730,7 +732,7 @@ mod tests {
         assert!(!resp.reliable);
         assert_eq!(
             resp.unreliable_reason,
-            Some(UnreliableReason::WatchOverflowPendingAudit)
+            Some(UnreliableReason::WatchOverflowPendingMaterialization)
         );
         assert!(resp.nodes.is_empty());
     }
@@ -996,7 +998,7 @@ mod tests {
         assert!(!resp.reliable);
         assert_eq!(
             resp.unreliable_reason,
-            Some(UnreliableReason::WatchOverflowPendingAudit)
+            Some(UnreliableReason::WatchOverflowPendingMaterialization)
         );
     }
 

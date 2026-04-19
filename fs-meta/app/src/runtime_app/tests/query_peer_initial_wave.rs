@@ -487,7 +487,7 @@ async fn internal_status_routes_stay_available_while_published_facade_state_rema
         .await
         .expect("activate internal status routes");
 
-    FSMetaApp::publish_facade_service_state_from_runtime_facts(
+    FSMetaApp::publish_facade_service_state_from_runtime_state(
         &app.facade_service_state,
         FacadeServiceStateDecisionInput {
             control_gate_ready: true,
@@ -711,7 +711,7 @@ async fn internal_status_routes_stay_available_on_peer_nodes_without_api_task_wh
         .await
         .expect("activate internal status routes");
 
-    FSMetaApp::publish_facade_service_state_from_runtime_facts(
+    FSMetaApp::publish_facade_service_state_from_runtime_state(
         &app.facade_service_state,
         FacadeServiceStateDecisionInput {
             control_gate_ready: true,
@@ -961,7 +961,7 @@ async fn internal_status_routes_stay_available_on_peer_nodes_without_api_task_wh
         .await
         .expect("activate peer internal status routes");
 
-    FSMetaApp::publish_facade_service_state_from_runtime_facts(
+    FSMetaApp::publish_facade_service_state_from_runtime_state(
         &app.facade_service_state,
         FacadeServiceStateDecisionInput {
             control_gate_ready: true,
@@ -1224,7 +1224,7 @@ async fn internal_status_routes_fail_closed_on_local_facade_owner_when_published
         .expect("activate internal status routes");
 
     app.api_control_gate.set_ready(true);
-    FSMetaApp::publish_facade_service_state_from_runtime_facts(
+    FSMetaApp::publish_facade_service_state_from_runtime_state(
         &app.facade_service_state,
         FacadeServiceStateDecisionInput {
             control_gate_ready: true,
@@ -1518,7 +1518,7 @@ async fn worker_backed_split_primary_initial_wave_arms_sink_before_source_public
             if last_snapshots.iter().any(|snapshot| {
                 snapshot.groups.iter().any(|group| {
                     group.group_id == "nfs3"
-                        && group.initial_audit_completed
+                        && group.is_ready()
                         && group.live_nodes > 0
                         && group.total_nodes > 0
                 })
@@ -1538,7 +1538,7 @@ async fn worker_backed_split_primary_initial_wave_arms_sink_before_source_public
         last_snapshots.iter().any(|snapshot| {
             snapshot.groups.iter().any(|group| {
                 group.group_id == "nfs3"
-                    && group.initial_audit_completed
+                    && group.is_ready()
                     && group.live_nodes > 0
                     && group.total_nodes > 0
             })

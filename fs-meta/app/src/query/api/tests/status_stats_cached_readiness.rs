@@ -13,13 +13,12 @@ fn sink_group_status(
         blind_spot_count: 0,
         shadow_time_us: 1,
         shadow_lag_us: 0,
-        overflow_pending_audit: false,
+        overflow_pending_materialization: false,
         readiness: if initial_audit_completed {
             crate::sink::GroupReadinessState::Ready
         } else {
-            crate::sink::GroupReadinessState::PendingAudit
+            crate::sink::GroupReadinessState::PendingMaterialization
         },
-        initial_audit_completed,
         materialized_revision: 1,
         estimated_heap_bytes: 0,
     }
@@ -57,7 +56,7 @@ fn cached_sink_status_preserves_complete_snapshot_for_same_roots() {
         merged
             .groups
             .iter()
-            .all(|group| group.initial_audit_completed)
+            .all(|group| group.is_ready())
     );
 }
 
@@ -171,9 +170,9 @@ fn local_sink_snapshot_explicit_empty_clears_preserved_cached_ready_groups_after
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -188,9 +187,9 @@ fn local_sink_snapshot_explicit_empty_clears_preserved_cached_ready_groups_after
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -223,9 +222,9 @@ fn local_sink_snapshot_explicit_empty_clears_preserved_cached_ready_groups_after
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -240,9 +239,9 @@ fn local_sink_snapshot_explicit_empty_clears_preserved_cached_ready_groups_after
                 blind_spot_count: 0,
                 shadow_time_us: 0,
                 shadow_lag_us: 0,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-            readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             },
@@ -281,7 +280,7 @@ fn local_sink_snapshot_explicit_empty_clears_preserved_cached_ready_groups_after
         .map(|group| {
             (
                 group.group_id.as_str(),
-                group.initial_audit_completed,
+                group.is_ready(),
                 group.total_nodes,
                 group.live_nodes,
             )
@@ -377,7 +376,7 @@ fn materialized_query_readiness_preserves_retained_group_audit_across_root_set_c
     let merged_groups = merged
         .groups
         .iter()
-        .map(|group| (group.group_id.as_str(), group.initial_audit_completed))
+        .map(|group| (group.group_id.as_str(), group.is_ready()))
         .collect::<Vec<_>>();
     assert_eq!(merged_groups, vec![("nfs2", true), ("nfs4", false)]);
     assert!(
@@ -429,7 +428,7 @@ fn cached_sink_status_preserves_missing_nfs2_readiness_when_later_fresh_snapshot
     let merged_groups = merged
         .groups
         .iter()
-        .map(|group| (group.group_id.as_str(), group.initial_audit_completed))
+        .map(|group| (group.group_id.as_str(), group.is_ready()))
         .collect::<Vec<_>>();
     assert_eq!(merged_groups, vec![("nfs1", true), ("nfs2", true)]);
     assert!(

@@ -420,8 +420,9 @@ fn summarize_candidate_sink_group_state(
         .iter()
         .map(|group_id| match sink_groups.get(group_id.as_str()) {
             Some(group) => format!(
-                "{group_id}:initial_audit_completed={}:overflow_pending_audit={}",
-                group.initial_audit_completed, group.overflow_pending_audit
+                "{group_id}:initial_audit_completed={}:overflow_pending_materialization={}",
+                group.is_ready(),
+                group.overflow_pending_materialization
             ),
             None => format!("{group_id}:missing"),
         })
@@ -665,17 +666,17 @@ pub async fn status(
                     blind_spot_count: group.blind_spot_count,
                     shadow_time_us: group.shadow_time_us,
                     shadow_lag_us: group.shadow_lag_us,
-                    overflow_pending_audit: group.overflow_pending_audit,
+                    overflow_pending_materialization: group.overflow_pending_materialization,
                     readiness: match group.readiness {
-                        crate::sink::GroupReadinessState::PendingAudit => {
-                            StatusSinkGroupReadiness::PendingAudit
+                        crate::sink::GroupReadinessState::PendingMaterialization => {
+                            StatusSinkGroupReadiness::PendingMaterialization
                         }
                         crate::sink::GroupReadinessState::WaitingForMaterializedRoot => {
                             StatusSinkGroupReadiness::WaitingForMaterializedRoot
                         }
                         crate::sink::GroupReadinessState::Ready => StatusSinkGroupReadiness::Ready,
                     },
-                    initial_audit_completed: group.initial_audit_completed,
+
                     estimated_heap_bytes: group.estimated_heap_bytes,
                 })
                 .collect(),
@@ -1002,8 +1003,15 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
     let sink_retry_boundary = boundary.clone();
     let sink_retry_node_id = node_id.clone();
     record_status_route_trace(trace_id, "sink.collect.begin");
-    let mut sink_result =
-        route_sink_status_snapshot(boundary.clone(), node_id.clone(), STATUS_ROUTE_TIMEOUT).await;
+    let mut sink_result = route_sink_status_snapshot(
+        boundary.clone(),
+        node_id.clone(),
+        crate::query::api::StatusRoutePlan::new(
+            STATUS_ROUTE_TIMEOUT,
+            STATUS_ROUTE_COLLECT_IDLE_GRACE,
+        ),
+    )
+    .await;
     record_status_route_trace(trace_id, "source.collect.begin");
     let source_result = route_source_observability_snapshot(
         boundary,
@@ -1020,7 +1028,10 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
         if let Ok(retry_snapshot) = route_sink_status_snapshot(
             sink_retry_boundary,
             sink_retry_node_id,
-            STATUS_SINK_ROUTE_RECOLLECT_BUDGET,
+            crate::query::api::StatusRoutePlan::new(
+                STATUS_SINK_ROUTE_RECOLLECT_BUDGET,
+                STATUS_ROUTE_COLLECT_IDLE_GRACE,
+            ),
         )
         .await
         {
@@ -3781,8 +3792,8 @@ mod tests {
                 blind_spot_count: 0,
                 shadow_time_us: 11,
                 shadow_lag_us: 12,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
@@ -3808,9 +3819,9 @@ mod tests {
                 blind_spot_count: 0,
                 shadow_time_us: 11,
                 shadow_lag_us: 12,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
             }],
@@ -4220,8 +4231,8 @@ mod tests {
                 blind_spot_count: 0,
                 shadow_time_us: 21,
                 shadow_lag_us: 22,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
@@ -4473,8 +4484,8 @@ mod tests {
                 blind_spot_count: 0,
                 shadow_time_us: 21,
                 shadow_lag_us: 22,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
@@ -4608,8 +4619,8 @@ mod tests {
                 blind_spot_count: 0,
                 shadow_time_us: 21,
                 shadow_lag_us: 22,
-                overflow_pending_audit: false,
-                initial_audit_completed: true,
+                overflow_pending_materialization: false,
+
                 readiness: crate::sink::GroupReadinessState::Ready,
                 materialized_revision: 1,
                 estimated_heap_bytes: 0,
@@ -6226,8 +6237,8 @@ mod tests {
                         blind_spot_count: 0,
                         shadow_time_us: 21,
                         shadow_lag_us: 22,
-                        overflow_pending_audit: false,
-                        initial_audit_completed: true,
+                        overflow_pending_materialization: false,
+
                         readiness: crate::sink::GroupReadinessState::Ready,
                         materialized_revision: 1,
                         estimated_heap_bytes: 0,
@@ -6333,8 +6344,8 @@ mod tests {
                         blind_spot_count: 0,
                         shadow_time_us: 21,
                         shadow_lag_us: 22,
-                        overflow_pending_audit: false,
-                        initial_audit_completed: true,
+                        overflow_pending_materialization: false,
+
                         readiness: crate::sink::GroupReadinessState::Ready,
                         materialized_revision: 1,
                         estimated_heap_bytes: 0,
@@ -6477,9 +6488,9 @@ mod tests {
                 blind_spot_count: 0,
                 shadow_time_us: 21,
                 shadow_lag_us: 22,
-                overflow_pending_audit: false,
-                initial_audit_completed: false,
-                readiness: crate::sink::GroupReadinessState::PendingAudit,
+                overflow_pending_materialization: false,
+
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
                 materialized_revision: 0,
                 estimated_heap_bytes: 0,
             }],
@@ -6506,8 +6517,8 @@ mod tests {
                     blind_spot_count: 0,
                     shadow_time_us: 31,
                     shadow_lag_us: 32,
-                    overflow_pending_audit: false,
-                    initial_audit_completed: true,
+                    overflow_pending_materialization: false,
+
                     readiness: crate::sink::GroupReadinessState::Ready,
                     materialized_revision: 1,
                     estimated_heap_bytes: 0,
@@ -6523,8 +6534,8 @@ mod tests {
                     blind_spot_count: 0,
                     shadow_time_us: 33,
                     shadow_lag_us: 34,
-                    overflow_pending_audit: false,
-                    initial_audit_completed: true,
+                    overflow_pending_materialization: false,
+
                     readiness: crate::sink::GroupReadinessState::Ready,
                     materialized_revision: 1,
                     estimated_heap_bytes: 0,
@@ -6540,8 +6551,8 @@ mod tests {
                     blind_spot_count: 0,
                     shadow_time_us: 35,
                     shadow_lag_us: 36,
-                    overflow_pending_audit: false,
-                    initial_audit_completed: true,
+                    overflow_pending_materialization: false,
+
                     readiness: crate::sink::GroupReadinessState::Ready,
                     materialized_revision: 1,
                     estimated_heap_bytes: 0,
@@ -6828,8 +6839,8 @@ mod tests {
                         blind_spot_count: 0,
                         shadow_time_us: 21,
                         shadow_lag_us: 22,
-                        overflow_pending_audit: false,
-                        initial_audit_completed: true,
+                        overflow_pending_materialization: false,
+
                         readiness: crate::sink::GroupReadinessState::Ready,
                         materialized_revision: 1,
                         estimated_heap_bytes: 0,
