@@ -396,27 +396,23 @@ struct PitSession {
     estimated_bytes: usize,
 }
 
-struct PitSessionParts {
+fn build_pit_session(
     mode: CursorQueryMode,
     scope: PitScope,
     read_class: ReadClass,
     observation_status: ObservationStatus,
     groups: Vec<GroupPitSnapshot>,
-}
-
-impl PitSessionParts {
-    fn into_session(self) -> PitSession {
-        let estimated_bytes =
-            self.groups.iter().map(estimated_group_bytes).sum::<usize>() + std::mem::size_of::<PitSession>();
-        PitSession {
-            mode: self.mode,
-            scope: self.scope,
-            read_class: self.read_class,
-            observation_status: self.observation_status,
-            groups: self.groups,
-            expires_at_ms: unix_now_ms() + PIT_TTL_MS_DEFAULT,
-            estimated_bytes,
-        }
+) -> PitSession {
+    let estimated_bytes =
+        groups.iter().map(estimated_group_bytes).sum::<usize>() + std::mem::size_of::<PitSession>();
+    PitSession {
+        mode,
+        scope,
+        read_class,
+        observation_status,
+        groups,
+        expires_at_ms: unix_now_ms() + PIT_TTL_MS_DEFAULT,
+        estimated_bytes,
     }
 }
 
@@ -662,7 +658,7 @@ pub(crate) struct StatusRoutePlan {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct StatusRouteRuntime {
+struct StatusRouteMachine {
     plan: StatusRoutePlan,
     route_deadline: tokio::time::Instant,
 }
@@ -673,17 +669,17 @@ struct StatusRouteAttemptRuntime {
     collect_idle_grace: Duration,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StatusRouteAction {
-    ReturnTimeout,
-    QueryAttempt(StatusRouteAttemptRuntime),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusRouteMachineTerminal {
+    Timeout,
+    CurrentError,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StatusRouteRetryAction {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusRouteMachinePhase {
+    Attempt(StatusRouteAttemptRuntime),
     WaitUntil(tokio::time::Instant),
-    ReturnTimeout,
-    ReturnCurrentError,
+    Failed(StatusRouteMachineTerminal),
 }
 
 impl StatusRoutePlan {
@@ -718,58 +714,65 @@ impl StatusRoutePlan {
         Self::new(route_timeout, self.collect_idle_grace)
     }
 
-    fn runtime(self) -> StatusRouteRuntime {
-        self.runtime_from_now(tokio::time::Instant::now())
+    fn machine(self) -> StatusRouteMachine {
+        self.machine_from_now(tokio::time::Instant::now())
     }
 
-    fn runtime_from_now(self, now: tokio::time::Instant) -> StatusRouteRuntime {
-        StatusRouteRuntime {
+    fn machine_from_now(self, now: tokio::time::Instant) -> StatusRouteMachine {
+        StatusRouteMachine {
             plan: self,
             route_deadline: now + self.route_timeout,
         }
     }
 }
 
-impl StatusRouteRuntime {
-    fn attempt_action_at(self, now: tokio::time::Instant) -> StatusRouteAction {
-        let remaining = self
-            .route_deadline
+impl StatusRouteMachine {
+    fn remaining_at(self, now: tokio::time::Instant) -> Duration {
+        self.route_deadline
             .checked_duration_since(now)
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    fn attempt_at(self, now: tokio::time::Instant) -> Option<StatusRouteAttemptRuntime> {
+        let remaining = self.remaining_at(now);
         if remaining.is_zero() {
-            StatusRouteAction::ReturnTimeout
+            None
         } else {
-            StatusRouteAction::QueryAttempt(StatusRouteAttemptRuntime {
+            Some(StatusRouteAttemptRuntime {
                 attempt_timeout: self.plan.attempt_timeout(remaining),
                 collect_idle_grace: self.plan.collect_idle_grace(),
             })
         }
     }
 
-    fn retry_action_at(self, now: tokio::time::Instant) -> StatusRouteRetryAction {
-        let remaining = self
-            .route_deadline
-            .checked_duration_since(now)
-            .unwrap_or_default();
-        if remaining.is_zero() {
-            StatusRouteRetryAction::ReturnTimeout
-        } else {
-            StatusRouteRetryAction::WaitUntil(
-                now + std::cmp::min(STATUS_ROUTE_RETRY_BACKOFF, remaining),
-            )
+    fn entry_phase(self) -> StatusRouteMachinePhase {
+        self.entry_phase_at(tokio::time::Instant::now())
+    }
+
+    fn entry_phase_at(self, now: tokio::time::Instant) -> StatusRouteMachinePhase {
+        match self.attempt_at(now) {
+            Some(attempt) => StatusRouteMachinePhase::Attempt(attempt),
+            None => StatusRouteMachinePhase::Failed(StatusRouteMachineTerminal::Timeout),
         }
     }
 
-    fn followup_action_at(
+    fn followup_phase_at(
         self,
         now: tokio::time::Instant,
         err: &CnxError,
         is_retryable_gap: fn(&CnxError) -> bool,
-    ) -> StatusRouteRetryAction {
+    ) -> StatusRouteMachinePhase {
         if !is_retryable_gap(err) {
-            StatusRouteRetryAction::ReturnCurrentError
+            return StatusRouteMachinePhase::Failed(StatusRouteMachineTerminal::CurrentError);
+        }
+        let remaining = self
+            .remaining_at(now);
+        if remaining.is_zero() {
+            StatusRouteMachinePhase::Failed(StatusRouteMachineTerminal::Timeout)
         } else {
-            self.retry_action_at(now)
+            StatusRouteMachinePhase::WaitUntil(
+                now + std::cmp::min(STATUS_ROUTE_RETRY_BACKOFF, remaining),
+            )
         }
     }
 }
@@ -817,7 +820,7 @@ async fn route_source_status_snapshot(
     let events = execute_status_route_collect(
         boundary,
         origin_id,
-        plan.runtime(),
+        plan.machine(),
         METHOD_SOURCE_STATUS,
         is_retryable_source_status_continuity_gap,
     )
@@ -859,7 +862,7 @@ pub(crate) async fn route_sink_status_snapshot(
     let events = execute_status_route_collect(
         boundary,
         origin_id,
-        plan.runtime(),
+        plan.machine(),
         METHOD_SINK_STATUS,
         is_retryable_sink_status_continuity_gap,
     )
@@ -889,65 +892,60 @@ pub(crate) async fn route_sink_status_snapshot(
 async fn execute_status_route_collect(
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
-    runtime: StatusRouteRuntime,
+    machine: StatusRouteMachine,
     method: &'static str,
     is_retryable_gap: fn(&CnxError) -> bool,
 ) -> Result<Vec<Event>, CnxError> {
-    execute_runtime_collect_loop(
-        runtime.attempt_action_at(tokio::time::Instant::now()),
-        |_last_err| async move { Ok(runtime.attempt_action_at(tokio::time::Instant::now())) },
-        |action, last_err| {
-            let boundary = boundary.clone();
-            let origin_id = origin_id.clone();
-            async move {
-                match action {
-                    StatusRouteAction::ReturnTimeout => Ok(RuntimeCollectLoopStep::Return(Err(
-                        take_last_route_error_or(last_err, || CnxError::Timeout),
-                    ))),
-                    StatusRouteAction::QueryAttempt(attempt) => {
-                        let adapter = exchange_host_adapter(
-                            boundary,
-                            origin_id,
-                            default_route_bindings(),
+    let mut phase = machine.entry_phase();
+    let mut last_err = None::<CnxError>;
+    loop {
+        match phase {
+            StatusRouteMachinePhase::Attempt(attempt) => {
+                let adapter =
+                    exchange_host_adapter(boundary.clone(), origin_id.clone(), default_route_bindings());
+                match adapter
+                    .call_collect(
+                        ROUTE_TOKEN_FS_META_INTERNAL,
+                        method,
+                        internal_status_request_payload(),
+                        attempt.attempt_timeout,
+                        attempt.collect_idle_grace,
+                    )
+                    .await
+                {
+                    Ok(events) => return Ok(events),
+                    Err(err) => {
+                        last_err = Some(err);
+                        phase = machine.followup_phase_at(
+                            tokio::time::Instant::now(),
+                            last_err
+                                .as_ref()
+                                .expect("status route followup owns current error"),
+                            is_retryable_gap,
                         );
-                        match adapter
-                            .call_collect(
-                                ROUTE_TOKEN_FS_META_INTERNAL,
-                                method,
-                                internal_status_request_payload(),
-                                attempt.attempt_timeout,
-                                attempt.collect_idle_grace,
-                            )
-                            .await
-                        {
-                            Ok(events) => Ok(RuntimeCollectLoopStep::Return(Ok(events))),
-                            Err(err) => {
-                                let last_err = Some(err);
-                                Ok(match runtime.followup_action_at(
-                                    tokio::time::Instant::now(),
-                                    last_err
-                                        .as_ref()
-                                        .expect("status route followup owns current error"),
-                                    is_retryable_gap,
-                                ) {
-                                    StatusRouteRetryAction::WaitUntil(until) => {
-                                        RuntimeCollectLoopStep::WaitUntil { until, last_err }
-                                    }
-                                    StatusRouteRetryAction::ReturnTimeout
-                                    | StatusRouteRetryAction::ReturnCurrentError => {
-                                        RuntimeCollectLoopStep::Return(Err(
-                                            take_last_route_error_or(last_err, || CnxError::Timeout),
-                                        ))
-                                    }
-                                })
-                            }
-                        }
                     }
                 }
             }
-        },
-    )
-    .await
+            StatusRouteMachinePhase::WaitUntil(until) => {
+                tokio::time::sleep_until(until).await;
+                phase = machine.entry_phase();
+            }
+            StatusRouteMachinePhase::Failed(terminal) => {
+                return Err(match terminal {
+                    StatusRouteMachineTerminal::Timeout => {
+                        take_last_route_error_or(last_err, || CnxError::Timeout)
+                    }
+                    StatusRouteMachineTerminal::CurrentError => {
+                        take_last_route_error_or(last_err, || {
+                            CnxError::Internal(
+                                "status route machine escaped its source error context".into(),
+                            )
+                        })
+                    }
+                });
+            }
+        }
+    }
 }
 
 fn is_retryable_sink_status_continuity_gap(err: &CnxError) -> bool {
@@ -3123,12 +3121,6 @@ struct ForceFindRoutePlan {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ForceFindRouteRuntime {
-    plan: ForceFindRoutePlan,
-    route_deadline: tokio::time::Instant,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ForceFindRouteAttemptRuntime {
     route_plan: ForceFindRoutePlan,
     remaining: Duration,
@@ -3179,7 +3171,8 @@ enum ForceFindRouteMachinePhase {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ForceFindRouteMachine {
-    runtime: ForceFindRouteRuntime,
+    plan: ForceFindRoutePlan,
+    route_deadline: tokio::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3188,12 +3181,17 @@ enum ForceFindInFlightHoldAction {
     WaitUntil(tokio::time::Instant),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TreePitProxyRouteAction {
-    ReturnTimeout,
-    ReturnCurrentError,
-    QueryAttempt(TreePitProxyAttemptRuntime),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProxyRouteMachineTerminal {
+    Timeout,
+    CurrentError,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProxyRouteMachinePhase {
+    Attempt(TreePitProxyAttemptRuntime),
     WaitUntil(tokio::time::Instant),
+    Failed(ProxyRouteMachineTerminal),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3215,7 +3213,7 @@ struct TreePitProxyRoutePlan {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TreePitProxyRouteRuntime {
+struct ProxyRouteMachine {
     plan: TreePitProxyRoutePlan,
     route_deadline: tokio::time::Instant,
 }
@@ -3543,7 +3541,7 @@ impl RetryableTreePitStageErrorRuntime {
             .retryable_gap_owner_retry_timeout(self.remaining_session_at(now))
     }
 
-    fn proxy_route_runtime_at(self, now: tokio::time::Instant) -> Option<TreePitProxyRouteRuntime> {
+    fn proxy_route_machine_at(self, now: tokio::time::Instant) -> Option<ProxyRouteMachine> {
         let plan = self.group_plan.retryable_gap_proxy_route_plan(
             self.remaining_session_at(now),
             self.remaining_stage_at(now),
@@ -3551,7 +3549,7 @@ impl RetryableTreePitStageErrorRuntime {
         if plan.route_timeout().is_zero() {
             None
         } else {
-            Some(plan.runtime_from_now(now))
+            Some(plan.machine_from_now(now))
         }
     }
 
@@ -3616,12 +3614,12 @@ impl ForceFindRoutePlan {
         Self::new(route_timeout)
     }
 
-    fn runtime(self) -> ForceFindRouteRuntime {
-        self.runtime_from_now(tokio::time::Instant::now())
+    fn machine(self) -> ForceFindRouteMachine {
+        self.machine_from_now(tokio::time::Instant::now())
     }
 
-    fn runtime_from_now(self, now: tokio::time::Instant) -> ForceFindRouteRuntime {
-        ForceFindRouteRuntime {
+    fn machine_from_now(self, now: tokio::time::Instant) -> ForceFindRouteMachine {
+        ForceFindRouteMachine {
             plan: self,
             route_deadline: now + self.route_timeout,
         }
@@ -3649,9 +3647,9 @@ impl ForceFindRoutePlan {
     }
 }
 
-impl ForceFindRouteRuntime {
+impl ForceFindRouteMachine {
     fn tree_entry_action_at(
-        self,
+        &self,
         now: tokio::time::Instant,
         selected_runner: Option<NodeId>,
     ) -> ForceFindTreeRouteAction {
@@ -3672,7 +3670,7 @@ impl ForceFindRouteRuntime {
         }
     }
 
-    fn attempt_at(self, now: tokio::time::Instant) -> Option<ForceFindRouteAttemptRuntime> {
+    fn attempt_at(&self, now: tokio::time::Instant) -> Option<ForceFindRouteAttemptRuntime> {
         let remaining = self
             .route_deadline
             .checked_duration_since(now)
@@ -3687,7 +3685,7 @@ impl ForceFindRouteRuntime {
     }
 
     fn tree_followup_action_at(
-        self,
+        &self,
         now: tokio::time::Instant,
         err: &CnxError,
         selected_runner_attempt: bool,
@@ -3708,42 +3706,33 @@ impl ForceFindRouteRuntime {
             }
         }
     }
-}
 
-impl ForceFindRouteMachine {
-    fn new(runtime: ForceFindRouteRuntime) -> Self {
-        Self { runtime }
-    }
-
-    fn entry_phase(self) -> ForceFindRouteMachinePhase {
+    fn entry_phase(&self) -> ForceFindRouteMachinePhase {
         ForceFindRouteMachinePhase::PlanSelectedRunner
     }
 
     fn phase_for_selected_runner_at(
-        self,
+        &self,
         now: tokio::time::Instant,
         selected_runner: Option<NodeId>,
     ) -> ForceFindRouteMachinePhase {
-        self.phase_from_action(self.runtime.tree_entry_action_at(now, selected_runner))
+        self.phase_from_action(self.tree_entry_action_at(now, selected_runner))
     }
 
     fn followup_phase_at(
-        self,
+        &self,
         now: tokio::time::Instant,
         err: &CnxError,
         selected_runner_attempt: bool,
     ) -> ForceFindRouteMachinePhase {
-        self.phase_from_action(
-            self.runtime
-                .tree_followup_action_at(now, err, selected_runner_attempt),
-        )
+        self.phase_from_action(self.tree_followup_action_at(now, err, selected_runner_attempt))
     }
 
-    fn phase_after_wait(self) -> ForceFindRouteMachinePhase {
+    fn phase_after_wait(&self) -> ForceFindRouteMachinePhase {
         ForceFindRouteMachinePhase::PlanSelectedRunner
     }
 
-    fn phase_from_action(self, action: ForceFindTreeRouteAction) -> ForceFindRouteMachinePhase {
+    fn phase_from_action(&self, action: ForceFindTreeRouteAction) -> ForceFindRouteMachinePhase {
         match action {
             ForceFindTreeRouteAction::ReturnTimeout => {
                 ForceFindRouteMachinePhase::Failed(ForceFindRouteMachineTerminal::Timeout)
@@ -3766,6 +3755,7 @@ impl ForceFindRouteMachine {
             }
         }
     }
+
 }
 
 impl ForceFindRouteAttemptRuntime {
@@ -3833,25 +3823,21 @@ impl TreePitProxyRoutePlan {
         self.retry_backoff
     }
 
-    fn runtime(self) -> TreePitProxyRouteRuntime {
-        self.runtime_from_now(tokio::time::Instant::now())
+    fn machine(self) -> ProxyRouteMachine {
+        self.machine_from_now(tokio::time::Instant::now())
     }
 
-    fn runtime_from_now(self, now: tokio::time::Instant) -> TreePitProxyRouteRuntime {
-        TreePitProxyRouteRuntime {
+    fn machine_from_now(self, now: tokio::time::Instant) -> ProxyRouteMachine {
+        ProxyRouteMachine {
             plan: self,
             route_deadline: now + self.route_timeout,
         }
     }
 }
 
-impl TreePitProxyRouteRuntime {
+impl ProxyRouteMachine {
     fn route_timeout(self) -> Duration {
         self.plan.route_timeout()
-    }
-
-    fn attempt(self) -> Option<TreePitProxyAttemptRuntime> {
-        self.attempt_at(tokio::time::Instant::now())
     }
 
     fn attempt_at(self, now: tokio::time::Instant) -> Option<TreePitProxyAttemptRuntime> {
@@ -3869,33 +3855,27 @@ impl TreePitProxyRouteRuntime {
         })
     }
 
-    fn entry_action(self) -> TreePitProxyRouteAction {
-        self.entry_action_at(tokio::time::Instant::now())
+    fn entry_phase(self) -> ProxyRouteMachinePhase {
+        self.entry_phase_at(tokio::time::Instant::now())
     }
 
-    fn entry_action_at(self, now: tokio::time::Instant) -> TreePitProxyRouteAction {
+    fn entry_phase_at(self, now: tokio::time::Instant) -> ProxyRouteMachinePhase {
         match self.attempt_at(now) {
-            Some(attempt_runtime) => TreePitProxyRouteAction::QueryAttempt(attempt_runtime),
-            None => TreePitProxyRouteAction::ReturnTimeout,
+            Some(attempt_runtime) => ProxyRouteMachinePhase::Attempt(attempt_runtime),
+            None => ProxyRouteMachinePhase::Failed(ProxyRouteMachineTerminal::Timeout),
         }
     }
 
-    fn retry_action(self) -> TreePitProxyRouteAction {
-        self.retry_action_at(tokio::time::Instant::now())
-    }
-
-    fn retry_action_at(self, now: tokio::time::Instant) -> TreePitProxyRouteAction {
-        let Some(attempt_runtime) = self.attempt_at(now) else {
-            return TreePitProxyRouteAction::ReturnTimeout;
-        };
-        TreePitProxyRouteAction::WaitUntil(now + attempt_runtime.retry_backoff)
-    }
-
-    fn followup_action_at(self, now: tokio::time::Instant, err: &CnxError) -> TreePitProxyRouteAction {
+    fn followup_phase_at(self, now: tokio::time::Instant, err: &CnxError) -> ProxyRouteMachinePhase {
         if !is_retryable_materialized_proxy_continuity_gap(err) {
-            TreePitProxyRouteAction::ReturnCurrentError
+            ProxyRouteMachinePhase::Failed(ProxyRouteMachineTerminal::CurrentError)
         } else {
-            self.retry_action_at(now)
+            match self.attempt_at(now) {
+                Some(attempt_runtime) => {
+                    ProxyRouteMachinePhase::WaitUntil(now + attempt_runtime.retry_backoff)
+                }
+                None => ProxyRouteMachinePhase::Failed(ProxyRouteMachineTerminal::Timeout),
+            }
         }
     }
 }
@@ -4241,7 +4221,7 @@ async fn rescue_trusted_materialized_empty_tree_response(
                 boundary.clone(),
                 origin_id.clone(),
                 input.tree_params.clone(),
-                proxy_route_plan.runtime(),
+                proxy_route_plan.machine(),
             )
             .await
             {
@@ -4554,23 +4534,23 @@ async fn handle_retryable_tree_pit_stage_error(
             ..
         } = &input.state.backend
         {
-            if let Some(proxy_retry_runtime) =
-                input.retryable_error_runtime.proxy_route_runtime_at(now)
+            if let Some(proxy_retry_machine) =
+                input.retryable_error_runtime.proxy_route_machine_at(now)
             {
                 if debug_materialized_route_capture_enabled() {
                     eprintln!(
                         "fs_meta_query_api: pit_group_stage proxy_fallback_after_owner_timeout group={} path={} proxy_timeout_ms={} remaining_ms={}",
                         input.group_key,
                         String::from_utf8_lossy(input.query_path),
-                        proxy_retry_runtime.route_timeout().as_millis(),
-                        proxy_retry_runtime.route_timeout().as_millis(),
+                        proxy_retry_machine.route_timeout().as_millis(),
+                        proxy_retry_machine.route_timeout().as_millis(),
                     );
                 }
                 match query_materialized_events_via_generic_proxy(
                     boundary.clone(),
                     origin_id.clone(),
                     input.tree_params.clone(),
-                    proxy_retry_runtime,
+                    proxy_retry_machine,
                 )
                 .await
                 {
@@ -4916,37 +4896,23 @@ async fn execute_tree_pit_ranked_group(
     Ok(())
 }
 
-macro_rules! execute_ranked_group_loop {
-    ($state:expr, $items:expr, |$state_ident:ident, $item:pat_param| $body:block) => {{
-        let mut state = $state;
-        for $item in $items {
-            let $state_ident = &mut state;
-            $body
-        }
-        state
-    }};
-}
-
 async fn execute_tree_pit_ranked_groups(
     input: TreePitRankedGroupExecutionInput<'_>,
     rankings: Vec<GroupRank>,
 ) -> Result<Vec<GroupPitSnapshot>, CnxError> {
     let group_order = input.params.group_order;
-    let state = execute_ranked_group_loop!(
-        TreePitRankedGroupsState::new(&rankings),
-        rankings.into_iter().enumerate(),
-        |state, (rank_index, rank)| {
-            execute_tree_pit_ranked_group(
-                &input,
-                rank_index,
-                rank.group_key,
-                &mut state.groups,
-                &mut state.group_rank_metrics,
-                &mut state.deferred_first_ranked_empty_trusted_non_root_group,
-            )
-            .await?;
-        }
-    );
+    let mut state = TreePitRankedGroupsState::new(&rankings);
+    for (rank_index, rank) in rankings.into_iter().enumerate() {
+        execute_tree_pit_ranked_group(
+            &input,
+            rank_index,
+            rank.group_key,
+            &mut state.groups,
+            &mut state.group_rank_metrics,
+            &mut state.deferred_first_ranked_empty_trusted_non_root_group,
+        )
+        .await?;
+    }
     Ok(state.finalize(group_order))
 }
 
@@ -5319,7 +5285,7 @@ fn tree_pit_retryable_stage_error_runtime_owns_owner_retry_timeout_from_remainin
 }
 
 #[test]
-fn tree_pit_retryable_stage_error_runtime_owns_proxy_route_runtime_from_deadlines() {
+fn tree_pit_retryable_stage_error_runtime_owns_proxy_route_machine_from_deadlines() {
     let now = tokio::time::Instant::now();
     let plan = TreePitSessionPlan::new(Duration::from_secs(5), 2).selected_group_stage_plan(
         TreePitGroupPlanInput {
@@ -5343,8 +5309,8 @@ fn tree_pit_retryable_stage_error_runtime_owns_proxy_route_runtime_from_deadline
     .retryable_error_runtime(plan);
 
     assert_eq!(
-        runtime.proxy_route_runtime_at(now + Duration::from_millis(300)),
-        Some(TreePitProxyRouteRuntime {
+        runtime.proxy_route_machine_at(now + Duration::from_millis(300)),
+        Some(ProxyRouteMachine {
             plan: TreePitProxyRoutePlan {
                 route_timeout: Duration::from_millis(1300),
                 collect_idle_grace: SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE,
@@ -5352,7 +5318,7 @@ fn tree_pit_retryable_stage_error_runtime_owns_proxy_route_runtime_from_deadline
             },
             route_deadline: now + Duration::from_millis(1600),
         }),
-        "retryable stage-error proxy fallback should use runtime-owned session/stage deadlines instead of re-deriving remaining budgets inside the error helper",
+        "retryable stage-error proxy fallback should use machine-owned session/stage deadlines instead of re-deriving remaining budgets inside the error helper",
     );
 }
 
@@ -5840,41 +5806,49 @@ fn status_route_plan_caps_attempt_timeout_to_canonical_cap() {
 }
 
 #[test]
-fn status_route_runtime_owns_attempt_budget_and_retry_followup() {
+fn status_route_machine_owns_attempt_budget_and_retry_followup() {
     let now = tokio::time::Instant::now();
-    let runtime = StatusRoutePlan::new(Duration::from_secs(30), STATUS_ROUTE_COLLECT_IDLE_GRACE)
-        .runtime_from_now(now);
+    let machine = StatusRoutePlan::new(Duration::from_secs(30), STATUS_ROUTE_COLLECT_IDLE_GRACE)
+        .machine_from_now(now);
 
     assert_eq!(
-        runtime.attempt_action_at(now),
-        StatusRouteAction::QueryAttempt(StatusRouteAttemptRuntime {
+        machine.entry_phase_at(now),
+        StatusRouteMachinePhase::Attempt(StatusRouteAttemptRuntime {
             attempt_timeout: STATUS_ROUTE_ATTEMPT_TIMEOUT_CAP,
             collect_idle_grace: STATUS_ROUTE_COLLECT_IDLE_GRACE,
         }),
-        "routed status runtime should own the canonical attempt budget instead of leaving helper loops to recompute remaining and attempt timeout inline",
+        "routed status machine should own the canonical attempt budget instead of leaving helper loops to recompute remaining and attempt timeout inline",
     );
     assert_eq!(
-        runtime.attempt_action_at(now + Duration::from_secs(29) + Duration::from_millis(980)),
-        StatusRouteAction::QueryAttempt(StatusRouteAttemptRuntime {
+        machine.entry_phase_at(now + Duration::from_secs(29) + Duration::from_millis(980)),
+        StatusRouteMachinePhase::Attempt(StatusRouteAttemptRuntime {
             attempt_timeout: Duration::from_millis(20),
             collect_idle_grace: STATUS_ROUTE_COLLECT_IDLE_GRACE,
         }),
-        "routed status runtime should preserve the final remaining route budget for the last attempt instead of leaving helpers to open-code deadline math",
+        "routed status machine should preserve the final remaining route budget for the last attempt instead of leaving helpers to open-code deadline math",
     );
     assert_eq!(
-        runtime.retry_action_at(now),
-        StatusRouteRetryAction::WaitUntil(now + STATUS_ROUTE_RETRY_BACKOFF),
-        "routed status runtime should own the retry wait followup instead of leaving helper loops to hot-spin on retryable continuity gaps",
+        machine.followup_phase_at(now, &CnxError::Timeout, is_retryable_source_status_continuity_gap),
+        StatusRouteMachinePhase::WaitUntil(now + STATUS_ROUTE_RETRY_BACKOFF),
+        "routed status machine should own the retry wait followup instead of leaving helper loops to hot-spin on retryable continuity gaps",
     );
     assert_eq!(
-        runtime.retry_action_at(now + Duration::from_secs(29) + Duration::from_millis(995)),
-        StatusRouteRetryAction::WaitUntil(now + Duration::from_secs(30)),
-        "routed status runtime should cap the retry wait followup to the remaining route budget instead of letting helpers sleep past the deadline",
+        machine.followup_phase_at(
+            now + Duration::from_secs(29) + Duration::from_millis(995),
+            &CnxError::Timeout,
+            is_retryable_source_status_continuity_gap,
+        ),
+        StatusRouteMachinePhase::WaitUntil(now + Duration::from_secs(30)),
+        "routed status machine should cap the retry wait followup to the remaining route budget instead of letting helpers sleep past the deadline",
     );
     assert_eq!(
-        runtime.retry_action_at(now + Duration::from_secs(30)),
-        StatusRouteRetryAction::ReturnTimeout,
-        "routed status runtime should also own the retry followup timeout cut-off instead of leaving helper loops to branch on remaining.is_zero() after each retryable continuity gap",
+        machine.followup_phase_at(
+            now + Duration::from_secs(30),
+            &CnxError::Timeout,
+            is_retryable_source_status_continuity_gap,
+        ),
+        StatusRouteMachinePhase::Failed(StatusRouteMachineTerminal::Timeout),
+        "routed status machine should also own the retry followup timeout cut-off instead of leaving helper loops to branch on remaining.is_zero() after each retryable continuity gap",
     );
 }
 
@@ -5906,19 +5880,19 @@ fn materialized_status_load_plan_owns_canonical_route_timing() {
 }
 
 #[test]
-fn status_route_runtime_owns_non_retryable_followup_lane() {
+fn status_route_machine_owns_non_retryable_followup_lane() {
     let now = tokio::time::Instant::now();
-    let runtime = StatusRoutePlan::new(Duration::from_secs(30), STATUS_ROUTE_COLLECT_IDLE_GRACE)
-        .runtime_from_now(now);
+    let machine = StatusRoutePlan::new(Duration::from_secs(30), STATUS_ROUTE_COLLECT_IDLE_GRACE)
+        .machine_from_now(now);
 
     assert_eq!(
-        runtime.followup_action_at(
+        machine.followup_phase_at(
             now,
             &CnxError::AccessDenied("non-retryable".into()),
             is_retryable_source_status_continuity_gap,
         ),
-        StatusRouteRetryAction::ReturnCurrentError,
-        "routed status runtime should own the non-retryable followup lane instead of leaving the helper loop to branch directly on the raw error",
+        StatusRouteMachinePhase::Failed(StatusRouteMachineTerminal::CurrentError),
+        "routed status machine should own the non-retryable followup lane instead of leaving the helper loop to branch directly on the raw error",
     );
 }
 
@@ -5969,52 +5943,52 @@ fn tree_pit_group_plan_empty_response_proxy_route_plan_caps_small_timeout() {
 }
 
 #[test]
-fn tree_pit_proxy_route_runtime_owns_attempt_budget_and_retry_backoff() {
+fn tree_pit_proxy_route_machine_owns_attempt_budget_and_retry_backoff() {
     let now = tokio::time::Instant::now();
-    let runtime = TreePitProxyRoutePlan::new(Duration::from_secs(3)).runtime_from_now(now);
+    let machine = TreePitProxyRoutePlan::new(Duration::from_secs(3)).machine_from_now(now);
 
     assert_eq!(
-        runtime.attempt_at(now + Duration::from_millis(200)),
-        Some(TreePitProxyAttemptRuntime {
+        machine.entry_phase_at(now + Duration::from_millis(200)),
+        ProxyRouteMachinePhase::Attempt(TreePitProxyAttemptRuntime {
             attempt_timeout: Duration::from_millis(2800),
             collect_idle_grace: SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE,
             retry_backoff: SELECTED_GROUP_PROXY_ROUTE_RETRY_BACKOFF,
         }),
-        "generic-proxy route runtime should own attempt timeout, collect-idle-grace, and retry-backoff from the remaining route budget instead of recomputing them inline inside the helper loop",
+        "generic-proxy route machine should own attempt timeout, collect-idle-grace, and retry-backoff from the remaining route budget instead of recomputing them inline inside the helper loop",
     );
 
     assert_eq!(
-        runtime.attempt_at(now + Duration::from_millis(2970)),
-        Some(TreePitProxyAttemptRuntime {
+        machine.entry_phase_at(now + Duration::from_millis(2970)),
+        ProxyRouteMachinePhase::Attempt(TreePitProxyAttemptRuntime {
             attempt_timeout: Duration::from_millis(30),
             collect_idle_grace: Duration::from_millis(30),
             retry_backoff: Duration::from_millis(30),
         }),
-        "generic-proxy route runtime should cap collect-idle-grace and retry-backoff to the final remaining route budget",
+        "generic-proxy route machine should cap collect-idle-grace and retry-backoff to the final remaining route budget",
     );
 }
 
 #[test]
-fn tree_pit_proxy_route_runtime_owns_retry_wait_action() {
+fn tree_pit_proxy_route_machine_owns_retry_wait_action() {
     let now = tokio::time::Instant::now();
-    let runtime = TreePitProxyRoutePlan::new(Duration::from_millis(30)).runtime_from_now(now);
+    let machine = TreePitProxyRoutePlan::new(Duration::from_millis(30)).machine_from_now(now);
 
     assert_eq!(
-        runtime.retry_action_at(now),
-        TreePitProxyRouteAction::WaitUntil(now + Duration::from_millis(30)),
-        "generic-proxy runtime should hand product code a canonical wait-until retry action instead of leaving the helper loop to sleep on a bare backoff duration",
+        machine.followup_phase_at(now, &CnxError::Timeout),
+        ProxyRouteMachinePhase::WaitUntil(now + Duration::from_millis(30)),
+        "generic-proxy machine should hand product code a canonical wait-until retry action instead of leaving the helper loop to sleep on a bare backoff duration",
     );
 }
 
 #[test]
-fn tree_pit_proxy_route_runtime_owns_non_retryable_followup_lane() {
+fn tree_pit_proxy_route_machine_owns_non_retryable_followup_lane() {
     let now = tokio::time::Instant::now();
-    let runtime = TreePitProxyRoutePlan::new(Duration::from_millis(30)).runtime_from_now(now);
+    let machine = TreePitProxyRoutePlan::new(Duration::from_millis(30)).machine_from_now(now);
 
     assert_eq!(
-        runtime.followup_action_at(now, &CnxError::ProtocolViolation("bad payload".into())),
-        TreePitProxyRouteAction::ReturnCurrentError,
-        "generic-proxy runtime should own the non-retryable followup lane instead of leaving the helper loop to branch directly on the raw error",
+        machine.followup_phase_at(now, &CnxError::ProtocolViolation("bad payload".into())),
+        ProxyRouteMachinePhase::Failed(ProxyRouteMachineTerminal::CurrentError),
+        "generic-proxy machine should own the non-retryable followup lane instead of leaving the helper loop to branch directly on the raw error",
     );
 }
 
@@ -6155,12 +6129,12 @@ fn force_find_session_plan_caps_route_timing_to_caller_timeout() {
 #[test]
 fn force_find_route_runtime_owns_remaining_budget_and_retry_lane() {
     let now = tokio::time::Instant::now();
-    let runtime = ForceFindSessionPlan::new(Duration::from_secs(3))
+    let machine = ForceFindSessionPlan::new(Duration::from_secs(3))
         .route_plan()
-        .runtime_from_now(now);
+        .machine_from_now(now);
 
     assert_eq!(
-        runtime.attempt_at(now + Duration::from_millis(200)),
+        machine.attempt_at(now + Duration::from_millis(200)),
         Some(ForceFindRouteAttemptRuntime {
             route_plan: ForceFindRoutePlan {
                 route_timeout: Duration::from_millis(2800),
@@ -6173,7 +6147,7 @@ fn force_find_route_runtime_owns_remaining_budget_and_retry_lane() {
         "force-find route runtime should own remaining route budget instead of leaving the main loop to re-derive rebudgeted route timing inline",
     );
 
-    let final_attempt = runtime
+    let final_attempt = machine
         .attempt_at(now + Duration::from_millis(2970))
         .expect("final force-find attempt runtime");
     assert_eq!(
@@ -6199,12 +6173,12 @@ fn force_find_route_runtime_owns_remaining_budget_and_retry_lane() {
 #[test]
 fn force_find_route_runtime_owns_tree_followup_action_and_backoff() {
     let now = tokio::time::Instant::now();
-    let runtime = ForceFindSessionPlan::new(Duration::from_secs(3))
+    let machine = ForceFindSessionPlan::new(Duration::from_secs(3))
         .route_plan()
-        .runtime_from_now(now);
+        .machine_from_now(now);
 
     assert_eq!(
-        runtime.tree_followup_action_at(
+        machine.tree_followup_action_at(
             now,
             &CnxError::PeerError("selected_group matched no group".into()),
             true,
@@ -6221,11 +6195,11 @@ fn force_find_route_runtime_owns_tree_followup_action_and_backoff() {
         "force-find runtime should hand product code a canonical fallback action instead of making the helper loop re-derive the runner-gap route pivot from remaining budget plus raw error",
     );
 
-    let final_runtime = ForceFindSessionPlan::new(Duration::from_millis(30))
+    let final_machine = ForceFindSessionPlan::new(Duration::from_millis(30))
         .route_plan()
-        .runtime_from_now(now);
+        .machine_from_now(now);
     assert_eq!(
-        final_runtime.tree_followup_action_at(now, &CnxError::Timeout, false),
+        final_machine.tree_followup_action_at(now, &CnxError::Timeout, false),
         ForceFindTreeRouteAction::WaitUntil(now + Duration::from_millis(30)),
         "force-find runtime should own retry wait-until capping for the last route budget instead of leaving the helper loop to recompute sleep timing inline",
     );
@@ -6251,11 +6225,9 @@ fn force_find_route_plan_owns_inflight_hold_wait_action() {
 #[test]
 fn force_find_route_machine_replans_selected_runner_after_wait() {
     let now = tokio::time::Instant::now();
-    let machine = ForceFindRouteMachine::new(
-        ForceFindSessionPlan::new(Duration::from_secs(3))
-            .route_plan()
-            .runtime_from_now(now),
-    );
+    let machine = ForceFindSessionPlan::new(Duration::from_secs(3))
+        .route_plan()
+        .machine_from_now(now);
 
     assert_eq!(
         machine.followup_phase_at(now, &CnxError::Timeout, false),
@@ -6274,11 +6246,9 @@ fn force_find_route_machine_replans_selected_runner_after_wait() {
 #[test]
 fn force_find_route_machine_routes_selected_runner_gap_to_generic_fallback() {
     let now = tokio::time::Instant::now();
-    let machine = ForceFindRouteMachine::new(
-        ForceFindSessionPlan::new(Duration::from_secs(3))
-            .route_plan()
-            .runtime_from_now(now),
-    );
+    let machine = ForceFindSessionPlan::new(Duration::from_secs(3))
+        .route_plan()
+        .machine_from_now(now);
 
     assert_eq!(
         machine.followup_phase_at(
@@ -6302,12 +6272,12 @@ fn force_find_route_machine_routes_selected_runner_gap_to_generic_fallback() {
 #[test]
 fn force_find_route_runtime_owns_tree_entry_action() {
     let now = tokio::time::Instant::now();
-    let runtime = ForceFindSessionPlan::new(Duration::from_secs(3))
+    let machine = ForceFindSessionPlan::new(Duration::from_secs(3))
         .route_plan()
-        .runtime_from_now(now);
+        .machine_from_now(now);
 
     assert_eq!(
-        runtime.tree_entry_action_at(now, Some(NodeId("node-a".into()))),
+        machine.tree_entry_action_at(now, Some(NodeId("node-a".into()))),
         ForceFindTreeRouteAction::QueryViaSelectedRunner {
             node_id: NodeId("node-a".into()),
             route_plan: ForceFindRoutePlan {
@@ -6320,7 +6290,7 @@ fn force_find_route_runtime_owns_tree_entry_action() {
         "force-find runtime should own the selected-runner route entry plan instead of leaving the helper loop to re-derive route timeout from remaining budget inline",
     );
     assert_eq!(
-        runtime.tree_entry_action_at(now, None),
+        machine.tree_entry_action_at(now, None),
         ForceFindTreeRouteAction::QueryGenericFallback {
             route_plan: ForceFindRoutePlan {
                 route_timeout: Duration::from_secs(3),
@@ -6868,7 +6838,7 @@ async fn proxy_selected_group_empty_tree_rescue(
         boundary.clone(),
         origin_id.clone(),
         params.clone(),
-        proxy_route_plan.runtime(),
+        proxy_route_plan.machine(),
     )
     .await?;
     if !selected_group_events_require_proxy_fallback(
@@ -7046,7 +7016,7 @@ async fn query_materialized_events_via_generic_proxy(
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
     params: InternalQueryRequest,
-    runtime: TreePitProxyRouteRuntime,
+    machine: ProxyRouteMachine,
 ) -> Result<Vec<Event>, CnxError> {
     if debug_materialized_route_capture_enabled() {
         eprintln!(
@@ -7054,7 +7024,7 @@ async fn query_materialized_events_via_generic_proxy(
             params.scope.selected_group,
             params.scope.recursive,
             String::from_utf8_lossy(&params.scope.path),
-            runtime.route_timeout().as_millis()
+            machine.route_timeout().as_millis()
         );
     }
     let payload = rmp_serde::to_vec(&params)
@@ -7063,7 +7033,7 @@ async fn query_materialized_events_via_generic_proxy(
         boundary,
         origin_id,
         Bytes::from(payload),
-        runtime,
+        machine,
     )
     .await;
     if debug_materialized_route_capture_enabled() {
@@ -7091,63 +7061,57 @@ async fn execute_tree_pit_proxy_route_collect(
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
     payload: Bytes,
-    runtime: TreePitProxyRouteRuntime,
+    machine: ProxyRouteMachine,
 ) -> Result<Vec<Event>, CnxError> {
-    execute_runtime_collect_loop(
-        runtime.entry_action(),
-        |_last_err| async move { Ok(runtime.entry_action()) },
-        |action, last_err| {
-            let boundary = boundary.clone();
-            let origin_id = origin_id.clone();
-            let payload = payload.clone();
-            async move {
-                match action {
-                    TreePitProxyRouteAction::ReturnTimeout
-                    | TreePitProxyRouteAction::ReturnCurrentError => {
-                        Ok(RuntimeCollectLoopStep::Return(Err(take_last_route_error_or(
-                            last_err,
-                            || CnxError::Timeout,
-                        ))))
-                    }
-                    TreePitProxyRouteAction::WaitUntil(until) => {
-                        Ok(RuntimeCollectLoopStep::WaitUntil { until, last_err })
-                    }
-                    TreePitProxyRouteAction::QueryAttempt(attempt_runtime) => {
-                        let adapter = exchange_host_adapter(
-                            boundary,
-                            origin_id,
-                            default_route_bindings(),
+    let mut phase = machine.entry_phase();
+    let mut last_err = None::<CnxError>;
+    loop {
+        match phase {
+            ProxyRouteMachinePhase::Attempt(attempt_runtime) => {
+                let adapter =
+                    exchange_host_adapter(boundary.clone(), origin_id.clone(), default_route_bindings());
+                match adapter
+                    .call_collect(
+                        ROUTE_TOKEN_FS_META_INTERNAL,
+                        METHOD_SINK_QUERY_PROXY,
+                        payload.clone(),
+                        attempt_runtime.attempt_timeout,
+                        attempt_runtime.collect_idle_grace,
+                    )
+                    .await
+                {
+                    Ok(events) => return Ok(events),
+                    Err(err) => {
+                        last_err = Some(err);
+                        phase = machine.followup_phase_at(
+                            tokio::time::Instant::now(),
+                            last_err
+                                .as_ref()
+                                .expect("generic-proxy followup owns current error"),
                         );
-                        match adapter
-                            .call_collect(
-                                ROUTE_TOKEN_FS_META_INTERNAL,
-                                METHOD_SINK_QUERY_PROXY,
-                                payload,
-                                attempt_runtime.attempt_timeout,
-                                attempt_runtime.collect_idle_grace,
-                            )
-                            .await
-                        {
-                            Ok(events) => Ok(RuntimeCollectLoopStep::Return(Ok(events))),
-                            Err(err) => {
-                                let last_err = Some(err);
-                                Ok(RuntimeCollectLoopStep::Continue {
-                                    next_action: runtime.followup_action_at(
-                                        tokio::time::Instant::now(),
-                                        last_err
-                                            .as_ref()
-                                            .expect("generic-proxy followup owns current error"),
-                                    ),
-                                    last_err,
-                                })
-                            }
-                        }
                     }
                 }
             }
-        },
-    )
-    .await
+            ProxyRouteMachinePhase::WaitUntil(until) => {
+                tokio::time::sleep_until(until).await;
+                phase = machine.entry_phase();
+            }
+            ProxyRouteMachinePhase::Failed(terminal) => {
+                return Err(match terminal {
+                    ProxyRouteMachineTerminal::Timeout => {
+                        take_last_route_error_or(last_err, || CnxError::Timeout)
+                    }
+                    ProxyRouteMachineTerminal::CurrentError => {
+                        take_last_route_error_or(last_err, || {
+                            CnxError::Internal(
+                                "proxy route machine escaped its source error context".into(),
+                            )
+                        })
+                    }
+                });
+            }
+        }
+    }
 }
 
 fn is_retryable_materialized_proxy_continuity_gap(err: &CnxError) -> bool {
@@ -7481,7 +7445,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                             boundary.clone(),
                             origin_id.clone(),
                             params.clone(),
-                            proxy_timeout.runtime(),
+                            proxy_timeout.machine(),
                         )
                         .await
                         {
@@ -7575,7 +7539,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                     boundary.clone(),
                     origin_id.clone(),
                     params,
-                    proxy_route_plan.runtime(),
+                    proxy_route_plan.machine(),
                 )
                 .await;
             }
@@ -8292,7 +8256,7 @@ async fn execute_force_find_group_stats_route_collect(
         boundary,
         source,
         request,
-        route_plan.runtime(),
+        route_plan.machine(),
         group_id,
         ForceFindRouteCollectKind::Stats { recursive },
     )
@@ -8326,7 +8290,7 @@ async fn query_force_find_group_tree_on_route(
         boundary,
         source,
         request,
-        route_plan.runtime(),
+        route_plan.machine(),
         group_id,
         ForceFindRouteCollectKind::Tree {
             recursive,
@@ -8398,11 +8362,10 @@ async fn execute_force_find_group_route_collect(
     boundary: Arc<dyn ChannelIoSubset>,
     source: &SourceFacade,
     request: InternalQueryRequest,
-    runtime: ForceFindRouteRuntime,
+    machine: ForceFindRouteMachine,
     group_id: &str,
     kind: ForceFindRouteCollectKind,
 ) -> Result<Vec<Event>, CnxError> {
-    let machine = ForceFindRouteMachine::new(runtime);
     let mut phase = machine.entry_phase();
     let mut last_err = None::<CnxError>;
     loop {
@@ -8796,14 +8759,11 @@ async fn execute_force_find_ranked_groups(
     input: ForceFindRankedGroupExecutionInput<'_>,
     rankings: Vec<GroupRank>,
 ) -> Result<Vec<GroupPitSnapshot>, CnxError> {
-    let rankings_len = rankings.len();
-    Ok(execute_ranked_group_loop!(
-        Vec::with_capacity(rankings_len),
-        rankings,
-        |groups, rank| {
-            groups.push(execute_force_find_ranked_group(&input, rank).await?);
-        }
-    ))
+    let mut groups = Vec::with_capacity(rankings.len());
+    for rank in rankings {
+        groups.push(execute_force_find_ranked_group(&input, rank).await?);
+    }
+    Ok(groups)
 }
 
 fn decode_materialized_selected_group_response(
@@ -9365,7 +9325,7 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
     request_sink_status: Option<&SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
 ) -> Result<PitSession, CnxError> {
-    prepare_tree_pit_ranked_session(
+    prepare_tree_pit_session_machine(
         state,
         policy,
         params,
@@ -9375,23 +9335,38 @@ async fn build_tree_pit_session_with_request_scoped_schedule_omitted_ready_group
         request_scoped_schedule_omitted_ready_groups,
     )
     .await?
-    .execute()
+    .run()
     .await
 }
 
-struct PreparedTreePitRankedSession<'a> {
+struct TreePitSessionMachine<'a> {
     input: TreePitRankedGroupExecutionInput<'a>,
     rankings: Vec<GroupRank>,
     observation_status: ObservationStatus,
 }
 
-impl PreparedTreePitRankedSession<'_> {
-    async fn execute(self) -> Result<PitSession, CnxError> {
-        execute_tree_pit_ranked_session(self.input, self.rankings, self.observation_status).await
+impl TreePitSessionMachine<'_> {
+    async fn run(self) -> Result<PitSession, CnxError> {
+        let read_class = self.input.read_class;
+        let scope = TreePitScope {
+            path: self.input.params.path.clone(),
+            group: self.input.params.group.clone(),
+            recursive: self.input.params.recursive,
+            max_depth: self.input.params.max_depth,
+            group_order: self.input.params.group_order,
+            read_class,
+        };
+        Ok(build_pit_session(
+            CursorQueryMode::Tree,
+            PitScope::Tree(scope),
+            read_class,
+            self.observation_status,
+            execute_tree_pit_ranked_groups(self.input, self.rankings).await?,
+        ))
     }
 }
 
-async fn prepare_tree_pit_ranked_session<'a>(
+async fn prepare_tree_pit_session_machine<'a>(
     state: &'a ApiState,
     policy: &'a ProjectionPolicy,
     params: &'a NormalizedApiParams,
@@ -9399,7 +9374,7 @@ async fn prepare_tree_pit_ranked_session<'a>(
     observation_status: ObservationStatus,
     request_sink_status: Option<&'a SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<&'a BTreeSet<String>>,
-) -> Result<PreparedTreePitRankedSession<'a>, CnxError> {
+) -> Result<TreePitSessionMachine<'a>, CnxError> {
     let ranking_started_at = tokio::time::Instant::now();
     let target_groups = materialized_target_groups(
         state,
@@ -9429,7 +9404,7 @@ async fn prepare_tree_pit_ranked_session<'a>(
     let total_ranked_groups = rankings.len();
     let session_plan = TreePitSessionPlan::new(timeout, total_ranked_groups);
     let session_runtime = session_plan.runtime(ranking_started_at, ranking_retryable_failure);
-    Ok(PreparedTreePitRankedSession {
+    Ok(TreePitSessionMachine {
         input: TreePitRankedGroupExecutionInput {
             state,
             policy,
@@ -9447,47 +9422,48 @@ async fn prepare_tree_pit_ranked_session<'a>(
     })
 }
 
-async fn execute_tree_pit_ranked_session(
-    input: TreePitRankedGroupExecutionInput<'_>,
-    rankings: Vec<GroupRank>,
-    observation_status: ObservationStatus,
-) -> Result<PitSession, CnxError> {
-    Ok(
-        execute_tree_pit_ranked_session_parts(input, rankings, observation_status)
-            .await?
-            .into_session(),
-    )
-}
-
 async fn build_force_find_pit_session(
     state: &ApiState,
     policy: &ProjectionPolicy,
     params: &NormalizedApiParams,
     timeout: Duration,
 ) -> Result<PitSession, CnxError> {
-    prepare_force_find_ranked_session(state, policy, params, timeout)
+    prepare_force_find_pit_session_machine(state, policy, params, timeout)
         .await?
-        .execute()
+        .run()
         .await
 }
 
-struct PreparedForceFindRankedSession<'a> {
+struct ForceFindPitSessionMachine<'a> {
     input: ForceFindRankedGroupExecutionInput<'a>,
     rankings: Vec<GroupRank>,
 }
 
-impl PreparedForceFindRankedSession<'_> {
-    async fn execute(self) -> Result<PitSession, CnxError> {
-        execute_force_find_ranked_session(self.input, self.rankings).await
+impl ForceFindPitSessionMachine<'_> {
+    async fn run(self) -> Result<PitSession, CnxError> {
+        let scope = ForceFindPitScope {
+            path: self.input.params.path.clone(),
+            group: self.input.params.group.clone(),
+            recursive: self.input.params.recursive,
+            max_depth: self.input.params.max_depth,
+            group_order: self.input.params.group_order,
+        };
+        Ok(build_pit_session(
+            CursorQueryMode::ForceFind,
+            PitScope::ForceFind(scope),
+            ReadClass::Fresh,
+            ObservationStatus::fresh_only(),
+            execute_force_find_ranked_groups(self.input, self.rankings).await?,
+        ))
     }
 }
 
-async fn prepare_force_find_ranked_session<'a>(
+async fn prepare_force_find_pit_session_machine<'a>(
     state: &'a ApiState,
     policy: &'a ProjectionPolicy,
     params: &'a NormalizedApiParams,
     timeout: Duration,
-) -> Result<PreparedForceFindRankedSession<'a>, CnxError> {
+) -> Result<ForceFindPitSessionMachine<'a>, CnxError> {
     let target_groups = resolve_force_find_groups(state, params).await?;
     let rankings = if params.group_order == GroupOrder::GroupKey {
         let mut ordered = target_groups.clone();
@@ -9516,7 +9492,7 @@ async fn prepare_force_find_ranked_session<'a>(
         .await?
         .0
     };
-    Ok(PreparedForceFindRankedSession {
+    Ok(ForceFindPitSessionMachine {
         input: ForceFindRankedGroupExecutionInput {
             state,
             policy,
@@ -9525,76 +9501,6 @@ async fn prepare_force_find_ranked_session<'a>(
         },
         rankings,
     })
-}
-
-async fn execute_force_find_ranked_session(
-    input: ForceFindRankedGroupExecutionInput<'_>,
-    rankings: Vec<GroupRank>,
-) -> Result<PitSession, CnxError> {
-    Ok(
-        execute_force_find_ranked_session_parts(input, rankings)
-            .await?
-            .into_session(),
-    )
-}
-
-async fn execute_tree_pit_ranked_session_parts(
-    input: TreePitRankedGroupExecutionInput<'_>,
-    rankings: Vec<GroupRank>,
-    observation_status: ObservationStatus,
-) -> Result<PitSessionParts, CnxError> {
-    let read_class = input.read_class;
-    let scope = TreePitScope {
-        path: input.params.path.clone(),
-        group: input.params.group.clone(),
-        recursive: input.params.recursive,
-        max_depth: input.params.max_depth,
-        group_order: input.params.group_order,
-        read_class,
-    };
-    Ok(build_pit_session_parts(
-        CursorQueryMode::Tree,
-        PitScope::Tree(scope),
-        read_class,
-        observation_status,
-        execute_tree_pit_ranked_groups(input, rankings).await?,
-    ))
-}
-
-async fn execute_force_find_ranked_session_parts(
-    input: ForceFindRankedGroupExecutionInput<'_>,
-    rankings: Vec<GroupRank>,
-) -> Result<PitSessionParts, CnxError> {
-    let scope = ForceFindPitScope {
-        path: input.params.path.clone(),
-        group: input.params.group.clone(),
-        recursive: input.params.recursive,
-        max_depth: input.params.max_depth,
-        group_order: input.params.group_order,
-    };
-    Ok(build_pit_session_parts(
-        CursorQueryMode::ForceFind,
-        PitScope::ForceFind(scope),
-        ReadClass::Fresh,
-        ObservationStatus::fresh_only(),
-        execute_force_find_ranked_groups(input, rankings).await?,
-    ))
-}
-
-fn build_pit_session_parts(
-    mode: CursorQueryMode,
-    scope: PitScope,
-    read_class: ReadClass,
-    observation_status: ObservationStatus,
-    groups: Vec<GroupPitSnapshot>,
-) -> PitSessionParts {
-    PitSessionParts {
-        mode,
-        scope,
-        read_class,
-        observation_status,
-        groups,
-    }
 }
 
 struct TreePitRankedGroupsState {
@@ -9638,53 +9544,6 @@ impl TreePitRankedGroupsState {
             });
         }
         self.groups
-    }
-}
-
-enum RuntimeCollectLoopStep<TAction, TOutput> {
-    Continue {
-        next_action: TAction,
-        last_err: Option<CnxError>,
-    },
-    WaitUntil {
-        until: tokio::time::Instant,
-        last_err: Option<CnxError>,
-    },
-    Return(Result<TOutput, CnxError>),
-}
-
-async fn execute_runtime_collect_loop<TAction, TOutput, TStep, TStepFut, TAfterWait, TAfterWaitFut>(
-    initial_action: TAction,
-    mut action_after_wait: TAfterWait,
-    mut step: TStep,
-) -> Result<TOutput, CnxError>
-where
-    TStep: FnMut(TAction, Option<CnxError>) -> TStepFut,
-    TStepFut: std::future::Future<Output = Result<RuntimeCollectLoopStep<TAction, TOutput>, CnxError>>,
-    TAfterWait: FnMut(Option<&CnxError>) -> TAfterWaitFut,
-    TAfterWaitFut: std::future::Future<Output = Result<TAction, CnxError>>,
-{
-    let mut action = initial_action;
-    let mut last_err = None::<CnxError>;
-    loop {
-        match step(action, last_err).await? {
-            RuntimeCollectLoopStep::Continue {
-                next_action,
-                last_err: next_last_err,
-            } => {
-                action = next_action;
-                last_err = next_last_err;
-            }
-            RuntimeCollectLoopStep::WaitUntil {
-                until,
-                last_err: next_last_err,
-            } => {
-                last_err = next_last_err;
-                tokio::time::sleep_until(until).await;
-                action = action_after_wait(last_err.as_ref()).await?;
-            }
-            RuntimeCollectLoopStep::Return(result) => return result,
-        }
     }
 }
 
@@ -10220,7 +10079,7 @@ async fn execute_selected_group_stats_rescue(
                 boundary.clone(),
                 origin_id.clone(),
                 materialized_request.clone(),
-                proxy_timeout.runtime(),
+                proxy_timeout.machine(),
             )
             .await
             {

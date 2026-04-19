@@ -36,6 +36,9 @@ use super::errors::ApiError;
 use super::facade_status::{
     PublishedFacadeStatusReader, SharedFacadePendingStatusCell, SharedFacadeServiceStateCell,
 };
+use super::rollout_status::{
+    PublishedRolloutStatusReader, SharedRolloutStatusCell, shared_rollout_status_cell,
+};
 use super::handlers;
 use super::state::{ApiControlGate, ApiRequestGuard, ApiRequestTracker, ApiState};
 
@@ -106,6 +109,37 @@ pub async fn spawn(
     request_tracker: Arc<ApiRequestTracker>,
     control_gate: Arc<ApiControlGate>,
 ) -> Result<ApiServerHandle> {
+    spawn_with_rollout_status(
+        cfg,
+        node_id,
+        runtime_boundary,
+        source,
+        sink,
+        query_sink,
+        query_runtime_boundary,
+        facade_pending,
+        facade_service_state,
+        shared_rollout_status_cell(),
+        request_tracker,
+        control_gate,
+    )
+    .await
+}
+
+pub(crate) async fn spawn_with_rollout_status(
+    cfg: ResolvedApiConfig,
+    node_id: NodeId,
+    runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
+    source: Arc<SourceFacade>,
+    sink: Arc<SinkFacade>,
+    query_sink: Arc<SinkFacade>,
+    query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
+    facade_pending: SharedFacadePendingStatusCell,
+    facade_service_state: SharedFacadeServiceStateCell,
+    rollout_status: SharedRolloutStatusCell,
+    request_tracker: Arc<ApiRequestTracker>,
+    control_gate: Arc<ApiControlGate>,
+) -> Result<ApiServerHandle> {
     eprintln!(
         "fs_meta_api_server: spawn begin bind_addr={}",
         cfg.bind_addr
@@ -147,6 +181,7 @@ pub async fn spawn(
             facade_service_state,
             facade_pending,
         ),
+        published_rollout_status: PublishedRolloutStatusReader::new(rollout_status),
         request_tracker,
     };
     refresh_policy_from_host_object_grants(
@@ -483,6 +518,9 @@ mod tests {
     use crate::api::facade_status::{
         shared_facade_pending_status_cell, shared_facade_service_state_cell,
     };
+    use crate::api::rollout_status::{
+        PublishedRolloutStatusReader, shared_rollout_status_cell,
+    };
     use crate::domain_state::FacadeServiceState;
     use crate::query::api::ProjectionPolicy;
     use crate::sink::SinkFileMeta;
@@ -548,6 +586,9 @@ mod tests {
             published_facade_status: PublishedFacadeStatusReader::new(
                 facade_service_state,
                 shared_facade_pending_status_cell(),
+            ),
+            published_rollout_status: PublishedRolloutStatusReader::new(
+                shared_rollout_status_cell(),
             ),
             request_tracker,
         }

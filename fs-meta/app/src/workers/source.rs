@@ -953,8 +953,14 @@ fn prime_cached_schedule_from_control_signals_for_replay_recovery(
     cache: &mut SourceWorkerSnapshotCache,
     node_id: &NodeId,
     signals: &[SourceControlSignal],
+    fallback_roots: &[RootSpec],
     fallback_grants: &[GrantedMountRoot],
 ) {
+    let roots = cache
+        .logical_roots
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| fallback_roots.to_vec());
     let grants = cache
         .grants
         .as_ref()
@@ -978,7 +984,14 @@ fn prime_cached_schedule_from_control_signals_for_replay_recovery(
             continue;
         };
         for scope in bound_scopes {
-            if !bound_scope_matches_local_grant(scope, node_id, &grants) {
+            let applies_locally = roots
+                .iter()
+                .filter(|root| match unit {
+                    SourceRuntimeUnit::Source => root.watch,
+                    SourceRuntimeUnit::Scan => root.scan,
+                })
+                .any(|root| bound_scope_applies_locally(scope, root, node_id, &grants));
+            if !applies_locally {
                 continue;
             }
             match unit {
@@ -1019,6 +1032,102 @@ fn prime_cached_schedule_from_control_signals_for_replay_recovery(
     replace_groups(
         &mut cache.replay_recovery_scheduled_scan_groups_by_node,
         desired_scan,
+    );
+}
+
+#[test]
+fn replay_recovery_schedule_priming_respects_scan_only_roots() {
+    let mut cache = SourceWorkerSnapshotCache::default();
+    let node_id = NodeId("node-a".to_string());
+    let root = {
+        let mut root = RootSpec::new("nfs1", "/tmp");
+        root.watch = false;
+        root.scan = true;
+        root
+    };
+    let bound_scopes = vec![RuntimeBoundScope {
+        scope_id: "nfs1".to_string(),
+        resource_ids: vec!["node-a::nfs1".to_string()],
+    }];
+    let signals = [
+        SourceControlSignal::Activate {
+            unit: SourceRuntimeUnit::Source,
+            route_key: "source-roots-control:v1.stream".to_string(),
+            generation: 2,
+            bound_scopes: bound_scopes.clone(),
+            envelope: capanix_runtime_entry_sdk::control::encode_runtime_exec_control(
+                &capanix_runtime_entry_sdk::control::RuntimeExecControl::Activate(
+                    capanix_runtime_entry_sdk::control::RuntimeExecActivate {
+                        route_key: "source-roots-control:v1.stream".to_string(),
+                        unit_id: SourceRuntimeUnit::Source.unit_id().to_string(),
+                        lease: None,
+                        generation: 2,
+                        expires_at_ms: 1,
+                        bound_scopes: bound_scopes.clone(),
+                    },
+                ),
+            )
+            .expect("encode source activate"),
+        },
+        SourceControlSignal::Activate {
+            unit: SourceRuntimeUnit::Scan,
+            route_key: "source-rescan-control:v1.stream".to_string(),
+            generation: 2,
+            bound_scopes: bound_scopes.clone(),
+            envelope: capanix_runtime_entry_sdk::control::encode_runtime_exec_control(
+                &capanix_runtime_entry_sdk::control::RuntimeExecControl::Activate(
+                    capanix_runtime_entry_sdk::control::RuntimeExecActivate {
+                        route_key: "source-rescan-control:v1.stream".to_string(),
+                        unit_id: SourceRuntimeUnit::Scan.unit_id().to_string(),
+                        lease: None,
+                        generation: 2,
+                        expires_at_ms: 1,
+                        bound_scopes,
+                    },
+                ),
+            )
+            .expect("encode scan activate"),
+        },
+    ];
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-a::nfs1".to_string(),
+        host_ref: "node-a".to_string(),
+        host_ip: "10.0.0.11".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: Default::default(),
+        mount_point: "/tmp".into(),
+        fs_source: "/tmp".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+
+    prime_cached_schedule_from_control_signals_for_replay_recovery(
+        &mut cache,
+        &node_id,
+        &signals,
+        &[root],
+        &grants,
+    );
+
+    assert!(
+        cache
+            .replay_recovery_scheduled_source_groups_by_node
+            .as_ref()
+            .is_none_or(|groups| groups.is_empty()),
+        "scan-only roots must not prime replay-recovery source groups: {:?}",
+        cache.replay_recovery_scheduled_source_groups_by_node
+    );
+    assert_eq!(
+        cache
+            .replay_recovery_scheduled_scan_groups_by_node
+            .as_ref()
+            .and_then(|groups| groups.get("node-a")),
+        Some(&vec!["nfs1".to_string()]),
+        "scan-only roots must still prime replay-recovery scan groups",
     );
 }
 
@@ -4509,6 +4618,7 @@ impl SourceWorkerClientHandle {
                                 cache,
                                 &self.node_id,
                                 signals,
+                                &self.config.roots,
                                 &self.config.host_object_grants,
                             );
                             primed_local_schedule

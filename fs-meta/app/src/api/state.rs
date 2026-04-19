@@ -9,6 +9,7 @@ use capanix_app_sdk::runtime::NodeId;
 use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
 
 use super::facade_status::PublishedFacadeStatusReader;
+use super::rollout_status::PublishedRolloutStatusReader;
 use crate::query::api::ProjectionPolicy;
 use crate::workers::sink::SinkFacade;
 use crate::workers::source::SourceFacade;
@@ -121,5 +122,6 @@ pub struct ApiState {
     pub auth: Arc<AuthService>,
     pub projection_policy: Arc<RwLock<ProjectionPolicy>>,
     pub published_facade_status: PublishedFacadeStatusReader,
+    pub published_rollout_status: PublishedRolloutStatusReader,
     pub request_tracker: Arc<ApiRequestTracker>,
 }

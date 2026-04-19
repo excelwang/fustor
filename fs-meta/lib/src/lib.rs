@@ -2,6 +2,7 @@ use capanix_app_sdk::runtime::ConfigValue;
 use capanix_app_sdk::{CnxError, Result};
 
 pub mod api;
+pub mod domain_state;
 pub mod product_model;
 pub mod query;
 pub mod shared_types;

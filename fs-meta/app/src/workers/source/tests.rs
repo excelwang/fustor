@@ -601,24 +601,24 @@ fn replay_recovery_cached_schedule_primes_desired_local_groups_from_grants() {
         &mut cache,
         &NodeId("node-a".to_string()),
         &signals,
+        &roots,
         &grants,
     );
 
-    assert_eq!(
-        cache.replay_recovery_scheduled_source_groups_by_node,
-        Some(std::collections::BTreeMap::from([(
-            "node-a".to_string(),
-            vec!["nfs1".to_string(), "nfs2".to_string()],
-        )])),
-        "replay-recovery bridge should preserve desired source groups from local grants"
+    assert!(
+        cache
+            .replay_recovery_scheduled_source_groups_by_node
+            .as_ref()
+            .is_none_or(|groups| groups.is_empty()),
+        "replay-recovery bridge must keep watch-disabled roots out of source groups"
     );
     assert_eq!(
         cache.replay_recovery_scheduled_scan_groups_by_node,
         Some(std::collections::BTreeMap::from([(
             "node-a".to_string(),
-            vec!["nfs1".to_string(), "nfs2".to_string()],
+            vec!["nfs1".to_string()],
         )])),
-        "replay-recovery bridge should preserve desired scan groups from local grants"
+        "replay-recovery bridge should only prime scan groups backed by known logical roots"
     );
 }
 
@@ -678,11 +678,13 @@ fn prime_cached_schedule_from_control_signals_for_replay_recovery_replaces_prior
         ])),
         ..SourceWorkerSnapshotCache::default()
     };
+    let fallback_roots = cache.logical_roots.clone().unwrap_or_default();
 
     prime_cached_schedule_from_control_signals_for_replay_recovery(
         &mut cache,
         &NodeId("node-a".to_string()),
         &signals,
+        &fallback_roots,
         &grants,
     );
 

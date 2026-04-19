@@ -4356,7 +4356,7 @@ async fn query_materialized_events_via_generic_proxy_retries_missing_channel_buf
             ReadClass::TrustedMaterialized,
             Some("nfs4".to_string()),
         ),
-        TreePitProxyRoutePlan::new(Duration::from_millis(1200)).runtime(),
+        TreePitProxyRoutePlan::new(Duration::from_millis(1200)).machine(),
     )
     .await;
 
@@ -4427,7 +4427,7 @@ async fn query_materialized_events_via_generic_proxy_accepts_immediate_reply_wit
             ReadClass::TrustedMaterialized,
             Some("nfs4".to_string()),
         ),
-        TreePitProxyRoutePlan::new(TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET).runtime(),
+        TreePitProxyRoutePlan::new(TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET).machine(),
     )
     .await;
 
@@ -4602,7 +4602,7 @@ async fn query_materialized_events_via_generic_proxy_does_not_retry_protocol_vio
             ReadClass::TrustedMaterialized,
             Some("nfs4".to_string()),
         ),
-        TreePitProxyRoutePlan::new(Duration::from_millis(450)).runtime(),
+        TreePitProxyRoutePlan::new(Duration::from_millis(450)).machine(),
     )
     .await;
 
@@ -4669,7 +4669,7 @@ async fn query_materialized_events_via_generic_proxy_does_not_hold_delayed_reply
                 ReadClass::TrustedMaterialized,
                 Some("nfs4".to_string()),
             ),
-            TreePitProxyRoutePlan::new(Duration::from_millis(1150)).runtime(),
+            TreePitProxyRoutePlan::new(Duration::from_millis(1150)).machine(),
         ),
     )
     .await;

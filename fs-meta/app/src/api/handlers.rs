@@ -22,7 +22,7 @@ use capanix_runtime_entry_sdk::advanced::boundary::{
 #[cfg(test)]
 use tokio::sync::Notify;
 
-use crate::domain_state::FacadeServiceState;
+use crate::domain_state::{FacadeServiceState, GroupServiceState, NodeParticipationState};
 use crate::query::api::{
     internal_status_request_payload, merge_sink_status_snapshots,
     refresh_policy_from_host_object_grants, route_sink_status_snapshot,
@@ -59,8 +59,8 @@ use super::types::{
     QueryApiKeysResponse, RescanResponse, RevokeQueryApiKeyResponse, RootEntry, RootPreviewItem,
     RootSelectorEntry, RootUpdateEntry, RootsPreviewResponse, RootsResponse, RootsUpdateRequest,
     RootsUpdateResponse, RuntimeGrantsResponse, StatusFacade, StatusFacadePending, StatusResponse,
-    StatusSink, StatusSinkDebug, StatusSinkGroup, StatusSinkGroupReadiness, StatusSource,
-    StatusSourceConcreteRoot, StatusSourceLogicalRoot,
+    StatusRollout, StatusSink, StatusSinkDebug, StatusSinkGroup, StatusSinkGroupReadiness,
+    StatusSource, StatusSourceConcreteRoot, StatusSourceLogicalRoot,
 };
 
 fn debug_status_route_fanin_enabled() -> bool {
@@ -589,6 +589,7 @@ pub async fn status(
         ),
     );
     let published_facade_status = state.published_facade_status.snapshot();
+    let published_rollout_status = state.published_rollout_status.snapshot();
     let published_facade_state = published_facade_status.state;
     let live_source_nodes = active_source_node_count(&source);
     let gate_inflight = state
@@ -655,8 +656,11 @@ pub async fn status(
             groups: sink_status
                 .groups
                 .into_iter()
-                .map(|group| StatusSinkGroup {
+                .map(|group| {
+                    let service_state = sink_group_service_state(&group);
+                    StatusSinkGroup {
                     group_id: group.group_id,
+                    service_state,
                     primary_object_ref: group.primary_object_ref,
                     total_nodes: group.total_nodes,
                     live_nodes: group.live_nodes,
@@ -678,6 +682,7 @@ pub async fn status(
                     },
 
                     estimated_heap_bytes: group.estimated_heap_bytes,
+                }
                 })
                 .collect(),
             debug: StatusSinkDebug {
@@ -692,6 +697,7 @@ pub async fn status(
                 received_origin_counts_by_node: sink_status.received_origin_counts_by_node,
             },
         },
+        rollout: status_rollout_from_published_state(published_rollout_status),
         facade: status_facade_from_published_state(published_facade_status),
     }))
 }
@@ -709,6 +715,63 @@ fn active_source_node_count(source: &SourceObservabilitySnapshot) -> u64 {
 fn status_sink_live_nodes(live_source_nodes: u64, sink_status: &SinkStatusSnapshot) -> u64 {
     let _ = live_source_nodes;
     sink_status.live_nodes
+}
+
+fn source_logical_root_service_state(
+    status: &str,
+    matched_grants: usize,
+    active_members: usize,
+) -> GroupServiceState {
+    match status.split_once(':').map(|(head, _)| head).unwrap_or(status) {
+        "ready" => GroupServiceState::ServingTrusted,
+        "retiring" => GroupServiceState::Retiring,
+        "retired" => GroupServiceState::Retired,
+        "no_visible_export_match" if matched_grants == 0 || active_members == 0 => {
+            GroupServiceState::NotSelected
+        }
+        _ if matched_grants == 0 || active_members == 0 => GroupServiceState::SelectedPending,
+        _ if status.contains("degraded")
+            || status.contains("error")
+            || status.contains("failed")
+            || status.contains("overflow") =>
+        {
+            GroupServiceState::ServingDegraded
+        }
+        _ => GroupServiceState::SelectedPending,
+    }
+}
+
+fn source_root_participation_state(status: &str) -> NodeParticipationState {
+    match status.split_once(':').map(|(head, _)| head).unwrap_or(status) {
+        "running" => NodeParticipationState::Serving,
+        "planned" | "starting" | "warming" => NodeParticipationState::Joining,
+        "retiring" | "stopped" | "draining" => NodeParticipationState::Retiring,
+        "retired" => NodeParticipationState::Retired,
+        "absent" => NodeParticipationState::Absent,
+        _ if status.contains("degraded")
+            || status.contains("error")
+            || status.contains("failed")
+            || status.contains("unreachable") =>
+        {
+            NodeParticipationState::Degraded
+        }
+        _ => NodeParticipationState::Joining,
+    }
+}
+
+fn sink_group_service_state(group: &crate::sink::SinkGroupStatusSnapshot) -> GroupServiceState {
+    let readiness = group.normalized_readiness();
+    if matches!(readiness, crate::sink::GroupReadinessState::Ready) {
+        if group.overflow_pending_materialization || group.blind_spot_count > 0 || group.suspect_count > 0 {
+            GroupServiceState::ServingDegraded
+        } else {
+            GroupServiceState::ServingTrusted
+        }
+    } else if group.total_nodes > 0 || group.live_nodes > 0 {
+        GroupServiceState::ServingDegraded
+    } else {
+        GroupServiceState::SelectedPending
+    }
 }
 
 fn snapshot_scoped_active_facade_candidate_groups(
@@ -1630,7 +1693,11 @@ fn status_source_from_observability(
             .into_iter()
             .map(|entry| StatusSourceLogicalRoot {
                 root_id: entry.root_id,
-                status: entry.status,
+                service_state: source_logical_root_service_state(
+                    &entry.status,
+                    entry.matched_grants,
+                    entry.active_members,
+                ),
                 matched_grants: entry.matched_grants,
                 active_members: entry.active_members,
                 coverage_mode: entry.coverage_mode,
@@ -1642,7 +1709,7 @@ fn status_source_from_observability(
                 root_key: entry.root_key,
                 logical_root_id: entry.logical_root_id,
                 object_ref: entry.object_ref,
-                status: entry.status,
+                participation_state: source_root_participation_state(&entry.status),
                 coverage_mode: entry.coverage_mode,
                 watch_enabled: entry.watch_enabled,
                 scan_enabled: entry.scan_enabled,
@@ -1675,10 +1742,16 @@ fn status_source_from_observability(
                 current_stream_generation: entry.current_stream_generation,
                 candidate_revision: entry.candidate_revision,
                 candidate_stream_generation: entry.candidate_stream_generation,
-                candidate_status: entry.candidate_status,
+                candidate_participation_state: entry
+                    .candidate_status
+                    .as_deref()
+                    .map(source_root_participation_state),
                 draining_revision: entry.draining_revision,
                 draining_stream_generation: entry.draining_stream_generation,
-                draining_status: entry.draining_status,
+                draining_participation_state: entry
+                    .draining_status
+                    .as_deref()
+                    .map(source_root_participation_state),
             })
             .collect(),
         debug: super::types::StatusSourceDebug {
@@ -2289,7 +2362,7 @@ fn status_facade_from_published_state(
     published_facade_status: crate::api::facade_status::PublishedFacadeStatusSnapshot,
 ) -> StatusFacade {
     StatusFacade {
-        state: published_facade_status.state.as_str().to_string(),
+        state: published_facade_status.state,
         pending: published_facade_status
             .pending
             .map(|pending| StatusFacadePending {
@@ -2307,6 +2380,17 @@ fn status_facade_from_published_state(
                 retry_backoff_ms: pending.retry_backoff_ms,
                 next_retry_at_us: pending.next_retry_at_us,
             }),
+    }
+}
+
+fn status_rollout_from_published_state(
+    published_rollout_status: crate::api::rollout_status::PublishedRolloutStatusSnapshot,
+) -> StatusRollout {
+    StatusRollout {
+        state: published_rollout_status.state,
+        serving_generation: published_rollout_status.serving_generation,
+        candidate_generation: published_rollout_status.candidate_generation,
+        retiring_generation: published_rollout_status.retiring_generation,
     }
 }
 
@@ -2427,6 +2511,9 @@ mod tests {
     use crate::api::facade_status::{
         shared_facade_pending_status_cell, shared_facade_service_state_cell,
     };
+    use crate::api::rollout_status::{
+        PublishedRolloutStatusReader, shared_rollout_status_cell,
+    };
     use crate::domain_state::FacadeServiceState;
     use crate::query::api::ProjectionPolicy;
     use crate::runtime::routes::METHOD_SINK_STATUS;
@@ -2453,6 +2540,10 @@ mod tests {
     struct NoopBoundary;
 
     impl ChannelIoSubset for NoopBoundary {}
+
+    fn test_published_rollout_status_reader() -> PublishedRolloutStatusReader {
+        PublishedRolloutStatusReader::new(shared_rollout_status_cell())
+    }
 
     struct DeniedControlRouteBoundary {
         sent_routes: Arc<StdMutex<Vec<String>>>,
@@ -3898,6 +3989,7 @@ mod tests {
                 facade_service_state,
                 shared_facade_pending_status_cell(),
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -4042,6 +4134,7 @@ mod tests {
                 facade_service_state,
                 shared_facade_pending_status_cell(),
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -5877,6 +5970,7 @@ mod tests {
                 facade_service_state,
                 shared_facade_pending_status_cell(),
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -5885,7 +5979,7 @@ mod tests {
             .expect("status should report serving facade state")
             .0;
 
-        assert_eq!(response.facade.state, "serving");
+        assert_eq!(response.facade.state, FacadeServiceState::Serving);
         assert!(
             response.facade.pending.is_none(),
             "serving facade state must not synthesize pending diagnostics"
@@ -5948,6 +6042,7 @@ mod tests {
                 facade_service_state,
                 shared_facade_pending_status_cell(),
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -5956,7 +6051,7 @@ mod tests {
             .expect("direct status handler should surface unavailable facade state")
             .0;
 
-        assert_eq!(response.facade.state, "unavailable");
+        assert_eq!(response.facade.state, FacadeServiceState::Unavailable);
         assert!(response.facade.pending.is_none());
     }
 
@@ -6023,6 +6118,7 @@ mod tests {
                 facade_service_state,
                 facade_pending,
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -6031,7 +6127,7 @@ mod tests {
             .expect("status should report pending facade state")
             .0;
 
-        assert_eq!(response.facade.state, "pending");
+        assert_eq!(response.facade.state, FacadeServiceState::Pending);
         let pending = response.facade.pending.expect("pending diagnostics");
         assert_eq!(pending.generation, 2);
         assert_eq!(pending.reason, "retrying_after_error");
@@ -6082,6 +6178,7 @@ mod tests {
                 shared_facade_service_state_cell(),
                 shared_facade_pending_status_cell(),
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -6143,6 +6240,7 @@ mod tests {
                 shared_facade_service_state_cell(),
                 shared_facade_pending_status_cell(),
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: request_tracker.clone(),
         };
 
@@ -6261,6 +6359,7 @@ mod tests {
                 shared_facade_service_state_cell(),
                 shared_facade_pending_status_cell(),
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -6368,6 +6467,7 @@ mod tests {
                 shared_facade_service_state_cell(),
                 shared_facade_pending_status_cell(),
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -6596,6 +6696,7 @@ mod tests {
                 facade_service_state,
                 facade_pending_status,
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -6758,6 +6859,7 @@ mod tests {
                 facade_service_state,
                 facade_pending_status,
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -6863,6 +6965,7 @@ mod tests {
                 shared_facade_service_state_cell(),
                 shared_facade_pending_status_cell(),
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -6945,6 +7048,7 @@ mod tests {
                 shared_facade_service_state_cell(),
                 shared_facade_pending_status_cell(),
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -7053,6 +7157,7 @@ mod tests {
                 facade_service_state,
                 shared_facade_pending_status_cell(),
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -7065,7 +7170,7 @@ mod tests {
             .expect("status join")
             .expect("serving facade must keep /status available across remote route timeouts")
             .0;
-        assert_eq!(response.facade.state, "serving");
+        assert_eq!(response.facade.state, FacadeServiceState::Serving);
         assert!(response.source.grants_count >= 1);
         assert_eq!(
             response.sink.live_nodes, 0,
@@ -7179,6 +7284,7 @@ mod tests {
                 facade_service_state,
                 facade_pending_status,
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -7191,7 +7297,7 @@ mod tests {
             .expect("status join")
             .expect("pending facade must keep /status available across remote route timeouts")
             .0;
-        assert_eq!(response.facade.state, "pending");
+        assert_eq!(response.facade.state, FacadeServiceState::Pending);
         assert!(response.facade.pending.is_some());
         assert_eq!(response.sink.groups.len(), 1);
     }
@@ -7243,6 +7349,7 @@ mod tests {
                 facade_service_state,
                 shared_facade_pending_status_cell(),
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -7327,6 +7434,7 @@ mod tests {
                 facade_service_state,
                 facade_pending_status,
             ),
+            published_rollout_status: test_published_rollout_status_reader(),
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
         };
 
@@ -7336,7 +7444,7 @@ mod tests {
             .expect("pending /status should fall back to local snapshots")
             .0;
 
-        assert_eq!(response.facade.state, "pending");
+        assert_eq!(response.facade.state, FacadeServiceState::Pending);
         assert!(response.facade.pending.is_some());
     }
 }

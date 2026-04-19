@@ -13,8 +13,11 @@ use crate::api::facade_status::{
     SharedFacadeServiceStateCell, shared_facade_pending_status_cell,
     shared_facade_service_state_cell,
 };
+use crate::api::rollout_status::{
+    PublishedRolloutStatusSnapshot, SharedRolloutStatusCell, shared_rollout_status_cell,
+};
 use crate::api::{ApiControlGate, ApiRequestTracker};
-use crate::domain_state::FacadeServiceState;
+use crate::domain_state::{FacadeServiceState, RolloutGenerationState};
 use crate::query::TreeGroupPayload;
 use crate::query::observation::{
     ObservationTrustPolicy, candidate_group_observation_evidence, evaluate_observation_status,
@@ -1790,6 +1793,81 @@ impl LocalSinkStatusRepublishMachine {
         }
         LocalSinkStatusRepublishStep::ProbeReadiness
     }
+
+    async fn advance(
+        &mut self,
+        source: &Arc<SourceFacade>,
+        sink: &Arc<SinkFacade>,
+        runtime_state_changed: &Arc<tokio::sync::Notify>,
+        expected_groups: &std::collections::BTreeSet<String>,
+        post_return_sink_replay_signals: &[SinkControlSignal],
+        observation: LocalSinkStatusRepublishObservation,
+    ) -> std::ops::ControlFlow<Result<()>> {
+        let mut step = self.step_for_observation(&observation);
+        loop {
+            match step {
+                LocalSinkStatusRepublishStep::WaitForRuntimeScopeConvergence => {
+                    FSMetaApp::wait_for_runtime_or_sink_progress_until(
+                        runtime_state_changed,
+                        sink,
+                        self.deadline(),
+                    )
+                    .await;
+                    return std::ops::ControlFlow::Continue(());
+                }
+                LocalSinkStatusRepublishStep::ReturnReady => {
+                    return std::ops::ControlFlow::Break(Ok(()));
+                }
+                LocalSinkStatusRepublishStep::TriggerSourceToSinkConvergence => {
+                    match self.trigger_source_to_sink_convergence(source).await {
+                        Ok(()) => return std::ops::ControlFlow::Continue(()),
+                        Err(err) => return std::ops::ControlFlow::Break(Err(err)),
+                    }
+                }
+                LocalSinkStatusRepublishStep::ReplayRetainedSinkWave => {
+                    return self
+                        .replay_retained_sink_wave(sink, post_return_sink_replay_signals)
+                        .await
+                        .map_or_else(
+                            |err| std::ops::ControlFlow::Break(Err(err)),
+                            |_| std::ops::ControlFlow::Continue(()),
+                        );
+                }
+                LocalSinkStatusRepublishStep::ProbeReadiness => {
+                    self.maybe_pause_before_probe().await;
+                    step = self.probe_action(
+                        FSMetaApp::probe_local_sink_status_republish_readiness(
+                            sink,
+                            expected_groups,
+                            self.deadline(),
+                        )
+                        .await,
+                        post_return_sink_replay_signals,
+                    );
+                }
+                LocalSinkStatusRepublishStep::PublishManualRescanFallbackAndWait => {
+                    match self
+                        .schedule_manual_rescan_fallback(source, post_return_sink_replay_signals)
+                        .await
+                    {
+                        Ok(()) => {
+                            FSMetaApp::wait_for_runtime_or_sink_progress_until(
+                                runtime_state_changed,
+                                sink,
+                                self.deadline(),
+                            )
+                            .await;
+                            return std::ops::ControlFlow::Continue(());
+                        }
+                        Err(err) => return std::ops::ControlFlow::Break(Err(err)),
+                    }
+                }
+                LocalSinkStatusRepublishStep::ReturnTimeout => {
+                    return std::ops::ControlFlow::Break(Err(CnxError::Timeout));
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -2156,6 +2234,7 @@ struct PendingFixedBindHandoffRegistrant {
     facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
     facade_pending_status: SharedFacadePendingStatusCell,
     facade_service_state: SharedFacadeServiceStateCell,
+    rollout_status: SharedRolloutStatusCell,
     api_request_tracker: Arc<ApiRequestTracker>,
     api_control_gate: Arc<ApiControlGate>,
     runtime_gate_state: Arc<StdMutex<RuntimeControlState>>,
@@ -2187,6 +2266,7 @@ impl PendingFixedBindHandoffRegistrant {
         facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
         facade_pending_status: SharedFacadePendingStatusCell,
         facade_service_state: SharedFacadeServiceStateCell,
+        rollout_status: SharedRolloutStatusCell,
         api_request_tracker: Arc<ApiRequestTracker>,
         api_control_gate: Arc<ApiControlGate>,
         runtime_gate_state: Arc<StdMutex<RuntimeControlState>>,
@@ -2207,6 +2287,7 @@ impl PendingFixedBindHandoffRegistrant {
             facade_spawn_in_progress,
             facade_pending_status,
             facade_service_state,
+            rollout_status,
             api_request_tracker,
             api_control_gate,
             runtime_gate_state,
@@ -2281,9 +2362,10 @@ impl PendingFixedBindHandoffRegistrant {
              query_runtime_boundary,
              facade_pending_status,
              facade_service_state,
+             rollout_status,
              api_request_tracker,
              api_control_gate| async move {
-                api::spawn(
+                api::spawn_with_rollout_status(
                     resolved,
                     node_id,
                     runtime_boundary,
@@ -2293,6 +2375,7 @@ impl PendingFixedBindHandoffRegistrant {
                     query_runtime_boundary,
                     facade_pending_status,
                     facade_service_state,
+                    rollout_status,
                     api_request_tracker,
                     api_control_gate,
                 )
@@ -4515,6 +4598,7 @@ pub struct FSMetaApp {
     shared_control_frame_serial: Arc<Mutex<()>>,
     facade_pending_status: SharedFacadePendingStatusCell,
     facade_service_state: SharedFacadeServiceStateCell,
+    rollout_status: SharedRolloutStatusCell,
     facade_gate: RuntimeUnitGate,
     mirrored_query_peer_routes: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
     runtime_gate_state: Arc<StdMutex<RuntimeControlState>>,
@@ -4745,17 +4829,16 @@ impl FSMetaApp {
                     LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath
                 ) && Self::cached_sink_status_ready_for_expected_groups(&sink, expected_groups),
             };
-            let step = republish_machine.step_for_observation(&observation);
-            let outcome = Self::dispatch_local_sink_status_republish_step(
-                &source,
-                &sink,
-                &runtime_state_changed,
-                &mut republish_machine,
-                expected_groups,
-                post_return_sink_replay_signals,
-                step,
-            )
-            .await;
+            let outcome = republish_machine
+                .advance(
+                    &source,
+                    &sink,
+                    &runtime_state_changed,
+                    expected_groups,
+                    post_return_sink_replay_signals,
+                    observation,
+                )
+                .await;
             match outcome {
                 std::ops::ControlFlow::Continue(()) => continue,
                 std::ops::ControlFlow::Break(Ok(())) => return Ok(()),
@@ -4766,78 +4849,6 @@ impl FSMetaApp {
                     )));
                 }
                 std::ops::ControlFlow::Break(Err(err)) => return Err(err),
-            }
-        }
-    }
-
-    async fn dispatch_local_sink_status_republish_step(
-        source: &Arc<SourceFacade>,
-        sink: &Arc<SinkFacade>,
-        runtime_state_changed: &Arc<tokio::sync::Notify>,
-        republish_machine: &mut LocalSinkStatusRepublishMachine,
-        expected_groups: &std::collections::BTreeSet<String>,
-        post_return_sink_replay_signals: &[SinkControlSignal],
-        mut step: LocalSinkStatusRepublishStep,
-    ) -> std::ops::ControlFlow<Result<()>> {
-        loop {
-            match step {
-                LocalSinkStatusRepublishStep::WaitForRuntimeScopeConvergence => {
-                    Self::wait_for_runtime_or_sink_progress_until(
-                        runtime_state_changed,
-                        sink,
-                        republish_machine.deadline(),
-                    )
-                    .await;
-                    return std::ops::ControlFlow::Continue(());
-                }
-                LocalSinkStatusRepublishStep::ReturnReady => {
-                    return std::ops::ControlFlow::Break(Ok(()));
-                }
-                LocalSinkStatusRepublishStep::TriggerSourceToSinkConvergence => {
-                    match republish_machine.trigger_source_to_sink_convergence(source).await {
-                        Ok(()) => return std::ops::ControlFlow::Continue(()),
-                        Err(err) => return std::ops::ControlFlow::Break(Err(err)),
-                    }
-                }
-                LocalSinkStatusRepublishStep::ReplayRetainedSinkWave => {
-                    return republish_machine
-                        .replay_retained_sink_wave(sink, post_return_sink_replay_signals)
-                        .await
-                        .map_or_else(
-                            |err| std::ops::ControlFlow::Break(Err(err)),
-                            |_| std::ops::ControlFlow::Continue(()),
-                        );
-                }
-                LocalSinkStatusRepublishStep::ProbeReadiness => {
-                    republish_machine.maybe_pause_before_probe().await;
-                    step = republish_machine.probe_action(
-                        Self::probe_local_sink_status_republish_readiness(
-                            sink,
-                            expected_groups,
-                            republish_machine.deadline(),
-                        )
-                        .await,
-                        post_return_sink_replay_signals,
-                    );
-                }
-                LocalSinkStatusRepublishStep::PublishManualRescanFallbackAndWait => {
-                    if let Err(err) = republish_machine
-                        .schedule_manual_rescan_fallback(source, post_return_sink_replay_signals)
-                        .await
-                    {
-                        return std::ops::ControlFlow::Break(Err(err));
-                    }
-                    Self::wait_for_runtime_or_sink_progress_until(
-                        runtime_state_changed,
-                        sink,
-                        republish_machine.deadline(),
-                    )
-                    .await;
-                    return std::ops::ControlFlow::Continue(());
-                }
-                LocalSinkStatusRepublishStep::ReturnTimeout => {
-                    return std::ops::ControlFlow::Break(Err(CnxError::Timeout));
-                }
             }
         }
     }
@@ -5517,6 +5528,7 @@ impl FSMetaApp {
             shared_control_frame_serial,
             facade_pending_status: shared_facade_pending_status_cell(),
             facade_service_state: shared_facade_service_state_cell(),
+            rollout_status: shared_rollout_status_cell(),
             facade_gate: RuntimeUnitGate::new(
                 "fs-meta",
                 &[
@@ -5793,6 +5805,16 @@ impl FSMetaApp {
         state
     }
 
+    fn publish_rollout_status(
+        rollout_status: &SharedRolloutStatusCell,
+        snapshot: PublishedRolloutStatusSnapshot,
+    ) -> PublishedRolloutStatusSnapshot {
+        *rollout_status
+            .write()
+            .expect("write published rollout status") = snapshot;
+        snapshot
+    }
+
     async fn observe_facade_gate_from_parts(
         instance_id: u64,
         api_task: Arc<Mutex<Option<FacadeActivation>>>,
@@ -5919,12 +5941,76 @@ impl FSMetaApp {
                 .ok()
                 .is_some_and(|status| status.is_some());
         let publication_ready = self.facade_publication_ready().await;
-        Self::publish_facade_service_state_from_runtime_state(
+        let published = Self::publish_facade_service_state_from_runtime_state(
             &self.facade_service_state,
             FacadeServiceStateDecisionInput {
                 control_gate_ready: self.api_control_gate.is_ready(),
                 publication_ready,
                 pending_facade_present,
+            },
+        );
+        let _ = self.publish_current_rollout_status(publication_ready).await;
+        published
+    }
+
+    async fn publish_current_rollout_status(
+        &self,
+        publication_ready: bool,
+    ) -> PublishedRolloutStatusSnapshot {
+        let runtime = self.runtime_control_state();
+        let active_generation = self.api_task.lock().await.as_ref().map(|active| active.generation);
+        let pending_generation = if let Some(pending) = self.pending_facade.lock().await.clone() {
+            Some((pending.generation, pending.runtime_exposure_confirmed))
+        } else {
+            self.facade_pending_status
+                .read()
+                .ok()
+                .and_then(|status| {
+                    status
+                        .as_ref()
+                        .map(|status| (status.generation, status.runtime_exposure_confirmed))
+                })
+        };
+        let candidate_generation = pending_generation.map(|(generation, _)| generation);
+        let candidate_runtime_exposure_confirmed =
+            pending_generation.is_some_and(|(_, confirmed)| confirmed);
+        let retiring_generation = match (active_generation, candidate_generation) {
+            (Some(active), Some(candidate)) if active != candidate => Some(active),
+            _ => None,
+        };
+        let state = match (active_generation, candidate_generation) {
+            (_, Some(_))
+                if !runtime.control_initialized()
+                    || runtime.source_state_replay_required()
+                    || runtime.sink_state_replay_required() =>
+            {
+                RolloutGenerationState::CatchUp
+            }
+            (_, Some(_)) if !candidate_runtime_exposure_confirmed => {
+                RolloutGenerationState::Eligible
+            }
+            (Some(active), Some(candidate)) if active != candidate => {
+                RolloutGenerationState::Cutover
+            }
+            (None, Some(_)) if publication_ready => RolloutGenerationState::Cutover,
+            (None, Some(_)) => RolloutGenerationState::Eligible,
+            (Some(_), None)
+                if runtime.control_initialized()
+                    && !runtime.source_state_replay_required()
+                    && !runtime.sink_state_replay_required()
+                    && publication_ready =>
+            {
+                RolloutGenerationState::Stable
+            }
+            _ => RolloutGenerationState::CatchUp,
+        };
+        Self::publish_rollout_status(
+            &self.rollout_status,
+            PublishedRolloutStatusSnapshot {
+                state,
+                serving_generation: active_generation,
+                candidate_generation,
+                retiring_generation,
             },
         )
     }
@@ -7472,6 +7558,7 @@ impl FSMetaApp {
                 facade_spawn_in_progress,
                 facade_pending_status,
                 facade_service_state,
+                shared_rollout_status_cell(),
                 api_request_tracker,
                 api_control_gate,
                 runtime_gate_state,
@@ -7483,7 +7570,32 @@ impl FSMetaApp {
                 query_sink,
                 query_runtime_boundary,
             ),
-            spawn_facade,
+            move |resolved,
+                  node_id,
+                  runtime_boundary,
+                  source,
+                  sink,
+                  query_sink,
+                  query_runtime_boundary,
+                  facade_pending_status,
+                  facade_service_state,
+                  _rollout_status,
+                  api_request_tracker,
+                  api_control_gate| {
+                spawn_facade(
+                    resolved,
+                    node_id,
+                    runtime_boundary,
+                    source,
+                    sink,
+                    query_sink,
+                    query_runtime_boundary,
+                    facade_pending_status,
+                    facade_service_state,
+                    api_request_tracker,
+                    api_control_gate,
+                )
+            },
         )
         .await
     }
@@ -7503,6 +7615,7 @@ impl FSMetaApp {
             Option<Arc<dyn ChannelIoSubset>>,
             SharedFacadePendingStatusCell,
             SharedFacadeServiceStateCell,
+            SharedRolloutStatusCell,
             Arc<ApiRequestTracker>,
             Arc<ApiControlGate>,
         ) -> SpawnFut,
@@ -7517,6 +7630,7 @@ impl FSMetaApp {
             facade_spawn_in_progress,
             facade_pending_status,
             facade_service_state,
+            rollout_status,
             api_request_tracker,
             api_control_gate,
             runtime_gate_state: _,
@@ -7640,6 +7754,7 @@ impl FSMetaApp {
             query_runtime_boundary,
             facade_pending_status.clone(),
             facade_service_state.clone(),
+            rollout_status.clone(),
             api_request_tracker.clone(),
             api_control_gate.clone(),
         )
@@ -9543,6 +9658,7 @@ impl FSMetaApp {
             self.facade_spawn_in_progress.clone(),
             self.facade_pending_status.clone(),
             self.facade_service_state.clone(),
+            self.rollout_status.clone(),
             self.api_request_tracker.clone(),
             self.api_control_gate.clone(),
             self.runtime_gate_state.clone(),

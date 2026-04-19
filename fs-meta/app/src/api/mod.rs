@@ -3,6 +3,7 @@ pub mod config;
 mod errors;
 pub(crate) mod facade_status;
 mod handlers;
+pub(crate) mod rollout_status;
 mod server;
 mod state;
 pub mod types;
@@ -17,5 +18,5 @@ pub(crate) use handlers::{
     install_status_pause_hook, install_status_route_trace_capture,
 };
 pub use server::ApiServerHandle;
-pub(crate) use server::spawn;
+pub(crate) use server::{spawn, spawn_with_rollout_status};
 pub(crate) use state::{ApiControlGate, ApiRequestTracker};

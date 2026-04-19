@@ -1,4 +1,7 @@
 use crate::source::config::GrantedMountRoot;
+use crate::domain_state::{
+    FacadeServiceState, GroupServiceState, NodeParticipationState, RolloutGenerationState,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
@@ -62,7 +65,7 @@ pub struct DegradedRoot {
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusSourceLogicalRoot {
     pub root_id: String,
-    pub status: String,
+    pub service_state: GroupServiceState,
     pub matched_grants: usize,
     pub active_members: usize,
     pub coverage_mode: String,
@@ -73,7 +76,7 @@ pub struct StatusSourceConcreteRoot {
     pub root_key: String,
     pub logical_root_id: String,
     pub object_ref: String,
-    pub status: String,
+    pub participation_state: NodeParticipationState,
     pub coverage_mode: String,
     pub watch_enabled: bool,
     pub scan_enabled: bool,
@@ -106,10 +109,10 @@ pub struct StatusSourceConcreteRoot {
     pub current_stream_generation: Option<u64>,
     pub candidate_revision: Option<u64>,
     pub candidate_stream_generation: Option<u64>,
-    pub candidate_status: Option<String>,
+    pub candidate_participation_state: Option<NodeParticipationState>,
     pub draining_revision: Option<u64>,
     pub draining_stream_generation: Option<u64>,
-    pub draining_status: Option<String>,
+    pub draining_participation_state: Option<NodeParticipationState>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,6 +163,7 @@ pub enum StatusSinkGroupReadiness {
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusSinkGroup {
     pub group_id: String,
+    pub service_state: GroupServiceState,
     pub primary_object_ref: String,
     pub total_nodes: u64,
     pub live_nodes: u64,
@@ -230,15 +234,27 @@ pub struct StatusFacadePending {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusFacade {
-    pub state: String,
+    pub state: FacadeServiceState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending: Option<StatusFacadePending>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusRollout {
+    pub state: RolloutGenerationState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serving_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retiring_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusResponse {
     pub source: StatusSource,
     pub sink: StatusSink,
+    pub rollout: StatusRollout,
     pub facade: StatusFacade,
 }
 
