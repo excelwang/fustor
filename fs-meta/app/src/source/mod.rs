@@ -439,6 +439,80 @@ pub struct SourceStatusSnapshot {
     pub degraded_roots: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceProgressSnapshot {
+    pub(crate) rescan_observed_epoch: u64,
+    pub(crate) scheduled_source_groups: BTreeSet<String>,
+    pub(crate) scheduled_scan_groups: BTreeSet<String>,
+    pub(crate) published_group_epoch: BTreeMap<String, u64>,
+}
+
+impl SourceProgressSnapshot {
+    pub(crate) fn scheduled_groups(&self) -> BTreeSet<String> {
+        let mut groups = self.scheduled_source_groups.clone();
+        groups.extend(self.scheduled_scan_groups.iter().cloned());
+        groups
+    }
+
+    pub(crate) fn published_expected_groups_since(
+        &self,
+        request_epoch: u64,
+        expected_groups: &BTreeSet<String>,
+    ) -> bool {
+        !expected_groups.is_empty()
+            && expected_groups.iter().all(|group_id| {
+                self.published_group_epoch
+                    .get(group_id)
+                    .is_some_and(|epoch| *epoch >= request_epoch)
+            })
+    }
+}
+
+impl SourceStatusSnapshot {
+    pub(crate) fn published_group_ids(&self) -> BTreeSet<String> {
+        self.concrete_roots
+            .iter()
+            .filter(|entry| entry.active)
+            .filter(|entry| {
+                entry.forwarded_batch_count > 0
+                    || entry.forwarded_event_count > 0
+                    || entry.forwarded_path_event_count > 0
+                    || entry.last_forwarded_at_us.is_some()
+                    || entry.emitted_batch_count > 0
+                    || entry.emitted_event_count > 0
+                    || entry.emitted_path_event_count > 0
+                    || entry.last_emitted_at_us.is_some()
+                    || entry.last_audit_completed_at_us.is_some()
+            })
+            .map(|entry| entry.logical_root_id.clone())
+            .collect()
+    }
+}
+
+fn source_status_publication_marker(status: &SourceStatusSnapshot) -> (u64, u64) {
+    let published_batches = status
+        .concrete_roots
+        .iter()
+        .map(|entry| entry.forwarded_batch_count)
+        .sum::<u64>();
+    let last_published_at_us = status
+        .concrete_roots
+        .iter()
+        .filter_map(|entry| entry.last_forwarded_at_us.or(entry.last_emitted_at_us))
+        .max()
+        .unwrap_or_default();
+    (published_batches, last_published_at_us)
+}
+
+fn source_status_rescan_completion_marker(status: &SourceStatusSnapshot) -> u64 {
+    status
+        .concrete_roots
+        .iter()
+        .filter_map(|entry| entry.last_audit_completed_at_us)
+        .max()
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Default)]
 struct CurrentStreamPathFrontierStats {
     generation: Option<u64>,
@@ -771,6 +845,12 @@ struct SourceStateCell {
     host_object_grants: Arc<Mutex<Vec<GrantedMountRoot>>>,
     root_task_revision: Arc<AtomicU64>,
     stream_generation: Arc<AtomicU64>,
+    rescan_request_epoch: Arc<AtomicU64>,
+    rescan_request_published_batches: Arc<AtomicU64>,
+    rescan_request_last_published_at_us: Arc<AtomicU64>,
+    rescan_request_last_audit_completed_at_us: Arc<AtomicU64>,
+    rescan_observed_epoch: Arc<AtomicU64>,
+    published_group_epoch: Arc<Mutex<BTreeMap<String, u64>>>,
     commit_boundary: CommitBoundary,
 }
 
@@ -798,6 +878,12 @@ impl SourceStateCell {
             host_object_grants: Arc::new(Mutex::new(host_object_grants)),
             root_task_revision: Arc::new(AtomicU64::new(1)),
             stream_generation: Arc::new(AtomicU64::new(1)),
+            rescan_request_epoch: Arc::new(AtomicU64::new(0)),
+            rescan_request_published_batches: Arc::new(AtomicU64::new(0)),
+            rescan_request_last_published_at_us: Arc::new(AtomicU64::new(0)),
+            rescan_request_last_audit_completed_at_us: Arc::new(AtomicU64::new(0)),
+            rescan_observed_epoch: Arc::new(AtomicU64::new(0)),
+            published_group_epoch: Arc::new(Mutex::new(BTreeMap::new())),
             commit_boundary,
         };
         let root_count = lock_or_recover(&cell.logical_roots, "source.state.bootstrap.roots").len();
@@ -835,6 +921,83 @@ impl SourceStateCell {
 
     fn next_stream_generation(&self) -> u64 {
         self.stream_generation.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn begin_rescan_request_epoch(
+        &self,
+        published_batches: u64,
+        last_published_at_us: u64,
+        last_audit_completed_at_us: u64,
+    ) -> u64 {
+        self.rescan_request_published_batches
+            .store(published_batches, Ordering::Release);
+        self.rescan_request_last_published_at_us
+            .store(last_published_at_us, Ordering::Release);
+        self.rescan_request_last_audit_completed_at_us
+            .store(last_audit_completed_at_us, Ordering::Release);
+        self.rescan_request_epoch
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    fn current_rescan_request_epoch(&self) -> u64 {
+        self.rescan_request_epoch.load(Ordering::Acquire)
+    }
+
+    fn current_rescan_observed_epoch(&self) -> u64 {
+        self.rescan_observed_epoch.load(Ordering::Acquire)
+    }
+
+    fn published_group_epoch_snapshot(&self) -> BTreeMap<String, u64> {
+        lock_or_recover(
+            &self.published_group_epoch,
+            "source.published_group_epoch.snapshot",
+        )
+        .clone()
+    }
+
+    fn mark_group_published(&self, logical_root_id: &str) {
+        let request_epoch = self.current_rescan_request_epoch();
+        if request_epoch > self.current_rescan_observed_epoch() {
+            self.rescan_observed_epoch
+                .store(request_epoch, Ordering::Release);
+        }
+        let mut published_group_epoch = lock_or_recover(
+            &self.published_group_epoch,
+            "source.published_group_epoch.mark",
+        );
+        published_group_epoch
+            .entry(logical_root_id.to_string())
+            .and_modify(|epoch| *epoch = (*epoch).max(request_epoch))
+            .or_insert(request_epoch);
+    }
+
+    fn mark_rescan_observed_if_publication_advanced(
+        &self,
+        published_batches: u64,
+        last_published_at_us: u64,
+        last_audit_completed_at_us: u64,
+    ) {
+        let request_epoch = self.current_rescan_request_epoch();
+        if request_epoch <= self.current_rescan_observed_epoch() {
+            return;
+        }
+        let baseline_published_batches = self
+            .rescan_request_published_batches
+            .load(Ordering::Acquire);
+        let baseline_last_published_at_us = self
+            .rescan_request_last_published_at_us
+            .load(Ordering::Acquire);
+        let baseline_last_audit_completed_at_us = self
+            .rescan_request_last_audit_completed_at_us
+            .load(Ordering::Acquire);
+        if published_batches > baseline_published_batches
+            || last_published_at_us > baseline_last_published_at_us
+            || last_audit_completed_at_us > baseline_last_audit_completed_at_us
+        {
+            self.rescan_observed_epoch
+                .store(request_epoch, Ordering::Release);
+        }
     }
 
     #[cfg(test)]
@@ -976,6 +1139,9 @@ impl FSMetaSource {
                     generation,
                     ..
                 } => {
+                    // `RuntimeUnitTick` stays explicit at the source boundary even
+                    // though runtime::orchestration pre-decodes the envelope into
+                    // `SourceControlSignal::Tick`.
                     // Unit tick is runtime-owned scheduling signal.
                     // Source accepts and validates the envelope kind while keeping
                     // business data path independent.
@@ -2844,9 +3010,25 @@ impl FSMetaSource {
     }
 
     pub async fn trigger_rescan_when_ready(&self) {
-        if self.wait_for_group_primary_scan_roots_ready().await {
-            self.trigger_rescan();
+        if !self.wait_for_group_primary_scan_roots_ready().await {
+            log::debug!(
+                "source-fs-meta: queue deferred manual rescan before primary scan roots report running"
+            );
         }
+        self.trigger_rescan();
+    }
+
+    pub(crate) async fn trigger_rescan_when_ready_epoch(&self) -> u64 {
+        let status = self.status_snapshot();
+        let (published_batches, last_published_at_us) = source_status_publication_marker(&status);
+        let last_audit_completed_at_us = source_status_rescan_completion_marker(&status);
+        let epoch = self.state_cell.begin_rescan_request_epoch(
+            published_batches,
+            last_published_at_us,
+            last_audit_completed_at_us,
+        );
+        self.trigger_rescan_when_ready().await;
+        epoch
     }
 
     /// Trigger an overflow diagnostic signal. Intended for tests simulating IN_Q_OVERFLOW recovery-path.
@@ -3059,6 +3241,41 @@ impl FSMetaSource {
             .map_err(|err| {
                 CnxError::Internal(format!("publish manual rescan signal failed: {err}"))
             })
+    }
+
+    pub(crate) fn current_rescan_observed_epoch(&self) -> u64 {
+        self.state_cell.current_rescan_observed_epoch()
+    }
+
+    pub(crate) fn progress_snapshot(&self) -> SourceProgressSnapshot {
+        SourceProgressSnapshot {
+            rescan_observed_epoch: self.current_rescan_observed_epoch(),
+            scheduled_source_groups: self
+                .scheduled_source_group_ids()
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            scheduled_scan_groups: self
+                .scheduled_scan_group_ids()
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            published_group_epoch: self.state_cell.published_group_epoch_snapshot(),
+        }
+    }
+
+    pub(crate) fn maybe_mark_rescan_observed_if_publication_advanced(
+        &self,
+        published_batches: u64,
+        last_published_at_us: u64,
+        last_audit_completed_at_us: u64,
+    ) {
+        self.state_cell
+            .mark_rescan_observed_if_publication_advanced(
+                published_batches,
+                last_published_at_us,
+                last_audit_completed_at_us,
+            );
     }
 
     pub async fn start_manual_rescan_watch(&self) -> Result<()> {
@@ -3318,6 +3535,7 @@ impl FSMetaSource {
         let roots_handle = self.state_cell.roots_handle();
         let manual_rescan_intents = self.state_cell.manual_rescan_intents_handle();
         let enqueued_path_origin_counts = self.enqueued_path_origin_counts.clone();
+        let state_cell = self.state_cell.clone();
         let sentinel = self.sentinel.clone();
         let apply_startup_delay = self.boundary.is_some();
         let join = tokio::spawn(async move {
@@ -3442,6 +3660,7 @@ impl FSMetaSource {
                                 stream_generation,
                                 &path_origin_counts,
                             );
+                            state_cell.mark_group_published(&root.logical_root_id);
                             Self::mark_root_forwarded_batch(
                                 &fanout_health,
                                 &root_key,

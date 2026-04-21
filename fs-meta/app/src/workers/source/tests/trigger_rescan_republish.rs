@@ -191,7 +191,7 @@ macro_rules! define_trigger_rescan_republish_tests {
         }
 
         client
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("trigger_rescan_when_ready after worker-not-initialized recovery");
 
@@ -418,7 +418,7 @@ macro_rules! define_trigger_rescan_republish_tests {
         }
 
         client
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("trigger_rescan_when_ready after unexpected-correlation recovery");
 
@@ -571,7 +571,7 @@ macro_rules! define_trigger_rescan_republish_tests {
         }
 
         client
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("initial trigger_rescan_when_ready should succeed");
 
@@ -764,7 +764,7 @@ macro_rules! define_trigger_rescan_republish_tests {
         );
 
         client
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("trigger_rescan_when_ready should succeed");
 
@@ -1107,13 +1107,13 @@ macro_rules! define_trigger_rescan_republish_tests {
         let raw_client = client.client().await.expect("typed source worker client");
         match raw_client
             .call_with_timeout(
-                SourceWorkerRequest::TriggerRescanWhenReady,
+                SourceWorkerRequest::TriggerRescanWhenReadyEpoch,
                 SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
             )
         .await
         .expect("raw trigger_rescan_when_ready RPC should succeed")
         {
-            SourceWorkerResponse::Ack => {}
+            SourceWorkerResponse::RescanRequestEpoch(_) => {}
             other => panic!("unexpected raw trigger_rescan_when_ready response: {other:?}"),
         }
 
@@ -1324,7 +1324,7 @@ macro_rules! define_trigger_rescan_republish_tests {
             .await
             .expect("initial watch-scan source wave without host grant change should succeed");
         route
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("initial trigger_rescan_when_ready should succeed");
 
@@ -1421,7 +1421,7 @@ macro_rules! define_trigger_rescan_republish_tests {
         }
 
         route
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("post-cleanup trigger_rescan_when_ready should succeed");
 
@@ -1639,7 +1639,7 @@ macro_rules! define_trigger_rescan_republish_tests {
             .await
             .expect("initial watch-scan source wave without host grant change should succeed");
         route
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("initial trigger_rescan_when_ready should succeed");
 
@@ -1765,7 +1765,7 @@ macro_rules! define_trigger_rescan_republish_tests {
         }
 
         route
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("post-cleanup trigger_rescan_when_ready should succeed after the fail-closed roots deactivate");
 
@@ -2584,7 +2584,7 @@ macro_rules! define_trigger_rescan_republish_tests {
             .await
             .expect("initial watch-scan source wave should succeed");
         route
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("initial trigger_rescan_when_ready should succeed");
 
@@ -2702,11 +2702,11 @@ macro_rules! define_trigger_rescan_republish_tests {
         }
 
         route
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("first post-cleanup trigger_rescan_when_ready should succeed");
         route
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("second post-cleanup trigger_rescan_when_ready should succeed");
 
@@ -2906,7 +2906,7 @@ macro_rules! define_trigger_rescan_republish_tests {
             .await
             .expect("initial watch-scan source wave should succeed");
         route
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("initial trigger_rescan_when_ready should succeed");
 
@@ -3024,11 +3024,11 @@ macro_rules! define_trigger_rescan_republish_tests {
         }
 
         route
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("first post-cleanup trigger_rescan_when_ready should succeed");
         route
-            .trigger_rescan_when_ready()
+            .trigger_rescan_when_ready_epoch()
             .await
             .expect("second post-cleanup trigger_rescan_when_ready should succeed");
 

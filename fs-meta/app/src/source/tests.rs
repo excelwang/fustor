@@ -15,7 +15,7 @@ use capanix_runtime_entry_sdk::control::{
     RuntimeHostObjectType, RuntimeObjectDescriptor, RuntimeUnitTick, encode_runtime_exec_control,
     encode_runtime_host_grant_change, encode_runtime_unit_tick,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 struct NoopBoundary;
 
@@ -184,6 +184,35 @@ fn event_origin_ids(events: &[Event]) -> BTreeSet<String> {
         .iter()
         .map(|event| event.metadata().origin_id.0.clone())
         .collect()
+}
+
+#[test]
+fn local_source_progress_snapshot_reads_machine_owned_published_group_epoch_from_state_cell() {
+    let source = build_source(Vec::new());
+    let request_epoch = source.state_cell.begin_rescan_request_epoch(0, 0, 0);
+
+    assert!(
+        source.status_snapshot().published_group_ids().is_empty(),
+        "fixture must keep status-derived published groups empty so this test proves local progress reads source-owned state instead of observability/status adapters",
+    );
+
+    source.state_cell.mark_group_published("nfs1");
+
+    let snapshot = source.progress_snapshot();
+    assert_eq!(
+        snapshot.rescan_observed_epoch, request_epoch,
+        "local source progress must advance rescan_observed_epoch when the source owner records a published group for the active request",
+    );
+    assert_eq!(
+        snapshot.published_group_epoch,
+        BTreeMap::from([("nfs1".to_string(), request_epoch)]),
+        "local source progress must read machine-owned published_group_epoch truth from SourceStateCell instead of reconstructing it from status/observability counters",
+    );
+    assert!(
+        snapshot
+            .published_expected_groups_since(request_epoch, &BTreeSet::from(["nfs1".to_string()]),),
+        "local source progress should satisfy request-scoped publication once SourceStateCell records the group epoch",
+    );
 }
 
 fn mk_source_record_event(origin: &str, path: &[u8], file_name: &[u8], ts: u64) -> Event {

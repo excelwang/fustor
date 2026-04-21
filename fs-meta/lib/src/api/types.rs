@@ -1,7 +1,7 @@
-use crate::source::config::GrantedMountRoot;
 use crate::domain_state::{
     FacadeServiceState, GroupServiceState, NodeParticipationState, RolloutGenerationState,
 };
+use crate::source::config::GrantedMountRoot;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
@@ -117,7 +117,6 @@ pub struct StatusSourceConcreteRoot {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusSource {
-    pub lifecycle_state: String,
     pub host_object_grants_version: u64,
     pub grants_count: usize,
     pub roots_count: usize,
@@ -129,6 +128,7 @@ pub struct StatusSource {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusSourceDebug {
+    pub lifecycle_state: String,
     pub current_stream_generation: Option<u64>,
     pub source_primary_by_group: BTreeMap<String, String>,
     pub last_force_find_runner_by_group: BTreeMap<String, String>,
@@ -154,7 +154,7 @@ pub struct StatusSourceDebug {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum StatusSinkGroupReadiness {
+pub enum StatusSinkGroupMaterializationReadiness {
     PendingMaterialization,
     WaitingForMaterializedRoot,
     Ready,
@@ -174,13 +174,17 @@ pub struct StatusSinkGroup {
     pub shadow_time_us: u64,
     pub shadow_lag_us: u64,
     pub overflow_pending_materialization: bool,
-    pub readiness: StatusSinkGroupReadiness,
+    pub initial_audit_completed: bool,
+    pub materialization_readiness: StatusSinkGroupMaterializationReadiness,
     pub estimated_heap_bytes: u64,
 }
 
 impl StatusSinkGroup {
     pub fn is_ready(&self) -> bool {
-        matches!(self.readiness, StatusSinkGroupReadiness::Ready)
+        matches!(
+            self.materialization_readiness,
+            StatusSinkGroupMaterializationReadiness::Ready
+        )
     }
 }
 
@@ -377,4 +381,80 @@ pub struct RootsPreviewResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct RescanResponse {
     pub accepted: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_source_serializes_lifecycle_state_under_debug_only() {
+        let value = serde_json::to_value(StatusSource {
+            host_object_grants_version: 7,
+            grants_count: 2,
+            roots_count: 1,
+            degraded_roots: Vec::new(),
+            logical_roots: Vec::new(),
+            concrete_roots: Vec::new(),
+            debug: StatusSourceDebug {
+                lifecycle_state: "ready".to_string(),
+                current_stream_generation: Some(3),
+                source_primary_by_group: BTreeMap::new(),
+                last_force_find_runner_by_group: BTreeMap::new(),
+                last_force_find_runners_by_group: BTreeMap::new(),
+                force_find_inflight_groups: Vec::new(),
+                scheduled_source_groups_by_node: BTreeMap::new(),
+                scheduled_scan_groups_by_node: BTreeMap::new(),
+                last_control_frame_signals_by_node: BTreeMap::new(),
+                published_batches_by_node: BTreeMap::new(),
+                published_events_by_node: BTreeMap::new(),
+                published_control_events_by_node: BTreeMap::new(),
+                published_data_events_by_node: BTreeMap::new(),
+                last_published_at_us_by_node: BTreeMap::new(),
+                last_published_origins_by_node: BTreeMap::new(),
+                published_origin_counts_by_node: BTreeMap::new(),
+                published_path_capture_target: None,
+                enqueued_path_origin_counts_by_node: BTreeMap::new(),
+                pending_path_origin_counts_by_node: BTreeMap::new(),
+                yielded_path_origin_counts_by_node: BTreeMap::new(),
+                summarized_path_origin_counts_by_node: BTreeMap::new(),
+                published_path_origin_counts_by_node: BTreeMap::new(),
+            },
+        })
+        .expect("serialize status source");
+
+        assert!(
+            value.get("lifecycle_state").is_none(),
+            "top-level source lifecycle_state should no longer be public status surface"
+        );
+        assert_eq!(value["debug"]["lifecycle_state"], "ready");
+    }
+
+    #[test]
+    fn status_sink_group_serializes_materialization_readiness_field() {
+        let value = serde_json::to_value(StatusSinkGroup {
+            group_id: "nfs1".to_string(),
+            service_state: GroupServiceState::ServingTrusted,
+            primary_object_ref: "node-a::nfs1".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 11,
+            shadow_lag_us: 12,
+            overflow_pending_materialization: false,
+            initial_audit_completed: true,
+            materialization_readiness: StatusSinkGroupMaterializationReadiness::Ready,
+            estimated_heap_bytes: 13,
+        })
+        .expect("serialize sink group");
+
+        assert_eq!(value["materialization_readiness"], "ready");
+        assert!(
+            value.get("readiness").is_none(),
+            "legacy readiness field should no longer be serialized"
+        );
+    }
 }

@@ -112,7 +112,15 @@
             resource_ids: vec!["listener-a".to_string()],
             handle: active_facade,
         });
-        app_1.refresh_active_fixed_bind_facade_owner().await;
+        mark_active_fixed_bind_facade_owner(
+            &bind_addr,
+            ActiveFixedBindFacadeRegistrant {
+                instance_id: app_1.instance_id,
+                api_task: app_1.api_task.clone(),
+                api_request_tracker: app_1.api_request_tracker.clone(),
+                api_control_gate: app_1.api_control_gate.clone(),
+            },
+        );
 
         let client = Client::new();
         let login = client
@@ -320,7 +328,15 @@
             resource_ids: vec!["listener-a".to_string()],
             handle: active_facade,
         });
-        app_1.refresh_active_fixed_bind_facade_owner().await;
+        mark_active_fixed_bind_facade_owner(
+            &bind_addr,
+            ActiveFixedBindFacadeRegistrant {
+                instance_id: app_1.instance_id,
+                api_task: app_1.api_task.clone(),
+                api_request_tracker: app_1.api_request_tracker.clone(),
+                api_control_gate: app_1.api_control_gate.clone(),
+            },
+        );
 
         let client = Client::new();
         let login = client

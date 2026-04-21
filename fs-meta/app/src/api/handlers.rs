@@ -59,8 +59,9 @@ use super::types::{
     QueryApiKeysResponse, RescanResponse, RevokeQueryApiKeyResponse, RootEntry, RootPreviewItem,
     RootSelectorEntry, RootUpdateEntry, RootsPreviewResponse, RootsResponse, RootsUpdateRequest,
     RootsUpdateResponse, RuntimeGrantsResponse, StatusFacade, StatusFacadePending, StatusResponse,
-    StatusRollout, StatusSink, StatusSinkDebug, StatusSinkGroup, StatusSinkGroupReadiness,
-    StatusSource, StatusSourceConcreteRoot, StatusSourceLogicalRoot,
+    StatusRollout, StatusSink, StatusSinkDebug, StatusSinkGroup,
+    StatusSinkGroupMaterializationReadiness, StatusSource, StatusSourceConcreteRoot,
+    StatusSourceLogicalRoot,
 };
 
 fn debug_status_route_fanin_enabled() -> bool {
@@ -622,6 +623,8 @@ pub async fn status(
         &source,
         &runner_sets,
     ) || should_fail_closed_source_ready_sink_empty_status(
+        sink_outcome,
+        source_outcome,
         published_facade_state,
         &sink_status,
         &source,
@@ -657,32 +660,37 @@ pub async fn status(
                 .groups
                 .into_iter()
                 .map(|group| {
+                    let readiness = group.normalized_readiness();
+                    let initial_audit_completed =
+                        matches!(readiness, crate::sink::GroupReadinessState::Ready);
                     let service_state = sink_group_service_state(&group);
                     StatusSinkGroup {
-                    group_id: group.group_id,
-                    service_state,
-                    primary_object_ref: group.primary_object_ref,
-                    total_nodes: group.total_nodes,
-                    live_nodes: group.live_nodes,
-                    tombstoned_count: group.tombstoned_count,
-                    attested_count: group.attested_count,
-                    suspect_count: group.suspect_count,
-                    blind_spot_count: group.blind_spot_count,
-                    shadow_time_us: group.shadow_time_us,
-                    shadow_lag_us: group.shadow_lag_us,
-                    overflow_pending_materialization: group.overflow_pending_materialization,
-                    readiness: match group.readiness {
-                        crate::sink::GroupReadinessState::PendingMaterialization => {
-                            StatusSinkGroupReadiness::PendingMaterialization
-                        }
-                        crate::sink::GroupReadinessState::WaitingForMaterializedRoot => {
-                            StatusSinkGroupReadiness::WaitingForMaterializedRoot
-                        }
-                        crate::sink::GroupReadinessState::Ready => StatusSinkGroupReadiness::Ready,
-                    },
-
-                    estimated_heap_bytes: group.estimated_heap_bytes,
-                }
+                        group_id: group.group_id,
+                        service_state,
+                        primary_object_ref: group.primary_object_ref,
+                        total_nodes: group.total_nodes,
+                        live_nodes: group.live_nodes,
+                        tombstoned_count: group.tombstoned_count,
+                        attested_count: group.attested_count,
+                        suspect_count: group.suspect_count,
+                        blind_spot_count: group.blind_spot_count,
+                        shadow_time_us: group.shadow_time_us,
+                        shadow_lag_us: group.shadow_lag_us,
+                        overflow_pending_materialization: group.overflow_pending_materialization,
+                        initial_audit_completed,
+                        materialization_readiness: match readiness {
+                            crate::sink::GroupReadinessState::PendingMaterialization => {
+                                StatusSinkGroupMaterializationReadiness::PendingMaterialization
+                            }
+                            crate::sink::GroupReadinessState::WaitingForMaterializedRoot => {
+                                StatusSinkGroupMaterializationReadiness::WaitingForMaterializedRoot
+                            }
+                            crate::sink::GroupReadinessState::Ready => {
+                                StatusSinkGroupMaterializationReadiness::Ready
+                            }
+                        },
+                        estimated_heap_bytes: group.estimated_heap_bytes,
+                    }
                 })
                 .collect(),
             debug: StatusSinkDebug {
@@ -722,7 +730,11 @@ fn source_logical_root_service_state(
     matched_grants: usize,
     active_members: usize,
 ) -> GroupServiceState {
-    match status.split_once(':').map(|(head, _)| head).unwrap_or(status) {
+    match status
+        .split_once(':')
+        .map(|(head, _)| head)
+        .unwrap_or(status)
+    {
         "ready" => GroupServiceState::ServingTrusted,
         "retiring" => GroupServiceState::Retiring,
         "retired" => GroupServiceState::Retired,
@@ -742,7 +754,11 @@ fn source_logical_root_service_state(
 }
 
 fn source_root_participation_state(status: &str) -> NodeParticipationState {
-    match status.split_once(':').map(|(head, _)| head).unwrap_or(status) {
+    match status
+        .split_once(':')
+        .map(|(head, _)| head)
+        .unwrap_or(status)
+    {
         "running" => NodeParticipationState::Serving,
         "planned" | "starting" | "warming" => NodeParticipationState::Joining,
         "retiring" | "stopped" | "draining" => NodeParticipationState::Retiring,
@@ -762,7 +778,10 @@ fn source_root_participation_state(status: &str) -> NodeParticipationState {
 fn sink_group_service_state(group: &crate::sink::SinkGroupStatusSnapshot) -> GroupServiceState {
     let readiness = group.normalized_readiness();
     if matches!(readiness, crate::sink::GroupReadinessState::Ready) {
-        if group.overflow_pending_materialization || group.blind_spot_count > 0 || group.suspect_count > 0 {
+        if group.overflow_pending_materialization
+            || group.blind_spot_count > 0
+            || group.suspect_count > 0
+        {
             GroupServiceState::ServingDegraded
         } else {
             GroupServiceState::ServingTrusted
@@ -1227,6 +1246,8 @@ fn should_fail_closed_partial_local_status_fallback(
 }
 
 fn should_fail_closed_source_ready_sink_empty_status(
+    sink_outcome: StatusRouteOutcome,
+    source_outcome: StatusRouteOutcome,
     published_facade_state: FacadeServiceState,
     sink_status: &SinkStatusSnapshot,
     source: &SourceObservabilitySnapshot,
@@ -1234,7 +1255,8 @@ fn should_fail_closed_source_ready_sink_empty_status(
     matches!(
         published_facade_state,
         FacadeServiceState::Serving | FacadeServiceState::Degraded
-    ) && !source_snapshot_active_groups(source).is_empty()
+    ) && status_route_collection_requested(sink_outcome, source_outcome)
+        && !source_snapshot_active_groups(source).is_empty()
         && source_snapshot_has_published_activity(source)
         && !source_snapshot_active_groups(source)
             .is_subset(&sink_snapshot_live_materialized_groups(sink_status))
@@ -1253,6 +1275,14 @@ fn status_route_collection_incomplete(
         source_outcome,
         StatusRouteOutcome::Skipped | StatusRouteOutcome::Ok
     )
+}
+
+fn status_route_collection_requested(
+    sink_outcome: StatusRouteOutcome,
+    source_outcome: StatusRouteOutcome,
+) -> bool {
+    !matches!(sink_outcome, StatusRouteOutcome::Skipped)
+        || !matches!(source_outcome, StatusRouteOutcome::Skipped)
 }
 
 fn log_status_route_fallback(label: &str, err: &CnxError) {
@@ -1558,7 +1588,7 @@ pub async fn rescan(
             "fs_meta_api: rescan via local source node={}",
             state.node_id.0
         );
-        state.source.trigger_rescan_when_ready().await?;
+        let _ = state.source.trigger_rescan_when_ready_epoch().await?;
     }
     #[cfg(test)]
     maybe_pause_rescan_before_return().await;
@@ -1684,7 +1714,6 @@ fn status_source_from_observability(
         .map(|(root_key, reason)| DegradedRoot { root_key, reason })
         .collect::<Vec<_>>();
     StatusSource {
-        lifecycle_state,
         host_object_grants_version,
         grants_count: grants.len(),
         roots_count: logical_roots.len(),
@@ -1755,6 +1784,7 @@ fn status_source_from_observability(
             })
             .collect(),
         debug: super::types::StatusSourceDebug {
+            lifecycle_state,
             current_stream_generation,
             source_primary_by_group,
             last_force_find_runner_by_group,
@@ -2511,9 +2541,7 @@ mod tests {
     use crate::api::facade_status::{
         shared_facade_pending_status_cell, shared_facade_service_state_cell,
     };
-    use crate::api::rollout_status::{
-        PublishedRolloutStatusReader, shared_rollout_status_cell,
-    };
+    use crate::api::rollout_status::{PublishedRolloutStatusReader, shared_rollout_status_cell};
     use crate::domain_state::FacadeServiceState;
     use crate::query::api::ProjectionPolicy;
     use crate::runtime::routes::METHOD_SINK_STATUS;

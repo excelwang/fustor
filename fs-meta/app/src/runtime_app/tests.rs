@@ -1,6 +1,7 @@
 use super::*;
 use crate::api::facade_status::{FacadePendingReason, SharedFacadePendingStatus};
-use crate::domain_state::FacadeServiceState;
+use crate::api::rollout_status::read_published_rollout_status;
+use crate::domain_state::{FacadeServiceState, RolloutGenerationState};
 use crate::runtime::routes::{
     METHOD_SINK_QUERY, ROUTE_KEY_EVENTS, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_SINK_QUERY_INTERNAL,
     ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
@@ -152,15 +153,9 @@ fn runtime_control_state_for_tests(
     sink_state_replay_required: bool,
 ) -> RuntimeControlState {
     if control_initialized {
-        RuntimeControlState::live(
-            source_state_replay_required,
-            sink_state_replay_required,
-        )
+        RuntimeControlState::live(source_state_replay_required, sink_state_replay_required)
     } else {
-        RuntimeControlState::bootstrapping(
-            source_state_replay_required,
-            sink_state_replay_required,
-        )
+        RuntimeControlState::bootstrapping(source_state_replay_required, sink_state_replay_required)
     }
 }
 
@@ -1215,39 +1210,8 @@ fn facade_pending_status(app: &FSMetaApp) -> SharedFacadePendingStatus {
 }
 
 async fn install_active_single_listener_facade_or_skip(app: &FSMetaApp) -> bool {
-    let existing = match api::spawn(
-        app.config
-            .api
-            .resolve_for_candidate_ids(&["single-app-listener".to_string()])
-            .expect("resolve facade config"),
-        app.node_id.clone(),
-        app.runtime_boundary.clone(),
-        app.source.clone(),
-        app.sink.clone(),
-        app.query_sink.clone(),
-        app.runtime_boundary.clone(),
-        app.facade_pending_status.clone(),
-        app.facade_service_state.clone(),
-        app.api_request_tracker.clone(),
-        app.api_control_gate.clone(),
-    )
-    .await
-    {
-        Ok(handle) => handle,
-        Err(CnxError::InvalidInput(msg))
-            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
-        {
-            return false;
-        }
-        Err(err) => panic!("spawn active facade: {err}"),
-    };
-    *app.api_task.lock().await = Some(FacadeActivation {
-        route_key: facade_control_stream_route(),
-        generation: 1,
-        resource_ids: vec!["single-app-listener".to_string()],
-        handle: existing,
-    });
-    true
+    app.install_active_facade_for_tests(&["single-app-listener"], 1)
+        .await
 }
 
 fn mk_source_event(origin: &str, path: &[u8], file_name: &[u8], ts: u64) -> Event {
@@ -2502,6 +2466,44 @@ fn runtime_control_state_control_gate_ready_requires_initialized_or_facade_only_
 }
 
 #[test]
+fn facade_publication_machine_keeps_active_facade_withheld_until_runtime_gate_is_ready() {
+    let snapshot = FacadePublicationMachine {
+        observation: FacadeGateObservation {
+            runtime: runtime_control_state_for_tests(false, false, false),
+            current_pending: None,
+            pending_facade_present: false,
+            pending_facade_is_control_route: false,
+            active_control_stream_present: true,
+            active_pending_control_stream_present: false,
+            allow_facade_only_handoff: false,
+        },
+        publication_ready: false,
+    }
+    .snapshot();
+
+    assert_eq!(snapshot.phase, FacadePublicationPhase::Withheld);
+    assert!(!snapshot.control_gate_ready);
+    assert_eq!(snapshot.published_state, FacadeServiceState::Unavailable);
+}
+
+#[test]
+fn rollout_generation_machine_enters_drain_after_candidate_publication_becomes_ready() {
+    let snapshot = RolloutGenerationMachine {
+        runtime: runtime_control_state_for_tests(true, false, false),
+        active_generation: Some(7),
+        candidate_generation: Some(8),
+        candidate_runtime_exposure_confirmed: true,
+        publication_ready: true,
+    }
+    .snapshot();
+
+    assert_eq!(snapshot.state, RolloutGenerationState::Drain);
+    assert_eq!(snapshot.serving_generation, Some(7));
+    assert_eq!(snapshot.candidate_generation, Some(8));
+    assert_eq!(snapshot.retiring_generation, Some(7));
+}
+
+#[test]
 fn runtime_control_state_transitions_preserve_initialized_and_replay_semantics() {
     let mut state = runtime_control_state_for_tests(false, false, false);
     assert_eq!(state, RuntimeControlState::bootstrapping(false, false));
@@ -2526,6 +2528,49 @@ fn runtime_control_state_transitions_preserve_initialized_and_replay_semantics()
 
     state.mark_uninitialized_with_full_replay();
     assert_eq!(state, RuntimeControlState::bootstrapping(true, true));
+}
+
+#[tokio::test]
+async fn install_active_facade_for_tests_republishes_rollout_snapshot_from_runtime_facts() {
+    let tmp = tempdir().expect("create temp dir");
+    let mount = tmp.path().join("root-a");
+    fs::create_dir_all(&mount).expect("create mount");
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let app = FSMetaApp::new(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("root-a", &mount)],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: "single-app-listener".to_string(),
+                local_listener_resources: vec![api::config::ApiListenerResource {
+                    resource_id: "single-app-listener".to_string(),
+                    bind_addr: "127.0.0.1:0".to_string(),
+                }],
+                auth: api::ApiAuthConfig {
+                    passwd_path,
+                    shadow_path,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        },
+        NodeId("single-app-node".into()),
+    )
+    .expect("init app");
+
+    if !app
+        .install_active_facade_for_tests(&["single-app-listener"], 7)
+        .await
+    {
+        return;
+    }
+
+    let published = read_published_rollout_status(&app.rollout_status);
+    assert_eq!(published.serving_generation, Some(7));
+    assert_eq!(published.candidate_generation, None);
+    assert_eq!(published.state, RolloutGenerationState::CatchUp);
 }
 
 #[test]
@@ -2667,7 +2712,31 @@ async fn pending_fixed_bind_handoff_release_registrant_for_tests(
     });
     app.pending_fixed_bind_has_suppressed_dependent_routes
         .store(suppressed_dependent_routes_remain, Ordering::Release);
-    app.pending_fixed_bind_handoff_registrant()
+    PendingFixedBindHandoffRegistrant {
+        instance_id: app.instance_id,
+        api_task: app.api_task.clone(),
+        pending_facade: app.pending_facade.clone(),
+        pending_fixed_bind_claim_release_followup: app
+            .pending_fixed_bind_claim_release_followup
+            .clone(),
+        pending_fixed_bind_has_suppressed_dependent_routes: app
+            .pending_fixed_bind_has_suppressed_dependent_routes
+            .clone(),
+        facade_spawn_in_progress: app.facade_spawn_in_progress.clone(),
+        facade_pending_status: app.facade_pending_status.clone(),
+        facade_service_state: app.facade_service_state.clone(),
+        rollout_status: app.rollout_status.clone(),
+        api_request_tracker: app.api_request_tracker.clone(),
+        api_control_gate: app.api_control_gate.clone(),
+        runtime_gate_state: app.runtime_gate_state.clone(),
+        runtime_state_changed: app.runtime_state_changed.clone(),
+        node_id: app.node_id.clone(),
+        runtime_boundary: app.runtime_boundary.clone(),
+        source: app.source.clone(),
+        sink: app.sink.clone(),
+        query_sink: app.query_sink.clone(),
+        query_runtime_boundary: app.runtime_boundary.clone(),
+    }
 }
 
 #[tokio::test]
@@ -2799,29 +2868,484 @@ async fn pending_fixed_bind_handoff_continuation_for_tests(
     .expect("init app");
     PendingFixedBindHandoffContinuation {
         bind_addr: bind_addr.to_string(),
-        registrant: app.pending_fixed_bind_handoff_registrant(),
+        registrant: PendingFixedBindHandoffRegistrant {
+            instance_id: app.instance_id,
+            api_task: app.api_task.clone(),
+            pending_facade: app.pending_facade.clone(),
+            pending_fixed_bind_claim_release_followup: app
+                .pending_fixed_bind_claim_release_followup
+                .clone(),
+            pending_fixed_bind_has_suppressed_dependent_routes: app
+                .pending_fixed_bind_has_suppressed_dependent_routes
+                .clone(),
+            facade_spawn_in_progress: app.facade_spawn_in_progress.clone(),
+            facade_pending_status: app.facade_pending_status.clone(),
+            facade_service_state: app.facade_service_state.clone(),
+            rollout_status: app.rollout_status.clone(),
+            api_request_tracker: app.api_request_tracker.clone(),
+            api_control_gate: app.api_control_gate.clone(),
+            runtime_gate_state: app.runtime_gate_state.clone(),
+            runtime_state_changed: app.runtime_state_changed.clone(),
+            node_id: app.node_id.clone(),
+            runtime_boundary: app.runtime_boundary.clone(),
+            source: app.source.clone(),
+            sink: app.sink.clone(),
+            query_sink: app.query_sink.clone(),
+            query_runtime_boundary: app.runtime_boundary.clone(),
+        },
     }
 }
 
-fn fixed_bind_handoff_driver_for_tests(
-    pending_fixed_bind_publication: PendingFixedBindPublicationState,
+fn fixed_bind_machine_for_tests(
+    pending_publication: Option<PendingFacadeActivation>,
+    conflicting_process_claim: Option<ProcessFacadeClaim>,
+    claim_release_followup_pending: bool,
     release_handoff: Option<PendingFixedBindHandoffContinuation>,
     shutdown_handoff: Option<ActiveFixedBindShutdownContinuation>,
-) -> FixedBindHandoffDriver {
-    FixedBindHandoffDriver {
-        gate: FacadeGateObservation {
-            runtime: runtime_control_state_for_tests(false, false, false),
-            current_pending: None,
-            pending_facade_present: false,
-            pending_facade_is_control_route: false,
-            active_control_stream_present: false,
-            active_pending_control_stream_present: false,
-            allow_facade_only_handoff: false,
+) -> FacadeDeactivateMachine {
+    FacadeDeactivateMachine {
+        fixed_bind: FacadeFixedBindSnapshot {
+            pending_publication,
+            conflicting_process_claim,
+            claim_release_followup_pending,
         },
-        pending_fixed_bind_publication,
         release_handoff,
         shutdown_handoff,
     }
+}
+
+#[test]
+fn facade_publication_machine_owns_fixed_bind_followup_and_route_suppression_dispositions() {
+    let machine = fixed_bind_machine_for_tests(
+        Some(PendingFacadeActivation {
+            route_key: format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+            generation: 1,
+            resource_ids: vec!["listener".to_string()],
+            bound_scopes: Vec::new(),
+            group_ids: Vec::new(),
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            resolved: api::config::ResolvedApiConfig {
+                bind_addr: "127.0.0.1:4100".to_string(),
+                auth: api::ApiAuthConfig::default(),
+            },
+        }),
+        Some(ProcessFacadeClaim {
+            owner_instance_id: 7,
+            bind_addr: "127.0.0.1:4100".to_string(),
+        }),
+        true,
+        None,
+        None,
+    );
+
+    assert_eq!(
+        machine
+            .fixed_bind
+            .pending_publication
+            .clone()
+            .map(|pending| pending.route_key),
+        Some(format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)),
+    );
+    assert!(
+        machine.fixed_bind.claim_release_followup_pending
+            && machine.fixed_bind.pending_publication.is_some()
+            && machine.fixed_bind.conflicting_process_claim.is_some(),
+        "claim-release followup should now be derived directly from fixed-bind pending-publication and conflict truth",
+    );
+    assert!(
+        machine.fixed_bind.conflicting_process_claim.is_some()
+            || (machine.fixed_bind.claim_release_followup_pending
+                && machine.fixed_bind.pending_publication.is_some()),
+        "claim-conflict suppression should now be derived directly from fixed-bind conflict truth and followup disposition",
+    );
+    assert_eq!(
+        machine
+            .fixed_bind
+            .pending_publication
+            .as_ref()
+            .filter(|pending| {
+                machine.fixed_bind.conflicting_process_claim.is_some()
+                    && pending.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+                    && !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr)
+            })
+            .map(|pending| pending.resolved.bind_addr.as_str()),
+        Some("127.0.0.1:4100"),
+    );
+}
+
+#[test]
+fn runtime_app_fixed_bind_projection_symbols_are_removed() {
+    let source = include_str!("../runtime_app.rs");
+    assert!(
+        !source.contains("struct PendingFixedBindPublicationProjection"),
+        "fixed-bind hard cut should not leave a projection shell between publication state and its callers",
+    );
+    assert!(
+        !source.contains("struct PendingFixedBindHandoffFollowup"),
+        "fixed-bind hard cut should not leave a followup shell separate from publication state ownership",
+    );
+    assert!(
+        !source.contains("fn apply_pending_fixed_bind_handoff_followup"),
+        "fixed-bind hard cut should not keep the old handoff followup helper once publication state owns the followup semantics",
+    );
+    assert!(
+        !source.contains("fn settle_pending_fixed_bind_publication_state_after_optional_retry"),
+        "fixed-bind hard cut should not leave the old state-level settle helper once the handoff driver owns retry and disposition reads",
+    );
+    assert!(
+        !source.contains("struct PendingFixedBindPublicationState"),
+        "fixed-bind hard cut should not keep a separate publication-state owner family once facade publication owns fixed-bind publication truth",
+    );
+    assert!(
+        !source.contains("struct FixedBindObservation"),
+        "fixed-bind hard cut should not leave the old fixed-bind observation carrier in production once facade publication consumes split observed parts directly",
+    );
+    assert!(
+        !source.contains("ProcessFacadeClaim::from_pending"),
+        "fixed-bind hard cut should not keep a trivial pending->claim constructor once production code constructs claims directly at the owning call site",
+    );
+    assert!(
+        !source.contains("FacadeSpawnInProgress::from_pending"),
+        "fixed-bind hard cut should not keep a trivial pending->inflight constructor once production code constructs inflight state directly at the owning call site",
+    );
+    assert!(
+        !source.contains("fn settle_fixed_bind_handoff_driver_after_optional_retry"),
+        "fixed-bind hard cut should not keep the old app-level settle helper once facade publication owns fixed-bind disposition reads",
+    );
+    assert!(
+        !source.contains("fn apply_observed_facade_ready_tail_from_parts"),
+        "fixed-bind hard cut should not keep a thin app-side ready-tail wrapper once callers can publish the observed facade tail directly from gate observation",
+    );
+    assert!(
+        !source.contains("fn apply_facade_ready_tail_decision("),
+        "fixed-bind hard cut should not keep a thin ready-tail publish helper once the owning publication tail callsite can write gate and service state directly",
+    );
+    assert!(
+        !source.contains("fn clear_pending_facade_and_publish_ready_tail_from_runtime_facts(")
+            && !source.contains("struct FacadeReadyTailDecisionInput"),
+        "fixed-bind hard cut should not keep a runtime-facts ready-tail wrapper once the owning publication tail callsite can clear pending state and publish the ready tail directly",
+    );
+    assert!(
+        !source.contains("fn clear_pending_facade_and_publish_ready_tail_after_publication("),
+        "fixed-bind hard cut should not keep a single-use pending-facade ready-tail helper once continuity callsites can clear pending state and publish the ready tail directly",
+    );
+    assert!(
+        !source.contains("fn pending_facade_spawn_continuity_disposition(")
+            && !source.contains("enum PendingFacadeSpawnContinuityDisposition"),
+        "fixed-bind hard cut should not keep a continuity carrier family once the owning spawn callsite can classify and execute continuity directly",
+    );
+    assert!(
+        !source.contains(
+            "async fn release_handoff_blocker_for_publication(\n        app: &FSMetaApp,"
+        ),
+        "fixed-bind hard cut should not keep a single-callsite publication handoff blocker wrapper once the owning readiness lane can build and execute that handoff directly",
+    );
+    assert!(
+        !source.contains("async fn observe_active_fixed_bind_handoffs_for_bind_addr("),
+        "fixed-bind hard cut should not keep a single-callsite active handoff observation wrapper once observe(app) and tests can read those handoffs directly from the owning bind address",
+    );
+    assert!(
+        !source.contains("enum PendingFacadeSpawnFollowupDisposition")
+            && !source.contains("fn pending_facade_spawn_followup_disposition(")
+            && !source.contains("async fn apply_pending_facade_spawn_followup("),
+        "fixed-bind hard cut should not keep a pending-facade spawn followup carrier family once try_spawn_pending_facade() can classify and execute followup lanes directly",
+    );
+    assert!(
+        !source
+            .contains("async fn retained_active_facade_continuity_keeps_internal_status_routes("),
+        "fixed-bind hard cut should not keep a single-callsite continuity bool helper once apply_facade_deactivate() can read continuity and active-control ownership directly",
+    );
+    assert!(
+        !source.contains("fn conflicting_process_facade_claim_for_pending("),
+        "fixed-bind hard cut should not keep a single-callsite pending-claim accessor once build_fixed_bind_snapshot_for_pending_publication() can read the owning claim cell directly",
+    );
+    assert!(
+        !source.contains("async fn observe(app: &FSMetaApp) -> Self"),
+        "fixed-bind hard cut should not keep FacadePublicationMachine::observe(app) once app-side typed input collection owns async observation",
+    );
+    assert!(
+        source.contains("struct FacadePublicationInput {")
+            && source.contains(
+                "async fn collect_facade_publication_input(&self) -> FacadePublicationInput",
+            )
+            && source.contains("struct FacadeDeactivateInput {")
+            && source.contains(
+                "async fn collect_facade_deactivate_input(&self) -> FacadeDeactivateInput",
+            )
+            && source.contains("fn from_input(input: FacadePublicationInput) -> Self")
+            && source.contains("fn from_input(input: FacadeDeactivateInput) -> Self")
+            && source.contains("async fn resolve_facade_publication_ready(")
+            && source.contains("async fn execute_fixed_bind_handoff_action("),
+        "fixed-bind hard cut regressed; facade publication/deactivate should flow through typed input collection, pure machine evaluation, and app-owned effect execution instead of async observe(app) ownership",
+    );
+    assert!(
+        !source.contains("async fn resolve_publication_ready("),
+        "fixed-bind hard cut should keep publication-readiness execution in the typed-input collector, not on FacadePublicationMachine itself",
+    );
+    assert!(
+        !source.contains("async fn execute_fixed_bind_action(")
+            && !source.contains("async fn drive_shutdown_handoff(")
+            && !source.contains("async fn execute_after_release_handoff(")
+            && !source.contains("async fn completion_ready_after_release(")
+            && !source.contains("async fn wait_for_after_release_completion_progress("),
+        "fixed-bind hard cut should not keep async effect executors on FacadePublicationMachine once app-side execution owns shutdown and after-release handoff effects",
+    );
+    assert!(
+        !source.contains("fn claim_release_followup_disposition(&self) -> PendingFixedBindClaimReleaseFollowupDisposition"),
+        "fixed-bind hard cut should not leave the old driver-local followup disposition helper once facade publication owns the disposition truth",
+    );
+    assert!(
+        !source.contains("enum PendingFixedBindClaimReleaseFollowupDisposition"),
+        "fixed-bind hard cut should not keep a dedicated followup disposition enum once owning callsites can derive followup state directly from fixed-bind truth",
+    );
+    assert!(
+        !source.contains(
+            "fn route_suppression_disposition(&self) -> PendingFixedBindRouteSuppressionDisposition"
+        ),
+        "fixed-bind hard cut should not leave the old driver-local route suppression helper once facade publication owns the suppression truth",
+    );
+    assert!(
+        !source.contains("enum PendingFixedBindRouteSuppressionDisposition"),
+        "fixed-bind hard cut should not keep a dedicated suppression disposition enum once owning callsites can derive suppression directly from fixed-bind truth",
+    );
+    assert!(
+        !source.contains("fn clear_pending_fixed_bind_claim_release_followup_if_completed"),
+        "fixed-bind hard cut should not keep a separate followup-clear helper once callers can clear completed followups directly at the owning call site",
+    );
+    assert!(
+        !source.contains("async fn pending_fixed_bind_claim_release_followup_disposition"),
+        "fixed-bind hard cut should not keep an app-level followup disposition wrapper once callers can read the machine disposition directly",
+    );
+    assert!(
+        !source.contains("fn pending_fixed_bind_claim_release_followup_disposition("),
+        "fixed-bind hard cut should not keep a machine-local followup disposition helper once owning callsites can derive followup state directly from fixed-bind truth",
+    );
+    assert!(
+        !source.contains("async fn observe_pending_fixed_bind_publication_snapshot("),
+        "fixed-bind hard cut should not keep an app-side fixed-bind observation wrapper once observe(app) can build the pending-publication snapshot directly",
+    );
+    assert!(
+        !source.contains("async fn observe_fixed_bind_snapshot_for_pending("),
+        "fixed-bind hard cut should not keep a registrant-side fixed-bind observation wrapper once surviving callsites can read the shared pending-publication snapshot builder directly",
+    );
+    assert!(
+        !source.contains("async fn facade_publication_ready(&self) -> bool"),
+        "fixed-bind hard cut should not keep an app-side publication-ready wrapper once owning callsites can read publication readiness directly from facade publication observation",
+    );
+    assert!(
+        !source.contains(
+            "async fn retry_pending_fixed_bind_facade_after_claim_release_without_query_followup("
+        ),
+        "fixed-bind hard cut should not keep a single-use claim-release retry wrapper once the owning publication-followup callsite can settle and clear followups directly",
+    );
+    assert!(
+        !source.contains("async fn settle_facade_publication_machine_after_optional_retry("),
+        "fixed-bind hard cut should not keep a dual-callsite settle helper once owning publication-followup and activate callsites can observe, retry, and re-observe directly",
+    );
+    assert!(
+        !source.contains("fn apply_pending_fixed_bind_publication_followup("),
+        "fixed-bind hard cut should not keep a publication-followup wrapper once surviving callsites can publish handoff readiness, set followup state, and notify directly",
+    );
+    assert!(
+        !source.contains("async fn pending_fixed_bind_route_suppression_disposition"),
+        "fixed-bind hard cut should not keep an app-level suppression disposition wrapper once callers can read the machine disposition directly",
+    );
+    assert!(
+        !source.contains("fn pending_fixed_bind_route_suppression_disposition("),
+        "fixed-bind hard cut should not keep a machine-local suppression disposition helper once owning callsites can derive suppression directly from fixed-bind truth",
+    );
+    assert!(
+        !source.contains("fn apply_pending_fixed_bind_bind_addr_in_use_followup"),
+        "fixed-bind hard cut should not keep a bind-addr-in-use followup wrapper once the spawn followup owner can publish that fixed-bind followup directly",
+    );
+    assert!(
+        !source.contains("fn active_fixed_bind_bind_addr_for(&self, active: &FacadeActivation)"),
+        "fixed-bind hard cut should not keep a one-shot active facade bind translator once the owning accessor can resolve the bind addr directly",
+    );
+    assert!(
+        !source.contains("async fn active_fixed_bind_bind_addr(&self) -> Option<String>"),
+        "fixed-bind hard cut should not keep a single-use active bind accessor once callers can resolve the active fixed-bind address directly at the owning call site",
+    );
+    assert!(
+        !source.contains("async fn observe_active_fixed_bind_handoffs("),
+        "fixed-bind hard cut should not keep an app-level active handoff wrapper once callers can observe handoffs directly from the resolved active bind address",
+    );
+    assert!(
+        !source.contains("async fn refresh_active_fixed_bind_facade_owner(&self)"),
+        "fixed-bind hard cut should not keep an app-level active-owner refresh helper once the owning followup callsite can mark active fixed-bind ownership directly",
+    );
+    assert!(
+        !source.contains("fn handoff_ready_bind_addr(&self) -> Option<&str>"),
+        "fixed-bind hard cut should not leave the old driver-local handoff-ready bind helper once facade publication owns fixed-bind followup reads",
+    );
+    assert!(
+        !source.contains("FixedBindObservation::release_handoff_blocker_for_publication"),
+        "fixed-bind hard cut should not leave publication release-blocker ownership on the observation carrier once facade publication owns that handoff lane",
+    );
+    assert!(
+        !source.contains("FixedBindObservation::completion_ready_after_release"),
+        "fixed-bind hard cut should not leave after-release completion ownership on the observation carrier once facade publication owns that continuation lane",
+    );
+    assert!(
+        !source.contains("FixedBindObservation::wait_for_completion_progress"),
+        "fixed-bind hard cut should not leave after-release completion waiting on the observation carrier once facade publication owns that continuation lane",
+    );
+    assert!(
+        !source.contains("from_fixed_bind_observation("),
+        "fixed-bind hard cut should not keep the old machine constructor that takes the observation carrier once publication consumes typed observed parts directly",
+    );
+    assert!(
+        !source.contains("fn from_observed_fixed_bind("),
+        "fixed-bind hard cut should not keep the old typed-part constructor once publication is built directly from machine-owned fields",
+    );
+    assert!(
+        !source.contains("fn from_pending_publication("),
+        "fixed-bind hard cut should not keep a trivial fixed-bind snapshot constructor once publication builds machine-owned fields directly",
+    );
+    assert!(
+        !source.contains("fn inactive() -> Self"),
+        "fixed-bind hard cut should not keep a trivial inactive fixed-bind snapshot constructor once production code builds the machine-owned zero state directly",
+    );
+    assert!(
+        !source.contains("FixedBindAfterReleaseRuntime::new()"),
+        "fixed-bind hard cut should not keep a trivial default after-release runtime constructor once production code builds the runtime with an explicit deadline",
+    );
+    assert!(
+        !source.contains("fn spawn_attempt_action(&self) -> FixedBindAfterReleaseAction")
+            && !source.contains(
+                "fn post_spawn_action(&self, completion_ready: bool) -> FixedBindAfterReleaseAction"
+            ),
+        "fixed-bind hard cut should not keep trivial now-wrapper after-release action helpers once production code calls the explicit _at variants at the owning call site",
+    );
+    assert!(
+        !source.contains("PendingFixedBindHandoffRegistrant::from_parts"),
+        "fixed-bind hard cut should not keep a trivial handoff-registrant constructor once production code builds the registrant directly at the owning call site",
+    );
+    assert!(
+        !source.contains("ActiveFixedBindFacadeRegistrant::from_parts"),
+        "fixed-bind hard cut should not keep a trivial active-registrant constructor once production code builds the registrant directly at the owning call site",
+    );
+    assert!(
+        !source.contains("fn matches_pending(&self, pending: &PendingFacadeActivation) -> bool {\n        pending.matches_route_resources(&self.route_key, &self.resource_ids)\n    }"),
+        "fixed-bind hard cut should not keep a trivial inflight->pending matcher once production code compares route/resource ownership directly at the owning call site",
+    );
+    assert!(
+        !source.contains("fn matches_pending(&self, pending: &PendingFacadeActivation) -> bool {\n        self.bind_addr == pending.resolved.bind_addr\n    }"),
+        "fixed-bind hard cut should not keep a trivial claim->pending matcher once production code compares bind ownership directly at the owning call site",
+    );
+    assert!(
+        !source.contains("#[cfg_attr(not(test), allow(dead_code))]\n    route_key: String,")
+            && !source.contains(
+                "#[cfg_attr(not(test), allow(dead_code))]\n    resource_ids: Vec<String>,"
+            ),
+        "fixed-bind hard cut should not keep stale route/resource shadow fields on ProcessFacadeClaim once bind ownership is the only production truth",
+    );
+    assert!(
+        !source.contains("fn matches_pending(&self, pending: &PendingFacadeActivation) -> bool {\n        self.matches_route_resources(&pending.route_key, &pending.resource_ids)\n            && self.generation == pending.generation\n    }")
+            && !source.contains("fn matches_route_resources(&self, route_key: &str, resource_ids: &[String]) -> bool {\n        self.route_key == route_key && self.resource_ids == resource_ids\n    }"),
+        "fixed-bind hard cut should not keep trivial facade-activation match helpers once production code compares route/resource ownership directly at the owning call site",
+    );
+    assert!(
+        !source.contains(
+            "fn matches_route_generation(&self, route_key: &str, generation: u64) -> bool"
+        ) && !source.contains("fn matches_active(&self, active: &FacadeActivation) -> bool")
+            && !source.contains(
+                "fn matches_active_route_resources(&self, active: &FacadeActivation) -> bool"
+            )
+            && !source
+                .contains("fn matches_status(&self, status: &SharedFacadePendingStatus) -> bool")
+            && !source.contains("fn pending_status_matches("),
+        "fixed-bind hard cut should not keep pending-facade matcher helpers once production code compares route/resource/generation ownership directly at the owning call site",
+    );
+    assert!(
+        !source.contains(
+            "fn handoff_continuation(&self, bind_addr: &str) -> PendingFixedBindHandoffContinuation"
+        ) && !source.contains(
+            "fn active_fixed_bind_facade_registrant(&self) -> ActiveFixedBindFacadeRegistrant"
+        ),
+        "fixed-bind hard cut should not keep trivial handoff/active-registrant constructor wrappers once production code builds these continuations directly at the owning call site",
+    );
+    assert!(
+        !source.contains("fn pending_fixed_bind_handoff_registrant(&self) -> PendingFixedBindHandoffRegistrant")
+            && !source.contains("fn into_pending_fixed_bind_handoff_registrant(&self) -> PendingFixedBindHandoffRegistrant"),
+        "fixed-bind hard cut should not keep a trivial app->registrant wrapper once production code builds the registrant directly at the owning call site",
+    );
+    assert!(
+        !source.contains("fn claim_conflict(&self) -> bool")
+            && !source.contains(
+                "fn conflicting_process_claim_for_handoff(&self) -> Option<ProcessFacadeClaim>"
+            ),
+        "fixed-bind hard cut should not keep trivial fixed-bind snapshot claim wrappers once production code reads claim conflict truth directly from owning fields",
+    );
+    assert!(
+        !source.contains(
+            "fn pending_fixed_bind_publication_incomplete(&self) -> Option<PendingFacadeActivation>"
+        ) && !source
+            .contains("fn pending_fixed_bind_handoff_ready_bind_addr(&self) -> Option<&str>"),
+        "fixed-bind hard cut should not keep trivial pending-publication snapshot accessors once production code reads pending publication truth directly from owning fields",
+    );
+    assert!(
+        !source.contains(
+            "fn publication_readiness_decision(&self) -> FacadePublicationReadinessDecision"
+        ) && !source.contains("fn publication_ready(&self) -> bool")
+            && !source.contains(
+                "fn ready_tail_decision(&self, publication_ready: bool) -> FacadeReadyTailDecision"
+            ),
+        "fixed-bind hard cut should not keep thin facade-gate observation wrappers once production code reads publication and ready-tail decisions directly from runtime ownership",
+    );
+    assert!(
+        !source.contains("fn phase(&self) -> FacadePublicationPhase"),
+        "fixed-bind hard cut should not keep a single-call snapshot phase wrapper once production code computes publication phase directly in the owning snapshot path",
+    );
+    assert!(
+        !source.contains("fn observe_facade_publication_machine("),
+        "fixed-bind hard cut should not keep an app-side facade publication wrapper once the machine can observe its own gate and fixed-bind parts directly",
+    );
+    assert!(
+        !source.contains("async fn observe_facade_gate("),
+        "fixed-bind hard cut should not keep an app-side facade gate wrapper once publication observes the gate directly from app parts",
+    );
+}
+
+#[tokio::test]
+async fn facade_publication_machine_owns_fixed_bind_claim_release_and_route_suppression_dispositions()
+ {
+    let machine = fixed_bind_machine_for_tests(
+        Some(PendingFacadeActivation {
+            route_key: format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+            generation: 1,
+            resource_ids: vec!["listener".to_string()],
+            bound_scopes: Vec::new(),
+            group_ids: Vec::new(),
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            resolved: api::config::ResolvedApiConfig {
+                bind_addr: "127.0.0.1:4100".to_string(),
+                auth: api::ApiAuthConfig::default(),
+            },
+        }),
+        Some(ProcessFacadeClaim {
+            owner_instance_id: 7,
+            bind_addr: "127.0.0.1:4100".to_string(),
+        }),
+        true,
+        None,
+        None,
+    );
+
+    assert!(
+        machine.fixed_bind.claim_release_followup_pending
+            && machine.fixed_bind.pending_publication.is_some()
+            && machine.fixed_bind.conflicting_process_claim.is_some(),
+        "claim-release followup should now be derived directly from fixed-bind pending-publication and conflict truth",
+    );
+    assert!(
+        machine.fixed_bind.conflicting_process_claim.is_some()
+            || (machine.fixed_bind.claim_release_followup_pending
+                && machine.fixed_bind.pending_publication.is_some()),
+        "claim-conflict suppression should now be derived directly from fixed-bind conflict truth and followup disposition",
+    );
 }
 
 async fn facade_deactivate_continuity_execution_plan_for_tests(
@@ -2835,29 +3359,25 @@ async fn facade_deactivate_continuity_execution_plan_for_tests(
     } else {
         None
     };
-    fixed_bind_handoff_driver_for_tests(
-        PendingFixedBindPublicationState::new(
-            pending_fixed_bind_conflict.then(|| PendingFacadeActivation {
-                route_key: format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
-                generation: 1,
-                resource_ids: vec!["listener".to_string()],
-                bound_scopes: Vec::new(),
-                group_ids: Vec::new(),
-                runtime_managed: true,
-                runtime_exposure_confirmed: true,
-                resolved: api::config::ResolvedApiConfig {
-                    bind_addr: "127.0.0.1:4100".to_string(),
-                    auth: api::ApiAuthConfig::default(),
-                },
-            }),
-            pending_fixed_bind_conflict.then(|| ProcessFacadeClaim {
-                owner_instance_id: 7,
-                route_key: format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
-                resource_ids: vec!["listener".to_string()],
+    fixed_bind_machine_for_tests(
+        pending_fixed_bind_conflict.then(|| PendingFacadeActivation {
+            route_key: format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+            generation: 1,
+            resource_ids: vec!["listener".to_string()],
+            bound_scopes: Vec::new(),
+            group_ids: Vec::new(),
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            resolved: api::config::ResolvedApiConfig {
                 bind_addr: "127.0.0.1:4100".to_string(),
-            }),
-            pending_fixed_bind_conflict,
-        ),
+                auth: api::ApiAuthConfig::default(),
+            },
+        }),
+        pending_fixed_bind_conflict.then(|| ProcessFacadeClaim {
+            owner_instance_id: 7,
+            bind_addr: "127.0.0.1:4100".to_string(),
+        }),
+        pending_fixed_bind_conflict,
         release_handoff.clone(),
         release_for_fixed_bind_handoff.then(|| ActiveFixedBindShutdownContinuation {
             bind_addr: "127.0.0.1:4100".to_string(),
@@ -2922,8 +3442,10 @@ async fn facade_deactivate_continuity_execution_plan_shuts_down_when_no_continui
 
 #[tokio::test]
 async fn facade_deactivate_continuity_execution_plan_reuses_observed_handoff_state_for_release() {
-    let plan = fixed_bind_handoff_driver_for_tests(
-        PendingFixedBindPublicationState::inactive(false),
+    let plan = fixed_bind_machine_for_tests(
+        None,
+        None,
+        false,
         Some(pending_fixed_bind_handoff_continuation_for_tests("127.0.0.1:4100").await),
         Some(ActiveFixedBindShutdownContinuation {
             bind_addr: "127.0.0.1:4100".to_string(),
@@ -2941,8 +3463,10 @@ async fn facade_deactivate_continuity_execution_plan_reuses_observed_handoff_sta
 
 #[tokio::test]
 async fn facade_deactivate_continuity_execution_plan_reuses_observed_handoff_state_for_shutdown() {
-    let plan = fixed_bind_handoff_driver_for_tests(
-        PendingFixedBindPublicationState::inactive(false),
+    let plan = fixed_bind_machine_for_tests(
+        None,
+        None,
+        false,
         None,
         Some(ActiveFixedBindShutdownContinuation {
             bind_addr: "127.0.0.1:4100".to_string(),
@@ -3431,7 +3955,9 @@ async fn facade_publication_ready_requires_active_control_stream_when_pending_fa
     });
 
     assert!(
-        !app.facade_publication_ready().await,
+        !FacadePublicationMachine::from_input(app.collect_facade_publication_input().await)
+            .snapshot()
+            .publication_ready,
         "non-control pending facade must not mark publication ready before an active control stream exists",
     );
 }
@@ -10105,8 +10631,6 @@ async fn pending_fixed_bind_facade_claim_keeps_successor_not_ready_until_publica
             bind_addr.clone(),
             ProcessFacadeClaim {
                 owner_instance_id: app.instance_id + 1,
-                route_key: facade_control_stream_route(),
-                resource_ids: vec![listener_resource.resource_id.clone()],
                 bind_addr: bind_addr.clone(),
             },
         );
@@ -10208,8 +10732,6 @@ async fn pending_fixed_bind_facade_claim_survives_later_facade_deactivate_follow
             bind_addr.clone(),
             ProcessFacadeClaim {
                 owner_instance_id: app.instance_id + 1,
-                route_key: facade_control_stream_route(),
-                resource_ids: vec![listener_resource.resource_id.clone()],
                 bind_addr: bind_addr.clone(),
             },
         );
@@ -11548,8 +12070,10 @@ async fn pending_fixed_bind_conflict_marks_handoff_ready_while_active_facade_exi
     };
     *app.pending_facade.lock().await = Some(pending.clone());
 
-    let existing_claim = ProcessFacadeClaim::from_pending(app.instance_id + 1, &pending)
-        .expect("build predecessor claim");
+    let existing_claim = ProcessFacadeClaim {
+        owner_instance_id: app.instance_id + 1,
+        bind_addr: pending.resolved.bind_addr.clone(),
+    };
     let mut claim_guard = match process_facade_claim_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -11656,8 +12180,10 @@ async fn pending_fixed_bind_publication_release_uses_local_registrant_when_ready
     };
     *app.pending_facade.lock().await = Some(pending.clone());
 
-    let conflicting_claim = ProcessFacadeClaim::from_pending(app.instance_id + 1, &pending)
-        .expect("build conflicting claim");
+    let conflicting_claim = ProcessFacadeClaim {
+        owner_instance_id: app.instance_id + 1,
+        bind_addr: pending.resolved.bind_addr.clone(),
+    };
     process_facade_claim_cell()
         .lock()
         .expect("lock claim cell")
@@ -11673,11 +12199,34 @@ async fn pending_fixed_bind_publication_release_uses_local_registrant_when_ready
         "publication release should not require a pre-populated ready-table entry"
     );
 
-    let handoff = app
-        .pending_fixed_bind_handoff_registrant()
-        .release_handoff_blocker_for_publication(&pending)
-        .await
-        .expect("publication release should use the local registrant");
+    let handoff = PendingFixedBindHandoffRegistrant {
+        instance_id: app.instance_id,
+        api_task: app.api_task.clone(),
+        pending_facade: app.pending_facade.clone(),
+        pending_fixed_bind_claim_release_followup: app
+            .pending_fixed_bind_claim_release_followup
+            .clone(),
+        pending_fixed_bind_has_suppressed_dependent_routes: app
+            .pending_fixed_bind_has_suppressed_dependent_routes
+            .clone(),
+        facade_spawn_in_progress: app.facade_spawn_in_progress.clone(),
+        facade_pending_status: app.facade_pending_status.clone(),
+        facade_service_state: app.facade_service_state.clone(),
+        rollout_status: app.rollout_status.clone(),
+        api_request_tracker: app.api_request_tracker.clone(),
+        api_control_gate: app.api_control_gate.clone(),
+        runtime_gate_state: app.runtime_gate_state.clone(),
+        runtime_state_changed: app.runtime_state_changed.clone(),
+        node_id: app.node_id.clone(),
+        runtime_boundary: app.runtime_boundary.clone(),
+        source: app.source.clone(),
+        sink: app.sink.clone(),
+        query_sink: app.query_sink.clone(),
+        query_runtime_boundary: app.runtime_boundary.clone(),
+    }
+    .release_handoff_blocker_for_publication(&pending)
+    .await
+    .expect("publication release should use the local registrant");
 
     assert_eq!(handoff.bind_addr, bind_addr);
     assert_eq!(handoff.registrant.instance_id, app.instance_id);
@@ -11805,7 +12354,11 @@ async fn pending_fixed_bind_release_unblocks_control_gate_for_pending_facade() {
 
     *successor.pending_facade.lock().await = Some(pending.clone());
 
-    if let Some(claim) = ProcessFacadeClaim::from_pending(predecessor.instance_id, &pending) {
+    if !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
+        let claim = ProcessFacadeClaim {
+            owner_instance_id: predecessor.instance_id,
+            bind_addr: pending.resolved.bind_addr.clone(),
+        };
         process_facade_claim_cell()
             .lock()
             .expect("lock claim cell")
@@ -11951,7 +12504,11 @@ async fn pending_fixed_bind_release_keeps_control_gate_closed_while_source_repla
 
     *successor.pending_facade.lock().await = Some(pending.clone());
 
-    if let Some(claim) = ProcessFacadeClaim::from_pending(predecessor.instance_id, &pending) {
+    if !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
+        let claim = ProcessFacadeClaim {
+            owner_instance_id: predecessor.instance_id,
+            bind_addr: pending.resolved.bind_addr.clone(),
+        };
         process_facade_claim_cell()
             .lock()
             .expect("lock claim cell")
@@ -12116,7 +12673,11 @@ async fn pending_fixed_bind_release_does_not_overwrite_pending_facade_state_with
 
     *successor.pending_facade.lock().await = Some(pending.clone());
 
-    if let Some(claim) = ProcessFacadeClaim::from_pending(predecessor.instance_id, &pending) {
+    if !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
+        let claim = ProcessFacadeClaim {
+            owner_instance_id: predecessor.instance_id,
+            bind_addr: pending.resolved.bind_addr.clone(),
+        };
         process_facade_claim_cell()
             .lock()
             .expect("lock claim cell")
@@ -12220,7 +12781,9 @@ async fn pending_fixed_bind_release_does_not_overwrite_pending_facade_state_with
         "fixed-bind handoff completion must keep the API control gate closed when a higher-generation pending facade reappears before the ready tail completes"
     );
     assert!(
-        !successor.facade_publication_ready().await,
+        !FacadePublicationMachine::from_input(successor.collect_facade_publication_input().await)
+            .snapshot()
+            .publication_ready,
         "fixed-bind handoff completion must not treat a stale active control stream as publication-ready when a higher-generation pending facade reappears before the ready tail completes"
     );
 
@@ -12354,7 +12917,11 @@ async fn pending_fixed_bind_release_reopens_control_gate_when_non_control_pendin
 
     *successor.pending_facade.lock().await = Some(pending.clone());
 
-    if let Some(claim) = ProcessFacadeClaim::from_pending(predecessor.instance_id, &pending) {
+    if !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
+        let claim = ProcessFacadeClaim {
+            owner_instance_id: predecessor.instance_id,
+            bind_addr: pending.resolved.bind_addr.clone(),
+        };
         process_facade_claim_cell()
             .lock()
             .expect("lock claim cell")
@@ -12436,7 +13003,9 @@ async fn pending_fixed_bind_release_reopens_control_gate_when_non_control_pendin
         "fixed-bind handoff completion must reopen the API control gate when a non-control pending facade reappears but the active control stream still exists"
     );
     assert!(
-        successor.facade_publication_ready().await,
+        FacadePublicationMachine::from_input(successor.collect_facade_publication_input().await)
+            .snapshot()
+            .publication_ready,
         "fixed-bind handoff completion must treat the active control stream as publication-ready when the reintroduced pending facade is not the control route"
     );
     assert_eq!(
@@ -12578,7 +13147,11 @@ async fn pending_fixed_bind_release_keeps_facade_unavailable_when_active_control
 
     *successor.pending_facade.lock().await = Some(pending.clone());
 
-    if let Some(claim) = ProcessFacadeClaim::from_pending(predecessor.instance_id, &pending) {
+    if !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
+        let claim = ProcessFacadeClaim {
+            owner_instance_id: predecessor.instance_id,
+            bind_addr: pending.resolved.bind_addr.clone(),
+        };
         process_facade_claim_cell()
             .lock()
             .expect("lock claim cell")
@@ -12761,7 +13334,11 @@ async fn pending_fixed_bind_release_remains_blocked_without_runtime_exposure_con
 
     *successor.pending_facade.lock().await = Some(pending.clone());
 
-    if let Some(claim) = ProcessFacadeClaim::from_pending(predecessor.instance_id, &pending) {
+    if !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
+        let claim = ProcessFacadeClaim {
+            owner_instance_id: predecessor.instance_id,
+            bind_addr: pending.resolved.bind_addr.clone(),
+        };
         process_facade_claim_cell()
             .lock()
             .expect("lock claim cell")
@@ -12775,7 +13352,9 @@ async fn pending_fixed_bind_release_remains_blocked_without_runtime_exposure_con
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        !successor.facade_publication_ready().await,
+        !FacadePublicationMachine::from_input(successor.collect_facade_publication_input().await)
+            .snapshot()
+            .publication_ready,
         "facade publication must remain blocked while runtime exposure is still unconfirmed"
     );
     assert!(
@@ -12892,7 +13471,11 @@ async fn fixed_bind_handoff_release_waits_for_live_suppressed_route_state() {
 
     *successor.pending_facade.lock().await = Some(pending.clone());
 
-    if let Some(claim) = ProcessFacadeClaim::from_pending(predecessor.instance_id, &pending) {
+    if !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
+        let claim = ProcessFacadeClaim {
+            owner_instance_id: predecessor.instance_id,
+            bind_addr: pending.resolved.bind_addr.clone(),
+        };
         process_facade_claim_cell()
             .lock()
             .expect("lock claim cell")
@@ -13037,7 +13620,31 @@ async fn fixed_bind_handoff_release_ignores_non_control_pending_ready_entry() {
     });
     mark_pending_fixed_bind_handoff_ready(
         &bind_addr,
-        successor.pending_fixed_bind_handoff_registrant(),
+        PendingFixedBindHandoffRegistrant {
+            instance_id: successor.instance_id,
+            api_task: successor.api_task.clone(),
+            pending_facade: successor.pending_facade.clone(),
+            pending_fixed_bind_claim_release_followup: successor
+                .pending_fixed_bind_claim_release_followup
+                .clone(),
+            pending_fixed_bind_has_suppressed_dependent_routes: successor
+                .pending_fixed_bind_has_suppressed_dependent_routes
+                .clone(),
+            facade_spawn_in_progress: successor.facade_spawn_in_progress.clone(),
+            facade_pending_status: successor.facade_pending_status.clone(),
+            facade_service_state: successor.facade_service_state.clone(),
+            rollout_status: successor.rollout_status.clone(),
+            api_request_tracker: successor.api_request_tracker.clone(),
+            api_control_gate: successor.api_control_gate.clone(),
+            runtime_gate_state: successor.runtime_gate_state.clone(),
+            runtime_state_changed: successor.runtime_state_changed.clone(),
+            node_id: successor.node_id.clone(),
+            runtime_boundary: successor.runtime_boundary.clone(),
+            source: successor.source.clone(),
+            sink: successor.sink.clone(),
+            query_sink: successor.query_sink.clone(),
+            query_runtime_boundary: successor.runtime_boundary.clone(),
+        },
     );
 
     assert!(
@@ -13104,8 +13711,6 @@ async fn pending_fixed_bind_claim_suppresses_all_facade_dependent_query_routes_r
             bind_addr.clone(),
             ProcessFacadeClaim {
                 owner_instance_id: app.instance_id + 1,
-                route_key: facade_control_stream_route(),
-                resource_ids: vec![listener_resource.resource_id.clone()],
                 bind_addr: bind_addr.clone(),
             },
         );
@@ -13243,8 +13848,6 @@ async fn pending_fixed_bind_claim_suppresses_sink_owned_facade_dependent_query_r
             bind_addr.clone(),
             ProcessFacadeClaim {
                 owner_instance_id: app.instance_id + 1,
-                route_key: facade_control_stream_route(),
-                resource_ids: vec![listener_resource.resource_id.clone()],
                 bind_addr: bind_addr.clone(),
             },
         );
@@ -16957,7 +17560,10 @@ async fn route_peer_turnover_keeps_facade_and_query_routes_live_during_replayed_
     let control_initialized = app.control_initialized();
     let source_replay_required = app.source_state_replay_required();
     let sink_replay_required = app.sink_state_replay_required();
-    let publication_ready = app.facade_publication_ready().await;
+    let publication_ready =
+        FacadePublicationMachine::from_input(app.collect_facade_publication_input().await)
+            .snapshot()
+            .publication_ready;
     assert!(
         control_initialized,
         "replayed mixed recovery should restore initialized runtime before serving status; source_replay_required={source_replay_required} sink_replay_required={sink_replay_required} publication_ready={publication_ready}"
@@ -31862,34 +32468,141 @@ async fn external_runtime_app_selected_group_proxy_materializes_each_local_prima
     )
     .expect("init external-worker runtime app");
 
-    app.on_control_frame(&[
-        activate_envelope_with_scope_rows(
-            execution_units::SOURCE_RUNTIME_UNIT_ID,
-            &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
-            1,
-        ),
-        activate_envelope_with_scope_rows(
-            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
-            &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
-            1,
-        ),
-        activate_envelope_with_scope_rows(
-            execution_units::SINK_RUNTIME_UNIT_ID,
-            &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
-            1,
-        ),
-        activate_envelope_with_route_key_and_scope_rows(
-            execution_units::QUERY_RUNTIME_UNIT_ID,
-            format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
-            &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
-            1,
-        ),
-    ])
-    .await
-    .expect("apply runtime control");
+    let source_wave = |generation| {
+        vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+        ]
+    };
+    let sink_wave = |generation| {
+        let root_scopes = &[
+            ("nfs1", &["node-a::nfs1"][..]),
+            ("nfs2", &["node-a::nfs2"][..]),
+        ];
+        let mut signals = vec![
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                root_scopes,
+                generation,
+            ),
+        ];
+        for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+            signals.push(activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                sink_query_request_route_for(node_id).0,
+                root_scopes,
+                generation,
+            ));
+        }
+        signals
+    };
+    let facade_wave = |generation| {
+        let listener_scopes = &[
+            ("nfs1", &["node-a::nfs1"][..]),
+            ("nfs2", &["node-a::nfs2"][..]),
+        ];
+        vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                listener_scopes,
+                generation,
+            ),
+        ]
+    };
+
+    let mut initial = source_wave(1);
+    initial.extend(sink_wave(1));
+    initial.extend(facade_wave(1));
+    app.on_control_frame(&initial)
+        .await
+        .expect("apply runtime control");
 
     let expected_groups =
         std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let expected_source_groups = std::collections::BTreeSet::new();
     let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let source_groups = app
@@ -31910,7 +32623,7 @@ async fn external_runtime_app_selected_group_proxy_materializes_each_local_prima
             .await
             .expect("sink groups")
             .unwrap_or_default();
-        if source_groups == expected_groups
+        if source_groups == expected_source_groups
             && scan_groups == expected_groups
             && sink_groups == expected_groups
         {
@@ -31921,6 +32634,29 @@ async fn external_runtime_app_selected_group_proxy_materializes_each_local_prima
             "timed out waiting for runtime scope convergence: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = app
+            .sink
+            .status_snapshot()
+            .await
+            .expect("sink status snapshot");
+        let ready_groups = snapshot
+            .groups
+            .iter()
+            .filter(|group| group.is_ready())
+            .map(|group| group.group_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if ready_groups == expected_groups {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < readiness_deadline,
+            "timed out waiting for sink readiness before selected-group proxy query: ready={ready_groups:?} snapshot={snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     for group_id in ["nfs1", "nfs2"] {
@@ -32155,6 +32891,7 @@ async fn external_runtime_app_selected_group_proxy_rematerializes_each_local_pri
         let app = app.clone();
         let boundary = boundary.clone();
         let expected_groups = expected_groups.clone();
+        let expected_source_groups = std::collections::BTreeSet::new();
         async move {
             let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             loop {
@@ -32176,7 +32913,7 @@ async fn external_runtime_app_selected_group_proxy_rematerializes_each_local_pri
                     .await
                     .expect("sink groups")
                     .unwrap_or_default();
-                if source_groups == expected_groups
+                if source_groups == expected_source_groups
                     && scan_groups == expected_groups
                     && sink_groups == expected_groups
                 {
@@ -32332,6 +33069,7 @@ async fn current_generation_sink_events_tick_after_sink_worker_reset_and_manual_
 
     let expected_groups =
         std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let expected_source_groups = std::collections::BTreeSet::new();
 
     let source_wave = |generation| {
         vec![
@@ -32413,7 +33151,7 @@ async fn current_generation_sink_events_tick_after_sink_worker_reset_and_manual_
             .await
             .expect("sink groups")
             .unwrap_or_default();
-        if source_groups == expected_groups
+        if source_groups == expected_source_groups
             && scan_groups == expected_groups
             && sink_groups == expected_groups
         {
@@ -32532,34 +33270,141 @@ async fn external_runtime_app_selected_group_proxy_materializes_each_local_prima
     )
     .expect("init external-worker runtime app");
 
-    app.on_control_frame(&[
-        activate_envelope_with_scope_rows(
-            execution_units::SOURCE_RUNTIME_UNIT_ID,
-            &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
-            1,
-        ),
-        activate_envelope_with_scope_rows(
-            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
-            &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
-            1,
-        ),
-        activate_envelope_with_scope_rows(
-            execution_units::SINK_RUNTIME_UNIT_ID,
-            &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
-            1,
-        ),
-        activate_envelope_with_route_key_and_scope_rows(
-            execution_units::QUERY_RUNTIME_UNIT_ID,
-            format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
-            &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
-            1,
-        ),
-    ])
-    .await
-    .expect("apply runtime control");
+    let source_wave = |generation| {
+        vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                generation,
+            ),
+        ]
+    };
+    let sink_wave = |generation| {
+        let root_scopes = &[
+            ("nfs1", &["node-a::nfs1"][..]),
+            ("nfs2", &["node-a::nfs2"][..]),
+        ];
+        let mut signals = vec![
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_EVENTS),
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+                root_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_FORCE_FIND),
+                root_scopes,
+                generation,
+            ),
+        ];
+        for node_id in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+            signals.push(activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                sink_query_request_route_for(node_id).0,
+                root_scopes,
+                generation,
+            ));
+        }
+        signals
+    };
+    let facade_wave = |generation| {
+        let listener_scopes = &[
+            ("nfs1", &["node-a::nfs1"][..]),
+            ("nfs2", &["node-a::nfs2"][..]),
+        ];
+        vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                listener_scopes,
+                generation,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                listener_scopes,
+                generation,
+            ),
+        ]
+    };
+
+    let mut initial = source_wave(1);
+    initial.extend(sink_wave(1));
+    initial.extend(facade_wave(1));
+    app.on_control_frame(&initial)
+        .await
+        .expect("apply runtime control");
 
     let expected_groups =
         std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let expected_source_groups = std::collections::BTreeSet::new();
     let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         let source_groups = app
@@ -32580,7 +33425,7 @@ async fn external_runtime_app_selected_group_proxy_materializes_each_local_prima
             .await
             .expect("sink groups")
             .unwrap_or_default();
-        if source_groups == expected_groups
+        if source_groups == expected_source_groups
             && scan_groups == expected_groups
             && sink_groups == expected_groups
         {
@@ -32591,6 +33436,29 @@ async fn external_runtime_app_selected_group_proxy_materializes_each_local_prima
             "timed out waiting for runtime scope convergence: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let snapshot = app
+            .sink
+            .status_snapshot()
+            .await
+            .expect("sink status snapshot");
+        let ready_groups = snapshot
+            .groups
+            .iter()
+            .filter(|group| group.is_ready())
+            .map(|group| group.group_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if ready_groups == expected_groups {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < readiness_deadline,
+            "timed out waiting for sink readiness before selected-group proxy query: ready={ready_groups:?} snapshot={snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     for group_id in ["nfs1", "nfs2"] {

@@ -77,6 +77,9 @@ enum SourceWorkerAction {
     PublishManualRescanSignal {
         source: Arc<FSMetaSource>,
     },
+    TriggerRescanWhenReadyEpoch {
+        source: Arc<FSMetaSource>,
+    },
     OnControlFrame {
         source: Arc<FSMetaSource>,
         envelopes: Vec<ControlEnvelope>,
@@ -110,6 +113,7 @@ fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
         SourceWorkerRequest::HostObjectGrantsSnapshot => "HostObjectGrantsSnapshot",
         SourceWorkerRequest::HostObjectGrantsVersionSnapshot => "HostObjectGrantsVersionSnapshot",
         SourceWorkerRequest::StatusSnapshot => "StatusSnapshot",
+        SourceWorkerRequest::ProgressSnapshot => "ProgressSnapshot",
         SourceWorkerRequest::ObservabilitySnapshot => "ObservabilitySnapshot",
         SourceWorkerRequest::LifecycleState => "LifecycleState",
         SourceWorkerRequest::ScheduledSourceGroupIds => "ScheduledSourceGroupIds",
@@ -122,7 +126,7 @@ fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
         SourceWorkerRequest::ForceFind { .. } => "ForceFind",
         SourceWorkerRequest::ResolveGroupIdForObjectRef { .. } => "ResolveGroupIdForObjectRef",
         SourceWorkerRequest::PublishManualRescanSignal => "PublishManualRescanSignal",
-        SourceWorkerRequest::TriggerRescanWhenReady => "TriggerRescanWhenReady",
+        SourceWorkerRequest::TriggerRescanWhenReadyEpoch => "TriggerRescanWhenReadyEpoch",
         SourceWorkerRequest::OnControlFrame { .. } => "OnControlFrame",
     }
 }
@@ -602,7 +606,8 @@ fn request_requires_live_publish_pump(request: &SourceWorkerRequest) -> bool {
         request,
         SourceWorkerRequest::UpdateLogicalRoots { .. }
             | SourceWorkerRequest::PublishManualRescanSignal
-            | SourceWorkerRequest::TriggerRescanWhenReady
+            | SourceWorkerRequest::TriggerRescanWhenReadyEpoch
+            | SourceWorkerRequest::ProgressSnapshot
             | SourceWorkerRequest::ObservabilitySnapshot
             | SourceWorkerRequest::OnControlFrame { .. }
     )
@@ -809,6 +814,16 @@ fn plan_worker_request(
                 false,
             ),
         },
+        SourceWorkerRequest::ProgressSnapshot => match state.source.as_ref() {
+            Some(source) => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::ProgressSnapshot(source.progress_snapshot()),
+                false,
+            ),
+            None => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
         SourceWorkerRequest::ObservabilitySnapshot => match state.source.as_ref() {
             Some(source) => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::ObservabilitySnapshot(source_observability_snapshot(
@@ -980,13 +995,8 @@ fn plan_worker_request(
                 false,
             ),
         },
-        SourceWorkerRequest::TriggerRescanWhenReady => match state.source.clone() {
-            Some(source) => {
-                tokio::spawn(async move {
-                    source.trigger_rescan_when_ready().await;
-                });
-                SourceWorkerAction::Immediate(SourceWorkerResponse::Ack, false)
-            }
+        SourceWorkerRequest::TriggerRescanWhenReadyEpoch => match state.source.clone() {
+            Some(source) => SourceWorkerAction::TriggerRescanWhenReadyEpoch { source },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
@@ -1057,6 +1067,10 @@ async fn execute_worker_action(action: SourceWorkerAction) -> (SourceWorkerRespo
                 Ok(()) => (SourceWorkerResponse::Ack, false),
                 Err(err) => (classify_source_worker_error(err), false),
             }
+        }
+        SourceWorkerAction::TriggerRescanWhenReadyEpoch { source } => {
+            let epoch = source.trigger_rescan_when_ready_epoch().await;
+            (SourceWorkerResponse::RescanRequestEpoch(epoch), false)
         }
         SourceWorkerAction::OnControlFrame { source, envelopes } => {
             match source.on_control_frame(&envelopes).await {
@@ -2057,11 +2071,14 @@ mod tests {
         );
 
         let (response, stop) = execute_worker_action(plan_worker_request(
-            SourceWorkerRequest::TriggerRescanWhenReady,
+            SourceWorkerRequest::TriggerRescanWhenReadyEpoch,
             &mut state,
         ))
         .await;
-        assert!(matches!(response, SourceWorkerResponse::Ack));
+        assert!(matches!(
+            response,
+            SourceWorkerResponse::RescanRequestEpoch(_)
+        ));
         assert!(
             !stop,
             "trigger_rescan_when_ready should not stop the worker in zero-grant watch-scan mode"
@@ -2214,11 +2231,14 @@ mod tests {
         );
 
         let (response, stop) = execute_worker_action(plan_worker_request(
-            SourceWorkerRequest::TriggerRescanWhenReady,
+            SourceWorkerRequest::TriggerRescanWhenReadyEpoch,
             &mut state,
         ))
         .await;
-        assert!(matches!(response, SourceWorkerResponse::Ack));
+        assert!(matches!(
+            response,
+            SourceWorkerResponse::RescanRequestEpoch(_)
+        ));
         assert!(
             !stop,
             "trigger_rescan_when_ready should not stop the worker in zero-grant watch-scan mode"

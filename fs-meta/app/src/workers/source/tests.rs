@@ -82,78 +82,730 @@ impl Drop for SourceWorkerLogicalRootsSnapshotHookReset {
 }
 
 #[test]
-fn source_refresh_runtime_owns_retry_followup_lane() {
-    let now = std::time::Instant::now();
-    let runtime = SourceRefreshRuntime::new(now + Duration::from_millis(250), Duration::from_secs(5));
-    let after = SourceProgressCursor::default();
+fn source_operation_attempt_timeout_clips_remaining_budget() {
+    let deadline = clip_retry_deadline(
+        std::time::Instant::now() + Duration::from_millis(250),
+        Duration::from_secs(5),
+    );
+    let timeout = source_operation_attempt_timeout(deadline, Duration::from_secs(5))
+        .expect("remaining budget should still admit an attempt timeout");
 
     assert!(
-        matches!(
-            runtime.followup_after(
-                CnxError::Timeout,
-                true,
-                can_retry_on_control_frame,
-                after,
-                SourceProgressMask::CONTROL_FLOW_RETRY,
-            ),
-            SourceRefreshFollowup::Apply(SourceRefreshRuntimeAction::ReconnectAndWaitForProgress {
-                after: observed_after,
-                accepted,
-                ..
-            }) if observed_after == after && accepted == SourceProgressMask::CONTROL_FLOW_RETRY,
-        ),
-        "source refresh runtime should own reconnect-and-wait-for-progress followup for retryable control-frame errors, including the accepted progress reasons, instead of leaving call sites to branch on deadline, reconnect policy, or unrelated progress release lanes",
+        timeout <= Duration::from_millis(250),
+        "source operation timeout budgeting should clip each attempt to the remaining deadline instead of letting per-call loops overshoot their caller budget",
     );
 }
 
 #[test]
-fn source_refresh_runtime_owns_non_retryable_followup_lane() {
-    let now = std::time::Instant::now();
-    let runtime = SourceRefreshRuntime::new(now + Duration::from_millis(250), Duration::from_secs(5));
-
-    match runtime.followup_after(
-        CnxError::InvalidInput("bad request".into()),
-        false,
-        can_retry_update_logical_roots,
-        SourceProgressCursor::default(),
-        SourceProgressMask::UPDATE_LOGICAL_ROOTS_RETRY,
-    ) {
-        SourceRefreshFollowup::ReturnErr(CnxError::InvalidInput(message)) => {
-            assert_eq!(message, "bad request");
-        }
-        other => panic!(
-            "source refresh runtime should own the non-retryable followup lane instead of leaving call sites to branch directly on the raw error: {other:?}"
+fn source_operation_attempt_timeout_owns_timeout_exhaustion_lane() {
+    assert!(
+        matches!(
+            source_operation_attempt_timeout(
+                std::time::Instant::now() - Duration::from_millis(1),
+                Duration::from_secs(5),
+            ),
+            Err(CnxError::Timeout)
         ),
+        "source operation timeout budgeting should own deadline exhaustion instead of leaving each operation loop to hand-roll timeout terminal lanes",
+    );
+}
+
+#[test]
+fn source_progress_state_only_releases_relevant_wait_reason() {
+    let mut state = SourceProgressState::default();
+    let baseline = state;
+    state.bump(SourceProgressReason::ObservabilityUpdated);
+
+    assert!(
+        SourceWaitFor::Observability.satisfied_by(state, baseline),
+        "observability progress should release observability waits",
+    );
+    assert!(
+        !SourceWaitFor::ControlFlowRetry.satisfied_by(state, baseline),
+        "observability refresh should not accidentally release control-flow retries",
+    );
+
+    let observability_only = state;
+    state.bump(SourceProgressReason::WorkerClientReplaced);
+    assert!(
+        SourceWaitFor::ControlFlowRetry.satisfied_by(state, observability_only),
+        "worker replacement should release control-flow retries",
+    );
+    assert!(
+        SourceWaitFor::LogicalRoots.satisfied_by(state, observability_only),
+        "worker replacement should release update-roots retries",
+    );
+}
+
+#[test]
+fn source_control_frame_machine_owns_retained_tick_entry_lane() {
+    let _machine = SourceControlFrameMachine {
+        operation_deadline: clip_retry_deadline(
+            std::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+        rpc_timeout: Duration::from_millis(250),
+        existing_client_present: false,
+        fail_fast_on_control_frame_bridge_reset: false,
+        generation_one_activate_only: false,
+        prefer_short_existing_client_attempt: false,
+        fail_fast_short_caller_budget_bridge_reset: false,
+        generation_one_timeout_like_reset_seen: false,
+    };
+    let action = SourceControlFrameEffect::RetainedTickFastPath;
+
+    assert!(
+        matches!(action, SourceControlFrameEffect::RetainedTickFastPath),
+        "source control-frame machine should own the retained-tick fast-path lane instead of leaving on_control_frame_with_timeouts to branch directly on retained_tick_only_wave",
+    );
+}
+
+#[test]
+fn source_control_frame_machine_owns_reconnect_then_retained_tick_replay_followup_lane() {
+    let mut machine = SourceControlFrameMachine {
+        operation_deadline: clip_retry_deadline(
+            std::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+        rpc_timeout: Duration::from_millis(250),
+        existing_client_present: false,
+        fail_fast_on_control_frame_bridge_reset: false,
+        generation_one_activate_only: false,
+        prefer_short_existing_client_attempt: false,
+        fail_fast_short_caller_budget_bridge_reset: false,
+        generation_one_timeout_like_reset_seen: false,
+    };
+    let reconnect = SourceControlFrameEffect::ReconnectThenReplayRetainedTick;
+    let replay = machine
+        .advance(SourceControlFrameEvent::ReconnectThenReplayRetainedTickCompleted)
+        .expect("reconnect-then-replay followup should resume into retained-tick replay");
+
+    assert!(
+        matches!(
+            reconnect,
+            SourceControlFrameEffect::ReconnectThenReplayRetainedTick
+        ) && matches!(replay, SourceControlFrameEffect::RetainedTickReplay),
+        "source control-frame machine should own reconnect-then-retained-tick replay through an explicit reconnect action instead of hidden reconnect followup state",
+    );
+}
+
+#[test]
+fn source_control_frame_machine_owns_generation_one_timeout_reset_retry_lane() {
+    let mut machine = SourceControlFrameMachine {
+        operation_deadline: clip_retry_deadline(
+            std::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+        rpc_timeout: Duration::from_millis(250),
+        existing_client_present: false,
+        fail_fast_on_control_frame_bridge_reset: false,
+        generation_one_activate_only: true,
+        prefer_short_existing_client_attempt: false,
+        fail_fast_short_caller_budget_bridge_reset: false,
+        generation_one_timeout_like_reset_seen: false,
+    };
+    let action = machine.action_after_error(CnxError::Timeout, SourceProgressState::default());
+    let retry_action = machine
+        .advance(SourceControlFrameEvent::ReconnectThenAttemptCompleted)
+        .expect("generation-one timeout-like reset should resume with another attempt");
+    let terminal_reconnect =
+        machine.action_after_error(CnxError::ChannelClosed, SourceProgressState::default());
+    let terminal_action = machine
+        .advance(SourceControlFrameEvent::ReconnectThenFailCompleted(
+            CnxError::ChannelClosed,
+        ))
+        .expect("bridge-reset fail-fast reconnect should resume into a terminal action");
+
+    assert!(
+        matches!(action, SourceControlFrameEffect::ReconnectThenAttempt)
+            && matches!(retry_action, SourceControlFrameEffect::Attempt { .. })
+            && matches!(
+                terminal_reconnect,
+                SourceControlFrameEffect::ReconnectThenFail(CnxError::ChannelClosed)
+            )
+            && matches!(
+                terminal_action,
+                SourceControlFrameEffect::Fail(CnxError::ChannelClosed)
+            ),
+        "source control-frame machine should own explicit reconnect followup actions for generation-one timeout-like resets instead of hiding retry and terminal bridge-reset lanes behind reconnect state",
+    );
+}
+
+#[test]
+fn source_control_frame_machine_owns_retry_resume_followup_lane() {
+    let mut machine = SourceControlFrameMachine {
+        operation_deadline: clip_retry_deadline(
+            std::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+        rpc_timeout: Duration::from_millis(250),
+        existing_client_present: false,
+        fail_fast_on_control_frame_bridge_reset: false,
+        generation_one_activate_only: false,
+        prefer_short_existing_client_attempt: false,
+        fail_fast_short_caller_budget_bridge_reset: false,
+        generation_one_timeout_like_reset_seen: false,
+    };
+    let reconnect = machine.action_after_error(CnxError::Timeout, SourceProgressState::default());
+    let wait = machine
+        .advance(SourceControlFrameEvent::ReconnectThenWaitCompleted {
+            after: SourceProgressState::default(),
+        })
+        .expect("retry reconnect should resume into a wait-for-progress action");
+    let action = machine
+        .advance(SourceControlFrameEvent::WaitCompleted)
+        .expect("wait completion should produce the next attempt action");
+
+    assert!(
+        matches!(
+            reconnect,
+            SourceControlFrameEffect::ReconnectThenWait { .. }
+        ) && machine.existing_client_present
+            && matches!(wait, SourceControlFrameEffect::Wait { .. })
+            && matches!(action, SourceControlFrameEffect::Attempt { .. }),
+        "source control-frame machine should own explicit reconnect and wait retry continuation instead of hiding it behind reconnect followup state",
+    );
+}
+
+#[test]
+fn source_control_frame_machine_owns_non_retryable_terminal_lane() {
+    let mut machine = SourceControlFrameMachine {
+        operation_deadline: clip_retry_deadline(
+            std::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+        rpc_timeout: Duration::from_millis(250),
+        existing_client_present: false,
+        fail_fast_on_control_frame_bridge_reset: false,
+        generation_one_activate_only: false,
+        prefer_short_existing_client_attempt: false,
+        fail_fast_short_caller_budget_bridge_reset: false,
+        generation_one_timeout_like_reset_seen: false,
+    };
+
+    assert!(
+        matches!(
+            machine.action_after_error(
+                CnxError::InvalidInput("bad request".into()),
+                SourceProgressState::default(),
+            ),
+            SourceControlFrameEffect::Fail(CnxError::InvalidInput(message))
+                if message == "bad request"
+        ),
+        "source control-frame machine should own the non-retryable terminal lane instead of leaking a generic SourceOperationPhase::Failed through the wait executor",
+    );
+}
+
+#[test]
+fn source_control_frame_machine_owns_unexpected_response_protocol_failure_lane() {
+    let mut machine = SourceControlFrameMachine {
+        operation_deadline: clip_retry_deadline(
+            std::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+        rpc_timeout: Duration::from_millis(250),
+        existing_client_present: false,
+        fail_fast_on_control_frame_bridge_reset: false,
+        generation_one_activate_only: false,
+        prefer_short_existing_client_attempt: false,
+        fail_fast_short_caller_budget_bridge_reset: false,
+        generation_one_timeout_like_reset_seen: false,
+    };
+
+    assert!(
+        matches!(
+            machine
+                .advance(SourceControlFrameEvent::RpcCompleted {
+                    rpc_result: Ok(SourceWorkerResponse::ScheduledGroupIds(Some(vec![
+                        "group-a".to_string(),
+                    ]))),
+                    after: SourceProgressState::default(),
+                    decoded_signals: &SourceControlFrameDecodedSignals::DecodeFailed,
+                    primed_local_schedule: None,
+                })
+                .expect("unexpected source worker response should still map into a terminal action"),
+            SourceControlFrameEffect::Fail(CnxError::ProtocolViolation(message))
+                if message.contains("unexpected source worker response for on_control_frame")
+        ),
+        "source control-frame machine should own unexpected-response protocol failure classification instead of leaving on_control_frame_with_timeouts to hand-roll a separate Ok(other) terminal branch",
+    );
+}
+
+#[test]
+fn source_control_frame_machine_owns_post_ack_schedule_refresh_followup_lane() {
+    let mut machine = SourceControlFrameMachine {
+        operation_deadline: clip_retry_deadline(
+            std::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        ),
+        rpc_timeout: Duration::from_millis(250),
+        existing_client_present: false,
+        fail_fast_on_control_frame_bridge_reset: false,
+        generation_one_activate_only: false,
+        prefer_short_existing_client_attempt: false,
+        fail_fast_short_caller_budget_bridge_reset: false,
+        generation_one_timeout_like_reset_seen: false,
+    };
+
+    let decoded_signals =
+        SourceControlFrameDecodedSignals::Decoded(vec![source_control_state_test_activate_signal(
+            SourceRuntimeUnit::Source,
+            ROUTE_KEY_QUERY,
+            1,
+            vec![RuntimeBoundScope {
+                scope_id: "nfs1".to_string(),
+                resource_ids: vec!["node-a::nfs1".to_string()],
+            }],
+        )]);
+    let post_ack = machine
+        .advance(SourceControlFrameEvent::RpcCompleted {
+            rpc_result: Ok(SourceWorkerResponse::Ack),
+            after: SourceProgressState::default(),
+            decoded_signals: &decoded_signals,
+            primed_local_schedule: Some(PrimedLocalScheduleSummary {
+                saw_activate_with_bound_scopes: true,
+                has_local_runnable_groups: true,
+            }),
+        })
+        .expect("ack should produce a post-ack cache side-effects action");
+
+    assert!(
+        matches!(
+            post_ack,
+            SourceControlFrameEffect::ApplyPostAckSignalsThenArmReplayAndRefreshScheduledGroups {
+                expect_local_runnable_groups: true,
+            },
+        ),
+        "source control-frame machine should encode the post-ack scheduled-groups refresh followup directly in its explicit action instead of stashing a queued followup across cache side effects",
+    );
+}
+
+#[test]
+fn source_control_frame_machine_observes_post_ack_summary_before_cache_side_effects() {
+    let source_impl = include_str!("../source.rs");
+
+    for required_symbol in [
+        "fn observe_post_ack_control_frame_cache(",
+        "fn apply_post_ack_control_frame_cache_side_effects(",
+    ] {
+        assert!(
+            source_impl.contains(required_symbol),
+            "workers/source control-frame hard cut regressed; ACK planning should use explicit observe/apply split before side effects: {required_symbol}",
+        );
+    }
+
+    for legacy_symbol in [
+        "fn prime_post_ack_control_frame_cache(",
+        "self.prime_post_ack_control_frame_cache(signals)",
+    ] {
+        assert!(
+            !source_impl.contains(legacy_symbol),
+            "workers/source control-frame hard cut regressed; ACK planning still mutates cache before the machine selects its followup lane: {legacy_symbol}",
+        );
     }
 }
 
 #[test]
-fn source_progress_state_only_bumps_relevant_wait_reason_mask() {
-    let mut state = SourceProgressState::default();
-    let baseline = state.cursor();
-    state.bump(SourceProgressReason::ObservabilityUpdated);
+fn source_operations_hard_cut_removed_generic_operation_machine_family() {
+    let source_impl = include_str!("../source.rs");
 
-    assert!(
-        state.advanced_past(baseline, SourceProgressMask::OBSERVABILITY_RETRY),
-        "observability progress should release observability waits via the accepted reason mask",
-    );
-    assert!(
-        !state.advanced_past(baseline, SourceProgressMask::CONTROL_FLOW_RETRY),
-        "observability refresh should not accidentally release control-flow retries",
-    );
+    for required_symbol in ["fn source_operation_attempt_timeout("] {
+        assert!(
+            source_impl.contains(required_symbol),
+            "workers/source hard cut regressed; operation-local retry loops should only share the surviving minimal timeout-budget helper: {required_symbol}",
+        );
+    }
 
-    let observability_only = state.cursor();
-    state.bump(SourceProgressReason::WorkerClientReplaced);
+    for legacy_symbol in [
+        "struct SourceOperationRetryPlan {",
+        "fn source_operation_retry_plan(",
+        "async fn apply_source_operation_retry_plan(",
+        "enum SourceOperationKind {",
+        "enum SourceOperationPhase {",
+        "struct SourceOperationMachine {",
+        "fn entry_phase(self) -> SourceOperationPhase",
+        "fn phase_after_error(",
+        "fn phase_after_wait(self) -> SourceOperationPhase",
+        "fn apply_source_operation_wait(",
+    ] {
+        assert!(
+            !source_impl.contains(legacy_symbol),
+            "workers/source hard cut regressed; generic source operation phase family returned to production: {legacy_symbol}",
+        );
+    }
+}
+
+#[test]
+fn source_control_frame_machine_owns_rpc_phase_dispatch_loop() {
+    let source_impl = include_str!("../source.rs");
+
+    for required_symbol in [
+        "struct SourceControlFrameExecutor<'a> {",
+        "enum SourceControlFrameDecodedSignals {",
+        "enum SourceControlFrameEvent<'a> {",
+        "enum SourceControlFrameExecutorOutcome<'a> {",
+        "fn rpc_attempt_plan(",
+        "async fn execute_control_frame_effect(",
+        "async fn execute_control_frame(",
+        "fn action_after_error(",
+        "fn advance(",
+        "SourceControlFrameDecodedSignals::DecodeFailed",
+        "SourceControlFrameEffect::RetainedTickFastPath",
+        "SourceControlFrameEffect::ReconnectThenAttempt",
+        "SourceControlFrameEffect::ReconnectThenWait {",
+        "SourceControlFrameEffect::ReconnectThenReplayRetainedTick",
+        "SourceControlFrameEffect::ReconnectThenFail(",
+        "SourceControlFrameEffect::ApplyPostAckSignalsThenComplete",
+        "SourceControlFrameEffect::ApplyPostAckSignalsThenArmReplayAndRefreshScheduledGroups {",
+        "SourceControlFrameEffect::Complete",
+        "SourceControlFrameEffect::RefreshScheduledGroups {",
+        "SourceControlFrameEffect::ArmReplayThenRefreshScheduledGroups {",
+        "SourceControlFrameEffect::Attempt {",
+        "SourceControlFrameEffect::Wait {",
+        "SourceControlFrameEvent::RpcCompleted {",
+        "SourceControlFrameEvent::ReconnectThenAttemptCompleted",
+        "SourceControlFrameEvent::ReconnectThenWaitCompleted {",
+        "SourceControlFrameEvent::ReconnectThenReplayRetainedTickCompleted",
+        "SourceControlFrameEvent::ReconnectThenFailCompleted(",
+        "SourceControlFrameEvent::WaitCompleted",
+        "SourceControlFrameEvent::ApplyPostAckSignalsThenCompleteCompleted",
+        "SourceControlFrameEvent::ApplyPostAckSignalsThenArmReplayAndRefreshScheduledGroupsCompleted {",
+        "SourceControlFrameEvent::RefreshScheduledGroupsCompleted {",
+        "SourceControlFrameEvent::ArmReplayThenRefreshScheduledGroupsCompleted {",
+    ] {
+        assert!(
+            source_impl.contains(required_symbol),
+            "workers/source control-frame hard cut regressed; RPC loop should be owned by dedicated machine-driven helpers instead of inlined in the outer shell: {required_symbol}",
+        );
+    }
+
+    for legacy_symbol in [
+        "enum SourceControlFrameErrorPhase {",
+        "fn operation_machine(self, existing_client_present: bool) -> SourceOperationMachine {",
+        "enum SourceControlFrameRpcPhase {",
+        "enum SourceControlFrameLoopProgress {",
+        "struct SourceControlFrameRpcAttemptOutcome {",
+        "fn execute_control_frame_attempt_io(",
+        "fn execute_control_frame_reconnect_io(",
+        "fn execute_control_frame_wait_io(",
+        "fn call_control_frame_rpc_once(",
+        "fn execute_control_frame_rpc_attempt(",
+        "fn execute_control_frame_loop_action(",
+        "fn execute_control_frame_rpc_phase(",
+        "fn run_control_frame_rpc_loop(",
+        "fn execute_control_frame_loop(",
+        "SourceControlFrameExecutor::new(",
+        "struct SourceControlFrameWaitPlan {",
+        "fn retry_rpc_attempt_plan(",
+        "clear_observability_override:",
+        "refresh_required_by_signals: Option<bool>",
+        "reconnect_followup: Option<SourceControlFrameReconnectFollowup>",
+        "enum SourceControlFrameReconnectFollowup {",
+        "fn reconnect_with_followup(",
+        "SourceControlFrameEffect::Wait {\n        after: SourceProgressState,\n        wait_for: SourceWaitFor,",
+        "fn execute_control_frame_reconnect_step(",
+        "fn execute_control_frame_wait_step(",
+        "SourceControlFrameEffect::Attempt(",
+        "fn action_after_retry_resume(",
+        "fn action_after_rpc_result(",
+        "SourceControlFrameEffect::Wait(",
+        "fn advance_after_reconnect(",
+        "fn advance_after_wait_completion(",
+        "fn advance_after_post_ack_side_effects(",
+        "fn action_after_scheduled_groups_refresh(",
+        "fn next_control_frame_loop_action(",
+        "self.next_control_frame_loop_action(",
+        "post_ack_followup: Option<SourceControlFrameEffect>",
+        "fn queue_post_ack_followup(",
+        "SourceControlFrameEffect::ApplyPostAckSignals =>",
+        "SourceControlFrameEvent::PostAckSignalsApplied",
+        "action = SourceControlFrameEffect::Complete;",
+        "action = SourceControlFrameEffect::ArmReplayThenRefreshScheduledGroups {",
+        "replay_deadline: std::time::Instant,",
+        "deadline: std::time::Instant,\n    },\n    ExecuteAckPlan(",
+        "fn retry_timeout_cap(",
+        "fn retry_followup_action(",
+        "fn attempt_action_from_deadline(",
+        "fn rpc_attempt_timeout_cap(",
+        "enum SourceControlFrameScheduleRefreshRequirement {",
+        "fn plan_after_ack(",
+        "fn as_slice(&self) -> Option<&[SourceControlSignal]> {",
+        "enum SourceControlFrameEntryPlan {",
+        "fn entry_plan(",
+        "async fn execute_control_frame_entry_plan(",
+        "fn entry_action(",
+        "enum SourceControlTickDisposition {",
+        "async fn generation_one_activate_wave_matches_retained_state(",
+        "async fn classify_tick_only_wave_against_retained_state(",
+        "fn initial_effect_or_rpc_attempt(",
+        "initial_effect: Option<SourceControlFrameEffect>",
+        "control_machine.initial_effect.take()",
+        "SourceControlFrameMachine::new(",
+        "enum SourceControlFrameAckPlan {",
+        "SourceControlFrameEffect::ExecuteAckPlan(",
+        "async fn execute_control_frame_ack_action(",
+        "async fn refresh_control_frame_scheduled_groups(",
+        "apply_decoded_signals:",
+        "arm_replay_before_refresh:",
+        "let refresh = match plan {",
+        "let Some((expect_local_runnable_groups, operation_deadline, arm_replay_before_refresh)) =",
+        "self.handle.execute_control_frame_ack_plan(",
+        "self.handle.execute_control_frame_loop(",
+        "let existing_client_present = self",
+        "struct SourceControlFrameObservation {",
+        "SourceControlFrameObservation {",
+        "decoded_signals: Option<&[SourceControlSignal]>",
+        "enum SourceControlFrameRawIoOutcome {",
+        "fn observe_control_frame_io_outcome(",
+        "struct SourceControlFrameIoRunner<'a> {",
+        "fn io_runner(&self) -> SourceControlFrameIoRunner<'a> {",
+        "enum SourceControlFrameIoOutcome {",
+        "fn observe_control_frame_attempt_progress(",
+        "fn observe_control_frame_attempt_ack_summary(",
+        "fn call_control_frame_rpc_with_client(",
+        "async fn existing_client_present(",
+        "async fn reconnect_once(",
+        "async fn wait_for_progress_once(",
+        "pub(crate) async fn reconnect_after_fail_closed_control_error(&self) -> Result<()> {\n        match self {\n            Self::Local(_) => Ok(()),\n            Self::Worker(client) => client.reconnect_shared_worker_client().await,\n        }\n    }",
+        "pub(crate) async fn reconnect_after_fail_closed_control_error(&self) -> Result<()> {\n        let stale_client = self.replace_shared_worker_client().await?;",
+        "pub(crate) async fn reconnect_after_retryable_control_reset(&self) -> Result<()>",
+        "enum SourceControlFrameIoPlan {",
+        "fn execute_control_frame_io_step(",
+        "SourceControlFrameEvent::ScheduledGroupsRefreshCompleted {",
+        "replay_required_before_refresh: bool,",
+        "enum SourceControlFrameReconnectCompletion {",
+        "SourceControlFrameEvent::ReconnectCompleted(",
+        "fn next_loop_action(",
+        "fn action_after_wait(",
+        "let worker = self.handle.worker_client().await;\n        #[cfg(test)]",
+        "control_machine.entry_plan(decoded_signals.is_some())",
+        "control_machine.next_loop_action(existing_client_present)?",
+        "control_machine.rpc_attempt_plan(self.handle.existing_client().await?.is_some())?",
+        "control_machine.rpc_attempt_plan(true)?",
+        "if control_machine.initial_effect.is_none() {\n            control_machine.existing_client_present = self.handle.existing_client().await?.is_some();\n        }",
+        "self.handle.reconnect_shared_worker_client().await?;\n                    control_machine.existing_client_present = true;\n                    action = control_machine.rpc_attempt_plan()?;",
+        "wait_for_source_progress_after(\n                            after,\n                            SourceWaitFor::ControlFlowRetry,\n                            control_machine.operation_deadline,\n                        )\n                        .await;\n                    control_machine.existing_client_present = true;\n                    action = control_machine.rpc_attempt_plan()?;",
+        "Attempt {\n        timeout: Duration,\n        reconnect_before: bool,",
+        "control_machine.next_loop_action(true)?",
+        "SourceControlFrameEffect::ExecuteIo(",
+        "fn action_after_io_outcome(",
+        "SourceControlFrameEffect::ReconnectThenRetainedTickReplay",
+        "self.handle.reconnect_shared_worker_client().await?;\n                    action = control_machine.action_after_retry_resume()?;",
+        "wait_for_source_progress_after(\n                            after,\n                            SourceWaitFor::ControlFlowRetry,\n                            control_machine.operation_deadline,\n                        )\n                        .await;\n                    action = control_machine.action_after_retry_resume()?;",
+    ] {
+        assert!(
+            !source_impl.contains(legacy_symbol),
+            "workers/source control-frame hard cut regressed; legacy helper-owned RPC phase dispatch returned to production: {legacy_symbol}",
+        );
+    }
+}
+
+#[test]
+fn source_control_frame_machine_owns_schedule_refresh_fail_closed_lane() {
     assert!(
-        state.advanced_past(observability_only, SourceProgressMask::CONTROL_FLOW_RETRY),
-        "worker replacement should release control-flow retries",
-    );
-    assert!(
-        state.advanced_past(
-            observability_only,
-            SourceProgressMask::UPDATE_LOGICAL_ROOTS_RETRY,
+        matches!(
+            classify_replay_required_control_frame_schedule_refresh_error(
+                CnxError::Timeout,
+                false
+            ),
+            CnxError::Internal(message)
+                if message.contains(
+                    "replay-required scheduled-groups refresh exhausted before a live worker recovered"
+                )
         ),
-        "worker replacement should release update-roots retries",
+        "source control-frame lane should own the replay-required scheduled-groups refresh fail-closed classification instead of leaving on_control_frame_with_timeouts to hand-roll the same timeout branch",
+    );
+}
+
+#[test]
+fn source_progress_snapshot_published_expected_groups_since_requires_group_epoch_at_request_boundary()
+ {
+    let expected_groups =
+        std::collections::BTreeSet::from(["group-a".to_string(), "group-b".to_string()]);
+    let snapshot = crate::source::SourceProgressSnapshot {
+        rescan_observed_epoch: 7,
+        scheduled_source_groups: std::collections::BTreeSet::new(),
+        scheduled_scan_groups: std::collections::BTreeSet::new(),
+        published_group_epoch: std::collections::BTreeMap::from([
+            ("group-a".to_string(), 7),
+            ("group-b".to_string(), 6),
+        ]),
+    };
+
+    assert!(
+        !snapshot.published_expected_groups_since(7, &expected_groups),
+        "source progress must not report publication satisfied when any expected group still trails the request epoch",
+    );
+    assert!(
+        snapshot.published_expected_groups_since(6, &expected_groups),
+        "source progress should report publication satisfied once every expected group has reached the request epoch",
+    );
+}
+
+#[test]
+fn source_progress_snapshot_cache_coupling_to_observability_is_removed() {
+    let source_impl = include_str!("../source.rs");
+
+    for legacy_symbol in [
+        "invalidate_cached_progress_snapshot_for_explicit_zero_nodes(",
+        "last_progress_snapshot: Option<crate::source::SourceProgressSnapshot>",
+        "cache.last_progress_snapshot = Some(snapshot.clone());",
+        "cache.last_progress_snapshot = None;",
+    ] {
+        assert!(
+            !source_impl.contains(legacy_symbol),
+            "workers/source progress hard cut regressed; progress truth still rides an observability-driven cached snapshot seam: {legacy_symbol}",
+        );
+    }
+}
+
+#[test]
+fn source_legacy_retry_kernel_symbols_are_removed() {
+    let source_impl = include_str!("../source.rs");
+    for legacy_symbol in [
+        "SourceRefreshRuntimeAction",
+        "SourceRefreshFollowup",
+        "SourceProgressMask",
+        "SourceProgressCursor",
+        "continue_source_refresh_after(",
+        "apply_source_refresh_runtime_action(",
+        "apply_source_refresh_followup(",
+    ] {
+        assert!(
+            !source_impl.contains(legacy_symbol),
+            "workers/source hard cut regressed; legacy retry-kernel symbol still present: {legacy_symbol}",
+        );
+    }
+}
+
+#[test]
+fn source_progress_snapshot_machine_owned_truth_removes_origin_count_adapter_symbol() {
+    let source_impl = include_str!("../source.rs");
+    for legacy_symbol in [
+        "fn source_progress_snapshot_from_status(",
+        "fn source_progress_snapshot_from_observability(",
+        ".published_origin_counts_by_node\n        .values()",
+        "fn update_cached_published_group_epoch_from_snapshot(",
+        "fn clear_cached_published_group_epoch_for_explicit_zero_nodes(",
+        "fn maybe_mark_rescan_observed_from_snapshot(",
+        "fn progress_snapshot_from_cache(",
+        "let snapshot = client.observability_snapshot_nonblocking().await;\n                client.progress_snapshot_from_cache(&snapshot)",
+        "if self.control_op_inflight() {\n            return Ok(self.cached_progress_snapshot());\n        }",
+    ] {
+        assert!(
+            !source_impl.contains(legacy_symbol),
+            "workers/source progress hard cut regressed; published_group_epoch still derives from the legacy observability-origin-count adapter: {legacy_symbol}",
+        );
+    }
+}
+
+#[test]
+fn source_worker_rescan_epoch_truth_uses_worker_owned_epoch_request() {
+    let source_impl = include_str!("../source.rs");
+    let source_ipc = include_str!("../source_ipc.rs");
+    let source_server = include_str!("../source_server.rs");
+
+    for required_symbol in [
+        "TriggerRescanWhenReadyEpoch",
+        "RescanRequestEpoch(u64)",
+        "SourceWorkerRequest::TriggerRescanWhenReadyEpoch",
+        "SourceWorkerResponse::RescanRequestEpoch(epoch)",
+        "source.trigger_rescan_when_ready_epoch().await",
+    ] {
+        assert!(
+            source_impl.contains(required_symbol)
+                || source_ipc.contains(required_symbol)
+                || source_server.contains(required_symbol),
+            "workers/source rescan epoch hard cut regressed; worker-owned rescan epoch symbol missing: {required_symbol}",
+        );
+    }
+
+    for legacy_symbol in [
+        "TriggerRescanWhenReady,",
+        "let epoch = self.begin_rescan_request_epoch();\n        self.trigger_rescan_when_ready().await?;",
+        "SourceWorkerRequest::TriggerRescanWhenReady,\n                SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,",
+        "cache.rescan_observed_epoch = cache.rescan_observed_epoch.max(epoch);",
+        "async fn try_progress_snapshot_nonblocking(",
+        "async fn request_trigger_rescan_when_ready_epoch(",
+        "pub async fn trigger_rescan_when_ready(&self) -> Result<()>",
+    ] {
+        assert!(
+            !source_impl.contains(legacy_symbol)
+                && !source_ipc.contains(legacy_symbol)
+                && !source_server.contains(legacy_symbol),
+            "workers/source rescan epoch hard cut regressed; client still synthesizes or conflates worker-local epoch truth: {legacy_symbol}",
+        );
+    }
+}
+
+#[test]
+fn source_progress_snapshot_uses_live_worker_retry_before_cached_fallback() {
+    let source_impl = include_str!("../source.rs");
+
+    for required_symbol in [
+        "pub(crate) async fn progress_snapshot(&self) -> Result<crate::source::SourceProgressSnapshot>",
+        "async fn progress_snapshot_with_timeout(",
+        ".with_started_retry(|client| async move {",
+        "SourceWorkerRequest::ProgressSnapshot",
+    ] {
+        assert!(
+            source_impl.contains(required_symbol),
+            "workers/source progress hard cut regressed; progress snapshot should drive through live worker retry before considering cached fallback: {required_symbol}",
+        );
+    }
+
+    assert!(
+        !source_impl.contains(
+            "let Some(_client) = self.existing_client().await? else {\n            return Ok(self.cached_progress_snapshot());\n        };"
+        ),
+        "workers/source progress hard cut regressed; progress snapshot still short-circuits to cached truth when no live worker client exists",
+    );
+}
+
+#[test]
+fn source_post_recovery_rescan_gate_uses_live_progress_snapshot() {
+    let source_impl = include_str!("../source.rs");
+    let runtime_impl = include_str!("../../runtime_app.rs");
+
+    assert!(
+        !source_impl.contains(
+            "pub(crate) async fn current_rescan_observed_epoch_nonblocking(&self) -> u64"
+        ),
+        "workers/source rescan hard cut regressed; production source facade still exposes cached nonblocking rescan epoch truth",
+    );
+    assert!(
+        runtime_impl.contains("if let Ok(snapshot) = source.progress_snapshot().await {")
+            && runtime_impl.contains("if snapshot.rescan_observed_epoch >= request_epoch {"),
+        "runtime post-recovery rescan gate should clear request state only from live source progress truth",
+    );
+    assert!(
+        !runtime_impl
+            .contains("source.current_rescan_observed_epoch_nonblocking().await >= request_epoch"),
+        "runtime post-recovery rescan gate regressed to cached source rescan observation truth",
+    );
+}
+
+#[test]
+fn source_facade_degraded_progress_surface_is_removed() {
+    let source_impl = include_str!("../source.rs");
+
+    assert!(
+        source_impl.contains(
+            "pub(crate) async fn progress_snapshot(&self) -> Result<crate::source::SourceProgressSnapshot>"
+        ),
+        "workers/source progress hard cut regressed; facade should continue exposing the live progress truth API",
+    );
+    assert!(
+        !source_impl.contains(
+            "pub(crate) async fn progress_snapshot_best_effort(\n        &self,\n    ) -> crate::source::SourceProgressSnapshot {"
+        ),
+        "workers/source progress hard cut regressed; facade still exposes a degraded cached progress surface",
+    );
+    assert!(
+        !source_impl.contains(
+            "pub(crate) async fn progress_snapshot_nonblocking(&self) -> crate::source::SourceProgressSnapshot {"
+        ),
+        "workers/source progress hard cut regressed; facade still exposes degraded cached progress under a truth-like API name",
     );
 }
 
@@ -655,18 +1307,23 @@ fn prime_cached_schedule_from_control_signals_for_replay_recovery_replaces_prior
     let nfs1 = tmp.path().join("nfs1");
     std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
     let roots = vec![worker_watch_scan_root("nfs1", &nfs1)];
-    let grants = vec![worker_source_export("node-a::nfs1", "node-a", "127.0.0.1", nfs1)];
-    let signals = source_control_signals_from_envelopes(&[
-        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+    let grants = vec![worker_source_export(
+        "node-a::nfs1",
+        "node-a",
+        "127.0.0.1",
+        nfs1,
+    )];
+    let signals = source_control_signals_from_envelopes(&[encode_runtime_exec_control(
+        &RuntimeExecControl::Activate(RuntimeExecActivate {
             route_key: ROUTE_KEY_QUERY.to_string(),
             unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
             lease: None,
             generation: 2,
             expires_at_ms: 1,
             bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
-        }))
-        .expect("encode source activate"),
-    ])
+        }),
+    )
+    .expect("encode source activate")])
     .expect("decode source control signals");
 
     let mut cache = SourceWorkerSnapshotCache {
@@ -1050,6 +1707,7 @@ fn degraded_worker_observability_uses_cached_snapshot() {
         replay_recovery_scheduled_source_groups_by_node: None,
         replay_recovery_scheduled_scan_groups_by_node: None,
         last_control_frame_signals_by_node: Some(std::collections::BTreeMap::new()),
+        observability_control_summary_override_by_node: None,
         published_batches_by_node: Some(std::collections::BTreeMap::new()),
         published_events_by_node: Some(std::collections::BTreeMap::new()),
         published_control_events_by_node: Some(std::collections::BTreeMap::new()),
@@ -1063,6 +1721,11 @@ fn degraded_worker_observability_uses_cached_snapshot() {
         yielded_path_origin_counts_by_node: Some(std::collections::BTreeMap::new()),
         summarized_path_origin_counts_by_node: Some(std::collections::BTreeMap::new()),
         published_path_origin_counts_by_node: Some(std::collections::BTreeMap::new()),
+        rescan_request_epoch: 0,
+        rescan_request_published_batches: 0,
+        rescan_request_last_published_at_us: 0,
+        rescan_request_last_audit_completed_at_us: 0,
+        rescan_observed_epoch: 0,
     };
 
     let snapshot =
@@ -1626,26 +2289,31 @@ fn source_control_state_classifies_tick_only_replay_paths_from_canonical_state()
     let mut state = SourceControlState::default();
     state.retain_signals(&[activate.clone()]);
 
-    assert_eq!(
-        state.classify_tick_only_wave(&[matching_tick.clone()]),
-        Some(SourceControlTickDisposition::FastPath),
+    assert!(
+        matches!(
+            state.classify_tick_only_wave(&[matching_tick.clone()]),
+            Some(SourceControlFrameEffect::RetainedTickFastPath)
+        ),
         "matching-generation tick-only followups should stay local when replay is already clear",
     );
 
     state.arm_replay();
-    assert_eq!(
-        state.classify_tick_only_wave(&[matching_tick]),
-        Some(SourceControlTickDisposition::ReplayInPlace),
+    assert!(
+        matches!(
+            state.classify_tick_only_wave(&[matching_tick]),
+            Some(SourceControlFrameEffect::RetainedTickReplay)
+        ),
         "matching-generation tick-only followups must replay retained control state when replay remains armed",
     );
-    assert_eq!(
-        state.classify_tick_only_wave(&[mismatched_tick]),
-        Some(SourceControlTickDisposition::ReconnectAndReplay),
+    assert!(
+        matches!(
+            state.classify_tick_only_wave(&[mismatched_tick]),
+            Some(SourceControlFrameEffect::ReconnectThenReplayRetainedTick)
+        ),
         "generation-mismatched tick-only followups must reconnect and replay from canonical state",
     );
-    assert_eq!(
-        state.classify_tick_only_wave(&[activate]),
-        None,
+    assert!(
+        matches!(state.classify_tick_only_wave(&[activate]), None),
         "non-tick waves must not be misclassified as tick-only replay paths",
     );
 }
@@ -7520,7 +8188,7 @@ async fn generation_two_real_source_route_replay_required_post_ack_schedule_refr
         .expect("initial real source route wave should succeed");
 
     client
-        .reconnect_after_retryable_control_reset()
+        .reconnect_shared_worker_client()
         .await
         .expect("force replay-required source worker rebind");
     let replay_required_instance_id = client.worker_instance_id_for_tests().await;

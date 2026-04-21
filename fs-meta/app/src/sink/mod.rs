@@ -629,7 +629,47 @@ pub(crate) struct SinkStatusConcernProjection {
     pub(crate) concern: Option<SinkStatusConcern>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SinkProgressSnapshot {
+    pub(crate) scheduled_groups: BTreeSet<String>,
+    pub(crate) materialized_groups: BTreeSet<String>,
+    pub(crate) ready_groups: BTreeSet<String>,
+    pub(crate) empty_summary: bool,
+}
+
+impl SinkProgressSnapshot {
+    pub(crate) fn has_ready_scheduled_groups(&self) -> bool {
+        !self.scheduled_groups.is_empty() && self.scheduled_groups.is_subset(&self.ready_groups)
+    }
+
+    pub(crate) fn ready_for_expected_groups(&self, expected_groups: &BTreeSet<String>) -> bool {
+        !expected_groups.is_empty()
+            && expected_groups.is_subset(&self.scheduled_groups)
+            && expected_groups.is_subset(&self.ready_groups)
+    }
+}
+
 impl SinkStatusSnapshot {
+    pub(crate) fn progress_snapshot(&self) -> SinkProgressSnapshot {
+        let summary = self.readiness_summary();
+        SinkProgressSnapshot {
+            scheduled_groups: summary.scheduled_groups.clone(),
+            materialized_groups: self
+                .groups
+                .iter()
+                .filter(|group| {
+                    !matches!(
+                        group.normalized_readiness(),
+                        GroupReadinessState::PendingMaterialization
+                    )
+                })
+                .map(|group| group.group_id.clone())
+                .collect(),
+            ready_groups: summary.ready_groups,
+            empty_summary: self.groups.is_empty() && summary.scheduled_groups.is_empty(),
+        }
+    }
+
     pub(crate) fn scheduled_groups(&self) -> BTreeSet<String> {
         self.scheduled_groups_by_node
             .values()
@@ -685,12 +725,7 @@ impl SinkStatusSnapshot {
     }
 
     pub(crate) fn has_ready_scheduled_groups(&self) -> bool {
-        let projection = self.concern_projection();
-        !projection.summary.scheduled_groups.is_empty()
-            && projection
-                .summary
-                .scheduled_groups
-                .is_subset(&projection.summary.ready_groups)
+        self.progress_snapshot().has_ready_scheduled_groups()
     }
 
     pub(crate) fn looks_stale_empty(&self) -> bool {
@@ -2975,6 +3010,9 @@ impl SinkFileMeta {
                     generation,
                     ..
                 } => {
+                    // `RuntimeUnitTick` stays explicit at the sink boundary even
+                    // though runtime::orchestration pre-decodes the envelope into
+                    // `SinkControlSignal::Tick`.
                     // Unit tick is runtime-owned scheduling signal.
                     // Sink accepts and validates envelope kind while keeping
                     // data interfaces independent.
@@ -3074,6 +3112,10 @@ impl SinkFileMeta {
         let grant_count = host_object_grants.len();
         let current_allowed_groups = self.scheduled_group_ids()?;
         if let Some(current_allowed_groups) = current_allowed_groups.as_ref() {
+            let root_ids = roots
+                .iter()
+                .map(|root| root.id.clone())
+                .collect::<BTreeSet<_>>();
             let restorable_group_ids = self
                 .state
                 .read()?
@@ -3088,12 +3130,18 @@ impl SinkFileMeta {
                 })
                 .map(|(group_id, _)| group_id.clone())
                 .collect::<BTreeSet<_>>();
-            let next_allowed_groups = current_allowed_groups
-                .iter()
-                .chain(restorable_group_ids.iter())
-                .filter(|group_id| roots.iter().any(|root| root.id == **group_id))
-                .cloned()
-                .collect::<BTreeSet<_>>();
+            let preserve_current_subset =
+                !current_allowed_groups.is_empty() && current_allowed_groups.is_subset(&root_ids);
+            let next_allowed_groups = if preserve_current_subset {
+                current_allowed_groups
+                    .iter()
+                    .chain(restorable_group_ids.iter())
+                    .filter(|group_id| root_ids.contains(*group_id))
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            } else {
+                root_ids
+            };
             let bound_scopes = roots
                 .iter()
                 .filter(|root| next_allowed_groups.contains(&root.id))

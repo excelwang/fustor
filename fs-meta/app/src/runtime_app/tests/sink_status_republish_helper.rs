@@ -220,7 +220,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
         }
         if tokio::time::Instant::now() >= initial_ready_deadline {
             app.source
-                .trigger_rescan_when_ready()
+                .trigger_rescan_when_ready_epoch()
                 .await
                 .expect("direct trigger_rescan_when_ready after failed deferred initial trigger");
             let direct_trigger_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -328,8 +328,6 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
     .expect("source-only deactivate should fail-close into uninitialized replay-required recovery");
     crate::workers::source::clear_source_worker_control_frame_error_hook();
     assert!(!app.control_initialized());
-
-    let previous_instance_id = source_client.worker_instance_id_for_tests().await;
 
     app.on_control_frame(&[
         deactivate_envelope_with_route_key_reason_and_lease(
@@ -833,7 +831,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
         }
         if tokio::time::Instant::now() >= initial_ready_deadline {
             app.source
-                .trigger_rescan_when_ready()
+                .trigger_rescan_when_ready_epoch()
                 .await
                 .expect("direct trigger_rescan_when_ready after failed deferred initial trigger");
             let direct_trigger_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -1671,7 +1669,7 @@ async fn wait_for_sink_status_republish_readiness_after_recovery_accepts_expecte
     );
 
     let readiness_result = app
-        .wait_for_sink_status_republish_readiness_after_recovery(false)
+        .wait_for_sink_status_republish_readiness_after_recovery(None)
         .await;
     assert_eq!(
         readiness_result.expect(
@@ -3948,7 +3946,10 @@ async fn source_led_uninitialized_mixed_recovery_keeps_control_gate_closed_until
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let initial_gate_ready = app.facade_publication_ready().await;
+    let initial_gate_ready =
+        FacadePublicationMachine::from_input(app.collect_facade_publication_input().await)
+        .snapshot()
+        .publication_ready;
     assert!(
         initial_gate_ready,
         "precondition: mixed-recovery gate red requires the active facade control stream to start publication-ready"
@@ -4332,7 +4333,10 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
         "precondition: deferred query-peer route must start inactive before helper publication"
     );
 
-    let control_ready_after_republish = app.facade_publication_ready().await;
+    let control_ready_after_republish =
+        FacadePublicationMachine::from_input(app.collect_facade_publication_input().await)
+        .snapshot()
+        .publication_ready;
     assert!(
         control_ready_after_republish,
         "precondition: helper tail red requires a stale ready bool captured before source replay regresses"
@@ -4374,6 +4378,7 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
         app.source.clone(),
         app.sink.clone(),
         expected_groups,
+        None,
         Vec::new(),
         vec![FacadeControlSignal::Activate {
             unit: FacadeRuntimeUnit::QueryPeer,
@@ -4624,7 +4629,10 @@ async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_f
     }
 
     let deferred_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
-    let control_ready_after_republish = app.facade_publication_ready().await;
+    let control_ready_after_republish =
+        FacadePublicationMachine::from_input(app.collect_facade_publication_input().await)
+        .snapshot()
+        .publication_ready;
     assert!(
         control_ready_after_republish,
         "precondition: helper pending-overwrite red requires facade publication to start ready"
@@ -4659,6 +4667,7 @@ async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_f
         app.source.clone(),
         app.sink.clone(),
         expected_groups,
+        None,
         Vec::new(),
         vec![FacadeControlSignal::Activate {
             unit: FacadeRuntimeUnit::QueryPeer,

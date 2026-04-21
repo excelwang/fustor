@@ -35,6 +35,69 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tower::util::ServiceExt;
 
+#[test]
+fn tree_pit_session_machine_owns_orchestration_only() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/query/api.rs"),
+    )
+    .expect("read query/api.rs");
+
+    assert!(
+        source.contains("struct TreePitGroupMachine<'a, 'b>"),
+        "expected TreePitGroupMachine owner to exist"
+    );
+    assert!(
+        source.contains("TreePitGroupMachine {\n                input: &self.input,"),
+        "expected TreePitSessionMachine to delegate ranked-group execution to TreePitGroupMachine"
+    );
+    assert!(
+        !source.contains("self.run_ranked_group(rank_index, rank.group_key, &mut state)"),
+        "TreePitSessionMachine must not keep session-local single-group execution"
+    );
+}
+
+#[test]
+fn force_find_pit_session_machine_owns_orchestration_only() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/query/api.rs"),
+    )
+    .expect("read query/api.rs");
+
+    assert!(
+        source.contains("struct ForceFindPitGroupMachine<'a, 'b>"),
+        "expected ForceFindPitGroupMachine owner to exist"
+    );
+    assert!(
+        source.contains("ForceFindPitGroupMachine {\n                    input: &self.input,"),
+        "expected ForceFindPitSessionMachine to delegate single-group execution to ForceFindPitGroupMachine"
+    );
+    assert!(
+        !source.contains("groups.push(self.run_ranked_group(rank).await?);"),
+        "ForceFindPitSessionMachine must not keep session-local single-group execution"
+    );
+}
+
+#[test]
+fn stats_query_machine_owns_orchestration_only() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/query/api.rs"),
+    )
+    .expect("read query/api.rs");
+
+    assert!(
+        source.contains("struct StatsGroupMachine<'a, 'b>"),
+        "expected StatsGroupMachine owner to exist"
+    );
+    assert!(
+        source.contains("StatsGroupMachine {\n                    query: self,"),
+        "expected StatsQueryMachine to delegate single-group execution to StatsGroupMachine"
+    );
+    assert!(
+        !source.contains("self.collect_group(group_id).await?"),
+        "StatsQueryMachine must not keep session-local single-group execution"
+    );
+}
+
 #[derive(Clone, Copy)]
 enum ForceFindFixtureScenario {
     Standard,

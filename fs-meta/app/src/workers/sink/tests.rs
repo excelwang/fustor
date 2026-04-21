@@ -386,6 +386,78 @@ fn fs_meta_worker_module_path_prefers_newer_debug_deps_cdylib_over_stale_top_lev
     );
 }
 
+#[test]
+fn sink_status_probe_machine_sequences_retry_reset_probe_before_replay() {
+    let deadline = std::time::Instant::now() + Duration::from_millis(250);
+    let initial = SinkStatusProbeMachine::new(deadline);
+
+    let initial_plan = initial.attempt_plan(true).expect("initial probe plan");
+    assert!(
+        !initial_plan.skip_replay,
+        "initial sink status probe should not skip replay before any retry reset",
+    );
+
+    let first_retry_reset = initial.phase_after_retry_reset();
+    let first_retry_plan = first_retry_reset
+        .attempt_plan(true)
+        .expect("first retry-reset probe plan");
+    assert!(
+        first_retry_plan.skip_replay,
+        "first probe after retry reset must probe once without replay",
+    );
+
+    let replay_after_retry_reset = first_retry_reset.phase_after_retry_reset();
+    let replay_plan = replay_after_retry_reset
+        .attempt_plan(true)
+        .expect("replay-after-retry-reset plan");
+    assert!(
+        !replay_plan.skip_replay,
+        "later retry-reset probes must re-enter replay before probing again",
+    );
+    assert!(
+        replay_after_retry_reset.recovered_after_retry_reset(),
+        "retry-reset state must live in machine phase, not helper-local bools",
+    );
+}
+
+#[test]
+fn sink_control_frame_machine_fail_fasts_after_missing_route_state_then_bridge_reset() {
+    let deadline = std::time::Instant::now() + Duration::from_millis(250);
+    let initial = SinkControlFrameMachine::new(deadline, &[]);
+
+    let after_missing_route_state = match initial.followup_after_error(CnxError::Internal(
+        "sink worker unavailable: missing route state for channel_buffer ChannelSlotId(1)"
+            .to_string(),
+    )) {
+        SinkControlFrameFollowup::RestartAndRetry(next_machine) => next_machine,
+        other => {
+            panic!("expected restart-and-retry after missing-route-state error, got {other:?}")
+        }
+    };
+
+    match after_missing_route_state.followup_after_error(CnxError::ChannelClosed) {
+        SinkControlFrameFollowup::RestartAndFailFast(CnxError::ChannelClosed) => {}
+        other => panic!(
+            "missing-route-state followed by bridge reset must fail fast from machine phase, got {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn sink_legacy_bool_driven_recovery_symbols_are_removed() {
+    let sink_impl = include_str!("../sink.rs");
+    for legacy_symbol in [
+        "let mut recovered_after_retry_reset = false;",
+        "let mut skipped_replay_after_retry_reset = false;",
+        "let mut saw_missing_channel_buffer_route_state = false;",
+    ] {
+        assert!(
+            !sink_impl.contains(legacy_symbol),
+            "workers/sink hard cut regressed; legacy helper-local bool-driven recovery state still present: {legacy_symbol}",
+        );
+    }
+}
+
 fn external_sink_worker_binding(socket_dir: &Path) -> RuntimeWorkerBinding {
     RuntimeWorkerBinding {
         role_id: "sink".to_string(),
@@ -3774,15 +3846,11 @@ fn sink_status_scenario_outcome_fails_closed_after_retry_reset_replay_pending_wi
 
 #[test]
 fn sink_status_scenario_outcome_returns_live_for_steady_replay_pending_without_cached_ready_truth_when_cached_truth_is_preactivate_unscheduled()
-{
+ {
     let outcome = reduce_sink_status_scenario_outcome_with_facts(
         SinkStatusScenario::Live(SinkStatusLiveScenario::Steady),
-        SinkStatusScenarioFacts::new(
-            Some(SinkStatusConcern::ReplayPending),
-            None,
-            false,
-        )
-        .with_cached_preactivate_unscheduled(true),
+        SinkStatusScenarioFacts::new(Some(SinkStatusConcern::ReplayPending), None, false)
+            .with_cached_preactivate_unscheduled(true),
     );
 
     assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnLive);
@@ -3793,7 +3861,7 @@ fn sink_status_scenario_outcome_returns_live_for_steady_replay_pending_without_c
 
 #[test]
 fn sink_status_scenario_outcome_returns_live_for_steady_replay_pending_without_cached_ready_truth_when_cached_truth_is_stale_empty()
-{
+ {
     let outcome = reduce_sink_status_scenario_outcome(
         SinkStatusScenario::Live(SinkStatusLiveScenario::Steady),
         Some(SinkStatusConcern::ReplayPending),
@@ -3809,15 +3877,11 @@ fn sink_status_scenario_outcome_returns_live_for_steady_replay_pending_without_c
 
 #[test]
 fn sink_status_scenario_outcome_returns_live_after_retry_reset_replay_pending_without_cached_ready_truth_when_cached_truth_is_preactivate_unscheduled()
-{
+ {
     let outcome = reduce_sink_status_scenario_outcome_with_facts(
         SinkStatusScenario::Live(SinkStatusLiveScenario::SteadyAfterRetryReset),
-        SinkStatusScenarioFacts::new(
-            Some(SinkStatusConcern::ReplayPending),
-            None,
-            false,
-        )
-        .with_cached_preactivate_unscheduled(true),
+        SinkStatusScenarioFacts::new(Some(SinkStatusConcern::ReplayPending), None, false)
+            .with_cached_preactivate_unscheduled(true),
     );
 
     assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnLive);
@@ -3828,7 +3892,7 @@ fn sink_status_scenario_outcome_returns_live_after_retry_reset_replay_pending_wi
 
 #[test]
 fn sink_status_scenario_outcome_returns_live_after_retry_reset_replay_pending_without_cached_ready_truth_when_cached_truth_is_stale_empty()
-{
+ {
     let outcome = reduce_sink_status_scenario_outcome(
         SinkStatusScenario::Live(SinkStatusLiveScenario::SteadyAfterRetryReset),
         Some(SinkStatusConcern::ReplayPending),
@@ -3844,15 +3908,11 @@ fn sink_status_scenario_outcome_returns_live_after_retry_reset_replay_pending_wi
 
 #[test]
 fn sink_status_scenario_outcome_returns_live_after_retry_reset_replay_pending_without_cached_ready_truth_when_cached_truth_is_republished_zero_row_summary()
-{
+ {
     let outcome = reduce_sink_status_scenario_outcome_with_facts(
         SinkStatusScenario::Live(SinkStatusLiveScenario::SteadyAfterRetryReset),
-        SinkStatusScenarioFacts::new(
-            Some(SinkStatusConcern::ReplayPending),
-            None,
-            false,
-        )
-        .with_cached_preactivate_unscheduled(true),
+        SinkStatusScenarioFacts::new(Some(SinkStatusConcern::ReplayPending), None, false)
+            .with_cached_preactivate_unscheduled(true),
     );
 
     assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnLive);
@@ -3878,7 +3938,7 @@ fn sink_status_scenario_outcome_returns_cached_for_worker_unavailable_replay_pen
 
 #[test]
 fn sink_status_scenario_outcome_propagates_error_for_worker_unavailable_regressed_zero_uninitialized_with_delivery_evidence()
-{
+ {
     let outcome = reduce_sink_status_scenario_outcome_with_facts(
         SinkStatusScenario::Cached(SinkStatusCachedScenario::WorkerUnavailable),
         SinkStatusScenarioFacts::new(None, None, false)

@@ -70,7 +70,15 @@ async fn close_clears_process_wide_fixed_bind_owner_and_pending_handoff_state() 
         Err(err) => panic!("spawn fixed-bind facade: {err}"),
     }
 
-    mark_active_fixed_bind_facade_owner(&bind_addr, app.active_fixed_bind_facade_registrant());
+    mark_active_fixed_bind_facade_owner(
+        &bind_addr,
+        ActiveFixedBindFacadeRegistrant {
+            instance_id: app.instance_id,
+            api_task: app.api_task.clone(),
+            api_request_tracker: app.api_request_tracker.clone(),
+            api_control_gate: app.api_control_gate.clone(),
+        },
+    );
     let active_owner_present = {
         let guard = match active_fixed_bind_facade_owner_cell().lock() {
             Ok(guard) => guard,
@@ -85,7 +93,31 @@ async fn close_clears_process_wide_fixed_bind_owner_and_pending_handoff_state() 
 
     mark_pending_fixed_bind_handoff_ready(
         &bind_addr,
-        app.pending_fixed_bind_handoff_registrant(),
+        PendingFixedBindHandoffRegistrant {
+            instance_id: app.instance_id,
+            api_task: app.api_task.clone(),
+            pending_facade: app.pending_facade.clone(),
+            pending_fixed_bind_claim_release_followup: app
+                .pending_fixed_bind_claim_release_followup
+                .clone(),
+            pending_fixed_bind_has_suppressed_dependent_routes: app
+                .pending_fixed_bind_has_suppressed_dependent_routes
+                .clone(),
+            facade_spawn_in_progress: app.facade_spawn_in_progress.clone(),
+            facade_pending_status: app.facade_pending_status.clone(),
+            facade_service_state: app.facade_service_state.clone(),
+            rollout_status: app.rollout_status.clone(),
+            api_request_tracker: app.api_request_tracker.clone(),
+            api_control_gate: app.api_control_gate.clone(),
+            runtime_gate_state: app.runtime_gate_state.clone(),
+            runtime_state_changed: app.runtime_state_changed.clone(),
+            node_id: app.node_id.clone(),
+            runtime_boundary: app.runtime_boundary.clone(),
+            source: app.source.clone(),
+            sink: app.sink.clone(),
+            query_sink: app.query_sink.clone(),
+            query_runtime_boundary: app.runtime_boundary.clone(),
+        },
     );
     let pending_handoff_present = {
         let guard = match pending_fixed_bind_handoff_ready_cell().lock() {

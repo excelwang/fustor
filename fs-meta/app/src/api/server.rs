@@ -36,10 +36,10 @@ use super::errors::ApiError;
 use super::facade_status::{
     PublishedFacadeStatusReader, SharedFacadePendingStatusCell, SharedFacadeServiceStateCell,
 };
+use super::handlers;
 use super::rollout_status::{
     PublishedRolloutStatusReader, SharedRolloutStatusCell, shared_rollout_status_cell,
 };
-use super::handlers;
 use super::state::{ApiControlGate, ApiRequestGuard, ApiRequestTracker, ApiState};
 
 enum ApiServerJoin {
@@ -518,9 +518,7 @@ mod tests {
     use crate::api::facade_status::{
         shared_facade_pending_status_cell, shared_facade_service_state_cell,
     };
-    use crate::api::rollout_status::{
-        PublishedRolloutStatusReader, shared_rollout_status_cell,
-    };
+    use crate::api::rollout_status::{PublishedRolloutStatusReader, shared_rollout_status_cell};
     use crate::domain_state::FacadeServiceState;
     use crate::query::api::ProjectionPolicy;
     use crate::sink::SinkFileMeta;

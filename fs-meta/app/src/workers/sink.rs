@@ -55,6 +55,8 @@ fn can_retry_on_control_frame(err: &CnxError) -> bool {
                 | CnxError::Internal(message)
                 if message.contains("drained/fenced")
                     && message.contains("grant attachments")
+                    || message.contains("statecell_write returned non-committed status")
+                        && message.contains("fenced")
                     || message.contains("invalid or revoked grant attachment token")
                     || message.contains("missing route state for channel_buffer")
         )
@@ -303,15 +305,21 @@ enum SinkStatusNonblockingEntryAction {
 impl SinkStatusNonblockingProbePlan {
     fn live_access_path(&self, recovered_after_retry_reset: bool) -> SinkStatusAccessPath {
         match (self.mode, recovered_after_retry_reset) {
-            (SinkStatusNonblockingMode::ControlInflight, _) => SinkStatusAccessPath::ControlInflight,
-            (SinkStatusNonblockingMode::Steady, true) => SinkStatusAccessPath::SteadyAfterRetryReset,
+            (SinkStatusNonblockingMode::ControlInflight, _) => {
+                SinkStatusAccessPath::ControlInflight
+            }
+            (SinkStatusNonblockingMode::Steady, true) => {
+                SinkStatusAccessPath::SteadyAfterRetryReset
+            }
             (SinkStatusNonblockingMode::Steady, false) => SinkStatusAccessPath::Steady,
         }
     }
 
     fn err_access_path(&self) -> SinkStatusAccessPath {
         match self.mode {
-            SinkStatusNonblockingMode::ControlInflight => SinkStatusAccessPath::ControlInflightNoClient,
+            SinkStatusNonblockingMode::ControlInflight => {
+                SinkStatusAccessPath::ControlInflightNoClient
+            }
             SinkStatusNonblockingMode::Steady => SinkStatusAccessPath::WorkerUnavailable,
         }
     }
@@ -409,10 +417,7 @@ impl SinkStatusScenarioFacts {
         }
     }
 
-    fn with_cached_preactivate_unscheduled(
-        mut self,
-        cached_preactivate_unscheduled: bool,
-    ) -> Self {
+    fn with_cached_preactivate_unscheduled(mut self, cached_preactivate_unscheduled: bool) -> Self {
         self.cached_preactivate_unscheduled = cached_preactivate_unscheduled;
         self
     }
@@ -449,6 +454,166 @@ struct SinkStatusSnapshotProbeOutcome {
     recovered_after_retry_reset: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkStatusProbePhase {
+    Initial,
+    ProbeAfterRetryResetWithoutReplay,
+    ReplayAfterRetryReset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SinkStatusProbeAttemptPlan {
+    replay_timeout: Duration,
+    attempt_timeout: Duration,
+    skip_replay: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SinkStatusProbeMachine {
+    deadline: std::time::Instant,
+    phase: SinkStatusProbePhase,
+}
+
+impl SinkStatusProbeMachine {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self {
+            deadline,
+            phase: SinkStatusProbePhase::Initial,
+        }
+    }
+
+    fn recovered_after_retry_reset(self) -> bool {
+        !matches!(self.phase, SinkStatusProbePhase::Initial)
+    }
+
+    fn attempt_plan(self, replay_required_for_attempt: bool) -> Result<SinkStatusProbeAttemptPlan> {
+        let now = std::time::Instant::now();
+        let remaining_before_replay = self.deadline.saturating_duration_since(now);
+        if remaining_before_replay.is_zero() {
+            return Err(CnxError::Timeout);
+        }
+        let skip_replay = replay_required_for_attempt
+            && matches!(
+                self.phase,
+                SinkStatusProbePhase::ProbeAfterRetryResetWithoutReplay
+            );
+        let replay_timeout = if replay_required_for_attempt
+            && matches!(self.phase, SinkStatusProbePhase::ReplayAfterRetryReset)
+        {
+            let capped = remaining_before_replay
+                .saturating_sub(SINK_WORKER_STATUS_RETRY_RESET_FINAL_PROBE_BUDGET);
+            if capped.is_zero() {
+                remaining_before_replay
+            } else {
+                capped
+            }
+        } else {
+            remaining_before_replay
+        };
+        let now = std::time::Instant::now();
+        let attempt_timeout = self.deadline.saturating_duration_since(now);
+        if attempt_timeout.is_zero() {
+            return Err(CnxError::Timeout);
+        }
+        Ok(SinkStatusProbeAttemptPlan {
+            replay_timeout,
+            attempt_timeout,
+            skip_replay,
+        })
+    }
+
+    fn replay_error_is_best_effort(
+        self,
+        err: &CnxError,
+        replay_required_for_attempt: bool,
+    ) -> bool {
+        replay_required_for_attempt
+            && matches!(self.phase, SinkStatusProbePhase::ReplayAfterRetryReset)
+            && (matches!(err, CnxError::Timeout) || can_retry_on_control_frame(err))
+            && std::time::Instant::now() < self.deadline
+    }
+
+    fn phase_after_retry_reset(mut self) -> Self {
+        self.phase = match self.phase {
+            SinkStatusProbePhase::Initial => {
+                SinkStatusProbePhase::ProbeAfterRetryResetWithoutReplay
+            }
+            SinkStatusProbePhase::ProbeAfterRetryResetWithoutReplay
+            | SinkStatusProbePhase::ReplayAfterRetryReset => {
+                SinkStatusProbePhase::ReplayAfterRetryReset
+            }
+        };
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkControlFramePhase {
+    Initial,
+    AfterMissingChannelBufferRouteState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SinkControlFrameMachine {
+    deadline: std::time::Instant,
+    phase: SinkControlFramePhase,
+    restart_deferred_retire_pending_deactivate: bool,
+}
+
+#[derive(Debug)]
+enum SinkControlFrameFollowup {
+    RestartAndRetry(SinkControlFrameMachine),
+    RestartAndFailFast(CnxError),
+    Failed(CnxError),
+}
+
+impl SinkControlFrameMachine {
+    fn new(deadline: std::time::Instant, envelopes: &[ControlEnvelope]) -> Self {
+        Self {
+            deadline,
+            phase: SinkControlFramePhase::Initial,
+            restart_deferred_retire_pending_deactivate:
+                is_restart_deferred_retire_pending_deactivate_batch(envelopes),
+        }
+    }
+
+    fn attempt_timeout(self, rpc_timeout: Duration) -> Result<Duration> {
+        let attempt_timeout = std::cmp::min(
+            rpc_timeout,
+            self.deadline
+                .saturating_duration_since(std::time::Instant::now()),
+        );
+        if attempt_timeout.is_zero() {
+            Err(CnxError::Timeout)
+        } else {
+            Ok(attempt_timeout)
+        }
+    }
+
+    fn followup_after_error(self, err: CnxError) -> SinkControlFrameFollowup {
+        if !(can_retry_on_control_frame(&err) && std::time::Instant::now() < self.deadline) {
+            return SinkControlFrameFollowup::Failed(err);
+        }
+        if self.restart_deferred_retire_pending_deactivate {
+            return SinkControlFrameFollowup::RestartAndFailFast(err);
+        }
+        if is_missing_channel_buffer_route_state(&err) {
+            return SinkControlFrameFollowup::RestartAndRetry(Self {
+                phase: SinkControlFramePhase::AfterMissingChannelBufferRouteState,
+                ..self
+            });
+        }
+        if matches!(
+            self.phase,
+            SinkControlFramePhase::AfterMissingChannelBufferRouteState
+        ) && is_retryable_worker_bridge_reset(&err)
+        {
+            return SinkControlFrameFollowup::RestartAndFailFast(err);
+        }
+        SinkControlFrameFollowup::RestartAndRetry(self)
+    }
+}
+
 fn project_sink_status_snapshot_concern(
     snapshot: &SinkStatusSnapshot,
 ) -> SinkStatusConcernProjection {
@@ -477,7 +642,10 @@ fn cached_ready_truth_covers_live_concern(
 }
 
 impl SinkStatusLiveScenario {
-    fn stale_empty_outcome(self, cached_concern: Option<SinkStatusConcern>) -> SinkStatusOutcomeKind {
+    fn stale_empty_outcome(
+        self,
+        cached_concern: Option<SinkStatusConcern>,
+    ) -> SinkStatusOutcomeKind {
         match self {
             Self::Blocking | Self::ControlInflight => SinkStatusOutcomeKind::ReturnLive,
             Self::Steady | Self::SteadyAfterRetryReset => {
@@ -490,7 +658,10 @@ impl SinkStatusLiveScenario {
         }
     }
 
-    fn cached_truth_driven_outcome(self, cached_ready_truth_covers_issue: bool) -> SinkStatusOutcomeKind {
+    fn cached_truth_driven_outcome(
+        self,
+        cached_ready_truth_covers_issue: bool,
+    ) -> SinkStatusOutcomeKind {
         if cached_ready_truth_covers_issue {
             SinkStatusOutcomeKind::ReturnCached
         } else {
@@ -498,7 +669,10 @@ impl SinkStatusLiveScenario {
         }
     }
 
-    fn replay_pending_outcome(self, cached_ready_truth_covers_issue: bool) -> SinkStatusOutcomeKind {
+    fn replay_pending_outcome(
+        self,
+        cached_ready_truth_covers_issue: bool,
+    ) -> SinkStatusOutcomeKind {
         match self {
             Self::Blocking => SinkStatusOutcomeKind::FailClosed,
             Self::ControlInflight => {
@@ -584,13 +758,13 @@ impl SinkStatusCachedScenario {
                 SinkStatusOutcomeKind::ReturnCached
             }
             (_, SinkStatusConcernLane::ReplayPending)
-            | (
-                Self::WorkerUnavailable | Self::NotStarted,
-                SinkStatusConcernLane::CoverageGap,
-            ) => {
+            | (Self::WorkerUnavailable | Self::NotStarted, SinkStatusConcernLane::CoverageGap) => {
                 SinkStatusOutcomeKind::ReturnCached
             }
-            (Self::WorkerUnavailable | Self::ControlInflightNoClient, SinkStatusConcernLane::StaleEmpty)
+            (
+                Self::WorkerUnavailable | Self::ControlInflightNoClient,
+                SinkStatusConcernLane::StaleEmpty,
+            )
             | (Self::WorkerUnavailable, SinkStatusConcernLane::MixedReadiness) => {
                 SinkStatusOutcomeKind::PropagateError
             }
@@ -636,7 +810,8 @@ fn reduce_sink_status_scenario_outcome(
     cached_concern: Option<SinkStatusConcern>,
     cached_ready_truth_covers_issue: bool,
 ) -> SinkStatusSnapshotOutcome {
-    let facts = SinkStatusScenarioFacts::new(concern, cached_concern, cached_ready_truth_covers_issue);
+    let facts =
+        SinkStatusScenarioFacts::new(concern, cached_concern, cached_ready_truth_covers_issue);
     reduce_sink_status_scenario_outcome_with_facts(scenario, facts)
 }
 
@@ -693,13 +868,14 @@ fn evaluate_cached_sink_status_snapshot(
         unreachable!("live access path passed to cached sink status evaluation");
     };
     let cached_projection = project_sink_status_snapshot_concern(cached_snapshot);
-    let delivery_backed_zero_uninitialized = matches!(scenario, SinkStatusCachedScenario::WorkerUnavailable)
-        && snapshot_has_scheduled_zero_uninitialized_groups(cached_snapshot)
-        && !matches!(
-            cached_projection.concern,
-            Some(SinkStatusConcern::WaitingForMaterializedRoot)
-        )
-        && snapshot_has_delivery_evidence(cached_snapshot);
+    let delivery_backed_zero_uninitialized =
+        matches!(scenario, SinkStatusCachedScenario::WorkerUnavailable)
+            && snapshot_has_scheduled_zero_uninitialized_groups(cached_snapshot)
+            && !matches!(
+                cached_projection.concern,
+                Some(SinkStatusConcern::WaitingForMaterializedRoot)
+            )
+            && snapshot_has_delivery_evidence(cached_snapshot);
     reduce_sink_status_scenario_outcome_with_facts(
         SinkStatusScenario::Cached(scenario),
         SinkStatusScenarioFacts::new(cached_projection.concern, None, false)
@@ -927,7 +1103,10 @@ struct InflightControlOpGuard {
 
 impl Drop for InflightControlOpGuard {
     fn drop(&mut self) {
-        let next = self.counter.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+        let next = self
+            .counter
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
         let _ = self.state.send_replace(next);
     }
 }
@@ -2444,9 +2623,7 @@ impl SinkWorkerClientHandle {
                 Some(SinkStatusConcern::WaitingForMaterializedRoot) => {
                     "scheduled_waiting_for_materialized_root"
                 }
-                Some(SinkStatusConcern::MixedReadiness) => {
-                    "scheduled_mixed_ready_and_unready"
-                }
+                Some(SinkStatusConcern::MixedReadiness) => "scheduled_mixed_ready_and_unready",
                 None => "steady",
             },
         }
@@ -2717,7 +2894,10 @@ impl SinkWorkerClientHandle {
                     )
                     .await
                 {
-                    Ok(probe_outcome) => self.finalize_nonblocking_live_probe(plan, probe_outcome).await,
+                    Ok(probe_outcome) => {
+                        self.finalize_nonblocking_live_probe(plan, probe_outcome)
+                            .await
+                    }
                     Err(err) => {
                         let access_path = plan.err_access_path();
                         self.finalize_nonblocking_cached_status_snapshot(
@@ -2770,22 +2950,12 @@ impl SinkWorkerClientHandle {
         &self,
         timeout: Duration,
     ) -> Result<SinkStatusSnapshotProbeOutcome> {
-        let deadline = std::time::Instant::now() + timeout;
-        let mut recovered_after_retry_reset = false;
-        let mut skipped_replay_after_retry_reset = false;
+        let mut machine = SinkStatusProbeMachine::new(std::time::Instant::now() + timeout);
         let response = loop {
-            let now = std::time::Instant::now();
-            let remaining_before_replay = deadline.saturating_duration_since(now);
-            if remaining_before_replay.is_zero() {
-                return Err(CnxError::Timeout);
-            }
             let replay_required_for_attempt =
                 self.control_state_replay_required.load(Ordering::Acquire) > 0;
-            let skip_replay_for_attempt = replay_required_for_attempt
-                && recovered_after_retry_reset
-                && !skipped_replay_after_retry_reset;
-            if skip_replay_for_attempt {
-                skipped_replay_after_retry_reset = true;
+            let attempt_plan = machine.attempt_plan(replay_required_for_attempt)?;
+            if attempt_plan.skip_replay {
                 if debug_control_scope_capture_enabled() {
                     eprintln!(
                         "fs_meta_sink_worker_client: status_snapshot replay_deferred node={} reason=retry_reset_first_probe",
@@ -2793,39 +2963,24 @@ impl SinkWorkerClientHandle {
                     );
                 }
             }
-            let replay_timeout = if replay_required_for_attempt
-                && recovered_after_retry_reset
-                && !skip_replay_for_attempt
-            {
-                let capped = remaining_before_replay
-                    .saturating_sub(SINK_WORKER_STATUS_RETRY_RESET_FINAL_PROBE_BUDGET);
-                if capped.is_zero() {
-                    remaining_before_replay
-                } else {
-                    capped
-                }
-            } else {
-                remaining_before_replay
-            };
-            if !skip_replay_for_attempt {
+            if !attempt_plan.skip_replay {
                 if let Err(err) = self
                     .replay_retained_control_state_if_needed_with_timeouts(
-                        replay_timeout,
-                        replay_timeout.min(SINK_WORKER_CONTROL_RPC_TIMEOUT),
+                        attempt_plan.replay_timeout,
+                        attempt_plan
+                            .replay_timeout
+                            .min(SINK_WORKER_CONTROL_RPC_TIMEOUT),
                     )
                     .await
                 {
-                    if replay_required_for_attempt
-                        && recovered_after_retry_reset
-                        && (matches!(err, CnxError::Timeout) || can_retry_on_control_frame(&err))
-                        && std::time::Instant::now() < deadline
-                    {
+                    if machine.replay_error_is_best_effort(&err, replay_required_for_attempt) {
                         if debug_control_scope_capture_enabled() {
                             eprintln!(
                                 "fs_meta_sink_worker_client: status_snapshot replay_best_effort node={} err={} remaining_ms={}",
                                 self.node_id.0,
                                 err,
-                                deadline
+                                machine
+                                    .deadline
                                     .saturating_duration_since(std::time::Instant::now())
                                     .as_millis()
                             );
@@ -2835,13 +2990,8 @@ impl SinkWorkerClientHandle {
                     }
                 }
             }
-            let now = std::time::Instant::now();
-            let attempt_timeout = deadline.saturating_duration_since(now);
-            if attempt_timeout.is_zero() {
-                return Err(CnxError::Timeout);
-            }
             #[cfg(test)]
-            record_sink_worker_status_timeout_probe(attempt_timeout);
+            record_sink_worker_status_timeout_probe(attempt_plan.attempt_timeout);
             #[cfg(test)]
             let current_worker_instance_id = self.shared_worker().await.0;
             let rpc_result = self
@@ -2862,28 +3012,31 @@ impl SinkWorkerClientHandle {
                     {
                         return Err(err);
                     }
-                    Self::call_worker(&client, SinkWorkerRequest::StatusSnapshot, attempt_timeout)
-                        .await
+                    Self::call_worker(
+                        &client,
+                        SinkWorkerRequest::StatusSnapshot,
+                        attempt_plan.attempt_timeout,
+                    )
+                    .await
                 })
                 .await;
             match rpc_result {
-                Ok(SinkWorkerResponse::Ack)
-                    if replay_required_for_attempt && std::time::Instant::now() < deadline =>
-                {
-                    recovered_after_retry_reset = true;
+                Ok(SinkWorkerResponse::Ack) if replay_required_for_attempt => {
+                    machine = machine.phase_after_retry_reset();
                     self.control_state_replay_required
                         .store(1, Ordering::Release);
-                    self.restart_shared_worker_client_for_retry_until(deadline)
+                    self.restart_shared_worker_client_for_retry_until(machine.deadline)
                         .await?;
                 }
                 Ok(response) => break response,
                 Err(err)
-                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
+                    if can_retry_on_control_frame(&err)
+                        && std::time::Instant::now() < machine.deadline =>
                 {
-                    recovered_after_retry_reset = true;
+                    machine = machine.phase_after_retry_reset();
                     self.control_state_replay_required
                         .store(1, Ordering::Release);
-                    self.restart_shared_worker_client_for_retry_until(deadline)
+                    self.restart_shared_worker_client_for_retry_until(machine.deadline)
                         .await?;
                 }
                 Err(err) => return Err(err),
@@ -2892,7 +3045,7 @@ impl SinkWorkerClientHandle {
         match response {
             SinkWorkerResponse::StatusSnapshot(snapshot) => Ok(SinkStatusSnapshotProbeOutcome {
                 snapshot,
-                recovered_after_retry_reset,
+                recovered_after_retry_reset: machine.recovered_after_retry_reset(),
             }),
             other => Err(CnxError::ProtocolViolation(format!(
                 "unexpected sink worker response for status snapshot: {:?}",
@@ -3228,16 +3381,11 @@ impl SinkWorkerClientHandle {
                 ),
             }
         }
-        let deadline = std::time::Instant::now() + total_timeout;
-        let mut saw_missing_channel_buffer_route_state = false;
+        let mut machine =
+            SinkControlFrameMachine::new(std::time::Instant::now() + total_timeout, &envelopes);
         loop {
-            let now = std::time::Instant::now();
-            let attempt_timeout =
-                std::cmp::min(rpc_timeout, deadline.saturating_duration_since(now));
-            if attempt_timeout.is_zero() {
-                return Err(CnxError::Timeout);
-            }
-            let (current_worker_instance_id, worker_client) = self.shared_worker().await;
+            let attempt_timeout = machine.attempt_timeout(rpc_timeout)?;
+            let (_current_worker_instance_id, worker_client) = self.shared_worker().await;
             let rpc_result = match tokio::time::timeout(
                 attempt_timeout,
                 worker_client.with_started_retry(|client| {
@@ -3247,7 +3395,7 @@ impl SinkWorkerClientHandle {
                         maybe_pause_before_on_control_frame_rpc().await;
                         #[cfg(test)]
                         if let Some(err) =
-                            take_sink_worker_control_frame_error_hook(current_worker_instance_id)
+                            take_sink_worker_control_frame_error_hook(_current_worker_instance_id)
                         {
                             return Err(err);
                         }
@@ -3288,50 +3436,34 @@ impl SinkWorkerClientHandle {
                         other
                     )));
                 }
-                Err(err)
-                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
-                {
-                    if is_restart_deferred_retire_pending_deactivate_batch(&envelopes) {
-                        self.restart_shared_worker_client_for_retry_until(deadline)
+                Err(err) => match machine.followup_after_error(err) {
+                    SinkControlFrameFollowup::RestartAndRetry(next_machine) => {
+                        self.restart_shared_worker_client_for_retry_until(machine.deadline)
                             .await?;
+                        machine = next_machine;
+                    }
+                    SinkControlFrameFollowup::RestartAndFailFast(err) => {
+                        self.restart_shared_worker_client_for_retry_until(machine.deadline)
+                            .await?;
+                        let lane = if machine.restart_deferred_retire_pending_deactivate {
+                            "restart_deferred_retire_pending_events_deactivate"
+                        } else {
+                            "missing_channel_buffer_route_state_then_bridge_reset"
+                        };
                         eprintln!(
-                            "fs_meta_sink_worker_client: on_control_frame fail-fast node={} err={} lane=restart_deferred_retire_pending_events_deactivate",
+                            "fs_meta_sink_worker_client: on_control_frame fail-fast node={} err={} lane={}",
+                            self.node_id.0, err, lane
+                        );
+                        return Err(err);
+                    }
+                    SinkControlFrameFollowup::Failed(err) => {
+                        eprintln!(
+                            "fs_meta_sink_worker_client: on_control_frame done node={} ok=false err={}",
                             self.node_id.0, err
                         );
                         return Err(err);
                     }
-                    if is_missing_channel_buffer_route_state(&err) {
-                        saw_missing_channel_buffer_route_state = true;
-                        self.restart_shared_worker_client_for_retry_until(deadline)
-                            .await?;
-                        continue;
-                    }
-                    if saw_missing_channel_buffer_route_state
-                        && is_retryable_worker_bridge_reset(&err)
-                    {
-                        self.restart_shared_worker_client_for_retry_until(deadline)
-                            .await?;
-                        eprintln!(
-                            "fs_meta_sink_worker_client: on_control_frame fail-fast node={} err={} lane=missing_channel_buffer_route_state_then_bridge_reset",
-                            self.node_id.0, err
-                        );
-                        return Err(err);
-                    }
-                    if is_retryable_worker_bridge_reset(&err) {
-                        self.restart_shared_worker_client_for_retry_until(deadline)
-                            .await?;
-                    } else {
-                        self.restart_shared_worker_client_for_retry_until(deadline)
-                            .await?;
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "fs_meta_sink_worker_client: on_control_frame done node={} ok=false err={}",
-                        self.node_id.0, err
-                    );
-                    return Err(err);
-                }
+                },
             }
         }
     }
@@ -3442,6 +3574,12 @@ impl SinkFacade {
         }
     }
 
+    pub(crate) async fn progress_snapshot(&self) -> Result<crate::sink::SinkProgressSnapshot> {
+        self.status_snapshot()
+            .await
+            .map(|snapshot| snapshot.progress_snapshot())
+    }
+
     pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
         match self {
             Self::Local(sink) => sink.status_snapshot(),
@@ -3449,11 +3587,24 @@ impl SinkFacade {
         }
     }
 
+    pub(crate) async fn progress_snapshot_nonblocking(
+        &self,
+    ) -> Result<crate::sink::SinkProgressSnapshot> {
+        self.status_snapshot_nonblocking()
+            .await
+            .map(|snapshot| snapshot.progress_snapshot())
+    }
+
     pub fn cached_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
         match self {
             Self::Local(sink) => sink.status_snapshot(),
             Self::Worker(client) => client.cached_status_snapshot(),
         }
+    }
+
+    pub(crate) fn cached_progress_snapshot(&self) -> Result<crate::sink::SinkProgressSnapshot> {
+        self.cached_status_snapshot()
+            .map(|snapshot| snapshot.progress_snapshot())
     }
 
     pub async fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {

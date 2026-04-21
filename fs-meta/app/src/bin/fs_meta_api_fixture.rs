@@ -404,7 +404,7 @@ async fn wait_for_fixture_query_ready(app: &FSMetaApp) -> Result<(), Box<dyn std
             }
         };
         if iteration % 10 == 0 && source_ready && !sink_ready {
-            let _ = app.trigger_rescan_when_ready().await;
+            let _ = app.trigger_rescan_when_ready_epoch().await;
         }
         if source_ready && sink_ready && query_ready {
             return Ok(());

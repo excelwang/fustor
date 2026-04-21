@@ -109,6 +109,10 @@
             resource_ids: vec!["listener-a".to_string()],
             handle: active_facade,
         });
+        app.api_control_gate.set_ready(true);
+        *app.facade_service_state
+            .write()
+            .expect("write published facade service state") = FacadeServiceState::Serving;
 
         let client = Client::new();
         let login = client
@@ -300,6 +304,12 @@
             resource_ids: vec!["listener-a".to_string()],
             handle: active_facade,
         });
+        app.api_control_gate.set_ready(
+            FacadePublicationMachine::from_input(app.collect_facade_publication_input().await)
+                .snapshot()
+                .publication_ready,
+        );
+        let _ = app.current_facade_service_state().await;
 
         let client = Client::new();
         let login = client
@@ -1210,6 +1220,10 @@
             resource_ids: vec!["listener-a".to_string()],
             handle: active_facade,
         });
+        app.api_control_gate.set_ready(true);
+        *app.facade_service_state
+            .write()
+            .expect("write published facade service state") = FacadeServiceState::Serving;
 
         let client = Client::new();
         let login = client

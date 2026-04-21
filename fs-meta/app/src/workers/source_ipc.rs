@@ -4,8 +4,8 @@ use capanix_app_sdk::runtime::ControlEnvelope;
 use capanix_app_sdk::{CnxError, Event, Result};
 
 use crate::query::request::InternalQueryRequest;
-use crate::source::SourceStatusSnapshot;
 use crate::source::config::{GrantedMountRoot, RootSpec};
+use crate::source::{SourceProgressSnapshot, SourceStatusSnapshot};
 use crate::workers::source::SourceObservabilitySnapshot;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -15,6 +15,7 @@ pub enum SourceWorkerRequest {
     HostObjectGrantsSnapshot,
     HostObjectGrantsVersionSnapshot,
     StatusSnapshot,
+    ProgressSnapshot,
     ObservabilitySnapshot,
     LifecycleState,
     ScheduledSourceGroupIds,
@@ -25,7 +26,7 @@ pub enum SourceWorkerRequest {
     ForceFind { request: InternalQueryRequest },
     ResolveGroupIdForObjectRef { object_ref: String },
     PublishManualRescanSignal,
-    TriggerRescanWhenReady,
+    TriggerRescanWhenReadyEpoch,
     OnControlFrame { envelopes: Vec<ControlEnvelope> },
 }
 
@@ -36,6 +37,7 @@ pub enum SourceWorkerResponse {
     HostObjectGrants(Vec<GrantedMountRoot>),
     HostObjectGrantsVersion(u64),
     StatusSnapshot(SourceStatusSnapshot),
+    ProgressSnapshot(SourceProgressSnapshot),
     ObservabilitySnapshot(SourceObservabilitySnapshot),
     LifecycleState(String),
     ScheduledGroupIds(Option<Vec<String>>),
@@ -44,6 +46,7 @@ pub enum SourceWorkerResponse {
     ForceFindInflightGroups(Vec<String>),
     Events(Vec<Event>),
     ResolveGroupIdForObjectRef(Option<String>),
+    RescanRequestEpoch(u64),
     InvalidInput(String),
     Error(String),
 }

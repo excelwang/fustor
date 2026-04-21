@@ -122,10 +122,6 @@ async fn facade_spawn_dedupes_across_distinct_app_instances_with_same_fixed_bind
     };
     assert_eq!(claim.owner_instance_id, app_1.instance_id);
     assert_eq!(claim.bind_addr, bind_addr);
-    assert_eq!(
-        claim.resource_ids,
-        vec![listener_resource.resource_id.clone()]
-    );
 
     app_2.close().await.expect("close second app");
     app_1.close().await.expect("close first app");

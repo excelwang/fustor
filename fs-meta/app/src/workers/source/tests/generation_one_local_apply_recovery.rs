@@ -475,7 +475,7 @@ macro_rules! define_generation_one_local_apply_recovery_tests {
 
         entered.notified().await;
         client
-            .reconnect_after_retryable_control_reset()
+            .reconnect_shared_worker_client()
             .await
             .expect("reconnect source worker during caller-owned control path");
         let recovered_instance_id = client.worker_instance_id_for_tests().await;
@@ -599,7 +599,7 @@ macro_rules! define_generation_one_local_apply_recovery_tests {
 
         entered.notified().await;
         client
-            .reconnect_after_retryable_control_reset()
+            .reconnect_shared_worker_client()
             .await
             .expect("reconnect source worker during empty-scope caller-owned control path");
         let recovered_instance_id = client.worker_instance_id_for_tests().await;

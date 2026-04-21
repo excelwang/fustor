@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::future::Future;
-use std::pin::Pin;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -91,62 +89,16 @@ struct FacadeActivation {
     handle: api::ApiServerHandle,
 }
 
-impl FacadeActivation {
-    fn matches_route_resources(&self, route_key: &str, resource_ids: &[String]) -> bool {
-        self.route_key == route_key && self.resource_ids == resource_ids
-    }
-
-    fn matches_pending(&self, pending: &PendingFacadeActivation) -> bool {
-        self.matches_route_resources(&pending.route_key, &pending.resource_ids)
-            && self.generation == pending.generation
-    }
-}
-
 #[derive(Clone)]
 struct FacadeSpawnInProgress {
     route_key: String,
     resource_ids: Vec<String>,
 }
 
-impl FacadeSpawnInProgress {
-    fn from_pending(pending: &PendingFacadeActivation) -> Self {
-        Self {
-            route_key: pending.route_key.clone(),
-            resource_ids: pending.resource_ids.clone(),
-        }
-    }
-
-    fn matches_pending(&self, pending: &PendingFacadeActivation) -> bool {
-        pending.matches_route_resources(&self.route_key, &self.resource_ids)
-    }
-}
-
 #[derive(Clone)]
 struct ProcessFacadeClaim {
     owner_instance_id: u64,
-    #[cfg_attr(not(test), allow(dead_code))]
-    route_key: String,
-    #[cfg_attr(not(test), allow(dead_code))]
-    resource_ids: Vec<String>,
     bind_addr: String,
-}
-
-impl ProcessFacadeClaim {
-    fn from_pending(owner_instance_id: u64, pending: &PendingFacadeActivation) -> Option<Self> {
-        if facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
-            return None;
-        }
-        Some(Self {
-            owner_instance_id,
-            route_key: pending.route_key.clone(),
-            resource_ids: pending.resource_ids.clone(),
-            bind_addr: pending.resolved.bind_addr.clone(),
-        })
-    }
-
-    fn matches_pending(&self, pending: &PendingFacadeActivation) -> bool {
-        self.bind_addr == pending.resolved.bind_addr
-    }
 }
 
 fn source_signal_generation(signal: &SourceControlSignal) -> u64 {
@@ -213,10 +165,7 @@ struct RuntimeControlState {
 }
 
 impl RuntimeControlState {
-    const fn bootstrapping(
-        source_replay_required: bool,
-        sink_replay_required: bool,
-    ) -> Self {
+    const fn bootstrapping(source_replay_required: bool, sink_replay_required: bool) -> Self {
         Self {
             lifecycle: RuntimeLifecyclePhase::Bootstrapping,
             source_replay_required,
@@ -362,17 +311,10 @@ impl RuntimeControlState {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FacadeServiceStateDecisionInput {
     control_gate_ready: bool,
-    publication_ready: bool,
-    pending_facade_present: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FacadeReadyTailDecisionInput {
-    runtime: RuntimeControlState,
-    allow_facade_only_handoff: bool,
     publication_ready: bool,
     pending_facade_present: bool,
 }
@@ -411,6 +353,64 @@ struct FacadeGateObservation {
     allow_facade_only_handoff: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FacadePublicationPhase {
+    NoFacade,
+    Pending,
+    Serving,
+    Withheld,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FacadePublicationSnapshot {
+    phase: FacadePublicationPhase,
+    control_gate_ready: bool,
+    publication_ready: bool,
+    published_state: FacadeServiceState,
+}
+
+#[derive(Clone)]
+struct FacadeFixedBindSnapshot {
+    pending_publication: Option<PendingFacadeActivation>,
+    conflicting_process_claim: Option<ProcessFacadeClaim>,
+    claim_release_followup_pending: bool,
+}
+
+#[derive(Clone)]
+struct FacadePublicationInput {
+    observation: FacadeGateObservation,
+    publication_ready: bool,
+}
+
+#[derive(Clone)]
+struct FacadePublicationMachine {
+    observation: FacadeGateObservation,
+    publication_ready: bool,
+}
+
+#[derive(Clone)]
+struct FacadeDeactivateInput {
+    fixed_bind: FacadeFixedBindSnapshot,
+    release_handoff: Option<PendingFixedBindHandoffContinuation>,
+    shutdown_handoff: Option<ActiveFixedBindShutdownContinuation>,
+}
+
+#[derive(Clone)]
+struct FacadeDeactivateMachine {
+    fixed_bind: FacadeFixedBindSnapshot,
+    release_handoff: Option<PendingFixedBindHandoffContinuation>,
+    shutdown_handoff: Option<ActiveFixedBindShutdownContinuation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RolloutGenerationMachine {
+    runtime: RuntimeControlState,
+    active_generation: Option<u64>,
+    candidate_generation: Option<u64>,
+    candidate_runtime_exposure_confirmed: bool,
+    publication_ready: bool,
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingFixedBindHandoffAttemptDecisionInput {
@@ -434,62 +434,6 @@ enum FacadeDeactivateContinuityExecutionPlan {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PendingFacadeSpawnContinuityDisposition {
-    ReuseCurrentGeneration,
-    PromoteExistingSameResource { active_generation: u64 },
-    Continue,
-}
-
-#[derive(Clone)]
-struct PendingFixedBindPublicationState {
-    pending: Option<PendingFacadeActivation>,
-    conflicting_process_claim: Option<ProcessFacadeClaim>,
-    claim_release_followup_pending: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PendingFixedBindClaimReleaseFollowupDisposition {
-    Inactive,
-    WaitingForClaimRelease,
-    PublicationStillIncomplete,
-    PublicationCompleted,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PendingFixedBindRouteSuppressionDisposition {
-    Allow,
-    SuppressClaimConflict,
-    SuppressPublicationIncomplete,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PendingFixedBindPublicationProjection {
-    claim_release_followup_required: bool,
-    claim_release_followup_disposition: PendingFixedBindClaimReleaseFollowupDisposition,
-    route_suppression_disposition: PendingFixedBindRouteSuppressionDisposition,
-    handoff_ready_bind_addr_present: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PendingFixedBindHandoffFollowup {
-    bind_addr: String,
-    claim_release_followup_required: bool,
-}
-
-enum PendingFacadeSpawnFollowupDisposition {
-    Spawned {
-        spawned: bool,
-        pending: Option<PendingFacadeActivation>,
-        reset_suppressed_dependent_routes: bool,
-    },
-    RetryAfterBindAddrInUse {
-        pending: PendingFacadeActivation,
-        err: CnxError,
-    },
-    PropagateError(CnxError),
-}
-
 #[derive(Clone)]
 struct ActiveFixedBindShutdownContinuation {
     bind_addr: String,
@@ -502,14 +446,6 @@ struct PendingFixedBindHandoffContinuation {
     registrant: PendingFixedBindHandoffRegistrant,
 }
 
-#[derive(Clone)]
-struct FixedBindHandoffDriver {
-    gate: FacadeGateObservation,
-    pending_fixed_bind_publication: PendingFixedBindPublicationState,
-    release_handoff: Option<PendingFixedBindHandoffContinuation>,
-    shutdown_handoff: Option<ActiveFixedBindShutdownContinuation>,
-}
-
 enum FixedBindHandoffAction {
     Deactivate {
         route_key: String,
@@ -517,17 +453,7 @@ enum FixedBindHandoffAction {
         retain_active_facade: bool,
         retain_pending_spawn: bool,
     },
-    Publication,
     Shutdown,
-    AfterRelease {
-        handoff: PendingFixedBindHandoffContinuation,
-    },
-}
-
-enum FixedBindHandoffExecution {
-    Completed,
-    PublicationReady(bool),
-    AfterReleaseCompleted(bool),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -545,10 +471,6 @@ enum FixedBindAfterReleaseAction {
 }
 
 impl FixedBindAfterReleaseRuntime {
-    fn new() -> Self {
-        Self::new_with_deadline(tokio::time::Instant::now() + Duration::from_secs(8))
-    }
-
     fn new_with_deadline(deadline: tokio::time::Instant) -> Self {
         Self {
             deadline,
@@ -558,10 +480,6 @@ impl FixedBindAfterReleaseRuntime {
 
     fn remaining_at(&self, now: tokio::time::Instant) -> Duration {
         self.deadline.saturating_duration_since(now)
-    }
-
-    fn spawn_attempt_action(&self) -> FixedBindAfterReleaseAction {
-        self.spawn_attempt_action_at(tokio::time::Instant::now())
     }
 
     fn spawn_attempt_action_at(&self, now: tokio::time::Instant) -> FixedBindAfterReleaseAction {
@@ -580,10 +498,6 @@ impl FixedBindAfterReleaseRuntime {
     fn note_spawn_failure(mut self, err: impl std::fmt::Display) -> Self {
         self.last_retry_error = Some(err.to_string());
         self
-    }
-
-    fn post_spawn_action(&self, completion_ready: bool) -> FixedBindAfterReleaseAction {
-        self.post_spawn_action_at(tokio::time::Instant::now(), completion_ready)
     }
 
     fn post_spawn_action_at(
@@ -651,380 +565,6 @@ fn fixed_bind_after_release_runtime_promotes_completion_without_outer_branching(
     );
 }
 
-impl FixedBindHandoffDriver {
-    async fn completion_ready_after_release(handoff: &PendingFixedBindHandoffContinuation) -> bool {
-        let pending_facade_present = handoff.registrant.pending_facade.lock().await.is_some();
-        let active_control_stream_present = handoff
-            .registrant
-            .api_task
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|active| {
-                active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-            });
-        !pending_facade_present && active_control_stream_present
-    }
-
-    async fn wait_for_completion_progress(
-        handoff: &PendingFixedBindHandoffContinuation,
-        remaining: Duration,
-        last_retry_error: Option<&str>,
-    ) -> bool {
-        if remaining.is_zero() {
-            if let Some(err) = last_retry_error {
-                eprintln!(
-                    "fs_meta_runtime_app: fixed-bind handoff completion retry failed bind_addr={} err={}",
-                    handoff.bind_addr, err
-                );
-            }
-            return false;
-        }
-        let _ = tokio::time::timeout(
-            remaining,
-            handoff.registrant.runtime_state_changed.notified(),
-        )
-        .await;
-        true
-    }
-
-    async fn release_handoff_blocker_for_publication(
-        app: &FSMetaApp,
-        pending: &PendingFacadeActivation,
-    ) -> Option<PendingFixedBindHandoffContinuation> {
-        let bind_addr = pending.resolved.bind_addr.clone();
-        let registrant = app.pending_fixed_bind_handoff_registrant();
-        mark_pending_fixed_bind_handoff_ready_with_registrant(&bind_addr, registrant.clone());
-        let state = registrant
-            .observe_pending_fixed_bind_publication_state_for_pending(pending)
-            .await;
-        if !state.claim_conflict() || !pending.runtime_exposure_confirmed {
-            return None;
-        }
-        if let Some(owner) = active_fixed_bind_facade_owner_for(&bind_addr, app.instance_id) {
-            owner.release_for_handoff(&bind_addr).await;
-            return Some(registrant.handoff_continuation(&bind_addr));
-        }
-        if let Some(owner_instance_id) = state
-            .conflicting_process_claim_for_handoff()
-            .map(|claim| claim.owner_instance_id)
-        {
-            clear_process_facade_claim_for_bind_addr(&bind_addr, owner_instance_id);
-            return Some(registrant.handoff_continuation(&bind_addr));
-        }
-        None
-    }
-
-    async fn drive_shutdown_handoff(
-        self,
-        app: &FSMetaApp,
-        handoff: Option<ActiveFixedBindShutdownContinuation>,
-    ) -> Result<()> {
-        app.api_request_tracker.wait_for_drain().await;
-        app.api_control_gate.wait_for_facade_request_drain().await;
-        #[cfg(test)]
-        notify_facade_shutdown_started();
-        eprintln!("fs_meta_runtime_app: shutdown_active_facade");
-        if let Some(current) = app.api_task.lock().await.take() {
-            eprintln!(
-                "fs_meta_runtime_app: shutting down previous active facade generation={}",
-                current.generation
-            );
-            current
-                .handle
-                .shutdown(ACTIVE_FACADE_SHUTDOWN_TIMEOUT)
-                .await;
-        }
-        clear_owned_process_facade_claim(app.instance_id);
-        if let Some(handoff) = handoff {
-            clear_active_fixed_bind_facade_owner(&handoff.bind_addr, app.instance_id);
-            if let Some(pending_handoff) = handoff.pending_handoff {
-                let _ = self
-                    .clone()
-                    .execute(
-                        app,
-                        FixedBindHandoffAction::AfterRelease {
-                            handoff: pending_handoff,
-                        },
-                    )
-                    .await?;
-            }
-        }
-        if let Some(pending) = app.pending_facade.lock().await.clone() {
-            clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
-        }
-        let _ = app.current_facade_service_state().await;
-        Ok(())
-    }
-
-    fn publication_readiness_decision(&self) -> FacadePublicationReadinessDecision {
-        self.gate.publication_readiness_decision()
-    }
-
-    fn publication_ready_bind_addr_to_clear(&self) -> Option<&str> {
-        self.gate.current_pending.as_ref().and_then(|pending| {
-            (self.gate.pending_facade_is_control_route
-                && self.gate.active_pending_control_stream_present)
-                .then_some(pending.resolved.bind_addr.as_str())
-        })
-    }
-
-    fn pending_publication_handoff(&self) -> Option<PendingFacadeActivation> {
-        self.gate
-            .current_pending
-            .clone()
-            .filter(|pending| !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr))
-    }
-
-    fn execute<'a>(
-        self,
-        app: &'a FSMetaApp,
-        action: FixedBindHandoffAction,
-    ) -> Pin<Box<dyn Future<Output = Result<FixedBindHandoffExecution>> + Send + 'a>> {
-        Box::pin(async move {
-            match action {
-                FixedBindHandoffAction::Deactivate {
-                    route_key,
-                    generation,
-                    retain_active_facade,
-                    retain_pending_spawn,
-                } => {
-                    match self
-                        .clone()
-                        .deactivate_decision(retain_active_facade, retain_pending_spawn)
-                    {
-                        FacadeDeactivateContinuityExecutionPlan::RetainActiveContinuity => {
-                            app.retained_active_facade_continuity
-                                .store(true, Ordering::Release);
-                            eprintln!(
-                                "fs_meta_runtime_app: retain active facade during continuity-preserving deactivate route_key={} generation={}",
-                                route_key, generation
-                            );
-                        }
-                        FacadeDeactivateContinuityExecutionPlan::RetainActiveWhilePendingFixedBindClaimConflict => {
-                            app.retained_active_facade_continuity
-                                .store(true, Ordering::Release);
-                            eprintln!(
-                                "fs_meta_runtime_app: retain active facade while pending fixed-bind claim remains owned elsewhere route_key={} generation={}",
-                                route_key, generation
-                            );
-                        }
-                        FacadeDeactivateContinuityExecutionPlan::RetainPendingWhilePendingFixedBindClaimConflict => {
-                            eprintln!(
-                                "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
-                                route_key, generation
-                            );
-                        }
-                        FacadeDeactivateContinuityExecutionPlan::ReleaseActiveForFixedBindHandoff {
-                            handoff,
-                        } => {
-                            eprintln!(
-                                "fs_meta_runtime_app: release active facade for fixed-bind handoff route_key={} generation={}",
-                                route_key, generation
-                            );
-                            app.retained_active_facade_continuity
-                                .store(false, Ordering::Release);
-                            *app.pending_facade.lock().await = None;
-                            FSMetaApp::clear_pending_facade_status(&app.facade_pending_status);
-                            let _ = app.current_facade_service_state().await;
-                            let _ = app.current_facade_service_state().await;
-                            app.wait_for_shared_worker_control_handoff().await;
-                            self.clone()
-                                .drive_shutdown_handoff(app, Some(handoff))
-                                .await?;
-                        }
-                        FacadeDeactivateContinuityExecutionPlan::RetainPendingForFixedBindHandoff => {
-                            eprintln!(
-                                "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
-                                route_key, generation
-                            );
-                        }
-                        FacadeDeactivateContinuityExecutionPlan::RetainPendingWhileSpawnInFlight => {
-                            eprintln!(
-                                "fs_meta_runtime_app: retain pending facade during in-flight spawn route_key={} generation={}",
-                                route_key, generation
-                            );
-                        }
-                        FacadeDeactivateContinuityExecutionPlan::Shutdown { handoff } => {
-                            app.retained_active_facade_continuity
-                                .store(false, Ordering::Release);
-                            *app.pending_facade.lock().await = None;
-                            FSMetaApp::clear_pending_facade_status(&app.facade_pending_status);
-                            let _ = app.current_facade_service_state().await;
-                            let _ = app.current_facade_service_state().await;
-                            app.wait_for_shared_worker_control_handoff().await;
-                            self.clone().drive_shutdown_handoff(app, handoff).await?;
-                        }
-                    }
-                    Ok(FixedBindHandoffExecution::Completed)
-                }
-                FixedBindHandoffAction::Publication => {
-                    let publication_ready = match self.publication_readiness_decision() {
-                        FacadePublicationReadinessDecision::BlockedControlGate
-                        | FacadePublicationReadinessDecision::BlockedWithoutActiveControlStream => {
-                            false
-                        }
-                        FacadePublicationReadinessDecision::Ready => {
-                            if let Some(bind_addr) = self.publication_ready_bind_addr_to_clear() {
-                                clear_pending_fixed_bind_handoff_ready(bind_addr);
-                            }
-                            true
-                        }
-                        FacadePublicationReadinessDecision::FixedBindHandoffPending => {
-                            let Some(pending) = self.pending_publication_handoff() else {
-                                return Ok(FixedBindHandoffExecution::PublicationReady(false));
-                            };
-                            let bind_addr = pending.resolved.bind_addr.clone();
-                            let Some(handoff) =
-                                Self::release_handoff_blocker_for_publication(app, &pending).await
-                            else {
-                                return Ok(FixedBindHandoffExecution::PublicationReady(false));
-                            };
-                            let after_release_completed = match self
-                                .clone()
-                                .execute(app, FixedBindHandoffAction::AfterRelease { handoff })
-                                .await?
-                            {
-                                FixedBindHandoffExecution::AfterReleaseCompleted(completed) => {
-                                    completed
-                                }
-                                _ => false,
-                            };
-                            if !after_release_completed {
-                                return Ok(FixedBindHandoffExecution::PublicationReady(false));
-                            }
-                            if app
-                                .api_task
-                                .lock()
-                                .await
-                                .as_ref()
-                                .is_some_and(|active| pending.matches_active(active))
-                            {
-                                clear_pending_fixed_bind_handoff_ready(&bind_addr);
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                    };
-                    Ok(FixedBindHandoffExecution::PublicationReady(
-                        publication_ready,
-                    ))
-                }
-                FixedBindHandoffAction::Shutdown => {
-                    self.clone()
-                        .drive_shutdown_handoff(app, self.shutdown_handoff)
-                        .await?;
-                    Ok(FixedBindHandoffExecution::Completed)
-                }
-                FixedBindHandoffAction::AfterRelease { handoff } => {
-                    let mut runtime = FixedBindAfterReleaseRuntime::new();
-                    loop {
-                        match runtime.spawn_attempt_action() {
-                            FixedBindAfterReleaseAction::ReturnTimeout => {
-                                return Ok(FixedBindHandoffExecution::AfterReleaseCompleted(false));
-                            }
-                            FixedBindAfterReleaseAction::SpawnAttempt => {
-                                runtime = match handoff.registrant.try_spawn_pending_facade().await
-                                {
-                                    Ok(_) => runtime.note_spawn_success(),
-                                    Err(err) => runtime.note_spawn_failure(err),
-                                };
-                            }
-                            FixedBindAfterReleaseAction::WaitForProgress(_)
-                            | FixedBindAfterReleaseAction::Complete => {
-                                unreachable!("after-release runtime produced a non-entry action")
-                            }
-                        }
-                        match runtime
-                            .post_spawn_action(Self::completion_ready_after_release(&handoff).await)
-                        {
-                            FixedBindAfterReleaseAction::Complete => {
-                                #[cfg(test)]
-                                maybe_pause_before_pending_fixed_bind_handoff_completion_gate_reopen()
-                                    .await;
-                                let _ = handoff
-                                    .registrant
-                                    .apply_forced_handoff_ready_tail(&handoff.bind_addr)
-                                    .await;
-                                #[cfg(test)]
-                                notify_pending_fixed_bind_handoff_completion_completion();
-                                return Ok(FixedBindHandoffExecution::AfterReleaseCompleted(true));
-                            }
-                            FixedBindAfterReleaseAction::WaitForProgress(remaining) => {
-                                if !Self::wait_for_completion_progress(
-                                    &handoff,
-                                    remaining,
-                                    runtime.last_retry_error_message(),
-                                )
-                                .await
-                                {
-                                    return Ok(FixedBindHandoffExecution::AfterReleaseCompleted(
-                                        false,
-                                    ));
-                                }
-                            }
-                            FixedBindAfterReleaseAction::ReturnTimeout => {
-                                return Ok(FixedBindHandoffExecution::AfterReleaseCompleted(false));
-                            }
-                            FixedBindAfterReleaseAction::SpawnAttempt => {
-                                unreachable!(
-                                    "after-release runtime post-spawn action regressed to spawn"
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        })
-    }
-
-    fn deactivate_decision(
-        self,
-        retain_active_facade: bool,
-        retain_pending_spawn: bool,
-    ) -> FacadeDeactivateContinuityExecutionPlan {
-        let pending_fixed_bind_conflict = self.pending_fixed_bind_publication.claim_conflict();
-        if retain_active_facade && !pending_fixed_bind_conflict && self.release_handoff.is_none() {
-            return FacadeDeactivateContinuityExecutionPlan::RetainActiveContinuity;
-        }
-        if pending_fixed_bind_conflict {
-            return if retain_active_facade {
-                FacadeDeactivateContinuityExecutionPlan::RetainActiveWhilePendingFixedBindClaimConflict
-            } else {
-                FacadeDeactivateContinuityExecutionPlan::RetainPendingWhilePendingFixedBindClaimConflict
-            };
-        }
-        if let Some(handoff) = self.release_handoff {
-            return if retain_active_facade {
-                FacadeDeactivateContinuityExecutionPlan::ReleaseActiveForFixedBindHandoff {
-                    handoff: ActiveFixedBindShutdownContinuation {
-                        bind_addr: handoff.bind_addr.clone(),
-                        pending_handoff: Some(handoff),
-                    },
-                }
-            } else {
-                FacadeDeactivateContinuityExecutionPlan::RetainPendingForFixedBindHandoff
-            };
-        }
-        if retain_pending_spawn {
-            return FacadeDeactivateContinuityExecutionPlan::RetainPendingWhileSpawnInFlight;
-        }
-        FacadeDeactivateContinuityExecutionPlan::Shutdown {
-            handoff: self.shutdown_handoff,
-        }
-    }
-
-    #[cfg(test)]
-    fn deactivate_plan(
-        self,
-        retain_active_facade: bool,
-        retain_pending_spawn: bool,
-    ) -> FacadeDeactivateContinuityExecutionPlan {
-        self.deactivate_decision(retain_active_facade, retain_pending_spawn)
-    }
-}
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingFixedBindHandoffAttemptDisposition {
@@ -1040,118 +580,241 @@ impl FacadeOnlyHandoffAllowanceDecision {
 }
 
 impl FacadeGateObservation {
-    fn publication_readiness_decision(&self) -> FacadePublicationReadinessDecision {
-        self.runtime.facade_publication_readiness_decision(
-            self.current_pending.is_some(),
-            self.pending_facade_is_control_route,
-            self.active_control_stream_present,
-            self.active_pending_control_stream_present,
-            self.allow_facade_only_handoff,
-        )
-    }
-
-    fn publication_ready(&self) -> bool {
-        matches!(
-            self.publication_readiness_decision(),
-            FacadePublicationReadinessDecision::Ready
-        )
-    }
-
-    fn ready_tail_decision(&self, publication_ready: bool) -> FacadeReadyTailDecision {
-        self.runtime.facade_ready_tail_decision(
-            publication_ready,
-            self.pending_facade_present,
-            self.allow_facade_only_handoff,
-        )
+    fn inert() -> Self {
+        Self {
+            runtime: RuntimeControlState::bootstrapping(false, false),
+            current_pending: None,
+            pending_facade_present: false,
+            pending_facade_is_control_route: false,
+            active_control_stream_present: false,
+            active_pending_control_stream_present: false,
+            allow_facade_only_handoff: false,
+        }
     }
 }
 
-impl PendingFixedBindPublicationState {
-    fn inactive(claim_release_followup_pending: bool) -> Self {
+impl FacadePublicationMachine {
+    fn from_input(input: FacadePublicationInput) -> Self {
+        let FacadePublicationInput {
+            observation,
+            publication_ready,
+        } = input;
         Self {
-            pending: None,
-            conflicting_process_claim: None,
-            claim_release_followup_pending,
+            observation,
+            publication_ready,
         }
     }
 
-    fn new(
-        pending: Option<PendingFacadeActivation>,
-        conflicting_process_claim: Option<ProcessFacadeClaim>,
-        claim_release_followup_pending: bool,
-    ) -> Self {
+    fn snapshot(&self) -> FacadePublicationSnapshot {
+        let ready_tail = self.observation.runtime.facade_ready_tail_decision(
+            self.publication_ready,
+            self.observation.pending_facade_present,
+            self.observation.allow_facade_only_handoff,
+        );
+        FacadePublicationSnapshot {
+            phase: if self.observation.pending_facade_present {
+                FacadePublicationPhase::Pending
+            } else if self
+                .observation
+                .runtime
+                .control_gate_ready(self.observation.allow_facade_only_handoff)
+                && self.publication_ready
+            {
+                FacadePublicationPhase::Serving
+            } else if self.observation.active_control_stream_present {
+                FacadePublicationPhase::Withheld
+            } else {
+                FacadePublicationPhase::NoFacade
+            },
+            control_gate_ready: ready_tail.control_gate_ready,
+            publication_ready: self.publication_ready,
+            published_state: ready_tail.published_state,
+        }
+    }
+}
+
+impl FacadeDeactivateMachine {
+    fn from_input(input: FacadeDeactivateInput) -> Self {
+        let FacadeDeactivateInput {
+            fixed_bind,
+            release_handoff,
+            shutdown_handoff,
+        } = input;
         Self {
-            pending,
-            conflicting_process_claim,
-            claim_release_followup_pending,
+            fixed_bind,
+            release_handoff,
+            shutdown_handoff,
         }
     }
 
-    fn publication_incomplete(&self) -> Option<PendingFacadeActivation> {
-        self.pending.clone()
-    }
-
-    fn claim_conflict(&self) -> bool {
-        self.conflicting_process_claim.is_some()
-    }
-
-    fn conflicting_process_claim_for_handoff(&self) -> Option<ProcessFacadeClaim> {
-        self.claim_release_followup_pending
-            .then(|| self.conflicting_process_claim.clone())
-            .flatten()
-    }
-
-    fn projection(&self) -> PendingFixedBindPublicationProjection {
-        let claim_release_followup_required = self.claim_conflict();
-        let claim_release_followup_disposition = if !self.claim_release_followup_pending {
-            PendingFixedBindClaimReleaseFollowupDisposition::Inactive
-        } else if self.publication_incomplete().is_none() {
-            PendingFixedBindClaimReleaseFollowupDisposition::PublicationCompleted
-        } else if claim_release_followup_required {
-            PendingFixedBindClaimReleaseFollowupDisposition::WaitingForClaimRelease
-        } else {
-            PendingFixedBindClaimReleaseFollowupDisposition::PublicationStillIncomplete
-        };
-        let route_suppression_disposition = if claim_release_followup_required {
-            PendingFixedBindRouteSuppressionDisposition::SuppressClaimConflict
-        } else {
-            match claim_release_followup_disposition {
-                PendingFixedBindClaimReleaseFollowupDisposition::Inactive
-                | PendingFixedBindClaimReleaseFollowupDisposition::PublicationCompleted => {
-                    PendingFixedBindRouteSuppressionDisposition::Allow
+    fn deactivate_plan(
+        &self,
+        retain_active_facade: bool,
+        retain_pending_spawn: bool,
+    ) -> FacadeDeactivateContinuityExecutionPlan {
+        let pending_fixed_bind_conflict = self.fixed_bind.conflicting_process_claim.is_some();
+        if retain_active_facade && !pending_fixed_bind_conflict && self.release_handoff.is_none() {
+            return FacadeDeactivateContinuityExecutionPlan::RetainActiveContinuity;
+        }
+        if pending_fixed_bind_conflict {
+            return if retain_active_facade {
+                FacadeDeactivateContinuityExecutionPlan::RetainActiveWhilePendingFixedBindClaimConflict
+            } else {
+                FacadeDeactivateContinuityExecutionPlan::RetainPendingWhilePendingFixedBindClaimConflict
+            };
+        }
+        if let Some(handoff) = self.release_handoff.clone() {
+            return if retain_active_facade {
+                FacadeDeactivateContinuityExecutionPlan::ReleaseActiveForFixedBindHandoff {
+                    handoff: ActiveFixedBindShutdownContinuation {
+                        bind_addr: handoff.bind_addr.clone(),
+                        pending_handoff: Some(handoff),
+                    },
                 }
-                PendingFixedBindClaimReleaseFollowupDisposition::WaitingForClaimRelease => {
-                    PendingFixedBindRouteSuppressionDisposition::SuppressClaimConflict
-                }
-                PendingFixedBindClaimReleaseFollowupDisposition::PublicationStillIncomplete => {
-                    PendingFixedBindRouteSuppressionDisposition::SuppressPublicationIncomplete
+            } else {
+                FacadeDeactivateContinuityExecutionPlan::RetainPendingForFixedBindHandoff
+            };
+        }
+        if retain_pending_spawn {
+            return FacadeDeactivateContinuityExecutionPlan::RetainPendingWhileSpawnInFlight;
+        }
+        FacadeDeactivateContinuityExecutionPlan::Shutdown {
+            handoff: self.shutdown_handoff.clone(),
+        }
+    }
+}
+
+async fn fixed_bind_completion_ready_after_release(
+    handoff: &PendingFixedBindHandoffContinuation,
+) -> bool {
+    let pending_facade_present = handoff.registrant.pending_facade.lock().await.is_some();
+    let active_control_stream_present = handoff
+        .registrant
+        .api_task
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|active| active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL));
+    !pending_facade_present && active_control_stream_present
+}
+
+async fn wait_for_fixed_bind_after_release_completion_progress(
+    handoff: &PendingFixedBindHandoffContinuation,
+    remaining: Duration,
+    last_retry_error: Option<&str>,
+) -> bool {
+    if remaining.is_zero() {
+        if let Some(err) = last_retry_error {
+            eprintln!(
+                "fs_meta_runtime_app: fixed-bind handoff completion retry failed bind_addr={} err={}",
+                handoff.bind_addr, err
+            );
+        }
+        return false;
+    }
+    let _ = tokio::time::timeout(
+        remaining,
+        handoff.registrant.runtime_state_changed.notified(),
+    )
+    .await;
+    true
+}
+
+async fn execute_fixed_bind_after_release_handoff(
+    handoff: PendingFixedBindHandoffContinuation,
+) -> Result<bool> {
+    let mut runtime = FixedBindAfterReleaseRuntime::new_with_deadline(
+        tokio::time::Instant::now() + Duration::from_secs(8),
+    );
+    loop {
+        match runtime.spawn_attempt_action_at(tokio::time::Instant::now()) {
+            FixedBindAfterReleaseAction::ReturnTimeout => return Ok(false),
+            FixedBindAfterReleaseAction::SpawnAttempt => {
+                runtime = match handoff.registrant.try_spawn_pending_facade().await {
+                    Ok(_) => runtime.note_spawn_success(),
+                    Err(err) => runtime.note_spawn_failure(err),
+                };
+            }
+            FixedBindAfterReleaseAction::WaitForProgress(_)
+            | FixedBindAfterReleaseAction::Complete => {
+                unreachable!("after-release runtime produced a non-entry action")
+            }
+        }
+        match runtime.post_spawn_action_at(
+            tokio::time::Instant::now(),
+            fixed_bind_completion_ready_after_release(&handoff).await,
+        ) {
+            FixedBindAfterReleaseAction::Complete => {
+                #[cfg(test)]
+                maybe_pause_before_pending_fixed_bind_handoff_completion_gate_reopen().await;
+                let _ = handoff
+                    .registrant
+                    .apply_forced_handoff_ready_tail(&handoff.bind_addr)
+                    .await;
+                #[cfg(test)]
+                notify_pending_fixed_bind_handoff_completion_completion();
+                return Ok(true);
+            }
+            FixedBindAfterReleaseAction::WaitForProgress(remaining) => {
+                if !wait_for_fixed_bind_after_release_completion_progress(
+                    &handoff,
+                    remaining,
+                    runtime.last_retry_error_message(),
+                )
+                .await
+                {
+                    return Ok(false);
                 }
             }
-        };
-
-        PendingFixedBindPublicationProjection {
-            claim_release_followup_required,
-            claim_release_followup_disposition,
-            route_suppression_disposition,
-            handoff_ready_bind_addr_present: self.pending.as_ref().is_some_and(|pending| {
-                claim_release_followup_required
-                    && pending.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-                    && !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr)
-            }),
+            FixedBindAfterReleaseAction::ReturnTimeout => return Ok(false),
+            FixedBindAfterReleaseAction::SpawnAttempt => {
+                unreachable!("after-release runtime post-spawn action regressed to spawn")
+            }
         }
     }
 }
 
-impl PendingFixedBindPublicationProjection {
-    fn handoff_followup_for_pending(
-        self,
-        pending: &PendingFacadeActivation,
-    ) -> Option<PendingFixedBindHandoffFollowup> {
-        self.handoff_ready_bind_addr_present
-            .then(|| PendingFixedBindHandoffFollowup {
-                bind_addr: pending.resolved.bind_addr.clone(),
-                claim_release_followup_required: self.claim_release_followup_required,
-            })
+impl RolloutGenerationMachine {
+    fn snapshot(self) -> PublishedRolloutStatusSnapshot {
+        let retiring_generation = match (self.active_generation, self.candidate_generation) {
+            (Some(active), Some(candidate)) if active != candidate => Some(active),
+            _ => None,
+        };
+        let state = match (self.active_generation, self.candidate_generation) {
+            (_, Some(_))
+                if !self.runtime.control_initialized()
+                    || self.runtime.source_state_replay_required()
+                    || self.runtime.sink_state_replay_required() =>
+            {
+                RolloutGenerationState::CatchUp
+            }
+            (_, Some(_)) if !self.candidate_runtime_exposure_confirmed => {
+                RolloutGenerationState::Eligible
+            }
+            (Some(active), Some(candidate)) if active != candidate && self.publication_ready => {
+                RolloutGenerationState::Drain
+            }
+            (Some(active), Some(candidate)) if active != candidate => {
+                RolloutGenerationState::Cutover
+            }
+            (None, Some(_)) if self.publication_ready => RolloutGenerationState::Cutover,
+            (None, Some(_)) => RolloutGenerationState::Eligible,
+            (Some(_), None)
+                if self.runtime.control_initialized()
+                    && !self.runtime.source_state_replay_required()
+                    && !self.runtime.sink_state_replay_required()
+                    && self.publication_ready =>
+            {
+                RolloutGenerationState::Stable
+            }
+            _ => RolloutGenerationState::CatchUp,
+        };
+        PublishedRolloutStatusSnapshot {
+            state,
+            serving_generation: self.active_generation,
+            candidate_generation: self.candidate_generation,
+            retiring_generation,
+        }
     }
 }
 
@@ -1370,17 +1033,10 @@ struct RuntimeScopeExpectedGroups {
 
 #[derive(Clone, Copy, Debug)]
 enum RuntimeScopeConvergenceExpectation<'a> {
-    NonemptyFullyConverged,
     ExpectedGroups(&'a RuntimeScopeExpectedGroups),
 }
 
 impl RuntimeScopeConvergenceObservation {
-    fn is_nonempty_fully_converged(&self) -> bool {
-        !self.source_groups.is_empty()
-            && self.source_groups == self.scan_groups
-            && self.source_groups == self.sink_groups
-    }
-
     fn matches_expected(&self, expected_groups: &RuntimeScopeExpectedGroups) -> bool {
         self.source_groups == expected_groups.source_groups
             && self.scan_groups == expected_groups.scan_groups
@@ -1394,14 +1050,29 @@ impl RuntimeScopeConvergenceObservation {
         )
     }
 
+    fn expected_groups_for_logical_roots(
+        &self,
+        logical_roots: &[source::config::RootSpec],
+    ) -> Option<RuntimeScopeExpectedGroups> {
+        let mut sink_groups = self.sink_groups.clone();
+        if sink_groups.is_empty() {
+            sink_groups.extend(self.source_groups.iter().cloned());
+            sink_groups.extend(self.scan_groups.iter().cloned());
+        }
+        if sink_groups.is_empty() {
+            return None;
+        }
+        Some(RuntimeScopeExpectedGroups::from_logical_roots(
+            logical_roots,
+            &sink_groups,
+        ))
+    }
+
     fn matches_expectation(
         self: &Self,
         expectation: RuntimeScopeConvergenceExpectation<'_>,
     ) -> bool {
         match expectation {
-            RuntimeScopeConvergenceExpectation::NonemptyFullyConverged => {
-                self.is_nonempty_fully_converged()
-            }
             RuntimeScopeConvergenceExpectation::ExpectedGroups(expected_groups) => {
                 self.matches_expected(expected_groups)
             }
@@ -1447,70 +1118,85 @@ impl RuntimeScopeExpectedGroups {
     }
 }
 
+#[derive(Debug)]
+struct SinkRecoveryMachine {
+    state: SinkRecoveryState,
+    #[cfg(test)]
+    first_sink_probe_pending: bool,
+}
+
+fn debug_sink_recovery_capture_enabled() -> bool {
+    std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
+}
+
+#[derive(Debug)]
+enum SinkRecoveryState {
+    PostRecovery(PostRecoverySinkRecoveryState),
+    LocalRepublish(LocalSinkRepublishState),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PostRecoveryScopeConvergenceTriggerState {
+struct PostRecoverySinkRecoveryState {
+    scope_trigger_state: SinkRecoveryScopeTriggerState,
+    sink_timeout_retry_state: SinkRecoveryTimeoutRetryState,
+    source_rescan_request_epoch: Option<u64>,
+}
+
+#[derive(Debug)]
+struct LocalSinkRepublishState {
+    deadline: tokio::time::Instant,
+    allow_cached_ready_fast_path: bool,
+    source_rescan_request_epoch: Option<u64>,
+    source_publication_epoch_floor: Option<u64>,
+    retrigger_state: SinkRecoveryRetriggerState,
+    manual_rescan_state: SinkRecoveryManualRescanState,
+    retained_sink_replay_state: SinkRecoveryRetainedSinkReplayState,
+    #[cfg(test)]
+    retrigger_probe_pause_pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SinkRecoveryScopeTriggerState {
     InitialNotTriggered,
     Triggered,
     RetryPending,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PostRecoverySinkStatusTimeoutRetryState {
+enum SinkRecoveryTimeoutRetryState {
     NotRetried,
     RetriedAfterManualRescan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PostRecoverySinkStatusReadinessWaitState {
-    scope_trigger_state: PostRecoveryScopeConvergenceTriggerState,
-    sink_timeout_retry_state: PostRecoverySinkStatusTimeoutRetryState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PostRecoveryScopeConvergenceAction {
+enum SinkRecoveryScopeConvergenceAction {
     Converged,
     TriggerInitialAndWait,
     Wait,
     ReturnTimeout,
 }
 
-#[derive(Debug)]
-struct LocalSinkStatusRepublishMachine {
-    deadline: tokio::time::Instant,
-    retrigger_state: LocalSinkStatusRepublishRetriggerState,
-    manual_rescan_state: LocalSinkStatusRepublishManualRescanState,
-    retained_sink_replay_state: LocalSinkStatusRepublishRetainedSinkReplayState,
-    #[cfg(test)]
-    first_sink_probe_pending: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalSinkStatusRepublishRetriggerState {
+enum SinkRecoveryRetriggerState {
     Pending { count: usize },
     Idle { count: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalSinkStatusRepublishManualRescanState {
+enum SinkRecoveryManualRescanState {
     NotPublished,
     Published,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalSinkStatusRepublishRetainedSinkReplayState {
+enum SinkRecoveryRetainedSinkReplayState {
     None,
     Pending,
     RequireReadyProbe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LocalSinkStatusRepublishObservation {
-    scope_converged: bool,
-    cached_ready_fast_path_satisfied: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalSinkStatusRepublishStep {
+enum SinkRecoveryStep {
     WaitForRuntimeScopeConvergence,
     ReturnReady,
     TriggerSourceToSinkConvergence,
@@ -1605,7 +1291,7 @@ impl ControlFrameWaveObservation {
     }
 }
 
-impl LocalSinkStatusRepublishRetriggerState {
+impl SinkRecoveryRetriggerState {
     fn is_pending(self) -> bool {
         matches!(self, Self::Pending { .. })
     }
@@ -1623,87 +1309,543 @@ impl LocalSinkStatusRepublishRetriggerState {
     }
 }
 
-impl LocalSinkStatusRepublishRetainedSinkReplayState {
+impl SinkRecoveryRetainedSinkReplayState {
     fn is_pending(self) -> bool {
         matches!(self, Self::Pending)
     }
 }
 
-impl LocalSinkStatusRepublishMachine {
-    fn new(mode: LocalSinkStatusRepublishWaitMode) -> Self {
-        Self::new_with_deadline(mode, tokio::time::Instant::now() + Duration::from_secs(5))
-    }
-
-    fn new_with_deadline(
-        mode: LocalSinkStatusRepublishWaitMode,
-        deadline: tokio::time::Instant,
-    ) -> Self {
+impl SinkRecoveryMachine {
+    fn new_post_recovery(source_to_sink_convergence_pretriggered_epoch: Option<u64>) -> Self {
         Self {
-            deadline,
-            retrigger_state: match mode {
-                LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath => {
-                    LocalSinkStatusRepublishRetriggerState::Pending { count: 0 }
-                }
-                LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady => {
-                    LocalSinkStatusRepublishRetriggerState::Idle { count: 0 }
-                }
-            },
-            manual_rescan_state: LocalSinkStatusRepublishManualRescanState::NotPublished,
-            retained_sink_replay_state: match mode {
-                LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath => {
-                    LocalSinkStatusRepublishRetainedSinkReplayState::None
-                }
-                LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady => {
-                    LocalSinkStatusRepublishRetainedSinkReplayState::RequireReadyProbe
-                }
-            },
+            state: SinkRecoveryState::PostRecovery(PostRecoverySinkRecoveryState {
+                scope_trigger_state: if source_to_sink_convergence_pretriggered_epoch.is_some() {
+                    SinkRecoveryScopeTriggerState::Triggered
+                } else {
+                    SinkRecoveryScopeTriggerState::InitialNotTriggered
+                },
+                sink_timeout_retry_state: SinkRecoveryTimeoutRetryState::NotRetried,
+                source_rescan_request_epoch: source_to_sink_convergence_pretriggered_epoch,
+            }),
             #[cfg(test)]
             first_sink_probe_pending: true,
         }
     }
 
+    fn new_local(mode: LocalSinkStatusRepublishWaitMode) -> Self {
+        Self::new_local_with_deadline(mode, tokio::time::Instant::now() + Duration::from_secs(5))
+    }
+
+    fn new_local_pretriggered(mode: LocalSinkStatusRepublishWaitMode, request_epoch: u64) -> Self {
+        Self::new_local_pretriggered_with_deadline(
+            mode,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            request_epoch,
+        )
+    }
+
+    fn new_local_with_deadline(
+        mode: LocalSinkStatusRepublishWaitMode,
+        deadline: tokio::time::Instant,
+    ) -> Self {
+        Self {
+            state: SinkRecoveryState::LocalRepublish(LocalSinkRepublishState {
+                deadline,
+                allow_cached_ready_fast_path: matches!(
+                    mode,
+                    LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath
+                ),
+                source_rescan_request_epoch: None,
+                source_publication_epoch_floor: None,
+                retrigger_state: match mode {
+                    LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath => {
+                        SinkRecoveryRetriggerState::Pending { count: 0 }
+                    }
+                    LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady => {
+                        SinkRecoveryRetriggerState::Idle { count: 0 }
+                    }
+                },
+                manual_rescan_state: SinkRecoveryManualRescanState::NotPublished,
+                retained_sink_replay_state: match mode {
+                    LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath => {
+                        SinkRecoveryRetainedSinkReplayState::None
+                    }
+                    LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady => {
+                        SinkRecoveryRetainedSinkReplayState::RequireReadyProbe
+                    }
+                },
+                #[cfg(test)]
+                retrigger_probe_pause_pending: false,
+            }),
+            #[cfg(test)]
+            first_sink_probe_pending: true,
+        }
+    }
+
+    fn new_local_pretriggered_with_deadline(
+        mode: LocalSinkStatusRepublishWaitMode,
+        deadline: tokio::time::Instant,
+        request_epoch: u64,
+    ) -> Self {
+        Self {
+            state: SinkRecoveryState::LocalRepublish(LocalSinkRepublishState {
+                deadline,
+                allow_cached_ready_fast_path: matches!(
+                    mode,
+                    LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath
+                ),
+                source_rescan_request_epoch: Some(request_epoch),
+                source_publication_epoch_floor: Some(request_epoch),
+                retrigger_state: SinkRecoveryRetriggerState::Pending { count: 1 },
+                manual_rescan_state: SinkRecoveryManualRescanState::NotPublished,
+                retained_sink_replay_state: match mode {
+                    LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath => {
+                        SinkRecoveryRetainedSinkReplayState::None
+                    }
+                    LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady => {
+                        SinkRecoveryRetainedSinkReplayState::RequireReadyProbe
+                    }
+                },
+                #[cfg(test)]
+                retrigger_probe_pause_pending: false,
+            }),
+            #[cfg(test)]
+            first_sink_probe_pending: true,
+        }
+    }
+
+    fn post_recovery_state(&self) -> &PostRecoverySinkRecoveryState {
+        match &self.state {
+            SinkRecoveryState::PostRecovery(state) => state,
+            SinkRecoveryState::LocalRepublish(_) => {
+                panic!("sink recovery machine accessed post-recovery state in local mode")
+            }
+        }
+    }
+
+    fn post_recovery_state_mut(&mut self) -> &mut PostRecoverySinkRecoveryState {
+        match &mut self.state {
+            SinkRecoveryState::PostRecovery(state) => state,
+            SinkRecoveryState::LocalRepublish(_) => {
+                panic!("sink recovery machine accessed post-recovery state in local mode")
+            }
+        }
+    }
+
+    fn local_state(&self) -> &LocalSinkRepublishState {
+        match &self.state {
+            SinkRecoveryState::LocalRepublish(state) => state,
+            SinkRecoveryState::PostRecovery(_) => {
+                panic!("sink recovery machine accessed local state in post-recovery mode")
+            }
+        }
+    }
+
+    fn local_state_mut(&mut self) -> &mut LocalSinkRepublishState {
+        match &mut self.state {
+            SinkRecoveryState::LocalRepublish(state) => state,
+            SinkRecoveryState::PostRecovery(_) => {
+                panic!("sink recovery machine accessed local state in post-recovery mode")
+            }
+        }
+    }
+
     fn remaining(&self) -> Duration {
-        self.deadline
+        self.local_state()
+            .deadline
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or_default()
     }
 
     fn deadline(&self) -> tokio::time::Instant {
-        self.deadline
+        self.local_state().deadline
     }
 
-    fn step_for_observation(
+    fn local_requires_probe_before_ready(&self) -> bool {
+        matches!(
+            self.local_state().retained_sink_replay_state,
+            SinkRecoveryRetainedSinkReplayState::RequireReadyProbe
+        )
+    }
+
+    #[cfg(test)]
+    async fn maybe_pause_at_retrigger_probe_boundary(&mut self) {
+        if self.local_state().retrigger_probe_pause_pending {
+            maybe_pause_after_local_sink_status_republish_retrigger().await;
+            self.local_state_mut().retrigger_probe_pause_pending = false;
+        }
+    }
+
+    fn post_recovery_source_rescan_pending(&self) -> bool {
+        self.post_recovery_state()
+            .source_rescan_request_epoch
+            .is_some()
+    }
+
+    fn post_recovery_scope_action(
         &self,
-        observation: &LocalSinkStatusRepublishObservation,
-    ) -> LocalSinkStatusRepublishStep {
-        if !observation.scope_converged {
-            return if self.remaining().is_zero() {
-                LocalSinkStatusRepublishStep::ReturnTimeout
-            } else {
-                LocalSinkStatusRepublishStep::WaitForRuntimeScopeConvergence
-            };
+        observation: &RuntimeScopeConvergenceObservation,
+        expected_scope_groups: Option<&RuntimeScopeExpectedGroups>,
+        deadline: tokio::time::Instant,
+    ) -> SinkRecoveryScopeConvergenceAction {
+        if expected_scope_groups.is_some_and(|expected_groups| {
+            observation.matches_expectation(RuntimeScopeConvergenceExpectation::ExpectedGroups(
+                expected_groups,
+            ))
+        }) && !self.post_recovery_source_rescan_pending()
+        {
+            SinkRecoveryScopeConvergenceAction::Converged
+        } else if tokio::time::Instant::now() >= deadline {
+            SinkRecoveryScopeConvergenceAction::ReturnTimeout
+        } else if matches!(
+            self.post_recovery_state().scope_trigger_state,
+            SinkRecoveryScopeTriggerState::InitialNotTriggered
+        ) {
+            SinkRecoveryScopeConvergenceAction::TriggerInitialAndWait
+        } else {
+            SinkRecoveryScopeConvergenceAction::Wait
         }
-        if observation.cached_ready_fast_path_satisfied {
-            return LocalSinkStatusRepublishStep::ReturnReady;
-        }
-        if self.remaining().is_zero() {
-            return LocalSinkStatusRepublishStep::ReturnTimeout;
-        }
-        self.next_step_after_scope_convergence()
     }
 
-    async fn trigger_source_to_sink_convergence(
+    async fn maybe_drive_pending_post_recovery_scope_convergence_retrigger(
         &mut self,
         source: &Arc<SourceFacade>,
     ) -> Result<()> {
-        source.trigger_rescan_when_ready().await?;
-        #[cfg(test)]
-        maybe_pause_after_local_sink_status_republish_retrigger().await;
-        self.retrigger_state.mark_triggered();
+        if matches!(
+            self.post_recovery_state().scope_trigger_state,
+            SinkRecoveryScopeTriggerState::RetryPending
+        ) {
+            let request_epoch = source.trigger_rescan_when_ready_epoch().await?;
+            let state = self.post_recovery_state_mut();
+            state.source_rescan_request_epoch = Some(request_epoch);
+            state.scope_trigger_state = SinkRecoveryScopeTriggerState::Triggered;
+        }
         Ok(())
     }
 
-    async fn replay_retained_sink_wave(
+    async fn maybe_trigger_initial_post_recovery_scope_convergence(
+        &mut self,
+        source: &Arc<SourceFacade>,
+    ) -> Result<()> {
+        if matches!(
+            self.post_recovery_state().scope_trigger_state,
+            SinkRecoveryScopeTriggerState::InitialNotTriggered
+        ) {
+            let request_epoch = source.trigger_rescan_when_ready_epoch().await?;
+            let state = self.post_recovery_state_mut();
+            state.source_rescan_request_epoch = Some(request_epoch);
+            state.scope_trigger_state = SinkRecoveryScopeTriggerState::Triggered;
+        }
+        Ok(())
+    }
+
+    async fn refresh_post_recovery_source_rescan_observation(
+        &mut self,
+        source: &Arc<SourceFacade>,
+    ) {
+        if let Some(request_epoch) = self.post_recovery_state().source_rescan_request_epoch {
+            if let Ok(snapshot) = source.progress_snapshot().await {
+                if snapshot.rescan_observed_epoch >= request_epoch {
+                    self.post_recovery_state_mut().source_rescan_request_epoch = None;
+                }
+            }
+        }
+    }
+
+    async fn wait_for_post_recovery_progress(
+        &self,
+        runtime_state_changed: &Arc<tokio::sync::Notify>,
+        source: &Arc<SourceFacade>,
+        sink: &Arc<SinkFacade>,
+        deadline: tokio::time::Instant,
+    ) {
+        if self.post_recovery_source_rescan_pending() {
+            FSMetaApp::wait_for_runtime_source_or_sink_progress_until(
+                runtime_state_changed,
+                source,
+                sink,
+                deadline,
+            )
+            .await;
+        } else {
+            FSMetaApp::wait_for_runtime_or_sink_progress_until(
+                runtime_state_changed,
+                sink,
+                deadline,
+            )
+            .await;
+        }
+    }
+
+    async fn maybe_schedule_post_recovery_sink_timeout_retry(
+        &mut self,
+        source: &Arc<SourceFacade>,
+        before_deadline: bool,
+    ) -> Result<bool> {
+        if !before_deadline
+            || !matches!(
+                self.post_recovery_state().sink_timeout_retry_state,
+                SinkRecoveryTimeoutRetryState::NotRetried
+            )
+        {
+            return Ok(false);
+        }
+        // A later source-only recovery can converge route scopes from primed
+        // cached groups before the post-recovery rescan has actually
+        // rematerialized baseline source publication. Request one explicit
+        // manual rescan before the final source->sink retry so sink readiness
+        // wait does not return on a scheduled-only zero-state sink.
+        source.publish_manual_rescan_signal().await?;
+        let state = self.post_recovery_state_mut();
+        state.sink_timeout_retry_state = SinkRecoveryTimeoutRetryState::RetriedAfterManualRescan;
+        state.scope_trigger_state = SinkRecoveryScopeTriggerState::RetryPending;
+        Ok(true)
+    }
+
+    async fn run_post_recovery_readiness(
+        &mut self,
+        source: &Arc<SourceFacade>,
+        sink: &Arc<SinkFacade>,
+        runtime_state_changed: &Arc<tokio::sync::Notify>,
+    ) -> Result<Option<std::collections::BTreeSet<String>>> {
+        let summarize_cached_sink_status_after_scope_convergence_timeout =
+            |sink: &Arc<SinkFacade>| {
+                sink.cached_status_snapshot()
+                    .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+                    .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"))
+            };
+        loop {
+            let scope_convergence_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let converged_groups = loop {
+                self.maybe_drive_pending_post_recovery_scope_convergence_retrigger(source)
+                    .await?;
+                self.refresh_post_recovery_source_rescan_observation(source)
+                    .await;
+                let scope_observation =
+                    FSMetaApp::observe_runtime_scope_convergence(source, sink).await?;
+                let expected_scope_groups = scope_observation
+                    .expected_groups_for_logical_roots(&source.logical_roots_snapshot().await?);
+                match self.post_recovery_scope_action(
+                    &scope_observation,
+                    expected_scope_groups.as_ref(),
+                    scope_convergence_deadline,
+                ) {
+                    SinkRecoveryScopeConvergenceAction::Converged => {
+                        break expected_scope_groups
+                            .expect("converged scope observation must define expected groups")
+                            .sink_groups;
+                    }
+                    SinkRecoveryScopeConvergenceAction::ReturnTimeout => {
+                        return Err(CnxError::Internal(format!(
+                            "runtime scope convergence not observed after retained replay: {}",
+                            scope_observation.timeout_context()
+                        )));
+                    }
+                    SinkRecoveryScopeConvergenceAction::TriggerInitialAndWait => {
+                        self.maybe_trigger_initial_post_recovery_scope_convergence(source)
+                            .await?;
+                        self.wait_for_post_recovery_progress(
+                            runtime_state_changed,
+                            source,
+                            sink,
+                            scope_convergence_deadline,
+                        )
+                        .await;
+                    }
+                    SinkRecoveryScopeConvergenceAction::Wait => {
+                        self.wait_for_post_recovery_progress(
+                            runtime_state_changed,
+                            source,
+                            sink,
+                            scope_convergence_deadline,
+                        )
+                        .await;
+                    }
+                }
+            };
+
+            let sink_readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                self.refresh_post_recovery_source_rescan_observation(source)
+                    .await;
+                match tokio::time::timeout(Duration::from_millis(250), sink.status_snapshot()).await
+                {
+                    Ok(Ok(snapshot)) => {
+                        if sink_status_snapshot_ready_for_expected_groups(
+                            &snapshot,
+                            &converged_groups,
+                        ) {
+                            return Ok(None);
+                        }
+                        if tokio::time::Instant::now() >= sink_readiness_deadline {
+                            return Err(CnxError::Internal(format!(
+                                "sink status readiness not restored after retained replay once runtime scope converged: {}",
+                                summarize_sink_status_endpoint(&snapshot)
+                            )));
+                        }
+                    }
+                    Ok(Err(err))
+                        if matches!(err, CnxError::Timeout)
+                            && self
+                                .maybe_schedule_post_recovery_sink_timeout_retry(
+                                    source,
+                                    tokio::time::Instant::now() < sink_readiness_deadline,
+                                )
+                                .await? =>
+                    {
+                        break;
+                    }
+                    Ok(Err(_err)) if tokio::time::Instant::now() < sink_readiness_deadline => {}
+                    Ok(Err(err)) if matches!(err, CnxError::Timeout) => {
+                        if sink.cached_status_snapshot().ok().is_some_and(|snapshot| {
+                            FSMetaApp::sink_status_snapshot_summary_is_empty(&snapshot)
+                        }) {
+                            return Ok(Some(converged_groups));
+                        }
+                        return Err(CnxError::Internal(format!(
+                            "sink status readiness not restored after retained replay once runtime scope converged: groups={:?} raw_timeout=true {}",
+                            converged_groups,
+                            summarize_cached_sink_status_after_scope_convergence_timeout(sink)
+                        )));
+                    }
+                    Ok(Err(err)) => return Err(err),
+                    Err(_)
+                        if self
+                            .maybe_schedule_post_recovery_sink_timeout_retry(
+                                source,
+                                tokio::time::Instant::now() < sink_readiness_deadline,
+                            )
+                            .await? =>
+                    {
+                        break;
+                    }
+                    Err(_) if tokio::time::Instant::now() < sink_readiness_deadline => {}
+                    Err(_) => {
+                        if sink.cached_status_snapshot().ok().is_some_and(|snapshot| {
+                            FSMetaApp::sink_status_snapshot_summary_is_empty(&snapshot)
+                        }) {
+                            return Ok(Some(converged_groups));
+                        }
+                        return Err(CnxError::Internal(format!(
+                            "sink status readiness not restored after retained replay once runtime scope converged: groups={:?} raw_timeout=true {}",
+                            converged_groups,
+                            summarize_cached_sink_status_after_scope_convergence_timeout(sink)
+                        )));
+                    }
+                }
+                self.wait_for_post_recovery_progress(
+                    runtime_state_changed,
+                    source,
+                    sink,
+                    sink_readiness_deadline,
+                )
+                .await;
+            }
+        }
+    }
+
+    fn local_source_request_observed(
+        &self,
+        source_progress: &crate::source::SourceProgressSnapshot,
+    ) -> bool {
+        !self
+            .local_state()
+            .source_rescan_request_epoch
+            .is_some_and(|request_epoch| source_progress.rescan_observed_epoch < request_epoch)
+    }
+
+    fn local_source_publication_satisfied(
+        &self,
+        source_progress: &crate::source::SourceProgressSnapshot,
+        expected_groups: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        !self
+            .local_state()
+            .source_publication_epoch_floor
+            .is_some_and(|request_epoch| {
+                !source_progress.published_expected_groups_since(request_epoch, expected_groups)
+            })
+    }
+
+    fn local_cached_ready_for_expected_groups(
+        &self,
+        cached_sink_progress: Option<&crate::sink::SinkProgressSnapshot>,
+        expected_groups: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        self.local_state().allow_cached_ready_fast_path
+            && cached_sink_progress
+                .is_some_and(|progress| progress.ready_for_expected_groups(expected_groups))
+    }
+
+    fn local_sink_materialized_for_expected_groups(
+        &self,
+        cached_sink_progress: Option<&crate::sink::SinkProgressSnapshot>,
+        expected_groups: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        !expected_groups.is_empty()
+            && cached_sink_progress
+                .is_some_and(|progress| expected_groups.is_subset(&progress.materialized_groups))
+    }
+
+    fn local_step_for_progress(
+        &self,
+        scope_converged: bool,
+        source_progress: &crate::source::SourceProgressSnapshot,
+        cached_sink_progress: Option<&crate::sink::SinkProgressSnapshot>,
+        expected_groups: &std::collections::BTreeSet<String>,
+    ) -> SinkRecoveryStep {
+        let source_request_observed = self.local_source_request_observed(source_progress);
+        let source_publication_satisfied =
+            self.local_source_publication_satisfied(source_progress, expected_groups);
+        let cached_ready_for_expected_groups =
+            self.local_cached_ready_for_expected_groups(cached_sink_progress, expected_groups);
+        let sink_materialized_for_expected_groups =
+            self.local_sink_materialized_for_expected_groups(cached_sink_progress, expected_groups);
+        if !scope_converged {
+            return if self.remaining().is_zero() {
+                SinkRecoveryStep::ReturnTimeout
+            } else {
+                SinkRecoveryStep::WaitForRuntimeScopeConvergence
+            };
+        }
+        let retrigger_count = self.local_state().retrigger_state.count();
+        let retrigger_pending = self.local_state().retrigger_state.is_pending();
+        if cached_ready_for_expected_groups && source_publication_satisfied && retrigger_count == 0
+        {
+            return SinkRecoveryStep::ReturnReady;
+        }
+        if self.remaining().is_zero() {
+            return SinkRecoveryStep::ReturnTimeout;
+        }
+        if retrigger_pending {
+            return SinkRecoveryStep::TriggerSourceToSinkConvergence;
+        }
+        if self.local_requires_probe_before_ready() {
+            if !source_publication_satisfied || !sink_materialized_for_expected_groups {
+                return SinkRecoveryStep::WaitForRuntimeScopeConvergence;
+            }
+        } else if !source_request_observed {
+            return SinkRecoveryStep::WaitForRuntimeScopeConvergence;
+        }
+        self.next_local_step_after_scope_convergence()
+    }
+
+    async fn trigger_local_source_to_sink_convergence(
+        &mut self,
+        source: &Arc<SourceFacade>,
+    ) -> Result<()> {
+        let request_epoch = source.trigger_rescan_when_ready_epoch().await?;
+        self.local_state_mut().source_rescan_request_epoch = Some(request_epoch);
+        self.local_state_mut().source_publication_epoch_floor = Some(request_epoch);
+        self.local_state_mut().retrigger_state.mark_triggered();
+        #[cfg(test)]
+        {
+            self.local_state_mut().retrigger_probe_pause_pending = true;
+        }
+        Ok(())
+    }
+
+    async fn replay_local_retained_sink_wave(
         &mut self,
         sink: &Arc<SinkFacade>,
         post_return_sink_replay_signals: &[SinkControlSignal],
@@ -1713,7 +1855,8 @@ impl LocalSinkStatusRepublishMachine {
             self.remaining(),
         )
         .await?;
-        self.retained_sink_replay_state = LocalSinkStatusRepublishRetainedSinkReplayState::None;
+        self.local_state_mut().retained_sink_replay_state =
+            SinkRecoveryRetainedSinkReplayState::None;
         Ok(())
     }
 
@@ -1725,221 +1868,488 @@ impl LocalSinkStatusRepublishMachine {
         }
     }
 
-    async fn schedule_manual_rescan_fallback(
+    async fn schedule_local_manual_rescan_fallback(
         &mut self,
         source: &Arc<SourceFacade>,
         post_return_sink_replay_signals: &[SinkControlSignal],
     ) -> Result<()> {
         if matches!(
-            self.manual_rescan_state,
-            LocalSinkStatusRepublishManualRescanState::Published
+            self.local_state().manual_rescan_state,
+            SinkRecoveryManualRescanState::Published
         ) {
             return Ok(());
         }
         // Retained sink replay can leave the local sink status lane effectively fresh
-        // again. Force one baseline replay pass, then allow one more direct
-        // source->sink retrigger so the helper waits on a real rematerialization
-        // instead of timing out against an empty-but-scheduled local summary.
+        // again. Force one baseline replay pass, then retrigger source->sink
+        // convergence one more time so readiness probing always follows an
+        // observed rescan epoch instead of a best-effort probe guess.
         source.publish_manual_rescan_signal().await?;
-        self.manual_rescan_state = LocalSinkStatusRepublishManualRescanState::Published;
-        self.retained_sink_replay_state = if post_return_sink_replay_signals.is_empty() {
-            LocalSinkStatusRepublishRetainedSinkReplayState::None
-        } else {
-            LocalSinkStatusRepublishRetainedSinkReplayState::Pending
+        let should_retrigger = {
+            let state = self.local_state_mut();
+            state.manual_rescan_state = SinkRecoveryManualRescanState::Published;
+            state.retained_sink_replay_state = if post_return_sink_replay_signals.is_empty() {
+                SinkRecoveryRetainedSinkReplayState::None
+            } else {
+                SinkRecoveryRetainedSinkReplayState::Pending
+            };
+            state.retrigger_state.count() < 3
         };
-        if self.retrigger_state.count() < 2 {
-            self.trigger_source_to_sink_convergence(source).await?;
+        if should_retrigger {
+            self.trigger_local_source_to_sink_convergence(source)
+                .await?;
         }
         Ok(())
     }
 
-    fn probe_action(
+    fn local_probe_action(
         &mut self,
-        probe_outcome: LocalSinkStatusRepublishProbeOutcome,
+        probe_outcome: SinkRecoveryProbeOutcome,
+        source_progress: &crate::source::SourceProgressSnapshot,
         post_return_sink_replay_signals: &[SinkControlSignal],
-    ) -> LocalSinkStatusRepublishStep {
+    ) -> SinkRecoveryStep {
+        let source_request_observed = self.local_source_request_observed(source_progress);
         match probe_outcome {
-            LocalSinkStatusRepublishProbeOutcome::Ready => match self.retained_sink_replay_state {
-                LocalSinkStatusRepublishRetainedSinkReplayState::RequireReadyProbe => {
-                    self.retained_sink_replay_state = if post_return_sink_replay_signals.is_empty()
-                    {
-                        LocalSinkStatusRepublishRetainedSinkReplayState::None
-                    } else {
-                        LocalSinkStatusRepublishRetainedSinkReplayState::Pending
-                    };
-                    if self.retained_sink_replay_state.is_pending() {
-                        LocalSinkStatusRepublishStep::ReplayRetainedSinkWave
-                    } else {
-                        LocalSinkStatusRepublishStep::ReturnReady
+            SinkRecoveryProbeOutcome::Ready => {
+                match self.local_state().retained_sink_replay_state {
+                    SinkRecoveryRetainedSinkReplayState::RequireReadyProbe => {
+                        let retained_sink_replay_state =
+                            if post_return_sink_replay_signals.is_empty() {
+                                SinkRecoveryRetainedSinkReplayState::None
+                            } else {
+                                SinkRecoveryRetainedSinkReplayState::Pending
+                            };
+                        self.local_state_mut().retained_sink_replay_state =
+                            retained_sink_replay_state;
+                        if retained_sink_replay_state.is_pending() {
+                            SinkRecoveryStep::ReplayRetainedSinkWave
+                        } else {
+                            SinkRecoveryStep::ReturnReady
+                        }
                     }
+                    _ => SinkRecoveryStep::ReturnReady,
                 }
-                _ => LocalSinkStatusRepublishStep::ReturnReady,
-            },
-            LocalSinkStatusRepublishProbeOutcome::NotReady if self.remaining().is_zero() => {
-                LocalSinkStatusRepublishStep::ReturnTimeout
             }
-            LocalSinkStatusRepublishProbeOutcome::NotReady => {
-                LocalSinkStatusRepublishStep::PublishManualRescanFallbackAndWait
+            SinkRecoveryProbeOutcome::NotReady
+                if matches!(
+                    self.local_state().retained_sink_replay_state,
+                    SinkRecoveryRetainedSinkReplayState::RequireReadyProbe
+                ) =>
+            {
+                let retained_sink_replay_state = if post_return_sink_replay_signals.is_empty() {
+                    SinkRecoveryRetainedSinkReplayState::None
+                } else {
+                    SinkRecoveryRetainedSinkReplayState::Pending
+                };
+                self.local_state_mut().retained_sink_replay_state = retained_sink_replay_state;
+                if retained_sink_replay_state.is_pending() {
+                    SinkRecoveryStep::ReplayRetainedSinkWave
+                } else if self.remaining().is_zero() {
+                    SinkRecoveryStep::ReturnTimeout
+                } else {
+                    SinkRecoveryStep::PublishManualRescanFallbackAndWait
+                }
+            }
+            SinkRecoveryProbeOutcome::NotReady
+                if !source_request_observed
+                    && self.local_state().manual_rescan_state
+                        == SinkRecoveryManualRescanState::NotPublished
+                    && self.local_state().retrigger_state.count() >= 2 =>
+            {
+                SinkRecoveryStep::PublishManualRescanFallbackAndWait
+            }
+            SinkRecoveryProbeOutcome::NotReady if !source_request_observed => {
+                SinkRecoveryStep::WaitForRuntimeScopeConvergence
+            }
+            SinkRecoveryProbeOutcome::NotReady if self.remaining().is_zero() => {
+                SinkRecoveryStep::ReturnTimeout
+            }
+            SinkRecoveryProbeOutcome::NotReady => {
+                SinkRecoveryStep::PublishManualRescanFallbackAndWait
             }
         }
     }
 
-    fn next_step_after_scope_convergence(&self) -> LocalSinkStatusRepublishStep {
-        if self.retrigger_state.is_pending() {
-            return LocalSinkStatusRepublishStep::TriggerSourceToSinkConvergence;
+    fn next_local_step_after_scope_convergence(&self) -> SinkRecoveryStep {
+        let state = self.local_state();
+        if state.retrigger_state.is_pending() {
+            return SinkRecoveryStep::TriggerSourceToSinkConvergence;
         }
-        if self.retained_sink_replay_state.is_pending() {
-            return LocalSinkStatusRepublishStep::ReplayRetainedSinkWave;
+        if state.retained_sink_replay_state.is_pending() {
+            return SinkRecoveryStep::ReplayRetainedSinkWave;
         }
-        LocalSinkStatusRepublishStep::ProbeReadiness
+        SinkRecoveryStep::ProbeReadiness
     }
 
-    async fn advance(
+    async fn run_local_republish(
         &mut self,
         source: &Arc<SourceFacade>,
         sink: &Arc<SinkFacade>,
         runtime_state_changed: &Arc<tokio::sync::Notify>,
         expected_groups: &std::collections::BTreeSet<String>,
         post_return_sink_replay_signals: &[SinkControlSignal],
-        observation: LocalSinkStatusRepublishObservation,
-    ) -> std::ops::ControlFlow<Result<()>> {
-        let mut step = self.step_for_observation(&observation);
+    ) -> Result<()> {
+        #[cfg(test)]
+        note_local_sink_status_republish_helper_entry_for_tests();
+        let summarize_cached_sink_status = |sink: &Arc<SinkFacade>| {
+            sink.cached_status_snapshot()
+                .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
+                .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"))
+        };
         loop {
-            match step {
-                LocalSinkStatusRepublishStep::WaitForRuntimeScopeConvergence => {
-                    FSMetaApp::wait_for_runtime_or_sink_progress_until(
-                        runtime_state_changed,
-                        sink,
-                        self.deadline(),
-                    )
-                    .await;
-                    return std::ops::ControlFlow::Continue(());
+            let expected_scope_groups = RuntimeScopeExpectedGroups::from_logical_roots(
+                &source.logical_roots_snapshot().await?,
+                expected_groups,
+            );
+            let scope_observation =
+                FSMetaApp::observe_runtime_scope_convergence(source, sink).await?;
+            let source_progress = source.progress_snapshot().await?;
+            if let Some(request_epoch) = self.local_state().source_rescan_request_epoch {
+                if source_progress.rescan_observed_epoch >= request_epoch {
+                    self.local_state_mut().source_rescan_request_epoch = None;
                 }
-                LocalSinkStatusRepublishStep::ReturnReady => {
-                    return std::ops::ControlFlow::Break(Ok(()));
+            }
+            if let Some(request_epoch) = self.local_state().source_publication_epoch_floor {
+                if source_progress.published_expected_groups_since(request_epoch, expected_groups) {
+                    self.local_state_mut().source_publication_epoch_floor = None;
                 }
-                LocalSinkStatusRepublishStep::TriggerSourceToSinkConvergence => {
-                    match self.trigger_source_to_sink_convergence(source).await {
-                        Ok(()) => return std::ops::ControlFlow::Continue(()),
-                        Err(err) => return std::ops::ControlFlow::Break(Err(err)),
-                    }
-                }
-                LocalSinkStatusRepublishStep::ReplayRetainedSinkWave => {
-                    return self
-                        .replay_retained_sink_wave(sink, post_return_sink_replay_signals)
-                        .await
-                        .map_or_else(
-                            |err| std::ops::ControlFlow::Break(Err(err)),
-                            |_| std::ops::ControlFlow::Continue(()),
-                        );
-                }
-                LocalSinkStatusRepublishStep::ProbeReadiness => {
-                    self.maybe_pause_before_probe().await;
-                    step = self.probe_action(
-                        FSMetaApp::probe_local_sink_status_republish_readiness(
-                            sink,
-                            expected_groups,
-                            self.deadline(),
-                        )
-                        .await,
-                        post_return_sink_replay_signals,
-                    );
-                }
-                LocalSinkStatusRepublishStep::PublishManualRescanFallbackAndWait => {
-                    match self
-                        .schedule_manual_rescan_fallback(source, post_return_sink_replay_signals)
-                        .await
-                    {
-                        Ok(()) => {
+            }
+            let scope_converged = scope_observation.matches_expectation(
+                RuntimeScopeConvergenceExpectation::ExpectedGroups(&expected_scope_groups),
+            );
+            let cached_sink_progress = sink.cached_progress_snapshot().ok();
+            let source_request_observed = self.local_source_request_observed(&source_progress);
+            let source_publication_satisfied =
+                self.local_source_publication_satisfied(&source_progress, expected_groups);
+            let cached_ready_for_expected_groups = self.local_cached_ready_for_expected_groups(
+                cached_sink_progress.as_ref(),
+                expected_groups,
+            );
+            let sink_materialized_for_expected_groups = self
+                .local_sink_materialized_for_expected_groups(
+                    cached_sink_progress.as_ref(),
+                    expected_groups,
+                );
+            let mut step = self.local_step_for_progress(
+                scope_converged,
+                &source_progress,
+                cached_sink_progress.as_ref(),
+                expected_groups,
+            );
+            if debug_sink_recovery_capture_enabled() {
+                eprintln!(
+                    "fs_meta_runtime_app: local_sink_recovery progress expected={expected_groups:?} scope_converged={} cached_ready_for_expected_groups={} sink_materialized_for_expected_groups={} source_request_observed={} source_publication_satisfied={} retrigger_state={:?} manual_state={:?} retained_state={:?} step={:?}",
+                    scope_converged,
+                    cached_ready_for_expected_groups,
+                    sink_materialized_for_expected_groups,
+                    source_request_observed,
+                    source_publication_satisfied,
+                    self.local_state().retrigger_state,
+                    self.local_state().manual_rescan_state,
+                    self.local_state().retained_sink_replay_state,
+                    step,
+                );
+            }
+            loop {
+                match step {
+                    SinkRecoveryStep::WaitForRuntimeScopeConvergence => {
+                        if !source_request_observed || !source_publication_satisfied {
+                            FSMetaApp::wait_for_runtime_or_source_progress_until(
+                                runtime_state_changed,
+                                source,
+                                self.deadline(),
+                            )
+                            .await;
+                        } else {
                             FSMetaApp::wait_for_runtime_or_sink_progress_until(
                                 runtime_state_changed,
                                 sink,
                                 self.deadline(),
                             )
                             .await;
-                            return std::ops::ControlFlow::Continue(());
                         }
-                        Err(err) => return std::ops::ControlFlow::Break(Err(err)),
+                        break;
                     }
-                }
-                LocalSinkStatusRepublishStep::ReturnTimeout => {
-                    return std::ops::ControlFlow::Break(Err(CnxError::Timeout));
+                    SinkRecoveryStep::ReturnReady => return Ok(()),
+                    SinkRecoveryStep::TriggerSourceToSinkConvergence => {
+                        if debug_sink_recovery_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_runtime_app: local_sink_recovery step=TriggerSourceToSinkConvergence expected={expected_groups:?}"
+                            );
+                        }
+                        self.trigger_local_source_to_sink_convergence(source)
+                            .await?;
+                        if !self.local_requires_probe_before_ready() {
+                            FSMetaApp::wait_for_runtime_or_source_progress_until(
+                                runtime_state_changed,
+                                source,
+                                self.deadline(),
+                            )
+                            .await;
+                        }
+                        break;
+                    }
+                    SinkRecoveryStep::ReplayRetainedSinkWave => {
+                        if debug_sink_recovery_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_runtime_app: local_sink_recovery step=ReplayRetainedSinkWave expected={expected_groups:?} signals={}",
+                                post_return_sink_replay_signals.len()
+                            );
+                        }
+                        self.replay_local_retained_sink_wave(sink, post_return_sink_replay_signals)
+                            .await?;
+                        FSMetaApp::wait_for_runtime_or_sink_progress_until(
+                            runtime_state_changed,
+                            sink,
+                            self.deadline(),
+                        )
+                        .await;
+                        break;
+                    }
+                    SinkRecoveryStep::ProbeReadiness => {
+                        #[cfg(test)]
+                        self.maybe_pause_at_retrigger_probe_boundary().await;
+                        if debug_sink_recovery_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_runtime_app: local_sink_recovery step=ProbeReadiness expected={expected_groups:?}"
+                            );
+                        }
+                        self.maybe_pause_before_probe().await;
+                        let probe_outcome = FSMetaApp::probe_local_sink_status_republish_readiness(
+                            sink,
+                            expected_groups,
+                            self.deadline(),
+                        )
+                        .await;
+                        step = self.local_probe_action(
+                            probe_outcome,
+                            &source_progress,
+                            post_return_sink_replay_signals,
+                        );
+                        if debug_sink_recovery_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_runtime_app: local_sink_recovery probe_outcome={:?} next_step={:?} expected={expected_groups:?}",
+                                probe_outcome, step,
+                            );
+                        }
+                    }
+                    SinkRecoveryStep::PublishManualRescanFallbackAndWait => {
+                        if debug_sink_recovery_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_runtime_app: local_sink_recovery step=PublishManualRescanFallbackAndWait expected={expected_groups:?}"
+                            );
+                        }
+                        self.schedule_local_manual_rescan_fallback(
+                            source,
+                            post_return_sink_replay_signals,
+                        )
+                        .await?;
+                        FSMetaApp::wait_for_runtime_or_source_progress_until(
+                            runtime_state_changed,
+                            source,
+                            self.deadline(),
+                        )
+                        .await;
+                        break;
+                    }
+                    SinkRecoveryStep::ReturnTimeout => {
+                        return Err(CnxError::Internal(format!(
+                            "local sink status republish not restored after retained replay once runtime scope converged: expected_groups={expected_groups:?} {}",
+                            summarize_cached_sink_status(sink)
+                        )));
+                    }
                 }
             }
         }
     }
 }
 
+#[cfg(test)]
+fn sink_recovery_test_expected_groups() -> std::collections::BTreeSet<String> {
+    std::collections::BTreeSet::from([String::from("g1")])
+}
+
+#[cfg(test)]
+fn sink_recovery_test_source_progress(
+    request_observed: bool,
+    publication_satisfied: bool,
+) -> crate::source::SourceProgressSnapshot {
+    let expected_groups = sink_recovery_test_expected_groups();
+    crate::source::SourceProgressSnapshot {
+        rescan_observed_epoch: u64::from(request_observed),
+        scheduled_source_groups: expected_groups.clone(),
+        scheduled_scan_groups: std::collections::BTreeSet::new(),
+        published_group_epoch: if publication_satisfied {
+            expected_groups
+                .into_iter()
+                .map(|group_id| (group_id, 1))
+                .collect()
+        } else {
+            std::collections::BTreeMap::new()
+        },
+    }
+}
+
+#[cfg(test)]
+fn sink_recovery_test_cached_sink_progress(
+    materialized: bool,
+    ready: bool,
+) -> crate::sink::SinkProgressSnapshot {
+    let expected_groups = sink_recovery_test_expected_groups();
+    crate::sink::SinkProgressSnapshot {
+        scheduled_groups: expected_groups.clone(),
+        materialized_groups: if materialized {
+            expected_groups.clone()
+        } else {
+            std::collections::BTreeSet::new()
+        },
+        ready_groups: if ready {
+            expected_groups
+        } else {
+            std::collections::BTreeSet::new()
+        },
+        empty_summary: false,
+    }
+}
+
+#[cfg(test)]
+fn sink_recovery_test_local_step(
+    runtime: &SinkRecoveryMachine,
+    scope_converged: bool,
+    request_observed: bool,
+    publication_satisfied: bool,
+    materialized: bool,
+    cached_ready: bool,
+) -> SinkRecoveryStep {
+    let expected_groups = sink_recovery_test_expected_groups();
+    let source_progress =
+        sink_recovery_test_source_progress(request_observed, publication_satisfied);
+    let cached_sink_progress = sink_recovery_test_cached_sink_progress(materialized, cached_ready);
+    runtime.local_step_for_progress(
+        scope_converged,
+        &source_progress,
+        Some(&cached_sink_progress),
+        &expected_groups,
+    )
+}
+
+#[cfg(test)]
+fn sink_recovery_test_probe_step(
+    runtime: &mut SinkRecoveryMachine,
+    outcome: SinkRecoveryProbeOutcome,
+    request_observed: bool,
+    publication_satisfied: bool,
+    post_return_sink_replay_signals: &[SinkControlSignal],
+) -> SinkRecoveryStep {
+    let source_progress =
+        sink_recovery_test_source_progress(request_observed, publication_satisfied);
+    runtime.local_probe_action(outcome, &source_progress, post_return_sink_replay_signals)
+}
+
 #[test]
-fn local_sink_status_republish_runtime_owns_deadline_for_iteration_and_probe_timeout() {
-    let live_runtime = LocalSinkStatusRepublishMachine::new_with_deadline(
+fn sink_recovery_machine_local_runtime_owns_deadline_for_iteration_and_probe_timeout() {
+    let live_runtime = SinkRecoveryMachine::new_local_with_deadline(
         LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
         tokio::time::Instant::now() + Duration::from_secs(1),
     );
-    let expired_runtime = LocalSinkStatusRepublishMachine::new_with_deadline(
+    let expired_runtime = SinkRecoveryMachine::new_local_with_deadline(
         LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
         tokio::time::Instant::now(),
     );
 
     assert_eq!(
-        live_runtime.step_for_observation(&LocalSinkStatusRepublishObservation {
-            scope_converged: false,
-            cached_ready_fast_path_satisfied: false,
-        }),
-        LocalSinkStatusRepublishStep::WaitForRuntimeScopeConvergence,
+        sink_recovery_test_local_step(&live_runtime, false, true, true, false, false),
+        SinkRecoveryStep::WaitForRuntimeScopeConvergence,
         "local republish waits should keep using the runtime-owned deadline while scope convergence is still pending",
     );
     assert_eq!(
-        expired_runtime.step_for_observation(&LocalSinkStatusRepublishObservation {
-            scope_converged: true,
-            cached_ready_fast_path_satisfied: false,
-        }),
-        LocalSinkStatusRepublishStep::ReturnTimeout,
+        sink_recovery_test_local_step(&expired_runtime, true, true, true, false, false),
+        SinkRecoveryStep::ReturnTimeout,
         "local republish timeout should come from the runtime-owned deadline instead of outer helper-local deadline booleans",
     );
     let mut expired_probe_runtime = expired_runtime;
     assert_eq!(
-        expired_probe_runtime.probe_action(LocalSinkStatusRepublishProbeOutcome::NotReady, &[]),
-        LocalSinkStatusRepublishStep::ReturnTimeout,
+        sink_recovery_test_probe_step(
+            &mut expired_probe_runtime,
+            SinkRecoveryProbeOutcome::NotReady,
+            true,
+            true,
+            &[],
+        ),
+        SinkRecoveryStep::ReturnTimeout,
         "post-probe timeout should also come from the same runtime-owned deadline",
     );
 }
 
 #[test]
-fn local_sink_status_republish_runtime_require_probe_mode_promotes_first_ready_probe_internally() {
-    let mut runtime = LocalSinkStatusRepublishMachine::new_with_deadline(
+fn sink_recovery_machine_local_require_probe_mode_promotes_first_ready_probe_internally() {
+    let mut runtime = SinkRecoveryMachine::new_local_with_deadline(
         LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady,
         tokio::time::Instant::now() + Duration::from_secs(1),
     );
 
     assert_eq!(
-        runtime.probe_action(LocalSinkStatusRepublishProbeOutcome::Ready, &[]),
-        LocalSinkStatusRepublishStep::ReturnReady,
+        sink_recovery_test_probe_step(
+            &mut runtime,
+            SinkRecoveryProbeOutcome::Ready,
+            true,
+            true,
+            &[],
+        ),
+        SinkRecoveryStep::ReturnReady,
         "require-probe mode should resolve the first ready probe inside the runtime instead of bouncing through outer post-probe helper decisions",
     );
     assert_eq!(
-        runtime.retained_sink_replay_state,
-        LocalSinkStatusRepublishRetainedSinkReplayState::None,
+        runtime.local_state().retained_sink_replay_state,
+        SinkRecoveryRetainedSinkReplayState::None,
         "the runtime should clear the synthetic require-probe latch once the first ready probe lands",
     );
 }
 
 #[test]
-fn local_sink_status_republish_runtime_not_ready_probe_requests_manual_rescan_wait() {
-    let mut runtime = LocalSinkStatusRepublishMachine::new_with_deadline(
+fn sink_recovery_machine_local_not_ready_probe_requests_manual_rescan_wait() {
+    let mut runtime = SinkRecoveryMachine::new_local_with_deadline(
         LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
         tokio::time::Instant::now() + Duration::from_secs(1),
     );
 
     assert_eq!(
-        runtime.probe_action(LocalSinkStatusRepublishProbeOutcome::NotReady, &[]),
-        LocalSinkStatusRepublishStep::PublishManualRescanFallbackAndWait,
+        sink_recovery_test_probe_step(
+            &mut runtime,
+            SinkRecoveryProbeOutcome::NotReady,
+            true,
+            true,
+            &[],
+        ),
+        SinkRecoveryStep::PublishManualRescanFallbackAndWait,
         "local republish runtime should own the manual-rescan publish-plus-wait lane instead of leaving the outer helper loop to glue together a probe decision, a fallback publication, and a separate wait branch",
     );
 }
 
 #[test]
-fn local_sink_status_republish_runtime_next_action_owns_pending_step_and_probe_followup() {
+fn sink_recovery_machine_local_unobserved_source_publication_only_accepts_ready_probe_truth() {
+    let mut runtime = SinkRecoveryMachine::new_local_with_deadline(
+        LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    );
+    runtime.local_state_mut().retrigger_state = SinkRecoveryRetriggerState::Idle { count: 1 };
+    runtime.local_state_mut().source_rescan_request_epoch = Some(1);
+    runtime.local_state_mut().source_publication_epoch_floor = Some(1);
+
+    assert_eq!(
+        sink_recovery_test_probe_step(
+            &mut runtime,
+            SinkRecoveryProbeOutcome::NotReady,
+            false,
+            false,
+            &[],
+        ),
+        SinkRecoveryStep::WaitForRuntimeScopeConvergence,
+        "until the owned source-rescan publication is observed, a not-ready probe should keep waiting instead of prematurely escalating into manual-rescan fallback",
+    );
+}
+
+#[test]
+fn sink_recovery_machine_local_next_action_owns_pending_step_and_probe_followup() {
     let expected = RuntimeScopeExpectedGroups {
         source_groups: std::collections::BTreeSet::from([String::from("g1")]),
         scan_groups: std::collections::BTreeSet::from([String::from("g1")]),
@@ -1950,42 +2360,58 @@ fn local_sink_status_republish_runtime_next_action_owns_pending_step_and_probe_f
         scan_groups: expected.scan_groups.clone(),
         sink_groups: expected.sink_groups.clone(),
     };
-    let mut runtime = LocalSinkStatusRepublishMachine::new_with_deadline(
+    let mut runtime = SinkRecoveryMachine::new_local_with_deadline(
         LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
         tokio::time::Instant::now() + Duration::from_secs(1),
     );
 
     assert_eq!(
-        runtime.step_for_observation(&LocalSinkStatusRepublishObservation {
-            scope_converged: converged
-                .matches_expectation(RuntimeScopeConvergenceExpectation::ExpectedGroups(&expected)),
-            cached_ready_fast_path_satisfied: false,
-        }),
-        LocalSinkStatusRepublishStep::TriggerSourceToSinkConvergence,
+        sink_recovery_test_local_step(
+            &runtime,
+            converged.matches_expectation(RuntimeScopeConvergenceExpectation::ExpectedGroups(
+                &expected
+            )),
+            true,
+            true,
+            false,
+            false,
+        ),
+        SinkRecoveryStep::TriggerSourceToSinkConvergence,
         "local republish runtime should own the first pending step directly instead of collapsing it into an outer helper-local apply-pending-steps bundle",
     );
 
-    runtime.retrigger_state = LocalSinkStatusRepublishRetriggerState::Idle { count: 1 };
+    runtime.local_state_mut().retrigger_state = SinkRecoveryRetriggerState::Idle { count: 1 };
     assert_eq!(
-        runtime.step_for_observation(&LocalSinkStatusRepublishObservation {
-            scope_converged: converged
-                .matches_expectation(RuntimeScopeConvergenceExpectation::ExpectedGroups(&expected)),
-            cached_ready_fast_path_satisfied: false,
-        }),
-        LocalSinkStatusRepublishStep::ProbeReadiness,
+        sink_recovery_test_local_step(
+            &runtime,
+            converged.matches_expectation(RuntimeScopeConvergenceExpectation::ExpectedGroups(
+                &expected
+            )),
+            true,
+            true,
+            false,
+            false,
+        ),
+        SinkRecoveryStep::ProbeReadiness,
         "once pending steps clear, the runtime should advance directly into probe readiness instead of forcing the outer helper to decide when probing starts",
     );
 
     assert_eq!(
-        runtime.probe_action(LocalSinkStatusRepublishProbeOutcome::NotReady, &[]),
-        LocalSinkStatusRepublishStep::PublishManualRescanFallbackAndWait,
+        sink_recovery_test_probe_step(
+            &mut runtime,
+            SinkRecoveryProbeOutcome::NotReady,
+            true,
+            true,
+            &[],
+        ),
+        SinkRecoveryStep::PublishManualRescanFallbackAndWait,
         "post-probe not-ready handling should also stay inside the runtime instead of bouncing back out to an outer post-probe branch",
     );
 }
 
 #[test]
-fn local_sink_status_republish_runtime_scope_action_owns_expected_group_convergence() {
-    let runtime = LocalSinkStatusRepublishMachine::new_with_deadline(
+fn sink_recovery_machine_local_scope_action_owns_expected_group_convergence() {
+    let runtime = SinkRecoveryMachine::new_local_with_deadline(
         LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
         tokio::time::Instant::now() + Duration::from_secs(1),
     );
@@ -2006,120 +2432,50 @@ fn local_sink_status_republish_runtime_scope_action_owns_expected_group_converge
     };
 
     assert_eq!(
-        runtime.step_for_observation(&LocalSinkStatusRepublishObservation {
-            scope_converged: missing_sink
-                .matches_expectation(RuntimeScopeConvergenceExpectation::ExpectedGroups(&expected)),
-            cached_ready_fast_path_satisfied: false,
-        }),
-        LocalSinkStatusRepublishStep::WaitForRuntimeScopeConvergence,
+        sink_recovery_test_local_step(
+            &runtime,
+            missing_sink.matches_expectation(RuntimeScopeConvergenceExpectation::ExpectedGroups(
+                &expected
+            )),
+            true,
+            true,
+            false,
+            false,
+        ),
+        SinkRecoveryStep::WaitForRuntimeScopeConvergence,
         "local republish should derive expected-group convergence inside the runtime instead of relying on an outer convergence decision helper",
     );
     assert_eq!(
-        runtime.step_for_observation(&LocalSinkStatusRepublishObservation {
-            scope_converged: converged
-                .matches_expectation(RuntimeScopeConvergenceExpectation::ExpectedGroups(&expected)),
-            cached_ready_fast_path_satisfied: true,
-        }),
-        LocalSinkStatusRepublishStep::ReturnReady,
+        sink_recovery_test_local_step(
+            &runtime,
+            converged.matches_expectation(RuntimeScopeConvergenceExpectation::ExpectedGroups(
+                &expected
+            )),
+            true,
+            true,
+            true,
+            true,
+        ),
+        SinkRecoveryStep::ReturnReady,
         "once expected groups converge, the runtime should promote the cached-ready fast path itself",
     );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalSinkStatusRepublishProbeOutcome {
+enum SinkRecoveryProbeOutcome {
     Ready,
     NotReady,
 }
 
-impl PostRecoverySinkStatusReadinessWaitState {
-    fn new(source_to_sink_convergence_pretriggered: bool) -> Self {
-        Self {
-            scope_trigger_state: if source_to_sink_convergence_pretriggered {
-                PostRecoveryScopeConvergenceTriggerState::Triggered
-            } else {
-                PostRecoveryScopeConvergenceTriggerState::InitialNotTriggered
-            },
-            sink_timeout_retry_state: PostRecoverySinkStatusTimeoutRetryState::NotRetried,
-        }
-    }
-
-    fn scope_action(
-        &self,
-        observation: &RuntimeScopeConvergenceObservation,
-        deadline: tokio::time::Instant,
-    ) -> PostRecoveryScopeConvergenceAction {
-        if observation.is_nonempty_fully_converged() {
-            PostRecoveryScopeConvergenceAction::Converged
-        } else if tokio::time::Instant::now() >= deadline {
-            PostRecoveryScopeConvergenceAction::ReturnTimeout
-        } else if matches!(
-            self.scope_trigger_state,
-            PostRecoveryScopeConvergenceTriggerState::InitialNotTriggered
-        ) {
-            PostRecoveryScopeConvergenceAction::TriggerInitialAndWait
-        } else {
-            PostRecoveryScopeConvergenceAction::Wait
-        }
-    }
-
-    async fn maybe_drive_pending_scope_convergence_retrigger(
-        &mut self,
-        source: &Arc<SourceFacade>,
-    ) -> Result<()> {
-        if matches!(
-            self.scope_trigger_state,
-            PostRecoveryScopeConvergenceTriggerState::RetryPending
-        ) {
-            source.trigger_rescan_when_ready().await?;
-            self.scope_trigger_state = PostRecoveryScopeConvergenceTriggerState::Triggered;
-        }
-        Ok(())
-    }
-
-    async fn maybe_trigger_initial_scope_convergence(
-        &mut self,
-        source: &Arc<SourceFacade>,
-    ) -> Result<()> {
-        if matches!(
-            self.scope_trigger_state,
-            PostRecoveryScopeConvergenceTriggerState::InitialNotTriggered
-        ) {
-            source.trigger_rescan_when_ready().await?;
-            self.scope_trigger_state = PostRecoveryScopeConvergenceTriggerState::Triggered;
-        }
-        Ok(())
-    }
-
-    async fn maybe_schedule_sink_timeout_retry(
-        &mut self,
-        source: &Arc<SourceFacade>,
-        before_deadline: bool,
-    ) -> Result<bool> {
-        if !before_deadline
-            || !matches!(
-                self.sink_timeout_retry_state,
-                PostRecoverySinkStatusTimeoutRetryState::NotRetried
-            )
-        {
-            return Ok(false);
-        }
-        // A later source-only recovery can converge route scopes from primed
-        // cached groups before the post-recovery rescan has actually
-        // rematerialized baseline source publication. Request one explicit
-        // manual rescan before the final source->sink retry so sink readiness
-        // wait does not return on a scheduled-only zero-state sink.
-        source.publish_manual_rescan_signal().await?;
-        self.sink_timeout_retry_state =
-            PostRecoverySinkStatusTimeoutRetryState::RetriedAfterManualRescan;
-        self.scope_trigger_state = PostRecoveryScopeConvergenceTriggerState::RetryPending;
-        Ok(true)
-    }
-}
-
 #[test]
-fn post_recovery_sink_status_readiness_wait_state_scope_action_owns_deadline_and_trigger_lane() {
-    let waiting = PostRecoverySinkStatusReadinessWaitState::new(false);
-    let pretriggered = PostRecoverySinkStatusReadinessWaitState::new(true);
+fn sink_recovery_machine_post_recovery_scope_action_owns_deadline_and_trigger_lane() {
+    let waiting = SinkRecoveryMachine::new_post_recovery(None);
+    let pretriggered = SinkRecoveryMachine::new_post_recovery(Some(1));
+    let expected = RuntimeScopeExpectedGroups {
+        source_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        scan_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        sink_groups: std::collections::BTreeSet::from([String::from("g1")]),
+    };
     let observation = RuntimeScopeConvergenceObservation {
         source_groups: std::collections::BTreeSet::from([String::from("g1")]),
         scan_groups: std::collections::BTreeSet::from([String::from("g1")]),
@@ -2127,25 +2483,249 @@ fn post_recovery_sink_status_readiness_wait_state_scope_action_owns_deadline_and
     };
 
     assert_eq!(
-        waiting.scope_action(
+        waiting.post_recovery_scope_action(
             &observation,
+            Some(&expected),
             tokio::time::Instant::now() + Duration::from_secs(1)
         ),
-        PostRecoveryScopeConvergenceAction::TriggerInitialAndWait,
+        SinkRecoveryScopeConvergenceAction::TriggerInitialAndWait,
         "post-recovery readiness waits should derive the initial convergence trigger lane from the wait state itself",
     );
     assert_eq!(
-        pretriggered.scope_action(
+        pretriggered.post_recovery_scope_action(
             &observation,
+            Some(&expected),
             tokio::time::Instant::now() + Duration::from_secs(1)
         ),
-        PostRecoveryScopeConvergenceAction::Wait,
+        SinkRecoveryScopeConvergenceAction::Wait,
         "once pretriggered, the wait state should stay in pure wait mode without reopening the initial trigger helper seam",
     );
     assert_eq!(
-        pretriggered.scope_action(&observation, tokio::time::Instant::now()),
-        PostRecoveryScopeConvergenceAction::ReturnTimeout,
+        pretriggered.post_recovery_scope_action(
+            &observation,
+            Some(&expected),
+            tokio::time::Instant::now()
+        ),
+        SinkRecoveryScopeConvergenceAction::ReturnTimeout,
         "post-recovery scope convergence timeout should come from the wait-state-owned deadline check",
+    );
+}
+
+#[test]
+fn sink_recovery_machine_post_recovery_accepts_scan_only_expected_groups() {
+    let waiting = SinkRecoveryMachine::new_post_recovery(None);
+    let expected = RuntimeScopeExpectedGroups {
+        source_groups: std::collections::BTreeSet::new(),
+        scan_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        sink_groups: std::collections::BTreeSet::from([String::from("g1")]),
+    };
+    let observation = RuntimeScopeConvergenceObservation {
+        source_groups: std::collections::BTreeSet::new(),
+        scan_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        sink_groups: std::collections::BTreeSet::from([String::from("g1")]),
+    };
+
+    assert_eq!(
+        waiting.post_recovery_scope_action(
+            &observation,
+            Some(&expected),
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        ),
+        SinkRecoveryScopeConvergenceAction::Converged,
+        "post-recovery readiness waits should treat scan-only roots as converged once scan and sink lanes match the expected groups",
+    );
+}
+
+#[test]
+fn sink_recovery_machine_local_prioritizes_owned_retrigger_before_waiting_on_source_publication() {
+    let runtime = SinkRecoveryMachine::new_local_pretriggered_with_deadline(
+        LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        1,
+    );
+
+    assert_eq!(
+        sink_recovery_test_local_step(&runtime, true, false, false, true, true),
+        SinkRecoveryStep::TriggerSourceToSinkConvergence,
+        "local republish must spend its owned post-return retrigger before cached-ready or probe paths can win, even if the pretriggered source publication has not yet been observed",
+    );
+    let mut waiting_after_retrigger = runtime;
+    waiting_after_retrigger.local_state_mut().retrigger_state =
+        SinkRecoveryRetriggerState::Idle { count: 1 };
+    assert_eq!(
+        sink_recovery_test_local_step(&waiting_after_retrigger, true, false, false, false, false),
+        SinkRecoveryStep::WaitForRuntimeScopeConvergence,
+        "once the owned retrigger has been spent, the local helper must wait for the retriggered source rescan epoch before any sink probe can run",
+    );
+    assert_eq!(
+        sink_recovery_test_local_step(&waiting_after_retrigger, true, true, true, false, false),
+        SinkRecoveryStep::ProbeReadiness,
+        "after the retriggered source publication is observed, the deferred helper can advance into readiness probing",
+    );
+}
+
+#[test]
+fn sink_recovery_machine_local_pretriggered_not_ready_probe_can_escalate_to_manual_rescan_after_owned_retrigger()
+ {
+    let mut runtime = SinkRecoveryMachine::new_local_pretriggered_with_deadline(
+        LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        1,
+    );
+    runtime.local_state_mut().retrigger_state = SinkRecoveryRetriggerState::Idle { count: 2 };
+
+    assert_eq!(
+        sink_recovery_test_probe_step(
+            &mut runtime,
+            SinkRecoveryProbeOutcome::NotReady,
+            false,
+            false,
+            &[],
+        ),
+        SinkRecoveryStep::PublishManualRescanFallbackAndWait,
+        "once the deferred helper has already spent its owned post-return retrigger, a still-unobserved source publication must escalate into the machine-owned manual-rescan fallback instead of timing out in pure wait mode",
+    );
+}
+
+#[test]
+fn sink_recovery_machine_local_pretriggered_unobserved_source_publication_escalates_before_probe_after_owned_retrigger()
+ {
+    let mut runtime = SinkRecoveryMachine::new_local_pretriggered_with_deadline(
+        LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        1,
+    );
+    runtime.local_state_mut().retrigger_state = SinkRecoveryRetriggerState::Idle { count: 2 };
+
+    assert_eq!(
+        sink_recovery_test_local_step(&runtime, true, false, false, false, false),
+        SinkRecoveryStep::WaitForRuntimeScopeConvergence,
+        "once the owned post-return retrigger has been spent, a pretriggered deferred helper must keep waiting for the owned source-rescan epoch instead of probing sink readiness early",
+    );
+}
+
+#[test]
+fn sink_recovery_machine_local_require_probe_not_ready_probe_replays_retained_sink_wave_before_manual_fallback()
+ {
+    let route_key = format!("{}.stream", ROUTE_KEY_EVENTS);
+    let mut runtime = SinkRecoveryMachine::new_local_pretriggered_with_deadline(
+        LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        1,
+    );
+    runtime.local_state_mut().retrigger_state = SinkRecoveryRetriggerState::Idle { count: 2 };
+
+    assert_eq!(
+        sink_recovery_test_probe_step(
+            &mut runtime,
+            SinkRecoveryProbeOutcome::NotReady,
+            false,
+            false,
+            &[SinkControlSignal::Tick {
+                unit: SinkRuntimeUnit::Sink,
+                route_key: route_key.clone(),
+                generation: 2,
+                envelope: encode_runtime_unit_tick(&RuntimeUnitTick {
+                    route_key,
+                    unit_id: execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                    generation: 2,
+                    at_ms: 1,
+                })
+                .expect("encode synthetic test sink replay tick"),
+            }],
+        ),
+        SinkRecoveryStep::ReplayRetainedSinkWave,
+        "require-probe deferred helpers should replay the retained sink wave after the first not-ready probe before they escalate into later source/manual fallback lanes",
+    );
+    assert_eq!(
+        runtime.local_state().retained_sink_replay_state,
+        SinkRecoveryRetainedSinkReplayState::Pending,
+        "the retained sink replay lane should become machine-owned pending state once the first not-ready probe lands in require-probe mode",
+    );
+}
+
+#[test]
+fn sink_recovery_machine_local_require_probe_pretriggered_waits_for_expected_group_publication_after_owned_retrigger()
+ {
+    let runtime = SinkRecoveryMachine::new_local_pretriggered_with_deadline(
+        LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        1,
+    );
+    let mut waiting_after_retrigger = runtime;
+    waiting_after_retrigger.local_state_mut().retrigger_state =
+        SinkRecoveryRetriggerState::Idle { count: 2 };
+
+    assert_eq!(
+        sink_recovery_test_local_step(&waiting_after_retrigger, true, false, false, false, false),
+        SinkRecoveryStep::WaitForRuntimeScopeConvergence,
+        "require-probe deferred helpers must keep waiting until the owned retrigger has published all expected source groups before the first blocking sink probe can run",
+    );
+}
+
+#[test]
+fn sink_recovery_machine_local_require_probe_pretriggered_publication_ready_probes_after_owned_retrigger()
+ {
+    let runtime = SinkRecoveryMachine::new_local_pretriggered_with_deadline(
+        LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        1,
+    );
+    let mut waiting_after_retrigger = runtime;
+    waiting_after_retrigger.local_state_mut().retrigger_state =
+        SinkRecoveryRetriggerState::Idle { count: 2 };
+
+    assert_eq!(
+        sink_recovery_test_local_step(&waiting_after_retrigger, true, true, true, true, false),
+        SinkRecoveryStep::ProbeReadiness,
+        "once the owned retrigger has published all expected source groups, require-probe helpers can advance into the first blocking sink probe",
+    );
+}
+
+#[test]
+fn sink_recovery_machine_removes_observation_bundle_phase_inputs() {
+    let source = include_str!("runtime_app.rs");
+    let production_source = source
+        .split("#[test]")
+        .next()
+        .expect("runtime_app.rs test split should yield production prefix");
+    assert!(
+        !production_source.contains("struct SinkRecoveryObservation")
+            && !production_source.contains("fn local_step_for_observation(")
+            && !production_source.contains("cached_ready_fast_path_satisfied:")
+            && !production_source.contains("source_rescan_request_observed:")
+            && !production_source.contains("source_publication_satisfied:")
+            && !production_source.contains("enum SinkRecoveryCachedReadiness")
+            && !production_source.contains("enum SinkRecoverySourceProgressState")
+            && !production_source.contains("fn local_cached_sink_readiness(")
+            && !production_source.contains("fn local_source_progress_state("),
+        "sink recovery should consume typed source/sink progress inputs directly; old observation-bundle phase inputs must not return",
+    );
+}
+
+#[test]
+fn sink_recovery_machine_post_recovery_waits_for_pretriggered_source_publication_before_accepting_scope_convergence()
+ {
+    let pretriggered = SinkRecoveryMachine::new_post_recovery(Some(1));
+    let expected = RuntimeScopeExpectedGroups {
+        source_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        scan_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        sink_groups: std::collections::BTreeSet::from([String::from("g1")]),
+    };
+    let converged = RuntimeScopeConvergenceObservation {
+        source_groups: expected.source_groups.clone(),
+        scan_groups: expected.scan_groups.clone(),
+        sink_groups: expected.sink_groups.clone(),
+    };
+
+    assert_eq!(
+        pretriggered.post_recovery_scope_action(
+            &converged,
+            Some(&expected),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
+        SinkRecoveryScopeConvergenceAction::Wait,
+        "post-recovery readiness must keep waiting while the owned pretriggered source-rescan request has not yet been observed, even if runtime scope convergence arrives early",
     );
 }
 
@@ -2159,45 +2739,28 @@ fn sink_group_status_counts_as_ready(group: &crate::sink::SinkGroupStatusSnapsho
 fn sink_status_snapshot_scheduled_groups(
     snapshot: &crate::sink::SinkStatusSnapshot,
 ) -> std::collections::BTreeSet<String> {
-    snapshot
-        .scheduled_groups_by_node
-        .values()
-        .flat_map(|groups| groups.iter().cloned())
-        .collect::<std::collections::BTreeSet<_>>()
+    snapshot.progress_snapshot().scheduled_groups
 }
 
 fn sink_status_snapshot_ready_groups(
     snapshot: &crate::sink::SinkStatusSnapshot,
 ) -> std::collections::BTreeSet<String> {
-    snapshot
-        .groups
-        .iter()
-        .filter(|group| sink_group_status_counts_as_ready(group))
-        .map(|group| group.group_id.clone())
-        .collect::<std::collections::BTreeSet<_>>()
+    snapshot.progress_snapshot().ready_groups
 }
 
 fn sink_status_snapshot_has_ready_scheduled_groups(
     snapshot: &crate::sink::SinkStatusSnapshot,
 ) -> bool {
-    let scheduled_groups = sink_status_snapshot_scheduled_groups(snapshot);
-    if scheduled_groups.is_empty() {
-        return false;
-    }
-    let ready_groups = sink_status_snapshot_ready_groups(snapshot);
-    scheduled_groups.is_subset(&ready_groups)
+    snapshot.progress_snapshot().has_ready_scheduled_groups()
 }
 
 fn sink_status_snapshot_ready_for_expected_groups(
     snapshot: &crate::sink::SinkStatusSnapshot,
     expected_groups: &std::collections::BTreeSet<String>,
 ) -> bool {
-    if expected_groups.is_empty() {
-        return false;
-    }
-    let scheduled_groups = sink_status_snapshot_scheduled_groups(snapshot);
-    let ready_groups = sink_status_snapshot_ready_groups(snapshot);
-    expected_groups.is_subset(&scheduled_groups) && expected_groups.is_subset(&ready_groups)
+    snapshot
+        .progress_snapshot()
+        .ready_for_expected_groups(expected_groups)
 }
 
 fn current_generation_sink_replay_tick(
@@ -2256,71 +2819,12 @@ struct ActiveFixedBindFacadeRegistrant {
 }
 
 impl PendingFixedBindHandoffRegistrant {
-    #[allow(clippy::too_many_arguments)]
-    fn from_parts(
-        instance_id: u64,
-        api_task: Arc<Mutex<Option<FacadeActivation>>>,
-        pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
-        pending_fixed_bind_claim_release_followup: Arc<AtomicBool>,
-        pending_fixed_bind_has_suppressed_dependent_routes: Arc<AtomicBool>,
-        facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
-        facade_pending_status: SharedFacadePendingStatusCell,
-        facade_service_state: SharedFacadeServiceStateCell,
-        rollout_status: SharedRolloutStatusCell,
-        api_request_tracker: Arc<ApiRequestTracker>,
-        api_control_gate: Arc<ApiControlGate>,
-        runtime_gate_state: Arc<StdMutex<RuntimeControlState>>,
-        runtime_state_changed: Arc<tokio::sync::Notify>,
-        node_id: NodeId,
-        runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
-        source: Arc<SourceFacade>,
-        sink: Arc<SinkFacade>,
-        query_sink: Arc<SinkFacade>,
-        query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
-    ) -> Self {
-        Self {
-            instance_id,
-            api_task,
-            pending_facade,
-            pending_fixed_bind_claim_release_followup,
-            pending_fixed_bind_has_suppressed_dependent_routes,
-            facade_spawn_in_progress,
-            facade_pending_status,
-            facade_service_state,
-            rollout_status,
-            api_request_tracker,
-            api_control_gate,
-            runtime_gate_state,
-            runtime_state_changed,
-            node_id,
-            runtime_boundary,
-            source,
-            sink,
-            query_sink,
-            query_runtime_boundary,
-        }
-    }
-
     fn runtime_control_state(&self) -> RuntimeControlState {
         RuntimeControlState::from_state_cell(&self.runtime_gate_state)
     }
 
     fn notify_runtime_state_changed(&self) {
         self.runtime_state_changed.notify_waiters();
-    }
-
-    async fn observe_pending_fixed_bind_publication_state_for_pending(
-        &self,
-        pending: &PendingFacadeActivation,
-    ) -> PendingFixedBindPublicationState {
-        FSMetaApp::observe_pending_fixed_bind_publication_for_pending(
-            self.instance_id,
-            self.api_task.clone(),
-            Some(pending.clone()),
-            self.pending_fixed_bind_claim_release_followup
-                .load(Ordering::Acquire),
-        )
-        .await
     }
 
     #[cfg(test)]
@@ -2330,22 +2834,35 @@ impl PendingFixedBindHandoffRegistrant {
     ) -> Option<PendingFixedBindHandoffContinuation> {
         let bind_addr = pending.resolved.bind_addr.clone();
         mark_pending_fixed_bind_handoff_ready_with_registrant(&bind_addr, self.clone());
-        let state = self
-            .observe_pending_fixed_bind_publication_state_for_pending(pending)
-            .await;
-        if !state.claim_conflict() || !pending.runtime_exposure_confirmed {
+        let fixed_bind = FSMetaApp::build_fixed_bind_snapshot_for_pending_publication(
+            self.instance_id,
+            self.api_task.clone(),
+            Some(pending.clone()),
+            self.pending_fixed_bind_claim_release_followup
+                .load(Ordering::Acquire),
+        )
+        .await;
+        if fixed_bind.conflicting_process_claim.is_none() || !pending.runtime_exposure_confirmed {
             return None;
         }
         if let Some(owner) = active_fixed_bind_facade_owner_for(&bind_addr, self.instance_id) {
             owner.release_for_handoff(&bind_addr).await;
-            return Some(self.handoff_continuation(&bind_addr));
+            return Some(PendingFixedBindHandoffContinuation {
+                bind_addr,
+                registrant: self.clone(),
+            });
         }
-        if let Some(owner_instance_id) = state
-            .conflicting_process_claim_for_handoff()
+        if let Some(owner_instance_id) = fixed_bind
+            .claim_release_followup_pending
+            .then(|| fixed_bind.conflicting_process_claim.clone())
+            .flatten()
             .map(|claim| claim.owner_instance_id)
         {
             clear_process_facade_claim_for_bind_addr(&bind_addr, owner_instance_id);
-            return Some(self.handoff_continuation(&bind_addr));
+            return Some(PendingFixedBindHandoffContinuation {
+                bind_addr,
+                registrant: self.clone(),
+            });
         }
         None
     }
@@ -2385,117 +2902,51 @@ impl PendingFixedBindHandoffRegistrant {
         .await
     }
 
-    fn active_fixed_bind_facade_registrant(&self) -> ActiveFixedBindFacadeRegistrant {
-        ActiveFixedBindFacadeRegistrant::from_parts(
-            self.instance_id,
-            self.api_task.clone(),
-            self.api_request_tracker.clone(),
-            self.api_control_gate.clone(),
-        )
-    }
-
-    fn clear_pending_facade_and_publish_ready_tail_after_publication(&self) {
-        FSMetaApp::clear_pending_facade_and_publish_ready_tail_from_runtime_facts(
-            &self.facade_pending_status,
-            &self.facade_service_state,
-            &self.api_control_gate,
-            FacadeReadyTailDecisionInput {
-                runtime: self.runtime_control_state(),
-                allow_facade_only_handoff: false,
-                publication_ready: true,
-                pending_facade_present: false,
-            },
-        );
-        self.notify_runtime_state_changed();
-    }
-
     async fn apply_forced_handoff_ready_tail(&self, bind_addr: &str) -> bool {
-        let applied = FSMetaApp::apply_observed_facade_ready_tail_from_parts(
+        let observation = FSMetaApp::observe_facade_gate_from_parts(
             self.instance_id,
             self.api_task.clone(),
             self.pending_facade.clone(),
             Some(&self.facade_pending_status),
-            &self.facade_service_state,
-            &self.api_control_gate,
             self.runtime_control_state(),
             self.pending_fixed_bind_has_suppressed_dependent_routes
                 .load(Ordering::Acquire),
             FacadeOnlyHandoffObservationPolicy::ForceAllowed,
-            Some((bind_addr, self.active_fixed_bind_facade_registrant())),
         )
         .await;
+        let applied = matches!(
+            observation.runtime.facade_publication_readiness_decision(
+                observation.current_pending.is_some(),
+                observation.pending_facade_is_control_route,
+                observation.active_control_stream_present,
+                observation.active_pending_control_stream_present,
+                observation.allow_facade_only_handoff,
+            ),
+            FacadePublicationReadinessDecision::Ready
+        );
+        if applied {
+            mark_active_fixed_bind_facade_owner(
+                bind_addr,
+                ActiveFixedBindFacadeRegistrant {
+                    instance_id: self.instance_id,
+                    api_task: self.api_task.clone(),
+                    api_request_tracker: self.api_request_tracker.clone(),
+                    api_control_gate: self.api_control_gate.clone(),
+                },
+            );
+        }
+        let snapshot = FacadePublicationMachine {
+            observation,
+            publication_ready: applied,
+        }
+        .snapshot();
+        FSMetaApp::publish_facade_publication_snapshot(
+            &self.facade_service_state,
+            &self.api_control_gate,
+            snapshot,
+        );
         self.notify_runtime_state_changed();
         applied
-    }
-
-    async fn apply_pending_facade_spawn_continuity_disposition(
-        &self,
-        disposition: PendingFacadeSpawnContinuityDisposition,
-        pending: &PendingFacadeActivation,
-    ) -> Option<bool> {
-        match disposition {
-            PendingFacadeSpawnContinuityDisposition::ReuseCurrentGeneration => {
-                let active_matches = self
-                    .api_task
-                    .lock()
-                    .await
-                    .as_ref()
-                    .is_some_and(|active| pending.matches_active(active));
-                if !active_matches {
-                    return None;
-                }
-                let mut pending_guard = self.pending_facade.lock().await;
-                if pending_guard.as_ref().is_some_and(|candidate| {
-                    candidate.matches_route_resources_generation(
-                        &pending.route_key,
-                        &pending.resource_ids,
-                        pending.generation,
-                    )
-                }) {
-                    pending_guard.take();
-                }
-                drop(pending_guard);
-                self.clear_pending_facade_and_publish_ready_tail_after_publication();
-                Some(true)
-            }
-            PendingFacadeSpawnContinuityDisposition::PromoteExistingSameResource {
-                active_generation,
-            } => {
-                let mut api_task_guard = self.api_task.lock().await;
-                let active_matches = api_task_guard.as_ref().is_some_and(|active| {
-                    pending.matches_active_route_resources(active)
-                        && active.generation == active_generation
-                });
-                if !active_matches {
-                    return None;
-                }
-                if let Some(active) = api_task_guard.as_mut() {
-                    active.generation = pending.generation;
-                }
-                drop(api_task_guard);
-                let mut pending_guard = self.pending_facade.lock().await;
-                if pending_guard.as_ref().is_some_and(|candidate| {
-                    candidate.matches_route_resources_generation(
-                        &pending.route_key,
-                        &pending.resource_ids,
-                        pending.generation,
-                    )
-                }) {
-                    pending_guard.take();
-                }
-                drop(pending_guard);
-                self.clear_pending_facade_and_publish_ready_tail_after_publication();
-                Some(true)
-            }
-            PendingFacadeSpawnContinuityDisposition::Continue => None,
-        }
-    }
-
-    fn handoff_continuation(&self, bind_addr: &str) -> PendingFixedBindHandoffContinuation {
-        PendingFixedBindHandoffContinuation {
-            bind_addr: bind_addr.to_string(),
-            registrant: self.clone(),
-        }
     }
 
     async fn release_handoff_for_active_owner(
@@ -2514,7 +2965,10 @@ impl PendingFixedBindHandoffRegistrant {
             .pending_fixed_bind_has_suppressed_dependent_routes
             .load(Ordering::Acquire);
         if pending.runtime_exposure_confirmed || !suppressed_dependent_routes_remain {
-            Some(self.handoff_continuation(bind_addr))
+            Some(PendingFixedBindHandoffContinuation {
+                bind_addr: bind_addr.to_string(),
+                registrant: self.clone(),
+            })
         } else {
             None
         }
@@ -2522,20 +2976,6 @@ impl PendingFixedBindHandoffRegistrant {
 }
 
 impl ActiveFixedBindFacadeRegistrant {
-    fn from_parts(
-        instance_id: u64,
-        api_task: Arc<Mutex<Option<FacadeActivation>>>,
-        api_request_tracker: Arc<ApiRequestTracker>,
-        api_control_gate: Arc<ApiControlGate>,
-    ) -> Self {
-        Self {
-            instance_id,
-            api_task,
-            api_request_tracker,
-            api_control_gate,
-        }
-    }
-
     async fn release_for_handoff(self, bind_addr: &str) {
         self.api_request_tracker.wait_for_drain().await;
         self.api_control_gate.wait_for_facade_request_drain().await;
@@ -2567,40 +3007,7 @@ struct PendingFacadeActivation {
     resolved: api::config::ResolvedApiConfig,
 }
 
-impl PendingFacadeActivation {
-    fn matches_route_generation(&self, route_key: &str, generation: u64) -> bool {
-        self.route_key == route_key && self.generation == generation
-    }
-
-    fn matches_route_resources(&self, route_key: &str, resource_ids: &[String]) -> bool {
-        self.route_key == route_key && self.resource_ids == resource_ids
-    }
-
-    fn matches_route_resources_generation(
-        &self,
-        route_key: &str,
-        resource_ids: &[String],
-        generation: u64,
-    ) -> bool {
-        self.matches_route_resources(route_key, resource_ids) && self.generation == generation
-    }
-
-    fn matches_active(&self, active: &FacadeActivation) -> bool {
-        active.matches_pending(self)
-    }
-
-    fn matches_active_route_resources(&self, active: &FacadeActivation) -> bool {
-        active.matches_route_resources(&self.route_key, &self.resource_ids)
-    }
-
-    fn matches_status(&self, status: &SharedFacadePendingStatus) -> bool {
-        self.matches_route_resources_generation(
-            &status.route_key,
-            &status.resource_ids,
-            status.generation,
-        )
-    }
-}
+impl PendingFacadeActivation {}
 
 fn default_runtime_worker_binding(
     role_id: &str,
@@ -4374,11 +4781,11 @@ fn clear_local_sink_status_republish_retrigger_pause_hook() {
 #[cfg(test)]
 async fn maybe_pause_after_local_sink_status_republish_retrigger() {
     let hook = {
-        let guard = match local_sink_status_republish_retrigger_pause_hook_cell().lock() {
+        let mut guard = match local_sink_status_republish_retrigger_pause_hook_cell().lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.clone()
+        guard.take()
     };
     if let Some(hook) = hook {
         hook.entered.notify_waiters();
@@ -4621,7 +5028,7 @@ struct RetainedSinkControlState {
 
 impl FSMetaApp {
     fn sink_status_snapshot_summary_is_empty(snapshot: &crate::sink::SinkStatusSnapshot) -> bool {
-        snapshot.groups.is_empty() && snapshot.scheduled_groups_by_node.is_empty()
+        snapshot.progress_snapshot().empty_summary
     }
 
     async fn observe_runtime_scope_convergence(
@@ -4658,144 +5065,57 @@ impl FSMetaApp {
         }
     }
 
+    async fn wait_for_runtime_source_or_sink_progress_until(
+        runtime_state_changed: &Arc<tokio::sync::Notify>,
+        source: &Arc<SourceFacade>,
+        sink: &Arc<SinkFacade>,
+        deadline: tokio::time::Instant,
+    ) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let wait_budget = remaining.min(Duration::from_millis(350));
+        let notified = runtime_state_changed.notified();
+        tokio::pin!(notified);
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = async {
+                let _ = tokio::time::timeout(wait_budget, source.observability_snapshot()).await;
+            } => {}
+            _ = async {
+                let _ = tokio::time::timeout(wait_budget, sink.status_snapshot()).await;
+            } => {}
+        }
+    }
+
+    async fn wait_for_runtime_or_source_progress_until(
+        runtime_state_changed: &Arc<tokio::sync::Notify>,
+        source: &Arc<SourceFacade>,
+        deadline: tokio::time::Instant,
+    ) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let wait_budget = remaining.min(Duration::from_millis(350));
+        let notified = runtime_state_changed.notified();
+        tokio::pin!(notified);
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = async {
+                let _ = tokio::time::timeout(wait_budget, source.observability_snapshot()).await;
+            } => {}
+        }
+    }
+
     async fn wait_for_sink_status_republish_readiness_after_recovery(
         &self,
-        source_to_sink_convergence_pretriggered: bool,
+        source_to_sink_convergence_pretriggered_epoch: Option<u64>,
     ) -> Result<Option<std::collections::BTreeSet<String>>> {
-        let summarize_cached_sink_status_after_scope_convergence_timeout = |app: &Self| {
-            app.sink
-                .cached_status_snapshot()
-                .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
-                .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"))
-        };
-        let mut wait_state =
-            PostRecoverySinkStatusReadinessWaitState::new(source_to_sink_convergence_pretriggered);
-        loop {
-            let scope_convergence_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-            let converged_groups = loop {
-                wait_state
-                    .maybe_drive_pending_scope_convergence_retrigger(&self.source)
-                    .await?;
-                let scope_observation =
-                    Self::observe_runtime_scope_convergence(&self.source, &self.sink).await?;
-                match wait_state.scope_action(&scope_observation, scope_convergence_deadline) {
-                    PostRecoveryScopeConvergenceAction::Converged => {
-                        break scope_observation.sink_groups;
-                    }
-                    PostRecoveryScopeConvergenceAction::ReturnTimeout => {
-                        return Err(CnxError::Internal(format!(
-                            "runtime scope convergence not observed after retained replay: {}",
-                            scope_observation.timeout_context()
-                        )));
-                    }
-                    PostRecoveryScopeConvergenceAction::TriggerInitialAndWait => {
-                        wait_state
-                            .maybe_trigger_initial_scope_convergence(&self.source)
-                            .await?;
-                        Self::wait_for_runtime_or_sink_progress_until(
-                            &self.runtime_state_changed,
-                            &self.sink,
-                            scope_convergence_deadline,
-                        )
-                        .await;
-                    }
-                    PostRecoveryScopeConvergenceAction::Wait => {
-                        Self::wait_for_runtime_or_sink_progress_until(
-                            &self.runtime_state_changed,
-                            &self.sink,
-                            scope_convergence_deadline,
-                        )
-                        .await;
-                    }
-                }
-            };
-
-            let sink_readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-            loop {
-                match tokio::time::timeout(Duration::from_millis(250), self.sink.status_snapshot())
-                    .await
-                {
-                    Ok(Ok(snapshot)) => {
-                        if sink_status_snapshot_ready_for_expected_groups(
-                            &snapshot,
-                            &converged_groups,
-                        ) {
-                            return Ok(None);
-                        }
-                        if tokio::time::Instant::now() >= sink_readiness_deadline {
-                            return Err(CnxError::Internal(format!(
-                                "sink status readiness not restored after retained replay once runtime scope converged: {}",
-                                summarize_sink_status_endpoint(&snapshot)
-                            )));
-                        }
-                    }
-                    Ok(Err(err))
-                        if matches!(err, CnxError::Timeout)
-                            && wait_state
-                                .maybe_schedule_sink_timeout_retry(
-                                    &self.source,
-                                    tokio::time::Instant::now() < sink_readiness_deadline,
-                                )
-                                .await? =>
-                    {
-                        break;
-                    }
-                    Ok(Err(_err)) if tokio::time::Instant::now() < sink_readiness_deadline => {}
-                    Ok(Err(err)) if matches!(err, CnxError::Timeout) => {
-                        if self
-                            .sink
-                            .cached_status_snapshot()
-                            .ok()
-                            .is_some_and(|snapshot| {
-                                Self::sink_status_snapshot_summary_is_empty(&snapshot)
-                            })
-                        {
-                            return Ok(Some(converged_groups));
-                        }
-                        return Err(CnxError::Internal(format!(
-                            "sink status readiness not restored after retained replay once runtime scope converged: groups={:?} raw_timeout=true {}",
-                            converged_groups,
-                            summarize_cached_sink_status_after_scope_convergence_timeout(self)
-                        )));
-                    }
-                    Ok(Err(err)) => return Err(err),
-                    Err(_)
-                        if wait_state
-                            .maybe_schedule_sink_timeout_retry(
-                                &self.source,
-                                tokio::time::Instant::now() < sink_readiness_deadline,
-                            )
-                            .await? =>
-                    {
-                        break;
-                    }
-                    Err(_) if tokio::time::Instant::now() < sink_readiness_deadline => {}
-                    Err(_) => {
-                        if self
-                            .sink
-                            .cached_status_snapshot()
-                            .ok()
-                            .is_some_and(|snapshot| {
-                                Self::sink_status_snapshot_summary_is_empty(&snapshot)
-                            })
-                        {
-                            return Ok(Some(converged_groups));
-                        }
-                        return Err(CnxError::Internal(format!(
-                            "sink status readiness not restored after retained replay once runtime scope converged: groups={:?} raw_timeout=true {}",
-                            converged_groups,
-                            summarize_cached_sink_status_after_scope_convergence_timeout(self)
-                        )));
-                    }
-                }
-                Self::wait_for_runtime_or_sink_progress_until(
-                    &self.runtime_state_changed,
-                    &self.sink,
-                    sink_readiness_deadline,
-                )
-                .await;
-            }
-        }
+        SinkRecoveryMachine::new_post_recovery(source_to_sink_convergence_pretriggered_epoch)
+            .run_post_recovery_readiness(&self.source, &self.sink, &self.runtime_state_changed)
+            .await
     }
 
     async fn execute_local_sink_status_republish_until_terminal(
@@ -4805,52 +5125,21 @@ impl FSMetaApp {
         expected_groups: &std::collections::BTreeSet<String>,
         post_return_sink_replay_signals: &[SinkControlSignal],
         mode: LocalSinkStatusRepublishWaitMode,
+        pretrigger_request_epoch: Option<u64>,
     ) -> Result<()> {
-        #[cfg(test)]
-        note_local_sink_status_republish_helper_entry_for_tests();
-        let summarize_cached_sink_status = |sink: &Arc<SinkFacade>| {
-            sink.cached_status_snapshot()
-                .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
-                .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"))
+        let mut machine = match pretrigger_request_epoch {
+            Some(request_epoch) => SinkRecoveryMachine::new_local_pretriggered(mode, request_epoch),
+            None => SinkRecoveryMachine::new_local(mode),
         };
-        let mut republish_machine = LocalSinkStatusRepublishMachine::new(mode);
-        loop {
-            let expected_scope_groups = RuntimeScopeExpectedGroups::from_logical_roots(
-                &source.logical_roots_snapshot().await?,
+        machine
+            .run_local_republish(
+                &source,
+                &sink,
+                &runtime_state_changed,
                 expected_groups,
-            );
-            let scope_observation = Self::observe_runtime_scope_convergence(&source, &sink).await?;
-            let observation = LocalSinkStatusRepublishObservation {
-                scope_converged: scope_observation.matches_expectation(
-                    RuntimeScopeConvergenceExpectation::ExpectedGroups(&expected_scope_groups),
-                ),
-                cached_ready_fast_path_satisfied: matches!(
-                    mode,
-                    LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath
-                ) && Self::cached_sink_status_ready_for_expected_groups(&sink, expected_groups),
-            };
-            let outcome = republish_machine
-                .advance(
-                    &source,
-                    &sink,
-                    &runtime_state_changed,
-                    expected_groups,
-                    post_return_sink_replay_signals,
-                    observation,
-                )
-                .await;
-            match outcome {
-                std::ops::ControlFlow::Continue(()) => continue,
-                std::ops::ControlFlow::Break(Ok(())) => return Ok(()),
-                std::ops::ControlFlow::Break(Err(CnxError::Timeout)) => {
-                    return Err(CnxError::Internal(format!(
-                        "local sink status republish not restored after retained replay once runtime scope converged: expected_groups={expected_groups:?} {}",
-                        summarize_cached_sink_status(&sink)
-                    )));
-                }
-                std::ops::ControlFlow::Break(Err(err)) => return Err(err),
-            }
-        }
+                post_return_sink_replay_signals,
+            )
+            .await
     }
 
     async fn wait_for_local_sink_status_republish_after_recovery_from_parts(
@@ -4867,6 +5156,27 @@ impl FSMetaApp {
             expected_groups,
             post_return_sink_replay_signals,
             LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
+            None,
+        )
+        .await
+    }
+
+    async fn wait_for_local_sink_status_republish_after_recovery_requiring_probe_from_parts_with_pretrigger_epoch(
+        source: Arc<SourceFacade>,
+        sink: Arc<SinkFacade>,
+        runtime_state_changed: Arc<tokio::sync::Notify>,
+        expected_groups: &std::collections::BTreeSet<String>,
+        post_return_sink_replay_signals: &[SinkControlSignal],
+        pretrigger_request_epoch: u64,
+    ) -> Result<()> {
+        Self::execute_local_sink_status_republish_until_terminal(
+            source,
+            sink,
+            runtime_state_changed,
+            expected_groups,
+            post_return_sink_replay_signals,
+            LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady,
+            Some(pretrigger_request_epoch),
         )
         .await
     }
@@ -4875,7 +5185,7 @@ impl FSMetaApp {
         sink: &Arc<SinkFacade>,
         expected_groups: &std::collections::BTreeSet<String>,
         deadline: tokio::time::Instant,
-    ) -> LocalSinkStatusRepublishProbeOutcome {
+    ) -> SinkRecoveryProbeOutcome {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if Self::nonblocking_sink_status_probe_ready_for_expected_groups(
             sink,
@@ -4884,12 +5194,12 @@ impl FSMetaApp {
         )
         .await
         {
-            return LocalSinkStatusRepublishProbeOutcome::Ready;
+            return SinkRecoveryProbeOutcome::Ready;
         }
         let remaining_after_nonblocking_probe =
             deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining_after_nonblocking_probe.is_zero() {
-            return LocalSinkStatusRepublishProbeOutcome::NotReady;
+            return SinkRecoveryProbeOutcome::NotReady;
         }
         if Self::blocking_sink_status_probe_ready_for_expected_groups(
             sink,
@@ -4898,9 +5208,9 @@ impl FSMetaApp {
         )
         .await
         {
-            LocalSinkStatusRepublishProbeOutcome::Ready
+            SinkRecoveryProbeOutcome::Ready
         } else {
-            LocalSinkStatusRepublishProbeOutcome::NotReady
+            SinkRecoveryProbeOutcome::NotReady
         }
     }
 
@@ -4963,6 +5273,7 @@ impl FSMetaApp {
             expected_groups,
             post_return_sink_replay_signals,
             LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady,
+            None,
         )
         .await
     }
@@ -5024,7 +5335,7 @@ impl FSMetaApp {
         sink_status_publication_present: bool,
         source_signals: &[SourceControlSignal],
         sink_signals: &[SinkControlSignal],
-        pretriggered_source_to_sink_convergence: bool,
+        pretriggered_source_to_sink_convergence_epoch: Option<u64>,
         deferred_local_sink_replay_signals: &[SinkControlSignal],
     ) -> Result<SinkRecoveryGateReopenDisposition> {
         if !replayed_sink_state_after_uninitialized_source_recovery
@@ -5054,11 +5365,14 @@ impl FSMetaApp {
                         &source_led_expected_groups,
                     )
                 });
-        let recovered_expected_groups = self
-            .wait_for_sink_status_republish_readiness_after_recovery(
-                pretriggered_source_to_sink_convergence,
+        let recovered_expected_groups = if source_led_uninitialized_mixed_recovery {
+            None
+        } else {
+            self.wait_for_sink_status_republish_readiness_after_recovery(
+                pretriggered_source_to_sink_convergence_epoch,
             )
-            .await?;
+            .await?
+        };
         let disposition = SinkRecoveryGateReopenDisposition::from_decision_input(
             SinkRecoveryGateReopenDecisionInput {
                 source_led_uninitialized_mixed_recovery,
@@ -5102,7 +5416,7 @@ impl FSMetaApp {
         request_sensitive: bool,
         sink_cleanup_only_while_uninitialized: bool,
         sink_recovery_tail_plan: SinkRecoveryTailPlan,
-        deferred_local_sink_replay_signals: Vec<SinkControlSignal>,
+        _deferred_local_sink_replay_signals: Vec<SinkControlSignal>,
         facade_publication_signals: Vec<FacadeControlSignal>,
     ) -> Result<()> {
         let (deferred_sink_owned_query_peer_publication_signals, facade_publication_signals): (
@@ -5121,11 +5435,28 @@ impl FSMetaApp {
         let query_publication_followup_present = facade_publication_signals
             .iter()
             .any(Self::facade_publication_signal_is_query_activate);
-        if !sink_cleanup_only_while_uninitialized {
-            self.retry_pending_fixed_bind_facade_after_claim_release_without_query_followup(
-                query_publication_followup_present,
-            )
-            .await?;
+        if !sink_cleanup_only_while_uninitialized && !query_publication_followup_present {
+            let mut machine =
+                FacadeDeactivateMachine::from_input(self.collect_facade_deactivate_input().await);
+            if machine.fixed_bind.claim_release_followup_pending
+                && machine.fixed_bind.pending_publication.is_some()
+                && machine.fixed_bind.conflicting_process_claim.is_none()
+            {
+                let pending = machine.fixed_bind.pending_publication.clone().expect(
+                    "pending fixed-bind claim-release retry requires pending facade in publication followup",
+                );
+                self.retry_pending_facade(&pending.route_key, pending.generation, false)
+                    .await?;
+                machine = FacadeDeactivateMachine::from_input(
+                    self.collect_facade_deactivate_input().await,
+                );
+            }
+            if machine.fixed_bind.claim_release_followup_pending
+                && machine.fixed_bind.pending_publication.is_none()
+            {
+                self.pending_fixed_bind_claim_release_followup
+                    .store(false, Ordering::Release);
+            }
         }
         for signal in facade_publication_signals {
             self.apply_facade_signal(signal).await?;
@@ -5162,11 +5493,20 @@ impl FSMetaApp {
                 .deferred_expected_groups()
                 .cloned()
             {
+                let post_return_sink_replay_signals = self
+                    .current_generation_retained_sink_replay_signals_for_local_republish()
+                    .await;
+                let pretrigger_request_epoch =
+                    self.source.trigger_rescan_when_ready_epoch().await?;
                 self.suppress_deferred_sink_owned_query_peer_publication_signals(
                     &deferred_sink_owned_query_peer_publication_signals,
                 )
                 .await?;
-                let control_ready_after_republish = self.facade_publication_ready().await;
+                let control_ready_after_republish = FacadePublicationMachine::from_input(
+                    self.collect_facade_publication_input().await,
+                )
+                .snapshot()
+                .publication_ready;
                 self.api_control_gate
                     .set_ready(control_ready_after_republish);
                 let _ = self.current_facade_service_state().await;
@@ -5175,7 +5515,8 @@ impl FSMetaApp {
                     self.source.clone(),
                     self.sink.clone(),
                     expected_groups,
-                    deferred_local_sink_replay_signals,
+                    Some(pretrigger_request_epoch),
+                    post_return_sink_replay_signals,
                     deferred_sink_owned_query_peer_publication_signals,
                     self.facade_gate.clone(),
                     self.mirrored_query_peer_routes.clone(),
@@ -5189,8 +5530,13 @@ impl FSMetaApp {
                     self.pending_fixed_bind_has_suppressed_dependent_routes.clone(),
                 );
             } else {
-                self.api_control_gate
-                    .set_ready(self.facade_publication_ready().await);
+                self.api_control_gate.set_ready(
+                    FacadePublicationMachine::from_input(
+                        self.collect_facade_publication_input().await,
+                    )
+                    .snapshot()
+                    .publication_ready,
+                );
                 let _ = self.current_facade_service_state().await;
             }
         }
@@ -5275,6 +5621,7 @@ impl FSMetaApp {
         source: Arc<SourceFacade>,
         sink: Arc<SinkFacade>,
         expected_groups: std::collections::BTreeSet<String>,
+        pretrigger_request_epoch: Option<u64>,
         post_return_sink_replay_signals: Vec<SinkControlSignal>,
         deferred_signals: Vec<FacadeControlSignal>,
         facade_gate: RuntimeUnitGate,
@@ -5289,15 +5636,30 @@ impl FSMetaApp {
         pending_fixed_bind_has_suppressed_dependent_routes: Arc<AtomicBool>,
     ) {
         tokio::spawn(async move {
-            if let Err(err) = Self::wait_for_local_sink_status_republish_after_recovery_from_parts(
-                source,
-                sink,
-                runtime_state_changed,
-                &expected_groups,
-                &post_return_sink_replay_signals,
-            )
-            .await
-            {
+            let helper_result = match pretrigger_request_epoch {
+                Some(request_epoch) => {
+                    Self::wait_for_local_sink_status_republish_after_recovery_requiring_probe_from_parts_with_pretrigger_epoch(
+                        source,
+                        sink,
+                        runtime_state_changed,
+                        &expected_groups,
+                        &post_return_sink_replay_signals,
+                        request_epoch,
+                    )
+                    .await
+                }
+                None => {
+                    Self::wait_for_local_sink_status_republish_after_recovery_from_parts(
+                        source,
+                        sink,
+                        runtime_state_changed,
+                        &expected_groups,
+                        &post_return_sink_replay_signals,
+                    )
+                    .await
+                }
+            };
+            if let Err(err) = helper_result {
                 eprintln!(
                     "fs_meta_runtime_app: deferred local sink-status republish wait failed err={}",
                     err
@@ -5322,19 +5684,35 @@ impl FSMetaApp {
             }
             #[cfg(test)]
             maybe_pause_before_deferred_sink_owned_query_peer_publication_gate_reopen().await;
-            let _ = Self::apply_observed_facade_ready_tail_from_parts(
+            let observation = Self::observe_facade_gate_from_parts(
                 instance_id,
                 api_task.clone(),
                 pending_facade.clone(),
                 Some(&facade_pending_status),
-                &facade_service_state,
-                &api_control_gate,
                 RuntimeControlState::from_state_cell(&runtime_gate_state),
                 pending_fixed_bind_has_suppressed_dependent_routes.load(Ordering::Acquire),
                 FacadeOnlyHandoffObservationPolicy::ForceBlocked,
-                None,
             )
             .await;
+            let snapshot = FacadePublicationMachine {
+                publication_ready: matches!(
+                    observation.runtime.facade_publication_readiness_decision(
+                        observation.current_pending.is_some(),
+                        observation.pending_facade_is_control_route,
+                        observation.active_control_stream_present,
+                        observation.active_pending_control_stream_present,
+                        observation.allow_facade_only_handoff,
+                    ),
+                    FacadePublicationReadinessDecision::Ready
+                ),
+                observation,
+            }
+            .snapshot();
+            Self::publish_facade_publication_snapshot(
+                &facade_service_state,
+                &api_control_gate,
+                snapshot,
+            );
             #[cfg(test)]
             notify_deferred_sink_owned_query_peer_publication_completion();
         });
@@ -5598,35 +5976,6 @@ impl FSMetaApp {
         self.runtime_state_changed.notify_waiters();
     }
 
-    fn apply_facade_ready_tail_decision(
-        api_control_gate: &ApiControlGate,
-        facade_service_state: &SharedFacadeServiceStateCell,
-        ready_tail_decision: FacadeReadyTailDecision,
-    ) {
-        api_control_gate.set_ready(ready_tail_decision.control_gate_ready);
-        *facade_service_state
-            .write()
-            .expect("write published facade service state") = ready_tail_decision.published_state;
-    }
-
-    fn clear_pending_facade_and_publish_ready_tail_from_runtime_facts(
-        facade_pending_status: &SharedFacadePendingStatusCell,
-        facade_service_state: &SharedFacadeServiceStateCell,
-        api_control_gate: &ApiControlGate,
-        input: FacadeReadyTailDecisionInput,
-    ) {
-        Self::clear_pending_facade_status(facade_pending_status);
-        Self::apply_facade_ready_tail_decision(
-            api_control_gate,
-            facade_service_state,
-            input.runtime.facade_ready_tail_decision(
-                input.publication_ready,
-                input.pending_facade_present,
-                input.allow_facade_only_handoff,
-            ),
-        );
-    }
-
     fn facade_only_handoff_allowance_decision(
         input: FacadeOnlyHandoffAllowanceDecisionInput,
     ) -> FacadeOnlyHandoffAllowanceDecision {
@@ -5662,24 +6011,6 @@ impl FSMetaApp {
             };
         }
         PendingFixedBindHandoffAttemptDisposition::NoAttempt
-    }
-
-    fn pending_facade_spawn_continuity_disposition(
-        active: Option<&FacadeActivation>,
-        pending: &PendingFacadeActivation,
-    ) -> PendingFacadeSpawnContinuityDisposition {
-        let Some(active) = active else {
-            return PendingFacadeSpawnContinuityDisposition::Continue;
-        };
-        if pending.matches_active(active) {
-            return PendingFacadeSpawnContinuityDisposition::ReuseCurrentGeneration;
-        }
-        if pending.matches_active_route_resources(active) {
-            return PendingFacadeSpawnContinuityDisposition::PromoteExistingSameResource {
-                active_generation: active.generation,
-            };
-        }
-        PendingFacadeSpawnContinuityDisposition::Continue
     }
 
     fn internal_status_available_from_published_facade_state(
@@ -5788,6 +6119,7 @@ impl FSMetaApp {
         }
     }
 
+    #[cfg(test)]
     fn publish_facade_service_state_from_runtime_state(
         facade_service_state: &SharedFacadeServiceStateCell,
         input: FacadeServiceStateDecisionInput,
@@ -5803,6 +6135,18 @@ impl FSMetaApp {
             .write()
             .expect("write published facade service state") = state;
         state
+    }
+
+    fn publish_facade_publication_snapshot(
+        facade_service_state: &SharedFacadeServiceStateCell,
+        api_control_gate: &ApiControlGate,
+        snapshot: FacadePublicationSnapshot,
+    ) -> FacadeServiceState {
+        api_control_gate.set_ready(snapshot.control_gate_ready);
+        *facade_service_state
+            .write()
+            .expect("write published facade service state") = snapshot.published_state;
+        snapshot.published_state
     }
 
     fn publish_rollout_status(
@@ -5840,7 +6184,11 @@ impl FSMetaApp {
                 active_ref.is_some_and(|active| active.route_key == control_route_key);
             let active_pending_control_stream_present = match (active_ref, current_pending.as_ref())
             {
-                (Some(active), Some(pending)) => pending.matches_active(active),
+                (Some(active), Some(pending)) => {
+                    active.route_key == pending.route_key
+                        && active.resource_ids == pending.resource_ids
+                        && active.generation == pending.generation
+                }
                 _ => false,
             };
             (
@@ -5882,45 +6230,243 @@ impl FSMetaApp {
         }
     }
 
-    async fn apply_observed_facade_ready_tail_from_parts(
-        instance_id: u64,
-        api_task: Arc<Mutex<Option<FacadeActivation>>>,
-        pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
-        facade_pending_status: Option<&SharedFacadePendingStatusCell>,
-        facade_service_state: &SharedFacadeServiceStateCell,
-        api_control_gate: &ApiControlGate,
-        runtime: RuntimeControlState,
-        pending_fixed_bind_has_suppressed_dependent_routes: bool,
-        handoff_policy: FacadeOnlyHandoffObservationPolicy,
-        active_fixed_bind_owner: Option<(&str, ActiveFixedBindFacadeRegistrant)>,
-    ) -> bool {
-        let observation = Self::observe_facade_gate_from_parts(
-            instance_id,
-            api_task,
-            pending_facade,
-            facade_pending_status,
-            runtime,
-            pending_fixed_bind_has_suppressed_dependent_routes,
-            handoff_policy,
-        )
-        .await;
-        let publication_ready = observation.publication_ready();
-        if publication_ready && let Some((bind_addr, registrant)) = active_fixed_bind_owner {
-            mark_active_fixed_bind_facade_owner(bind_addr, registrant);
+    async fn resolve_facade_publication_ready(
+        &self,
+        observation: &FacadeGateObservation,
+    ) -> Result<bool> {
+        match observation.runtime.facade_publication_readiness_decision(
+            observation.current_pending.is_some(),
+            observation.pending_facade_is_control_route,
+            observation.active_control_stream_present,
+            observation.active_pending_control_stream_present,
+            observation.allow_facade_only_handoff,
+        ) {
+            FacadePublicationReadinessDecision::BlockedControlGate
+            | FacadePublicationReadinessDecision::BlockedWithoutActiveControlStream => Ok(false),
+            FacadePublicationReadinessDecision::Ready => {
+                if let Some(bind_addr) = observation.current_pending.as_ref().and_then(|pending| {
+                    (observation.pending_facade_is_control_route
+                        && observation.active_pending_control_stream_present)
+                        .then_some(pending.resolved.bind_addr.as_str())
+                }) {
+                    clear_pending_fixed_bind_handoff_ready(bind_addr);
+                }
+                Ok(true)
+            }
+            FacadePublicationReadinessDecision::FixedBindHandoffPending => {
+                let Some(pending) = observation
+                    .current_pending
+                    .clone()
+                    .filter(|pending| !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr))
+                else {
+                    return Ok(false);
+                };
+                let bind_addr = pending.resolved.bind_addr.clone();
+                let registrant = PendingFixedBindHandoffRegistrant {
+                    instance_id: self.instance_id,
+                    api_task: self.api_task.clone(),
+                    pending_facade: self.pending_facade.clone(),
+                    pending_fixed_bind_claim_release_followup: self
+                        .pending_fixed_bind_claim_release_followup
+                        .clone(),
+                    pending_fixed_bind_has_suppressed_dependent_routes: self
+                        .pending_fixed_bind_has_suppressed_dependent_routes
+                        .clone(),
+                    facade_spawn_in_progress: self.facade_spawn_in_progress.clone(),
+                    facade_pending_status: self.facade_pending_status.clone(),
+                    facade_service_state: self.facade_service_state.clone(),
+                    rollout_status: self.rollout_status.clone(),
+                    api_request_tracker: self.api_request_tracker.clone(),
+                    api_control_gate: self.api_control_gate.clone(),
+                    runtime_gate_state: self.runtime_gate_state.clone(),
+                    runtime_state_changed: self.runtime_state_changed.clone(),
+                    node_id: self.node_id.clone(),
+                    runtime_boundary: self.runtime_boundary.clone(),
+                    source: self.source.clone(),
+                    sink: self.sink.clone(),
+                    query_sink: self.query_sink.clone(),
+                    query_runtime_boundary: self.runtime_boundary.clone(),
+                };
+                mark_pending_fixed_bind_handoff_ready_with_registrant(
+                    &bind_addr,
+                    registrant.clone(),
+                );
+                let fixed_bind = FSMetaApp::build_fixed_bind_snapshot_for_pending_publication(
+                    registrant.instance_id,
+                    registrant.api_task.clone(),
+                    Some(pending.clone()),
+                    registrant
+                        .pending_fixed_bind_claim_release_followup
+                        .load(Ordering::Acquire),
+                )
+                .await;
+                let handoff = if fixed_bind.conflicting_process_claim.is_none()
+                    || !pending.runtime_exposure_confirmed
+                {
+                    None
+                } else if let Some(owner) =
+                    active_fixed_bind_facade_owner_for(&bind_addr, self.instance_id)
+                {
+                    owner.release_for_handoff(&bind_addr).await;
+                    Some(PendingFixedBindHandoffContinuation {
+                        bind_addr: bind_addr.clone(),
+                        registrant,
+                    })
+                } else if let Some(owner_instance_id) = fixed_bind
+                    .claim_release_followup_pending
+                    .then(|| fixed_bind.conflicting_process_claim.clone())
+                    .flatten()
+                    .map(|claim| claim.owner_instance_id)
+                {
+                    clear_process_facade_claim_for_bind_addr(&bind_addr, owner_instance_id);
+                    Some(PendingFixedBindHandoffContinuation {
+                        bind_addr: bind_addr.clone(),
+                        registrant,
+                    })
+                } else {
+                    None
+                };
+                let Some(handoff) = handoff else {
+                    return Ok(false);
+                };
+                let after_release_completed =
+                    execute_fixed_bind_after_release_handoff(handoff).await?;
+                if !after_release_completed {
+                    return Ok(false);
+                }
+                if self.api_task.lock().await.as_ref().is_some_and(|active| {
+                    active.route_key == pending.route_key
+                        && active.resource_ids == pending.resource_ids
+                        && active.generation == pending.generation
+                }) {
+                    clear_pending_fixed_bind_handoff_ready(&bind_addr);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
         }
-        Self::apply_facade_ready_tail_decision(
-            api_control_gate,
-            facade_service_state,
-            observation.ready_tail_decision(publication_ready),
-        );
-        publication_ready
     }
 
-    async fn observe_facade_gate(
+    async fn drive_fixed_bind_shutdown_handoff(
         &self,
-        handoff_policy: FacadeOnlyHandoffObservationPolicy,
-    ) -> FacadeGateObservation {
-        Self::observe_facade_gate_from_parts(
+        handoff: Option<ActiveFixedBindShutdownContinuation>,
+    ) -> Result<()> {
+        self.api_request_tracker.wait_for_drain().await;
+        self.api_control_gate.wait_for_facade_request_drain().await;
+        #[cfg(test)]
+        notify_facade_shutdown_started();
+        eprintln!("fs_meta_runtime_app: shutdown_active_facade");
+        if let Some(current) = self.api_task.lock().await.take() {
+            eprintln!(
+                "fs_meta_runtime_app: shutting down previous active facade generation={}",
+                current.generation
+            );
+            current
+                .handle
+                .shutdown(ACTIVE_FACADE_SHUTDOWN_TIMEOUT)
+                .await;
+        }
+        clear_owned_process_facade_claim(self.instance_id);
+        if let Some(handoff) = handoff {
+            clear_active_fixed_bind_facade_owner(&handoff.bind_addr, self.instance_id);
+            if let Some(pending_handoff) = handoff.pending_handoff {
+                let _ = execute_fixed_bind_after_release_handoff(pending_handoff).await?;
+            }
+        }
+        if let Some(pending) = self.pending_facade.lock().await.clone() {
+            clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
+        }
+        let _ = self.current_facade_service_state().await;
+        Ok(())
+    }
+
+    async fn execute_fixed_bind_handoff_action(
+        &self,
+        machine: &FacadeDeactivateMachine,
+        action: FixedBindHandoffAction,
+    ) -> Result<()> {
+        match action {
+            FixedBindHandoffAction::Deactivate {
+                route_key,
+                generation,
+                retain_active_facade,
+                retain_pending_spawn,
+            } => {
+                match machine.deactivate_plan(retain_active_facade, retain_pending_spawn) {
+                    FacadeDeactivateContinuityExecutionPlan::RetainActiveContinuity => {
+                        self.retained_active_facade_continuity
+                            .store(true, Ordering::Release);
+                        eprintln!(
+                            "fs_meta_runtime_app: retain active facade during continuity-preserving deactivate route_key={} generation={}",
+                            route_key, generation
+                        );
+                    }
+                    FacadeDeactivateContinuityExecutionPlan::RetainActiveWhilePendingFixedBindClaimConflict => {
+                        self.retained_active_facade_continuity
+                            .store(true, Ordering::Release);
+                        eprintln!(
+                            "fs_meta_runtime_app: retain active facade while pending fixed-bind claim remains owned elsewhere route_key={} generation={}",
+                            route_key, generation
+                        );
+                    }
+                    FacadeDeactivateContinuityExecutionPlan::RetainPendingWhilePendingFixedBindClaimConflict => {
+                        eprintln!(
+                            "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
+                            route_key, generation
+                        );
+                    }
+                    FacadeDeactivateContinuityExecutionPlan::ReleaseActiveForFixedBindHandoff {
+                        handoff,
+                    } => {
+                        eprintln!(
+                            "fs_meta_runtime_app: release active facade for fixed-bind handoff route_key={} generation={}",
+                            route_key, generation
+                        );
+                        self.retained_active_facade_continuity
+                            .store(false, Ordering::Release);
+                        *self.pending_facade.lock().await = None;
+                        Self::clear_pending_facade_status(&self.facade_pending_status);
+                        let _ = self.current_facade_service_state().await;
+                        let _ = self.current_facade_service_state().await;
+                        self.wait_for_shared_worker_control_handoff().await;
+                        self.drive_fixed_bind_shutdown_handoff(Some(handoff)).await?;
+                    }
+                    FacadeDeactivateContinuityExecutionPlan::RetainPendingForFixedBindHandoff => {
+                        eprintln!(
+                            "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
+                            route_key, generation
+                        );
+                    }
+                    FacadeDeactivateContinuityExecutionPlan::RetainPendingWhileSpawnInFlight => {
+                        eprintln!(
+                            "fs_meta_runtime_app: retain pending facade during in-flight spawn route_key={} generation={}",
+                            route_key, generation
+                        );
+                    }
+                    FacadeDeactivateContinuityExecutionPlan::Shutdown { handoff } => {
+                        self.retained_active_facade_continuity
+                            .store(false, Ordering::Release);
+                        *self.pending_facade.lock().await = None;
+                        Self::clear_pending_facade_status(&self.facade_pending_status);
+                        let _ = self.current_facade_service_state().await;
+                        let _ = self.current_facade_service_state().await;
+                        self.wait_for_shared_worker_control_handoff().await;
+                        self.drive_fixed_bind_shutdown_handoff(handoff).await?;
+                    }
+                }
+                Ok(())
+            }
+            FixedBindHandoffAction::Shutdown => {
+                self.drive_fixed_bind_shutdown_handoff(machine.shutdown_handoff.clone())
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn collect_facade_publication_input(&self) -> FacadePublicationInput {
+        let observation = Self::observe_facade_gate_from_parts(
             self.instance_id,
             self.api_task.clone(),
             self.pending_facade.clone(),
@@ -5928,28 +6474,95 @@ impl FSMetaApp {
             self.runtime_control_state(),
             self.pending_fixed_bind_has_suppressed_dependent_routes
                 .load(Ordering::Acquire),
-            handoff_policy,
+            FacadeOnlyHandoffObservationPolicy::DeriveFromPendingBind,
         )
-        .await
+        .await;
+        let publication_ready = match self.resolve_facade_publication_ready(&observation).await {
+            Ok(publication_ready) => publication_ready,
+            Err(err) => {
+                eprintln!(
+                    "fs_meta_runtime_app: facade publication readiness execution failed err={}",
+                    err
+                );
+                false
+            }
+        };
+        FacadePublicationInput {
+            observation,
+            publication_ready,
+        }
+    }
+
+    async fn collect_facade_deactivate_input(&self) -> FacadeDeactivateInput {
+        let pending = self.pending_facade.lock().await.clone();
+        let fixed_bind = Self::build_fixed_bind_snapshot_for_pending_publication(
+            self.instance_id,
+            self.api_task.clone(),
+            pending,
+            self.pending_fixed_bind_claim_release_followup
+                .load(Ordering::Acquire),
+        )
+        .await;
+        let active_fixed_bind_bind_addr = {
+            let api_task = self.api_task.lock().await;
+            api_task.as_ref().and_then(|active| {
+                (active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL))
+                    .then(|| {
+                        self.config
+                            .api
+                            .resolve_for_candidate_ids(&active.resource_ids)
+                    })
+                    .flatten()
+                    .map(|resolved| resolved.bind_addr)
+                    .filter(|bind_addr| !facade_bind_addr_is_ephemeral(bind_addr))
+            })
+        };
+        let (release_handoff, shutdown_handoff) = if let Some(bind_addr) =
+            active_fixed_bind_bind_addr
+        {
+            let ready = pending_fixed_bind_handoff_ready_for(&bind_addr);
+            let pending_handoff = ready
+                .as_ref()
+                .and_then(|ready| (ready.instance_id != self.instance_id).then_some(ready.clone()))
+                .map(|registrant| PendingFixedBindHandoffContinuation {
+                    bind_addr: bind_addr.clone(),
+                    registrant,
+                });
+            let shutdown_handoff = ActiveFixedBindShutdownContinuation {
+                bind_addr: bind_addr.clone(),
+                pending_handoff: pending_handoff.clone(),
+            };
+            let release_handoff = match ready.as_ref() {
+                Some(ready) => {
+                    ready
+                        .release_handoff_for_active_owner(&bind_addr, self.instance_id)
+                        .await
+                }
+                None => None,
+            };
+            (release_handoff, Some(shutdown_handoff))
+        } else {
+            (None, None)
+        };
+        FacadeDeactivateInput {
+            fixed_bind,
+            release_handoff,
+            shutdown_handoff,
+        }
     }
 
     async fn current_facade_service_state(&self) -> FacadeServiceState {
-        let pending_facade_present = self.pending_facade.lock().await.is_some()
-            || self
-                .facade_pending_status
-                .read()
-                .ok()
-                .is_some_and(|status| status.is_some());
-        let publication_ready = self.facade_publication_ready().await;
-        let published = Self::publish_facade_service_state_from_runtime_state(
+        let machine =
+            FacadePublicationMachine::from_input(self.collect_facade_publication_input().await);
+        let facade_snapshot = machine.snapshot();
+        let published = Self::publish_facade_publication_snapshot(
             &self.facade_service_state,
-            FacadeServiceStateDecisionInput {
-                control_gate_ready: self.api_control_gate.is_ready(),
-                publication_ready,
-                pending_facade_present,
-            },
+            &self.api_control_gate,
+            facade_snapshot,
         );
-        let _ = self.publish_current_rollout_status(publication_ready).await;
+        let _ = self
+            .publish_current_rollout_status(facade_snapshot.publication_ready)
+            .await;
         published
     }
 
@@ -5958,61 +6571,91 @@ impl FSMetaApp {
         publication_ready: bool,
     ) -> PublishedRolloutStatusSnapshot {
         let runtime = self.runtime_control_state();
-        let active_generation = self.api_task.lock().await.as_ref().map(|active| active.generation);
+        let active_generation = self
+            .api_task
+            .lock()
+            .await
+            .as_ref()
+            .map(|active| active.generation);
         let pending_generation = if let Some(pending) = self.pending_facade.lock().await.clone() {
             Some((pending.generation, pending.runtime_exposure_confirmed))
         } else {
-            self.facade_pending_status
-                .read()
-                .ok()
-                .and_then(|status| {
-                    status
-                        .as_ref()
-                        .map(|status| (status.generation, status.runtime_exposure_confirmed))
-                })
+            self.facade_pending_status.read().ok().and_then(|status| {
+                status
+                    .as_ref()
+                    .map(|status| (status.generation, status.runtime_exposure_confirmed))
+            })
         };
         let candidate_generation = pending_generation.map(|(generation, _)| generation);
         let candidate_runtime_exposure_confirmed =
             pending_generation.is_some_and(|(_, confirmed)| confirmed);
-        let retiring_generation = match (active_generation, candidate_generation) {
-            (Some(active), Some(candidate)) if active != candidate => Some(active),
-            _ => None,
-        };
-        let state = match (active_generation, candidate_generation) {
-            (_, Some(_))
-                if !runtime.control_initialized()
-                    || runtime.source_state_replay_required()
-                    || runtime.sink_state_replay_required() =>
-            {
-                RolloutGenerationState::CatchUp
-            }
-            (_, Some(_)) if !candidate_runtime_exposure_confirmed => {
-                RolloutGenerationState::Eligible
-            }
-            (Some(active), Some(candidate)) if active != candidate => {
-                RolloutGenerationState::Cutover
-            }
-            (None, Some(_)) if publication_ready => RolloutGenerationState::Cutover,
-            (None, Some(_)) => RolloutGenerationState::Eligible,
-            (Some(_), None)
-                if runtime.control_initialized()
-                    && !runtime.source_state_replay_required()
-                    && !runtime.sink_state_replay_required()
-                    && publication_ready =>
-            {
-                RolloutGenerationState::Stable
-            }
-            _ => RolloutGenerationState::CatchUp,
-        };
         Self::publish_rollout_status(
             &self.rollout_status,
-            PublishedRolloutStatusSnapshot {
-                state,
-                serving_generation: active_generation,
+            RolloutGenerationMachine {
+                runtime,
+                active_generation,
                 candidate_generation,
-                retiring_generation,
-            },
+                candidate_runtime_exposure_confirmed,
+                publication_ready,
+            }
+            .snapshot(),
         )
+    }
+
+    #[cfg(test)]
+    async fn install_active_facade_for_tests(
+        &self,
+        resource_ids: &[&str],
+        generation: u64,
+    ) -> bool {
+        let resource_ids = resource_ids
+            .iter()
+            .map(|resource_id| (*resource_id).to_string())
+            .collect::<Vec<_>>();
+        let active_facade = match api::spawn(
+            self.config
+                .api
+                .resolve_for_candidate_ids(&resource_ids)
+                .expect("resolve facade config"),
+            self.node_id.clone(),
+            self.runtime_boundary.clone(),
+            self.source.clone(),
+            self.sink.clone(),
+            self.query_sink.clone(),
+            self.runtime_boundary.clone(),
+            self.facade_pending_status.clone(),
+            self.facade_service_state.clone(),
+            self.api_request_tracker.clone(),
+            self.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return false;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *self.api_task.lock().await = Some(FacadeActivation {
+            route_key: format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+            generation,
+            resource_ids,
+            handle: active_facade,
+        });
+        let machine =
+            FacadePublicationMachine::from_input(self.collect_facade_publication_input().await);
+        let facade_snapshot = machine.snapshot();
+        let _ = Self::publish_facade_publication_snapshot(
+            &self.facade_service_state,
+            &self.api_control_gate,
+            facade_snapshot,
+        );
+        let _ = self
+            .publish_current_rollout_status(facade_snapshot.publication_ready)
+            .await;
+        true
     }
     fn should_initialize_from_control(
         source_signals: &[SourceControlSignal],
@@ -6270,8 +6913,11 @@ impl FSMetaApp {
         }
         eprintln!("fs_meta_runtime_app: initialize_from_control endpoints ok");
         self.update_runtime_control_state(|state| state.mark_initialized());
-        self.api_control_gate
-            .set_ready(self.facade_publication_ready().await);
+        self.api_control_gate.set_ready(
+            FacadePublicationMachine::from_input(self.collect_facade_publication_input().await)
+                .snapshot()
+                .publication_ready,
+        );
         let _ = self.current_facade_service_state().await;
         eprintln!("fs_meta_runtime_app: initialize_from_control done");
 
@@ -7402,81 +8048,160 @@ impl FSMetaApp {
         reset_suppressed_dependent_routes: bool,
     ) {
         if let Some(pending) = pending {
-            let registrant = self.pending_fixed_bind_handoff_registrant();
-            let state = registrant
-                .observe_pending_fixed_bind_publication_state_for_pending(&pending)
-                .await;
-            let _ = self.apply_pending_fixed_bind_handoff_followup(
-                state.projection().handoff_followup_for_pending(&pending),
+            let registrant = PendingFixedBindHandoffRegistrant {
+                instance_id: self.instance_id,
+                api_task: self.api_task.clone(),
+                pending_facade: self.pending_facade.clone(),
+                pending_fixed_bind_claim_release_followup: self
+                    .pending_fixed_bind_claim_release_followup
+                    .clone(),
+                pending_fixed_bind_has_suppressed_dependent_routes: self
+                    .pending_fixed_bind_has_suppressed_dependent_routes
+                    .clone(),
+                facade_spawn_in_progress: self.facade_spawn_in_progress.clone(),
+                facade_pending_status: self.facade_pending_status.clone(),
+                facade_service_state: self.facade_service_state.clone(),
+                rollout_status: self.rollout_status.clone(),
+                api_request_tracker: self.api_request_tracker.clone(),
+                api_control_gate: self.api_control_gate.clone(),
+                runtime_gate_state: self.runtime_gate_state.clone(),
+                runtime_state_changed: self.runtime_state_changed.clone(),
+                node_id: self.node_id.clone(),
+                runtime_boundary: self.runtime_boundary.clone(),
+                source: self.source.clone(),
+                sink: self.sink.clone(),
+                query_sink: self.query_sink.clone(),
+                query_runtime_boundary: self.runtime_boundary.clone(),
+            };
+            let fixed_bind = FSMetaApp::build_fixed_bind_snapshot_for_pending_publication(
+                registrant.instance_id,
+                registrant.api_task.clone(),
+                Some(pending.clone()),
+                registrant
+                    .pending_fixed_bind_claim_release_followup
+                    .load(Ordering::Acquire),
+            )
+            .await;
+            let machine = FacadeDeactivateMachine {
+                fixed_bind,
+                release_handoff: None,
+                shutdown_handoff: None,
+            };
+            let pending_fixed_bind_handoff_ready_bind_addr = machine
+                .fixed_bind
+                .pending_publication
+                .as_ref()
+                .filter(|pending| {
+                    machine.fixed_bind.conflicting_process_claim.is_some()
+                        && pending.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+                        && !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr)
+                })
+                .map(|pending| pending.resolved.bind_addr.as_str());
+            if let Some(bind_addr) = pending_fixed_bind_handoff_ready_bind_addr {
+                mark_pending_fixed_bind_handoff_ready_with_registrant(
+                    bind_addr,
+                    PendingFixedBindHandoffRegistrant {
+                        instance_id: self.instance_id,
+                        api_task: self.api_task.clone(),
+                        pending_facade: self.pending_facade.clone(),
+                        pending_fixed_bind_claim_release_followup: self
+                            .pending_fixed_bind_claim_release_followup
+                            .clone(),
+                        pending_fixed_bind_has_suppressed_dependent_routes: self
+                            .pending_fixed_bind_has_suppressed_dependent_routes
+                            .clone(),
+                        facade_spawn_in_progress: self.facade_spawn_in_progress.clone(),
+                        facade_pending_status: self.facade_pending_status.clone(),
+                        facade_service_state: self.facade_service_state.clone(),
+                        rollout_status: self.rollout_status.clone(),
+                        api_request_tracker: self.api_request_tracker.clone(),
+                        api_control_gate: self.api_control_gate.clone(),
+                        runtime_gate_state: self.runtime_gate_state.clone(),
+                        runtime_state_changed: self.runtime_state_changed.clone(),
+                        node_id: self.node_id.clone(),
+                        runtime_boundary: self.runtime_boundary.clone(),
+                        source: self.source.clone(),
+                        sink: self.sink.clone(),
+                        query_sink: self.query_sink.clone(),
+                        query_runtime_boundary: self.runtime_boundary.clone(),
+                    },
+                );
+            }
+            self.pending_fixed_bind_claim_release_followup.store(
+                machine.fixed_bind.claim_release_followup_pending
+                    && machine.fixed_bind.pending_publication.is_some()
+                    && machine.fixed_bind.conflicting_process_claim.is_some(),
+                Ordering::Release,
             );
+            self.notify_runtime_state_changed();
         } else {
-            let _ = self.apply_pending_fixed_bind_handoff_followup(None);
+            self.pending_fixed_bind_claim_release_followup
+                .store(false, Ordering::Release);
+            self.notify_runtime_state_changed();
         }
         if reset_suppressed_dependent_routes {
             self.pending_fixed_bind_has_suppressed_dependent_routes
                 .store(false, Ordering::Release);
         }
-        self.refresh_active_fixed_bind_facade_owner().await;
-    }
-
-    fn apply_pending_fixed_bind_handoff_followup(
-        &self,
-        followup: Option<PendingFixedBindHandoffFollowup>,
-    ) -> bool {
-        if let Some(followup) = &followup {
-            mark_pending_fixed_bind_handoff_ready_with_registrant(
-                &followup.bind_addr,
-                self.pending_fixed_bind_handoff_registrant(),
+        let bind_addr = {
+            let api_task = self.api_task.lock().await;
+            api_task.as_ref().and_then(|active| {
+                (active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL))
+                    .then(|| {
+                        self.config
+                            .api
+                            .resolve_for_candidate_ids(&active.resource_ids)
+                    })
+                    .flatten()
+                    .map(|resolved| resolved.bind_addr)
+                    .filter(|bind_addr| !facade_bind_addr_is_ephemeral(bind_addr))
+            })
+        };
+        if let Some(bind_addr) = bind_addr {
+            mark_active_fixed_bind_facade_owner(
+                &bind_addr,
+                ActiveFixedBindFacadeRegistrant {
+                    instance_id: self.instance_id,
+                    api_task: self.api_task.clone(),
+                    api_request_tracker: self.api_request_tracker.clone(),
+                    api_control_gate: self.api_control_gate.clone(),
+                },
             );
         }
-        let claim_release_followup = followup
-            .as_ref()
-            .is_some_and(|followup| followup.claim_release_followup_required);
-        self.pending_fixed_bind_claim_release_followup
-            .store(claim_release_followup, Ordering::Release);
-        self.notify_runtime_state_changed();
-        claim_release_followup
     }
 
-    fn apply_pending_fixed_bind_bind_addr_in_use_followup(&self, bind_addr: &str) {
-        let _ =
-            self.apply_pending_fixed_bind_handoff_followup(Some(PendingFixedBindHandoffFollowup {
-                bind_addr: bind_addr.to_string(),
-                claim_release_followup_required: true,
-            }));
-    }
-
-    fn pending_facade_spawn_followup_disposition(
-        spawn_result: Result<bool>,
-        pending: Option<PendingFacadeActivation>,
-    ) -> PendingFacadeSpawnFollowupDisposition {
-        match (spawn_result, pending) {
-            (Ok(spawned), pending) => PendingFacadeSpawnFollowupDisposition::Spawned {
-                spawned,
-                reset_suppressed_dependent_routes: spawned || pending.is_none(),
-                pending,
-            },
-            (Err(err), Some(pending))
-                if Self::facade_spawn_error_is_bind_addr_in_use(&err)
-                    && pending.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-                    && !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) =>
-            {
-                PendingFacadeSpawnFollowupDisposition::RetryAfterBindAddrInUse { pending, err }
-            }
-            (Err(err), _) => PendingFacadeSpawnFollowupDisposition::PropagateError(err),
+    async fn try_spawn_pending_facade(&self) -> Result<bool> {
+        let spawn_result = PendingFixedBindHandoffRegistrant {
+            instance_id: self.instance_id,
+            api_task: self.api_task.clone(),
+            pending_facade: self.pending_facade.clone(),
+            pending_fixed_bind_claim_release_followup: self
+                .pending_fixed_bind_claim_release_followup
+                .clone(),
+            pending_fixed_bind_has_suppressed_dependent_routes: self
+                .pending_fixed_bind_has_suppressed_dependent_routes
+                .clone(),
+            facade_spawn_in_progress: self.facade_spawn_in_progress.clone(),
+            facade_pending_status: self.facade_pending_status.clone(),
+            facade_service_state: self.facade_service_state.clone(),
+            rollout_status: self.rollout_status.clone(),
+            api_request_tracker: self.api_request_tracker.clone(),
+            api_control_gate: self.api_control_gate.clone(),
+            runtime_gate_state: self.runtime_gate_state.clone(),
+            runtime_state_changed: self.runtime_state_changed.clone(),
+            node_id: self.node_id.clone(),
+            runtime_boundary: self.runtime_boundary.clone(),
+            source: self.source.clone(),
+            sink: self.sink.clone(),
+            query_sink: self.query_sink.clone(),
+            query_runtime_boundary: self.runtime_boundary.clone(),
         }
-    }
-
-    async fn apply_pending_facade_spawn_followup(
-        &self,
-        disposition: PendingFacadeSpawnFollowupDisposition,
-    ) -> Result<bool> {
-        match disposition {
-            PendingFacadeSpawnFollowupDisposition::Spawned {
-                spawned,
-                pending,
-                reset_suppressed_dependent_routes,
-            } => {
+        .try_spawn_pending_facade()
+        .await;
+        let pending = self.pending_facade.lock().await.clone();
+        match (spawn_result, pending) {
+            (Ok(spawned), pending) => {
+                let reset_suppressed_dependent_routes = spawned || pending.is_none();
                 self.apply_pending_fixed_bind_spawn_success_followup(
                     pending,
                     reset_suppressed_dependent_routes,
@@ -7484,32 +8209,51 @@ impl FSMetaApp {
                 .await;
                 Ok(spawned)
             }
-            PendingFacadeSpawnFollowupDisposition::RetryAfterBindAddrInUse { pending, err } => {
+            (Err(err), Some(pending))
+                if Self::facade_spawn_error_is_bind_addr_in_use(&err)
+                    && pending.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+                    && !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) =>
+            {
                 Self::record_pending_facade_retry_error(
                     &self.facade_pending_status,
                     &pending,
                     &err,
                 );
-                self.apply_pending_fixed_bind_bind_addr_in_use_followup(
+                mark_pending_fixed_bind_handoff_ready_with_registrant(
                     &pending.resolved.bind_addr,
+                    PendingFixedBindHandoffRegistrant {
+                        instance_id: self.instance_id,
+                        api_task: self.api_task.clone(),
+                        pending_facade: self.pending_facade.clone(),
+                        pending_fixed_bind_claim_release_followup: self
+                            .pending_fixed_bind_claim_release_followup
+                            .clone(),
+                        pending_fixed_bind_has_suppressed_dependent_routes: self
+                            .pending_fixed_bind_has_suppressed_dependent_routes
+                            .clone(),
+                        facade_spawn_in_progress: self.facade_spawn_in_progress.clone(),
+                        facade_pending_status: self.facade_pending_status.clone(),
+                        facade_service_state: self.facade_service_state.clone(),
+                        rollout_status: self.rollout_status.clone(),
+                        api_request_tracker: self.api_request_tracker.clone(),
+                        api_control_gate: self.api_control_gate.clone(),
+                        runtime_gate_state: self.runtime_gate_state.clone(),
+                        runtime_state_changed: self.runtime_state_changed.clone(),
+                        node_id: self.node_id.clone(),
+                        runtime_boundary: self.runtime_boundary.clone(),
+                        source: self.source.clone(),
+                        sink: self.sink.clone(),
+                        query_sink: self.query_sink.clone(),
+                        query_runtime_boundary: self.runtime_boundary.clone(),
+                    },
                 );
+                self.pending_fixed_bind_claim_release_followup
+                    .store(true, Ordering::Release);
+                self.notify_runtime_state_changed();
                 Ok(false)
             }
-            PendingFacadeSpawnFollowupDisposition::PropagateError(err) => Err(err),
+            (Err(err), _) => Err(err),
         }
-    }
-
-    async fn try_spawn_pending_facade(&self) -> Result<bool> {
-        let spawn_result = self
-            .pending_fixed_bind_handoff_registrant()
-            .try_spawn_pending_facade()
-            .await;
-        let pending = self.pending_facade.lock().await.clone();
-        self.apply_pending_facade_spawn_followup(Self::pending_facade_spawn_followup_disposition(
-            spawn_result,
-            pending,
-        ))
-        .await
     }
 
     #[cfg(test)]
@@ -7549,27 +8293,27 @@ impl FSMetaApp {
         SpawnFut: std::future::Future<Output = Result<api::ApiServerHandle>>,
     {
         Self::try_spawn_pending_facade_from_registrant_with_spawn(
-            PendingFixedBindHandoffRegistrant::from_parts(
+            PendingFixedBindHandoffRegistrant {
                 instance_id,
                 api_task,
                 pending_facade,
-                Arc::new(AtomicBool::new(false)),
+                pending_fixed_bind_claim_release_followup: Arc::new(AtomicBool::new(false)),
                 pending_fixed_bind_has_suppressed_dependent_routes,
                 facade_spawn_in_progress,
                 facade_pending_status,
                 facade_service_state,
-                shared_rollout_status_cell(),
+                rollout_status: shared_rollout_status_cell(),
                 api_request_tracker,
                 api_control_gate,
                 runtime_gate_state,
-                Arc::new(tokio::sync::Notify::new()),
+                runtime_state_changed: Arc::new(tokio::sync::Notify::new()),
                 node_id,
                 runtime_boundary,
                 source,
                 sink,
                 query_sink,
                 query_runtime_boundary,
-            ),
+            },
             move |resolved,
                   node_id,
                   runtime_boundary,
@@ -7645,14 +8389,18 @@ impl FSMetaApp {
         let Some(pending) = pending_facade.lock().await.clone() else {
             return Ok(false);
         };
-        if let Some(claim) = ProcessFacadeClaim::from_pending(instance_id, &pending) {
+        if !facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
+            let claim = ProcessFacadeClaim {
+                owner_instance_id: instance_id,
+                bind_addr: pending.resolved.bind_addr.clone(),
+            };
             let mut guard = match process_facade_claim_cell().lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
             if let Some(existing) = guard.get(&claim.bind_addr)
                 && existing.owner_instance_id != instance_id
-                && existing.matches_pending(&pending)
+                && existing.bind_addr == pending.resolved.bind_addr
             {
                 eprintln!(
                     "fs_meta_runtime_app: facade process claim already owned instance_id={} generation={} route_key={} resources={:?} bind_addr={}",
@@ -7693,21 +8441,103 @@ impl FSMetaApp {
                 clear_active_fixed_bind_facade_owner(&pending.resolved.bind_addr, instance_id);
             }
         }
-        let (continuity_disposition, replacing_existing) = {
+        let (
+            reuse_current_generation,
+            promote_existing_same_resource_generation,
+            replacing_existing,
+        ) = {
             let api_task_guard = api_task.lock().await;
-            (
-                Self::pending_facade_spawn_continuity_disposition(
-                    api_task_guard.as_ref(),
-                    &pending,
-                ),
-                api_task_guard.is_some(),
-            )
+            let continuity = match api_task_guard.as_ref() {
+                Some(active)
+                    if active.route_key == pending.route_key
+                        && active.resource_ids == pending.resource_ids
+                        && active.generation == pending.generation =>
+                {
+                    (true, None)
+                }
+                Some(active)
+                    if active.route_key == pending.route_key
+                        && active.resource_ids == pending.resource_ids =>
+                {
+                    (false, Some(active.generation))
+                }
+                _ => (false, None),
+            };
+            (continuity.0, continuity.1, api_task_guard.is_some())
         };
-        if let Some(result) = registrant
-            .apply_pending_facade_spawn_continuity_disposition(continuity_disposition, &pending)
-            .await
-        {
-            return Ok(result);
+        if reuse_current_generation {
+            let active_matches = registrant
+                .api_task
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|active| {
+                    active.route_key == pending.route_key
+                        && active.resource_ids == pending.resource_ids
+                        && active.generation == pending.generation
+                });
+            if active_matches {
+                let mut pending_guard = registrant.pending_facade.lock().await;
+                if pending_guard.as_ref().is_some_and(|candidate| {
+                    candidate.route_key == pending.route_key
+                        && candidate.resource_ids == pending.resource_ids
+                        && candidate.generation == pending.generation
+                }) {
+                    pending_guard.take();
+                }
+                drop(pending_guard);
+                FSMetaApp::clear_pending_facade_status(&registrant.facade_pending_status);
+                let ready_tail_decision = registrant
+                    .runtime_control_state()
+                    .facade_ready_tail_decision(true, false, false);
+                registrant
+                    .api_control_gate
+                    .set_ready(ready_tail_decision.control_gate_ready);
+                *registrant
+                    .facade_service_state
+                    .write()
+                    .expect("write published facade service state") =
+                    ready_tail_decision.published_state;
+                registrant.notify_runtime_state_changed();
+                return Ok(true);
+            }
+        }
+        if let Some(active_generation) = promote_existing_same_resource_generation {
+            let mut api_task_guard = registrant.api_task.lock().await;
+            let active_matches = api_task_guard.as_ref().is_some_and(|active| {
+                active.route_key == pending.route_key
+                    && active.resource_ids == pending.resource_ids
+                    && active.generation == active_generation
+            });
+            if active_matches {
+                if let Some(active) = api_task_guard.as_mut() {
+                    active.generation = pending.generation;
+                }
+                drop(api_task_guard);
+                let mut pending_guard = registrant.pending_facade.lock().await;
+                if pending_guard.as_ref().is_some_and(|candidate| {
+                    candidate.route_key == pending.route_key
+                        && candidate.resource_ids == pending.resource_ids
+                        && candidate.generation == pending.generation
+                }) {
+                    pending_guard.take();
+                }
+                drop(pending_guard);
+                FSMetaApp::clear_pending_facade_status(&registrant.facade_pending_status);
+                let ready_tail_decision = registrant
+                    .runtime_control_state()
+                    .facade_ready_tail_decision(true, false, false);
+                registrant
+                    .api_control_gate
+                    .set_ready(ready_tail_decision.control_gate_ready);
+                *registrant
+                    .facade_service_state
+                    .write()
+                    .expect("write published facade service state") =
+                    ready_tail_decision.published_state;
+                registrant.notify_runtime_state_changed();
+                return Ok(true);
+            }
         }
         if let Some(wait_reason) = Self::facade_replacement_wait_reason(
             source.as_ref(),
@@ -7728,11 +8558,15 @@ impl FSMetaApp {
                     pending.generation,
                     pending.route_key,
                     pending.resource_ids,
-                    inflight.matches_pending(&pending)
+                    pending.route_key == inflight.route_key
+                        && pending.resource_ids == inflight.resource_ids
                 );
                 return Ok(false);
             }
-            *inflight_guard = Some(FacadeSpawnInProgress::from_pending(&pending));
+            *inflight_guard = Some(FacadeSpawnInProgress {
+                route_key: pending.route_key.clone(),
+                resource_ids: pending.resource_ids.clone(),
+            });
         }
         // Cold start has no prior facade to retain, so runtime confirmation is
         // sufficient to bring up the hosting boundary. Replacement also proceeds once
@@ -7761,10 +8595,10 @@ impl FSMetaApp {
         .await;
         {
             let mut inflight_guard = facade_spawn_in_progress.lock().await;
-            if inflight_guard
-                .as_ref()
-                .is_some_and(|inflight| inflight.matches_pending(&pending))
-            {
+            if inflight_guard.as_ref().is_some_and(|inflight| {
+                pending.route_key == inflight.route_key
+                    && pending.resource_ids == inflight.resource_ids
+            }) {
                 inflight_guard.take();
             }
         }
@@ -7776,7 +8610,8 @@ impl FSMetaApp {
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 if guard.get(&pending.resolved.bind_addr).is_some_and(|claim| {
-                    claim.owner_instance_id == instance_id && claim.matches_pending(&pending)
+                    claim.owner_instance_id == instance_id
+                        && claim.bind_addr == pending.resolved.bind_addr
                 }) {
                     guard.remove(&pending.resolved.bind_addr);
                 }
@@ -7791,8 +8626,8 @@ impl FSMetaApp {
         let adopted_generation = {
             let pending_guard = pending_facade.lock().await;
             pending_guard.as_ref().and_then(|candidate| {
-                candidate
-                    .matches_route_resources(&pending.route_key, &pending.resource_ids)
+                (candidate.route_key == pending.route_key
+                    && candidate.resource_ids == pending.resource_ids)
                     .then_some(candidate.generation)
             })
         };
@@ -7807,7 +8642,8 @@ impl FSMetaApp {
                 Err(poisoned) => poisoned.into_inner(),
             };
             if guard.get(&pending.resolved.bind_addr).is_some_and(|claim| {
-                claim.owner_instance_id == instance_id && claim.matches_pending(&pending)
+                claim.owner_instance_id == instance_id
+                    && claim.bind_addr == pending.resolved.bind_addr
             }) {
                 guard.remove(&pending.resolved.bind_addr);
             }
@@ -7827,7 +8663,8 @@ impl FSMetaApp {
         );
         let mut pending_guard = pending_facade.lock().await;
         if pending_guard.as_ref().is_some_and(|candidate| {
-            candidate.matches_route_resources(&pending.route_key, &pending.resource_ids)
+            candidate.route_key == pending.route_key
+                && candidate.resource_ids == pending.resource_ids
         }) {
             pending_guard.take();
         }
@@ -7858,13 +8695,6 @@ impl FSMetaApp {
         }
     }
 
-    fn pending_status_matches(
-        status: &SharedFacadePendingStatus,
-        pending: &PendingFacadeActivation,
-    ) -> bool {
-        pending.matches_status(status)
-    }
-
     fn clear_pending_facade_status(status_cell: &SharedFacadePendingStatusCell) {
         if let Ok(mut guard) = status_cell.write() {
             *guard = None;
@@ -7881,7 +8711,10 @@ impl FSMetaApp {
             .ok()
             .and_then(|guard| {
                 guard.as_ref().and_then(|status| {
-                    Self::pending_status_matches(status, pending).then_some(status.pending_since_us)
+                    (status.route_key == pending.route_key
+                        && status.resource_ids == pending.resource_ids
+                        && status.generation == pending.generation)
+                        .then_some(status.pending_since_us)
                 })
             })
             .unwrap_or_else(now_us);
@@ -7934,10 +8767,13 @@ impl FSMetaApp {
             .ok()
             .and_then(|guard| {
                 guard.as_ref().and_then(|status| {
-                    Self::pending_status_matches(status, pending).then_some((
-                        status.retry_attempts.saturating_add(1),
-                        status.pending_since_us,
-                    ))
+                    (status.route_key == pending.route_key
+                        && status.resource_ids == pending.resource_ids
+                        && status.generation == pending.generation)
+                        .then_some((
+                            status.retry_attempts.saturating_add(1),
+                            status.pending_since_us,
+                        ))
                 })
             })
             .unwrap_or((1, now));
@@ -7972,11 +8808,14 @@ impl FSMetaApp {
             .ok()
             .and_then(|guard| {
                 guard.as_ref().and_then(|status| {
-                    Self::pending_status_matches(status, pending).then_some(
-                        status
-                            .next_retry_at_us
-                            .map_or(true, |deadline| deadline <= now),
-                    )
+                    (status.route_key == pending.route_key
+                        && status.resource_ids == pending.resource_ids
+                        && status.generation == pending.generation)
+                        .then_some(
+                            status
+                                .next_retry_at_us
+                                .map_or(true, |deadline| deadline <= now),
+                        )
                 })
             })
             .unwrap_or(true)
@@ -7992,8 +8831,7 @@ impl FSMetaApp {
             .await
             .as_ref()
             .and_then(|pending| {
-                pending
-                    .matches_route_generation(route_key, generation)
+                (pending.route_key == route_key && pending.generation == generation)
                     .then_some(pending.clone())
             })
     }
@@ -8154,170 +8992,53 @@ impl FSMetaApp {
         message.contains("fs-meta api bind failed") && message.contains("address already in use")
     }
 
-    fn conflicting_process_facade_claim_for_pending(
-        instance_id: u64,
-        pending: &PendingFacadeActivation,
-    ) -> Option<ProcessFacadeClaim> {
-        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-            || facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr)
-        {
-            return None;
-        }
-        let guard = match process_facade_claim_cell().lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.get(&pending.resolved.bind_addr).and_then(|claim| {
-            (claim.owner_instance_id != instance_id && claim.matches_pending(pending))
-                .then_some(claim.clone())
-        })
-    }
-
-    async fn observe_pending_fixed_bind_publication_for_pending(
+    async fn build_fixed_bind_snapshot_for_pending_publication(
         instance_id: u64,
         api_task: Arc<Mutex<Option<FacadeActivation>>>,
         pending: Option<PendingFacadeActivation>,
         claim_release_followup_pending: bool,
-    ) -> PendingFixedBindPublicationState {
+    ) -> FacadeFixedBindSnapshot {
         let Some(pending) = pending else {
-            return PendingFixedBindPublicationState::inactive(claim_release_followup_pending);
+            return FacadeFixedBindSnapshot {
+                pending_publication: None,
+                conflicting_process_claim: None,
+                claim_release_followup_pending,
+            };
         };
         if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
             || facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr)
         {
-            return PendingFixedBindPublicationState::inactive(claim_release_followup_pending);
+            return FacadeFixedBindSnapshot {
+                pending_publication: None,
+                conflicting_process_claim: None,
+                claim_release_followup_pending,
+            };
         }
-        if api_task
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|active| pending.matches_active_route_resources(active))
-        {
-            return PendingFixedBindPublicationState::inactive(claim_release_followup_pending);
+        if api_task.lock().await.as_ref().is_some_and(|active| {
+            active.route_key == pending.route_key && active.resource_ids == pending.resource_ids
+        }) {
+            return FacadeFixedBindSnapshot {
+                pending_publication: None,
+                conflicting_process_claim: None,
+                claim_release_followup_pending,
+            };
         }
-        PendingFixedBindPublicationState::new(
-            Some(pending.clone()),
-            Self::conflicting_process_facade_claim_for_pending(instance_id, &pending),
+        let conflicting_process_claim = {
+            let guard = match process_facade_claim_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.get(&pending.resolved.bind_addr).and_then(|claim| {
+                (claim.owner_instance_id != instance_id
+                    && claim.bind_addr == pending.resolved.bind_addr)
+                    .then_some(claim.clone())
+            })
+        };
+        FacadeFixedBindSnapshot {
+            pending_publication: Some(pending.clone()),
+            conflicting_process_claim,
             claim_release_followup_pending,
-        )
-    }
-
-    async fn observe_pending_fixed_bind_publication_state(
-        &self,
-    ) -> PendingFixedBindPublicationState {
-        let pending = self.pending_facade.lock().await.clone();
-        Self::observe_pending_fixed_bind_publication_for_pending(
-            self.instance_id,
-            self.api_task.clone(),
-            pending,
-            self.pending_fixed_bind_claim_release_followup
-                .load(Ordering::Acquire),
-        )
-        .await
-    }
-
-    fn clear_pending_fixed_bind_claim_release_followup_if_completed(
-        &self,
-        disposition: PendingFixedBindClaimReleaseFollowupDisposition,
-    ) {
-        if matches!(
-            disposition,
-            PendingFixedBindClaimReleaseFollowupDisposition::PublicationCompleted
-        ) {
-            self.pending_fixed_bind_claim_release_followup
-                .store(false, Ordering::Release);
         }
-    }
-
-    async fn settle_pending_fixed_bind_publication_state_after_optional_retry(
-        &self,
-        state: PendingFixedBindPublicationState,
-        retry_pending_facade: bool,
-    ) -> Result<PendingFixedBindPublicationState> {
-        if !matches!(
-            state.projection().claim_release_followup_disposition,
-            PendingFixedBindClaimReleaseFollowupDisposition::PublicationStillIncomplete
-        ) {
-            return Ok(state);
-        }
-
-        let pending = state
-            .publication_incomplete()
-            .expect("publication incomplete disposition requires pending facade");
-        if retry_pending_facade {
-            self.retry_pending_facade(&pending.route_key, pending.generation, false)
-                .await?;
-        }
-        Ok(self.observe_pending_fixed_bind_publication_state().await)
-    }
-
-    async fn pending_fixed_bind_claim_release_followup_disposition(
-        &self,
-        retry_pending_facade: bool,
-    ) -> Result<PendingFixedBindClaimReleaseFollowupDisposition> {
-        Ok(self
-            .settle_pending_fixed_bind_publication_projection_after_optional_retry(
-                retry_pending_facade,
-            )
-            .await?
-            .claim_release_followup_disposition)
-    }
-
-    async fn retry_pending_fixed_bind_facade_after_claim_release_without_query_followup(
-        &self,
-        query_followup_present: bool,
-    ) -> Result<()> {
-        if query_followup_present {
-            return Ok(());
-        }
-        let _ = self
-            .pending_fixed_bind_claim_release_followup_disposition(true)
-            .await?;
-        Ok(())
-    }
-
-    async fn settle_pending_fixed_bind_publication_projection_after_optional_retry(
-        &self,
-        retry_pending_facade: bool,
-    ) -> Result<PendingFixedBindPublicationProjection> {
-        let settled = self
-            .settle_pending_fixed_bind_publication_state_after_optional_retry(
-                self.observe_pending_fixed_bind_publication_state().await,
-                retry_pending_facade,
-            )
-            .await?;
-        let projection = settled.projection();
-        self.clear_pending_fixed_bind_claim_release_followup_if_completed(
-            projection.claim_release_followup_disposition,
-        );
-        Ok(projection)
-    }
-
-    async fn pending_fixed_bind_route_suppression_disposition(
-        &self,
-        retry_pending_facade: bool,
-    ) -> Result<PendingFixedBindRouteSuppressionDisposition> {
-        Ok(self
-            .settle_pending_fixed_bind_publication_projection_after_optional_retry(
-                retry_pending_facade,
-            )
-            .await?
-            .route_suppression_disposition)
-    }
-
-    async fn retained_active_facade_continuity_keeps_internal_status_routes(&self) -> bool {
-        if !self
-            .retained_active_facade_continuity
-            .load(Ordering::Acquire)
-        {
-            return false;
-        }
-        let facade_control_route_key = format!("{}.stream", ROUTE_KEY_FACADE_CONTROL);
-        self.api_task
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|active| active.route_key == facade_control_route_key)
     }
 
     fn sink_route_is_facade_dependent_query_request(route_key: &str) -> bool {
@@ -8330,8 +9051,11 @@ impl FSMetaApp {
         &self,
         sink_signals: &[SinkControlSignal],
     ) -> Vec<SinkControlSignal> {
-        let publication_state = self.observe_pending_fixed_bind_publication_state().await;
-        let suppression = publication_state.projection().route_suppression_disposition;
+        let machine =
+            FacadeDeactivateMachine::from_input(self.collect_facade_deactivate_input().await);
+        let allow_routes = machine.fixed_bind.conflicting_process_claim.is_none()
+            && (!machine.fixed_bind.claim_release_followup_pending
+                || machine.fixed_bind.pending_publication.is_none());
         let mut filtered = Vec::with_capacity(sink_signals.len());
         for signal in sink_signals {
             match signal {
@@ -8340,10 +9064,7 @@ impl FSMetaApp {
                     generation,
                     ..
                 } if Self::sink_route_is_facade_dependent_query_request(route_key)
-                    && !matches!(
-                        suppression,
-                        PendingFixedBindRouteSuppressionDisposition::Allow
-                    ) =>
+                    && !allow_routes =>
                 {
                     self.pending_fixed_bind_has_suppressed_dependent_routes
                         .store(true, Ordering::Release);
@@ -8379,47 +9100,65 @@ impl FSMetaApp {
             unit,
             FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer
         ) {
-            match self
-                .pending_fixed_bind_route_suppression_disposition(true)
-                .await?
+            let mut machine =
+                FacadeDeactivateMachine::from_input(self.collect_facade_deactivate_input().await);
+            if machine.fixed_bind.claim_release_followup_pending
+                && machine.fixed_bind.pending_publication.is_some()
+                && machine.fixed_bind.conflicting_process_claim.is_none()
             {
-                PendingFixedBindRouteSuppressionDisposition::Allow => {}
-                PendingFixedBindRouteSuppressionDisposition::SuppressClaimConflict => {
-                    self.pending_fixed_bind_has_suppressed_dependent_routes
-                        .store(true, Ordering::Release);
-                    self.record_suppressed_public_query_activate(
-                        unit,
-                        route_key,
-                        generation,
-                        bound_scopes,
-                    )
-                    .await;
-                    eprintln!(
-                        "fs_meta_runtime_app: suppress facade-dependent route unit={} route_key={} generation={} while pending facade fixed-bind claim is still owned by another instance",
-                        unit.unit_id(),
-                        route_key,
-                        generation
-                    );
-                    return Ok(());
-                }
-                PendingFixedBindRouteSuppressionDisposition::SuppressPublicationIncomplete => {
-                    self.pending_fixed_bind_has_suppressed_dependent_routes
-                        .store(true, Ordering::Release);
-                    self.record_suppressed_public_query_activate(
-                        unit,
-                        route_key,
-                        generation,
-                        bound_scopes,
-                    )
-                    .await;
-                    eprintln!(
-                        "fs_meta_runtime_app: suppress facade-dependent route unit={} route_key={} generation={} while pending fixed-bind facade publication is still incomplete after predecessor claim release",
-                        unit.unit_id(),
-                        route_key,
-                        generation
-                    );
-                    return Ok(());
-                }
+                let pending = machine.fixed_bind.pending_publication.clone().expect(
+                    "facade activate retry requires pending facade while fixed-bind publication remains incomplete",
+                );
+                self.retry_pending_facade(&pending.route_key, pending.generation, false)
+                    .await?;
+                machine = FacadeDeactivateMachine::from_input(
+                    self.collect_facade_deactivate_input().await,
+                );
+            }
+            let publication_completed = machine.fixed_bind.claim_release_followup_pending
+                && machine.fixed_bind.pending_publication.is_none();
+            let publication_still_incomplete = machine.fixed_bind.claim_release_followup_pending
+                && machine.fixed_bind.pending_publication.is_some()
+                && machine.fixed_bind.conflicting_process_claim.is_none();
+            if publication_completed {
+                self.pending_fixed_bind_claim_release_followup
+                    .store(false, Ordering::Release);
+            }
+            if machine.fixed_bind.conflicting_process_claim.is_some() {
+                self.pending_fixed_bind_has_suppressed_dependent_routes
+                    .store(true, Ordering::Release);
+                self.record_suppressed_public_query_activate(
+                    unit,
+                    route_key,
+                    generation,
+                    bound_scopes,
+                )
+                .await;
+                eprintln!(
+                    "fs_meta_runtime_app: suppress facade-dependent route unit={} route_key={} generation={} while pending facade fixed-bind claim is still owned by another instance",
+                    unit.unit_id(),
+                    route_key,
+                    generation
+                );
+                return Ok(());
+            }
+            if publication_still_incomplete {
+                self.pending_fixed_bind_has_suppressed_dependent_routes
+                    .store(true, Ordering::Release);
+                self.record_suppressed_public_query_activate(
+                    unit,
+                    route_key,
+                    generation,
+                    bound_scopes,
+                )
+                .await;
+                eprintln!(
+                    "fs_meta_runtime_app: suppress facade-dependent route unit={} route_key={} generation={} while pending fixed-bind facade publication is still incomplete after predecessor claim release",
+                    unit.unit_id(),
+                    route_key,
+                    generation
+                );
+                return Ok(());
             }
         }
         // Facade activation is a runtime-owned generation/bind/run handoff carrier.
@@ -8483,7 +9222,8 @@ impl FSMetaApp {
         let stale_active = {
             let mut api_task = self.api_task.lock().await;
             if api_task.as_ref().is_some_and(|active| {
-                active.matches_route_resources(route_key, &candidate_resource_ids)
+                active.route_key == route_key
+                    && active.resource_ids == candidate_resource_ids
                     && !active.handle.is_running()
             }) {
                 api_task.take()
@@ -8511,17 +9251,20 @@ impl FSMetaApp {
         {
             let mut api_task = self.api_task.lock().await;
             if let Some(current) = api_task.as_mut()
-                && current.matches_route_resources(route_key, &candidate_resource_ids)
+                && current.route_key == route_key
+                && current.resource_ids == candidate_resource_ids
             {
                 current.generation = generation;
                 drop(api_task);
                 let mut pending = self.pending_facade.lock().await;
                 if pending.as_ref().is_some_and(|candidate| {
-                    candidate.matches_route_resources(route_key, &candidate_resource_ids)
+                    candidate.route_key == route_key
+                        && candidate.resource_ids == candidate_resource_ids
                 }) {
                     pending.take();
                 }
                 Self::clear_pending_facade_status(&self.facade_pending_status);
+                drop(pending);
                 let _ = self.current_facade_service_state().await;
                 return Ok(());
             }
@@ -8550,9 +9293,10 @@ impl FSMetaApp {
 
     #[cfg(test)]
     async fn shutdown_active_facade(&self) {
-        self.observe_fixed_bind_handoff_driver()
-            .await
-            .execute(self, FixedBindHandoffAction::Shutdown)
+        let machine = FacadeDeactivateMachine::from_input(
+            self.collect_facade_deactivate_input().await,
+        );
+        self.execute_fixed_bind_handoff_action(&machine, FixedBindHandoffAction::Shutdown)
             .await
             .expect("shutdown handoff should complete");
     }
@@ -8926,10 +9670,7 @@ impl FSMetaApp {
                     self.source
                         .record_retained_control_signals(&filtered_source_signals)
                         .await;
-                    let _ = self
-                        .source
-                        .reconnect_after_fail_closed_control_error()
-                        .await;
+                    let _ = self.source.reconnect_shared_worker_client().await;
                     self.mark_control_uninitialized_after_failure().await;
                     return Ok(());
                 }
@@ -8941,7 +9682,7 @@ impl FSMetaApp {
                         "fs_meta_runtime_app: source control replay after retryable reset err={}",
                         err
                     );
-                    let _ = self.source.reconnect_after_retryable_control_reset().await;
+                    let _ = self.source.reconnect_shared_worker_client().await;
                     self.reinitialize_after_control_reset_with_deadline(deadline)
                         .await?;
                 }
@@ -9391,8 +10132,11 @@ impl FSMetaApp {
             FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer
         ) && is_facade_dependent_query_route(route_key)
             && self
-                .retained_active_facade_continuity_keeps_internal_status_routes()
-                .await
+                .retained_active_facade_continuity
+                .load(Ordering::Acquire)
+            && self.api_task.lock().await.as_ref().is_some_and(|active| {
+                active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+            })
         {
             eprintln!(
                 "fs_meta_runtime_app: retain facade-dependent query route during continuity-preserving deactivate route_key={} generation={}",
@@ -9449,19 +10193,20 @@ impl FSMetaApp {
             })
         };
         let retain_pending_spawn = self.pending_spawn_in_flight_for_route_key(route_key).await;
-        self.observe_fixed_bind_handoff_driver()
-            .await
-            .execute(
-                self,
-                FixedBindHandoffAction::Deactivate {
-                    route_key: route_key.to_string(),
-                    generation,
-                    retain_active_facade,
-                    retain_pending_spawn,
-                },
-            )
-            .await
-            .map(|_| ())
+        let machine = FacadeDeactivateMachine::from_input(
+            self.collect_facade_deactivate_input().await,
+        );
+        self.execute_fixed_bind_handoff_action(
+            &machine,
+            FixedBindHandoffAction::Deactivate {
+                route_key: route_key.to_string(),
+                generation,
+                retain_active_facade,
+                retain_pending_spawn,
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     fn accept_facade_tick(
@@ -9556,80 +10301,33 @@ impl FSMetaApp {
         Ok(())
     }
 
-    async fn active_fixed_bind_bind_addr(&self) -> Option<String> {
-        let api_task = self.api_task.lock().await;
-        api_task
-            .as_ref()
-            .and_then(|active| self.active_fixed_bind_bind_addr_for(active))
-    }
-
-    async fn observe_active_fixed_bind_handoffs_for_bind_addr(
-        &self,
-        bind_addr: String,
-    ) -> (
-        Option<PendingFixedBindHandoffContinuation>,
-        ActiveFixedBindShutdownContinuation,
-    ) {
-        let ready = pending_fixed_bind_handoff_ready_for(&bind_addr);
-        let pending_handoff = ready
-            .as_ref()
-            .and_then(|ready| (ready.instance_id != self.instance_id).then_some(ready.clone()))
-            .map(|registrant| registrant.handoff_continuation(&bind_addr));
-        let shutdown_handoff = ActiveFixedBindShutdownContinuation {
-            bind_addr: bind_addr.clone(),
-            pending_handoff: pending_handoff.clone(),
-        };
-        let release_handoff = match ready.as_ref() {
-            Some(ready) => {
-                ready
-                    .release_handoff_for_active_owner(&bind_addr, self.instance_id)
-                    .await
-            }
-            None => None,
-        };
-        (release_handoff, shutdown_handoff)
-    }
-
-    async fn observe_active_fixed_bind_handoffs(
-        &self,
-    ) -> Option<(
-        Option<PendingFixedBindHandoffContinuation>,
-        ActiveFixedBindShutdownContinuation,
-    )> {
-        let bind_addr = self.active_fixed_bind_bind_addr().await?;
-        Some(
-            self.observe_active_fixed_bind_handoffs_for_bind_addr(bind_addr)
-                .await,
-        )
-    }
-
-    async fn observe_fixed_bind_handoff_driver(&self) -> FixedBindHandoffDriver {
-        let gate = self
-            .observe_facade_gate(FacadeOnlyHandoffObservationPolicy::DeriveFromPendingBind)
-            .await;
-        let (release_handoff, shutdown_handoff) = self
-            .observe_active_fixed_bind_handoffs()
-            .await
-            .map_or((None, None), |(release_handoff, shutdown_handoff)| {
-                (release_handoff, Some(shutdown_handoff))
-            });
-        FixedBindHandoffDriver {
-            gate,
-            pending_fixed_bind_publication: self
-                .observe_pending_fixed_bind_publication_state()
-                .await,
-            release_handoff,
-            shutdown_handoff,
-        }
-    }
-
     #[cfg(test)]
     async fn fixed_bind_handoff_ready_for_release(&self) -> bool {
-        self.observe_active_fixed_bind_handoffs()
-            .await
-            .map(|(release_handoff, _)| release_handoff)
-            .flatten()
-            .is_some()
+        let bind_addr = {
+            let api_task = self.api_task.lock().await;
+            api_task.as_ref().and_then(|active| {
+                (active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL))
+                    .then(|| {
+                        self.config
+                            .api
+                            .resolve_for_candidate_ids(&active.resource_ids)
+                    })
+                    .flatten()
+                    .map(|resolved| resolved.bind_addr)
+                    .filter(|bind_addr| !facade_bind_addr_is_ephemeral(bind_addr))
+            })
+        };
+        let Some(bind_addr) = bind_addr else {
+            return false;
+        };
+        let ready = pending_fixed_bind_handoff_ready_for(&bind_addr);
+        match ready.as_ref() {
+            Some(ready) => ready
+                .release_handoff_for_active_owner(&bind_addr, self.instance_id)
+                .await
+                .is_some(),
+            None => false,
+        }
     }
 
     async fn pending_spawn_in_flight_for_route_key(&self, route_key: &str) -> bool {
@@ -9644,80 +10342,10 @@ impl FSMetaApp {
             .lock()
             .await
             .as_ref()
-            .is_some_and(|inflight| inflight.matches_pending(&pending))
-    }
-
-    fn pending_fixed_bind_handoff_registrant(&self) -> PendingFixedBindHandoffRegistrant {
-        PendingFixedBindHandoffRegistrant::from_parts(
-            self.instance_id,
-            self.api_task.clone(),
-            self.pending_facade.clone(),
-            self.pending_fixed_bind_claim_release_followup.clone(),
-            self.pending_fixed_bind_has_suppressed_dependent_routes
-                .clone(),
-            self.facade_spawn_in_progress.clone(),
-            self.facade_pending_status.clone(),
-            self.facade_service_state.clone(),
-            self.rollout_status.clone(),
-            self.api_request_tracker.clone(),
-            self.api_control_gate.clone(),
-            self.runtime_gate_state.clone(),
-            self.runtime_state_changed.clone(),
-            self.node_id.clone(),
-            self.runtime_boundary.clone(),
-            self.source.clone(),
-            self.sink.clone(),
-            self.query_sink.clone(),
-            self.runtime_boundary.clone(),
-        )
-    }
-
-    fn active_fixed_bind_facade_registrant(&self) -> ActiveFixedBindFacadeRegistrant {
-        ActiveFixedBindFacadeRegistrant::from_parts(
-            self.instance_id,
-            self.api_task.clone(),
-            self.api_request_tracker.clone(),
-            self.api_control_gate.clone(),
-        )
-    }
-
-    fn active_fixed_bind_bind_addr_for(&self, active: &FacadeActivation) -> Option<String> {
-        (active.route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL))
-            .then(|| {
-                self.config
-                    .api
-                    .resolve_for_candidate_ids(&active.resource_ids)
+            .is_some_and(|inflight| {
+                pending.route_key == inflight.route_key
+                    && pending.resource_ids == inflight.resource_ids
             })
-            .flatten()
-            .map(|resolved| resolved.bind_addr)
-            .filter(|bind_addr| !facade_bind_addr_is_ephemeral(bind_addr))
-    }
-
-    async fn refresh_active_fixed_bind_facade_owner(&self) {
-        let Some(bind_addr) = self.active_fixed_bind_bind_addr().await else {
-            return;
-        };
-        mark_active_fixed_bind_facade_owner(&bind_addr, self.active_fixed_bind_facade_registrant());
-    }
-
-    async fn facade_publication_ready(&self) -> bool {
-        match self
-            .observe_fixed_bind_handoff_driver()
-            .await
-            .execute(self, FixedBindHandoffAction::Publication)
-            .await
-        {
-            Ok(FixedBindHandoffExecution::PublicationReady(publication_ready)) => publication_ready,
-            Ok(FixedBindHandoffExecution::AfterReleaseCompleted(_)) => false,
-            Ok(FixedBindHandoffExecution::Completed) => false,
-            Err(err) => {
-                eprintln!(
-                    "fs_meta_runtime_app: facade publication readiness execution failed err={}",
-                    err
-                );
-                false
-            }
-        }
     }
 
     async fn service_on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
@@ -9904,7 +10532,7 @@ impl FSMetaApp {
             .iter()
             .any(facade_publication_signal_is_sink_status_activate);
         let facade_claim_signals_present = !facade_claim_signals.is_empty();
-        let mut pretriggered_source_to_sink_convergence = false;
+        let mut pretriggered_source_to_sink_convergence_epoch = None::<u64>;
         let mut sink_recovery_tail_plan = SinkRecoveryTailPlan::new();
         for signal in facade_claim_signals {
             self.apply_facade_signal(signal).await?;
@@ -10030,8 +10658,8 @@ impl FSMetaApp {
                         // finishes applying its control wave. This must not depend on a
                         // facade sink-status publication lane because local sink readiness
                         // can be required before any facade publication exists.
-                        self.source.trigger_rescan_when_ready().await?;
-                        pretriggered_source_to_sink_convergence = true;
+                        pretriggered_source_to_sink_convergence_epoch =
+                            Some(self.source.trigger_rescan_when_ready_epoch().await?);
                     }
                 }
                 if !control_initialized_at_entry && sink_signals.is_empty() {
@@ -10043,8 +10671,13 @@ impl FSMetaApp {
                         .is_empty();
                     if retained_sink_routes_present {
                         if sink_status_publication_present {
-                            self.source.trigger_rescan_when_ready().await?;
-                            pretriggered_source_to_sink_convergence = true;
+                            // Source-led uninitialized mixed recovery still owns the
+                            // source wave only. The followup source->sink convergence
+                            // belongs to the local sink republish machine; kicking it
+                            // here races a second owner against the deferred sink
+                            // recovery lane and can leave the sink probing against a
+                            // partial pretriggered publication.
+                            pretriggered_source_to_sink_convergence_epoch = None;
                         }
                         // A later source-only recovery can reopen the runtime before the sink
                         // worker has replayed its retained control state into the current
@@ -10107,7 +10740,7 @@ impl FSMetaApp {
                 );
                 if wait_for_status_republish_after_apply {
                     if let Some(expected_groups) = self
-                        .wait_for_sink_status_republish_readiness_after_recovery(false)
+                        .wait_for_sink_status_republish_readiness_after_recovery(None)
                         .await?
                     {
                         self.wait_for_local_sink_status_republish_after_recovery(&expected_groups)
@@ -10171,7 +10804,7 @@ impl FSMetaApp {
                 sink_status_publication_present,
                 &source_signals,
                 &sink_signals,
-                pretriggered_source_to_sink_convergence,
+                pretriggered_source_to_sink_convergence_epoch,
                 &deferred_local_sink_replay_signals,
             )
             .await?;
@@ -10246,12 +10879,13 @@ impl FSMetaApp {
         {
             fixed_bind_addrs.insert(pending_bind_addr);
         }
-        let handoff_driver = self.observe_fixed_bind_handoff_driver().await;
+        let machine = FacadeDeactivateMachine::from_input(
+            self.collect_facade_deactivate_input().await,
+        );
         *self.pending_facade.lock().await = None;
         *self.facade_spawn_in_progress.lock().await = None;
         Self::clear_pending_facade_status(&self.facade_pending_status);
-        handoff_driver
-            .execute(self, FixedBindHandoffAction::Shutdown)
+        self.execute_fixed_bind_handoff_action(&machine, FixedBindHandoffAction::Shutdown)
             .await?;
         self.closing.store(true, Ordering::Release);
         self.update_runtime_control_state(|state| {
@@ -10325,8 +10959,8 @@ impl FSMetaApp {
         self.sink.status_snapshot().await
     }
 
-    pub async fn trigger_rescan_when_ready(&self) -> Result<()> {
-        self.source.trigger_rescan_when_ready().await
+    pub async fn trigger_rescan_when_ready_epoch(&self) -> Result<u64> {
+        self.source.trigger_rescan_when_ready_epoch().await
     }
 
     pub async fn query_node(&self, path: &[u8]) -> Result<Option<QueryNode>> {
