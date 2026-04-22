@@ -305,7 +305,7 @@
             handle: active_facade,
         });
         app.api_control_gate.set_ready(
-            FacadePublicationMachine::from_input(app.collect_facade_publication_input().await)
+            FixedBindLifecycleMachine::from_facts(app.collect_fixed_bind_lifecycle_facts().await)
                 .snapshot()
                 .publication_ready,
         );

@@ -40,26 +40,226 @@ const SINK_WORKER_STATUS_NONBLOCKING_PROBE_BUDGET: Duration = Duration::from_mil
 const SINK_WORKER_STATUS_NONBLOCKING_SETTLE_SLACK: Duration = Duration::from_millis(50);
 const SINK_WORKER_STATUS_RETRY_RESET_FINAL_PROBE_BUDGET: Duration = Duration::from_millis(100);
 
-fn can_retry_on_control_frame(err: &CnxError) -> bool {
-    matches!(
-        err,
-        CnxError::PeerError(message) if message == "worker not initialized"
-    ) || matches!(
-        err,
-        CnxError::TransportClosed(_) | CnxError::Timeout | CnxError::ChannelClosed
-    ) || is_retryable_worker_bridge_peer_error(err)
-        || matches!(
-            err,
-            CnxError::AccessDenied(message)
-                | CnxError::PeerError(message)
-                | CnxError::Internal(message)
-                if message.contains("drained/fenced")
-                    && message.contains("grant attachments")
-                    || message.contains("statecell_write returned non-committed status")
-                        && message.contains("fenced")
-                    || message.contains("invalid or revoked grant attachment token")
-                    || message.contains("missing route state for channel_buffer")
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkControlResetKind {
+    WorkerNotInitialized,
+    TransportClosed,
+    ChannelClosed,
+    BridgePeerReset,
+    GrantAttachmentsDrainedOrFenced,
+    InvalidGrantAttachmentToken,
+    MissingChannelBufferRouteState,
+}
+
+impl SinkControlResetKind {
+    const fn is_bridge_reset_like(self) -> bool {
+        matches!(
+            self,
+            Self::TransportClosed | Self::ChannelClosed | Self::BridgePeerReset
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkRetryBudgetExhaustionKind {
+    StatusProbeAttempt,
+    ControlFrameAttempt,
+    ControlFrameRetry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkReplayHandlingKind {
+    BestEffortAfterRetryReset,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SinkProtocolViolationKind {
+    UnexpectedWorkerResponse {
+        context: &'static str,
+        response: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SinkFailureReason {
+    RetryBudgetExhausted(SinkRetryBudgetExhaustionKind),
+    ControlReset(SinkControlResetKind),
+    ProtocolViolation(SinkProtocolViolationKind),
+    ReplayHandling(SinkReplayHandlingKind),
+    TimeoutLike,
+    NonRetryable,
+}
+
+#[derive(Debug)]
+struct SinkFailure {
+    cause: CnxError,
+    reason: SinkFailureReason,
+}
+
+impl SinkFailure {
+    fn from_cause(cause: CnxError) -> Self {
+        match cause {
+            CnxError::Timeout => Self {
+                cause,
+                reason: SinkFailureReason::TimeoutLike,
+            },
+            _ => match classify_sink_control_reset(&cause) {
+                Some(kind) => Self {
+                    cause,
+                    reason: SinkFailureReason::ControlReset(kind),
+                },
+                None => Self {
+                    cause,
+                    reason: SinkFailureReason::NonRetryable,
+                },
+            },
+        }
+    }
+
+    fn allows_retry(&self) -> bool {
+        matches!(
+            self.reason,
+            SinkFailureReason::TimeoutLike | SinkFailureReason::ControlReset(_)
+        )
+    }
+
+    fn supports_best_effort_replay(&self) -> bool {
+        self.allows_retry()
+    }
+
+    fn retry_budget_exhausted(kind: SinkRetryBudgetExhaustionKind) -> Self {
+        Self {
+            cause: shape_sink_retry_budget_exhaustion(kind),
+            reason: SinkFailureReason::RetryBudgetExhausted(kind),
+        }
+    }
+
+    fn replay_best_effort(cause: CnxError) -> Self {
+        Self {
+            cause,
+            reason: SinkFailureReason::ReplayHandling(
+                SinkReplayHandlingKind::BestEffortAfterRetryReset,
+            ),
+        }
+    }
+
+    fn protocol_violation(kind: SinkProtocolViolationKind) -> Self {
+        Self {
+            cause: kind.clone().into_error(),
+            reason: SinkFailureReason::ProtocolViolation(kind),
+        }
+    }
+
+    fn into_error(self) -> CnxError {
+        self.cause
+    }
+
+    fn as_error(&self) -> &CnxError {
+        &self.cause
+    }
+}
+
+impl From<CnxError> for SinkFailure {
+    fn from(cause: CnxError) -> Self {
+        Self::from_cause(cause)
+    }
+}
+
+fn shape_sink_retry_budget_exhaustion(kind: SinkRetryBudgetExhaustionKind) -> CnxError {
+    let _ = kind;
+    CnxError::Timeout
+}
+
+impl SinkProtocolViolationKind {
+    fn into_error(self) -> CnxError {
+        match self {
+            Self::UnexpectedWorkerResponse { context, response } => CnxError::ProtocolViolation(
+                format!("unexpected sink worker response {context}: {response}"),
+            ),
+        }
+    }
+}
+
+fn unexpected_sink_worker_response_failure(
+    context: &'static str,
+    response: SinkWorkerResponse,
+) -> SinkFailure {
+    SinkFailure::protocol_violation(SinkProtocolViolationKind::UnexpectedWorkerResponse {
+        context,
+        response: format!("{:?}", response),
+    })
+}
+
+fn unexpected_sink_worker_response(
+    context: &'static str,
+    response: SinkWorkerResponse,
+) -> CnxError {
+    unexpected_sink_worker_response_failure(context, response).into_error()
+}
+
+fn unexpected_sink_worker_response_result<T>(
+    context: &'static str,
+    response: SinkWorkerResponse,
+) -> std::result::Result<T, SinkFailure> {
+    Err(unexpected_sink_worker_response_failure(context, response))
+}
+
+fn classify_sink_control_reset(err: &CnxError) -> Option<SinkControlResetKind> {
+    match err {
+        CnxError::PeerError(message) if message == "worker not initialized" => {
+            Some(SinkControlResetKind::WorkerNotInitialized)
+        }
+        CnxError::TransportClosed(_) => Some(SinkControlResetKind::TransportClosed),
+        CnxError::ChannelClosed => Some(SinkControlResetKind::ChannelClosed),
+        CnxError::PeerError(message) | CnxError::Internal(message)
+            if is_retryable_worker_bridge_transport_error_message(message) =>
+        {
+            Some(SinkControlResetKind::BridgePeerReset)
+        }
+        CnxError::AccessDenied(message) | CnxError::PeerError(message)
+            if message.contains("drained/fenced") && message.contains("grant attachments") =>
+        {
+            Some(SinkControlResetKind::GrantAttachmentsDrainedOrFenced)
+        }
+        CnxError::AccessDenied(message)
+        | CnxError::PeerError(message)
+        | CnxError::Internal(message)
+            if message.contains("invalid or revoked grant attachment token") =>
+        {
+            Some(SinkControlResetKind::InvalidGrantAttachmentToken)
+        }
+        CnxError::AccessDenied(message)
+        | CnxError::PeerError(message)
+        | CnxError::Internal(message)
+            if message.contains("missing route state for channel_buffer") =>
+        {
+            Some(SinkControlResetKind::MissingChannelBufferRouteState)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+enum SinkRetryDisposition {
+    Retry,
+    Fail(SinkFailure),
+}
+
+fn classify_sink_retry_disposition(
+    deadline: std::time::Instant,
+    err: CnxError,
+    exhaustion_kind: SinkRetryBudgetExhaustionKind,
+) -> SinkRetryDisposition {
+    if std::time::Instant::now() >= deadline {
+        SinkRetryDisposition::Fail(SinkFailure::retry_budget_exhausted(exhaustion_kind))
+    } else {
+        let failure = SinkFailure::from_cause(err);
+        if failure.allows_retry() {
+            SinkRetryDisposition::Retry
+        } else {
+            SinkRetryDisposition::Fail(failure)
+        }
+    }
 }
 
 fn is_restart_deferred_retire_pending_deactivate_batch(envelopes: &[ControlEnvelope]) -> bool {
@@ -86,29 +286,6 @@ fn is_retryable_worker_bridge_transport_error_message(message: &str) -> bool {
             || message.contains("early eof")
             || message.contains("Broken pipe")
             || message.contains("bridge stopped"))
-}
-
-fn is_retryable_worker_bridge_peer_error(err: &CnxError) -> bool {
-    matches!(
-        err,
-        CnxError::PeerError(message) | CnxError::Internal(message)
-            if is_retryable_worker_bridge_transport_error_message(message)
-    )
-}
-
-fn is_retryable_worker_bridge_reset(err: &CnxError) -> bool {
-    matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
-        || is_retryable_worker_bridge_peer_error(err)
-}
-
-fn is_missing_channel_buffer_route_state(err: &CnxError) -> bool {
-    matches!(
-        err,
-        CnxError::AccessDenied(message)
-            | CnxError::PeerError(message)
-            | CnxError::Internal(message)
-            if message.contains("missing route state for channel_buffer")
-    )
 }
 
 fn debug_control_scope_capture_enabled() -> bool {
@@ -474,6 +651,12 @@ struct SinkStatusProbeMachine {
     phase: SinkStatusProbePhase,
 }
 
+#[derive(Debug)]
+enum SinkStatusProbeReplayDisposition {
+    BestEffort(SinkFailure),
+    Fail(SinkFailure),
+}
+
 impl SinkStatusProbeMachine {
     fn new(deadline: std::time::Instant) -> Self {
         Self {
@@ -486,11 +669,16 @@ impl SinkStatusProbeMachine {
         !matches!(self.phase, SinkStatusProbePhase::Initial)
     }
 
-    fn attempt_plan(self, replay_required_for_attempt: bool) -> Result<SinkStatusProbeAttemptPlan> {
+    fn attempt_plan(
+        self,
+        replay_required_for_attempt: bool,
+    ) -> std::result::Result<SinkStatusProbeAttemptPlan, SinkFailure> {
         let now = std::time::Instant::now();
         let remaining_before_replay = self.deadline.saturating_duration_since(now);
         if remaining_before_replay.is_zero() {
-            return Err(CnxError::Timeout);
+            return Err(SinkFailure::retry_budget_exhausted(
+                SinkRetryBudgetExhaustionKind::StatusProbeAttempt,
+            ));
         }
         let skip_replay = replay_required_for_attempt
             && matches!(
@@ -513,7 +701,9 @@ impl SinkStatusProbeMachine {
         let now = std::time::Instant::now();
         let attempt_timeout = self.deadline.saturating_duration_since(now);
         if attempt_timeout.is_zero() {
-            return Err(CnxError::Timeout);
+            return Err(SinkFailure::retry_budget_exhausted(
+                SinkRetryBudgetExhaustionKind::StatusProbeAttempt,
+            ));
         }
         Ok(SinkStatusProbeAttemptPlan {
             replay_timeout,
@@ -522,15 +712,29 @@ impl SinkStatusProbeMachine {
         })
     }
 
-    fn replay_error_is_best_effort(
+    fn classify_replay_failure_disposition(
         self,
-        err: &CnxError,
+        err: CnxError,
         replay_required_for_attempt: bool,
-    ) -> bool {
-        replay_required_for_attempt
+    ) -> SinkStatusProbeReplayDisposition {
+        let failure = SinkFailure::from_cause(err);
+        let best_effort = replay_required_for_attempt
             && matches!(self.phase, SinkStatusProbePhase::ReplayAfterRetryReset)
-            && (matches!(err, CnxError::Timeout) || can_retry_on_control_frame(err))
-            && std::time::Instant::now() < self.deadline
+            && failure.supports_best_effort_replay()
+            && std::time::Instant::now() < self.deadline;
+        if best_effort {
+            SinkStatusProbeReplayDisposition::BestEffort(SinkFailure::replay_best_effort(
+                failure.cause,
+            ))
+        } else {
+            SinkStatusProbeReplayDisposition::Fail(if std::time::Instant::now() >= self.deadline {
+                SinkFailure::retry_budget_exhausted(
+                    SinkRetryBudgetExhaustionKind::StatusProbeAttempt,
+                )
+            } else {
+                failure
+            })
+        }
     }
 
     fn phase_after_retry_reset(mut self) -> Self {
@@ -563,8 +767,16 @@ struct SinkControlFrameMachine {
 #[derive(Debug)]
 enum SinkControlFrameFollowup {
     RestartAndRetry(SinkControlFrameMachine),
-    RestartAndFailFast(CnxError),
-    Failed(CnxError),
+    RestartAndFailFast(SinkFailure),
+    Failed(SinkFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SinkControlFrameFailureDisposition {
+    RetrySamePhase,
+    RetryAfterMissingRouteState,
+    RestartAndFailFast,
+    Fail,
 }
 
 impl SinkControlFrameMachine {
@@ -577,40 +789,73 @@ impl SinkControlFrameMachine {
         }
     }
 
-    fn attempt_timeout(self, rpc_timeout: Duration) -> Result<Duration> {
+    fn attempt_timeout(self, rpc_timeout: Duration) -> std::result::Result<Duration, SinkFailure> {
         let attempt_timeout = std::cmp::min(
             rpc_timeout,
             self.deadline
                 .saturating_duration_since(std::time::Instant::now()),
         );
         if attempt_timeout.is_zero() {
-            Err(CnxError::Timeout)
+            Err(SinkFailure::retry_budget_exhausted(
+                SinkRetryBudgetExhaustionKind::ControlFrameAttempt,
+            ))
         } else {
             Ok(attempt_timeout)
         }
     }
 
+    fn classify_failure_disposition(
+        self,
+        failure: &SinkFailure,
+    ) -> SinkControlFrameFailureDisposition {
+        match failure.reason {
+            SinkFailureReason::RetryBudgetExhausted(_)
+            | SinkFailureReason::ProtocolViolation(_)
+            | SinkFailureReason::ReplayHandling(_)
+            | SinkFailureReason::NonRetryable => SinkControlFrameFailureDisposition::Fail,
+            SinkFailureReason::TimeoutLike => SinkControlFrameFailureDisposition::RetrySamePhase,
+            SinkFailureReason::ControlReset(reset_kind) => {
+                if self.restart_deferred_retire_pending_deactivate {
+                    SinkControlFrameFailureDisposition::RestartAndFailFast
+                } else if matches!(
+                    reset_kind,
+                    SinkControlResetKind::MissingChannelBufferRouteState
+                ) {
+                    SinkControlFrameFailureDisposition::RetryAfterMissingRouteState
+                } else if matches!(
+                    self.phase,
+                    SinkControlFramePhase::AfterMissingChannelBufferRouteState
+                ) && reset_kind.is_bridge_reset_like()
+                {
+                    SinkControlFrameFailureDisposition::RestartAndFailFast
+                } else {
+                    SinkControlFrameFailureDisposition::RetrySamePhase
+                }
+            }
+        }
+    }
+
     fn followup_after_error(self, err: CnxError) -> SinkControlFrameFollowup {
-        if !(can_retry_on_control_frame(&err) && std::time::Instant::now() < self.deadline) {
-            return SinkControlFrameFollowup::Failed(err);
+        let failure = if std::time::Instant::now() >= self.deadline {
+            SinkFailure::retry_budget_exhausted(SinkRetryBudgetExhaustionKind::ControlFrameRetry)
+        } else {
+            SinkFailure::from_cause(err)
+        };
+        match self.classify_failure_disposition(&failure) {
+            SinkControlFrameFailureDisposition::RetrySamePhase => {
+                SinkControlFrameFollowup::RestartAndRetry(self)
+            }
+            SinkControlFrameFailureDisposition::RetryAfterMissingRouteState => {
+                SinkControlFrameFollowup::RestartAndRetry(Self {
+                    phase: SinkControlFramePhase::AfterMissingChannelBufferRouteState,
+                    ..self
+                })
+            }
+            SinkControlFrameFailureDisposition::RestartAndFailFast => {
+                SinkControlFrameFollowup::RestartAndFailFast(failure)
+            }
+            SinkControlFrameFailureDisposition::Fail => SinkControlFrameFollowup::Failed(failure),
         }
-        if self.restart_deferred_retire_pending_deactivate {
-            return SinkControlFrameFollowup::RestartAndFailFast(err);
-        }
-        if is_missing_channel_buffer_route_state(&err) {
-            return SinkControlFrameFollowup::RestartAndRetry(Self {
-                phase: SinkControlFramePhase::AfterMissingChannelBufferRouteState,
-                ..self
-            });
-        }
-        if matches!(
-            self.phase,
-            SinkControlFramePhase::AfterMissingChannelBufferRouteState
-        ) && is_retryable_worker_bridge_reset(&err)
-        {
-            return SinkControlFrameFollowup::RestartAndFailFast(err);
-        }
-        SinkControlFrameFollowup::RestartAndRetry(self)
     }
 }
 
@@ -642,14 +887,16 @@ fn cached_ready_truth_covers_live_concern(
 }
 
 impl SinkStatusLiveScenario {
-    fn stale_empty_outcome(
+    fn stale_empty_outcome_with_facts(
         self,
-        cached_concern: Option<SinkStatusConcern>,
+        facts: SinkStatusScenarioFacts,
     ) -> SinkStatusOutcomeKind {
         match self {
             Self::Blocking | Self::ControlInflight => SinkStatusOutcomeKind::ReturnLive,
             Self::Steady | Self::SteadyAfterRetryReset => {
-                if matches!(cached_concern, Some(SinkStatusConcern::CoverageGap)) {
+                if facts.cached_preactivate_unscheduled {
+                    SinkStatusOutcomeKind::ReturnLive
+                } else if matches!(facts.cached_concern, Some(SinkStatusConcern::CoverageGap)) {
                     SinkStatusOutcomeKind::ReturnCached
                 } else {
                     SinkStatusOutcomeKind::FailClosed
@@ -719,7 +966,7 @@ impl SinkStatusLiveScenario {
     fn outcome_kind(self, facts: SinkStatusScenarioFacts) -> SinkStatusOutcomeKind {
         match facts.concern_lane {
             SinkStatusConcernLane::Clear => SinkStatusOutcomeKind::ReturnLive,
-            SinkStatusConcernLane::StaleEmpty => self.stale_empty_outcome(facts.cached_concern),
+            SinkStatusConcernLane::StaleEmpty => self.stale_empty_outcome_with_facts(facts),
             SinkStatusConcernLane::ReplayPending => match self {
                 Self::Steady | Self::SteadyAfterRetryReset => {
                     self.replay_pending_outcome_with_facts(facts)
@@ -751,6 +998,12 @@ impl SinkStatusCachedScenario {
             && facts.worker_unavailable_delivery_backed_zero_uninitialized
         {
             return SinkStatusOutcomeKind::PropagateError;
+        }
+        if matches!(self, Self::WorkerUnavailable)
+            && matches!(facts.concern_lane, SinkStatusConcernLane::StaleEmpty)
+            && facts.cached_preactivate_unscheduled
+        {
+            return SinkStatusOutcomeKind::ReturnCached;
         }
         match (self, facts.concern_lane) {
             (_, SinkStatusConcernLane::Clear)
@@ -876,9 +1129,13 @@ fn evaluate_cached_sink_status_snapshot(
                 Some(SinkStatusConcern::WaitingForMaterializedRoot)
             )
             && snapshot_has_delivery_evidence(cached_snapshot);
+    let cached_preactivate_unscheduled = !snapshot_has_delivery_evidence(cached_snapshot)
+        && (cached_snapshot.scheduled_groups_by_node.is_empty()
+            || snapshot_has_scheduled_zero_uninitialized_groups(cached_snapshot));
     reduce_sink_status_scenario_outcome_with_facts(
         SinkStatusScenario::Cached(scenario),
         SinkStatusScenarioFacts::new(cached_projection.concern, None, false)
+            .with_cached_preactivate_unscheduled(cached_preactivate_unscheduled)
             .with_worker_unavailable_delivery_backed_zero_uninitialized(
                 delivery_backed_zero_uninitialized,
             ),
@@ -1276,6 +1533,11 @@ pub(crate) struct SinkWorkerScheduledGroupsErrorHook {
 pub(crate) struct SinkWorkerStatusNonblockingCacheFallbackHook;
 
 #[cfg(test)]
+struct SinkWorkerStatusNonblockingCacheFallbackHookSlot {
+    target_worker_instance_id: Option<u64>,
+}
+
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct SinkWorkerRetryResetHook {
     pub reset_count: Arc<AtomicUsize>,
@@ -1360,9 +1622,10 @@ fn sink_worker_scheduled_groups_error_hook_cell()
 
 #[cfg(test)]
 fn sink_worker_status_nonblocking_cache_fallback_hook_cell()
--> &'static Mutex<Option<SinkWorkerStatusNonblockingCacheFallbackHook>> {
-    static CELL: std::sync::OnceLock<Mutex<Option<SinkWorkerStatusNonblockingCacheFallbackHook>>> =
-        std::sync::OnceLock::new();
+-> &'static Mutex<Option<SinkWorkerStatusNonblockingCacheFallbackHookSlot>> {
+    static CELL: std::sync::OnceLock<
+        Mutex<Option<SinkWorkerStatusNonblockingCacheFallbackHookSlot>>,
+    > = std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
 
@@ -1529,11 +1792,34 @@ pub(crate) fn install_sink_worker_scheduled_groups_error_hook(
 pub(crate) fn install_sink_worker_status_nonblocking_cache_fallback_hook(
     hook: SinkWorkerStatusNonblockingCacheFallbackHook,
 ) {
+    install_sink_worker_status_nonblocking_cache_fallback_hook_for_worker_instance_inner(
+        None, hook,
+    );
+}
+
+#[cfg(test)]
+fn install_sink_worker_status_nonblocking_cache_fallback_hook_for_worker_instance_inner(
+    worker_instance_id: Option<u64>,
+    _hook: SinkWorkerStatusNonblockingCacheFallbackHook,
+) {
     let mut guard = match sink_worker_status_nonblocking_cache_fallback_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    *guard = Some(hook);
+    *guard = Some(SinkWorkerStatusNonblockingCacheFallbackHookSlot {
+        target_worker_instance_id: worker_instance_id,
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn install_sink_worker_status_nonblocking_cache_fallback_hook_for_worker_instance(
+    worker_instance_id: u64,
+    hook: SinkWorkerStatusNonblockingCacheFallbackHook,
+) {
+    install_sink_worker_status_nonblocking_cache_fallback_hook_for_worker_instance_inner(
+        Some(worker_instance_id),
+        hook,
+    );
 }
 
 #[cfg(test)]
@@ -1706,12 +1992,23 @@ fn take_sink_worker_scheduled_groups_error_hook() -> Option<CnxError> {
 }
 
 #[cfg(test)]
-fn take_sink_worker_status_nonblocking_cache_fallback_hook() -> bool {
+fn take_sink_worker_status_nonblocking_cache_fallback_hook(
+    current_worker_instance_id: u64,
+) -> bool {
     let mut guard = match sink_worker_status_nonblocking_cache_fallback_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.take().is_some()
+    let Some(hook) = guard.take() else {
+        return false;
+    };
+    if let Some(target_worker_instance_id) = hook.target_worker_instance_id
+        && target_worker_instance_id != current_worker_instance_id
+    {
+        *guard = Some(hook);
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -2337,11 +2634,11 @@ impl SinkWorkerClientHandle {
         })
     }
 
-    pub async fn update_logical_roots(
+    async fn update_logical_roots_with_failure(
         &self,
         roots: Vec<crate::source::config::RootSpec>,
         host_object_grants: Vec<GrantedMountRoot>,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), SinkFailure> {
         let _inflight = self.begin_control_op();
         eprintln!(
             "fs_meta_sink_worker_client: update_logical_roots begin node={} roots={} grants={}",
@@ -2363,7 +2660,8 @@ impl SinkWorkerClientHandle {
                     },
                     SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
                 )
-                .await?
+                .await
+                ?
                 {
                     SinkWorkerResponse::Ack => {
                         eprintln!(
@@ -2374,57 +2672,77 @@ impl SinkWorkerClientHandle {
                         );
                         Ok(())
                     }
-                    other => Err(CnxError::ProtocolViolation(format!(
-                        "unexpected sink worker response for update roots: {:?}",
-                        other
-                    ))),
+                    other => Err(unexpected_sink_worker_response("for update roots", other)),
                 }
             }
         })
-        .await?;
-        self.update_cached_logical_roots(roots.clone())?;
-        self.update_cached_runtime_config(&roots, &host_object_grants)?;
+        .await
+        .map_err(SinkFailure::from)?;
+        self.update_cached_logical_roots(roots.clone())
+            .map_err(SinkFailure::from)?;
+        self.update_cached_runtime_config(&roots, &host_object_grants)
+            .map_err(SinkFailure::from)?;
         self.retain_cached_status_for_surviving_roots(&roots)
+            .map_err(SinkFailure::from)
+    }
+
+    pub async fn update_logical_roots(
+        &self,
+        roots: Vec<crate::source::config::RootSpec>,
+        host_object_grants: Vec<GrantedMountRoot>,
+    ) -> Result<()> {
+        self.update_logical_roots_with_failure(roots, host_object_grants)
+            .await
+            .map_err(SinkFailure::into_error)
     }
 
     pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
         self.cached_logical_roots()
     }
 
-    pub async fn logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
-        let roots = match Self::call_worker(
+    async fn logical_roots_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<crate::source::config::RootSpec>, SinkFailure> {
+        let response = Self::call_worker(
             &self.client().await?,
             SinkWorkerRequest::LogicalRootsSnapshot,
             Duration::from_secs(5),
         )
-        .await?
-        {
+        .await
+        .map_err(SinkFailure::from)?;
+        let roots = match response {
             SinkWorkerResponse::LogicalRoots(roots) => roots,
-            other => {
-                return Err(CnxError::ProtocolViolation(format!(
-                    "unexpected sink worker response for logical roots: {:?}",
-                    other
-                )));
-            }
+            other => return unexpected_sink_worker_response_result("for logical roots", other),
         };
-        self.update_cached_logical_roots(roots.clone())?;
+        self.update_cached_logical_roots(roots.clone())
+            .map_err(SinkFailure::from)?;
         Ok(roots)
     }
 
-    pub async fn health(&self) -> Result<HealthStats> {
+    pub async fn logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
+        self.logical_roots_snapshot_with_failure()
+            .await
+            .map_err(SinkFailure::into_error)
+    }
+
+    async fn health_with_failure(&self) -> std::result::Result<HealthStats, SinkFailure> {
         match Self::call_worker(
             &self.client().await?,
             SinkWorkerRequest::Health,
             Duration::from_secs(5),
         )
-        .await?
+        .await
+        .map_err(SinkFailure::from)?
         {
             SinkWorkerResponse::Health(health) => Ok(health),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for health: {:?}",
-                other
-            ))),
+            other => unexpected_sink_worker_response_result("for health", other),
         }
+    }
+
+    pub async fn health(&self) -> Result<HealthStats> {
+        self.health_with_failure()
+            .await
+            .map_err(SinkFailure::into_error)
     }
 
     fn prepare_status_snapshot_for_evaluation(
@@ -2869,24 +3187,31 @@ impl SinkWorkerClientHandle {
         self.finalize_blocking_status_snapshot(snapshot, replay_required)
     }
 
-    pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
+    async fn status_snapshot_nonblocking_with_access_path(
+        &self,
+    ) -> Result<(SinkStatusSnapshot, bool)> {
         #[cfg(test)]
-        if take_sink_worker_status_nonblocking_cache_fallback_hook() {
-            let snapshot = self.cached_status_snapshot()?;
-            if debug_control_scope_capture_enabled() {
-                eprintln!(
-                    "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=test_hook {}",
-                    self.node_id.0,
-                    summarize_sink_status_snapshot(&snapshot)
-                );
+        {
+            let current_worker_instance_id = self.shared_worker().await.0;
+            if take_sink_worker_status_nonblocking_cache_fallback_hook(current_worker_instance_id) {
+                let snapshot = self.cached_status_snapshot()?;
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=test_hook {}",
+                        self.node_id.0,
+                        summarize_sink_status_snapshot(&snapshot)
+                    );
+                }
+                return Ok((snapshot, true));
             }
-            return Ok(snapshot);
         }
         match self.nonblocking_status_entry_action().await? {
             SinkStatusNonblockingEntryAction::ReturnCached {
                 snapshot,
                 access_path,
-            } => self.finalize_nonblocking_cached_status_snapshot(snapshot, access_path, None),
+            } => self
+                .finalize_nonblocking_cached_status_snapshot(snapshot, access_path, None)
+                .map(|snapshot| (snapshot, true)),
             SinkStatusNonblockingEntryAction::ProbeLive(plan) => {
                 match self
                     .status_snapshot_with_timeout_outcome(
@@ -2894,27 +3219,49 @@ impl SinkWorkerClientHandle {
                     )
                     .await
                 {
-                    Ok(probe_outcome) => {
-                        self.finalize_nonblocking_live_probe(plan, probe_outcome)
-                            .await
-                    }
+                    Ok(probe_outcome) => self
+                        .finalize_nonblocking_live_probe(plan, probe_outcome)
+                        .await
+                        .map(|snapshot| (snapshot, false)),
                     Err(err) => {
                         let access_path = plan.err_access_path();
                         self.finalize_nonblocking_cached_status_snapshot(
                             plan.cached_snapshot,
                             access_path,
-                            Some(err),
+                            Some(err.into_error()),
                         )
+                        .map(|snapshot| (snapshot, true))
                     }
                 }
             }
         }
     }
 
+    pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
+        self.status_snapshot_nonblocking_with_access_path()
+            .await
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    pub(crate) async fn status_snapshot_nonblocking_for_status_route(
+        &self,
+    ) -> Result<(SinkStatusSnapshot, bool)> {
+        self.status_snapshot_nonblocking_with_access_path().await
+    }
+
     async fn status_snapshot_probe_once_with_timeout(
         &self,
         timeout: Duration,
     ) -> Result<SinkStatusSnapshot> {
+        self.status_snapshot_probe_once_with_timeout_with_failure(timeout)
+            .await
+            .map_err(SinkFailure::into_error)
+    }
+
+    async fn status_snapshot_probe_once_with_timeout_with_failure(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
         self.replay_retained_control_state_if_needed().await?;
         #[cfg(test)]
         let current_worker_instance_id = self.shared_worker().await.0;
@@ -2923,10 +3270,10 @@ impl SinkWorkerClientHandle {
         if let Some(reply) = take_sink_worker_status_response_queue_hook() {
             return match reply? {
                 SinkWorkerResponse::StatusSnapshot(snapshot) => Ok(snapshot),
-                other => Err(CnxError::ProtocolViolation(format!(
-                    "unexpected sink worker response for status snapshot: {:?}",
-                    other
-                ))),
+                other => Err(unexpected_sink_worker_response_failure(
+                    "for status snapshot",
+                    other,
+                )),
             };
         }
         #[cfg(test)]
@@ -2935,21 +3282,21 @@ impl SinkWorkerClientHandle {
         }
         #[cfg(test)]
         if let Some(err) = take_sink_worker_status_error_hook(current_worker_instance_id) {
-            return Err(err);
+            return Err(err.into());
         }
         match Self::call_worker(&client, SinkWorkerRequest::StatusSnapshot, timeout).await? {
             SinkWorkerResponse::StatusSnapshot(snapshot) => Ok(snapshot),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for status snapshot: {:?}",
-                other
-            ))),
+            other => Err(unexpected_sink_worker_response_failure(
+                "for status snapshot",
+                other,
+            )),
         }
     }
 
     async fn status_snapshot_with_timeout_outcome(
         &self,
         timeout: Duration,
-    ) -> Result<SinkStatusSnapshotProbeOutcome> {
+    ) -> std::result::Result<SinkStatusSnapshotProbeOutcome, SinkFailure> {
         let mut machine = SinkStatusProbeMachine::new(std::time::Instant::now() + timeout);
         let response = loop {
             let replay_required_for_attempt =
@@ -2973,20 +3320,25 @@ impl SinkWorkerClientHandle {
                     )
                     .await
                 {
-                    if machine.replay_error_is_best_effort(&err, replay_required_for_attempt) {
-                        if debug_control_scope_capture_enabled() {
-                            eprintln!(
-                                "fs_meta_sink_worker_client: status_snapshot replay_best_effort node={} err={} remaining_ms={}",
-                                self.node_id.0,
-                                err,
-                                machine
-                                    .deadline
-                                    .saturating_duration_since(std::time::Instant::now())
-                                    .as_millis()
-                            );
+                    match machine
+                        .classify_replay_failure_disposition(err, replay_required_for_attempt)
+                    {
+                        SinkStatusProbeReplayDisposition::BestEffort(failure) => {
+                            if debug_control_scope_capture_enabled() {
+                                eprintln!(
+                                    "fs_meta_sink_worker_client: status_snapshot replay_best_effort node={} err={} remaining_ms={}",
+                                    self.node_id.0,
+                                    failure.as_error(),
+                                    machine
+                                        .deadline
+                                        .saturating_duration_since(std::time::Instant::now())
+                                        .as_millis()
+                                );
+                            }
                         }
-                    } else {
-                        return Err(err);
+                        SinkStatusProbeReplayDisposition::Fail(failure) => {
+                            return Err(failure);
+                        }
                     }
                 }
             }
@@ -3029,17 +3381,22 @@ impl SinkWorkerClientHandle {
                         .await?;
                 }
                 Ok(response) => break response,
-                Err(err)
-                    if can_retry_on_control_frame(&err)
-                        && std::time::Instant::now() < machine.deadline =>
-                {
-                    machine = machine.phase_after_retry_reset();
-                    self.control_state_replay_required
-                        .store(1, Ordering::Release);
-                    self.restart_shared_worker_client_for_retry_until(machine.deadline)
-                        .await?;
-                }
-                Err(err) => return Err(err),
+                Err(err) => match classify_sink_retry_disposition(
+                    machine.deadline,
+                    err,
+                    SinkRetryBudgetExhaustionKind::StatusProbeAttempt,
+                ) {
+                    SinkRetryDisposition::Retry => {
+                        machine = machine.phase_after_retry_reset();
+                        self.control_state_replay_required
+                            .store(1, Ordering::Release);
+                        self.restart_shared_worker_client_for_retry_until(machine.deadline)
+                            .await?;
+                    }
+                    SinkRetryDisposition::Fail(failure) => {
+                        return Err(failure);
+                    }
+                },
             }
         };
         match response {
@@ -3047,22 +3404,33 @@ impl SinkWorkerClientHandle {
                 snapshot,
                 recovered_after_retry_reset: machine.recovered_after_retry_reset(),
             }),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for status snapshot: {:?}",
-                other
-            ))),
+            other => Err(SinkFailure::protocol_violation(
+                SinkProtocolViolationKind::UnexpectedWorkerResponse {
+                    context: "for status snapshot",
+                    response: format!("{:?}", other),
+                },
+            )),
         }
     }
 
-    async fn status_snapshot_with_timeout(&self, timeout: Duration) -> Result<SinkStatusSnapshot> {
-        Ok(self
-            .status_snapshot_with_timeout_outcome(timeout)
-            .await?
-            .snapshot)
+    async fn status_snapshot_with_timeout_with_failure(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        self.status_snapshot_with_timeout_outcome(timeout)
+            .await
+            .map(|outcome| outcome.snapshot)
     }
 
-    pub async fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
-        self.replay_retained_control_state_if_needed().await?;
+    async fn status_snapshot_with_timeout(&self, timeout: Duration) -> Result<SinkStatusSnapshot> {
+        self.status_snapshot_with_timeout_with_failure(timeout)
+            .await
+            .map_err(SinkFailure::into_error)
+    }
+
+    async fn scheduled_group_ids_result_with_failure(
+        &self,
+    ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SinkFailure> {
         match self.scheduled_group_ids_with_timeout().await? {
             SinkWorkerResponse::ScheduledGroupIds(groups) => {
                 let groups = groups.map(|groups| {
@@ -3071,26 +3439,35 @@ impl SinkWorkerClientHandle {
                         .collect::<std::collections::BTreeSet<_>>()
                 });
                 if let Some(groups) = groups.as_ref().filter(|groups| !groups.is_empty()) {
-                    self.update_cached_scheduled_group_ids(groups)?;
+                    self.update_cached_scheduled_group_ids(groups)
+                        .map_err(SinkFailure::from)?;
                     return Ok(Some(groups.clone()));
                 }
-                self.cached_scheduled_group_ids()
+                self.cached_scheduled_group_ids().map_err(SinkFailure::from)
             }
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for scheduled groups: {:?}",
-                other
-            ))),
+            other => unexpected_sink_worker_response_result("for scheduled groups", other),
         }
     }
 
-    async fn scheduled_group_ids_with_timeout(&self) -> Result<SinkWorkerResponse> {
+    pub async fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
+        self.replay_retained_control_state_if_needed().await?;
+        self.scheduled_group_ids_result_with_failure()
+            .await
+            .map_err(SinkFailure::into_error)
+    }
+
+    async fn scheduled_group_ids_with_timeout(
+        &self,
+    ) -> std::result::Result<SinkWorkerResponse, SinkFailure> {
         let deadline = std::time::Instant::now() + SINK_WORKER_CONTROL_TOTAL_TIMEOUT;
         loop {
             let now = std::time::Instant::now();
             let attempt_timeout =
                 Duration::from_secs(5).min(deadline.saturating_duration_since(now));
             if attempt_timeout.is_zero() {
-                return Err(CnxError::Timeout);
+                return Err(SinkFailure::retry_budget_exhausted(
+                    SinkRetryBudgetExhaustionKind::ControlFrameAttempt,
+                ));
             }
             let rpc_result = self
                 .with_started_retry(|client| async move {
@@ -3108,16 +3485,39 @@ impl SinkWorkerClientHandle {
                 .await;
             match rpc_result {
                 Ok(response) => return Ok(response),
-                Err(err)
-                    if can_retry_on_control_frame(&err) && std::time::Instant::now() < deadline =>
-                {
-                    self.restart_shared_worker_client_for_retry_until(
-                        Self::scheduled_group_ids_retry_action(deadline)?,
-                    )
-                    .await?;
-                }
-                Err(err) => return Err(err),
+                Err(err) => match classify_sink_retry_disposition(
+                    deadline,
+                    err,
+                    SinkRetryBudgetExhaustionKind::ControlFrameRetry,
+                ) {
+                    SinkRetryDisposition::Retry => {
+                        self.restart_shared_worker_client_for_retry_until(
+                            Self::scheduled_group_ids_retry_action(deadline)?,
+                        )
+                        .await?;
+                    }
+                    SinkRetryDisposition::Fail(failure) => {
+                        return Err(failure);
+                    }
+                },
             }
+        }
+    }
+
+    async fn visibility_lag_samples_since_with_failure(
+        &self,
+        since_us: u64,
+    ) -> std::result::Result<Vec<VisibilityLagSample>, SinkFailure> {
+        match Self::call_worker(
+            &self.client().await?,
+            SinkWorkerRequest::VisibilityLagSamplesSince { since_us },
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(SinkFailure::from)?
+        {
+            SinkWorkerResponse::VisibilityLagSamples(samples) => Ok(samples),
+            other => unexpected_sink_worker_response_result("for visibility lag samples", other),
         }
     }
 
@@ -3125,22 +3525,38 @@ impl SinkWorkerClientHandle {
         &self,
         since_us: u64,
     ) -> Result<Vec<VisibilityLagSample>> {
-        match Self::call_worker(
-            &self.client().await?,
-            SinkWorkerRequest::VisibilityLagSamplesSince { since_us },
-            Duration::from_secs(5),
-        )
-        .await?
-        {
-            SinkWorkerResponse::VisibilityLagSamples(samples) => Ok(samples),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for visibility lag samples: {:?}",
-                other
-            ))),
+        self.visibility_lag_samples_since_with_failure(since_us)
+            .await
+            .map_err(SinkFailure::into_error)
+    }
+
+    async fn send_with_failure(&self, events: Vec<Event>) -> std::result::Result<(), SinkFailure> {
+        let response = self
+            .with_started_retry(|client| {
+                let events = events.clone();
+                async move {
+                    Self::call_worker(
+                        &client,
+                        SinkWorkerRequest::Send {
+                            events: events.clone(),
+                        },
+                        Duration::from_secs(5),
+                    )
+                    .await
+                }
+            })
+            .await
+            .map_err(SinkFailure::from)?;
+        match response {
+            SinkWorkerResponse::Ack => Ok(()),
+            other => unexpected_sink_worker_response_result("for send", other),
         }
     }
 
-    pub async fn query_node(&self, path: Vec<u8>) -> Result<Option<QueryNode>> {
+    async fn query_node_with_failure(
+        &self,
+        path: Vec<u8>,
+    ) -> std::result::Result<Option<QueryNode>, SinkFailure> {
         self.with_started_retry(|client| {
             let path = path.clone();
             async move {
@@ -3164,10 +3580,10 @@ impl SinkWorkerClientHandle {
                     {
                         SinkWorkerResponse::Events(events) => events,
                         other => {
-                            return Err(CnxError::ProtocolViolation(format!(
-                                "unexpected sink worker response for materialized query: {:?}",
-                                other
-                            )));
+                            return Err(unexpected_sink_worker_response(
+                                "for materialized query",
+                                other,
+                            ));
                         }
                     },
                     &path,
@@ -3175,9 +3591,19 @@ impl SinkWorkerClientHandle {
             }
         })
         .await
+        .map_err(SinkFailure::from)
     }
 
-    pub async fn materialized_query(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
+    pub async fn query_node(&self, path: Vec<u8>) -> Result<Option<QueryNode>> {
+        self.query_node_with_failure(path)
+            .await
+            .map_err(SinkFailure::into_error)
+    }
+
+    async fn materialized_query_with_failure(
+        &self,
+        request: InternalQueryRequest,
+    ) -> std::result::Result<Vec<Event>, SinkFailure> {
         self.replay_retained_control_state_if_needed().await?;
         self.with_started_retry(|client| {
             let request = request.clone();
@@ -3192,20 +3618,27 @@ impl SinkWorkerClientHandle {
                 .await?
                 {
                     SinkWorkerResponse::Events(events) => Ok(events),
-                    other => Err(CnxError::ProtocolViolation(format!(
-                        "unexpected sink worker response for materialized query: {:?}",
-                        other
-                    ))),
+                    other => Err(unexpected_sink_worker_response(
+                        "for materialized query",
+                        other,
+                    )),
                 }
             }
         })
         .await
+        .map_err(SinkFailure::from)
     }
 
-    pub async fn materialized_query_nonblocking(
+    pub async fn materialized_query(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
+        self.materialized_query_with_failure(request)
+            .await
+            .map_err(SinkFailure::into_error)
+    }
+
+    async fn materialized_query_nonblocking_with_failure(
         &self,
         request: InternalQueryRequest,
-    ) -> Result<Vec<Event>> {
+    ) -> std::result::Result<Vec<Event>, SinkFailure> {
         if self.control_op_inflight() {
             return Ok(Vec::new());
         }
@@ -3220,17 +3653,29 @@ impl SinkWorkerClientHandle {
                 .await?
                 {
                     SinkWorkerResponse::Events(events) => Ok(events),
-                    other => Err(CnxError::ProtocolViolation(format!(
-                        "unexpected sink worker response for materialized query: {:?}",
-                        other
-                    ))),
+                    other => Err(unexpected_sink_worker_response_failure(
+                        "for materialized query",
+                        other,
+                    )),
                 }
             }
             None => Ok(Vec::new()),
         }
     }
 
-    pub async fn subtree_stats(&self, path: Vec<u8>) -> Result<Vec<Event>> {
+    pub async fn materialized_query_nonblocking(
+        &self,
+        request: InternalQueryRequest,
+    ) -> Result<Vec<Event>> {
+        self.materialized_query_nonblocking_with_failure(request)
+            .await
+            .map_err(SinkFailure::into_error)
+    }
+
+    async fn subtree_stats_with_failure(
+        &self,
+        path: Vec<u8>,
+    ) -> std::result::Result<Vec<Event>, SinkFailure> {
         self.with_started_retry(|client| {
             let path = path.clone();
             async move {
@@ -3253,14 +3698,21 @@ impl SinkWorkerClientHandle {
                 .await?
                 {
                     SinkWorkerResponse::Events(events) => Ok(events),
-                    other => Err(CnxError::ProtocolViolation(format!(
-                        "unexpected sink worker response for materialized query: {:?}",
-                        other
-                    ))),
+                    other => Err(unexpected_sink_worker_response(
+                        "for materialized query",
+                        other,
+                    )),
                 }
             }
         })
         .await
+        .map_err(SinkFailure::from)
+    }
+
+    pub async fn subtree_stats(&self, path: Vec<u8>) -> Result<Vec<Event>> {
+        self.subtree_stats_with_failure(path)
+            .await
+            .map_err(SinkFailure::into_error)
     }
 
     pub async fn force_find_proxy(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
@@ -3298,48 +3750,38 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn send(&self, events: Vec<Event>) -> Result<()> {
-        self.with_started_retry(|client| {
-            let events = events.clone();
-            async move {
-                match Self::call_worker(
+        self.send_with_failure(events)
+            .await
+            .map_err(SinkFailure::into_error)
+    }
+
+    async fn recv_with_failure(
+        &self,
+        opts: RecvOpts,
+    ) -> std::result::Result<Vec<Event>, SinkFailure> {
+        let timeout_ms = opts.timeout.map(|d| d.as_millis() as u64);
+        let limit = opts.limit;
+        let response = self
+            .with_started_retry(|client| async move {
+                Self::call_worker(
                     &client,
-                    SinkWorkerRequest::Send {
-                        events: events.clone(),
-                    },
+                    SinkWorkerRequest::Recv { timeout_ms, limit },
                     Duration::from_secs(5),
                 )
-                .await?
-                {
-                    SinkWorkerResponse::Ack => Ok(()),
-                    other => Err(CnxError::ProtocolViolation(format!(
-                        "unexpected sink worker response for send: {:?}",
-                        other
-                    ))),
-                }
-            }
-        })
-        .await
+                .await
+            })
+            .await
+            .map_err(SinkFailure::from)?;
+        match response {
+            SinkWorkerResponse::Events(events) => Ok(events),
+            other => unexpected_sink_worker_response_result("for recv", other),
+        }
     }
 
     pub async fn recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
-        let timeout_ms = opts.timeout.map(|d| d.as_millis() as u64);
-        let limit = opts.limit;
-        self.with_started_retry(|client| async move {
-            match Self::call_worker(
-                &client,
-                SinkWorkerRequest::Recv { timeout_ms, limit },
-                Duration::from_secs(5),
-            )
-            .await?
-            {
-                SinkWorkerResponse::Events(events) => Ok(events),
-                other => Err(CnxError::ProtocolViolation(format!(
-                    "unexpected sink worker response for recv: {:?}",
-                    other
-                ))),
-            }
-        })
-        .await
+        self.recv_with_failure(opts)
+            .await
+            .map_err(SinkFailure::into_error)
     }
 
     pub async fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
@@ -3357,6 +3799,17 @@ impl SinkWorkerClientHandle {
         total_timeout: Duration,
         rpc_timeout: Duration,
     ) -> Result<()> {
+        self.on_control_frame_with_timeouts_with_failure(envelopes, total_timeout, rpc_timeout)
+            .await
+            .map_err(SinkFailure::into_error)
+    }
+
+    async fn on_control_frame_with_timeouts_with_failure(
+        &self,
+        envelopes: Vec<ControlEnvelope>,
+        total_timeout: Duration,
+        rpc_timeout: Duration,
+    ) -> std::result::Result<(), SinkFailure> {
         let _inflight = self.begin_control_op();
         let decoded_signals = sink_control_signals_from_envelopes(&envelopes).ok();
         let inflight_summary = decoded_signals
@@ -3431,10 +3884,10 @@ impl SinkWorkerClientHandle {
                         "fs_meta_sink_worker_client: on_control_frame done node={} ok=false err=unexpected_response:{:?}",
                         self.node_id.0, other
                     );
-                    return Err(CnxError::ProtocolViolation(format!(
-                        "unexpected sink worker response for on_control_frame: {:?}",
-                        other
-                    )));
+                    return Err(unexpected_sink_worker_response_failure(
+                        "for on_control_frame",
+                        other,
+                    ));
                 }
                 Err(err) => match machine.followup_after_error(err) {
                     SinkControlFrameFollowup::RestartAndRetry(next_machine) => {
@@ -3442,7 +3895,7 @@ impl SinkWorkerClientHandle {
                             .await?;
                         machine = next_machine;
                     }
-                    SinkControlFrameFollowup::RestartAndFailFast(err) => {
+                    SinkControlFrameFollowup::RestartAndFailFast(failure) => {
                         self.restart_shared_worker_client_for_retry_until(machine.deadline)
                             .await?;
                         let lane = if machine.restart_deferred_retire_pending_deactivate {
@@ -3452,16 +3905,19 @@ impl SinkWorkerClientHandle {
                         };
                         eprintln!(
                             "fs_meta_sink_worker_client: on_control_frame fail-fast node={} err={} lane={}",
-                            self.node_id.0, err, lane
+                            self.node_id.0,
+                            failure.as_error(),
+                            lane
                         );
-                        return Err(err);
+                        return Err(failure);
                     }
-                    SinkControlFrameFollowup::Failed(err) => {
+                    SinkControlFrameFollowup::Failed(failure) => {
                         eprintln!(
                             "fs_meta_sink_worker_client: on_control_frame done node={} ok=false err={}",
-                            self.node_id.0, err
+                            self.node_id.0,
+                            failure.as_error()
                         );
-                        return Err(err);
+                        return Err(failure);
                     }
                 },
             }
@@ -3595,6 +4051,15 @@ impl SinkFacade {
             .map(|snapshot| snapshot.progress_snapshot())
     }
 
+    pub(crate) async fn status_snapshot_nonblocking_for_status_route(
+        &self,
+    ) -> Result<(SinkStatusSnapshot, bool)> {
+        match self {
+            Self::Local(sink) => Ok((sink.status_snapshot()?, false)),
+            Self::Worker(client) => client.status_snapshot_nonblocking_for_status_route().await,
+        }
+    }
+
     pub fn cached_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
         match self {
             Self::Local(sink) => sink.status_snapshot(),
@@ -3605,6 +4070,14 @@ impl SinkFacade {
     pub(crate) fn cached_progress_snapshot(&self) -> Result<crate::sink::SinkProgressSnapshot> {
         self.cached_status_snapshot()
             .map(|snapshot| snapshot.progress_snapshot())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn worker_instance_id_for_tests(&self) -> Option<u64> {
+        match self {
+            Self::Local(_) => None,
+            Self::Worker(client) => Some(client.worker_instance_id_for_tests().await),
+        }
     }
 
     pub async fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {

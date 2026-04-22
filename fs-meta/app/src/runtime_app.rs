@@ -377,29 +377,28 @@ struct FacadeFixedBindSnapshot {
 }
 
 #[derive(Clone)]
-struct FacadePublicationInput {
+struct FixedBindLifecycleFacts {
     observation: FacadeGateObservation,
     publication_ready: bool,
-}
-
-#[derive(Clone)]
-struct FacadePublicationMachine {
-    observation: FacadeGateObservation,
-    publication_ready: bool,
-}
-
-#[derive(Clone)]
-struct FacadeDeactivateInput {
     fixed_bind: FacadeFixedBindSnapshot,
     release_handoff: Option<PendingFixedBindHandoffContinuation>,
     shutdown_handoff: Option<ActiveFixedBindShutdownContinuation>,
 }
 
 #[derive(Clone)]
-struct FacadeDeactivateMachine {
+struct FixedBindLifecycleMachine {
+    observation: FacadeGateObservation,
+    publication_ready: bool,
     fixed_bind: FacadeFixedBindSnapshot,
     release_handoff: Option<PendingFixedBindHandoffContinuation>,
     shutdown_handoff: Option<ActiveFixedBindShutdownContinuation>,
+}
+
+#[derive(Clone)]
+struct FixedBindClaimReleaseFollowupSnapshot {
+    claim_release_followup_pending: bool,
+    pending_publication: Option<PendingFacadeActivation>,
+    conflicting_process_claim: Option<ProcessFacadeClaim>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -420,15 +419,42 @@ struct PendingFixedBindHandoffAttemptDecisionInput {
     conflicting_process_claim_owner_instance_id: Option<u64>,
 }
 
-enum FacadeDeactivateContinuityExecutionPlan {
-    RetainActiveContinuity,
-    RetainActiveWhilePendingFixedBindClaimConflict,
-    RetainPendingWhilePendingFixedBindClaimConflict,
+enum FixedBindLifecycleRequest {
+    Deactivate {
+        route_key: String,
+        generation: u64,
+        retain_active_facade: bool,
+        retain_pending_spawn: bool,
+    },
+    Shutdown,
+}
+
+enum FixedBindLifecycleExecution {
+    RetainActiveContinuity {
+        route_key: String,
+        generation: u64,
+    },
+    RetainActiveWhilePendingFixedBindClaimConflict {
+        route_key: String,
+        generation: u64,
+    },
+    RetainPendingWhilePendingFixedBindClaimConflict {
+        route_key: String,
+        generation: u64,
+    },
     ReleaseActiveForFixedBindHandoff {
+        route_key: String,
+        generation: u64,
         handoff: ActiveFixedBindShutdownContinuation,
     },
-    RetainPendingForFixedBindHandoff,
-    RetainPendingWhileSpawnInFlight,
+    RetainPendingForFixedBindHandoff {
+        route_key: String,
+        generation: u64,
+    },
+    RetainPendingWhileSpawnInFlight {
+        route_key: String,
+        generation: u64,
+    },
     Shutdown {
         handoff: Option<ActiveFixedBindShutdownContinuation>,
     },
@@ -446,18 +472,8 @@ struct PendingFixedBindHandoffContinuation {
     registrant: PendingFixedBindHandoffRegistrant,
 }
 
-enum FixedBindHandoffAction {
-    Deactivate {
-        route_key: String,
-        generation: u64,
-        retain_active_facade: bool,
-        retain_pending_spawn: bool,
-    },
-    Shutdown,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct FixedBindAfterReleaseRuntime {
+struct FixedBindAfterReleaseMachine {
     deadline: tokio::time::Instant,
     last_retry_error: Option<String>,
 }
@@ -470,7 +486,25 @@ enum FixedBindAfterReleaseAction {
     ReturnTimeout,
 }
 
-impl FixedBindAfterReleaseRuntime {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FixedBindAfterReleaseEvent {
+    SpawnAttemptCompleted {
+        retry_error: Option<String>,
+        completion_ready: bool,
+    },
+    WaitForProgressCompleted {
+        completion_ready: bool,
+    },
+}
+
+enum FixedBindAfterReleaseExecutorOutcome {
+    Event(FixedBindAfterReleaseEvent),
+    Complete(bool),
+}
+
+const FIXED_BIND_AFTER_RELEASE_TIMEOUT: Duration = Duration::from_secs(8);
+
+impl FixedBindAfterReleaseMachine {
     fn new_with_deadline(deadline: tokio::time::Instant) -> Self {
         Self {
             deadline,
@@ -482,7 +516,7 @@ impl FixedBindAfterReleaseRuntime {
         self.deadline.saturating_duration_since(now)
     }
 
-    fn spawn_attempt_action_at(&self, now: tokio::time::Instant) -> FixedBindAfterReleaseAction {
+    fn start(&self, now: tokio::time::Instant) -> FixedBindAfterReleaseAction {
         if self.remaining_at(now).is_zero() {
             FixedBindAfterReleaseAction::ReturnTimeout
         } else {
@@ -490,17 +524,7 @@ impl FixedBindAfterReleaseRuntime {
         }
     }
 
-    fn note_spawn_success(mut self) -> Self {
-        self.last_retry_error = None;
-        self
-    }
-
-    fn note_spawn_failure(mut self, err: impl std::fmt::Display) -> Self {
-        self.last_retry_error = Some(err.to_string());
-        self
-    }
-
-    fn post_spawn_action_at(
+    fn next_action_at(
         &self,
         now: tokio::time::Instant,
         completion_ready: bool,
@@ -517,51 +541,80 @@ impl FixedBindAfterReleaseRuntime {
         }
     }
 
+    fn advance(
+        &mut self,
+        now: tokio::time::Instant,
+        event: FixedBindAfterReleaseEvent,
+    ) -> FixedBindAfterReleaseAction {
+        match event {
+            FixedBindAfterReleaseEvent::SpawnAttemptCompleted {
+                retry_error,
+                completion_ready,
+            } => {
+                self.last_retry_error = retry_error;
+                self.next_action_at(now, completion_ready)
+            }
+            FixedBindAfterReleaseEvent::WaitForProgressCompleted { completion_ready } => {
+                self.next_action_at(now, completion_ready)
+            }
+        }
+    }
+
     fn last_retry_error_message(&self) -> Option<&str> {
         self.last_retry_error.as_deref()
     }
 }
 
 #[test]
-fn fixed_bind_after_release_runtime_owns_deadline_and_retry_wait() {
+fn fixed_bind_after_release_machine_owns_deadline_and_retry_wait() {
     let now = tokio::time::Instant::now();
-    let live_runtime =
-        FixedBindAfterReleaseRuntime::new_with_deadline(now + Duration::from_secs(1))
-            .note_spawn_failure("bind busy");
-    let expired_runtime = FixedBindAfterReleaseRuntime::new_with_deadline(now);
+    let mut live_runtime =
+        FixedBindAfterReleaseMachine::new_with_deadline(now + Duration::from_secs(1));
+    let expired_runtime = FixedBindAfterReleaseMachine::new_with_deadline(now);
 
     assert_eq!(
-        live_runtime.spawn_attempt_action_at(now),
+        live_runtime.start(now),
         FixedBindAfterReleaseAction::SpawnAttempt,
-        "after-release handoff should keep spawn-attempt eligibility inside the runtime instead of leaving execute(...) to compare raw instants inline",
+        "after-release handoff should keep spawn-attempt eligibility inside the machine instead of leaving execute(...) to compare raw instants inline",
     );
     assert_eq!(
-        live_runtime.post_spawn_action_at(now + Duration::from_millis(200), false),
+        live_runtime.advance(
+            now + Duration::from_millis(200),
+            FixedBindAfterReleaseEvent::SpawnAttemptCompleted {
+                retry_error: Some("bind busy".to_string()),
+                completion_ready: false,
+            },
+        ),
         FixedBindAfterReleaseAction::WaitForProgress(Duration::from_millis(800)),
-        "after-release handoff should derive wait duration from the runtime-owned deadline instead of leaving the outer loop to re-budget progress waits",
+        "after-release handoff should derive wait duration from the machine-owned deadline instead of leaving the outer loop to re-budget progress waits",
     );
     assert_eq!(
         live_runtime.last_retry_error_message(),
         Some("bind busy"),
-        "after-release runtime should retain the last retry failure message so timeout logging stays owned by the runtime flow instead of an outer helper-local variable",
+        "after-release machine should retain the last retry failure message so timeout logging stays owned by the time-machine flow instead of an outer helper-local variable",
     );
     assert_eq!(
-        expired_runtime.spawn_attempt_action_at(now),
+        expired_runtime.start(now),
         FixedBindAfterReleaseAction::ReturnTimeout,
-        "after-release timeout should come from the runtime-owned deadline instead of a helper-local deadline loop",
+        "after-release timeout should come from the machine-owned deadline instead of a helper-local deadline loop",
     );
 }
 
 #[test]
-fn fixed_bind_after_release_runtime_promotes_completion_without_outer_branching() {
+fn fixed_bind_after_release_machine_promotes_completion_without_outer_branching() {
     let now = tokio::time::Instant::now();
-    let runtime = FixedBindAfterReleaseRuntime::new_with_deadline(now + Duration::from_secs(1))
-        .note_spawn_success();
+    let mut runtime = FixedBindAfterReleaseMachine::new_with_deadline(now + Duration::from_secs(1));
 
     assert_eq!(
-        runtime.post_spawn_action_at(now, true),
+        runtime.advance(
+            now,
+            FixedBindAfterReleaseEvent::SpawnAttemptCompleted {
+                retry_error: None,
+                completion_ready: true,
+            },
+        ),
         FixedBindAfterReleaseAction::Complete,
-        "after-release handoff should surface completion through a runtime-owned action instead of leaving execute(...) to branch on completion-ready inline",
+        "after-release handoff should surface completion through a machine-owned action instead of leaving execute(...) to branch on completion-ready inline",
     );
 }
 
@@ -593,15 +646,21 @@ impl FacadeGateObservation {
     }
 }
 
-impl FacadePublicationMachine {
-    fn from_input(input: FacadePublicationInput) -> Self {
-        let FacadePublicationInput {
+impl FixedBindLifecycleMachine {
+    fn from_facts(facts: FixedBindLifecycleFacts) -> Self {
+        let FixedBindLifecycleFacts {
             observation,
             publication_ready,
-        } = input;
+            fixed_bind,
+            release_handoff,
+            shutdown_handoff,
+        } = facts;
         Self {
             observation,
             publication_ready,
+            fixed_bind,
+            release_handoff,
+            shutdown_handoff,
         }
     }
 
@@ -631,56 +690,126 @@ impl FacadePublicationMachine {
             published_state: ready_tail.published_state,
         }
     }
-}
 
-impl FacadeDeactivateMachine {
-    fn from_input(input: FacadeDeactivateInput) -> Self {
-        let FacadeDeactivateInput {
-            fixed_bind,
-            release_handoff,
-            shutdown_handoff,
-        } = input;
-        Self {
-            fixed_bind,
-            release_handoff,
-            shutdown_handoff,
+    fn claim_release_followup_snapshot(&self) -> FixedBindClaimReleaseFollowupSnapshot {
+        FixedBindClaimReleaseFollowupSnapshot {
+            claim_release_followup_pending: self.fixed_bind.claim_release_followup_pending,
+            pending_publication: self.fixed_bind.pending_publication.clone(),
+            conflicting_process_claim: self.fixed_bind.conflicting_process_claim.clone(),
         }
     }
 
-    fn deactivate_plan(
-        &self,
-        retain_active_facade: bool,
-        retain_pending_spawn: bool,
-    ) -> FacadeDeactivateContinuityExecutionPlan {
-        let pending_fixed_bind_conflict = self.fixed_bind.conflicting_process_claim.is_some();
-        if retain_active_facade && !pending_fixed_bind_conflict && self.release_handoff.is_none() {
-            return FacadeDeactivateContinuityExecutionPlan::RetainActiveContinuity;
-        }
-        if pending_fixed_bind_conflict {
-            return if retain_active_facade {
-                FacadeDeactivateContinuityExecutionPlan::RetainActiveWhilePendingFixedBindClaimConflict
-            } else {
-                FacadeDeactivateContinuityExecutionPlan::RetainPendingWhilePendingFixedBindClaimConflict
-            };
-        }
-        if let Some(handoff) = self.release_handoff.clone() {
-            return if retain_active_facade {
-                FacadeDeactivateContinuityExecutionPlan::ReleaseActiveForFixedBindHandoff {
-                    handoff: ActiveFixedBindShutdownContinuation {
-                        bind_addr: handoff.bind_addr.clone(),
-                        pending_handoff: Some(handoff),
-                    },
+    fn evaluate(&self, request: FixedBindLifecycleRequest) -> FixedBindLifecycleExecution {
+        match request {
+            FixedBindLifecycleRequest::Deactivate {
+                route_key,
+                generation,
+                retain_active_facade,
+                retain_pending_spawn,
+            } => {
+                let pending_fixed_bind_conflict =
+                    self.fixed_bind.conflicting_process_claim.is_some();
+                if retain_active_facade
+                    && !pending_fixed_bind_conflict
+                    && self.release_handoff.is_none()
+                {
+                    return FixedBindLifecycleExecution::RetainActiveContinuity {
+                        route_key,
+                        generation,
+                    };
                 }
-            } else {
-                FacadeDeactivateContinuityExecutionPlan::RetainPendingForFixedBindHandoff
-            };
+                if pending_fixed_bind_conflict {
+                    return if retain_active_facade {
+                        FixedBindLifecycleExecution::RetainActiveWhilePendingFixedBindClaimConflict {
+                            route_key,
+                            generation,
+                        }
+                    } else {
+                        FixedBindLifecycleExecution::RetainPendingWhilePendingFixedBindClaimConflict {
+                            route_key,
+                            generation,
+                        }
+                    };
+                }
+                if let Some(handoff) = self.release_handoff.clone() {
+                    return if retain_active_facade {
+                        FixedBindLifecycleExecution::ReleaseActiveForFixedBindHandoff {
+                            route_key,
+                            generation,
+                            handoff: ActiveFixedBindShutdownContinuation {
+                                bind_addr: handoff.bind_addr.clone(),
+                                pending_handoff: Some(handoff),
+                            },
+                        }
+                    } else {
+                        FixedBindLifecycleExecution::RetainPendingForFixedBindHandoff {
+                            route_key,
+                            generation,
+                        }
+                    };
+                }
+                if retain_pending_spawn {
+                    return FixedBindLifecycleExecution::RetainPendingWhileSpawnInFlight {
+                        route_key,
+                        generation,
+                    };
+                }
+                FixedBindLifecycleExecution::Shutdown {
+                    handoff: self.shutdown_handoff.clone(),
+                }
+            }
+            FixedBindLifecycleRequest::Shutdown => FixedBindLifecycleExecution::Shutdown {
+                handoff: self.shutdown_handoff.clone(),
+            },
         }
-        if retain_pending_spawn {
-            return FacadeDeactivateContinuityExecutionPlan::RetainPendingWhileSpawnInFlight;
+    }
+}
+
+#[derive(Clone)]
+struct FixedBindLifecycleView {
+    machine: FixedBindLifecycleMachine,
+}
+
+impl FixedBindLifecycleView {
+    fn from_facts(facts: FixedBindLifecycleFacts) -> Self {
+        Self {
+            machine: FixedBindLifecycleMachine::from_facts(facts),
         }
-        FacadeDeactivateContinuityExecutionPlan::Shutdown {
-            handoff: self.shutdown_handoff.clone(),
-        }
+    }
+
+    fn evaluate(&self, request: FixedBindLifecycleRequest) -> FixedBindLifecycleExecution {
+        self.machine.evaluate(request)
+    }
+
+    fn snapshot(&self) -> FacadePublicationSnapshot {
+        self.machine.snapshot()
+    }
+
+    fn claim_release_followup_snapshot(&self) -> FixedBindClaimReleaseFollowupSnapshot {
+        self.machine.claim_release_followup_snapshot()
+    }
+}
+
+#[derive(Clone)]
+struct FixedBindLifecycleSession {
+    view: FixedBindLifecycleView,
+}
+
+impl FixedBindLifecycleSession {
+    fn new(view: FixedBindLifecycleView) -> Self {
+        Self { view }
+    }
+
+    fn evaluate(&self, request: FixedBindLifecycleRequest) -> FixedBindLifecycleExecution {
+        self.view.evaluate(request)
+    }
+
+    fn publication_snapshot(&self) -> FacadePublicationSnapshot {
+        self.view.snapshot()
+    }
+
+    fn claim_release_followup_snapshot(&self) -> FixedBindClaimReleaseFollowupSnapshot {
+        self.view.claim_release_followup_snapshot()
     }
 }
 
@@ -720,58 +849,81 @@ async fn wait_for_fixed_bind_after_release_completion_progress(
     true
 }
 
-async fn execute_fixed_bind_after_release_handoff(
-    handoff: PendingFixedBindHandoffContinuation,
-) -> Result<bool> {
-    let mut runtime = FixedBindAfterReleaseRuntime::new_with_deadline(
-        tokio::time::Instant::now() + Duration::from_secs(8),
-    );
-    loop {
-        match runtime.spawn_attempt_action_at(tokio::time::Instant::now()) {
-            FixedBindAfterReleaseAction::ReturnTimeout => return Ok(false),
-            FixedBindAfterReleaseAction::SpawnAttempt => {
-                runtime = match handoff.registrant.try_spawn_pending_facade().await {
-                    Ok(_) => runtime.note_spawn_success(),
-                    Err(err) => runtime.note_spawn_failure(err),
-                };
-            }
-            FixedBindAfterReleaseAction::WaitForProgress(_)
-            | FixedBindAfterReleaseAction::Complete => {
-                unreachable!("after-release runtime produced a non-entry action")
-            }
-        }
-        match runtime.post_spawn_action_at(
-            tokio::time::Instant::now(),
-            fixed_bind_completion_ready_after_release(&handoff).await,
-        ) {
-            FixedBindAfterReleaseAction::Complete => {
-                #[cfg(test)]
-                maybe_pause_before_pending_fixed_bind_handoff_completion_gate_reopen().await;
-                let _ = handoff
-                    .registrant
-                    .apply_forced_handoff_ready_tail(&handoff.bind_addr)
-                    .await;
-                #[cfg(test)]
-                notify_pending_fixed_bind_handoff_completion_completion();
-                return Ok(true);
-            }
-            FixedBindAfterReleaseAction::WaitForProgress(remaining) => {
-                if !wait_for_fixed_bind_after_release_completion_progress(
-                    &handoff,
-                    remaining,
-                    runtime.last_retry_error_message(),
-                )
+async fn execute_fixed_bind_after_release_action(
+    handoff: &PendingFixedBindHandoffContinuation,
+    machine: &FixedBindAfterReleaseMachine,
+    action: FixedBindAfterReleaseAction,
+) -> Result<FixedBindAfterReleaseExecutorOutcome> {
+    match action {
+        FixedBindAfterReleaseAction::SpawnAttempt => {
+            let retry_error = handoff
+                .registrant
+                .try_spawn_pending_facade()
                 .await
-                {
-                    return Ok(false);
-                }
+                .err()
+                .map(|err| err.to_string());
+            Ok(FixedBindAfterReleaseExecutorOutcome::Event(
+                FixedBindAfterReleaseEvent::SpawnAttemptCompleted {
+                    retry_error,
+                    completion_ready: fixed_bind_completion_ready_after_release(handoff).await,
+                },
+            ))
+        }
+        FixedBindAfterReleaseAction::WaitForProgress(remaining) => {
+            let progressed = wait_for_fixed_bind_after_release_completion_progress(
+                handoff,
+                remaining,
+                machine.last_retry_error_message(),
+            )
+            .await;
+            Ok(FixedBindAfterReleaseExecutorOutcome::Event(
+                FixedBindAfterReleaseEvent::WaitForProgressCompleted {
+                    completion_ready: progressed
+                        && fixed_bind_completion_ready_after_release(handoff).await,
+                },
+            ))
+        }
+        FixedBindAfterReleaseAction::Complete => {
+            #[cfg(test)]
+            maybe_pause_before_pending_fixed_bind_handoff_completion_gate_reopen().await;
+            let _ = handoff
+                .registrant
+                .apply_forced_handoff_ready_tail(&handoff.bind_addr)
+                .await;
+            #[cfg(test)]
+            notify_pending_fixed_bind_handoff_completion_completion();
+            Ok(FixedBindAfterReleaseExecutorOutcome::Complete(true))
+        }
+        FixedBindAfterReleaseAction::ReturnTimeout => {
+            Ok(FixedBindAfterReleaseExecutorOutcome::Complete(false))
+        }
+    }
+}
+
+async fn drive_fixed_bind_after_release_loop(
+    handoff: &PendingFixedBindHandoffContinuation,
+    machine: &mut FixedBindAfterReleaseMachine,
+) -> Result<bool> {
+    let mut action = machine.start(tokio::time::Instant::now());
+    loop {
+        match execute_fixed_bind_after_release_action(handoff, machine, action).await? {
+            FixedBindAfterReleaseExecutorOutcome::Event(event) => {
+                action = machine.advance(tokio::time::Instant::now(), event);
             }
-            FixedBindAfterReleaseAction::ReturnTimeout => return Ok(false),
-            FixedBindAfterReleaseAction::SpawnAttempt => {
-                unreachable!("after-release runtime post-spawn action regressed to spawn")
+            FixedBindAfterReleaseExecutorOutcome::Complete(completed) => {
+                return Ok(completed);
             }
         }
     }
+}
+
+async fn execute_fixed_bind_after_release_handoff(
+    handoff: PendingFixedBindHandoffContinuation,
+) -> Result<bool> {
+    let mut machine = FixedBindAfterReleaseMachine::new_with_deadline(
+        tokio::time::Instant::now() + FIXED_BIND_AFTER_RELEASE_TIMEOUT,
+    );
+    drive_fixed_bind_after_release_loop(&handoff, &mut machine).await
 }
 
 impl RolloutGenerationMachine {
@@ -2935,11 +3087,7 @@ impl PendingFixedBindHandoffRegistrant {
                 },
             );
         }
-        let snapshot = FacadePublicationMachine {
-            observation,
-            publication_ready: applied,
-        }
-        .snapshot();
+        let snapshot = FSMetaApp::fixed_bind_gate_publication_snapshot(observation, applied);
         FSMetaApp::publish_facade_publication_snapshot(
             &self.facade_service_state,
             &self.api_control_gate,
@@ -5419,6 +5567,7 @@ impl FSMetaApp {
         _deferred_local_sink_replay_signals: Vec<SinkControlSignal>,
         facade_publication_signals: Vec<FacadeControlSignal>,
     ) -> Result<()> {
+        let mut fixed_bind_session = self.begin_fixed_bind_lifecycle_session().await;
         let (deferred_sink_owned_query_peer_publication_signals, facade_publication_signals): (
             Vec<_>,
             Vec<_>,
@@ -5436,30 +5585,15 @@ impl FSMetaApp {
             .iter()
             .any(Self::facade_publication_signal_is_query_activate);
         if !sink_cleanup_only_while_uninitialized && !query_publication_followup_present {
-            let mut machine =
-                FacadeDeactivateMachine::from_input(self.collect_facade_deactivate_input().await);
-            if machine.fixed_bind.claim_release_followup_pending
-                && machine.fixed_bind.pending_publication.is_some()
-                && machine.fixed_bind.conflicting_process_claim.is_none()
-            {
-                let pending = machine.fixed_bind.pending_publication.clone().expect(
-                    "pending fixed-bind claim-release retry requires pending facade in publication followup",
-                );
-                self.retry_pending_facade(&pending.route_key, pending.generation, false)
-                    .await?;
-                machine = FacadeDeactivateMachine::from_input(
-                    self.collect_facade_deactivate_input().await,
-                );
-            }
-            if machine.fixed_bind.claim_release_followup_pending
-                && machine.fixed_bind.pending_publication.is_none()
-            {
-                self.pending_fixed_bind_claim_release_followup
-                    .store(false, Ordering::Release);
-            }
+            let (_, session) = self
+                .settle_fixed_bind_claim_release_followup_with_session(fixed_bind_session)
+                .await?;
+            fixed_bind_session = session;
         }
         for signal in facade_publication_signals {
-            self.apply_facade_signal(signal).await?;
+            fixed_bind_session = self
+                .apply_facade_signal_with_session(fixed_bind_session, signal)
+                .await?;
         }
         self.replay_suppressed_public_query_activates_after_publication()
             .await?;
@@ -5502,14 +5636,15 @@ impl FSMetaApp {
                     &deferred_sink_owned_query_peer_publication_signals,
                 )
                 .await?;
-                let control_ready_after_republish = FacadePublicationMachine::from_input(
-                    self.collect_facade_publication_input().await,
-                )
-                .snapshot()
-                .publication_ready;
-                self.api_control_gate
-                    .set_ready(control_ready_after_republish);
-                let _ = self.current_facade_service_state().await;
+                fixed_bind_session = self
+                    .rebuild_fixed_bind_lifecycle_session(
+                        &fixed_bind_session,
+                        "publish_facade_service_state_after_sink_recovery_tail_deferred_query_peer_publication_suppression",
+                    )
+                    .await;
+                let _ = self
+                    .publish_facade_service_state_with_session(&fixed_bind_session)
+                    .await;
                 Self::spawn_deferred_sink_owned_query_peer_publication_after_local_sink_status_ready(
                     self.instance_id,
                     self.source.clone(),
@@ -5530,14 +5665,15 @@ impl FSMetaApp {
                     self.pending_fixed_bind_has_suppressed_dependent_routes.clone(),
                 );
             } else {
-                self.api_control_gate.set_ready(
-                    FacadePublicationMachine::from_input(
-                        self.collect_facade_publication_input().await,
+                fixed_bind_session = self
+                    .rebuild_fixed_bind_lifecycle_session(
+                        &fixed_bind_session,
+                        "publish_facade_service_state_after_sink_recovery_tail",
                     )
-                    .snapshot()
-                    .publication_ready,
-                );
-                let _ = self.current_facade_service_state().await;
+                    .await;
+                let _ = self
+                    .publish_facade_service_state_with_session(&fixed_bind_session)
+                    .await;
             }
         }
         Ok(())
@@ -5694,8 +5830,9 @@ impl FSMetaApp {
                 FacadeOnlyHandoffObservationPolicy::ForceBlocked,
             )
             .await;
-            let snapshot = FacadePublicationMachine {
-                publication_ready: matches!(
+            let snapshot = Self::fixed_bind_gate_publication_snapshot(
+                observation.clone(),
+                matches!(
                     observation.runtime.facade_publication_readiness_decision(
                         observation.current_pending.is_some(),
                         observation.pending_facade_is_control_route,
@@ -5705,9 +5842,7 @@ impl FSMetaApp {
                     ),
                     FacadePublicationReadinessDecision::Ready
                 ),
-                observation,
-            }
-            .snapshot();
+            );
             Self::publish_facade_publication_snapshot(
                 &facade_service_state,
                 &api_control_gate,
@@ -6149,6 +6284,24 @@ impl FSMetaApp {
         snapshot.published_state
     }
 
+    fn fixed_bind_gate_publication_snapshot(
+        observation: FacadeGateObservation,
+        publication_ready: bool,
+    ) -> FacadePublicationSnapshot {
+        FixedBindLifecycleMachine {
+            observation,
+            publication_ready,
+            fixed_bind: FacadeFixedBindSnapshot {
+                pending_publication: None,
+                conflicting_process_claim: None,
+                claim_release_followup_pending: false,
+            },
+            release_handoff: None,
+            shutdown_handoff: None,
+        }
+        .snapshot()
+    }
+
     fn publish_rollout_status(
         rollout_status: &SharedRolloutStatusCell,
         snapshot: PublishedRolloutStatusSnapshot,
@@ -6350,6 +6503,7 @@ impl FSMetaApp {
 
     async fn drive_fixed_bind_shutdown_handoff(
         &self,
+        session: FixedBindLifecycleSession,
         handoff: Option<ActiveFixedBindShutdownContinuation>,
     ) -> Result<()> {
         self.api_request_tracker.wait_for_drain().await;
@@ -6377,95 +6531,202 @@ impl FSMetaApp {
         if let Some(pending) = self.pending_facade.lock().await.clone() {
             clear_pending_fixed_bind_handoff_ready(&pending.resolved.bind_addr);
         }
-        let _ = self.current_facade_service_state().await;
+        let session = self
+            .rebuild_fixed_bind_lifecycle_session(
+                &session,
+                "publish_facade_service_state_after_fixed_bind_shutdown_handoff",
+            )
+            .await;
+        let _ = self
+            .publish_facade_service_state_with_session(&session)
+            .await;
         Ok(())
     }
 
-    async fn execute_fixed_bind_handoff_action(
+    async fn execute_fixed_bind_lifecycle_execution(
         &self,
-        machine: &FacadeDeactivateMachine,
-        action: FixedBindHandoffAction,
+        session: FixedBindLifecycleSession,
+        execution: FixedBindLifecycleExecution,
     ) -> Result<()> {
-        match action {
-            FixedBindHandoffAction::Deactivate {
+        match execution {
+            FixedBindLifecycleExecution::RetainActiveContinuity {
                 route_key,
                 generation,
-                retain_active_facade,
-                retain_pending_spawn,
             } => {
-                match machine.deactivate_plan(retain_active_facade, retain_pending_spawn) {
-                    FacadeDeactivateContinuityExecutionPlan::RetainActiveContinuity => {
-                        self.retained_active_facade_continuity
-                            .store(true, Ordering::Release);
-                        eprintln!(
-                            "fs_meta_runtime_app: retain active facade during continuity-preserving deactivate route_key={} generation={}",
-                            route_key, generation
-                        );
-                    }
-                    FacadeDeactivateContinuityExecutionPlan::RetainActiveWhilePendingFixedBindClaimConflict => {
-                        self.retained_active_facade_continuity
-                            .store(true, Ordering::Release);
-                        eprintln!(
-                            "fs_meta_runtime_app: retain active facade while pending fixed-bind claim remains owned elsewhere route_key={} generation={}",
-                            route_key, generation
-                        );
-                    }
-                    FacadeDeactivateContinuityExecutionPlan::RetainPendingWhilePendingFixedBindClaimConflict => {
-                        eprintln!(
-                            "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
-                            route_key, generation
-                        );
-                    }
-                    FacadeDeactivateContinuityExecutionPlan::ReleaseActiveForFixedBindHandoff {
-                        handoff,
-                    } => {
-                        eprintln!(
-                            "fs_meta_runtime_app: release active facade for fixed-bind handoff route_key={} generation={}",
-                            route_key, generation
-                        );
-                        self.retained_active_facade_continuity
-                            .store(false, Ordering::Release);
-                        *self.pending_facade.lock().await = None;
-                        Self::clear_pending_facade_status(&self.facade_pending_status);
-                        let _ = self.current_facade_service_state().await;
-                        let _ = self.current_facade_service_state().await;
-                        self.wait_for_shared_worker_control_handoff().await;
-                        self.drive_fixed_bind_shutdown_handoff(Some(handoff)).await?;
-                    }
-                    FacadeDeactivateContinuityExecutionPlan::RetainPendingForFixedBindHandoff => {
-                        eprintln!(
-                            "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
-                            route_key, generation
-                        );
-                    }
-                    FacadeDeactivateContinuityExecutionPlan::RetainPendingWhileSpawnInFlight => {
-                        eprintln!(
-                            "fs_meta_runtime_app: retain pending facade during in-flight spawn route_key={} generation={}",
-                            route_key, generation
-                        );
-                    }
-                    FacadeDeactivateContinuityExecutionPlan::Shutdown { handoff } => {
-                        self.retained_active_facade_continuity
-                            .store(false, Ordering::Release);
-                        *self.pending_facade.lock().await = None;
-                        Self::clear_pending_facade_status(&self.facade_pending_status);
-                        let _ = self.current_facade_service_state().await;
-                        let _ = self.current_facade_service_state().await;
-                        self.wait_for_shared_worker_control_handoff().await;
-                        self.drive_fixed_bind_shutdown_handoff(handoff).await?;
-                    }
-                }
+                self.retained_active_facade_continuity
+                    .store(true, Ordering::Release);
+                eprintln!(
+                    "fs_meta_runtime_app: retain active facade during continuity-preserving deactivate route_key={} generation={}",
+                    route_key, generation
+                );
                 Ok(())
             }
-            FixedBindHandoffAction::Shutdown => {
-                self.drive_fixed_bind_shutdown_handoff(machine.shutdown_handoff.clone())
+            FixedBindLifecycleExecution::RetainActiveWhilePendingFixedBindClaimConflict {
+                route_key,
+                generation,
+            } => {
+                self.retained_active_facade_continuity
+                    .store(true, Ordering::Release);
+                eprintln!(
+                    "fs_meta_runtime_app: retain active facade while pending fixed-bind claim remains owned elsewhere route_key={} generation={}",
+                    route_key, generation
+                );
+                Ok(())
+            }
+            FixedBindLifecycleExecution::RetainPendingWhilePendingFixedBindClaimConflict {
+                route_key,
+                generation,
+            } => {
+                eprintln!(
+                    "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
+                    route_key, generation
+                );
+                Ok(())
+            }
+            FixedBindLifecycleExecution::ReleaseActiveForFixedBindHandoff {
+                route_key,
+                generation,
+                handoff,
+            } => {
+                eprintln!(
+                    "fs_meta_runtime_app: release active facade for fixed-bind handoff route_key={} generation={}",
+                    route_key, generation
+                );
+                self.retained_active_facade_continuity
+                    .store(false, Ordering::Release);
+                *self.pending_facade.lock().await = None;
+                Self::clear_pending_facade_status(&self.facade_pending_status);
+                let session = self
+                    .rebuild_fixed_bind_lifecycle_session(
+                        &session,
+                        "publish_facade_service_state_before_fixed_bind_release_handoff",
+                    )
+                    .await;
+                let _ = self
+                    .publish_facade_service_state_with_session(&session)
+                    .await;
+                self.wait_for_shared_worker_control_handoff().await;
+                self.drive_fixed_bind_shutdown_handoff(session, Some(handoff))
+                    .await?;
+                Ok(())
+            }
+            FixedBindLifecycleExecution::RetainPendingForFixedBindHandoff {
+                route_key,
+                generation,
+            } => {
+                eprintln!(
+                    "fs_meta_runtime_app: retain pending facade during fixed-bind continuity-preserving deactivate route_key={} generation={}",
+                    route_key, generation
+                );
+                Ok(())
+            }
+            FixedBindLifecycleExecution::RetainPendingWhileSpawnInFlight {
+                route_key,
+                generation,
+            } => {
+                eprintln!(
+                    "fs_meta_runtime_app: retain pending facade during in-flight spawn route_key={} generation={}",
+                    route_key, generation
+                );
+                Ok(())
+            }
+            FixedBindLifecycleExecution::Shutdown { handoff } => {
+                self.retained_active_facade_continuity
+                    .store(false, Ordering::Release);
+                *self.pending_facade.lock().await = None;
+                Self::clear_pending_facade_status(&self.facade_pending_status);
+                let session = self
+                    .rebuild_fixed_bind_lifecycle_session(
+                        &session,
+                        "publish_facade_service_state_before_fixed_bind_shutdown",
+                    )
+                    .await;
+                let _ = self
+                    .publish_facade_service_state_with_session(&session)
+                    .await;
+                self.wait_for_shared_worker_control_handoff().await;
+                self.drive_fixed_bind_shutdown_handoff(session, handoff)
                     .await?;
                 Ok(())
             }
         }
     }
 
-    async fn collect_facade_publication_input(&self) -> FacadePublicationInput {
+    async fn drive_fixed_bind_lifecycle_request(
+        &self,
+        request: FixedBindLifecycleRequest,
+    ) -> Result<()> {
+        let session = self.begin_fixed_bind_lifecycle_session().await;
+        let execution = session.evaluate(request);
+        self.execute_fixed_bind_lifecycle_execution(session, execution)
+            .await
+    }
+
+    async fn begin_fixed_bind_lifecycle_session(&self) -> FixedBindLifecycleSession {
+        FixedBindLifecycleSession::new(self.current_fixed_bind_lifecycle_view().await)
+    }
+
+    async fn rebuild_fixed_bind_lifecycle_session(
+        &self,
+        _session: &FixedBindLifecycleSession,
+        _reason: &'static str,
+    ) -> FixedBindLifecycleSession {
+        FixedBindLifecycleSession::new(self.current_fixed_bind_lifecycle_view().await)
+    }
+
+    async fn current_fixed_bind_lifecycle_view(&self) -> FixedBindLifecycleView {
+        FixedBindLifecycleView::from_facts(self.collect_fixed_bind_lifecycle_facts().await)
+    }
+
+    async fn settle_fixed_bind_claim_release_followup_with_session(
+        &self,
+        mut session: FixedBindLifecycleSession,
+    ) -> Result<(
+        FixedBindClaimReleaseFollowupSnapshot,
+        FixedBindLifecycleSession,
+    )> {
+        let mut snapshot = session.claim_release_followup_snapshot();
+        if snapshot.claim_release_followup_pending
+            && snapshot.pending_publication.is_some()
+            && snapshot.conflicting_process_claim.is_none()
+        {
+            let pending = snapshot.pending_publication.clone().expect(
+                "fixed-bind claim-release retry requires pending facade while publication followup remains incomplete",
+            );
+            self.retry_pending_facade(&pending.route_key, pending.generation, false)
+                .await?;
+            session = self
+                .rebuild_fixed_bind_lifecycle_session(
+                    &session,
+                    "retry_pending_facade_after_claim_release_followup",
+                )
+                .await;
+            snapshot = session.claim_release_followup_snapshot();
+        }
+        if snapshot.claim_release_followup_pending && snapshot.pending_publication.is_none() {
+            self.pending_fixed_bind_claim_release_followup
+                .store(false, Ordering::Release);
+        }
+        Ok((snapshot, session))
+    }
+
+    async fn publish_facade_service_state_with_session(
+        &self,
+        session: &FixedBindLifecycleSession,
+    ) -> FacadeServiceState {
+        let facade_snapshot = session.publication_snapshot();
+        let published = Self::publish_facade_publication_snapshot(
+            &self.facade_service_state,
+            &self.api_control_gate,
+            facade_snapshot,
+        );
+        let _ = self
+            .publish_current_rollout_status(facade_snapshot.publication_ready)
+            .await;
+        published
+    }
+
+    async fn collect_fixed_bind_lifecycle_facts(&self) -> FixedBindLifecycleFacts {
         let observation = Self::observe_facade_gate_from_parts(
             self.instance_id,
             self.api_task.clone(),
@@ -6487,13 +6748,6 @@ impl FSMetaApp {
                 false
             }
         };
-        FacadePublicationInput {
-            observation,
-            publication_ready,
-        }
-    }
-
-    async fn collect_facade_deactivate_input(&self) -> FacadeDeactivateInput {
         let pending = self.pending_facade.lock().await.clone();
         let fixed_bind = Self::build_fixed_bind_snapshot_for_pending_publication(
             self.instance_id,
@@ -6544,26 +6798,29 @@ impl FSMetaApp {
         } else {
             (None, None)
         };
-        FacadeDeactivateInput {
+        FixedBindLifecycleFacts {
+            observation,
+            publication_ready,
             fixed_bind,
             release_handoff,
             shutdown_handoff,
         }
     }
 
+    async fn settle_fixed_bind_claim_release_followup(
+        &self,
+    ) -> Result<FixedBindClaimReleaseFollowupSnapshot> {
+        let session = self.begin_fixed_bind_lifecycle_session().await;
+        let (snapshot, _) = self
+            .settle_fixed_bind_claim_release_followup_with_session(session)
+            .await?;
+        Ok(snapshot)
+    }
+
     async fn current_facade_service_state(&self) -> FacadeServiceState {
-        let machine =
-            FacadePublicationMachine::from_input(self.collect_facade_publication_input().await);
-        let facade_snapshot = machine.snapshot();
-        let published = Self::publish_facade_publication_snapshot(
-            &self.facade_service_state,
-            &self.api_control_gate,
-            facade_snapshot,
-        );
-        let _ = self
-            .publish_current_rollout_status(facade_snapshot.publication_ready)
-            .await;
-        published
+        let session = self.begin_fixed_bind_lifecycle_session().await;
+        self.publish_facade_service_state_with_session(&session)
+            .await
     }
 
     async fn publish_current_rollout_status(
@@ -6644,16 +6901,9 @@ impl FSMetaApp {
             resource_ids,
             handle: active_facade,
         });
-        let machine =
-            FacadePublicationMachine::from_input(self.collect_facade_publication_input().await);
-        let facade_snapshot = machine.snapshot();
-        let _ = Self::publish_facade_publication_snapshot(
-            &self.facade_service_state,
-            &self.api_control_gate,
-            facade_snapshot,
-        );
+        let fixed_bind_session = self.begin_fixed_bind_lifecycle_session().await;
         let _ = self
-            .publish_current_rollout_status(facade_snapshot.publication_ready)
+            .publish_facade_service_state_with_session(&fixed_bind_session)
             .await;
         true
     }
@@ -6913,12 +7163,10 @@ impl FSMetaApp {
         }
         eprintln!("fs_meta_runtime_app: initialize_from_control endpoints ok");
         self.update_runtime_control_state(|state| state.mark_initialized());
-        self.api_control_gate.set_ready(
-            FacadePublicationMachine::from_input(self.collect_facade_publication_input().await)
-                .snapshot()
-                .publication_ready,
-        );
-        let _ = self.current_facade_service_state().await;
+        let fixed_bind_session = self.begin_fixed_bind_lifecycle_session().await;
+        let _ = self
+            .publish_facade_service_state_with_session(&fixed_bind_session)
+            .await;
         eprintln!("fs_meta_runtime_app: initialize_from_control done");
 
         Ok(())
@@ -8082,7 +8330,9 @@ impl FSMetaApp {
                     .load(Ordering::Acquire),
             )
             .await;
-            let machine = FacadeDeactivateMachine {
+            let machine = FixedBindLifecycleMachine {
+                observation: FacadeGateObservation::inert(),
+                publication_ready: false,
                 fixed_bind,
                 release_handoff: None,
                 shutdown_handoff: None,
@@ -8465,6 +8715,13 @@ impl FSMetaApp {
             };
             (continuity.0, continuity.1, api_task_guard.is_some())
         };
+        let replacement_wait_reason = Self::facade_replacement_wait_reason(
+            source.as_ref(),
+            sink.as_ref(),
+            &pending,
+            replacing_existing,
+        )
+        .await?;
         if reuse_current_generation {
             let active_matches = registrant
                 .api_task
@@ -8477,6 +8734,14 @@ impl FSMetaApp {
                         && active.generation == pending.generation
                 });
             if active_matches {
+                if let Some(wait_reason) = replacement_wait_reason {
+                    Self::set_pending_facade_status_waiting(
+                        &facade_pending_status,
+                        &pending,
+                        wait_reason,
+                    );
+                    return Ok(false);
+                }
                 let mut pending_guard = registrant.pending_facade.lock().await;
                 if pending_guard.as_ref().is_some_and(|candidate| {
                     candidate.route_key == pending.route_key
@@ -8510,6 +8775,15 @@ impl FSMetaApp {
                     && active.generation == active_generation
             });
             if active_matches {
+                if let Some(wait_reason) = replacement_wait_reason {
+                    drop(api_task_guard);
+                    Self::set_pending_facade_status_waiting(
+                        &facade_pending_status,
+                        &pending,
+                        wait_reason,
+                    );
+                    return Ok(false);
+                }
                 if let Some(active) = api_task_guard.as_mut() {
                     active.generation = pending.generation;
                 }
@@ -8539,14 +8813,7 @@ impl FSMetaApp {
                 return Ok(true);
             }
         }
-        if let Some(wait_reason) = Self::facade_replacement_wait_reason(
-            source.as_ref(),
-            sink.as_ref(),
-            &pending,
-            replacing_existing,
-        )
-        .await?
-        {
+        if let Some(wait_reason) = replacement_wait_reason {
             Self::set_pending_facade_status_waiting(&facade_pending_status, &pending, wait_reason);
             return Ok(false);
         }
@@ -8981,8 +9248,11 @@ impl FSMetaApp {
             let drained = std::mem::take(&mut *retained);
             drained.into_values().collect::<Vec<_>>()
         };
+        let mut fixed_bind_session = self.begin_fixed_bind_lifecycle_session().await;
         for signal in signals {
-            self.apply_facade_signal(signal).await?;
+            fixed_bind_session = self
+                .apply_facade_signal_with_session(fixed_bind_session, signal)
+                .await?;
         }
         Ok(())
     }
@@ -9047,15 +9317,15 @@ impl FSMetaApp {
             || is_per_peer_sink_query_request_route(route_key)
     }
 
-    async fn filter_sink_facade_dependent_route_activates_during_pending_fixed_bind_claim(
+    async fn filter_sink_facade_dependent_route_activates_during_pending_fixed_bind_claim_with_session(
         &self,
         sink_signals: &[SinkControlSignal],
+        session: &FixedBindLifecycleSession,
     ) -> Vec<SinkControlSignal> {
-        let machine =
-            FacadeDeactivateMachine::from_input(self.collect_facade_deactivate_input().await);
-        let allow_routes = machine.fixed_bind.conflicting_process_claim.is_none()
-            && (!machine.fixed_bind.claim_release_followup_pending
-                || machine.fixed_bind.pending_publication.is_none());
+        let followup_snapshot = session.claim_release_followup_snapshot();
+        let allow_routes = followup_snapshot.conflicting_process_claim.is_none()
+            && (!followup_snapshot.claim_release_followup_pending
+                || followup_snapshot.pending_publication.is_none());
         let mut filtered = Vec::with_capacity(sink_signals.len());
         for signal in sink_signals {
             match signal {
@@ -9086,6 +9356,21 @@ impl FSMetaApp {
         generation: u64,
         bound_scopes: &[RuntimeBoundScope],
     ) -> Result<()> {
+        let session = self.begin_fixed_bind_lifecycle_session().await;
+        let _ = self
+            .apply_facade_activate_with_session(session, unit, route_key, generation, bound_scopes)
+            .await?;
+        Ok(())
+    }
+
+    async fn apply_facade_activate_with_session(
+        &self,
+        mut session: FixedBindLifecycleSession,
+        unit: FacadeRuntimeUnit,
+        route_key: &str,
+        generation: u64,
+        bound_scopes: &[RuntimeBoundScope],
+    ) -> Result<FixedBindLifecycleSession> {
         eprintln!(
             "fs_meta_runtime_app: apply_facade_activate unit={} route_key={} generation={} scopes={}",
             unit.unit_id(),
@@ -9094,37 +9379,20 @@ impl FSMetaApp {
             bound_scopes.len()
         );
         if !facade_route_key_matches(unit, route_key) {
-            return Ok(());
+            return Ok(session);
         }
         if matches!(
             unit,
             FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer
         ) {
-            let mut machine =
-                FacadeDeactivateMachine::from_input(self.collect_facade_deactivate_input().await);
-            if machine.fixed_bind.claim_release_followup_pending
-                && machine.fixed_bind.pending_publication.is_some()
-                && machine.fixed_bind.conflicting_process_claim.is_none()
-            {
-                let pending = machine.fixed_bind.pending_publication.clone().expect(
-                    "facade activate retry requires pending facade while fixed-bind publication remains incomplete",
-                );
-                self.retry_pending_facade(&pending.route_key, pending.generation, false)
-                    .await?;
-                machine = FacadeDeactivateMachine::from_input(
-                    self.collect_facade_deactivate_input().await,
-                );
-            }
-            let publication_completed = machine.fixed_bind.claim_release_followup_pending
-                && machine.fixed_bind.pending_publication.is_none();
-            let publication_still_incomplete = machine.fixed_bind.claim_release_followup_pending
-                && machine.fixed_bind.pending_publication.is_some()
-                && machine.fixed_bind.conflicting_process_claim.is_none();
-            if publication_completed {
-                self.pending_fixed_bind_claim_release_followup
-                    .store(false, Ordering::Release);
-            }
-            if machine.fixed_bind.conflicting_process_claim.is_some() {
+            let (followup_snapshot, next_session) = self
+                .settle_fixed_bind_claim_release_followup_with_session(session)
+                .await?;
+            session = next_session;
+            let publication_still_incomplete = followup_snapshot.claim_release_followup_pending
+                && followup_snapshot.pending_publication.is_some()
+                && followup_snapshot.conflicting_process_claim.is_none();
+            if followup_snapshot.conflicting_process_claim.is_some() {
                 self.pending_fixed_bind_has_suppressed_dependent_routes
                     .store(true, Ordering::Release);
                 self.record_suppressed_public_query_activate(
@@ -9140,7 +9408,7 @@ impl FSMetaApp {
                     route_key,
                     generation
                 );
-                return Ok(());
+                return Ok(session);
             }
             if publication_still_incomplete {
                 self.pending_fixed_bind_has_suppressed_dependent_routes
@@ -9158,7 +9426,7 @@ impl FSMetaApp {
                     route_key,
                     generation
                 );
-                return Ok(());
+                return Ok(session);
             }
         }
         // Facade activation is a runtime-owned generation/bind/run handoff carrier.
@@ -9175,7 +9443,7 @@ impl FSMetaApp {
                 unit_id,
                 generation
             );
-            return Ok(());
+            return Ok(session);
         }
         if matches!(unit, FacadeRuntimeUnit::Query) {
             self.mirrored_query_peer_routes
@@ -9203,7 +9471,7 @@ impl FSMetaApp {
         }
         let facade_control_route_key = format!("{}.stream", ROUTE_KEY_FACADE_CONTROL);
         if matches!(unit, FacadeRuntimeUnit::Query) || route_key != facade_control_route_key {
-            return Ok(());
+            return Ok(session);
         }
         self.retained_active_facade_continuity
             .store(false, Ordering::Release);
@@ -9253,6 +9521,7 @@ impl FSMetaApp {
             if let Some(current) = api_task.as_mut()
                 && current.route_key == route_key
                 && current.resource_ids == candidate_resource_ids
+                && !runtime_managed
             {
                 current.generation = generation;
                 drop(api_task);
@@ -9265,8 +9534,16 @@ impl FSMetaApp {
                 }
                 Self::clear_pending_facade_status(&self.facade_pending_status);
                 drop(pending);
-                let _ = self.current_facade_service_state().await;
-                return Ok(());
+                session = self
+                    .rebuild_fixed_bind_lifecycle_session(
+                        &session,
+                        "publish_facade_service_state_after_facade_activate_generation_update",
+                    )
+                    .await;
+                let _ = self
+                    .publish_facade_service_state_with_session(&session)
+                    .await;
+                return Ok(session);
             }
         }
         let runtime_exposure_confirmed = !runtime_managed;
@@ -9281,22 +9558,27 @@ impl FSMetaApp {
             resolved,
         };
         *self.pending_facade.lock().await = Some(pending.clone());
-        let _ = self.current_facade_service_state().await;
+        session = self
+            .rebuild_fixed_bind_lifecycle_session(
+                &session,
+                "publish_facade_service_state_after_pending_facade_activate",
+            )
+            .await;
+        let _ = self
+            .publish_facade_service_state_with_session(&session)
+            .await;
         if !self.try_spawn_pending_facade().await? {
             eprintln!(
                 "fs_meta_runtime_app: pending facade generation={} route_key={} runtime_exposure_confirmed={}",
                 pending.generation, pending.route_key, pending.runtime_exposure_confirmed
             );
         }
-        Ok(())
+        Ok(session)
     }
 
     #[cfg(test)]
     async fn shutdown_active_facade(&self) {
-        let machine = FacadeDeactivateMachine::from_input(
-            self.collect_facade_deactivate_input().await,
-        );
-        self.execute_fixed_bind_handoff_action(&machine, FixedBindHandoffAction::Shutdown)
+        self.drive_fixed_bind_lifecycle_request(FixedBindLifecycleRequest::Shutdown)
             .await
             .expect("shutdown handoff should complete");
     }
@@ -9347,7 +9629,10 @@ impl FSMetaApp {
             state.mark_uninitialized_with_full_replay();
         });
         self.api_control_gate.set_ready(false);
-        let _ = self.current_facade_service_state().await;
+        let fixed_bind_session = self.begin_fixed_bind_lifecycle_session().await;
+        let _ = self
+            .publish_facade_service_state_with_session(&fixed_bind_session)
+            .await;
         self.initialize_from_control(true, true).await
     }
 
@@ -9359,7 +9644,10 @@ impl FSMetaApp {
             state.mark_uninitialized_with_full_replay();
         });
         self.api_control_gate.set_ready(false);
-        let _ = self.current_facade_service_state().await;
+        let fixed_bind_session = self.begin_fixed_bind_lifecycle_session().await;
+        let _ = self
+            .publish_facade_service_state_with_session(&fixed_bind_session)
+            .await;
         self.initialize_from_control_with_deadline(true, true, Some(deadline))
             .await
     }
@@ -9369,7 +9657,10 @@ impl FSMetaApp {
             state.mark_uninitialized_with_full_replay();
         });
         self.api_control_gate.set_ready(false);
-        let _ = self.current_facade_service_state().await;
+        let fixed_bind_session = self.begin_fixed_bind_lifecycle_session().await;
+        let _ = self
+            .publish_facade_service_state_with_session(&fixed_bind_session)
+            .await;
         self.retained_active_facade_continuity
             .store(false, Ordering::Release);
         self.clear_shared_source_route_claims_for_instance().await;
@@ -9967,13 +10258,15 @@ impl FSMetaApp {
         replay_retained_state: bool,
         fail_closed_in_generation_cutover_lane: bool,
     ) -> Result<()> {
+        let fixed_bind_session = self.begin_fixed_bind_lifecycle_session().await;
         let filtered_sink_signals = self
-            .filter_sink_facade_dependent_route_activates_during_pending_fixed_bind_claim(
+            .filter_sink_facade_dependent_route_activates_during_pending_fixed_bind_claim_with_session(
                 &self
                     .filter_shared_sink_route_deactivates(
                         &self.filter_stale_sink_ticks(sink_signals).await,
                     )
                     .await,
+                &fixed_bind_session,
             )
             .await;
         if self.control_initialized()
@@ -10193,18 +10486,12 @@ impl FSMetaApp {
             })
         };
         let retain_pending_spawn = self.pending_spawn_in_flight_for_route_key(route_key).await;
-        let machine = FacadeDeactivateMachine::from_input(
-            self.collect_facade_deactivate_input().await,
-        );
-        self.execute_fixed_bind_handoff_action(
-            &machine,
-            FixedBindHandoffAction::Deactivate {
-                route_key: route_key.to_string(),
-                generation,
-                retain_active_facade,
-                retain_pending_spawn,
-            },
-        )
+        self.drive_fixed_bind_lifecycle_request(FixedBindLifecycleRequest::Deactivate {
+            route_key: route_key.to_string(),
+            generation,
+            retain_active_facade,
+            retain_pending_spawn,
+        })
         .await
         .map(|_| ())
     }
@@ -10235,6 +10522,18 @@ impl FSMetaApp {
     }
 
     async fn apply_facade_signal(&self, signal: FacadeControlSignal) -> Result<()> {
+        let session = self.begin_fixed_bind_lifecycle_session().await;
+        let _ = self
+            .apply_facade_signal_with_session(session, signal)
+            .await?;
+        Ok(())
+    }
+
+    async fn apply_facade_signal_with_session(
+        &self,
+        session: FixedBindLifecycleSession,
+        signal: FacadeControlSignal,
+    ) -> Result<FixedBindLifecycleSession> {
         match signal {
             FacadeControlSignal::Activate {
                 unit,
@@ -10242,8 +10541,15 @@ impl FSMetaApp {
                 generation,
                 bound_scopes,
             } => {
-                self.apply_facade_activate(unit, &route_key, generation, &bound_scopes)
-                    .await?;
+                return self
+                    .apply_facade_activate_with_session(
+                        session,
+                        unit,
+                        &route_key,
+                        generation,
+                        &bound_scopes,
+                    )
+                    .await;
             }
             FacadeControlSignal::Deactivate {
                 unit,
@@ -10298,7 +10604,7 @@ impl FSMetaApp {
             FacadeControlSignal::RuntimeHostGrantChange { .. }
             | FacadeControlSignal::Passthrough => {}
         }
-        Ok(())
+        Ok(session)
     }
 
     #[cfg(test)]
@@ -10534,8 +10840,11 @@ impl FSMetaApp {
         let facade_claim_signals_present = !facade_claim_signals.is_empty();
         let mut pretriggered_source_to_sink_convergence_epoch = None::<u64>;
         let mut sink_recovery_tail_plan = SinkRecoveryTailPlan::new();
+        let mut fixed_bind_session = self.begin_fixed_bind_lifecycle_session().await;
         for signal in facade_claim_signals {
-            self.apply_facade_signal(signal).await?;
+            fixed_bind_session = self
+                .apply_facade_signal_with_session(fixed_bind_session, signal)
+                .await?;
         }
         let sink_tick_fast_path_eligible =
             self.sink.current_generation_tick_fast_path_eligible().await;
@@ -10564,7 +10873,9 @@ impl FSMetaApp {
         );
         if facade_cleanup_only_while_uninitialized {
             for signal in facade_publication_signals.drain(..) {
-                self.apply_facade_signal(signal).await?;
+                fixed_bind_session = self
+                    .apply_facade_signal_with_session(fixed_bind_session, signal)
+                    .await?;
             }
             eprintln!(
                 "fs_meta_runtime_app: on_control_frame cleanup-only facade followup left runtime uninitialized"
@@ -10879,20 +11190,20 @@ impl FSMetaApp {
         {
             fixed_bind_addrs.insert(pending_bind_addr);
         }
-        let machine = FacadeDeactivateMachine::from_input(
-            self.collect_facade_deactivate_input().await,
-        );
         *self.pending_facade.lock().await = None;
         *self.facade_spawn_in_progress.lock().await = None;
         Self::clear_pending_facade_status(&self.facade_pending_status);
-        self.execute_fixed_bind_handoff_action(&machine, FixedBindHandoffAction::Shutdown)
+        self.drive_fixed_bind_lifecycle_request(FixedBindLifecycleRequest::Shutdown)
             .await?;
         self.closing.store(true, Ordering::Release);
         self.update_runtime_control_state(|state| {
             state.mark_uninitialized_preserving_replay();
         });
         self.api_control_gate.set_ready(false);
-        let _ = self.current_facade_service_state().await;
+        let fixed_bind_session = self.begin_fixed_bind_lifecycle_session().await;
+        let _ = self
+            .publish_facade_service_state_with_session(&fixed_bind_session)
+            .await;
         clear_owned_process_facade_claim(self.instance_id);
         for bind_addr in fixed_bind_addrs {
             clear_active_fixed_bind_facade_owner(&bind_addr, self.instance_id);

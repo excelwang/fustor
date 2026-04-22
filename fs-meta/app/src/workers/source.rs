@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RuntimeWorkerBinding};
 use capanix_app_sdk::{CnxError, Event, Result};
 use capanix_runtime_entry_sdk::advanced::boundary::{
@@ -138,95 +139,787 @@ impl SourceProgressState {
     }
 }
 
-#[derive(Debug)]
-enum SourceControlFrameEffect {
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SourceControlFrameLaneInspect {
     RetainedTickFastPath,
     RetainedTickReplay,
-    Attempt { timeout: Duration },
-    ReconnectThenAttempt,
-    ReconnectThenWait { after: SourceProgressState },
-    ReconnectThenReplayRetainedTick,
-    ReconnectThenFail(CnxError),
-    Wait { after: SourceProgressState },
-    ApplyPostAckSignalsThenComplete,
-    ApplyPostAckSignalsThenArmReplayAndRefreshScheduledGroups { expect_local_runnable_groups: bool },
-    Complete,
-    RefreshScheduledGroups { expect_local_runnable_groups: bool },
-    ArmReplayThenRefreshScheduledGroups { expect_local_runnable_groups: bool },
-    Fail(CnxError),
+    Attempt,
+    Reconnect,
+    Wait {
+        after: SourceProgressState,
+        deadline: std::time::Instant,
+    },
+    ApplyPostAckCacheAndRetainSignals {
+        cache_priming: SourceControlFramePostAckCachePriming,
+    },
+    ArmReplay,
+    RefreshScheduledGroups {
+        scheduled_groups_expectation: SourceScheduledGroupsExpectation,
+        deadline: std::time::Instant,
+    },
 }
 
+#[async_trait]
+trait SourceControlFrameLane: Send {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn inspect(&self) -> SourceControlFrameLaneInspect;
+
+    async fn execute(
+        self: Box<Self>,
+        handle: &SourceWorkerClientHandle,
+    ) -> std::result::Result<SourceControlFrameEvent, SourceFailure>;
+}
+
+type SourceControlFrameRun = Box<dyn SourceControlFrameLane>;
+
+struct RetainedTickFastPathLane {
+    signals: Vec<SourceControlSignal>,
+}
+
+#[async_trait]
+impl SourceControlFrameLane for RetainedTickFastPathLane {
+    fn inspect(&self) -> SourceControlFrameLaneInspect {
+        SourceControlFrameLaneInspect::RetainedTickFastPath
+    }
+
+    async fn execute(
+        self: Box<Self>,
+        handle: &SourceWorkerClientHandle,
+    ) -> std::result::Result<SourceControlFrameEvent, SourceFailure> {
+        handle.apply_control_frame_retained_tick_fast_path(&self.signals);
+        Ok(SourceControlFrameEvent::RetainedTickFastPathApplied)
+    }
+}
+
+struct RetainedTickReplayLane {
+    deadline: std::time::Instant,
+}
+
+#[async_trait]
+impl SourceControlFrameLane for RetainedTickReplayLane {
+    fn inspect(&self) -> SourceControlFrameLaneInspect {
+        SourceControlFrameLaneInspect::RetainedTickReplay
+    }
+
+    async fn execute(
+        self: Box<Self>,
+        handle: &SourceWorkerClientHandle,
+    ) -> std::result::Result<SourceControlFrameEvent, SourceFailure> {
+        handle
+            .replay_control_frame_retained_tick(self.deadline)
+            .await?;
+        Ok(SourceControlFrameEvent::RetainedTickReplayCompleted)
+    }
+}
+
+struct AttemptLane {
+    envelopes: Arc<[ControlEnvelope]>,
+    timeout: Duration,
+}
+
+#[async_trait]
+impl SourceControlFrameLane for AttemptLane {
+    fn inspect(&self) -> SourceControlFrameLaneInspect {
+        SourceControlFrameLaneInspect::Attempt
+    }
+
+    async fn execute(
+        self: Box<Self>,
+        handle: &SourceWorkerClientHandle,
+    ) -> std::result::Result<SourceControlFrameEvent, SourceFailure> {
+        let (rpc_result, after) = handle
+            .perform_control_frame_attempt(&self.envelopes, self.timeout)
+            .await;
+        Ok(SourceControlFrameEvent::RpcCompleted { rpc_result, after })
+    }
+}
+
+struct ReconnectLane;
+
+#[async_trait]
+impl SourceControlFrameLane for ReconnectLane {
+    fn inspect(&self) -> SourceControlFrameLaneInspect {
+        SourceControlFrameLaneInspect::Reconnect
+    }
+
+    async fn execute(
+        self: Box<Self>,
+        handle: &SourceWorkerClientHandle,
+    ) -> std::result::Result<SourceControlFrameEvent, SourceFailure> {
+        handle.reconnect_for_control_frame().await?;
+        Ok(SourceControlFrameEvent::ReconnectCompleted)
+    }
+}
+
+struct WaitLane {
+    after: SourceProgressState,
+    deadline: std::time::Instant,
+}
+
+#[async_trait]
+impl SourceControlFrameLane for WaitLane {
+    fn inspect(&self) -> SourceControlFrameLaneInspect {
+        SourceControlFrameLaneInspect::Wait {
+            after: self.after,
+            deadline: self.deadline,
+        }
+    }
+
+    async fn execute(
+        self: Box<Self>,
+        handle: &SourceWorkerClientHandle,
+    ) -> std::result::Result<SourceControlFrameEvent, SourceFailure> {
+        handle
+            .wait_control_frame_retry_after(self.after, self.deadline)
+            .await;
+        Ok(SourceControlFrameEvent::WaitCompleted)
+    }
+}
+
+struct ApplyPostAckCacheAndRetainSignalsLane {
+    signals: Vec<SourceControlSignal>,
+    cache_priming: SourceControlFramePostAckCachePriming,
+}
+
+#[async_trait]
+impl SourceControlFrameLane for ApplyPostAckCacheAndRetainSignalsLane {
+    fn inspect(&self) -> SourceControlFrameLaneInspect {
+        SourceControlFrameLaneInspect::ApplyPostAckCacheAndRetainSignals {
+            cache_priming: self.cache_priming,
+        }
+    }
+
+    async fn execute(
+        self: Box<Self>,
+        handle: &SourceWorkerClientHandle,
+    ) -> std::result::Result<SourceControlFrameEvent, SourceFailure> {
+        handle
+            .apply_post_ack_cache_and_retain_signals(&self.signals, self.cache_priming)
+            .await;
+        Ok(SourceControlFrameEvent::PostAckCacheAndSignalsRetained)
+    }
+}
+
+struct ArmReplayLane;
+
+#[async_trait]
+impl SourceControlFrameLane for ArmReplayLane {
+    fn inspect(&self) -> SourceControlFrameLaneInspect {
+        SourceControlFrameLaneInspect::ArmReplay
+    }
+
+    async fn execute(
+        self: Box<Self>,
+        handle: &SourceWorkerClientHandle,
+    ) -> std::result::Result<SourceControlFrameEvent, SourceFailure> {
+        handle.arm_control_frame_replay().await;
+        Ok(SourceControlFrameEvent::ArmReplayCompleted)
+    }
+}
+
+struct RefreshScheduledGroupsLane {
+    scheduled_groups_expectation: SourceScheduledGroupsExpectation,
+    deadline: std::time::Instant,
+}
+
+#[async_trait]
+impl SourceControlFrameLane for RefreshScheduledGroupsLane {
+    fn inspect(&self) -> SourceControlFrameLaneInspect {
+        SourceControlFrameLaneInspect::RefreshScheduledGroups {
+            scheduled_groups_expectation: self.scheduled_groups_expectation,
+            deadline: self.deadline,
+        }
+    }
+
+    async fn execute(
+        self: Box<Self>,
+        handle: &SourceWorkerClientHandle,
+    ) -> std::result::Result<SourceControlFrameEvent, SourceFailure> {
+        Ok(SourceControlFrameEvent::RefreshScheduledGroupsCompleted {
+            refresh_result: handle
+                .refresh_scheduled_groups_for_control_frame(
+                    self.deadline,
+                    self.scheduled_groups_expectation,
+                )
+                .await,
+        })
+    }
+}
+
+enum SourceControlFrameTerminal {
+    Complete,
+    Fail(SourceFailure),
+}
+
+enum SourceControlFrameStep {
+    Run(SourceControlFrameRun),
+    Terminal(SourceControlFrameTerminal),
+}
+
+impl SourceControlFrameStep {
+    fn run<L>(lane: L) -> Self
+    where
+        L: SourceControlFrameLane + 'static,
+    {
+        Self::Run(Box::new(lane))
+    }
+
+    const fn complete() -> Self {
+        Self::Terminal(SourceControlFrameTerminal::Complete)
+    }
+
+    fn fail(failure: SourceFailure) -> Self {
+        Self::Terminal(SourceControlFrameTerminal::Fail(failure))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn inspect(&self) -> Option<SourceControlFrameLaneInspect> {
+        match self {
+            Self::Run(lane) => Some(lane.inspect()),
+            Self::Terminal(_) => None,
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn terminal(&self) -> Option<&SourceControlFrameTerminal> {
+        match self {
+            Self::Run(_) => None,
+            Self::Terminal(terminal) => Some(terminal),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn is_complete(&self) -> bool {
+        matches!(self.terminal(), Some(SourceControlFrameTerminal::Complete))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn terminal_error(&self) -> Option<&CnxError> {
+        match self.terminal() {
+            Some(SourceControlFrameTerminal::Fail(failure)) => Some(failure.as_error()),
+            _ => None,
+        }
+    }
+}
+
+enum SourceControlFrameInitialStep {
+    Run(SourceControlFrameRun),
+    Reconnect(SourceControlFrameReconnectResume),
+}
+
+impl SourceControlFrameInitialStep {
+    fn run<L>(lane: L) -> Self
+    where
+        L: SourceControlFrameLane + 'static,
+    {
+        Self::Run(Box::new(lane))
+    }
+}
+
+#[derive(Clone, Debug)]
+enum SourceControlFrameTickOnlyDisposition {
+    RetainedTickFastPath { signals: Vec<SourceControlSignal> },
+    RetainedTickReplay,
+    Reconnect,
+}
+
+#[derive(Clone, Debug)]
 enum SourceControlFrameDecodedSignals {
     Decoded(Vec<SourceControlSignal>),
     DecodeFailed,
 }
 
-enum SourceControlFrameEvent<'a> {
+struct SourceControlFrameFacts {
+    envelopes: Arc<[ControlEnvelope]>,
+    decoded_signals: SourceControlFrameDecodedSignals,
+    primed_local_schedule: Option<PrimedLocalScheduleSummary>,
+    post_ack_refresh_requirement: SourceControlFramePostAckRefreshRequirement,
+    initial_step: Option<SourceControlFrameInitialStep>,
+    operation_deadline: std::time::Instant,
+    rpc_timeout: Duration,
+    existing_client_present: bool,
+    bridge_reset_policy: SourceControlFrameBridgeResetPolicy,
+    timeout_reset_policy: SourceControlFrameTimeoutResetPolicy,
+    attempt_timeout_policy: SourceControlFrameAttemptTimeoutPolicy,
+}
+
+enum SourceControlFrameEvent {
+    RetainedTickFastPathApplied,
+    RetainedTickReplayCompleted,
     RpcCompleted {
         rpc_result: std::result::Result<SourceWorkerResponse, CnxError>,
         after: SourceProgressState,
-        decoded_signals: &'a SourceControlFrameDecodedSignals,
-        primed_local_schedule: Option<PrimedLocalScheduleSummary>,
     },
-    ReconnectThenAttemptCompleted,
-    ReconnectThenWaitCompleted {
-        after: SourceProgressState,
-    },
-    ReconnectThenReplayRetainedTickCompleted,
-    ReconnectThenFailCompleted(CnxError),
+    ReconnectCompleted,
     WaitCompleted,
-    ApplyPostAckSignalsThenCompleteCompleted,
-    ApplyPostAckSignalsThenArmReplayAndRefreshScheduledGroupsCompleted {
-        expect_local_runnable_groups: bool,
-    },
+    PostAckCacheAndSignalsRetained,
+    ArmReplayCompleted,
     RefreshScheduledGroupsCompleted {
-        refresh_result: std::result::Result<(), ScheduledGroupsRefreshFailure>,
+        refresh_result: std::result::Result<(), SourceFailure>,
     },
-    ArmReplayThenRefreshScheduledGroupsCompleted {
-        refresh_result: std::result::Result<(), ScheduledGroupsRefreshFailure>,
-    },
-}
-
-enum SourceControlFrameExecutorOutcome<'a> {
-    Event(SourceControlFrameEvent<'a>),
-    Complete,
-    Fail(CnxError),
 }
 
 struct SourceControlFrameExecutor<'a> {
     handle: &'a SourceWorkerClientHandle,
-    envelopes: &'a [ControlEnvelope],
-    decoded_signals: SourceControlFrameDecodedSignals,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SourceControlFrameAttemptTimeoutPolicy {
+    Standard,
+    PreferShortIfExistingClient,
+}
+
+impl SourceControlFrameAttemptTimeoutPolicy {
+    const fn timeout_cap(self, existing_client_present: bool, rpc_timeout: Duration) -> Duration {
+        match self {
+            Self::Standard => rpc_timeout,
+            Self::PreferShortIfExistingClient if existing_client_present => {
+                SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT
+            }
+            Self::PreferShortIfExistingClient => rpc_timeout,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SourceControlFrameBridgeResetPolicy {
+    RetryAfterReconnect,
+    ReconnectThenFail,
+    FailImmediately,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SourceControlFrameTimeoutResetPolicy {
+    Standard,
+    GenerationOneActivateWave,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SourceControlFrameTimeoutResetObservation {
+    Clear,
+    Seen,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SourceControlFrameRequestAttemptKind {
+    ControlFrame,
+    RetainedReplay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceControlFramePostAckCachePriming {
+    Standard,
+    ReplayRecovery,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SourceControlFramePostAckRefreshRequirement {
+    NotRequired,
+    Required,
+}
+
+impl SourceControlFramePostAckRefreshRequirement {
+    fn replay_required_refresh_expectation(
+        self,
+        primed_local_schedule: Option<PrimedLocalScheduleSummary>,
+    ) -> Option<SourceScheduledGroupsExpectation> {
+        match primed_local_schedule {
+            None => matches!(self, Self::Required)
+                .then_some(SourceScheduledGroupsExpectation::DoNotExpectLocalRunnableGroups),
+            Some(primed_local_schedule) => {
+                let scheduled_groups_expectation = if primed_local_schedule
+                    .saw_activate_with_bound_scopes
+                    && primed_local_schedule.has_local_runnable_groups
+                {
+                    SourceScheduledGroupsExpectation::ExpectLocalRunnableGroups
+                } else {
+                    SourceScheduledGroupsExpectation::DoNotExpectLocalRunnableGroups
+                };
+                let should_refresh_cached_schedule = matches!(self, Self::Required)
+                    && !(primed_local_schedule.saw_activate_with_bound_scopes
+                        && !primed_local_schedule.has_local_runnable_groups);
+                should_refresh_cached_schedule.then_some(scheduled_groups_expectation)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SourceControlFrameSignalPolicies {
+    timeout_reset_policy: SourceControlFrameTimeoutResetPolicy,
+    attempt_timeout_policy: SourceControlFrameAttemptTimeoutPolicy,
+    post_ack_refresh_requirement: SourceControlFramePostAckRefreshRequirement,
+}
+
+impl SourceControlFrameSignalPolicies {
+    const fn standard() -> Self {
+        Self {
+            timeout_reset_policy: SourceControlFrameTimeoutResetPolicy::Standard,
+            attempt_timeout_policy: SourceControlFrameAttemptTimeoutPolicy::Standard,
+            post_ack_refresh_requirement: SourceControlFramePostAckRefreshRequirement::NotRequired,
+        }
+    }
+
+    fn from_signals(signals: &[SourceControlSignal]) -> Self {
+        let mut saw_generation_one_activate = false;
+        let mut generation_one_activate_only = true;
+        let mut prefer_short_existing_client_attempt = false;
+        let mut post_ack_refresh_requirement =
+            SourceControlFramePostAckRefreshRequirement::NotRequired;
+
+        for signal in signals {
+            match signal {
+                SourceControlSignal::Activate {
+                    generation,
+                    bound_scopes,
+                    ..
+                } => {
+                    prefer_short_existing_client_attempt = true;
+                    if !bound_scopes.is_empty() {
+                        post_ack_refresh_requirement =
+                            SourceControlFramePostAckRefreshRequirement::Required;
+                    }
+                    if *generation == 1 {
+                        saw_generation_one_activate = true;
+                    } else {
+                        generation_one_activate_only = false;
+                    }
+                }
+                SourceControlSignal::Deactivate { .. }
+                | SourceControlSignal::Tick { .. }
+                | SourceControlSignal::ManualRescan { .. }
+                | SourceControlSignal::Passthrough(_) => {
+                    prefer_short_existing_client_attempt = true;
+                    generation_one_activate_only = false;
+                }
+                _ => {
+                    generation_one_activate_only = false;
+                }
+            }
+        }
+
+        if !saw_generation_one_activate {
+            generation_one_activate_only = false;
+        }
+
+        Self {
+            timeout_reset_policy: if generation_one_activate_only {
+                SourceControlFrameTimeoutResetPolicy::GenerationOneActivateWave
+            } else {
+                SourceControlFrameTimeoutResetPolicy::Standard
+            },
+            attempt_timeout_policy: if prefer_short_existing_client_attempt {
+                SourceControlFrameAttemptTimeoutPolicy::PreferShortIfExistingClient
+            } else {
+                SourceControlFrameAttemptTimeoutPolicy::Standard
+            },
+            post_ack_refresh_requirement,
+        }
+    }
+}
+
+impl SourceControlFramePostAckCachePriming {
+    fn apply_to_cache(
+        self,
+        cache: &mut SourceWorkerSnapshotCache,
+        node_id: &NodeId,
+        signals: &[SourceControlSignal],
+        fallback_roots: &[RootSpec],
+        fallback_grants: &[GrantedMountRoot],
+    ) {
+        let _ = prime_cached_schedule_from_control_signals(
+            cache,
+            node_id,
+            signals,
+            fallback_roots,
+            fallback_grants,
+        );
+        prime_cached_control_summary_from_control_signals(cache, node_id, signals, fallback_grants);
+        cache.observability_control_summary_override_by_node = None;
+        if matches!(self, Self::ReplayRecovery) {
+            prime_cached_schedule_from_control_signals_for_replay_recovery(
+                cache,
+                node_id,
+                signals,
+                fallback_roots,
+                fallback_grants,
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SourceControlFrameReconnectResume {
+    Attempt,
+    Wait(SourceProgressState),
+    RetainedTickReplay,
+    Fail(SourceFailure),
+}
+
+#[derive(Debug)]
+enum SourceControlFramePendingRefreshNextStep {
+    ArmReplay,
+    RefreshScheduledGroups,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SourceScheduledGroupsRefreshDisposition {
+    OrdinaryScheduleRefresh,
+    ReplayRequiredRecovery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceScheduledGroupsExpectation {
+    DoNotExpectLocalRunnableGroups,
+    ExpectLocalRunnableGroups,
+}
+
+impl SourceScheduledGroupsExpectation {
+    const fn expect_local_runnable_groups(self) -> bool {
+        matches!(self, Self::ExpectLocalRunnableGroups)
+    }
+}
+
+impl SourceScheduledGroupsRefreshDisposition {
+    const fn requires_replay_recovery(self) -> bool {
+        matches!(self, Self::ReplayRequiredRecovery)
+    }
+}
+
+#[derive(Debug)]
+struct SourceControlFramePendingRefresh {
+    scheduled_groups_expectation: SourceScheduledGroupsExpectation,
+    next_step: SourceControlFramePendingRefreshNextStep,
+}
+
+impl SourceControlFramePendingRefresh {
+    fn step(&self, deadline: std::time::Instant) -> SourceControlFrameStep {
+        match self.next_step {
+            SourceControlFramePendingRefreshNextStep::ArmReplay => {
+                SourceControlFrameStep::run(ArmReplayLane)
+            }
+            SourceControlFramePendingRefreshNextStep::RefreshScheduledGroups => {
+                SourceControlFrameStep::run(RefreshScheduledGroupsLane {
+                    scheduled_groups_expectation: self.scheduled_groups_expectation,
+                    deadline,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 struct SourceControlFrameMachine {
+    envelopes: Arc<[ControlEnvelope]>,
     operation_deadline: std::time::Instant,
     rpc_timeout: Duration,
+    decoded_signals: SourceControlFrameDecodedSignals,
+    primed_local_schedule: Option<PrimedLocalScheduleSummary>,
+    post_ack_refresh_requirement: SourceControlFramePostAckRefreshRequirement,
     existing_client_present: bool,
-    fail_fast_on_control_frame_bridge_reset: bool,
-    generation_one_activate_only: bool,
-    prefer_short_existing_client_attempt: bool,
-    fail_fast_short_caller_budget_bridge_reset: bool,
-    generation_one_timeout_like_reset_seen: bool,
+    bridge_reset_policy: SourceControlFrameBridgeResetPolicy,
+    timeout_reset_policy: SourceControlFrameTimeoutResetPolicy,
+    attempt_timeout_policy: SourceControlFrameAttemptTimeoutPolicy,
+    timeout_reset_observation: SourceControlFrameTimeoutResetObservation,
+    pending_reconnect_resume: Option<SourceControlFrameReconnectResume>,
+    pending_refresh: Option<SourceControlFramePendingRefresh>,
 }
 
 impl SourceControlFrameMachine {
-    fn rpc_attempt_plan(&self) -> Result<SourceControlFrameEffect> {
-        let timeout_cap =
-            if self.prefer_short_existing_client_attempt && self.existing_client_present {
-                SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT
-            } else {
-                self.rpc_timeout
-            };
-        let remaining = self
-            .operation_deadline
-            .saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(CnxError::Timeout);
+    fn start(
+        facts: SourceControlFrameFacts,
+    ) -> std::result::Result<(Self, SourceControlFrameStep), SourceFailure> {
+        let SourceControlFrameFacts {
+            envelopes,
+            decoded_signals,
+            primed_local_schedule,
+            post_ack_refresh_requirement,
+            initial_step,
+            operation_deadline,
+            rpc_timeout,
+            existing_client_present,
+            bridge_reset_policy,
+            timeout_reset_policy,
+            attempt_timeout_policy,
+        } = facts;
+        let (pending_reconnect_resume, initial_step) = match initial_step {
+            Some(SourceControlFrameInitialStep::Run(lane)) => (None, Some(lane)),
+            Some(SourceControlFrameInitialStep::Reconnect(resume)) => (Some(resume), None),
+            None => (None, None),
+        };
+        let machine = Self {
+            envelopes,
+            operation_deadline,
+            rpc_timeout,
+            decoded_signals,
+            primed_local_schedule,
+            post_ack_refresh_requirement,
+            existing_client_present,
+            bridge_reset_policy,
+            timeout_reset_policy,
+            attempt_timeout_policy,
+            timeout_reset_observation: SourceControlFrameTimeoutResetObservation::Clear,
+            pending_reconnect_resume,
+            pending_refresh: None,
+        };
+        let initial_effect = if let Some(initial_step) = initial_step {
+            SourceControlFrameStep::Run(initial_step)
+        } else if machine.pending_reconnect_resume.is_some() {
+            SourceControlFrameStep::run(ReconnectLane)
+        } else {
+            machine.rpc_attempt_plan()?
+        };
+        Ok((machine, initial_effect))
+    }
+
+    fn rpc_attempt_plan(&self) -> std::result::Result<SourceControlFrameStep, SourceFailure> {
+        let timeout_cap = self
+            .attempt_timeout_policy
+            .timeout_cap(self.existing_client_present, self.rpc_timeout);
+        Ok(SourceControlFrameStep::run(AttemptLane {
+            envelopes: self.envelopes.clone(),
+            timeout: source_operation_attempt_timeout(self.operation_deadline, timeout_cap)?,
+        }))
+    }
+
+    fn queue_pending_refresh(
+        &mut self,
+        scheduled_groups_expectation: SourceScheduledGroupsExpectation,
+        next_step: SourceControlFramePendingRefreshNextStep,
+    ) {
+        self.pending_refresh = Some(SourceControlFramePendingRefresh {
+            scheduled_groups_expectation,
+            next_step,
+        });
+    }
+
+    fn bridge_reset_policy_after_timeout_reset(&self) -> SourceControlFrameBridgeResetPolicy {
+        match (self.timeout_reset_policy, self.timeout_reset_observation) {
+            (
+                SourceControlFrameTimeoutResetPolicy::GenerationOneActivateWave,
+                SourceControlFrameTimeoutResetObservation::Seen,
+            ) => SourceControlFrameBridgeResetPolicy::ReconnectThenFail,
+            _ => self.bridge_reset_policy,
         }
-        Ok(SourceControlFrameEffect::Attempt {
-            timeout: remaining.min(timeout_cap),
+    }
+
+    fn pending_refresh_effect(&self) -> std::result::Result<SourceControlFrameStep, SourceFailure> {
+        Ok(self
+            .pending_refresh
+            .as_ref()
+            .ok_or_else(|| {
+                missing_control_frame_pending_refresh_state("control-frame refresh followup")
+            })?
+            .step(self.operation_deadline))
+    }
+
+    fn schedule_post_ack_cache_and_signal_retention(
+        &mut self,
+        signals: Vec<SourceControlSignal>,
+        replay_required_refresh_expectation: Option<SourceScheduledGroupsExpectation>,
+    ) -> SourceControlFrameStep {
+        let cache_priming = match replay_required_refresh_expectation {
+            None => {
+                self.pending_refresh = None;
+                SourceControlFramePostAckCachePriming::Standard
+            }
+            Some(scheduled_groups_expectation) => {
+                self.queue_pending_refresh(
+                    scheduled_groups_expectation,
+                    SourceControlFramePendingRefreshNextStep::ArmReplay,
+                );
+                SourceControlFramePostAckCachePriming::ReplayRecovery
+            }
+        };
+        SourceControlFrameStep::run(ApplyPostAckCacheAndRetainSignalsLane {
+            signals,
+            cache_priming,
+        })
+    }
+
+    fn replay_required_refresh_expectation_after_ack(
+        &self,
+    ) -> Option<SourceScheduledGroupsExpectation> {
+        self.post_ack_refresh_requirement
+            .replay_required_refresh_expectation(self.primed_local_schedule)
+    }
+
+    fn step_after_ack_success(
+        &mut self,
+    ) -> std::result::Result<SourceControlFrameStep, SourceFailure> {
+        match &self.decoded_signals {
+            SourceControlFrameDecodedSignals::DecodeFailed => {
+                self.queue_pending_refresh(
+                    SourceScheduledGroupsExpectation::DoNotExpectLocalRunnableGroups,
+                    SourceControlFramePendingRefreshNextStep::RefreshScheduledGroups,
+                );
+                self.pending_refresh_effect()
+            }
+            SourceControlFrameDecodedSignals::Decoded(signals) => Ok(self
+                .schedule_post_ack_cache_and_signal_retention(
+                    signals.clone(),
+                    self.replay_required_refresh_expectation_after_ack(),
+                )),
+        }
+    }
+
+    fn step_after_reconnect_completion(
+        &mut self,
+    ) -> std::result::Result<SourceControlFrameStep, SourceFailure> {
+        self.existing_client_present = true;
+        match self.pending_reconnect_resume.take() {
+            Some(SourceControlFrameReconnectResume::Attempt) => self.rpc_attempt_plan(),
+            Some(SourceControlFrameReconnectResume::Wait(after)) => {
+                Ok(SourceControlFrameStep::run(WaitLane {
+                    after,
+                    deadline: self.operation_deadline,
+                }))
+            }
+            Some(SourceControlFrameReconnectResume::RetainedTickReplay) => {
+                Ok(SourceControlFrameStep::run(RetainedTickReplayLane {
+                    deadline: self.operation_deadline,
+                }))
+            }
+            Some(SourceControlFrameReconnectResume::Fail(failure)) => {
+                Ok(SourceControlFrameStep::fail(failure))
+            }
+            None => Err(missing_control_frame_pending_reconnect_resume()),
+        }
+    }
+
+    fn step_after_post_ack_completion(
+        &self,
+    ) -> std::result::Result<SourceControlFrameStep, SourceFailure> {
+        if self.pending_refresh.is_some() {
+            self.pending_refresh_effect()
+        } else {
+            Ok(SourceControlFrameStep::complete())
+        }
+    }
+
+    fn step_after_arm_replay_completion(
+        &mut self,
+    ) -> std::result::Result<SourceControlFrameStep, SourceFailure> {
+        let pending_refresh = self
+            .pending_refresh
+            .as_mut()
+            .ok_or_else(|| missing_control_frame_pending_refresh_state("replay arm completion"))?;
+        pending_refresh.next_step =
+            SourceControlFramePendingRefreshNextStep::RefreshScheduledGroups;
+        self.pending_refresh_effect()
+    }
+
+    fn step_after_refresh_completion(
+        &mut self,
+        refresh_result: std::result::Result<(), SourceFailure>,
+    ) -> std::result::Result<SourceControlFrameStep, SourceFailure> {
+        let _pending_refresh = self.pending_refresh.take().ok_or_else(|| {
+            missing_control_frame_pending_refresh_state("scheduled-groups refresh completion")
+        })?;
+        Ok(match refresh_result {
+            Ok(()) => SourceControlFrameStep::complete(),
+            Err(refresh_failure) => SourceControlFrameStep::fail(refresh_failure),
         })
     }
 
@@ -234,171 +927,83 @@ impl SourceControlFrameMachine {
         &mut self,
         err: CnxError,
         after: SourceProgressState,
-    ) -> SourceControlFrameEffect {
-        if (self.fail_fast_on_control_frame_bridge_reset
-            || (self.generation_one_activate_only && self.generation_one_timeout_like_reset_seen))
-            && is_bridge_reset_like_control_error(&err)
+    ) -> SourceControlFrameStep {
+        let retryable_control_error_kind = classify_source_worker_control_reset(&err);
+        let failure = match retryable_control_error_kind {
+            Some(kind) => SourceFailure {
+                cause: err,
+                reason: SourceFailureReason::ControlReset(kind),
+            },
+            None => SourceFailure::non_retryable(err),
+        };
+        if retryable_control_error_kind.is_some_and(|kind| kind.is_bridge_reset_like()) {
+            match self.bridge_reset_policy_after_timeout_reset() {
+                SourceControlFrameBridgeResetPolicy::ReconnectThenFail => {
+                    self.pending_reconnect_resume =
+                        Some(SourceControlFrameReconnectResume::Fail(failure));
+                    return SourceControlFrameStep::run(ReconnectLane);
+                }
+                SourceControlFrameBridgeResetPolicy::FailImmediately => {
+                    self.pending_reconnect_resume = None;
+                    return SourceControlFrameStep::fail(failure);
+                }
+                SourceControlFrameBridgeResetPolicy::RetryAfterReconnect => {}
+            }
+        }
+        if retryable_control_error_kind.is_none() {
+            self.pending_reconnect_resume = None;
+            return SourceControlFrameStep::fail(failure);
+        }
+        if matches!(
+            self.timeout_reset_policy,
+            SourceControlFrameTimeoutResetPolicy::GenerationOneActivateWave
+        ) && retryable_control_error_kind.is_some_and(|kind| kind.is_timeout_like_reset())
         {
-            return SourceControlFrameEffect::ReconnectThenFail(err);
+            self.timeout_reset_observation = SourceControlFrameTimeoutResetObservation::Seen;
+            self.pending_reconnect_resume = Some(SourceControlFrameReconnectResume::Attempt);
+            return SourceControlFrameStep::run(ReconnectLane);
         }
-        if self.fail_fast_short_caller_budget_bridge_reset
-            && is_bridge_reset_like_control_error(&err)
-        {
-            return SourceControlFrameEffect::Fail(err);
+        if matches!(
+            classify_source_retry_budget(self.operation_deadline),
+            SourceRetryBudgetDisposition::Exhausted
+        ) {
+            self.pending_reconnect_resume = None;
+            return SourceControlFrameStep::fail(SourceFailure::retry_budget_exhausted(
+                SourceRetryBudgetExhaustionKind::ControlFrameRetry,
+            ));
         }
-        if !can_retry_on_control_frame(&err) {
-            return SourceControlFrameEffect::Fail(err);
-        }
-        if self.generation_one_activate_only && is_timeout_like_worker_control_reset(&err) {
-            self.generation_one_timeout_like_reset_seen = true;
-            return SourceControlFrameEffect::ReconnectThenAttempt;
-        }
-        if self
-            .operation_deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .is_zero()
-        {
-            return SourceControlFrameEffect::Fail(CnxError::Timeout);
-        }
-        SourceControlFrameEffect::ReconnectThenWait { after }
+        self.pending_reconnect_resume = Some(SourceControlFrameReconnectResume::Wait(after));
+        SourceControlFrameStep::run(ReconnectLane)
     }
 
     fn advance(
         &mut self,
-        event: SourceControlFrameEvent<'_>,
-    ) -> Result<SourceControlFrameEffect> {
+        event: SourceControlFrameEvent,
+    ) -> std::result::Result<SourceControlFrameStep, SourceFailure> {
         match event {
-            SourceControlFrameEvent::RpcCompleted {
-                rpc_result,
-                after,
-                decoded_signals,
-                primed_local_schedule,
-            } => Ok(match rpc_result {
-                Ok(SourceWorkerResponse::Ack) => {
-                    match decoded_signals {
-                        SourceControlFrameDecodedSignals::DecodeFailed => {
-                            SourceControlFrameEffect::RefreshScheduledGroups {
-                                expect_local_runnable_groups: false,
-                            }
-                        }
-                        SourceControlFrameDecodedSignals::Decoded(signals) => {
-                            let refresh_required_by_signals =
-                                source_control_signals_require_post_ack_schedule_refresh(signals);
-                            match primed_local_schedule {
-                                None => {
-                                    if refresh_required_by_signals {
-                                        SourceControlFrameEffect::ApplyPostAckSignalsThenArmReplayAndRefreshScheduledGroups {
-                                            expect_local_runnable_groups: false,
-                                        }
-                                    } else {
-                                        SourceControlFrameEffect::ApplyPostAckSignalsThenComplete
-                                    }
-                                }
-                                Some(primed_local_schedule) => {
-                                    let expect_local_runnable_groups = primed_local_schedule
-                                        .saw_activate_with_bound_scopes
-                                        && primed_local_schedule.has_local_runnable_groups;
-                                    let should_refresh_cached_schedule =
-                                        refresh_required_by_signals
-                                            && !(primed_local_schedule
-                                                .saw_activate_with_bound_scopes
-                                                && !primed_local_schedule.has_local_runnable_groups);
-                                    if should_refresh_cached_schedule {
-                                        SourceControlFrameEffect::ApplyPostAckSignalsThenArmReplayAndRefreshScheduledGroups {
-                                            expect_local_runnable_groups,
-                                        }
-                                    } else {
-                                        SourceControlFrameEffect::ApplyPostAckSignalsThenComplete
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(other) => SourceControlFrameEffect::Fail(CnxError::ProtocolViolation(
-                    format!("unexpected source worker response for on_control_frame: {:?}", other),
-                )),
+            SourceControlFrameEvent::RetainedTickFastPathApplied => {
+                Ok(SourceControlFrameStep::complete())
+            }
+            SourceControlFrameEvent::RetainedTickReplayCompleted => {
+                Ok(SourceControlFrameStep::complete())
+            }
+            SourceControlFrameEvent::RpcCompleted { rpc_result, after } => Ok(match rpc_result {
+                Ok(response) => match expect_source_worker_ack("for on_control_frame", response) {
+                    Ok(()) => self.step_after_ack_success()?,
+                    Err(failure) => SourceControlFrameStep::fail(failure),
+                },
                 Err(err) => self.action_after_error(err, after),
             }),
-            SourceControlFrameEvent::ReconnectThenAttemptCompleted => {
-                self.existing_client_present = true;
-                self.rpc_attempt_plan()
-            }
-            SourceControlFrameEvent::ReconnectThenWaitCompleted { after } => {
-                self.existing_client_present = true;
-                Ok(SourceControlFrameEffect::Wait { after })
-            }
-            SourceControlFrameEvent::ReconnectThenReplayRetainedTickCompleted => {
-                self.existing_client_present = true;
-                Ok(SourceControlFrameEffect::RetainedTickReplay)
-            }
-            SourceControlFrameEvent::ReconnectThenFailCompleted(err) => {
-                self.existing_client_present = true;
-                Ok(SourceControlFrameEffect::Fail(err))
-            }
+            SourceControlFrameEvent::ReconnectCompleted => self.step_after_reconnect_completion(),
             SourceControlFrameEvent::WaitCompleted => self.rpc_attempt_plan(),
-            SourceControlFrameEvent::ApplyPostAckSignalsThenCompleteCompleted => {
-                Ok(SourceControlFrameEffect::Complete)
+            SourceControlFrameEvent::PostAckCacheAndSignalsRetained => {
+                self.step_after_post_ack_completion()
             }
-            SourceControlFrameEvent::ApplyPostAckSignalsThenArmReplayAndRefreshScheduledGroupsCompleted {
-                expect_local_runnable_groups,
-            } => Ok(SourceControlFrameEffect::ArmReplayThenRefreshScheduledGroups {
-                expect_local_runnable_groups,
-            }),
+            SourceControlFrameEvent::ArmReplayCompleted => self.step_after_arm_replay_completion(),
             SourceControlFrameEvent::RefreshScheduledGroupsCompleted { refresh_result } => {
-                Ok(match refresh_result {
-                    Ok(()) => SourceControlFrameEffect::Complete,
-                    Err(ScheduledGroupsRefreshFailure {
-                        err,
-                        recovered_live_worker_during_refresh,
-                    }) => SourceControlFrameEffect::Fail(
-                        classify_control_frame_schedule_refresh_error(
-                            err,
-                            recovered_live_worker_during_refresh,
-                        ),
-                    ),
-                })
+                self.step_after_refresh_completion(refresh_result)
             }
-            SourceControlFrameEvent::ArmReplayThenRefreshScheduledGroupsCompleted {
-                refresh_result,
-            } => Ok(match refresh_result {
-                Ok(()) => SourceControlFrameEffect::Complete,
-                    Err(ScheduledGroupsRefreshFailure {
-                        err,
-                        recovered_live_worker_during_refresh,
-                    }) => SourceControlFrameEffect::Fail(
-                        classify_replay_required_control_frame_schedule_refresh_error(
-                            err,
-                            recovered_live_worker_during_refresh,
-                        ),
-                    ),
-                }),
         }
-    }
-}
-
-fn classify_control_frame_schedule_refresh_error(
-    err: CnxError,
-    _recovered_live_worker_during_refresh: bool,
-) -> CnxError {
-    if let Some(sharp_err) = post_ack_schedule_refresh_exhaustion_error(&err) {
-        sharp_err
-    } else {
-        err
-    }
-}
-
-fn classify_replay_required_control_frame_schedule_refresh_error(
-    err: CnxError,
-    recovered_live_worker_during_refresh: bool,
-) -> CnxError {
-    if matches!(err, CnxError::Timeout) && !recovered_live_worker_during_refresh {
-        CnxError::Internal(
-            "source worker replay-required scheduled-groups refresh exhausted before a live worker recovered"
-                .to_string(),
-        )
-    } else {
-        classify_control_frame_schedule_refresh_error(err, recovered_live_worker_during_refresh)
     }
 }
 
@@ -406,128 +1011,1221 @@ fn clip_retry_deadline(deadline: std::time::Instant, budget: Duration) -> std::t
     std::cmp::min(deadline, std::time::Instant::now() + budget)
 }
 
-fn source_operation_attempt_timeout(
-    deadline: std::time::Instant,
-    attempt_timeout_cap: Duration,
-) -> Result<Duration> {
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
-        Err(CnxError::Timeout)
-    } else {
-        Ok(remaining.min(attempt_timeout_cap))
+fn map_source_timeout_result<T>(
+    result: std::result::Result<Result<T>, tokio::time::error::Elapsed>,
+) -> Result<T> {
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(CnxError::Timeout),
     }
 }
 
-fn can_use_cached_host_object_grants_snapshot(err: &CnxError) -> bool {
-    matches!(
-        err,
-        CnxError::PeerError(message) if message == "worker not initialized"
-    ) || matches!(err, CnxError::TransportClosed(_) | CnxError::Timeout)
-        || matches!(
-            err,
-            CnxError::AccessDenied(message) | CnxError::PeerError(message)
-                if message.contains("drained/fenced")
-                    && message.contains("grant attachments")
-        )
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceRetryBudgetDisposition {
+    Exhausted,
+    Remaining(Duration),
 }
 
-fn can_use_cached_logical_roots_snapshot(err: &CnxError) -> bool {
-    matches!(
-        err,
-        CnxError::PeerError(message) if message == "worker not initialized"
-    ) || matches!(err, CnxError::TransportClosed(_) | CnxError::Timeout)
-        || matches!(
-            err,
-            CnxError::AccessDenied(message) | CnxError::PeerError(message)
-                if message.contains("drained/fenced")
-                    && message.contains("grant attachments")
-        )
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceRetryBudgetExhaustionKind {
+    ControlFrameRetry,
+    OperationAttempt,
+    OperationWait,
 }
 
-fn is_retryable_worker_bridge_peer_error(err: &CnxError) -> bool {
-    matches!(
-        err,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceScheduledGroupsRefreshExhaustionReason {
+    Timeout,
+    TransportClosed,
+    MissingRouteState,
+    RetryableReset,
+    NoLiveWorkerRecovery,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceProtocolViolationKind {
+    UnexpectedWorkerResponse {
+        context: &'static str,
+        response: String,
+    },
+    MissingReconnectWait {
+        reconnect_context: &'static str,
+    },
+    MissingControlFramePendingReconnectResume,
+    MissingControlFramePendingRefreshState {
+        context: &'static str,
+    },
+}
+
+impl SourceProtocolViolationKind {
+    fn into_error(self) -> CnxError {
+        match self {
+            Self::UnexpectedWorkerResponse { context, response } => CnxError::ProtocolViolation(
+                format!("unexpected source worker response {context}: {response}"),
+            ),
+            Self::MissingReconnectWait { reconnect_context } => CnxError::ProtocolViolation(
+                format!("unexpected {reconnect_context} reconnect completion without pending wait"),
+            ),
+            Self::MissingControlFramePendingReconnectResume => CnxError::ProtocolViolation(
+                "unexpected reconnect completion without pending control-frame resume".to_string(),
+            ),
+            Self::MissingControlFramePendingRefreshState { context } => {
+                CnxError::ProtocolViolation(format!(
+                    "unexpected {context} without pending control-frame refresh state"
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceFailureReason {
+    ProtocolViolation(SourceProtocolViolationKind),
+    RetryBudgetExhausted(SourceRetryBudgetExhaustionKind),
+    ControlReset(SourceWorkerControlResetKind),
+    RefreshExhausted(SourceScheduledGroupsRefreshExhaustionReason),
+    NonRetryable,
+}
+
+#[derive(Debug)]
+struct SourceFailure {
+    cause: CnxError,
+    reason: SourceFailureReason,
+}
+
+impl SourceFailure {
+    fn non_retryable(cause: CnxError) -> Self {
+        Self {
+            cause,
+            reason: SourceFailureReason::NonRetryable,
+        }
+    }
+
+    fn from_cause(cause: CnxError) -> Self {
+        match classify_source_worker_control_reset(&cause) {
+            Some(kind) => Self {
+                cause,
+                reason: SourceFailureReason::ControlReset(kind),
+            },
+            None => Self::non_retryable(cause),
+        }
+    }
+
+    fn protocol_violation(kind: SourceProtocolViolationKind) -> Self {
+        Self {
+            cause: kind.clone().into_error(),
+            reason: SourceFailureReason::ProtocolViolation(kind),
+        }
+    }
+
+    fn retry_budget_exhausted(kind: SourceRetryBudgetExhaustionKind) -> Self {
+        Self {
+            cause: shape_source_retry_budget_exhaustion(kind),
+            reason: SourceFailureReason::RetryBudgetExhausted(kind),
+        }
+    }
+
+    fn refresh_exhausted(kind: SourceScheduledGroupsRefreshExhaustionReason) -> Self {
+        Self {
+            cause: shape_source_scheduled_groups_refresh_exhaustion(kind),
+            reason: SourceFailureReason::RefreshExhausted(kind),
+        }
+    }
+
+    fn as_error(&self) -> &CnxError {
+        &self.cause
+    }
+
+    fn into_error(self) -> CnxError {
+        self.cause
+    }
+}
+
+impl From<CnxError> for SourceFailure {
+    fn from(cause: CnxError) -> Self {
+        Self::from_cause(cause)
+    }
+}
+
+fn classify_source_retry_budget(deadline: std::time::Instant) -> SourceRetryBudgetDisposition {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        SourceRetryBudgetDisposition::Exhausted
+    } else {
+        SourceRetryBudgetDisposition::Remaining(remaining)
+    }
+}
+
+fn shape_source_retry_budget_exhaustion(kind: SourceRetryBudgetExhaustionKind) -> CnxError {
+    let _ = kind;
+    CnxError::Timeout
+}
+
+fn source_operation_attempt_timeout(
+    deadline: std::time::Instant,
+    attempt_timeout_cap: Duration,
+) -> std::result::Result<Duration, SourceFailure> {
+    match classify_source_retry_budget(deadline) {
+        SourceRetryBudgetDisposition::Exhausted => Err(SourceFailure::retry_budget_exhausted(
+            SourceRetryBudgetExhaustionKind::OperationAttempt,
+        )),
+        SourceRetryBudgetDisposition::Remaining(remaining) => {
+            Ok(remaining.min(attempt_timeout_cap))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceWorkerControlResetKind {
+    WorkerNotInitialized,
+    TransportClosed,
+    ChannelClosed,
+    Timeout,
+    TimeoutLikePeerOrInternal,
+    BridgePeerReset,
+    UnexpectedCorrelationReply,
+    GrantAttachmentsDrainedOrFenced,
+    InvalidGrantAttachmentToken,
+    MissingChannelBufferRouteState,
+}
+
+impl SourceWorkerControlResetKind {
+    const fn supports_cached_grant_derived_snapshot(self) -> bool {
+        matches!(
+            self,
+            Self::WorkerNotInitialized
+                | Self::TransportClosed
+                | Self::Timeout
+                | Self::GrantAttachmentsDrainedOrFenced
+        )
+    }
+
+    const fn is_bridge_reset_like(self) -> bool {
+        matches!(
+            self,
+            Self::TransportClosed | Self::ChannelClosed | Self::BridgePeerReset
+        )
+    }
+
+    const fn is_timeout_like_reset(self) -> bool {
+        matches!(self, Self::Timeout | Self::TimeoutLikePeerOrInternal)
+    }
+}
+
+fn classify_source_worker_control_reset(err: &CnxError) -> Option<SourceWorkerControlResetKind> {
+    match err {
+        CnxError::PeerError(message) if message == "worker not initialized" => {
+            Some(SourceWorkerControlResetKind::WorkerNotInitialized)
+        }
+        CnxError::TransportClosed(_) => Some(SourceWorkerControlResetKind::TransportClosed),
+        CnxError::ChannelClosed => Some(SourceWorkerControlResetKind::ChannelClosed),
+        CnxError::Timeout => Some(SourceWorkerControlResetKind::Timeout),
+        CnxError::PeerError(message) | CnxError::Internal(message)
+            if message.contains("operation timed out") =>
+        {
+            Some(SourceWorkerControlResetKind::TimeoutLikePeerOrInternal)
+        }
         CnxError::PeerError(message)
             if message.contains("transport closed")
                 && (message.contains("Connection reset by peer")
                     || message.contains("early eof")
                     || message.contains("Broken pipe")
-                    || message.contains("bridge stopped"))
+                    || message.contains("bridge stopped")) =>
+        {
+            Some(SourceWorkerControlResetKind::BridgePeerReset)
+        }
+        CnxError::ProtocolViolation(message) | CnxError::PeerError(message)
+            if message.contains("unexpected correlation_id in reply batch") =>
+        {
+            Some(SourceWorkerControlResetKind::UnexpectedCorrelationReply)
+        }
+        CnxError::AccessDenied(message) | CnxError::PeerError(message)
+            if message.contains("drained/fenced") && message.contains("grant attachments") =>
+        {
+            Some(SourceWorkerControlResetKind::GrantAttachmentsDrainedOrFenced)
+        }
+        CnxError::AccessDenied(message)
+        | CnxError::PeerError(message)
+        | CnxError::Internal(message)
+            if message.contains("invalid or revoked grant attachment token") =>
+        {
+            Some(SourceWorkerControlResetKind::InvalidGrantAttachmentToken)
+        }
+        CnxError::AccessDenied(message)
+        | CnxError::PeerError(message)
+        | CnxError::Internal(message)
+            if message.contains("missing route state for channel_buffer") =>
+        {
+            Some(SourceWorkerControlResetKind::MissingChannelBufferRouteState)
+        }
+        _ => None,
+    }
+}
+
+fn classify_source_scheduled_groups_refresh_deadline_exhaustion(
+    refresh_disposition: SourceScheduledGroupsRefreshDisposition,
+    recovery_observation: SourceScheduledGroupsRefreshRecoveryObservation,
+) -> SourceScheduledGroupsRefreshExhaustionReason {
+    if matches!(
+        (refresh_disposition, recovery_observation),
+        (
+            SourceScheduledGroupsRefreshDisposition::ReplayRequiredRecovery,
+            SourceScheduledGroupsRefreshRecoveryObservation::NoLiveWorkerRecovery,
+        )
+    ) {
+        SourceScheduledGroupsRefreshExhaustionReason::NoLiveWorkerRecovery
+    } else {
+        SourceScheduledGroupsRefreshExhaustionReason::Timeout
+    }
+}
+
+fn classify_source_scheduled_groups_refresh_exhaustion(
+    err: &CnxError,
+    refresh_disposition: SourceScheduledGroupsRefreshDisposition,
+    recovery_observation: SourceScheduledGroupsRefreshRecoveryObservation,
+) -> Option<SourceScheduledGroupsRefreshExhaustionReason> {
+    if matches!(err, CnxError::Timeout) {
+        return Some(
+            classify_source_scheduled_groups_refresh_deadline_exhaustion(
+                refresh_disposition,
+                recovery_observation,
+            ),
+        );
+    }
+
+    Some(match classify_source_worker_control_reset(err)? {
+        SourceWorkerControlResetKind::Timeout
+        | SourceWorkerControlResetKind::TimeoutLikePeerOrInternal => {
+            SourceScheduledGroupsRefreshExhaustionReason::Timeout
+        }
+        SourceWorkerControlResetKind::TransportClosed
+        | SourceWorkerControlResetKind::ChannelClosed => {
+            SourceScheduledGroupsRefreshExhaustionReason::TransportClosed
+        }
+        SourceWorkerControlResetKind::MissingChannelBufferRouteState => {
+            SourceScheduledGroupsRefreshExhaustionReason::MissingRouteState
+        }
+        SourceWorkerControlResetKind::WorkerNotInitialized
+        | SourceWorkerControlResetKind::BridgePeerReset
+        | SourceWorkerControlResetKind::UnexpectedCorrelationReply
+        | SourceWorkerControlResetKind::GrantAttachmentsDrainedOrFenced
+        | SourceWorkerControlResetKind::InvalidGrantAttachmentToken => {
+            SourceScheduledGroupsRefreshExhaustionReason::RetryableReset
+        }
+    })
+}
+
+fn source_scheduled_groups_refresh_failure_from_error(
+    err: CnxError,
+    refresh_disposition: SourceScheduledGroupsRefreshDisposition,
+    recovery_observation: SourceScheduledGroupsRefreshRecoveryObservation,
+) -> SourceFailure {
+    match classify_source_scheduled_groups_refresh_exhaustion(
+        &err,
+        refresh_disposition,
+        recovery_observation,
+    ) {
+        Some(reason) => SourceFailure::refresh_exhausted(reason),
+        None => SourceFailure::from_cause(err),
+    }
+}
+
+fn source_scheduled_groups_refresh_deadline_failure(
+    refresh_disposition: SourceScheduledGroupsRefreshDisposition,
+    recovery_observation: SourceScheduledGroupsRefreshRecoveryObservation,
+) -> SourceFailure {
+    SourceFailure::refresh_exhausted(
+        classify_source_scheduled_groups_refresh_deadline_exhaustion(
+            refresh_disposition,
+            recovery_observation,
+        ),
     )
 }
 
-fn is_bridge_reset_like_control_error(err: &CnxError) -> bool {
-    matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
-        || is_retryable_worker_bridge_peer_error(err)
+fn shape_source_scheduled_groups_refresh_exhaustion(
+    reason: SourceScheduledGroupsRefreshExhaustionReason,
+) -> CnxError {
+    match reason {
+        SourceScheduledGroupsRefreshExhaustionReason::NoLiveWorkerRecovery => {
+            CnxError::Internal(
+                "source worker replay-required scheduled-groups refresh exhausted before a live worker recovered"
+                    .to_string(),
+            )
+        }
+        reason => {
+            let reason = match reason {
+                SourceScheduledGroupsRefreshExhaustionReason::Timeout => "timeout",
+                SourceScheduledGroupsRefreshExhaustionReason::TransportClosed => {
+                    "transport_closed"
+                }
+                SourceScheduledGroupsRefreshExhaustionReason::MissingRouteState => {
+                    "missing_route_state"
+                }
+                SourceScheduledGroupsRefreshExhaustionReason::RetryableReset => {
+                    "retryable_reset"
+                }
+                SourceScheduledGroupsRefreshExhaustionReason::NoLiveWorkerRecovery => {
+                    unreachable!("handled above")
+                }
+            };
+            CnxError::Internal(format!(
+                "source worker post-ack scheduled-groups refresh exhausted before scheduled groups converged ({reason})"
+            ))
+        }
+    }
 }
 
-fn is_timeout_like_worker_control_reset(err: &CnxError) -> bool {
-    matches!(err, CnxError::Timeout)
-        || matches!(
-            err,
-            CnxError::PeerError(message) | CnxError::Internal(message)
-                if message.contains("operation timed out")
-        )
+fn can_use_cached_grant_derived_snapshot(err: &CnxError) -> bool {
+    classify_source_worker_control_reset(err)
+        .is_some_and(|kind| kind.supports_cached_grant_derived_snapshot())
 }
 
 fn can_retry_update_logical_roots(err: &CnxError) -> bool {
-    matches!(
-        err,
-        CnxError::PeerError(message) if message == "worker not initialized"
-    ) || matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
-        || is_timeout_like_worker_control_reset(err)
-        || is_retryable_worker_bridge_peer_error(err)
-        || matches!(
-            err,
-            CnxError::ProtocolViolation(message)
-                if message.contains("unexpected correlation_id in reply batch")
-        )
-        || matches!(
-            err,
-            CnxError::PeerError(message)
-                if message.contains("unexpected correlation_id in reply batch")
-        )
-        || matches!(
-            err,
-            CnxError::AccessDenied(message)
-                | CnxError::PeerError(message)
-                | CnxError::Internal(message)
-                if message.contains("drained/fenced")
-                    && message.contains("grant attachments")
-                    || message.contains("invalid or revoked grant attachment token")
-                    || message.contains("missing route state for channel_buffer")
-        )
-}
-
-fn can_retry_on_control_frame(err: &CnxError) -> bool {
-    can_retry_update_logical_roots(err)
-}
-
-fn post_ack_schedule_refresh_exhaustion_error(err: &CnxError) -> Option<CnxError> {
-    let reason = match err {
-        _ if is_timeout_like_worker_control_reset(err) => "timeout",
-        CnxError::TransportClosed(_) | CnxError::ChannelClosed => "transport_closed",
-        CnxError::Internal(message)
-        | CnxError::PeerError(message)
-        | CnxError::AccessDenied(message)
-            if message.contains("missing route state for channel_buffer") =>
-        {
-            "missing_route_state"
-        }
-        other if can_retry_on_control_frame(other) => "retryable_reset",
-        _ => return None,
-    };
-    Some(CnxError::Internal(format!(
-        "source worker post-ack scheduled-groups refresh exhausted before scheduled groups converged ({reason})"
-    )))
+    classify_source_worker_control_reset(err).is_some()
 }
 
 fn can_retry_force_find(err: &CnxError) -> bool {
     matches!(
-        err,
-        CnxError::ProtocolViolation(message) | CnxError::PeerError(message)
-            if message.contains("unexpected correlation_id in reply batch")
+        classify_source_worker_control_reset(err),
+        Some(SourceWorkerControlResetKind::UnexpectedCorrelationReply)
     )
+}
+
+#[derive(Debug)]
+enum SourceReconnectRetryDisposition {
+    ReconnectAfter(SourceProgressState),
+    Fail(SourceFailure),
+}
+
+#[derive(Debug)]
+enum SourceWaitRetryDisposition {
+    WaitAfter(SourceProgressState),
+    Fail(SourceFailure),
+}
+
+#[derive(Debug)]
+enum SourceScheduledGroupsRefreshRetryDisposition {
+    ReconnectAfter(SourceProgressState),
+    Fail(SourceFailure),
+}
+
+fn classify_source_reconnect_retry(
+    deadline: std::time::Instant,
+    err: CnxError,
+    after: SourceProgressState,
+) -> SourceReconnectRetryDisposition {
+    if !can_retry_update_logical_roots(&err) {
+        return SourceReconnectRetryDisposition::Fail(SourceFailure::from_cause(err));
+    }
+    if matches!(
+        classify_source_retry_budget(deadline),
+        SourceRetryBudgetDisposition::Exhausted
+    ) {
+        return SourceReconnectRetryDisposition::Fail(SourceFailure::retry_budget_exhausted(
+            SourceRetryBudgetExhaustionKind::OperationWait,
+        ));
+    }
+    SourceReconnectRetryDisposition::ReconnectAfter(after)
+}
+
+fn classify_source_wait_retry(
+    deadline: std::time::Instant,
+    err: CnxError,
+    after: SourceProgressState,
+    can_retry: impl FnOnce(&CnxError) -> bool,
+) -> SourceWaitRetryDisposition {
+    if !can_retry(&err) {
+        return SourceWaitRetryDisposition::Fail(SourceFailure::from_cause(err));
+    }
+    if matches!(
+        classify_source_retry_budget(deadline),
+        SourceRetryBudgetDisposition::Exhausted
+    ) {
+        return SourceWaitRetryDisposition::Fail(SourceFailure::retry_budget_exhausted(
+            SourceRetryBudgetExhaustionKind::OperationWait,
+        ));
+    }
+    SourceWaitRetryDisposition::WaitAfter(after)
+}
+
+fn classify_source_scheduled_groups_refresh_retry(
+    deadline: std::time::Instant,
+    err: CnxError,
+    after: SourceProgressState,
+    refresh_disposition: SourceScheduledGroupsRefreshDisposition,
+    recovery_observation: SourceScheduledGroupsRefreshRecoveryObservation,
+) -> SourceScheduledGroupsRefreshRetryDisposition {
+    if !can_retry_update_logical_roots(&err) {
+        return SourceScheduledGroupsRefreshRetryDisposition::Fail(
+            source_scheduled_groups_refresh_failure_from_error(
+                err,
+                refresh_disposition,
+                recovery_observation,
+            ),
+        );
+    }
+    if matches!(
+        classify_source_retry_budget(deadline),
+        SourceRetryBudgetDisposition::Exhausted
+    ) {
+        return SourceScheduledGroupsRefreshRetryDisposition::Fail(
+            source_scheduled_groups_refresh_deadline_failure(
+                refresh_disposition,
+                recovery_observation,
+            ),
+        );
+    }
+    SourceScheduledGroupsRefreshRetryDisposition::ReconnectAfter(after)
+}
+
+fn classify_source_scheduled_groups_refresh_retry_failure(
+    deadline: std::time::Instant,
+    failure: SourceFailure,
+    after: SourceProgressState,
+    refresh_disposition: SourceScheduledGroupsRefreshDisposition,
+    recovery_observation: SourceScheduledGroupsRefreshRecoveryObservation,
+) -> SourceScheduledGroupsRefreshRetryDisposition {
+    match failure.reason {
+        SourceFailureReason::RetryBudgetExhausted(_) => {
+            SourceScheduledGroupsRefreshRetryDisposition::Fail(
+                source_scheduled_groups_refresh_deadline_failure(
+                    refresh_disposition,
+                    recovery_observation,
+                ),
+            )
+        }
+        SourceFailureReason::RefreshExhausted(_)
+        | SourceFailureReason::ProtocolViolation(_)
+        | SourceFailureReason::NonRetryable => {
+            SourceScheduledGroupsRefreshRetryDisposition::Fail(failure)
+        }
+        SourceFailureReason::ControlReset(_) => classify_source_scheduled_groups_refresh_retry(
+            deadline,
+            failure.into_error(),
+            after,
+            refresh_disposition,
+            recovery_observation,
+        ),
+    }
+}
+
+fn take_pending_reconnect_wait_after(
+    pending_reconnect_wait_after: &mut Option<SourceProgressState>,
+    reconnect_context: &'static str,
+) -> std::result::Result<SourceProgressState, SourceFailure> {
+    pending_reconnect_wait_after
+        .take()
+        .ok_or_else(|| missing_source_reconnect_wait_after(reconnect_context))
+}
+
+fn missing_source_reconnect_wait_after(reconnect_context: &'static str) -> SourceFailure {
+    SourceFailure::protocol_violation(SourceProtocolViolationKind::MissingReconnectWait {
+        reconnect_context,
+    })
+}
+
+fn missing_control_frame_pending_reconnect_resume() -> SourceFailure {
+    SourceFailure::protocol_violation(
+        SourceProtocolViolationKind::MissingControlFramePendingReconnectResume,
+    )
+}
+
+fn missing_control_frame_pending_refresh_state(context: &'static str) -> SourceFailure {
+    SourceFailure::protocol_violation(
+        SourceProtocolViolationKind::MissingControlFramePendingRefreshState { context },
+    )
+}
+
+fn expect_source_worker_ack(
+    context: &'static str,
+    response: SourceWorkerResponse,
+) -> std::result::Result<(), SourceFailure> {
+    match response {
+        SourceWorkerResponse::Ack => Ok(()),
+        other => Err(SourceFailure::protocol_violation(
+            SourceProtocolViolationKind::UnexpectedWorkerResponse {
+                context,
+                response: format!("{:?}", other),
+            },
+        )),
+    }
+}
+
+fn unexpected_source_worker_response(
+    context: &'static str,
+    response: SourceWorkerResponse,
+) -> CnxError {
+    SourceProtocolViolationKind::UnexpectedWorkerResponse {
+        context,
+        response: format!("{:?}", response),
+    }
+    .into_error()
+}
+
+struct SourceForceFindMachine {
+    deadline: std::time::Instant,
+}
+
+struct SourceScheduledGroupIdsMachine {
+    deadline: std::time::Instant,
+    pending_reconnect_wait_after: Option<SourceProgressState>,
+}
+
+struct SourceUpdateLogicalRootsMachine {
+    deadline: std::time::Instant,
+}
+
+struct SourceObservabilitySnapshotMachine {
+    deadline: std::time::Instant,
+    timeout_cap: Duration,
+}
+
+struct SourceStartMachine {
+    deadline: std::time::Instant,
+    pending_reconnect_wait_after: Option<SourceProgressState>,
+}
+
+struct SourceReplayRetainedControlStateMachine {
+    deadline: std::time::Instant,
+    pending_reconnect_wait_after: Option<SourceProgressState>,
+}
+
+struct SourceScheduledGroupsRefreshMachine {
+    deadline: std::time::Instant,
+    scheduled_groups_expectation: SourceScheduledGroupsExpectation,
+    refresh_disposition: SourceScheduledGroupsRefreshDisposition,
+    recovery_observation: SourceScheduledGroupsRefreshRecoveryObservation,
+    pending_reconnect_wait_after: Option<SourceProgressState>,
+}
+
+enum SourceScheduledGroupIdsEffect {
+    Attempt { timeout: Duration },
+    Reconnect,
+    Wait { after: SourceProgressState },
+    Complete(SourceWorkerResponse),
+    Fail(SourceFailure),
+}
+
+enum SourceReplayRetainedControlStateEffect {
+    Attempt { timeout: Duration },
+    Reconnect,
+    Wait { after: SourceProgressState },
+    Complete,
+    Fail(SourceFailure),
+}
+
+enum SourceScheduledGroupsRefreshEffect {
+    EnsureStarted,
+    ReplayRetainedControlState,
+    AcquireClient,
+    RefreshGrants {
+        client: TypedWorkerClient<SourceWorkerRpc>,
+    },
+    FetchScheduledGroups {
+        client: TypedWorkerClient<SourceWorkerRpc>,
+        stable_host_ref: String,
+    },
+    Reconnect,
+    Wait {
+        after: SourceProgressState,
+    },
+    CommitGroups {
+        scheduled_source: std::collections::BTreeMap<String, Vec<String>>,
+        scheduled_scan: std::collections::BTreeMap<String, Vec<String>>,
+    },
+    Complete,
+    Fail(SourceFailure),
+}
+
+enum SourceStartEffect {
+    Attempt { timeout: Duration },
+    Reconnect,
+    Wait { after: SourceProgressState },
+    Complete,
+    Fail(SourceFailure),
+}
+
+enum SourceObservabilitySnapshotEffect {
+    Attempt { timeout: Duration },
+    Wait { after: SourceProgressState },
+    Complete(SourceWorkerResponse),
+    Fail(SourceFailure),
+}
+
+enum SourceUpdateLogicalRootsEffect {
+    Attempt { timeout: Duration },
+    Wait { after: SourceProgressState },
+    Complete,
+    Fail(SourceFailure),
+}
+
+enum SourceScheduledGroupIdsEvent {
+    AttemptCompleted {
+        rpc_result: std::result::Result<SourceWorkerResponse, CnxError>,
+        after: SourceProgressState,
+    },
+    ReconnectCompleted,
+    WaitCompleted,
+}
+
+enum SourceUpdateLogicalRootsEvent {
+    AttemptCompleted {
+        rpc_result: std::result::Result<SourceWorkerResponse, CnxError>,
+        after: SourceProgressState,
+    },
+    WaitCompleted,
+}
+
+enum SourceObservabilitySnapshotEvent {
+    AttemptCompleted {
+        rpc_result: std::result::Result<SourceWorkerResponse, CnxError>,
+        after: SourceProgressState,
+    },
+    WaitCompleted,
+}
+
+enum SourceStartEvent {
+    AttemptCompleted {
+        start_result: std::result::Result<(), CnxError>,
+        after: SourceProgressState,
+    },
+    ReconnectCompleted,
+    WaitCompleted,
+}
+
+enum SourceReplayRetainedControlStateEvent {
+    AttemptCompleted {
+        rpc_result: std::result::Result<SourceWorkerResponse, CnxError>,
+        after: SourceProgressState,
+    },
+    ReconnectCompleted,
+    WaitCompleted,
+}
+
+struct SourceScheduledGroupsRefreshGrantedClient {
+    client: TypedWorkerClient<SourceWorkerRpc>,
+    stable_host_ref: String,
+}
+
+struct SourceScheduledGroupsRefreshFetchedGroups {
+    scheduled_source: std::collections::BTreeMap<String, Vec<String>>,
+    scheduled_scan: std::collections::BTreeMap<String, Vec<String>>,
+    cache_empty: bool,
+}
+
+enum SourceScheduledGroupsRefreshEvent {
+    EnsureStartedCompleted {
+        result: std::result::Result<(), SourceFailure>,
+        after: SourceProgressState,
+    },
+    ReplayRetainedControlStateCompleted(std::result::Result<(), SourceFailure>),
+    ClientAcquired {
+        result: std::result::Result<TypedWorkerClient<SourceWorkerRpc>, SourceFailure>,
+        after: SourceProgressState,
+    },
+    GrantsRefreshed {
+        result: std::result::Result<SourceScheduledGroupsRefreshGrantedClient, SourceFailure>,
+        after: SourceProgressState,
+    },
+    FetchScheduledGroupsCompleted {
+        result: std::result::Result<SourceScheduledGroupsRefreshFetchedGroups, SourceFailure>,
+        after: SourceProgressState,
+    },
+    ReconnectCompleted,
+    WaitCompleted,
+    CommitGroupsCompleted,
+}
+
+enum SourceForceFindEffect {
+    Attempt { timeout: Duration },
+    Wait { after: SourceProgressState },
+    Complete(Vec<Event>),
+    Fail(SourceFailure),
+}
+
+enum SourceForceFindEvent {
+    AttemptCompleted {
+        rpc_result: std::result::Result<Vec<Event>, CnxError>,
+        after: SourceProgressState,
+    },
+    WaitCompleted,
+}
+
+enum SourceOperationLoopStep<Event, Output, Error> {
+    Event(Event),
+    Complete(Output),
+    Fail(Error),
+}
+
+async fn drive_source_machine_loop<Effect, Event, Output, Error, Execute, ExecuteFuture, Advance>(
+    mut effect: Effect,
+    mut execute: Execute,
+    mut advance: Advance,
+) -> std::result::Result<Output, Error>
+where
+    Execute: FnMut(Effect) -> ExecuteFuture,
+    ExecuteFuture: std::future::Future<Output = SourceOperationLoopStep<Event, Output, Error>>,
+    Advance: FnMut(Event) -> std::result::Result<Effect, Error>,
+{
+    loop {
+        match execute(effect).await {
+            SourceOperationLoopStep::Event(event) => {
+                effect = advance(event)?;
+            }
+            SourceOperationLoopStep::Complete(output) => return Ok(output),
+            SourceOperationLoopStep::Fail(err) => return Err(err),
+        }
+    }
+}
+
+impl SourceForceFindMachine {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self { deadline }
+    }
+
+    fn start(&self) -> std::result::Result<SourceForceFindEffect, SourceFailure> {
+        Ok(SourceForceFindEffect::Attempt {
+            timeout: source_operation_attempt_timeout(
+                self.deadline,
+                SOURCE_WORKER_FORCE_FIND_TIMEOUT,
+            )?,
+        })
+    }
+
+    fn advance(
+        &self,
+        event: SourceForceFindEvent,
+    ) -> std::result::Result<SourceForceFindEffect, SourceFailure> {
+        match event {
+            SourceForceFindEvent::AttemptCompleted {
+                rpc_result: Ok(events),
+                ..
+            } => Ok(SourceForceFindEffect::Complete(events)),
+            SourceForceFindEvent::AttemptCompleted {
+                rpc_result: Err(err),
+                after,
+            } => Ok(
+                match classify_source_wait_retry(self.deadline, err, after, can_retry_force_find) {
+                    SourceWaitRetryDisposition::WaitAfter(after) => {
+                        SourceForceFindEffect::Wait { after }
+                    }
+                    SourceWaitRetryDisposition::Fail(failure) => {
+                        SourceForceFindEffect::Fail(failure)
+                    }
+                },
+            ),
+            SourceForceFindEvent::WaitCompleted => self.start(),
+        }
+    }
+}
+
+impl SourceScheduledGroupIdsMachine {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self {
+            deadline,
+            pending_reconnect_wait_after: None,
+        }
+    }
+
+    fn start(&self) -> std::result::Result<SourceScheduledGroupIdsEffect, SourceFailure> {
+        Ok(SourceScheduledGroupIdsEffect::Attempt {
+            timeout: source_operation_attempt_timeout(
+                self.deadline,
+                SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+            )?,
+        })
+    }
+
+    fn advance(
+        &mut self,
+        event: SourceScheduledGroupIdsEvent,
+    ) -> std::result::Result<SourceScheduledGroupIdsEffect, SourceFailure> {
+        match event {
+            SourceScheduledGroupIdsEvent::AttemptCompleted {
+                rpc_result: Ok(response),
+                ..
+            } => Ok(SourceScheduledGroupIdsEffect::Complete(response)),
+            SourceScheduledGroupIdsEvent::AttemptCompleted {
+                rpc_result: Err(err),
+                after,
+            } => Ok(
+                match classify_source_reconnect_retry(self.deadline, err, after) {
+                    SourceReconnectRetryDisposition::ReconnectAfter(after) => {
+                        self.pending_reconnect_wait_after = Some(after);
+                        SourceScheduledGroupIdsEffect::Reconnect
+                    }
+                    SourceReconnectRetryDisposition::Fail(failure) => {
+                        SourceScheduledGroupIdsEffect::Fail(failure)
+                    }
+                },
+            ),
+            SourceScheduledGroupIdsEvent::ReconnectCompleted => {
+                Ok(SourceScheduledGroupIdsEffect::Wait {
+                    after: take_pending_reconnect_wait_after(
+                        &mut self.pending_reconnect_wait_after,
+                        "scheduled-group-ids",
+                    )?,
+                })
+            }
+            SourceScheduledGroupIdsEvent::WaitCompleted => self.start(),
+        }
+    }
+}
+
+impl SourceUpdateLogicalRootsMachine {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self { deadline }
+    }
+
+    fn start(&self) -> std::result::Result<SourceUpdateLogicalRootsEffect, SourceFailure> {
+        Ok(SourceUpdateLogicalRootsEffect::Attempt {
+            timeout: source_operation_attempt_timeout(
+                self.deadline,
+                SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
+            )?,
+        })
+    }
+
+    fn advance(
+        &self,
+        event: SourceUpdateLogicalRootsEvent,
+    ) -> std::result::Result<SourceUpdateLogicalRootsEffect, SourceFailure> {
+        match event {
+            SourceUpdateLogicalRootsEvent::AttemptCompleted {
+                rpc_result: Err(CnxError::InvalidInput(message)),
+                ..
+            } => Ok(SourceUpdateLogicalRootsEffect::Fail(
+                SourceFailure::non_retryable(CnxError::InvalidInput(message)),
+            )),
+            SourceUpdateLogicalRootsEvent::AttemptCompleted {
+                rpc_result: Ok(response),
+                ..
+            } => Ok(
+                match expect_source_worker_ack("for update roots", response) {
+                    Ok(()) => SourceUpdateLogicalRootsEffect::Complete,
+                    Err(failure) => SourceUpdateLogicalRootsEffect::Fail(failure),
+                },
+            ),
+            SourceUpdateLogicalRootsEvent::AttemptCompleted {
+                rpc_result: Err(err),
+                after,
+            } => Ok(
+                match classify_source_wait_retry(
+                    self.deadline,
+                    err,
+                    after,
+                    can_retry_update_logical_roots,
+                ) {
+                    SourceWaitRetryDisposition::WaitAfter(after) => {
+                        SourceUpdateLogicalRootsEffect::Wait { after }
+                    }
+                    SourceWaitRetryDisposition::Fail(failure) => {
+                        SourceUpdateLogicalRootsEffect::Fail(failure)
+                    }
+                },
+            ),
+            SourceUpdateLogicalRootsEvent::WaitCompleted => self.start(),
+        }
+    }
+}
+
+impl SourceObservabilitySnapshotMachine {
+    fn new(deadline: std::time::Instant, timeout_cap: Duration) -> Self {
+        Self {
+            deadline,
+            timeout_cap,
+        }
+    }
+
+    fn start(&self) -> std::result::Result<SourceObservabilitySnapshotEffect, SourceFailure> {
+        Ok(SourceObservabilitySnapshotEffect::Attempt {
+            timeout: source_operation_attempt_timeout(self.deadline, self.timeout_cap)?,
+        })
+    }
+
+    fn advance(
+        &self,
+        event: SourceObservabilitySnapshotEvent,
+    ) -> std::result::Result<SourceObservabilitySnapshotEffect, SourceFailure> {
+        match event {
+            SourceObservabilitySnapshotEvent::AttemptCompleted {
+                rpc_result: Ok(response),
+                ..
+            } => Ok(SourceObservabilitySnapshotEffect::Complete(response)),
+            SourceObservabilitySnapshotEvent::AttemptCompleted {
+                rpc_result: Err(err),
+                after,
+            } => Ok(
+                match classify_source_wait_retry(
+                    self.deadline,
+                    err,
+                    after,
+                    can_retry_update_logical_roots,
+                ) {
+                    SourceWaitRetryDisposition::WaitAfter(after) => {
+                        SourceObservabilitySnapshotEffect::Wait { after }
+                    }
+                    SourceWaitRetryDisposition::Fail(failure) => {
+                        SourceObservabilitySnapshotEffect::Fail(failure)
+                    }
+                },
+            ),
+            SourceObservabilitySnapshotEvent::WaitCompleted => self.start(),
+        }
+    }
+}
+
+impl SourceStartMachine {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self {
+            deadline,
+            pending_reconnect_wait_after: None,
+        }
+    }
+
+    fn start(&self) -> std::result::Result<SourceStartEffect, SourceFailure> {
+        Ok(SourceStartEffect::Attempt {
+            timeout: source_operation_attempt_timeout(
+                self.deadline,
+                SOURCE_WORKER_START_ATTEMPT_TIMEOUT,
+            )?,
+        })
+    }
+
+    fn advance(
+        &mut self,
+        event: SourceStartEvent,
+    ) -> std::result::Result<SourceStartEffect, SourceFailure> {
+        match event {
+            SourceStartEvent::AttemptCompleted {
+                start_result: Ok(()),
+                ..
+            } => Ok(SourceStartEffect::Complete),
+            SourceStartEvent::AttemptCompleted {
+                start_result: Err(err),
+                after,
+            } => Ok(
+                match classify_source_reconnect_retry(self.deadline, err, after) {
+                    SourceReconnectRetryDisposition::ReconnectAfter(after) => {
+                        self.pending_reconnect_wait_after = Some(after);
+                        SourceStartEffect::Reconnect
+                    }
+                    SourceReconnectRetryDisposition::Fail(failure) => {
+                        SourceStartEffect::Fail(failure)
+                    }
+                },
+            ),
+            SourceStartEvent::ReconnectCompleted => Ok(SourceStartEffect::Wait {
+                after: take_pending_reconnect_wait_after(
+                    &mut self.pending_reconnect_wait_after,
+                    "start",
+                )?,
+            }),
+            SourceStartEvent::WaitCompleted => self.start(),
+        }
+    }
+}
+
+impl SourceReplayRetainedControlStateMachine {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self {
+            deadline,
+            pending_reconnect_wait_after: None,
+        }
+    }
+
+    fn start(&self) -> SourceReplayRetainedControlStateEffect {
+        match source_operation_attempt_timeout(self.deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT) {
+            Ok(timeout) => SourceReplayRetainedControlStateEffect::Attempt { timeout },
+            Err(failure) => SourceReplayRetainedControlStateEffect::Fail(failure),
+        }
+    }
+
+    fn advance(
+        &mut self,
+        event: SourceReplayRetainedControlStateEvent,
+    ) -> SourceReplayRetainedControlStateEffect {
+        match event {
+            SourceReplayRetainedControlStateEvent::AttemptCompleted {
+                rpc_result: Ok(response),
+                ..
+            } => match expect_source_worker_ack("while replaying retained control state", response)
+            {
+                Ok(()) => SourceReplayRetainedControlStateEffect::Complete,
+                Err(failure) => SourceReplayRetainedControlStateEffect::Fail(failure),
+            },
+            SourceReplayRetainedControlStateEvent::AttemptCompleted {
+                rpc_result: Err(err),
+                after,
+            } => match classify_source_reconnect_retry(self.deadline, err, after) {
+                SourceReconnectRetryDisposition::ReconnectAfter(after) => {
+                    self.pending_reconnect_wait_after = Some(after);
+                    SourceReplayRetainedControlStateEffect::Reconnect
+                }
+                SourceReconnectRetryDisposition::Fail(failure) => {
+                    SourceReplayRetainedControlStateEffect::Fail(failure)
+                }
+            },
+            SourceReplayRetainedControlStateEvent::ReconnectCompleted => {
+                match take_pending_reconnect_wait_after(
+                    &mut self.pending_reconnect_wait_after,
+                    "retained-control replay",
+                ) {
+                    Ok(after) => SourceReplayRetainedControlStateEffect::Wait { after },
+                    Err(failure) => SourceReplayRetainedControlStateEffect::Fail(failure),
+                }
+            }
+            SourceReplayRetainedControlStateEvent::WaitCompleted => self.start(),
+        }
+    }
+}
+
+impl SourceScheduledGroupsRefreshMachine {
+    fn new(
+        deadline: std::time::Instant,
+        scheduled_groups_expectation: SourceScheduledGroupsExpectation,
+        refresh_disposition: SourceScheduledGroupsRefreshDisposition,
+    ) -> Self {
+        Self {
+            deadline,
+            scheduled_groups_expectation,
+            refresh_disposition,
+            recovery_observation:
+                SourceScheduledGroupsRefreshRecoveryObservation::NoLiveWorkerRecovery,
+            pending_reconnect_wait_after: None,
+        }
+    }
+
+    fn start(&self) -> SourceScheduledGroupsRefreshEffect {
+        SourceScheduledGroupsRefreshEffect::EnsureStarted
+    }
+
+    fn fail(&self, err: CnxError) -> SourceScheduledGroupsRefreshEffect {
+        let failure = source_scheduled_groups_refresh_failure_from_error(
+            err,
+            self.refresh_disposition,
+            self.recovery_observation,
+        );
+        SourceScheduledGroupsRefreshEffect::Fail(failure)
+    }
+
+    fn retry_or_fail(
+        &mut self,
+        failure: SourceFailure,
+        after: SourceProgressState,
+    ) -> SourceScheduledGroupsRefreshEffect {
+        match classify_source_scheduled_groups_refresh_retry_failure(
+            self.deadline,
+            failure,
+            after,
+            self.refresh_disposition,
+            self.recovery_observation,
+        ) {
+            SourceScheduledGroupsRefreshRetryDisposition::ReconnectAfter(after) => {
+                self.pending_reconnect_wait_after = Some(after);
+                SourceScheduledGroupsRefreshEffect::Reconnect
+            }
+            SourceScheduledGroupsRefreshRetryDisposition::Fail(failure) => {
+                SourceScheduledGroupsRefreshEffect::Fail(failure)
+            }
+        }
+    }
+
+    fn advance(
+        &mut self,
+        event: SourceScheduledGroupsRefreshEvent,
+    ) -> SourceScheduledGroupsRefreshEffect {
+        match event {
+            SourceScheduledGroupsRefreshEvent::EnsureStartedCompleted {
+                result: Ok(()), ..
+            } => SourceScheduledGroupsRefreshEffect::ReplayRetainedControlState,
+            SourceScheduledGroupsRefreshEvent::EnsureStartedCompleted {
+                result: Err(err),
+                after,
+            } => self.retry_or_fail(err, after),
+            SourceScheduledGroupsRefreshEvent::ReplayRetainedControlStateCompleted(Ok(())) => {
+                if self.refresh_disposition.requires_replay_recovery() {
+                    self.recovery_observation =
+                        SourceScheduledGroupsRefreshRecoveryObservation::RecoveredLiveWorker;
+                }
+                SourceScheduledGroupsRefreshEffect::AcquireClient
+            }
+            SourceScheduledGroupsRefreshEvent::ReplayRetainedControlStateCompleted(Err(err)) => {
+                SourceScheduledGroupsRefreshEffect::Fail(err)
+            }
+            SourceScheduledGroupsRefreshEvent::ClientAcquired {
+                result: Ok(client), ..
+            } => SourceScheduledGroupsRefreshEffect::RefreshGrants { client },
+            SourceScheduledGroupsRefreshEvent::ClientAcquired {
+                result: Err(err),
+                after,
+            } => self.retry_or_fail(err, after),
+            SourceScheduledGroupsRefreshEvent::GrantsRefreshed {
+                result:
+                    Ok(SourceScheduledGroupsRefreshGrantedClient {
+                        client,
+                        stable_host_ref,
+                    }),
+                ..
+            } => SourceScheduledGroupsRefreshEffect::FetchScheduledGroups {
+                client,
+                stable_host_ref,
+            },
+            SourceScheduledGroupsRefreshEvent::GrantsRefreshed {
+                result: Err(err),
+                after,
+            } => self.retry_or_fail(err, after),
+            SourceScheduledGroupsRefreshEvent::FetchScheduledGroupsCompleted {
+                result:
+                    Ok(SourceScheduledGroupsRefreshFetchedGroups {
+                        scheduled_source,
+                        scheduled_scan,
+                        cache_empty,
+                    }),
+                ..
+            } => {
+                let groups_empty = scheduled_source.values().all(|groups| groups.is_empty())
+                    && scheduled_scan.values().all(|groups| groups.is_empty());
+                if groups_empty
+                    && (cache_empty
+                        || self
+                            .scheduled_groups_expectation
+                            .expect_local_runnable_groups())
+                {
+                    if matches!(
+                        classify_source_retry_budget(self.deadline),
+                        SourceRetryBudgetDisposition::Exhausted
+                    ) {
+                        self.fail(CnxError::Timeout)
+                    } else {
+                        self.start()
+                    }
+                } else {
+                    SourceScheduledGroupsRefreshEffect::CommitGroups {
+                        scheduled_source,
+                        scheduled_scan,
+                    }
+                }
+            }
+            SourceScheduledGroupsRefreshEvent::FetchScheduledGroupsCompleted {
+                result: Err(err),
+                after,
+            } => self.retry_or_fail(err, after),
+            SourceScheduledGroupsRefreshEvent::ReconnectCompleted => {
+                match take_pending_reconnect_wait_after(
+                    &mut self.pending_reconnect_wait_after,
+                    "scheduled-groups refresh",
+                ) {
+                    Ok(after) => SourceScheduledGroupsRefreshEffect::Wait { after },
+                    Err(failure) => SourceScheduledGroupsRefreshEffect::Fail(failure),
+                }
+            }
+            SourceScheduledGroupsRefreshEvent::WaitCompleted => self.start(),
+            SourceScheduledGroupsRefreshEvent::CommitGroupsCompleted => {
+                SourceScheduledGroupsRefreshEffect::Complete
+            }
+        }
+    }
 }
 
 fn is_restart_deferred_retire_pending_deactivate_batch(envelopes: &[ControlEnvelope]) -> bool {
@@ -549,47 +2247,6 @@ fn is_restart_deferred_retire_pending_deactivate_batch(envelopes: &[ControlEnvel
                     )
             )
         })
-}
-
-fn source_control_signals_prefer_short_existing_client_attempt(
-    signals: &[SourceControlSignal],
-) -> bool {
-    signals.iter().any(|signal| {
-        matches!(
-            signal,
-            SourceControlSignal::Activate { .. }
-                | SourceControlSignal::Deactivate { .. }
-                | SourceControlSignal::Tick { .. }
-                | SourceControlSignal::ManualRescan { .. }
-                | SourceControlSignal::Passthrough(_)
-        )
-    })
-}
-
-fn source_control_signals_require_post_ack_schedule_refresh(
-    signals: &[SourceControlSignal],
-) -> bool {
-    signals.iter().any(|signal| {
-        matches!(
-            signal,
-            SourceControlSignal::Activate { bound_scopes, .. } if !bound_scopes.is_empty()
-        )
-    })
-}
-
-fn source_control_signals_are_generation_one_activate_only(
-    signals: &[SourceControlSignal],
-) -> bool {
-    let mut saw_activate = false;
-    for signal in signals {
-        match signal {
-            SourceControlSignal::Activate { generation, .. } if *generation == 1 => {
-                saw_activate = true;
-            }
-            _ => return false,
-        }
-    }
-    saw_activate
 }
 
 fn debug_control_scope_capture_enabled() -> bool {
@@ -1999,9 +3656,26 @@ struct SharedSourceWorkerHandleState {
     control_ops_serial: Arc<tokio::sync::Mutex<()>>,
 }
 
-struct ScheduledGroupsRefreshFailure {
-    err: CnxError,
-    recovered_live_worker_during_refresh: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceScheduledGroupsRefreshRecoveryObservation {
+    NoLiveWorkerRecovery,
+    RecoveredLiveWorker,
+}
+
+impl SourceScheduledGroupsRefreshRecoveryObservation {
+    const fn as_atomic_u8(self) -> u8 {
+        match self {
+            Self::NoLiveWorkerRecovery => 0,
+            Self::RecoveredLiveWorker => 1,
+        }
+    }
+
+    const fn from_atomic_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::RecoveredLiveWorker,
+            _ => Self::NoLiveWorkerRecovery,
+        }
+    }
 }
 
 struct SharedSourceWorkerClient {
@@ -2016,6 +3690,15 @@ pub(crate) enum SourceControlReplayState {
     Required,
 }
 
+impl SourceControlReplayState {
+    const fn refresh_disposition(self) -> SourceScheduledGroupsRefreshDisposition {
+        match self {
+            Self::Clear => SourceScheduledGroupsRefreshDisposition::OrdinaryScheduleRefresh,
+            Self::Required => SourceScheduledGroupsRefreshDisposition::ReplayRequiredRecovery,
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub(crate) struct SourceControlState {
     pub(crate) replay_state: SourceControlReplayState,
@@ -2024,21 +3707,20 @@ pub(crate) struct SourceControlState {
 }
 
 impl SourceControlState {
-    fn replay_required(&self) -> bool {
-        self.replay_state == SourceControlReplayState::Required
+    fn replay_state(&self) -> SourceControlReplayState {
+        self.replay_state
     }
 
     fn arm_replay(&mut self) {
         self.replay_state = SourceControlReplayState::Required;
     }
 
-    fn take_replay_requirement(&mut self) -> bool {
-        if self.replay_required() {
+    fn take_replay_state(&mut self) -> SourceControlReplayState {
+        let replay_state = self.replay_state;
+        if matches!(replay_state, SourceControlReplayState::Required) {
             self.replay_state = SourceControlReplayState::Clear;
-            true
-        } else {
-            false
         }
+        replay_state
     }
 
     pub(crate) fn retain_signals(&mut self, signals: &[SourceControlSignal]) {
@@ -2066,7 +3748,10 @@ impl SourceControlState {
     }
 
     fn matches_generation_one_activate_wave(&self, signals: &[SourceControlSignal]) -> bool {
-        if !source_control_signals_are_generation_one_activate_only(signals) {
+        if !matches!(
+            SourceControlFrameSignalPolicies::from_signals(signals).timeout_reset_policy,
+            SourceControlFrameTimeoutResetPolicy::GenerationOneActivateWave
+        ) {
             return false;
         }
         !self.active_by_route.is_empty()
@@ -2094,7 +3779,7 @@ impl SourceControlState {
     fn classify_tick_only_wave(
         &self,
         signals: &[SourceControlSignal],
-    ) -> Option<SourceControlFrameEffect> {
+    ) -> Option<SourceControlFrameTickOnlyDisposition> {
         if signals.is_empty()
             || !signals
                 .iter()
@@ -2134,11 +3819,15 @@ impl SourceControlState {
             }
         }
         if saw_generation_mismatch {
-            Some(SourceControlFrameEffect::ReconnectThenReplayRetainedTick)
-        } else if self.replay_required() {
-            Some(SourceControlFrameEffect::RetainedTickReplay)
+            Some(SourceControlFrameTickOnlyDisposition::Reconnect)
+        } else if matches!(self.replay_state(), SourceControlReplayState::Required) {
+            Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay)
         } else {
-            Some(SourceControlFrameEffect::RetainedTickFastPath)
+            Some(
+                SourceControlFrameTickOnlyDisposition::RetainedTickFastPath {
+                    signals: signals.to_vec(),
+                },
+            )
         }
     }
 
@@ -3273,13 +4962,104 @@ impl SourceWorkerClientHandle {
         self.bump_source_progress(SourceProgressReason::ControlSignalsRetained);
     }
 
+    fn apply_control_frame_retained_tick_fast_path(&self, signals: &[SourceControlSignal]) {
+        self.with_cache_mut(|cache| {
+            prime_cached_control_summary_from_control_signals(
+                cache,
+                &self.node_id,
+                signals,
+                &self.config.host_object_grants,
+            );
+            cache.observability_control_summary_override_by_node =
+                cache.last_control_frame_signals_by_node.clone();
+        });
+    }
+
+    async fn replay_control_frame_retained_tick(
+        &self,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<(), SourceFailure> {
+        self.with_cache_mut(|cache| {
+            cache.observability_control_summary_override_by_node = None;
+        });
+        self.replay_retained_control_state_if_needed_for_refresh_until(deadline)
+            .await
+    }
+
+    async fn apply_post_ack_cache_and_retain_signals(
+        &self,
+        signals: &[SourceControlSignal],
+        cache_priming: SourceControlFramePostAckCachePriming,
+    ) {
+        self.with_cache_mut(|cache| {
+            cache_priming.apply_to_cache(
+                cache,
+                &self.node_id,
+                signals,
+                &self.config.roots,
+                &self.config.host_object_grants,
+            );
+        });
+        self.retain_control_signals(signals).await;
+    }
+
+    async fn perform_control_frame_attempt(
+        &self,
+        envelopes: &[ControlEnvelope],
+        timeout: Duration,
+    ) -> (
+        std::result::Result<SourceWorkerResponse, CnxError>,
+        SourceProgressState,
+    ) {
+        let rpc_result = self
+            .execute_on_control_frame_request_attempt(
+                envelopes,
+                timeout,
+                SourceControlFrameRequestAttemptKind::ControlFrame,
+            )
+            .await;
+        (rpc_result, self.current_source_progress_state())
+    }
+
+    async fn reconnect_for_control_frame(&self) -> Result<()> {
+        self.reconnect_shared_worker_client().await
+    }
+
+    async fn wait_control_frame_retry_after(
+        &self,
+        after: SourceProgressState,
+        deadline: std::time::Instant,
+    ) {
+        self.wait_for_source_progress_after(after, SourceWaitFor::ControlFlowRetry, deadline)
+            .await;
+    }
+
+    async fn arm_control_frame_replay(&self) {
+        self.control_state.lock().await.arm_replay();
+    }
+
+    async fn refresh_scheduled_groups_for_control_frame(
+        &self,
+        deadline: std::time::Instant,
+        scheduled_groups_expectation: SourceScheduledGroupsExpectation,
+    ) -> std::result::Result<(), SourceFailure> {
+        self.refresh_cached_scheduled_groups_from_live_worker_until(
+            deadline,
+            scheduled_groups_expectation,
+        )
+        .await
+    }
+
     async fn replay_retained_control_state_if_needed_for_refresh_until(
         &self,
         deadline: std::time::Instant,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), SourceFailure> {
         let envelopes = {
             let mut control_state = self.control_state.lock().await;
-            if !control_state.take_replay_requirement() {
+            if !matches!(
+                control_state.take_replay_state(),
+                SourceControlReplayState::Required
+            ) {
                 return Ok(());
             }
             control_state.replay_envelopes()
@@ -3289,73 +5069,61 @@ impl SourceWorkerClientHandle {
         }
 
         let deadline = clip_retry_deadline(deadline, SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT);
-        loop {
-            let timeout =
-                match source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
-                {
-                    Ok(timeout) => timeout,
-                    Err(err) => {
-                        self.control_state.lock().await.arm_replay();
-                        return Err(err);
-                    }
-                };
-            let worker = self.worker_client().await;
-            let rpc_result = match tokio::time::timeout(
-                timeout,
-                worker.with_started_retry(|client| {
-                    let envelopes = envelopes.clone();
-                    async move {
-                        Self::call_worker(
-                            &client,
-                            SourceWorkerRequest::OnControlFrame {
-                                envelopes: envelopes.clone(),
+        let mut machine = SourceReplayRetainedControlStateMachine::new(deadline);
+        let replay_result = drive_source_machine_loop(
+            machine.start(),
+            |effect| async {
+                match effect {
+                    SourceReplayRetainedControlStateEffect::Attempt { timeout } => {
+                        SourceOperationLoopStep::Event(
+                            SourceReplayRetainedControlStateEvent::AttemptCompleted {
+                                rpc_result: self
+                                    .execute_on_control_frame_request_attempt(
+                                        &envelopes,
+                                        timeout,
+                                        SourceControlFrameRequestAttemptKind::RetainedReplay,
+                                    )
+                                    .await,
+                                after: self.current_source_progress_state(),
                             },
-                            timeout,
                         )
-                        .await
                     }
-                }),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(CnxError::Timeout),
-            };
-            match rpc_result {
-                Ok(SourceWorkerResponse::Ack) => return Ok(()),
-                Ok(other) => {
-                    self.control_state.lock().await.arm_replay();
-                    return Err(CnxError::ProtocolViolation(format!(
-                        "unexpected source worker response while replaying retained control state: {:?}",
-                        other
-                    )));
+                    SourceReplayRetainedControlStateEffect::Reconnect => {
+                        match self.reconnect_shared_worker_client().await {
+                            Ok(()) => SourceOperationLoopStep::Event(
+                                SourceReplayRetainedControlStateEvent::ReconnectCompleted,
+                            ),
+                            Err(err) => {
+                                SourceOperationLoopStep::Fail(SourceFailure::from_cause(err))
+                            }
+                        }
+                    }
+                    SourceReplayRetainedControlStateEffect::Wait { after } => {
+                        self.wait_for_source_progress_after(
+                            after,
+                            SourceWaitFor::ControlFlowRetry,
+                            deadline,
+                        )
+                        .await;
+                        SourceOperationLoopStep::Event(
+                            SourceReplayRetainedControlStateEvent::WaitCompleted,
+                        )
+                    }
+                    SourceReplayRetainedControlStateEffect::Complete => {
+                        SourceOperationLoopStep::Complete(())
+                    }
+                    SourceReplayRetainedControlStateEffect::Fail(failure) => {
+                        SourceOperationLoopStep::Fail(failure)
+                    }
                 }
-                Err(err) => {
-                    let after = self.current_source_progress_state();
-                    if !can_retry_on_control_frame(&err) {
-                        self.control_state.lock().await.arm_replay();
-                        return Err(err);
-                    }
-                    if deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .is_zero()
-                    {
-                        self.control_state.lock().await.arm_replay();
-                        return Err(CnxError::Timeout);
-                    }
-                    if let Err(err) = self.reconnect_shared_worker_client().await {
-                        self.control_state.lock().await.arm_replay();
-                        return Err(err);
-                    }
-                    self.wait_for_source_progress_after(
-                        after,
-                        SourceWaitFor::ControlFlowRetry,
-                        deadline,
-                    )
-                    .await;
-                }
-            }
+            },
+            |event| Ok(machine.advance(event)),
+        )
+        .await;
+        if replay_result.is_err() {
+            self.control_state.lock().await.arm_replay();
         }
+        replay_result
     }
 
     fn begin_control_op(&self) -> InflightControlOpGuard {
@@ -3481,287 +5249,283 @@ impl SourceWorkerClientHandle {
     async fn refresh_cached_scheduled_groups_from_live_worker_until(
         &self,
         deadline: std::time::Instant,
-        expect_local_runnable_groups: bool,
-    ) -> std::result::Result<(), ScheduledGroupsRefreshFailure> {
+        scheduled_groups_expectation: SourceScheduledGroupsExpectation,
+    ) -> std::result::Result<(), SourceFailure> {
         eprintln!(
             "fs_meta_source_worker_client: refresh_cached_scheduled_groups begin node={}",
             self.node_id.0
         );
-        let replay_required_recovery = self.control_state.lock().await.replay_required();
-        let mut recovered_live_worker_during_refresh = false;
         let deadline = clip_retry_deadline(deadline, SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT);
-        loop {
-            let worker = self.worker_client().await;
-            let ensure_started_timeout =
-                source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
-                    .map_err(|err| ScheduledGroupsRefreshFailure {
-                        err,
-                        recovered_live_worker_during_refresh,
-                    })?;
-            let ensure_started_result =
-                match tokio::time::timeout(ensure_started_timeout, worker.ensure_started()).await {
-                    Ok(result) => result,
-                    Err(_) => Err(CnxError::Timeout),
-                };
-            match ensure_started_result {
-                Ok(()) => {}
-                Err(err) => {
-                    eprintln!(
-                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry ensure_started node={} err={}",
-                        self.node_id.0, err
-                    );
-                    let after = self.current_source_progress_state();
-                    if !can_retry_on_control_frame(&err) {
-                        return Err(ScheduledGroupsRefreshFailure {
-                            err,
-                            recovered_live_worker_during_refresh,
-                        });
-                    }
-                    if deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .is_zero()
-                    {
-                        return Err(ScheduledGroupsRefreshFailure {
-                            err: CnxError::Timeout,
-                            recovered_live_worker_during_refresh,
-                        });
-                    }
-                    self.reconnect_shared_worker_client().await.map_err(|err| {
-                        ScheduledGroupsRefreshFailure {
-                            err,
-                            recovered_live_worker_during_refresh,
-                        }
-                    })?;
-                    self.wait_for_source_progress_after(
-                        after,
-                        SourceWaitFor::ScheduledGroupsRefresh,
-                        deadline,
-                    )
-                    .await;
-                    continue;
-                }
-            }
-            self.replay_retained_control_state_if_needed_for_refresh_until(deadline)
-                .await
-                .map_err(|err| ScheduledGroupsRefreshFailure {
-                    err,
-                    recovered_live_worker_during_refresh,
-                })?;
-            if replay_required_recovery {
-                recovered_live_worker_during_refresh = true;
-            }
-            let worker = self.worker_client().await;
-            let client = match worker.client().await {
-                Ok(client) => client,
-                Err(err) => {
-                    eprintln!(
-                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry client node={} err={}",
-                        self.node_id.0, err
-                    );
-                    let after = self.current_source_progress_state();
-                    if !can_retry_on_control_frame(&err) {
-                        return Err(ScheduledGroupsRefreshFailure {
-                            err,
-                            recovered_live_worker_during_refresh,
-                        });
-                    }
-                    if deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .is_zero()
-                    {
-                        return Err(ScheduledGroupsRefreshFailure {
-                            err: CnxError::Timeout,
-                            recovered_live_worker_during_refresh,
-                        });
-                    }
-                    self.reconnect_shared_worker_client().await.map_err(|err| {
-                        ScheduledGroupsRefreshFailure {
-                            err,
-                            recovered_live_worker_during_refresh,
-                        }
-                    })?;
-                    self.wait_for_source_progress_after(
-                        after,
-                        SourceWaitFor::ScheduledGroupsRefresh,
-                        deadline,
-                    )
-                    .await;
-                    continue;
-                }
-            };
-            let grants = match Self::call_worker(
-                &client,
-                SourceWorkerRequest::HostObjectGrantsSnapshot,
-                source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
-                    .map_err(|err| ScheduledGroupsRefreshFailure {
-                        err,
-                        recovered_live_worker_during_refresh,
-                    })?,
-            )
+        let refresh_disposition = self
+            .control_state
+            .lock()
             .await
-            {
-                Ok(SourceWorkerResponse::HostObjectGrants(grants)) => {
-                    self.with_cache_mut(|cache| {
-                        cache.grants = Some(grants.clone());
-                    });
-                    self.bump_source_progress(SourceProgressReason::HostObjectGrantsUpdated);
-                    grants
-                }
-                Ok(other) => {
-                    return Err(ScheduledGroupsRefreshFailure {
-                        err: CnxError::ProtocolViolation(format!(
-                            "unexpected source worker response for scheduled groups host grants refresh: {:?}",
-                            other
-                        )),
-                        recovered_live_worker_during_refresh,
-                    });
-                }
-                Err(err) if can_use_cached_host_object_grants_snapshot(&err) => self
-                    .cached_host_object_grants_snapshot()
-                    .map_err(|err| ScheduledGroupsRefreshFailure {
-                        err,
-                        recovered_live_worker_during_refresh,
-                    })?,
-                Err(err) => {
-                    eprintln!(
-                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry grants node={} err={}",
-                        self.node_id.0, err
-                    );
-                    let after = self.current_source_progress_state();
-                    if !can_retry_on_control_frame(&err) {
-                        return Err(ScheduledGroupsRefreshFailure {
-                            err,
-                            recovered_live_worker_during_refresh,
-                        });
+            .replay_state()
+            .refresh_disposition();
+        let mut machine = SourceScheduledGroupsRefreshMachine::new(
+            deadline,
+            scheduled_groups_expectation,
+            refresh_disposition,
+        );
+        let recovery_observation =
+            std::sync::atomic::AtomicU8::new(machine.recovery_observation.as_atomic_u8());
+        drive_source_machine_loop(
+            machine.start(),
+            |effect| async {
+                match effect {
+                    SourceScheduledGroupsRefreshEffect::EnsureStarted => {
+                        SourceOperationLoopStep::Event(
+                            SourceScheduledGroupsRefreshEvent::EnsureStartedCompleted {
+                                result: self
+                                    .execute_scheduled_groups_refresh_ensure_started(deadline)
+                                    .await,
+                                after: self.current_source_progress_state(),
+                            },
+                        )
                     }
-                    if deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .is_zero()
-                    {
-                        return Err(ScheduledGroupsRefreshFailure {
-                            err: CnxError::Timeout,
-                            recovered_live_worker_during_refresh,
-                        });
+                    SourceScheduledGroupsRefreshEffect::ReplayRetainedControlState => {
+                        SourceOperationLoopStep::Event(
+                            SourceScheduledGroupsRefreshEvent::ReplayRetainedControlStateCompleted(
+                                self.replay_retained_control_state_if_needed_for_refresh_until(
+                                    deadline,
+                                )
+                                .await,
+                            ),
+                        )
                     }
-                    self.reconnect_shared_worker_client().await.map_err(|err| {
-                        ScheduledGroupsRefreshFailure {
-                            err,
-                            recovered_live_worker_during_refresh,
+                    SourceScheduledGroupsRefreshEffect::AcquireClient => {
+                        SourceOperationLoopStep::Event(
+                            SourceScheduledGroupsRefreshEvent::ClientAcquired {
+                                result: self
+                                    .execute_scheduled_groups_refresh_acquire_client()
+                                    .await,
+                                after: self.current_source_progress_state(),
+                            },
+                        )
+                    }
+                    SourceScheduledGroupsRefreshEffect::RefreshGrants { client } => {
+                        SourceOperationLoopStep::Event(
+                            SourceScheduledGroupsRefreshEvent::GrantsRefreshed {
+                                result: self
+                                    .execute_scheduled_groups_refresh_grants(&client, deadline)
+                                    .await
+                                    .map(|stable_host_ref| {
+                                        SourceScheduledGroupsRefreshGrantedClient {
+                                            client,
+                                            stable_host_ref,
+                                        }
+                                    }),
+                                after: self.current_source_progress_state(),
+                            },
+                        )
+                    }
+                    SourceScheduledGroupsRefreshEffect::FetchScheduledGroups {
+                        client,
+                        stable_host_ref,
+                    } => SourceOperationLoopStep::Event(
+                        SourceScheduledGroupsRefreshEvent::FetchScheduledGroupsCompleted {
+                            result: self
+                                .execute_scheduled_groups_refresh_fetch(
+                                    &client,
+                                    &stable_host_ref,
+                                    deadline,
+                                )
+                                .await,
+                            after: self.current_source_progress_state(),
+                        },
+                    ),
+                    SourceScheduledGroupsRefreshEffect::Reconnect => {
+                        match self.reconnect_shared_worker_client().await {
+                            Ok(()) => SourceOperationLoopStep::Event(
+                                SourceScheduledGroupsRefreshEvent::ReconnectCompleted,
+                            ),
+                            Err(err) => SourceOperationLoopStep::Fail(
+                                source_scheduled_groups_refresh_failure_from_error(
+                                    err,
+                                    refresh_disposition,
+                                    SourceScheduledGroupsRefreshRecoveryObservation::from_atomic_u8(
+                                        recovery_observation.load(Ordering::Relaxed),
+                                    ),
+                                ),
+                            ),
                         }
-                    })?;
-                    self.wait_for_source_progress_after(
-                        after,
-                        SourceWaitFor::ScheduledGroupsRefresh,
-                        deadline,
-                    )
-                    .await;
-                    continue;
+                    }
+                    SourceScheduledGroupsRefreshEffect::Wait { after } => {
+                        self.wait_for_source_progress_after(
+                            after,
+                            SourceWaitFor::ScheduledGroupsRefresh,
+                            deadline,
+                        )
+                        .await;
+                        SourceOperationLoopStep::Event(
+                            SourceScheduledGroupsRefreshEvent::WaitCompleted,
+                        )
+                    }
+                    SourceScheduledGroupsRefreshEffect::CommitGroups {
+                        scheduled_source,
+                        scheduled_scan,
+                    } => {
+                        self.execute_scheduled_groups_refresh_commit_groups(
+                            scheduled_source,
+                            scheduled_scan,
+                        );
+                        SourceOperationLoopStep::Event(
+                            SourceScheduledGroupsRefreshEvent::CommitGroupsCompleted,
+                        )
+                    }
+                    SourceScheduledGroupsRefreshEffect::Complete => {
+                        SourceOperationLoopStep::Complete(())
+                    }
+                    SourceScheduledGroupsRefreshEffect::Fail(failure) => {
+                        SourceOperationLoopStep::Fail(failure)
+                    }
                 }
-            };
-            let stable_host_ref = {
-                let stable = stable_host_ref_for_node_id(&self.node_id, &grants);
-                if stable != self.node_id.0 {
-                    stable
-                } else {
-                    self.with_cache_mut(|cache| {
-                        stable_host_ref_from_cached_scheduled_groups(&self.node_id, cache)
-                            .unwrap_or(stable)
-                    })
-                }
-            };
-            #[cfg(test)]
-            let refresh_attempt = {
-                let injected = take_source_worker_scheduled_groups_refresh_error_queue_hook(
-                    self.worker_instance_id_for_tests().await,
+            },
+            |event| {
+                let effect = machine.advance(event);
+                recovery_observation.store(
+                    machine.recovery_observation.as_atomic_u8(),
+                    Ordering::Relaxed,
                 );
-                if let Some(err) = injected {
-                    Err(err)
-                } else {
-                    self.fetch_scheduled_groups_refresh_attempt(&client, &stable_host_ref, deadline)
-                        .await
-                }
-            };
-            #[cfg(not(test))]
-            let refresh_attempt = self
-                .fetch_scheduled_groups_refresh_attempt(&client, &stable_host_ref, deadline)
-                .await;
-            let (scheduled_source, scheduled_scan) = match refresh_attempt {
-                Ok(groups) => groups,
-                Err(err) => {
-                    eprintln!(
-                        "fs_meta_source_worker_client: refresh_cached_scheduled_groups retry schedule node={} err={}",
-                        self.node_id.0, err
-                    );
-                    let after = self.current_source_progress_state();
-                    if !can_retry_on_control_frame(&err) {
-                        return Err(ScheduledGroupsRefreshFailure {
-                            err,
-                            recovered_live_worker_during_refresh,
-                        });
-                    }
-                    if deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .is_zero()
-                    {
-                        return Err(ScheduledGroupsRefreshFailure {
-                            err: CnxError::Timeout,
-                            recovered_live_worker_during_refresh,
-                        });
-                    }
-                    self.reconnect_shared_worker_client().await.map_err(|err| {
-                        ScheduledGroupsRefreshFailure {
-                            err,
-                            recovered_live_worker_during_refresh,
-                        }
-                    })?;
-                    self.wait_for_source_progress_after(
-                        after,
-                        SourceWaitFor::ScheduledGroupsRefresh,
-                        deadline,
-                    )
-                    .await;
-                    continue;
-                }
-            };
-            let cache_empty = self.with_cache_mut(|cache| {
-                cache
-                    .scheduled_source_groups_by_node
-                    .as_ref()
-                    .is_none_or(|groups| groups.is_empty())
-                    && cache
-                        .scheduled_scan_groups_by_node
-                        .as_ref()
-                        .is_none_or(|groups| groups.is_empty())
-            });
-            if scheduled_source.values().all(|groups| groups.is_empty())
-                && scheduled_scan.values().all(|groups| groups.is_empty())
-                && (cache_empty || expect_local_runnable_groups)
-            {
-                if deadline
-                    .saturating_duration_since(std::time::Instant::now())
-                    .is_zero()
-                {
-                    return Err(ScheduledGroupsRefreshFailure {
-                        err: CnxError::Timeout,
-                        recovered_live_worker_during_refresh,
-                    });
-                }
-                continue;
-            }
+                Ok(effect)
+            },
+        )
+        .await
+    }
+
+    async fn execute_scheduled_groups_refresh_ensure_started(
+        &self,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<(), SourceFailure> {
+        let worker = self.worker_client().await;
+        let ensure_started_timeout =
+            source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)?;
+        map_source_timeout_result(
+            tokio::time::timeout(ensure_started_timeout, worker.ensure_started()).await,
+        )
+        .map_err(SourceFailure::from)
+    }
+
+    async fn execute_scheduled_groups_refresh_acquire_client(
+        &self,
+    ) -> std::result::Result<TypedWorkerClient<SourceWorkerRpc>, SourceFailure> {
+        self.worker_client()
+            .await
+            .client()
+            .await
+            .map_err(SourceFailure::from)
+    }
+
+    fn scheduled_groups_refresh_stable_host_ref(&self, grants: &[GrantedMountRoot]) -> String {
+        let stable = stable_host_ref_for_node_id(&self.node_id, grants);
+        if stable != self.node_id.0 {
+            stable
+        } else {
             self.with_cache_mut(|cache| {
-                update_cached_scheduled_groups_from_refresh(
-                    cache,
+                stable_host_ref_from_cached_scheduled_groups(&self.node_id, cache).unwrap_or(stable)
+            })
+        }
+    }
+
+    async fn execute_scheduled_groups_refresh_grants_snapshot(
+        &self,
+        client: &TypedWorkerClient<SourceWorkerRpc>,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<SourceWorkerResponse, SourceFailure> {
+        Self::call_worker(
+            client,
+            SourceWorkerRequest::HostObjectGrantsSnapshot,
+            source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)?,
+        )
+        .await
+        .map_err(SourceFailure::from)
+    }
+
+    async fn execute_scheduled_groups_refresh_grants(
+        &self,
+        client: &TypedWorkerClient<SourceWorkerRpc>,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<String, SourceFailure> {
+        match self
+            .execute_scheduled_groups_refresh_grants_snapshot(client, deadline)
+            .await
+        {
+            Ok(SourceWorkerResponse::HostObjectGrants(grants)) => {
+                self.with_cache_mut(|cache| {
+                    cache.grants = Some(grants.clone());
+                });
+                self.bump_source_progress(SourceProgressReason::HostObjectGrantsUpdated);
+                Ok(self.scheduled_groups_refresh_stable_host_ref(&grants))
+            }
+            Ok(other) => Err(unexpected_source_worker_response(
+                "for scheduled groups host grants refresh",
+                other,
+            )
+            .into()),
+            Err(err) if can_use_cached_grant_derived_snapshot(err.as_error()) => Ok(self
+                .cached_host_object_grants_snapshot()
+                .map(|grants| self.scheduled_groups_refresh_stable_host_ref(&grants))
+                .map_err(SourceFailure::from)?),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn execute_scheduled_groups_refresh_fetch(
+        &self,
+        client: &TypedWorkerClient<SourceWorkerRpc>,
+        stable_host_ref: &str,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<SourceScheduledGroupsRefreshFetchedGroups, SourceFailure> {
+        #[cfg(test)]
+        let refresh_attempt = {
+            let injected = take_source_worker_scheduled_groups_refresh_error_queue_hook(
+                self.worker_instance_id_for_tests().await,
+            );
+            if let Some(err) = injected {
+                Err(err.into())
+            } else {
+                self.fetch_scheduled_groups_refresh_attempt(client, stable_host_ref, deadline)
+                    .await
+            }
+        };
+        #[cfg(not(test))]
+        let refresh_attempt = self
+            .fetch_scheduled_groups_refresh_attempt(client, stable_host_ref, deadline)
+            .await;
+        match refresh_attempt {
+            Ok((scheduled_source, scheduled_scan)) => {
+                Ok(SourceScheduledGroupsRefreshFetchedGroups {
+                    cache_empty: self.with_cache_mut(|cache| {
+                        cache
+                            .scheduled_source_groups_by_node
+                            .as_ref()
+                            .is_none_or(|groups| groups.is_empty())
+                            && cache
+                                .scheduled_scan_groups_by_node
+                                .as_ref()
+                                .is_none_or(|groups| groups.is_empty())
+                    }),
                     scheduled_source,
                     scheduled_scan,
-                );
-            });
-            self.bump_source_progress(SourceProgressReason::ScheduledGroupsUpdated);
-            eprintln!(
-                "fs_meta_source_worker_client: refresh_cached_scheduled_groups ok node={}",
-                self.node_id.0
-            );
-            return Ok(());
+                })
+            }
+            Err(err) => Err(err),
         }
+    }
+
+    fn execute_scheduled_groups_refresh_commit_groups(
+        &self,
+        scheduled_source: std::collections::BTreeMap<String, Vec<String>>,
+        scheduled_scan: std::collections::BTreeMap<String, Vec<String>>,
+    ) {
+        self.with_cache_mut(|cache| {
+            update_cached_scheduled_groups_from_refresh(cache, scheduled_source, scheduled_scan);
+        });
+        self.bump_source_progress(SourceProgressReason::ScheduledGroupsUpdated);
+        eprintln!(
+            "fs_meta_source_worker_client: refresh_cached_scheduled_groups ok node={}",
+            self.node_id.0
+        );
     }
 
     async fn fetch_scheduled_groups_refresh_attempt(
@@ -3769,10 +5533,13 @@ impl SourceWorkerClientHandle {
         client: &TypedWorkerClient<SourceWorkerRpc>,
         stable_host_ref: &str,
         deadline: std::time::Instant,
-    ) -> Result<(
-        std::collections::BTreeMap<String, Vec<String>>,
-        std::collections::BTreeMap<String, Vec<String>>,
-    )> {
+    ) -> std::result::Result<
+        (
+            std::collections::BTreeMap<String, Vec<String>>,
+            std::collections::BTreeMap<String, Vec<String>>,
+        ),
+        SourceFailure,
+    > {
         #[cfg(test)]
         if let Some((source_groups, scan_groups)) =
             take_source_worker_scheduled_groups_refresh_queue_hook()
@@ -3795,7 +5562,8 @@ impl SourceWorkerClientHandle {
             SourceWorkerRequest::ScheduledSourceGroupIds,
             source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)?,
         )
-        .await?
+        .await
+        .map_err(SourceFailure::from)?
         {
             SourceWorkerResponse::ScheduledGroupIds(groups) => groups
                 .map(|groups| {
@@ -3806,10 +5574,11 @@ impl SourceWorkerClientHandle {
                 })
                 .unwrap_or_default(),
             other => {
-                return Err(CnxError::ProtocolViolation(format!(
-                    "unexpected source worker response for scheduled source groups cache refresh: {:?}",
-                    other
-                )));
+                return Err(unexpected_source_worker_response(
+                    "for scheduled source groups cache refresh",
+                    other,
+                )
+                .into());
             }
         };
         let scheduled_scan = match Self::call_worker(
@@ -3817,7 +5586,8 @@ impl SourceWorkerClientHandle {
             SourceWorkerRequest::ScheduledScanGroupIds,
             source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)?,
         )
-        .await?
+        .await
+        .map_err(SourceFailure::from)?
         {
             SourceWorkerResponse::ScheduledGroupIds(groups) => groups
                 .map(|groups| {
@@ -3828,10 +5598,11 @@ impl SourceWorkerClientHandle {
                 })
                 .unwrap_or_default(),
             other => {
-                return Err(CnxError::ProtocolViolation(format!(
-                    "unexpected source worker response for scheduled scan groups cache refresh: {:?}",
-                    other
-                )));
+                return Err(unexpected_source_worker_response(
+                    "for scheduled scan groups cache refresh",
+                    other,
+                )
+                .into());
             }
         };
         Ok((scheduled_source, scheduled_scan))
@@ -3861,51 +5632,44 @@ impl SourceWorkerClientHandle {
         self.worker_client().await.existing_client().await
     }
 
-    async fn observability_snapshot_with_timeout(
+    async fn observability_snapshot_with_timeout_with_failure(
         &self,
         timeout: Duration,
-    ) -> Result<SourceObservabilitySnapshot> {
+    ) -> std::result::Result<SourceObservabilitySnapshot, SourceFailure> {
         let deadline = clip_retry_deadline(std::time::Instant::now() + timeout, timeout);
-        let response = loop {
-            let attempt_timeout = source_operation_attempt_timeout(deadline, timeout)?;
-            let rpc_result = self
-                .with_started_retry(|client| async move {
-                    #[cfg(test)]
-                    record_source_worker_observability_rpc_attempt();
-                    #[cfg(test)]
-                    if let Some(err) = take_source_worker_observability_error_hook() {
-                        return Err(err);
+        let machine = SourceObservabilitySnapshotMachine::new(deadline, timeout);
+        let response = drive_source_machine_loop(
+            machine.start()?,
+            |effect| async {
+                match effect {
+                    SourceObservabilitySnapshotEffect::Attempt { timeout } => {
+                        SourceOperationLoopStep::Event(
+                            SourceObservabilitySnapshotEvent::AttemptCompleted {
+                                rpc_result: self
+                                    .execute_observability_snapshot_attempt(timeout)
+                                    .await,
+                                after: self.current_source_progress_state(),
+                            },
+                        )
                     }
-                    Self::call_worker(
-                        &client,
-                        SourceWorkerRequest::ObservabilitySnapshot,
-                        attempt_timeout,
-                    )
-                    .await
-                })
-                .await;
-            match rpc_result {
-                Ok(response) => break response,
-                Err(err) => {
-                    let after = self.current_source_progress_state();
-                    if !can_retry_update_logical_roots(&err) {
-                        return Err(err);
+                    SourceObservabilitySnapshotEffect::Wait { after } => {
+                        self.execute_observability_snapshot_wait(after, deadline)
+                            .await;
+                        SourceOperationLoopStep::Event(
+                            SourceObservabilitySnapshotEvent::WaitCompleted,
+                        )
                     }
-                    if deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .is_zero()
-                    {
-                        return Err(CnxError::Timeout);
+                    SourceObservabilitySnapshotEffect::Complete(response) => {
+                        SourceOperationLoopStep::Complete(response)
                     }
-                    self.wait_for_source_progress_after(
-                        after,
-                        SourceWaitFor::Observability,
-                        deadline,
-                    )
-                    .await;
+                    SourceObservabilitySnapshotEffect::Fail(failure) => {
+                        SourceOperationLoopStep::Fail(failure)
+                    }
                 }
-            }
-        };
+            },
+            |event| machine.advance(event),
+        )
+        .await?;
         match response {
             SourceWorkerResponse::ObservabilitySnapshot(mut snapshot) => {
                 snapshot = self.with_cache_mut(|cache| {
@@ -3942,10 +5706,50 @@ impl SourceWorkerClientHandle {
                 self.update_cached_observability_snapshot(&snapshot);
                 Ok(snapshot)
             }
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for observability snapshot: {:?}",
-                other
-            ))),
+            other => Err(SourceFailure::protocol_violation(
+                SourceProtocolViolationKind::UnexpectedWorkerResponse {
+                    context: "for observability snapshot",
+                    response: format!("{:?}", other),
+                },
+            )),
+        }
+    }
+
+    async fn observability_snapshot_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<SourceObservabilitySnapshot> {
+        self.observability_snapshot_with_timeout_with_failure(timeout)
+            .await
+            .map_err(SourceFailure::into_error)
+    }
+
+    async fn wait_for_rescan_observed_epoch_with_failure(
+        &self,
+        request_epoch: u64,
+        total_timeout: Duration,
+    ) -> std::result::Result<(), SourceFailure> {
+        let deadline = Instant::now() + total_timeout;
+        loop {
+            if self.cached_rescan_observed_epoch() >= request_epoch {
+                return Ok(());
+            }
+            let remaining = match classify_source_retry_budget(deadline) {
+                SourceRetryBudgetDisposition::Exhausted => {
+                    return Err(SourceFailure::retry_budget_exhausted(
+                        SourceRetryBudgetExhaustionKind::OperationWait,
+                    ));
+                }
+                SourceRetryBudgetDisposition::Remaining(remaining) => remaining,
+            };
+            let snapshot_timeout = remaining.min(SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT);
+            let snapshot = self
+                .progress_snapshot_with_timeout(snapshot_timeout)
+                .await
+                .map_err(SourceFailure::from)?;
+            if snapshot.rescan_observed_epoch >= request_epoch {
+                return Ok(());
+            }
         }
     }
 
@@ -3954,97 +5758,77 @@ impl SourceWorkerClientHandle {
         request_epoch: u64,
         total_timeout: Duration,
     ) -> Result<()> {
-        let deadline = Instant::now() + total_timeout;
-        loop {
-            if self.cached_rescan_observed_epoch() >= request_epoch {
-                return Ok(());
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(CnxError::Timeout);
-            }
-            let snapshot_timeout = remaining.min(SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT);
-            let snapshot = self
-                .progress_snapshot_with_timeout(snapshot_timeout)
-                .await?;
-            if snapshot.rescan_observed_epoch >= request_epoch {
-                return Ok(());
-            }
-        }
+        self.wait_for_rescan_observed_epoch_with_failure(request_epoch, total_timeout)
+            .await
+            .map_err(SourceFailure::into_error)
     }
 
-    pub async fn start(&self) -> Result<()> {
+    async fn start_with_failure(&self) -> std::result::Result<(), SourceFailure> {
         let _start_serial = self.start_serial.lock().await;
         let deadline = clip_retry_deadline(
             std::time::Instant::now() + SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
             SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
         );
-        loop {
-            let timeout =
-                source_operation_attempt_timeout(deadline, SOURCE_WORKER_START_ATTEMPT_TIMEOUT)?;
-            eprintln!(
-                "fs_meta_source_worker_client: ensure_started begin node={}",
-                self.node_id.0
-            );
-            #[cfg(test)]
-            maybe_pause_before_ensure_started().await;
-            #[cfg(test)]
-            let injected = take_source_worker_start_error_queue_hook(
-                self.worker_instance_id_for_tests().await,
-            );
-            #[cfg(not(test))]
-            let injected = None::<CnxError>;
-            #[cfg(test)]
-            let injected_delay = take_source_worker_start_delay_hook();
-            let worker = self.worker_client().await;
-            let start_result = match injected {
-                Some(err) => Err(err),
-                None => match tokio::time::timeout(timeout, async {
-                    #[cfg(test)]
-                    if let Some(delay) = injected_delay {
-                        tokio::time::sleep(delay).await;
+        let mut machine = SourceStartMachine::new(deadline);
+        drive_source_machine_loop(
+            machine.start()?,
+            |effect| async {
+                match effect {
+                    SourceStartEffect::Attempt { timeout } => {
+                        eprintln!(
+                            "fs_meta_source_worker_client: ensure_started begin node={}",
+                            self.node_id.0
+                        );
+                        SourceOperationLoopStep::Event(SourceStartEvent::AttemptCompleted {
+                            start_result: self.execute_start_attempt(timeout).await,
+                            after: self.current_source_progress_state(),
+                        })
                     }
-                    worker.ensure_started().await
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(CnxError::Timeout),
-                },
-            };
-            match start_result {
-                Ok(()) => {
-                    eprintln!(
-                        "fs_meta_source_worker_client: ensure_started ok node={}",
-                        self.node_id.0
-                    );
-                    self.bump_source_progress(SourceProgressReason::Started);
-                    return Ok(());
-                }
-                Err(err) => {
-                    eprintln!(
-                        "fs_meta_source_worker_client: on_control_frame retry node={} err={}",
-                        self.node_id.0, err
-                    );
-                    let after = self.current_source_progress_state();
-                    if !can_retry_on_control_frame(&err) {
-                        return Err(err);
+                    SourceStartEffect::Reconnect => {
+                        match self.reconnect_shared_worker_client().await {
+                            Ok(()) => {
+                                SourceOperationLoopStep::Event(SourceStartEvent::ReconnectCompleted)
+                            }
+                            Err(err) => {
+                                SourceOperationLoopStep::Fail(SourceFailure::from_cause(err))
+                            }
+                        }
                     }
-                    if deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .is_zero()
-                    {
-                        return Err(CnxError::Timeout);
-                    }
-                    self.reconnect_shared_worker_client().await?;
-                    self.wait_for_source_progress_after(after, SourceWaitFor::Started, deadline)
+                    SourceStartEffect::Wait { after } => {
+                        self.wait_for_source_progress_after(
+                            after,
+                            SourceWaitFor::Started,
+                            deadline,
+                        )
                         .await;
+                        SourceOperationLoopStep::Event(SourceStartEvent::WaitCompleted)
+                    }
+                    SourceStartEffect::Complete => {
+                        eprintln!(
+                            "fs_meta_source_worker_client: ensure_started ok node={}",
+                            self.node_id.0
+                        );
+                        self.bump_source_progress(SourceProgressReason::Started);
+                        SourceOperationLoopStep::Complete(())
+                    }
+                    SourceStartEffect::Fail(failure) => SourceOperationLoopStep::Fail(failure),
                 }
-            }
-        }
+            },
+            |event| machine.advance(event),
+        )
+        .await
     }
 
-    pub async fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {
+    pub async fn start(&self) -> Result<()> {
+        self.start_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)
+    }
+
+    async fn update_logical_roots_with_failure(
+        &self,
+        roots: Vec<RootSpec>,
+    ) -> std::result::Result<(), SourceFailure> {
         let _inflight = self.begin_control_op();
         let _serial = self.control_ops_serial.lock().await;
         eprintln!(
@@ -4056,72 +5840,53 @@ impl SourceWorkerClientHandle {
             std::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT,
             SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT,
         );
-        loop {
-            let timeout =
-                source_operation_attempt_timeout(deadline, SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT)?;
-            let rpc_result = self
-                .with_started_retry(|client| {
-                    let roots = roots.clone();
-                    async move {
-                        #[cfg(test)]
-                        maybe_pause_before_update_logical_roots_rpc().await;
-                        #[cfg(test)]
-                        if let Some(err) = take_update_logical_roots_error_hook() {
-                            return Err(err);
-                        }
-                        Self::call_worker(
-                            &client,
-                            SourceWorkerRequest::UpdateLogicalRoots {
-                                roots: roots.clone(),
+        let machine = SourceUpdateLogicalRootsMachine::new(deadline);
+        drive_source_machine_loop(
+            machine.start()?,
+            |effect| async {
+                match effect {
+                    SourceUpdateLogicalRootsEffect::Attempt { timeout } => {
+                        SourceOperationLoopStep::Event(
+                            SourceUpdateLogicalRootsEvent::AttemptCompleted {
+                                rpc_result: self
+                                    .execute_update_logical_roots_attempt(&roots, timeout)
+                                    .await,
+                                after: self.current_source_progress_state(),
                             },
-                            timeout,
                         )
-                        .await
                     }
-                })
-                .await;
-            match rpc_result {
-                Ok(SourceWorkerResponse::Ack) => {
-                    self.with_cache_mut(|cache| {
-                        cache.logical_roots = Some(roots.clone());
-                    });
-                    self.bump_source_progress(SourceProgressReason::LogicalRootsUpdated);
-                    eprintln!(
-                        "fs_meta_source_worker_client: update_logical_roots ok node={} roots={}",
-                        self.node_id.0,
-                        roots.len()
-                    );
-                    return Ok(());
-                }
-                Err(CnxError::InvalidInput(message)) => {
-                    return Err(CnxError::InvalidInput(message));
-                }
-                Ok(other) => {
-                    return Err(CnxError::ProtocolViolation(format!(
-                        "unexpected source worker response for update roots: {:?}",
-                        other
-                    )));
-                }
-                Err(err) => {
-                    let after = self.current_source_progress_state();
-                    if !can_retry_update_logical_roots(&err) {
-                        return Err(err);
+                    SourceUpdateLogicalRootsEffect::Wait { after } => {
+                        self.execute_update_logical_roots_wait(after, deadline).await;
+                        SourceOperationLoopStep::Event(
+                            SourceUpdateLogicalRootsEvent::WaitCompleted,
+                        )
                     }
-                    if deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .is_zero()
-                    {
-                        return Err(CnxError::Timeout);
+                    SourceUpdateLogicalRootsEffect::Complete => {
+                        self.with_cache_mut(|cache| {
+                            cache.logical_roots = Some(roots.clone());
+                        });
+                        self.bump_source_progress(SourceProgressReason::LogicalRootsUpdated);
+                        eprintln!(
+                            "fs_meta_source_worker_client: update_logical_roots ok node={} roots={}",
+                            self.node_id.0,
+                            roots.len()
+                        );
+                        SourceOperationLoopStep::Complete(())
                     }
-                    self.wait_for_source_progress_after(
-                        after,
-                        SourceWaitFor::LogicalRoots,
-                        deadline,
-                    )
-                    .await;
+                    SourceUpdateLogicalRootsEffect::Fail(failure) => {
+                        SourceOperationLoopStep::Fail(failure)
+                    }
                 }
-            }
-        }
+            },
+            |event| machine.advance(event),
+        )
+        .await
+    }
+
+    pub async fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {
+        self.update_logical_roots_with_failure(roots)
+            .await
+            .map_err(SourceFailure::into_error)
     }
 
     pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
@@ -4160,11 +5925,11 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(roots)
             }
-            Ok(other) => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for logical roots: {:?}",
-                other
-            ))),
-            Err(err) if can_use_cached_logical_roots_snapshot(&err) => {
+            Ok(other) => Err(unexpected_source_worker_response(
+                "for logical roots",
+                other,
+            )),
+            Err(err) if can_use_cached_grant_derived_snapshot(&err) => {
                 self.cached_logical_roots_snapshot()
             }
             Err(err) => Err(err),
@@ -4197,11 +5962,11 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(grants)
             }
-            Ok(other) => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for host object grants: {:?}",
-                other
-            ))),
-            Err(err) if can_use_cached_host_object_grants_snapshot(&err) => {
+            Ok(other) => Err(unexpected_source_worker_response(
+                "for host object grants",
+                other,
+            )),
+            Err(err) if can_use_cached_grant_derived_snapshot(&err) => {
                 self.cached_host_object_grants_snapshot()
             }
             Err(err) => Err(err),
@@ -4222,10 +5987,10 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(version)
             }
-            Ok(other) => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for host object grants version: {:?}",
-                other
-            ))),
+            Ok(other) => Err(unexpected_source_worker_response(
+                "for host object grants version",
+                other,
+            )),
             Err(err) => Err(err),
         }
     }
@@ -4251,10 +6016,10 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(snapshot)
             }
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for status snapshot: {:?}",
-                other
-            ))),
+            other => Err(unexpected_source_worker_response(
+                "for status snapshot",
+                other,
+            )),
         })
     }
 
@@ -4272,10 +6037,10 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(state)
             }
-            Ok(other) => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for lifecycle state: {:?}",
-                other
-            ))),
+            Ok(other) => Err(unexpected_source_worker_response(
+                "for lifecycle state",
+                other,
+            )),
             Err(err) => Err(err),
         }
     }
@@ -4289,11 +6054,12 @@ impl SourceWorkerClientHandle {
     ) -> Result<()> {
         self.on_control_frame_with_timeouts(envelopes, total_timeout, rpc_timeout)
             .await
+            .map_err(SourceFailure::into_error)
     }
 
-    pub async fn scheduled_source_group_ids(
+    async fn scheduled_source_group_ids_with_failure(
         &self,
-    ) -> Result<Option<std::collections::BTreeSet<String>>> {
+    ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SourceFailure> {
         match self
             .scheduled_group_ids_with_timeout(SourceWorkerRequest::ScheduledSourceGroupIds)
             .await?
@@ -4306,16 +6072,26 @@ impl SourceWorkerClientHandle {
                     &cache.replay_recovery_scheduled_source_groups_by_node,
                 )
             })),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for scheduled source groups: {:?}",
-                other
-            ))),
+            other => Err(SourceFailure::protocol_violation(
+                SourceProtocolViolationKind::UnexpectedWorkerResponse {
+                    context: "for scheduled source groups",
+                    response: format!("{:?}", other),
+                },
+            )),
         }
     }
 
-    pub async fn scheduled_scan_group_ids(
+    pub async fn scheduled_source_group_ids(
         &self,
     ) -> Result<Option<std::collections::BTreeSet<String>>> {
+        self.scheduled_source_group_ids_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)
+    }
+
+    async fn scheduled_scan_group_ids_with_failure(
+        &self,
+    ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SourceFailure> {
         match self
             .scheduled_group_ids_with_timeout(SourceWorkerRequest::ScheduledScanGroupIds)
             .await?
@@ -4328,59 +6104,76 @@ impl SourceWorkerClientHandle {
                     &cache.replay_recovery_scheduled_scan_groups_by_node,
                 )
             })),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for scheduled scan groups: {:?}",
-                other
-            ))),
+            other => Err(SourceFailure::protocol_violation(
+                SourceProtocolViolationKind::UnexpectedWorkerResponse {
+                    context: "for scheduled scan groups",
+                    response: format!("{:?}", other),
+                },
+            )),
         }
+    }
+
+    pub async fn scheduled_scan_group_ids(
+        &self,
+    ) -> Result<Option<std::collections::BTreeSet<String>>> {
+        self.scheduled_scan_group_ids_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)
     }
 
     async fn scheduled_group_ids_with_timeout(
         &self,
         request: SourceWorkerRequest,
-    ) -> Result<SourceWorkerResponse> {
+    ) -> std::result::Result<SourceWorkerResponse, SourceFailure> {
         let deadline = clip_retry_deadline(
             std::time::Instant::now() + SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
             SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
         );
-        loop {
-            let timeout =
-                source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)?;
-            let rpc_result = self
-                .with_started_retry(|client| {
-                    let request = request.clone();
-                    async move {
-                        #[cfg(test)]
-                        if let Some(err) = take_source_worker_scheduled_groups_error_hook() {
-                            return Err(err);
+        let mut machine = SourceScheduledGroupIdsMachine::new(deadline);
+        drive_source_machine_loop(
+            machine.start()?,
+            |effect| async {
+                match effect {
+                    SourceScheduledGroupIdsEffect::Attempt { timeout } => {
+                        SourceOperationLoopStep::Event(
+                            SourceScheduledGroupIdsEvent::AttemptCompleted {
+                                rpc_result: self
+                                    .execute_scheduled_group_ids_attempt(&request, timeout)
+                                    .await,
+                                after: self.current_source_progress_state(),
+                            },
+                        )
+                    }
+                    SourceScheduledGroupIdsEffect::Reconnect => {
+                        match self.reconnect_shared_worker_client().await {
+                            Ok(()) => SourceOperationLoopStep::Event(
+                                SourceScheduledGroupIdsEvent::ReconnectCompleted,
+                            ),
+                            Err(err) => {
+                                SourceOperationLoopStep::Fail(SourceFailure::from_cause(err))
+                            }
                         }
-                        Self::call_worker(&client, request, timeout).await
                     }
-                })
-                .await;
-            match rpc_result {
-                Ok(response) => return Ok(response),
-                Err(err) => {
-                    let after = self.current_source_progress_state();
-                    if !can_retry_on_control_frame(&err) {
-                        return Err(err);
+                    SourceScheduledGroupIdsEffect::Wait { after } => {
+                        self.wait_for_source_progress_after(
+                            after,
+                            SourceWaitFor::ControlFlowRetry,
+                            deadline,
+                        )
+                        .await;
+                        SourceOperationLoopStep::Event(SourceScheduledGroupIdsEvent::WaitCompleted)
                     }
-                    if deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .is_zero()
-                    {
-                        return Err(CnxError::Timeout);
+                    SourceScheduledGroupIdsEffect::Complete(response) => {
+                        SourceOperationLoopStep::Complete(response)
                     }
-                    self.reconnect_shared_worker_client().await?;
-                    self.wait_for_source_progress_after(
-                        after,
-                        SourceWaitFor::ControlFlowRetry,
-                        deadline,
-                    )
-                    .await;
+                    SourceScheduledGroupIdsEffect::Fail(failure) => {
+                        SourceOperationLoopStep::Fail(failure)
+                    }
                 }
-            }
-        }
+            },
+            |event| machine.advance(event),
+        )
+        .await
     }
 
     pub async fn source_primary_by_group_snapshot(
@@ -4399,10 +6192,10 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(groups)
             }
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for primary groups: {:?}",
-                other
-            ))),
+            other => Err(unexpected_source_worker_response(
+                "for primary groups",
+                other,
+            )),
         }
     }
 
@@ -4422,10 +6215,10 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(groups)
             }
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for last force-find runner: {:?}",
-                other
-            ))),
+            other => Err(unexpected_source_worker_response(
+                "for last force-find runner",
+                other,
+            )),
         }
     }
 
@@ -4443,10 +6236,10 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(groups)
             }
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for force-find inflight groups: {:?}",
-                other
-            ))),
+            other => Err(unexpected_source_worker_response(
+                "for force-find inflight groups",
+                other,
+            )),
         }
     }
 
@@ -4464,103 +6257,280 @@ impl SourceWorkerClientHandle {
         .await?
         {
             SourceWorkerResponse::ResolveGroupIdForObjectRef(group) => Ok(group),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for resolve group: {:?}",
-                other
-            ))),
+            other => Err(unexpected_source_worker_response(
+                "for resolve group",
+                other,
+            )),
         }
     }
 
-    pub async fn force_find(&self, params: InternalQueryRequest) -> Result<Vec<Event>> {
+    async fn execute_force_find_attempt(
+        &self,
+        params: &InternalQueryRequest,
+        target_node: &NodeId,
+        timeout: Duration,
+    ) -> std::result::Result<Vec<Event>, CnxError> {
+        #[cfg(test)]
+        let worker_instance_id = self.worker_instance_id_for_tests().await;
+        self.with_started_retry(|client| {
+            let params = params.clone();
+            let target_node = target_node.clone();
+            async move {
+                if debug_force_find_route_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_source_worker_client: force_find rpc begin target_node={} selected_group={:?} recursive={} max_depth={:?} path={}",
+                        target_node.0,
+                        params.scope.selected_group,
+                        params.scope.recursive,
+                        params.scope.max_depth,
+                        String::from_utf8_lossy(&params.scope.path)
+                    );
+                }
+                #[cfg(test)]
+                if let Some(err) = take_source_worker_force_find_error_queue_hook(worker_instance_id)
+                {
+                    return Err(err);
+                }
+                let response = Self::call_worker(
+                    &client,
+                    SourceWorkerRequest::ForceFind {
+                        request: params.clone(),
+                    },
+                    timeout,
+                )
+                .await;
+                match response {
+                    Err(err) => {
+                        if debug_force_find_route_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_source_worker_client: force_find rpc failed target_node={} err={}",
+                                target_node.0, err
+                            );
+                        }
+                        Err(err)
+                    }
+                    Ok(SourceWorkerResponse::Events(events)) => {
+                        if debug_force_find_route_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_source_worker_client: force_find rpc done target_node={} events={} origins={:?}",
+                                target_node.0,
+                                events.len(),
+                                summarize_event_counts_by_origin(&events)
+                            );
+                        }
+                        Ok(events)
+                    }
+                    Ok(other) => Err(unexpected_source_worker_response(
+                        "for force-find",
+                        other,
+                    )),
+                }
+            }
+        })
+        .await
+    }
+
+    async fn execute_force_find_wait(
+        &self,
+        after: SourceProgressState,
+        deadline: std::time::Instant,
+    ) {
+        self.wait_for_source_progress_after(after, SourceWaitFor::ForceFind, deadline)
+            .await;
+    }
+
+    async fn execute_scheduled_group_ids_attempt(
+        &self,
+        request: &SourceWorkerRequest,
+        timeout: Duration,
+    ) -> std::result::Result<SourceWorkerResponse, CnxError> {
+        self.with_started_retry(|client| {
+            let request = request.clone();
+            async move {
+                #[cfg(test)]
+                if let Some(err) = take_source_worker_scheduled_groups_error_hook() {
+                    return Err(err);
+                }
+                Self::call_worker(&client, request, timeout).await
+            }
+        })
+        .await
+    }
+
+    async fn execute_observability_snapshot_attempt(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<SourceWorkerResponse, CnxError> {
+        self.with_started_retry(|client| async move {
+            #[cfg(test)]
+            record_source_worker_observability_rpc_attempt();
+            #[cfg(test)]
+            if let Some(err) = take_source_worker_observability_error_hook() {
+                return Err(err);
+            }
+            Self::call_worker(&client, SourceWorkerRequest::ObservabilitySnapshot, timeout).await
+        })
+        .await
+    }
+
+    async fn execute_observability_snapshot_wait(
+        &self,
+        after: SourceProgressState,
+        deadline: std::time::Instant,
+    ) {
+        self.wait_for_source_progress_after(after, SourceWaitFor::Observability, deadline)
+            .await;
+    }
+
+    async fn execute_start_attempt(&self, timeout: Duration) -> std::result::Result<(), CnxError> {
+        #[cfg(test)]
+        maybe_pause_before_ensure_started().await;
+        #[cfg(test)]
+        let injected =
+            take_source_worker_start_error_queue_hook(self.worker_instance_id_for_tests().await);
+        #[cfg(not(test))]
+        let injected = None::<CnxError>;
+        #[cfg(test)]
+        let injected_delay = take_source_worker_start_delay_hook();
+        let worker = self.worker_client().await;
+        let start_result = match injected {
+            Some(err) => Err(err),
+            None => map_source_timeout_result(
+                tokio::time::timeout(timeout, async {
+                    #[cfg(test)]
+                    if let Some(delay) = injected_delay {
+                        tokio::time::sleep(delay).await;
+                    }
+                    worker.ensure_started().await
+                })
+                .await,
+            ),
+        };
+        if let Err(err) = &start_result {
+            eprintln!(
+                "fs_meta_source_worker_client: on_control_frame retry node={} err={}",
+                self.node_id.0, err
+            );
+        }
+        start_result
+    }
+
+    async fn execute_on_control_frame_request_attempt(
+        &self,
+        envelopes: &[ControlEnvelope],
+        timeout: Duration,
+        attempt_kind: SourceControlFrameRequestAttemptKind,
+    ) -> std::result::Result<SourceWorkerResponse, CnxError> {
+        let worker = self.worker_client().await;
+        map_source_timeout_result(
+            tokio::time::timeout(
+                timeout,
+                worker.with_started_retry(|client| {
+                    let envelopes = envelopes.to_vec();
+                    async move {
+                        if matches!(
+                            attempt_kind,
+                            SourceControlFrameRequestAttemptKind::ControlFrame
+                        ) {
+                            #[cfg(test)]
+                            {
+                                maybe_pause_before_on_control_frame_rpc().await;
+                                if let Some(err) = take_on_control_frame_error_hook(
+                                    self.worker_instance_id_for_tests().await,
+                                ) {
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        Self::call_worker(
+                            &client,
+                            SourceWorkerRequest::OnControlFrame { envelopes },
+                            timeout,
+                        )
+                        .await
+                    }
+                }),
+            )
+            .await,
+        )
+    }
+
+    async fn execute_update_logical_roots_attempt(
+        &self,
+        roots: &[RootSpec],
+        timeout: Duration,
+    ) -> std::result::Result<SourceWorkerResponse, CnxError> {
+        self.with_started_retry(|client| {
+            let roots = roots.to_vec();
+            async move {
+                #[cfg(test)]
+                maybe_pause_before_update_logical_roots_rpc().await;
+                #[cfg(test)]
+                if let Some(err) = take_update_logical_roots_error_hook() {
+                    return Err(err);
+                }
+                Self::call_worker(
+                    &client,
+                    SourceWorkerRequest::UpdateLogicalRoots { roots },
+                    timeout,
+                )
+                .await
+            }
+        })
+        .await
+    }
+
+    async fn execute_update_logical_roots_wait(
+        &self,
+        after: SourceProgressState,
+        deadline: std::time::Instant,
+    ) {
+        self.wait_for_source_progress_after(after, SourceWaitFor::LogicalRoots, deadline)
+            .await;
+    }
+
+    async fn force_find_with_failure(
+        &self,
+        params: InternalQueryRequest,
+    ) -> std::result::Result<Vec<Event>, SourceFailure> {
         let target_node = self.node_id.clone();
         let deadline = clip_retry_deadline(
             std::time::Instant::now() + SOURCE_WORKER_FORCE_FIND_TIMEOUT,
             SOURCE_WORKER_FORCE_FIND_TIMEOUT,
         );
-        loop {
-            let timeout =
-                source_operation_attempt_timeout(deadline, SOURCE_WORKER_FORCE_FIND_TIMEOUT)?;
-            #[cfg(test)]
-            let worker_instance_id = self.worker_instance_id_for_tests().await;
-            let rpc_result = self
-                .with_started_retry(|client| {
-                    let params = params.clone();
-                    let target_node = target_node.clone();
-                    async move {
-                        if debug_force_find_route_capture_enabled() {
-                            eprintln!(
-                                "fs_meta_source_worker_client: force_find rpc begin target_node={} selected_group={:?} recursive={} max_depth={:?} path={}",
-                                target_node.0,
-                                params.scope.selected_group,
-                                params.scope.recursive,
-                                params.scope.max_depth,
-                                String::from_utf8_lossy(&params.scope.path)
-                            );
-                        }
-                        #[cfg(test)]
-                        if let Some(err) =
-                            take_source_worker_force_find_error_queue_hook(worker_instance_id)
-                        {
-                            return Err(err);
-                        }
-                        let response = Self::call_worker(
-                            &client,
-                            SourceWorkerRequest::ForceFind {
-                                request: params.clone(),
-                            },
-                            timeout,
-                        )
-                        .await;
-                        match response {
-                            Err(err) => {
-                                if debug_force_find_route_capture_enabled() {
-                                    eprintln!(
-                                        "fs_meta_source_worker_client: force_find rpc failed target_node={} err={}",
-                                        target_node.0, err
-                                    );
-                                }
-                                Err(err)
-                            }
-                            Ok(SourceWorkerResponse::Events(events)) => {
-                                if debug_force_find_route_capture_enabled() {
-                                    eprintln!(
-                                        "fs_meta_source_worker_client: force_find rpc done target_node={} events={} origins={:?}",
-                                        target_node.0,
-                                        events.len(),
-                                        summarize_event_counts_by_origin(&events)
-                                    );
-                                }
-                                Ok(events)
-                            }
-                            Ok(other) => Err(CnxError::ProtocolViolation(format!(
-                                "unexpected source worker response for force-find: {:?}",
-                                other
-                            ))),
-                        }
+        let machine = SourceForceFindMachine::new(deadline);
+        drive_source_machine_loop(
+            machine.start()?,
+            |effect| async {
+                match effect {
+                    SourceForceFindEffect::Attempt { timeout } => {
+                        SourceOperationLoopStep::Event(SourceForceFindEvent::AttemptCompleted {
+                            rpc_result: self
+                                .execute_force_find_attempt(&params, &target_node, timeout)
+                                .await,
+                            after: self.current_source_progress_state(),
+                        })
                     }
-                })
-                .await;
-            match rpc_result {
-                Ok(events) => {
-                    let _ = self.last_force_find_runner_by_group_snapshot().await;
-                    return Ok(events);
+                    SourceForceFindEffect::Wait { after } => {
+                        self.execute_force_find_wait(after, deadline).await;
+                        SourceOperationLoopStep::Event(SourceForceFindEvent::WaitCompleted)
+                    }
+                    SourceForceFindEffect::Complete(events) => {
+                        let _ = self.last_force_find_runner_by_group_snapshot().await;
+                        SourceOperationLoopStep::Complete(events)
+                    }
+                    SourceForceFindEffect::Fail(failure) => SourceOperationLoopStep::Fail(failure),
                 }
-                Err(err) => {
-                    let after = self.current_source_progress_state();
-                    if !can_retry_force_find(&err) {
-                        return Err(err);
-                    }
-                    if deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .is_zero()
-                    {
-                        return Err(CnxError::Timeout);
-                    }
-                    self.wait_for_source_progress_after(after, SourceWaitFor::ForceFind, deadline)
-                        .await;
-                }
-            }
-        }
+            },
+            |event| machine.advance(event),
+        )
+        .await
+    }
+
+    pub async fn force_find(&self, params: InternalQueryRequest) -> Result<Vec<Event>> {
+        self.force_find_with_failure(params)
+            .await
+            .map_err(SourceFailure::into_error)
     }
 
     pub async fn publish_manual_rescan_signal(&self) -> Result<()> {
@@ -4580,6 +6550,7 @@ impl SourceWorkerClientHandle {
             SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
         )
         .await
+        .map_err(SourceFailure::into_error)
     }
 
     async fn observe_control_frame(
@@ -4587,116 +6558,94 @@ impl SourceWorkerClientHandle {
         envelopes: &[ControlEnvelope],
         total_timeout: Duration,
         rpc_timeout: Duration,
-    ) -> Result<(
-        SourceControlFrameMachine,
-        SourceControlFrameEffect,
-        SourceControlFrameDecodedSignals,
-    )> {
+    ) -> Result<SourceControlFrameFacts> {
+        let control_envelopes = Arc::<[ControlEnvelope]>::from(envelopes.to_vec());
+        let operation_deadline =
+            clip_retry_deadline(std::time::Instant::now() + total_timeout, total_timeout);
         let decoded_signals = source_control_signals_from_envelopes(envelopes)
             .map(SourceControlFrameDecodedSignals::Decoded)
             .unwrap_or(SourceControlFrameDecodedSignals::DecodeFailed);
-        let (fail_fast_generation_one_activate_replay, initial_effect) = match &decoded_signals {
+        let (fail_fast_generation_one_activate_replay, initial_step) = match &decoded_signals {
             SourceControlFrameDecodedSignals::Decoded(signals) => {
                 let control_state = self.control_state.lock().await;
+                let initial_step = match control_state.classify_tick_only_wave(signals) {
+                    Some(SourceControlFrameTickOnlyDisposition::RetainedTickFastPath {
+                        signals,
+                    }) => Some(SourceControlFrameInitialStep::run(
+                        RetainedTickFastPathLane { signals },
+                    )),
+                    Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay) => {
+                        Some(SourceControlFrameInitialStep::run(RetainedTickReplayLane {
+                            deadline: operation_deadline,
+                        }))
+                    }
+                    Some(SourceControlFrameTickOnlyDisposition::Reconnect) => {
+                        Some(SourceControlFrameInitialStep::Reconnect(
+                            SourceControlFrameReconnectResume::RetainedTickReplay,
+                        ))
+                    }
+                    None => None,
+                };
                 (
                     control_state.matches_generation_one_activate_wave(signals),
-                    control_state.classify_tick_only_wave(signals),
+                    initial_step,
                 )
             }
             SourceControlFrameDecodedSignals::DecodeFailed => (false, None),
         };
-        let generation_one_activate_only = match &decoded_signals {
+        let signal_policies = match &decoded_signals {
             SourceControlFrameDecodedSignals::Decoded(signals) => {
-                source_control_signals_are_generation_one_activate_only(signals)
+                SourceControlFrameSignalPolicies::from_signals(signals)
             }
-            SourceControlFrameDecodedSignals::DecodeFailed => false,
+            SourceControlFrameDecodedSignals::DecodeFailed => {
+                SourceControlFrameSignalPolicies::standard()
+            }
         };
-        let prefer_short_existing_client_attempt = match &decoded_signals {
+        let timeout_reset_policy = signal_policies.timeout_reset_policy;
+        let attempt_timeout_policy = signal_policies.attempt_timeout_policy;
+        let primed_local_schedule = match &decoded_signals {
             SourceControlFrameDecodedSignals::Decoded(signals) => {
-                source_control_signals_prefer_short_existing_client_attempt(signals)
+                Some(self.with_cache_mut(|cache| {
+                    let mut observed_cache = cache.clone();
+                    prime_cached_schedule_from_control_signals(
+                        &mut observed_cache,
+                        &self.node_id,
+                        signals,
+                        &self.config.roots,
+                        &self.config.host_object_grants,
+                    )
+                }))
             }
-            SourceControlFrameDecodedSignals::DecodeFailed => false,
+            SourceControlFrameDecodedSignals::DecodeFailed => None,
         };
-        let existing_client_present = if initial_effect.is_none() {
+        let post_ack_refresh_requirement = signal_policies.post_ack_refresh_requirement;
+        let existing_client_present = if initial_step.is_none() {
             self.existing_client().await?.is_some()
         } else {
             false
         };
-        let control_machine = SourceControlFrameMachine {
-            operation_deadline: clip_retry_deadline(
-                std::time::Instant::now() + total_timeout,
-                total_timeout,
-            ),
+        let bridge_reset_policy =
+            if total_timeout <= SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT {
+                SourceControlFrameBridgeResetPolicy::FailImmediately
+            } else if fail_fast_generation_one_activate_replay
+                || is_restart_deferred_retire_pending_deactivate_batch(envelopes)
+            {
+                SourceControlFrameBridgeResetPolicy::ReconnectThenFail
+            } else {
+                SourceControlFrameBridgeResetPolicy::RetryAfterReconnect
+            };
+        Ok(SourceControlFrameFacts {
+            envelopes: control_envelopes,
+            decoded_signals,
+            primed_local_schedule,
+            post_ack_refresh_requirement,
+            initial_step,
+            operation_deadline,
             rpc_timeout,
             existing_client_present,
-            fail_fast_on_control_frame_bridge_reset: fail_fast_generation_one_activate_replay
-                || is_restart_deferred_retire_pending_deactivate_batch(envelopes),
-            generation_one_activate_only,
-            prefer_short_existing_client_attempt,
-            fail_fast_short_caller_budget_bridge_reset: total_timeout
-                <= SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT,
-            generation_one_timeout_like_reset_seen: false,
-        };
-        let initial_effect = if let Some(initial_effect) = initial_effect {
-            initial_effect
-        } else {
-            control_machine.rpc_attempt_plan()?
-        };
-        Ok((control_machine, initial_effect, decoded_signals))
-    }
-
-    fn apply_control_frame_fast_path_signals(&self, signals: &[SourceControlSignal]) {
-        self.with_cache_mut(|cache| {
-            prime_cached_control_summary_from_control_signals(
-                cache,
-                &self.node_id,
-                signals,
-                &self.config.host_object_grants,
-            );
-            cache.observability_control_summary_override_by_node =
-                cache.last_control_frame_signals_by_node.clone();
-        });
-    }
-
-    fn observe_post_ack_control_frame_cache(
-        &self,
-        signals: &[SourceControlSignal],
-    ) -> PrimedLocalScheduleSummary {
-        self.with_cache_mut(|cache| {
-            let mut observed_cache = cache.clone();
-            prime_cached_schedule_from_control_signals(
-                &mut observed_cache,
-                &self.node_id,
-                signals,
-                &self.config.roots,
-                &self.config.host_object_grants,
-            )
-        })
-    }
-
-    fn apply_post_ack_control_frame_cache_side_effects(&self, signals: &[SourceControlSignal]) {
-        self.with_cache_mut(|cache| {
-            let _ = prime_cached_schedule_from_control_signals(
-                cache,
-                &self.node_id,
-                signals,
-                &self.config.roots,
-                &self.config.host_object_grants,
-            );
-            prime_cached_control_summary_from_control_signals(
-                cache,
-                &self.node_id,
-                signals,
-                &self.config.host_object_grants,
-            );
-            cache.observability_control_summary_override_by_node = None;
-            prime_cached_schedule_from_control_signals_for_replay_recovery(
-                cache,
-                &self.node_id,
-                signals,
-                &self.config.roots,
-                &self.config.host_object_grants,
-            );
+            bridge_reset_policy,
+            timeout_reset_policy,
+            attempt_timeout_policy,
         })
     }
 
@@ -4705,14 +6654,16 @@ impl SourceWorkerClientHandle {
         envelopes: Vec<ControlEnvelope>,
         total_timeout: Duration,
         rpc_timeout: Duration,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), SourceFailure> {
         let _inflight = self.begin_control_op();
         let _serial = self.control_ops_serial.lock().await;
         #[cfg(test)]
         notify_source_worker_control_frame_started();
-        let (control_machine, initial_effect, decoded_signals) = self
+        let facts = self
             .observe_control_frame(&envelopes, total_timeout, rpc_timeout)
             .await?;
+        let decoded_signals = facts.decoded_signals.clone();
+        let (control_machine, initial_effect) = SourceControlFrameMachine::start(facts)?;
         eprintln!(
             "fs_meta_source_worker_client: on_control_frame begin node={} envelopes={}",
             self.node_id.0,
@@ -4731,16 +6682,14 @@ impl SourceWorkerClientHandle {
                 ),
             }
         }
-        SourceControlFrameExecutor {
-            handle: self,
-            envelopes: &envelopes,
-            decoded_signals,
-        }
-        .execute_control_frame(control_machine, initial_effect)
-        .await
+        SourceControlFrameExecutor { handle: self }
+            .execute_control_frame(control_machine, initial_effect)
+            .await
     }
 
-    pub async fn trigger_rescan_when_ready_epoch(&self) -> Result<u64> {
+    async fn trigger_rescan_when_ready_epoch_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SourceFailure> {
         let epoch = self
             .with_started_retry(|client| async move {
                 match Self::call_worker(
@@ -4751,13 +6700,17 @@ impl SourceWorkerClientHandle {
                 .await?
                 {
                     SourceWorkerResponse::RescanRequestEpoch(epoch) => Ok(epoch),
-                    other => Err(CnxError::ProtocolViolation(format!(
-                        "unexpected source worker response for trigger_rescan_when_ready_epoch: {:?}",
-                        other
-                    ))),
+                    other => Err(SourceFailure::protocol_violation(
+                        SourceProtocolViolationKind::UnexpectedWorkerResponse {
+                            context: "for trigger_rescan_when_ready_epoch",
+                            response: format!("{:?}", other),
+                        },
+                    )
+                    .into_error()),
                 }
             })
-            .await?;
+            .await
+            .map_err(SourceFailure::from)?;
         self.with_cache_mut(|cache| {
             let last_audit_completed_at_us = cache
                 .status
@@ -4770,9 +6723,18 @@ impl SourceWorkerClientHandle {
             cache.rescan_request_last_audit_completed_at_us = last_audit_completed_at_us;
             cache.rescan_request_epoch = cache.rescan_request_epoch.max(epoch);
         });
-        self.wait_for_rescan_observed_epoch(epoch, SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT)
-            .await?;
+        self.wait_for_rescan_observed_epoch_with_failure(
+            epoch,
+            SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
+        )
+        .await?;
         Ok(epoch)
+    }
+
+    pub async fn trigger_rescan_when_ready_epoch(&self) -> Result<u64> {
+        self.trigger_rescan_when_ready_epoch_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)
     }
 
     async fn progress_snapshot_with_timeout(
@@ -4801,10 +6763,10 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(snapshot)
             }
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for progress_snapshot: {:?}",
-                other
-            ))),
+            other => Err(unexpected_source_worker_response(
+                "for progress_snapshot",
+                other,
+            )),
         }
     }
 
@@ -5533,204 +7495,40 @@ fn build_source_observability_snapshot_from_cache(
 }
 
 impl<'a> SourceControlFrameExecutor<'a> {
-    async fn execute_control_frame_effect(
-        &self,
-        action: SourceControlFrameEffect,
-        operation_deadline: std::time::Instant,
-    ) -> Result<SourceControlFrameExecutorOutcome<'_>> {
-        Ok(match action {
-            SourceControlFrameEffect::RetainedTickFastPath => {
-                if let SourceControlFrameDecodedSignals::Decoded(signals) = &self.decoded_signals {
-                    self.handle.apply_control_frame_fast_path_signals(signals);
-                }
-                eprintln!(
-                    "fs_meta_source_worker_client: on_control_frame done node={} ok=true retained_tick_fast_path=true",
-                    self.handle.node_id.0
-                );
-                SourceControlFrameExecutorOutcome::Complete
-            }
-            SourceControlFrameEffect::RetainedTickReplay => {
-                self.handle.with_cache_mut(|cache| {
-                    cache.observability_control_summary_override_by_node = None;
-                });
-                self.handle
-                    .replay_retained_control_state_if_needed_for_refresh_until(operation_deadline)
-                    .await?;
-                eprintln!(
-                    "fs_meta_source_worker_client: on_control_frame done node={} ok=true retained_tick_replay=true",
-                    self.handle.node_id.0
-                );
-                SourceControlFrameExecutorOutcome::Complete
-            }
-            SourceControlFrameEffect::Attempt { timeout } => {
-                let rpc_result = match tokio::time::timeout(
-                    timeout,
-                    self.handle.with_started_retry(|client| {
-                        let envelopes = self.envelopes.to_vec();
-                        async move {
-                            #[cfg(test)]
-                            {
-                                maybe_pause_before_on_control_frame_rpc().await;
-                                if let Some(err) =
-                                    take_on_control_frame_error_hook(
-                                        self.handle.worker_instance_id_for_tests().await,
-                                    )
-                                {
-                                    return Err(err);
-                                }
-                            }
-                            client
-                                .call_with_timeout(
-                                    SourceWorkerRequest::OnControlFrame { envelopes },
-                                    timeout,
-                                )
-                                .await
-                        }
-                    }),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(CnxError::Timeout),
-                };
-                let primed_local_schedule = matches!(rpc_result, Ok(SourceWorkerResponse::Ack))
-                    .then(|| match &self.decoded_signals {
-                        SourceControlFrameDecodedSignals::Decoded(signals) => {
-                            Some(self.handle.observe_post_ack_control_frame_cache(signals))
-                        }
-                        SourceControlFrameDecodedSignals::DecodeFailed => None,
-                    })
-                    .flatten();
-                SourceControlFrameExecutorOutcome::Event(SourceControlFrameEvent::RpcCompleted {
-                    rpc_result,
-                    after: self.handle.current_source_progress_state(),
-                    decoded_signals: &self.decoded_signals,
-                    primed_local_schedule,
-                })
-            }
-            SourceControlFrameEffect::ReconnectThenAttempt => {
-                self.handle.reconnect_shared_worker_client().await?;
-                SourceControlFrameExecutorOutcome::Event(
-                    SourceControlFrameEvent::ReconnectThenAttemptCompleted,
-                )
-            }
-            SourceControlFrameEffect::ReconnectThenWait { after } => {
-                self.handle.reconnect_shared_worker_client().await?;
-                SourceControlFrameExecutorOutcome::Event(
-                    SourceControlFrameEvent::ReconnectThenWaitCompleted { after },
-                )
-            }
-            SourceControlFrameEffect::ReconnectThenReplayRetainedTick => {
-                self.handle.reconnect_shared_worker_client().await?;
-                SourceControlFrameExecutorOutcome::Event(
-                    SourceControlFrameEvent::ReconnectThenReplayRetainedTickCompleted,
-                )
-            }
-            SourceControlFrameEffect::ReconnectThenFail(err) => {
-                self.handle.reconnect_shared_worker_client().await?;
-                SourceControlFrameExecutorOutcome::Event(
-                    SourceControlFrameEvent::ReconnectThenFailCompleted(err),
-                )
-            }
-            SourceControlFrameEffect::Wait { after } => {
-                self.handle
-                    .wait_for_source_progress_after(
-                        after,
-                        SourceWaitFor::ControlFlowRetry,
-                        operation_deadline,
-                    )
-                    .await;
-                SourceControlFrameExecutorOutcome::Event(SourceControlFrameEvent::WaitCompleted)
-            }
-            SourceControlFrameEffect::ApplyPostAckSignalsThenComplete => {
-                if let SourceControlFrameDecodedSignals::Decoded(signals) = &self.decoded_signals {
-                    self.handle
-                        .apply_post_ack_control_frame_cache_side_effects(signals);
-                    self.handle.retain_control_signals(signals).await;
-                }
-                SourceControlFrameExecutorOutcome::Event(
-                    SourceControlFrameEvent::ApplyPostAckSignalsThenCompleteCompleted,
-                )
-            }
-            SourceControlFrameEffect::ApplyPostAckSignalsThenArmReplayAndRefreshScheduledGroups {
-                expect_local_runnable_groups,
-            } => {
-                if let SourceControlFrameDecodedSignals::Decoded(signals) = &self.decoded_signals {
-                    self.handle
-                        .apply_post_ack_control_frame_cache_side_effects(signals);
-                    self.handle.retain_control_signals(signals).await;
-                }
-                SourceControlFrameExecutorOutcome::Event(
-                    SourceControlFrameEvent::ApplyPostAckSignalsThenArmReplayAndRefreshScheduledGroupsCompleted {
-                        expect_local_runnable_groups,
-                    },
-                )
-            }
-            SourceControlFrameEffect::RefreshScheduledGroups {
-                expect_local_runnable_groups,
-            } => {
-                let refresh_result = self
-                    .handle
-                    .refresh_cached_scheduled_groups_from_live_worker_until(
-                        operation_deadline,
-                        expect_local_runnable_groups,
-                    )
-                    .await;
-                SourceControlFrameExecutorOutcome::Event(
-                    SourceControlFrameEvent::RefreshScheduledGroupsCompleted { refresh_result },
-                )
-            }
-            SourceControlFrameEffect::ArmReplayThenRefreshScheduledGroups {
-                expect_local_runnable_groups,
-            } => {
-                self.handle.control_state.lock().await.arm_replay();
-                let refresh_result = self
-                    .handle
-                    .refresh_cached_scheduled_groups_from_live_worker_until(
-                        operation_deadline,
-                        expect_local_runnable_groups,
-                    )
-                    .await;
-                SourceControlFrameExecutorOutcome::Event(
-                    SourceControlFrameEvent::ArmReplayThenRefreshScheduledGroupsCompleted {
-                        refresh_result,
-                    },
-                )
-            }
-            SourceControlFrameEffect::Complete => {
-                eprintln!(
-                    "fs_meta_source_worker_client: on_control_frame done node={} ok=true",
-                    self.handle.node_id.0
-                );
-                SourceControlFrameExecutorOutcome::Complete
-            }
-            SourceControlFrameEffect::Fail(err) => {
-                eprintln!(
-                    "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={}",
-                    self.handle.node_id.0, err
-                );
-                SourceControlFrameExecutorOutcome::Fail(err)
-            }
-        })
+    fn log_control_frame_terminal_outcome(&self, terminal: std::result::Result<(), &CnxError>) {
+        match terminal {
+            Ok(()) => eprintln!(
+                "fs_meta_source_worker_client: on_control_frame done node={} ok=true",
+                self.handle.node_id.0
+            ),
+            Err(err) => eprintln!(
+                "fs_meta_source_worker_client: on_control_frame done node={} ok=false err={}",
+                self.handle.node_id.0, err
+            ),
+        }
     }
 
     async fn execute_control_frame(
         &self,
         control_machine: SourceControlFrameMachine,
-        initial_effect: SourceControlFrameEffect,
-    ) -> Result<()> {
+        initial_effect: SourceControlFrameStep,
+    ) -> std::result::Result<(), SourceFailure> {
         let mut control_machine = control_machine;
         let mut action = initial_effect;
         loop {
-            match self
-                .execute_control_frame_effect(action, control_machine.operation_deadline)
-                .await?
-            {
-                SourceControlFrameExecutorOutcome::Event(event) => {
+            match action {
+                SourceControlFrameStep::Terminal(SourceControlFrameTerminal::Complete) => {
+                    self.log_control_frame_terminal_outcome(Ok(()));
+                    return Ok(());
+                }
+                SourceControlFrameStep::Terminal(SourceControlFrameTerminal::Fail(failure)) => {
+                    self.log_control_frame_terminal_outcome(Err(failure.as_error()));
+                    return Err(failure);
+                }
+                SourceControlFrameStep::Run(lane) => {
+                    let event = lane.execute(self.handle).await?;
                     action = control_machine.advance(event)?;
                 }
-                SourceControlFrameExecutorOutcome::Complete => return Ok(()),
-                SourceControlFrameExecutorOutcome::Fail(err) => return Err(err),
             }
         }
     }
@@ -5804,17 +7602,13 @@ impl SourceFacade {
             SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT,
         );
         match self {
-            Self::Local(source) => {
-                match tokio::time::timeout(
+            Self::Local(source) => map_source_timeout_result(
+                tokio::time::timeout(
                     single_attempt_total_timeout,
                     source.apply_orchestration_signals(signals),
                 )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(CnxError::Timeout),
-                }
-            }
+                .await,
+            ),
             Self::Worker(client) => {
                 let envelopes = signals
                     .iter()
@@ -5831,6 +7625,7 @@ impl SourceFacade {
                         rpc_timeout,
                     )
                     .await
+                    .map_err(SourceFailure::into_error)
             }
         }
     }

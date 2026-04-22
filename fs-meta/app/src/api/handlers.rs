@@ -23,12 +23,14 @@ use capanix_runtime_entry_sdk::advanced::boundary::{
 use tokio::sync::Notify;
 
 use crate::domain_state::{FacadeServiceState, GroupServiceState, NodeParticipationState};
+use crate::query::ObservationState;
 use crate::query::api::{
     internal_status_request_payload, merge_sink_status_snapshots,
     refresh_policy_from_host_object_grants, route_sink_status_snapshot,
 };
 use crate::query::observation::{
     ObservationTrustPolicy, candidate_group_observation_evidence, evaluate_observation_status,
+    trusted_materialized_not_ready_message,
 };
 use crate::runtime::execution_units;
 use crate::runtime::orchestration::encode_logical_roots_control_payload;
@@ -455,11 +457,15 @@ pub async fn status(
     let trace_id = next_status_trace_request_id();
     record_status_route_trace(trace_id, "status.enter");
 
-    let local_sink = match state.sink.status_snapshot_nonblocking().await {
-        Ok(snapshot) => snapshot,
+    let (local_sink, local_sink_used_cached_fallback) = match state
+        .sink
+        .status_snapshot_nonblocking_for_status_route()
+        .await
+    {
+        Ok((snapshot, used_cached_fallback)) => (snapshot, used_cached_fallback),
         Err(err) if state.sink.is_worker() => {
             log::warn!("status falling back to default cached sink snapshot: {err}");
-            Default::default()
+            (Default::default(), true)
         }
         Err(err) => {
             return Err(ApiError::internal(format!("sink status failed: {err}")));
@@ -468,7 +474,17 @@ pub async fn status(
     let local_source = state.source.observability_snapshot_nonblocking().await;
     if state.source.is_worker() || state.sink.is_worker() {
         let active_candidate_groups =
-            snapshot_scoped_active_facade_candidate_groups(&local_source, &local_sink);
+            status_local_observation_candidate_groups(&local_source, &local_sink);
+        let local_observation_status = (!active_candidate_groups.is_empty()).then(|| {
+            evaluate_observation_status(
+                &candidate_group_observation_evidence(
+                    &local_source.status,
+                    &local_sink,
+                    &active_candidate_groups,
+                ),
+                ObservationTrustPolicy::candidate_generation(),
+            )
+        });
         record_status_route_trace(
             trace_id,
             format!(
@@ -503,14 +519,9 @@ pub async fn status(
                 if active_candidate_groups.is_empty() {
                     " state=SkippedNoCandidateGroups".to_string()
                 } else {
-                    let local_observation_status = evaluate_observation_status(
-                        &candidate_group_observation_evidence(
-                            &local_source.status,
-                            &local_sink,
-                            &active_candidate_groups,
-                        ),
-                        ObservationTrustPolicy::candidate_generation(),
-                    );
+                    let local_observation_status = local_observation_status
+                        .as_ref()
+                        .expect("candidate groups imply observation status");
                     format!(
                         " state={:?} reasons={}",
                         local_observation_status.state,
@@ -519,6 +530,14 @@ pub async fn status(
                 }
             ),
         );
+        if local_sink_used_cached_fallback
+            && let Some(local_observation_status) = local_observation_status.as_ref()
+            && local_observation_status.state != ObservationState::TrustedMaterialized
+        {
+            return Err(ApiError::service_unavailable(
+                trusted_materialized_not_ready_message(local_observation_status),
+            ));
+        }
         // Management /status remains available while active facade observation is still converging.
         // Facade readiness is reported via published facade state and pending diagnostics rather than
         // by fail-closing the management surface on observation trust.
@@ -626,6 +645,7 @@ pub async fn status(
         sink_outcome,
         source_outcome,
         published_facade_state,
+        state.source.is_worker() || state.sink.is_worker(),
         &sink_status,
         &source,
     ) {
@@ -821,6 +841,26 @@ fn snapshot_scoped_active_facade_candidate_groups(
     }
     if !source_groups.is_empty() && sink_groups.is_empty() {
         return BTreeSet::new();
+    }
+    if !source_groups.is_empty() {
+        return source_groups;
+    }
+    sink_groups
+}
+
+fn status_local_observation_candidate_groups(
+    local_source: &SourceObservabilitySnapshot,
+    local_sink: &SinkStatusSnapshot,
+) -> BTreeSet<String> {
+    let source_groups = source_snapshot_active_groups(local_source);
+    let sink_groups = local_sink
+        .scheduled_groups_by_node
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !source_groups.is_empty() && !sink_groups.is_empty() {
+        return source_groups.intersection(&sink_groups).cloned().collect();
     }
     if !source_groups.is_empty() {
         return source_groups;
@@ -1249,9 +1289,13 @@ fn should_fail_closed_source_ready_sink_empty_status(
     sink_outcome: StatusRouteOutcome,
     source_outcome: StatusRouteOutcome,
     published_facade_state: FacadeServiceState,
+    worker_runtime: bool,
     sink_status: &SinkStatusSnapshot,
     source: &SourceObservabilitySnapshot,
 ) -> bool {
+    if worker_runtime {
+        return false;
+    }
     matches!(
         published_facade_state,
         FacadeServiceState::Serving | FacadeServiceState::Degraded
@@ -3953,6 +3997,40 @@ mod tests {
         assert!(
             candidate_groups.is_empty(),
             "source-only scheduled groups without any local sink schedule must not become active facade observation candidates: {candidate_groups:?}"
+        );
+    }
+
+    #[test]
+    fn status_local_observation_candidate_groups_keep_source_only_groups_for_cached_gate() {
+        let local_source = local_source_snapshot();
+        let local_sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::new(),
+            groups: vec![crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs1".to_string(),
+                primary_object_ref: "obj-a".to_string(),
+                total_nodes: 1,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 11,
+                shadow_lag_us: 12,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            }],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let candidate_groups =
+            status_local_observation_candidate_groups(&local_source, &local_sink);
+
+        assert_eq!(
+            candidate_groups,
+            BTreeSet::from(["nfs1".to_string()]),
+            "status.local.gate must preserve source-only groups so cached observation failure reasons survive before blocking sink-status timeouts"
         );
     }
 

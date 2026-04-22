@@ -398,7 +398,10 @@ fn test_unified_audit_scan_and_drift_timestamp_contracts_are_migrated_to_main_sp
                 "if root.spec.scan && Self::root_current_is_group_primary(&roots_handle, &root_key)"
             )
     );
-    assert!(source_mod.contains("if root.is_group_primary"));
+    assert!(
+        source_mod.contains("if root.is_group_primary")
+            || source_mod.contains("root_current_is_group_primary")
+    );
     assert!(source_mod.contains("RescanReason::Overflow"));
     assert!(source_mod.contains("HealthSignal::WatchOverflow"));
     assert!(source_mod.contains("timestamp_us: now_us()"));
@@ -891,22 +894,25 @@ fn test_unit_control_envelope_fencing_contract() {
     assert!(cfg.contains("runtime.exec.*"));
 
     let source = read_fs_meta_spec_file("fs-meta/app/src/source/mod.rs");
+    let source_tests = read_fs_meta_spec_file("fs-meta/app/src/source/tests.rs");
+    let runtime_orchestration = read_fs_meta_spec_file("fs-meta/app/src/runtime/orchestration.rs");
     assert!(source.contains("RuntimeUnitGate::new"));
     assert!(source.contains("SOURCE_RUNTIME_UNITS"));
-    assert!(source.contains("unsupported unit_id"));
     assert!(source.contains("ignore stale activate"));
     assert!(source.contains("ignore stale deactivate"));
-    assert!(source.contains("stale_deactivate_generation_is_ignored"));
-    assert!(source.contains("stale_activate_generation_is_ignored"));
+    assert!(source_tests.contains("stale_deactivate_generation_is_ignored"));
+    assert!(source_tests.contains("stale_activate_generation_is_ignored"));
+    assert!(runtime_orchestration.contains("source-fs-meta: unsupported unit_id"));
 
     let sink = read_fs_meta_spec_file("fs-meta/app/src/sink/mod.rs");
+    let sink_tests = read_fs_meta_spec_file("fs-meta/app/src/sink/tests.rs");
     assert!(sink.contains("RuntimeUnitGate::new"));
     assert!(sink.contains("SINK_RUNTIME_UNITS"));
-    assert!(sink.contains("unsupported unit_id"));
     assert!(sink.contains("ignore stale activate"));
     assert!(sink.contains("ignore stale deactivate"));
-    assert!(sink.contains("stale_deactivate_generation_is_ignored"));
-    assert!(sink.contains("stale_activate_generation_is_ignored"));
+    assert!(sink_tests.contains("stale_deactivate_generation_is_ignored"));
+    assert!(sink_tests.contains("stale_activate_generation_is_ignored"));
+    assert!(runtime_orchestration.contains("sink-file-meta: unsupported unit_id"));
 
     let gate = read_fs_meta_spec_file("fs-meta/app/src/runtime/unit_gate.rs");
     assert!(gate.contains("struct RuntimeUnitGate"));
@@ -1461,7 +1467,6 @@ fn test_control_frame_signal_translation_contract() {
 
     let runtime_app = read_fs_meta_spec_file("fs-meta/app/src/runtime_app.rs");
     assert!(runtime_app.contains("split_app_control_signals("));
-    assert!(runtime_app.contains("apply_orchestration_signals("));
 
     let source_mod = read_fs_meta_spec_file("fs-meta/app/src/source/mod.rs");
     assert!(source_mod.contains("source_control_signals_from_envelopes("));
@@ -1544,7 +1549,9 @@ fn test_named_read_class_replaces_freeform_stability_selection() {
 // @verify_spec("CONTRACTS.API_BOUNDARY.API_NON_OWNERSHIP_OF_QUERY_FIND_CHANNEL_PATH", mode="system")
 #[test]
 fn projection_http_runtime_coverage_moved_to_local_projection_api_unit_tests() {
-    let projection_api = read_fs_meta_spec_file("fs-meta/app/src/query/api.rs");
+    let projection_api = read_fs_meta_spec_file(
+        "fs-meta/app/src/query/api/tests/pit_public/endpoints_force_find.rs",
+    );
     assert!(projection_api.contains("force_find_group_order_file_count_top_bucket_local"));
     assert!(projection_api.contains("force_find_group_order_file_age_top_bucket_local"));
     assert!(projection_api

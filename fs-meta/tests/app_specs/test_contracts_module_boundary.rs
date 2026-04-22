@@ -872,7 +872,7 @@ fn status_paths_use_nonblocking_worker_observation_reads() {
     let worker_sink = read_app_spec("src/workers/sink.rs");
     let worker_source_ipc = read_app_spec("src/workers/source_ipc.rs");
 
-    assert!(handlers.contains("state.sink.status_snapshot_nonblocking().await"));
+    assert!(handlers.contains("status_snapshot_nonblocking_for_status_route()"));
     assert!(handlers.contains("state.source.observability_snapshot_nonblocking().await"));
     assert!(!handlers.contains("state.sink.cached_status_snapshot_for_status_route()"));
     assert!(!handlers.contains("state.source.cached_observability_snapshot()"));
@@ -887,6 +887,7 @@ fn status_paths_use_nonblocking_worker_observation_reads() {
     assert!(worker_source.contains("control_op_inflight()"));
     assert!(worker_sink.contains("control_op_inflight()"));
     assert!(worker_sink.contains("status_snapshot_nonblocking"));
+    assert!(worker_sink.contains("status_snapshot_nonblocking_for_status_route"));
     assert!(worker_source_ipc.contains("ObservabilitySnapshot"));
     assert!(
         !worker_source.contains("tokio::join!("),

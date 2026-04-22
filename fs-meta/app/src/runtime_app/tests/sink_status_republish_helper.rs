@@ -3947,7 +3947,7 @@ async fn source_led_uninitialized_mixed_recovery_keeps_control_gate_closed_until
     }
 
     let initial_gate_ready =
-        FacadePublicationMachine::from_input(app.collect_facade_publication_input().await)
+        FixedBindLifecycleMachine::from_facts(app.collect_fixed_bind_lifecycle_facts().await)
         .snapshot()
         .publication_ready;
     assert!(
@@ -4334,7 +4334,7 @@ async fn deferred_sink_owned_query_peer_publication_keeps_control_gate_closed_wh
     );
 
     let control_ready_after_republish =
-        FacadePublicationMachine::from_input(app.collect_facade_publication_input().await)
+        FixedBindLifecycleMachine::from_facts(app.collect_fixed_bind_lifecycle_facts().await)
         .snapshot()
         .publication_ready;
     assert!(
@@ -4630,7 +4630,7 @@ async fn deferred_sink_owned_query_peer_publication_does_not_overwrite_pending_f
 
     let deferred_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
     let control_ready_after_republish =
-        FacadePublicationMachine::from_input(app.collect_facade_publication_input().await)
+        FixedBindLifecycleMachine::from_facts(app.collect_fixed_bind_lifecycle_facts().await)
         .snapshot()
         .publication_ready;
     assert!(

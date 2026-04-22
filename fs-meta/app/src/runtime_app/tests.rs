@@ -2467,7 +2467,7 @@ fn runtime_control_state_control_gate_ready_requires_initialized_or_facade_only_
 
 #[test]
 fn facade_publication_machine_keeps_active_facade_withheld_until_runtime_gate_is_ready() {
-    let snapshot = FacadePublicationMachine {
+    let snapshot = FixedBindLifecycleMachine {
         observation: FacadeGateObservation {
             runtime: runtime_control_state_for_tests(false, false, false),
             current_pending: None,
@@ -2478,6 +2478,13 @@ fn facade_publication_machine_keeps_active_facade_withheld_until_runtime_gate_is
             allow_facade_only_handoff: false,
         },
         publication_ready: false,
+        fixed_bind: FacadeFixedBindSnapshot {
+            pending_publication: None,
+            conflicting_process_claim: None,
+            claim_release_followup_pending: false,
+        },
+        release_handoff: None,
+        shutdown_handoff: None,
     }
     .snapshot();
 
@@ -2902,8 +2909,10 @@ fn fixed_bind_machine_for_tests(
     claim_release_followup_pending: bool,
     release_handoff: Option<PendingFixedBindHandoffContinuation>,
     shutdown_handoff: Option<ActiveFixedBindShutdownContinuation>,
-) -> FacadeDeactivateMachine {
-    FacadeDeactivateMachine {
+) -> FixedBindLifecycleMachine {
+    FixedBindLifecycleMachine {
+        observation: FacadeGateObservation::inert(),
+        publication_ready: false,
         fixed_bind: FacadeFixedBindSnapshot {
             pending_publication,
             conflicting_process_claim,
@@ -3065,23 +3074,149 @@ fn runtime_app_fixed_bind_projection_symbols_are_removed() {
         "fixed-bind hard cut should not keep FacadePublicationMachine::observe(app) once app-side typed input collection owns async observation",
     );
     assert!(
-        source.contains("struct FacadePublicationInput {")
-            && source.contains(
+        !source.contains("struct FacadePublicationInput {")
+            && !source.contains("struct FacadeDeactivateInput {")
+            && !source.contains(
                 "async fn collect_facade_publication_input(&self) -> FacadePublicationInput",
             )
-            && source.contains("struct FacadeDeactivateInput {")
-            && source.contains(
+            && !source.contains(
                 "async fn collect_facade_deactivate_input(&self) -> FacadeDeactivateInput",
             )
-            && source.contains("fn from_input(input: FacadePublicationInput) -> Self")
-            && source.contains("fn from_input(input: FacadeDeactivateInput) -> Self")
-            && source.contains("async fn resolve_facade_publication_ready(")
-            && source.contains("async fn execute_fixed_bind_handoff_action("),
-        "fixed-bind hard cut regressed; facade publication/deactivate should flow through typed input collection, pure machine evaluation, and app-owned effect execution instead of async observe(app) ownership",
+            && !source.contains("fn from_input(input: FacadePublicationInput) -> Self")
+            && !source.contains("fn from_input(input: FacadeDeactivateInput) -> Self")
+            && source.contains("struct FixedBindLifecycleFacts {")
+            && source.contains("struct FixedBindLifecycleMachine {")
+            && source.contains("struct FixedBindLifecycleView {")
+            && source.contains("struct FixedBindLifecycleSession {")
+            && source.contains(
+                "async fn collect_fixed_bind_lifecycle_facts(&self) -> FixedBindLifecycleFacts",
+            )
+            && source.contains("fn from_facts(facts: FixedBindLifecycleFacts) -> Self")
+            && source.contains("async fn current_facade_service_state(&self) -> FacadeServiceState {")
+            && source.contains(
+                "async fn publish_facade_service_state_with_session(",
+            )
+            && source.contains(
+                "async fn begin_fixed_bind_lifecycle_session(&self) -> FixedBindLifecycleSession {",
+            )
+            && source.contains(
+                "async fn rebuild_fixed_bind_lifecycle_session(",
+            )
+            && source.contains("struct FixedBindClaimReleaseFollowupSnapshot {")
+            && source.contains(
+                "fn claim_release_followup_snapshot(&self) -> FixedBindClaimReleaseFollowupSnapshot {",
+            )
+            && source.contains(
+                "fn fixed_bind_gate_publication_snapshot(\n        observation: FacadeGateObservation,\n        publication_ready: bool,\n    ) -> FacadePublicationSnapshot",
+            )
+            && source.contains(
+                "async fn settle_fixed_bind_claim_release_followup(\n        &self,\n    ) -> Result<FixedBindClaimReleaseFollowupSnapshot>",
+            )
+            && source.contains(
+                "async fn settle_fixed_bind_claim_release_followup_with_session(",
+            )
+            && source.contains("async fn apply_facade_signal_with_session(")
+            && source.contains(
+                "let mut fixed_bind_session = self.begin_fixed_bind_lifecycle_session().await;",
+            )
+            && source.contains(
+                ".settle_fixed_bind_claim_release_followup_with_session(fixed_bind_session)",
+            )
+            && source.contains(
+                ".apply_facade_signal_with_session(fixed_bind_session, signal)",
+            )
+            && source.contains(
+                ".publish_facade_service_state_with_session(&fixed_bind_session)",
+            )
+            && source.contains("enum FixedBindLifecycleRequest {")
+            && source.contains("enum FixedBindLifecycleExecution {")
+            && source.contains("fn evaluate(&self, request: FixedBindLifecycleRequest)")
+            && source.contains("async fn drive_fixed_bind_lifecycle_request(")
+            && source.contains("async fn execute_fixed_bind_lifecycle_execution(")
+            && !source.contains("struct FixedBindLifecycleReadSide {")
+            && !source.contains("current_fixed_bind_lifecycle_read_side(")
+            && !source.contains("enum FixedBindHandoffAction {")
+            && !source.contains("fn deactivate_action(")
+            && !source.contains("async fn execute_fixed_bind_lifecycle_action(")
+            && !source.contains(
+                "execute_fixed_bind_lifecycle_execution(machine.evaluate(",
+            )
+            && !source.contains(
+                "let machine = FixedBindLifecycleMachine::from_facts(\n            self.collect_fixed_bind_lifecycle_facts().await,\n        );\n        let facade_snapshot = machine.snapshot();",
+            )
+            && !source.contains(
+                "if !sink_cleanup_only_while_uninitialized && !query_publication_followup_present {\n            let mut machine = FixedBindLifecycleMachine::from_facts(\n                self.collect_fixed_bind_lifecycle_facts().await,\n            );",
+            )
+            && !source.contains(
+                "let mut snapshot = self\n            .current_fixed_bind_lifecycle_view()\n            .await\n            .claim_release_followup_snapshot();",
+            )
+            && !source.contains(
+                "let facade_snapshot = self.current_fixed_bind_lifecycle_view().await.snapshot();",
+            )
+            && !source.contains(
+                "let followup_snapshot = self\n            .current_fixed_bind_lifecycle_view()\n            .await\n            .claim_release_followup_snapshot();",
+            )
+            && !source.contains(
+                "self.api_control_gate\n                    .set_ready(self.current_fixed_bind_publication_snapshot().await.publication_ready);",
+            )
+            && !source.contains(
+                "let facade_snapshot = self.current_fixed_bind_publication_snapshot().await;\n        let _ = Self::publish_facade_publication_snapshot(",
+            )
+            && !source.contains(
+                "let facade_snapshot = self.current_fixed_bind_publication_snapshot().await;\n                let _ = self\n                    .publish_fixed_bind_publication_snapshot(facade_snapshot)\n                    .await;",
+            )
+            && !source.contains(
+                "let facade_snapshot = self.current_fixed_bind_publication_snapshot().await;\n        let _ = self\n            .publish_fixed_bind_publication_snapshot(facade_snapshot)\n            .await;",
+            )
+            && !source.contains(
+                "async fn publish_fixed_bind_publication_snapshot(\n        &self,\n        facade_snapshot: FacadePublicationSnapshot,\n    ) -> FacadeServiceState",
+            )
+            && !source.contains(
+                "async fn current_fixed_bind_publication_snapshot(&self) -> FacadePublicationSnapshot",
+            )
+            && !source.contains(
+                "async fn current_fixed_bind_claim_release_followup_snapshot(\n        &self,\n    ) -> FixedBindClaimReleaseFollowupSnapshot",
+            )
+            && !source.contains(
+                "fn project_fixed_bind_claim_release_followup_snapshot(\n        facts: FixedBindLifecycleFacts,\n    ) -> FixedBindClaimReleaseFollowupSnapshot {",
+            )
+            && !source.contains(
+                "async fn current_fixed_bind_claim_release_followup_allows_dependent_routes(&self) -> bool",
+            )
+            && !source.contains(
+                "fn fixed_bind_claim_release_followup_allows_dependent_routes(\n        snapshot: &FixedBindClaimReleaseFollowupSnapshot,\n    ) -> bool {",
+            )
+            && !source.contains(
+                "let machine =\n            FixedBindLifecycleMachine::from_facts(self.collect_fixed_bind_lifecycle_facts().await);\n        let allow_routes = machine.fixed_bind.conflicting_process_claim.is_none()",
+            )
+            && !source.contains(
+                "self\n            .current_fixed_bind_lifecycle_machine()\n            .await\n            .claim_release_followup_snapshot()",
+            )
+            && !source.contains(
+                "async fn current_fixed_bind_lifecycle_machine(&self) -> FixedBindLifecycleMachine {",
+            )
+            && !source.contains(
+                "let facade_snapshot = self.current_fixed_bind_lifecycle_machine().await.snapshot();",
+            )
+            && !source.contains(
+                "let facade_snapshot =\n            FixedBindLifecycleMachine::from_facts(self.collect_fixed_bind_lifecycle_facts().await)\n                .snapshot();",
+            )
+            && !source.contains("let snapshot = FixedBindLifecycleMachine {")
+            && !source.contains(
+                "let _ = self.current_facade_service_state().await;\n                let _ = self.current_facade_service_state().await;",
+            ),
+        "fixed-bind hard cut regressed; fixed-bind lifecycle should flow through one typed-facts collector, one pure machine, and app-owned handoff execution instead of split publication/deactivate inputs",
     );
     assert!(
-        !source.contains("async fn resolve_publication_ready("),
-        "fixed-bind hard cut should keep publication-readiness execution in the typed-input collector, not on FacadePublicationMachine itself",
+        !source.contains(
+            "fn project_fixed_bind_publication_snapshot(\n        facts: FixedBindLifecycleFacts,\n    ) -> FacadePublicationSnapshot {",
+        ),
+        "fixed-bind hard cut regressed; single-use publication projection helper returned to production",
+    );
+    assert!(
+        source.contains("async fn resolve_facade_publication_ready(")
+            && !source.contains("async fn resolve_publication_ready("),
+        "fixed-bind hard cut should keep publication-readiness execution in the lifecycle-facts collector, not on the machine itself",
     );
     assert!(
         !source.contains("async fn execute_fixed_bind_action(")
@@ -3208,8 +3343,17 @@ fn runtime_app_fixed_bind_projection_symbols_are_removed() {
         "fixed-bind hard cut should not keep a trivial inactive fixed-bind snapshot constructor once production code builds the machine-owned zero state directly",
     );
     assert!(
-        !source.contains("FixedBindAfterReleaseRuntime::new()"),
-        "fixed-bind hard cut should not keep a trivial default after-release runtime constructor once production code builds the runtime with an explicit deadline",
+        !source.contains("FixedBindAfterReleaseRuntime::new()")
+            && !source.contains("struct FixedBindAfterReleaseRuntime {")
+            && source.contains("struct FixedBindAfterReleaseMachine {")
+            && source.contains("impl FixedBindAfterReleaseMachine {")
+            && source.contains(
+                "const FIXED_BIND_AFTER_RELEASE_TIMEOUT: Duration = Duration::from_secs(8);"
+            )
+            && source.contains("async fn execute_fixed_bind_after_release_action(")
+            && source.contains("async fn drive_fixed_bind_after_release_loop(")
+            && !source.contains("tokio::time::Instant::now() + Duration::from_secs(8)"),
+        "fixed-bind hard cut should not keep the old after-release runtime shell once fixed-bind after-release ownership is modeled as a machine with an explicit deadline",
     );
     assert!(
         !source.contains("fn spawn_attempt_action(&self) -> FixedBindAfterReleaseAction")
@@ -3353,7 +3497,7 @@ async fn facade_deactivate_continuity_execution_plan_for_tests(
     pending_fixed_bind_conflict: bool,
     release_for_fixed_bind_handoff: bool,
     retain_pending_spawn: bool,
-) -> FacadeDeactivateContinuityExecutionPlan {
+) -> FixedBindLifecycleExecution {
     let release_handoff = if release_for_fixed_bind_handoff {
         Some(pending_fixed_bind_handoff_continuation_for_tests("127.0.0.1:4100").await)
     } else {
@@ -3384,7 +3528,12 @@ async fn facade_deactivate_continuity_execution_plan_for_tests(
             pending_handoff: release_handoff,
         }),
     )
-    .deactivate_plan(retain_active_facade, retain_pending_spawn)
+    .evaluate(FixedBindLifecycleRequest::Deactivate {
+        route_key: format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+        generation: 1,
+        retain_active_facade,
+        retain_pending_spawn,
+    })
 }
 
 #[tokio::test]
@@ -3392,7 +3541,7 @@ async fn facade_deactivate_continuity_execution_plan_retains_active_continuity_w
  {
     assert!(matches!(
         facade_deactivate_continuity_execution_plan_for_tests(true, false, false, false).await,
-        FacadeDeactivateContinuityExecutionPlan::RetainActiveContinuity
+        FixedBindLifecycleExecution::RetainActiveContinuity { .. }
     ));
 }
 
@@ -3401,7 +3550,7 @@ async fn facade_deactivate_continuity_execution_plan_retains_active_facade_while
  {
     assert!(matches!(
         facade_deactivate_continuity_execution_plan_for_tests(true, true, false, false).await,
-        FacadeDeactivateContinuityExecutionPlan::RetainActiveWhilePendingFixedBindClaimConflict
+        FixedBindLifecycleExecution::RetainActiveWhilePendingFixedBindClaimConflict { .. }
     ));
 }
 
@@ -3410,7 +3559,7 @@ async fn facade_deactivate_continuity_execution_plan_retains_pending_facade_whil
  {
     assert!(matches!(
         facade_deactivate_continuity_execution_plan_for_tests(false, true, false, false).await,
-        FacadeDeactivateContinuityExecutionPlan::RetainPendingWhilePendingFixedBindClaimConflict
+        FixedBindLifecycleExecution::RetainPendingWhilePendingFixedBindClaimConflict { .. }
     ));
 }
 
@@ -3419,7 +3568,7 @@ async fn facade_deactivate_continuity_execution_plan_releases_active_facade_for_
 {
     assert!(matches!(
         facade_deactivate_continuity_execution_plan_for_tests(true, false, true, false).await,
-        FacadeDeactivateContinuityExecutionPlan::ReleaseActiveForFixedBindHandoff { .. }
+        FixedBindLifecycleExecution::ReleaseActiveForFixedBindHandoff { .. }
     ));
 }
 
@@ -3428,7 +3577,7 @@ async fn facade_deactivate_continuity_execution_plan_retains_pending_facade_whil
  {
     assert!(matches!(
         facade_deactivate_continuity_execution_plan_for_tests(false, false, false, true).await,
-        FacadeDeactivateContinuityExecutionPlan::RetainPendingWhileSpawnInFlight
+        FixedBindLifecycleExecution::RetainPendingWhileSpawnInFlight { .. }
     ));
 }
 
@@ -3436,7 +3585,7 @@ async fn facade_deactivate_continuity_execution_plan_retains_pending_facade_whil
 async fn facade_deactivate_continuity_execution_plan_shuts_down_when_no_continuity_lane_applies() {
     assert!(matches!(
         facade_deactivate_continuity_execution_plan_for_tests(false, false, false, false).await,
-        FacadeDeactivateContinuityExecutionPlan::Shutdown { handoff: None }
+        FixedBindLifecycleExecution::Shutdown { handoff: None }
     ));
 }
 
@@ -3452,11 +3601,16 @@ async fn facade_deactivate_continuity_execution_plan_reuses_observed_handoff_sta
             pending_handoff: None,
         }),
     )
-    .deactivate_plan(true, false);
+    .evaluate(FixedBindLifecycleRequest::Deactivate {
+        route_key: format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+        generation: 1,
+        retain_active_facade: true,
+        retain_pending_spawn: false,
+    });
 
     assert!(matches!(
         plan,
-        FacadeDeactivateContinuityExecutionPlan::ReleaseActiveForFixedBindHandoff { handoff }
+        FixedBindLifecycleExecution::ReleaseActiveForFixedBindHandoff { handoff, .. }
             if handoff.bind_addr == "127.0.0.1:4100"
     ));
 }
@@ -3473,11 +3627,16 @@ async fn facade_deactivate_continuity_execution_plan_reuses_observed_handoff_sta
             pending_handoff: None,
         }),
     )
-    .deactivate_plan(false, false);
+    .evaluate(FixedBindLifecycleRequest::Deactivate {
+        route_key: format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+        generation: 1,
+        retain_active_facade: false,
+        retain_pending_spawn: false,
+    });
 
     assert!(matches!(
         plan,
-        FacadeDeactivateContinuityExecutionPlan::Shutdown { handoff: Some(handoff) }
+        FixedBindLifecycleExecution::Shutdown { handoff: Some(handoff) }
             if handoff.bind_addr == "127.0.0.1:4100"
     ));
 }
@@ -3955,7 +4114,7 @@ async fn facade_publication_ready_requires_active_control_stream_when_pending_fa
     });
 
     assert!(
-        !FacadePublicationMachine::from_input(app.collect_facade_publication_input().await)
+        !FixedBindLifecycleMachine::from_facts(app.collect_fixed_bind_lifecycle_facts().await)
             .snapshot()
             .publication_ready,
         "non-control pending facade must not mark publication ready before an active control stream exists",
@@ -7212,7 +7371,13 @@ async fn external_worker_status_uses_cached_observation_reason_before_blocking_s
     let token = login_body["token"].as_str().expect("token");
 
     let _sink_nonblocking_cache_reset = SinkWorkerStatusNonblockingCacheFallbackHookReset;
-    crate::workers::sink::install_sink_worker_status_nonblocking_cache_fallback_hook(
+    let sink_worker_instance_id = app
+        .sink
+        .worker_instance_id_for_tests()
+        .await
+        .expect("worker sink instance id");
+    crate::workers::sink::install_sink_worker_status_nonblocking_cache_fallback_hook_for_worker_instance(
+        sink_worker_instance_id,
         crate::workers::sink::SinkWorkerStatusNonblockingCacheFallbackHook,
     );
     let trace_events = Arc::new(StdMutex::new(Vec::new()));
@@ -12781,9 +12946,11 @@ async fn pending_fixed_bind_release_does_not_overwrite_pending_facade_state_with
         "fixed-bind handoff completion must keep the API control gate closed when a higher-generation pending facade reappears before the ready tail completes"
     );
     assert!(
-        !FacadePublicationMachine::from_input(successor.collect_facade_publication_input().await)
-            .snapshot()
-            .publication_ready,
+        !FixedBindLifecycleMachine::from_facts(
+            successor.collect_fixed_bind_lifecycle_facts().await
+        )
+        .snapshot()
+        .publication_ready,
         "fixed-bind handoff completion must not treat a stale active control stream as publication-ready when a higher-generation pending facade reappears before the ready tail completes"
     );
 
@@ -13003,7 +13170,7 @@ async fn pending_fixed_bind_release_reopens_control_gate_when_non_control_pendin
         "fixed-bind handoff completion must reopen the API control gate when a non-control pending facade reappears but the active control stream still exists"
     );
     assert!(
-        FacadePublicationMachine::from_input(successor.collect_facade_publication_input().await)
+        FixedBindLifecycleMachine::from_facts(successor.collect_fixed_bind_lifecycle_facts().await)
             .snapshot()
             .publication_ready,
         "fixed-bind handoff completion must treat the active control stream as publication-ready when the reintroduced pending facade is not the control route"
@@ -13352,9 +13519,11 @@ async fn pending_fixed_bind_release_remains_blocked_without_runtime_exposure_con
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        !FacadePublicationMachine::from_input(successor.collect_facade_publication_input().await)
-            .snapshot()
-            .publication_ready,
+        !FixedBindLifecycleMachine::from_facts(
+            successor.collect_fixed_bind_lifecycle_facts().await
+        )
+        .snapshot()
+        .publication_ready,
         "facade publication must remain blocked while runtime exposure is still unconfirmed"
     );
     assert!(
@@ -17561,7 +17730,7 @@ async fn route_peer_turnover_keeps_facade_and_query_routes_live_during_replayed_
     let source_replay_required = app.source_state_replay_required();
     let sink_replay_required = app.sink_state_replay_required();
     let publication_ready =
-        FacadePublicationMachine::from_input(app.collect_facade_publication_input().await)
+        FixedBindLifecycleMachine::from_facts(app.collect_fixed_bind_lifecycle_facts().await)
             .snapshot()
             .publication_ready;
     assert!(

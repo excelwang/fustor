@@ -436,9 +436,76 @@ fn sink_control_frame_machine_fail_fasts_after_missing_route_state_then_bridge_r
     };
 
     match after_missing_route_state.followup_after_error(CnxError::ChannelClosed) {
-        SinkControlFrameFollowup::RestartAndFailFast(CnxError::ChannelClosed) => {}
+        SinkControlFrameFollowup::RestartAndFailFast(SinkFailure {
+            cause: CnxError::ChannelClosed,
+            reason: SinkFailureReason::ControlReset(SinkControlResetKind::ChannelClosed),
+        }) => {}
         other => panic!(
             "missing-route-state followed by bridge reset must fail fast from machine phase, got {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn sink_control_frame_machine_deadline_exhaustion_beats_reset_retry_policy() {
+    let deadline = std::time::Instant::now();
+    let machine = SinkControlFrameMachine::new(deadline, &[]);
+
+    match machine.followup_after_error(CnxError::Internal(
+        "sink worker unavailable: missing route state for channel_buffer ChannelSlotId(1)"
+            .to_string(),
+    )) {
+        SinkControlFrameFollowup::Failed(SinkFailure {
+            cause: CnxError::Timeout,
+            reason:
+                SinkFailureReason::RetryBudgetExhausted(
+                    SinkRetryBudgetExhaustionKind::ControlFrameRetry,
+                ),
+        }) => {}
+        other => panic!(
+            "deadline exhaustion must terminate as typed retry-budget failure before reset retry policy, got {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn sink_status_probe_retry_disposition_deadline_exhaustion_beats_reset_retry_policy() {
+    match classify_sink_retry_disposition(
+        std::time::Instant::now(),
+        CnxError::Internal(
+            "sink worker unavailable: missing route state for channel_buffer ChannelSlotId(1)"
+                .to_string(),
+        ),
+        SinkRetryBudgetExhaustionKind::StatusProbeAttempt,
+    ) {
+        SinkRetryDisposition::Fail(SinkFailure {
+            cause: CnxError::Timeout,
+            reason:
+                SinkFailureReason::RetryBudgetExhausted(
+                    SinkRetryBudgetExhaustionKind::StatusProbeAttempt,
+                ),
+        }) => {}
+        other => panic!(
+            "status probe deadline exhaustion must terminate as typed retry-budget failure before reset retry policy, got {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn sink_status_probe_replay_after_retry_reset_treats_timeout_as_best_effort_before_deadline() {
+    let deadline = std::time::Instant::now() + Duration::from_millis(250);
+    let machine = SinkStatusProbeMachine::new(deadline)
+        .phase_after_retry_reset()
+        .phase_after_retry_reset();
+
+    match machine.classify_replay_failure_disposition(CnxError::Timeout, true) {
+        SinkStatusProbeReplayDisposition::BestEffort(SinkFailure {
+            cause: CnxError::Timeout,
+            reason:
+                SinkFailureReason::ReplayHandling(SinkReplayHandlingKind::BestEffortAfterRetryReset),
+        }) => {}
+        other => panic!(
+            "replay-after-retry-reset timeout must stay in typed best-effort disposition before deadline, got {other:?}"
         ),
     }
 }
@@ -450,10 +517,37 @@ fn sink_legacy_bool_driven_recovery_symbols_are_removed() {
         "let mut recovered_after_retry_reset = false;",
         "let mut skipped_replay_after_retry_reset = false;",
         "let mut saw_missing_channel_buffer_route_state = false;",
+        "fn can_retry_on_control_frame(",
+        "fn sink_control_frame_retryable(",
+        "fn is_retryable_worker_bridge_reset(",
+        "fn is_missing_channel_buffer_route_state(",
     ] {
         assert!(
             !sink_impl.contains(legacy_symbol),
             "workers/sink hard cut regressed; legacy helper-local bool-driven recovery state still present: {legacy_symbol}",
+        );
+    }
+    assert!(
+        sink_impl.contains("enum SinkControlFrameFailureDisposition {"),
+        "workers/sink hard cut regressed; control-frame retry/fail-fast policy should be centralized in a typed failure disposition instead of drifting back into predicate-order branching",
+    );
+    assert!(
+        sink_impl.contains("enum SinkStatusProbeReplayDisposition {"),
+        "workers/sink hard cut regressed; status-probe replay handling should stay centralized in a typed disposition instead of drifting back into helper-local predicate ordering",
+    );
+    for unexpected_response_string in [
+        "\"unexpected sink worker response for update roots:",
+        "\"unexpected sink worker response for logical roots:",
+        "\"unexpected sink worker response for health:",
+        "\"unexpected sink worker response for visibility lag samples:",
+        "\"unexpected sink worker response for materialized query:",
+        "\"unexpected sink worker response for send:",
+        "\"unexpected sink worker response for recv:",
+        "\"unexpected sink worker response for on_control_frame:",
+    ] {
+        assert!(
+            !sink_impl.contains(unexpected_response_string),
+            "workers/sink hard cut regressed; protocol violation shaping must flow through unexpected_sink_worker_response(...) instead of scattered direct strings: {unexpected_response_string}",
         );
     }
 }
@@ -3922,6 +4016,21 @@ fn sink_status_scenario_outcome_returns_live_after_retry_reset_replay_pending_wi
 }
 
 #[test]
+fn sink_status_scenario_outcome_returns_live_after_retry_reset_stale_empty_when_cached_truth_is_preactivate_unscheduled()
+ {
+    let outcome = reduce_sink_status_scenario_outcome_with_facts(
+        SinkStatusScenario::Live(SinkStatusLiveScenario::SteadyAfterRetryReset),
+        SinkStatusScenarioFacts::new(Some(SinkStatusConcern::StaleEmpty), None, false)
+            .with_cached_preactivate_unscheduled(true),
+    );
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnLive);
+    assert_eq!(outcome.concern, Some(SinkStatusConcern::StaleEmpty));
+    assert!(!outcome.should_mark_replay_required);
+    assert!(!outcome.should_republish_zero_row_summary);
+}
+
+#[test]
 fn sink_status_scenario_outcome_returns_cached_for_worker_unavailable_replay_pending_cache() {
     let outcome = reduce_sink_status_scenario_outcome(
         SinkStatusScenario::Cached(SinkStatusCachedScenario::WorkerUnavailable),
@@ -4059,6 +4168,20 @@ fn sink_status_scenario_outcome_republishes_zero_row_summary_for_worker_unavaila
     );
 
     assert_eq!(outcome.kind, SinkStatusOutcomeKind::PropagateError);
+    assert_eq!(outcome.concern, Some(SinkStatusConcern::StaleEmpty));
+    assert!(!outcome.should_mark_replay_required);
+    assert!(outcome.should_republish_zero_row_summary);
+}
+
+#[test]
+fn evaluate_cached_sink_status_snapshot_returns_cached_for_worker_unavailable_preactivate_stale_empty()
+ {
+    let snapshot = SinkStatusSnapshot::default();
+
+    let outcome =
+        evaluate_cached_sink_status_snapshot(&snapshot, SinkStatusAccessPath::WorkerUnavailable);
+
+    assert_eq!(outcome.kind, SinkStatusOutcomeKind::ReturnCached);
     assert_eq!(outcome.concern, Some(SinkStatusConcern::StaleEmpty));
     assert!(!outcome.should_mark_replay_required);
     assert!(outcome.should_republish_zero_row_summary);
