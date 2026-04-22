@@ -83,7 +83,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 &mut session,
                 &harness.lab,
                 harness.facade_count,
-                false,
+                true,
             )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
             run_roots_matrix(&mut session, &harness.lab)?;
@@ -111,7 +111,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 &mut session,
                 &harness.lab,
                 harness.facade_count,
-                false,
+                true,
             )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
             run_roots_matrix(&mut session, &harness.lab)?;
@@ -139,7 +139,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 &mut session,
                 &harness.lab,
                 harness.facade_count,
-                false,
+                true,
             )?;
         }
     }
@@ -750,6 +750,8 @@ fn run_query_live_only_rescan_phase(
     )?;
 
     session.rescan()?;
+    let post_rescan_status = session.status()?;
+    validate_status_monitoring_shape(&post_rescan_status, true)?;
 
     session.update_roots(&roots_payload(&baseline_roots(lab)))?;
     session.rescan()?;
@@ -825,9 +827,7 @@ fn run_status_and_grants_checks(
             if groups.is_empty() && require_sink_groups {
                 return Ok(false);
             }
-            Ok(groups
-                .iter()
-                .all(|group| group.get("shadow_lag_us").is_some_and(Value::is_number)))
+            Ok(validate_status_monitoring_shape(&status, require_sink_groups).is_ok())
         },
     )?;
     let metrics_before = session.bound_route_metrics()?;
@@ -850,22 +850,7 @@ fn run_status_and_grants_checks(
     if sink.get("live_nodes").and_then(Value::as_u64).unwrap_or(0) == 0 {
         return Err(format!("expected live sink nodes in status: {status}"));
     }
-    if let Some(sink_groups) = sink.get("groups").and_then(Value::as_array) {
-        if require_sink_groups && sink_groups.is_empty() {
-            return Err(format!(
-                "expected non-empty sink.groups in status: {status}"
-            ));
-        }
-        for group in sink_groups {
-            if !group.get("shadow_lag_us").is_some_and(Value::is_number) {
-                return Err(format!(
-                    "status sink group missing numeric shadow_lag_us: {group}"
-                ));
-            }
-        }
-    } else if require_sink_groups {
-        return Err(format!("status missing sink.groups array: {status}"));
-    }
+    validate_status_monitoring_shape(&status, require_sink_groups)?;
     let timeouts_before = metrics_before
         .get("call_timeout_total")
         .and_then(Value::as_u64)
@@ -916,6 +901,392 @@ fn run_status_and_grants_checks(
                 "runtime grants missing export {export_name}: {grants}"
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_status_monitoring_shape(
+    status: &Value,
+    require_sink_groups: bool,
+) -> Result<(), String> {
+    let source = status
+        .get("source")
+        .ok_or_else(|| format!("status missing source: {status}"))?;
+    validate_status_source_shape(source, status)?;
+    let sink = status
+        .get("sink")
+        .ok_or_else(|| format!("status missing sink: {status}"))?;
+    validate_status_sink_shape(sink, status, require_sink_groups)?;
+    let facade = status
+        .get("facade")
+        .ok_or_else(|| format!("status missing facade: {status}"))?;
+    validate_status_facade_shape(facade, status)?;
+    Ok(())
+}
+
+fn validate_status_source_shape(source: &Value, status: &Value) -> Result<(), String> {
+    if !source.get("grants_count").is_some_and(Value::is_u64) {
+        return Err(format!(
+            "status.source.grants_count missing numeric value: {status}"
+        ));
+    }
+    if !source.get("roots_count").is_some_and(Value::is_u64) {
+        return Err(format!(
+            "status.source.roots_count missing numeric value: {status}"
+        ));
+    }
+    let logical_roots = source
+        .get("logical_roots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("status.source.logical_roots missing array: {status}"))?;
+    if logical_roots.is_empty() {
+        return Err(format!(
+            "status.source.logical_roots unexpectedly empty: {status}"
+        ));
+    }
+    for root in logical_roots {
+        let group_state = root
+            .get("service_state")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("status.source.logical_roots[].service_state missing: {status}")
+            })?;
+        if !matches!(
+            group_state,
+            "not-selected"
+                | "selected-pending"
+                | "serving-trusted"
+                | "serving-degraded"
+                | "retiring"
+                | "retired"
+        ) {
+            return Err(format!(
+                "status.source.logical_roots has invalid service_state={group_state}: {root}"
+            ));
+        }
+        if !root.get("root_id").is_some_and(Value::is_string) {
+            return Err(format!(
+                "status.source.logical_roots[].root_id missing string value: {root}"
+            ));
+        }
+        if !root.get("matched_grants").is_some_and(Value::is_u64) {
+            return Err(format!(
+                "status.source.logical_roots[].matched_grants missing numeric value: {root}"
+            ));
+        }
+        if !root.get("active_members").is_some_and(Value::is_u64) {
+            return Err(format!(
+                "status.source.logical_roots[].active_members missing numeric value: {root}"
+            ));
+        }
+        validate_status_coverage_mode(root.get("coverage_mode"), root)?;
+    }
+
+    let concrete_roots = source
+        .get("concrete_roots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("status.source.concrete_roots missing array: {status}"))?;
+    if concrete_roots.is_empty() {
+        return Err(format!(
+            "status.source.concrete_roots unexpectedly empty: {status}"
+        ));
+    }
+    for root in concrete_roots {
+        if !root.get("root_key").is_some_and(Value::is_string) {
+            return Err(format!(
+                "status.source.concrete_roots[].root_key missing string value: {root}"
+            ));
+        }
+        if !root.get("logical_root_id").is_some_and(Value::is_string) {
+            return Err(format!(
+                "status.source.concrete_roots[].logical_root_id missing string value: {root}"
+            ));
+        }
+        if !root.get("object_ref").is_some_and(Value::is_string) {
+            return Err(format!(
+                "status.source.concrete_roots[].object_ref missing string value: {root}"
+            ));
+        }
+        let participation_state = root
+            .get("participation_state")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "status.source.concrete_roots[].participation_state missing string value: {root}"
+                )
+            })?;
+        if !matches!(
+            participation_state,
+            "absent" | "joining" | "serving" | "degraded" | "retiring" | "retired"
+        ) {
+            return Err(format!(
+                "status.source.concrete_roots has invalid participation_state={participation_state}: {root}"
+            ));
+        }
+        validate_status_coverage_mode(root.get("coverage_mode"), root)?;
+        for key in [
+            "watch_enabled",
+            "scan_enabled",
+            "is_group_primary",
+            "active",
+            "overflow_pending",
+            "rescan_pending",
+        ] {
+            if !root.get(key).is_some_and(Value::is_boolean) {
+                return Err(format!(
+                    "status.source.concrete_roots[].{key} missing boolean value: {root}"
+                ));
+            }
+        }
+        for key in ["watch_lru_capacity", "audit_interval_ms", "overflow_count"] {
+            if !root.get(key).is_some_and(Value::is_u64) {
+                return Err(format!(
+                    "status.source.concrete_roots[].{key} missing numeric value: {root}"
+                ));
+            }
+        }
+        for key in ["last_rescan_reason", "last_error"] {
+            if !root
+                .get(key)
+                .is_some_and(|value| value.is_null() || value.is_string())
+            {
+                return Err(format!(
+                    "status.source.concrete_roots[].{key} must be null|string: {root}"
+                ));
+            }
+        }
+        for key in [
+            "last_audit_started_at_us",
+            "last_audit_completed_at_us",
+            "last_audit_duration_ms",
+        ] {
+            if !root
+                .get(key)
+                .is_some_and(|value| value.is_null() || value.is_u64())
+            {
+                return Err(format!(
+                    "status.source.concrete_roots[].{key} must be null|u64: {root}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_status_sink_shape(
+    sink: &Value,
+    status: &Value,
+    require_sink_groups: bool,
+) -> Result<(), String> {
+    for key in [
+        "live_nodes",
+        "tombstoned_count",
+        "attested_count",
+        "suspect_count",
+        "blind_spot_count",
+        "shadow_time_us",
+        "estimated_heap_bytes",
+    ] {
+        if !sink.get(key).is_some_and(Value::is_u64) {
+            return Err(format!("status.sink.{key} missing numeric value: {status}"));
+        }
+    }
+    let groups = sink
+        .get("groups")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("status.sink.groups missing array: {status}"))?;
+    if require_sink_groups && groups.is_empty() {
+        return Err(format!("status.sink.groups unexpectedly empty: {status}"));
+    }
+    for group in groups {
+        if !group.get("group_id").is_some_and(Value::is_string) {
+            return Err(format!(
+                "status.sink.groups[].group_id missing string value: {group}"
+            ));
+        }
+        let service_state = group
+            .get("service_state")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("status.sink.groups[].service_state missing string value: {group}")
+            })?;
+        if !matches!(
+            service_state,
+            "not-selected"
+                | "selected-pending"
+                | "serving-trusted"
+                | "serving-degraded"
+                | "retiring"
+                | "retired"
+        ) {
+            return Err(format!(
+                "status.sink.groups has invalid service_state={service_state}: {group}"
+            ));
+        }
+        if !group
+            .get("primary_object_ref")
+            .is_some_and(Value::is_string)
+        {
+            return Err(format!(
+                "status.sink.groups[].primary_object_ref missing string value: {group}"
+            ));
+        }
+        for key in [
+            "total_nodes",
+            "live_nodes",
+            "tombstoned_count",
+            "attested_count",
+            "suspect_count",
+            "blind_spot_count",
+            "shadow_time_us",
+            "shadow_lag_us",
+            "estimated_heap_bytes",
+        ] {
+            if !group.get(key).is_some_and(Value::is_u64) {
+                return Err(format!(
+                    "status.sink.groups[].{key} missing numeric value: {group}"
+                ));
+            }
+        }
+        for key in [
+            "overflow_pending_materialization",
+            "initial_audit_completed",
+        ] {
+            if !group.get(key).is_some_and(Value::is_boolean) {
+                return Err(format!(
+                    "status.sink.groups[].{key} missing boolean value: {group}"
+                ));
+            }
+        }
+        let readiness = group
+            .get("materialization_readiness")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "status.sink.groups[].materialization_readiness missing string value: {group}"
+                )
+            })?;
+        if !matches!(
+            readiness,
+            "pending-materialization" | "waiting-for-materialized-root" | "ready"
+        ) {
+            return Err(format!(
+                "status.sink.groups has invalid materialization_readiness={readiness}: {group}"
+            ));
+        }
+        let initial_audit_completed = group
+            .get("initial_audit_completed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if initial_audit_completed != (readiness == "ready") {
+            return Err(format!(
+                "status.sink.groups initial_audit_completed/readiness mismatch: readiness={readiness} group={group}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_status_facade_shape(facade: &Value, status: &Value) -> Result<(), String> {
+    let state = facade
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("status.facade.state missing string value: {status}"))?;
+    if !matches!(state, "unavailable" | "pending" | "serving" | "degraded") {
+        return Err(format!("status.facade has invalid state={state}: {status}"));
+    }
+    if let Some(pending) = facade.get("pending") {
+        if !pending.is_object() {
+            return Err(format!("status.facade.pending must be object: {status}"));
+        }
+        if !pending.get("route_key").is_some_and(Value::is_string) {
+            return Err(format!(
+                "status.facade.pending.route_key missing string value: {pending}"
+            ));
+        }
+        if !pending.get("generation").is_some_and(Value::is_u64) {
+            return Err(format!(
+                "status.facade.pending.generation missing numeric value: {pending}"
+            ));
+        }
+        if !pending
+            .get("resource_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().all(Value::is_string))
+        {
+            return Err(format!(
+                "status.facade.pending.resource_ids missing string array: {pending}"
+            ));
+        }
+        for key in ["runtime_managed", "runtime_exposure_confirmed"] {
+            if !pending.get(key).is_some_and(Value::is_boolean) {
+                return Err(format!(
+                    "status.facade.pending.{key} missing boolean value: {pending}"
+                ));
+            }
+        }
+        let reason = pending
+            .get("reason")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("status.facade.pending.reason missing string value: {pending}")
+            })?;
+        if !matches!(
+            reason,
+            "awaiting_runtime_exposure"
+                | "awaiting_observation_eligibility"
+                | "retrying_after_error"
+        ) {
+            return Err(format!(
+                "status.facade.pending has invalid reason={reason}: {pending}"
+            ));
+        }
+        for key in ["retry_attempts", "pending_since_us"] {
+            if !pending.get(key).is_some_and(Value::is_u64) {
+                return Err(format!(
+                    "status.facade.pending.{key} missing numeric value: {pending}"
+                ));
+            }
+        }
+        if !pending
+            .get("last_error")
+            .is_none_or(|value| value.is_string())
+        {
+            return Err(format!(
+                "status.facade.pending.last_error must be omitted|string: {pending}"
+            ));
+        }
+        for key in [
+            "last_attempt_at_us",
+            "last_error_at_us",
+            "retry_backoff_ms",
+            "next_retry_at_us",
+        ] {
+            if !pending.get(key).is_none_or(Value::is_u64) {
+                return Err(format!(
+                    "status.facade.pending.{key} must be omitted|u64: {pending}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_status_coverage_mode(value: Option<&Value>, root: &Value) -> Result<(), String> {
+    let coverage_mode = value
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("status source root missing string coverage_mode: {root}"))?;
+    if !matches!(
+        coverage_mode,
+        "realtime_hotset_plus_audit"
+            | "realtime_hotset_only"
+            | "audit_only"
+            | "watch_requested_without_capacity"
+            | "inactive"
+    ) {
+        return Err(format!(
+            "status source root has invalid coverage_mode={coverage_mode}: {root}"
+        ));
     }
     Ok(())
 }

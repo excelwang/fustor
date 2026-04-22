@@ -1010,13 +1010,21 @@ fn test_fs_meta_http_api_boundary_contract() {
     assert!(l1.contains("Covers L0: VISION.ONLINE_SCOPE_MUTATION_AND_REPAIR"));
     assert!(l3.contains("GET /status"));
     assert!(l3.contains("QueryApiKeyManagementEndpoints"));
+    assert!(l3.contains("matched_grants"));
+    assert!(l3.contains("coverage_mode"));
+    assert!(l3.contains("watch_lru_capacity"));
     assert!(l3.contains("last_audit_completed_at_us"));
+    assert!(l3.contains("last_audit_duration_ms"));
+    assert!(l3.contains("groups[].estimated_heap_bytes"));
     assert!(l3.contains("groups[].initial_audit_completed"));
     assert!(l3.contains("groups[].overflow_pending_materialization"));
+    assert!(l3.contains("groups[].materialization_readiness"));
     assert!(l3.contains("observation-evidence boundary"));
     assert!(l3.contains("optional facade-pending diagnostics"));
     assert!(l3.contains("`facade.pending`"));
+    assert!(l3.contains("runtime_exposure_confirmed"));
     assert!(l3.contains("retry_attempts"));
+    assert!(l3.contains("pending_since_us"));
     assert_domain_fs_meta_contract_test(
         "CONTRACTS.API_BOUNDARY.FS_META_HTTP_API_BOUNDARY",
         "test_fs_meta_http_api_boundary_contract",

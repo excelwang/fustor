@@ -3,7 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::app_support::fixture_support::{FsMetaApiFixture, HttpResponse, http_json};
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn expect_error_field(resp: &HttpResponse) {
     let json = resp
@@ -145,6 +145,346 @@ fn wait_for_status_sink_groups(
     );
 }
 
+fn assert_status_monitoring_shape(status: &HttpResponse) {
+    let body = status
+        .json
+        .as_ref()
+        .expect("status response should be json payload");
+    let source = body
+        .get("source")
+        .expect("status.source must exist on management status");
+    assert!(
+        source.get("grants_count").is_some_and(Value::is_u64),
+        "status.source.grants_count missing numeric value: {}",
+        status.body
+    );
+    assert!(
+        source.get("roots_count").is_some_and(Value::is_u64),
+        "status.source.roots_count missing numeric value: {}",
+        status.body
+    );
+    let logical_roots = source
+        .get("logical_roots")
+        .and_then(Value::as_array)
+        .expect("status.source.logical_roots must be an array");
+    assert!(
+        !logical_roots.is_empty(),
+        "status.source.logical_roots missing or empty: {}",
+        status.body
+    );
+    for root in logical_roots {
+        assert!(
+            root.get("root_id").is_some_and(Value::is_string),
+            "status.source.logical_roots[].root_id missing string value: {}",
+            root
+        );
+        let service_state = root
+            .get("service_state")
+            .and_then(Value::as_str)
+            .expect("status.source.logical_roots[].service_state");
+        assert!(
+            matches!(
+                service_state,
+                "not-selected"
+                    | "selected-pending"
+                    | "serving-trusted"
+                    | "serving-degraded"
+                    | "retiring"
+                    | "retired"
+            ),
+            "status.source.logical_roots[].service_state out of domain: {}",
+            root
+        );
+        assert!(
+            root.get("matched_grants").is_some_and(Value::is_u64),
+            "status.source.logical_roots[].matched_grants missing numeric value: {}",
+            root
+        );
+        assert!(
+            root.get("active_members").is_some_and(Value::is_u64),
+            "status.source.logical_roots[].active_members missing numeric value: {}",
+            root
+        );
+        assert_status_coverage_mode(root.get("coverage_mode"), root);
+    }
+
+    let concrete_roots = source
+        .get("concrete_roots")
+        .and_then(Value::as_array)
+        .expect("status.source.concrete_roots must be an array");
+    assert!(
+        !concrete_roots.is_empty(),
+        "status.source.concrete_roots missing or empty: {}",
+        status.body
+    );
+    for root in concrete_roots {
+        for key in ["root_key", "logical_root_id", "object_ref"] {
+            assert!(
+                root.get(key).is_some_and(Value::is_string),
+                "status.source.concrete_roots[].{key} missing string value: {}",
+                root
+            );
+        }
+        let participation_state = root
+            .get("participation_state")
+            .and_then(Value::as_str)
+            .expect("status.source.concrete_roots[].participation_state");
+        assert!(
+            matches!(
+                participation_state,
+                "absent" | "joining" | "serving" | "degraded" | "retiring" | "retired"
+            ),
+            "status.source.concrete_roots[].participation_state out of domain: {}",
+            root
+        );
+        assert_status_coverage_mode(root.get("coverage_mode"), root);
+        for key in [
+            "watch_enabled",
+            "scan_enabled",
+            "is_group_primary",
+            "active",
+            "overflow_pending",
+            "rescan_pending",
+        ] {
+            assert!(
+                root.get(key).is_some_and(Value::is_boolean),
+                "status.source.concrete_roots[].{key} missing boolean value: {}",
+                root
+            );
+        }
+        for key in ["watch_lru_capacity", "audit_interval_ms", "overflow_count"] {
+            assert!(
+                root.get(key).is_some_and(Value::is_u64),
+                "status.source.concrete_roots[].{key} missing numeric value: {}",
+                root
+            );
+        }
+        for key in ["last_rescan_reason", "last_error"] {
+            assert!(
+                root.get(key)
+                    .is_some_and(|value| value.is_null() || value.is_string()),
+                "status.source.concrete_roots[].{key} must be null|string: {}",
+                root
+            );
+        }
+        for key in [
+            "last_audit_started_at_us",
+            "last_audit_completed_at_us",
+            "last_audit_duration_ms",
+        ] {
+            assert!(
+                root.get(key)
+                    .is_some_and(|value| value.is_null() || value.is_u64()),
+                "status.source.concrete_roots[].{key} must be null|u64: {}",
+                root
+            );
+        }
+    }
+
+    let sink = body
+        .get("sink")
+        .expect("status.sink must exist on management status");
+    for key in [
+        "live_nodes",
+        "tombstoned_count",
+        "attested_count",
+        "suspect_count",
+        "blind_spot_count",
+        "shadow_time_us",
+        "estimated_heap_bytes",
+    ] {
+        assert!(
+            sink.get(key).is_some_and(Value::is_u64),
+            "status.sink.{key} missing numeric value: {}",
+            status.body
+        );
+    }
+    let groups = sink
+        .get("groups")
+        .and_then(Value::as_array)
+        .expect("status.sink.groups must be an array");
+    assert!(
+        !groups.is_empty(),
+        "status.sink.groups missing or empty: {}",
+        status.body
+    );
+    for group in groups {
+        let service_state = group
+            .get("service_state")
+            .and_then(Value::as_str)
+            .expect("status.sink.groups[].service_state");
+        assert!(
+            matches!(
+                service_state,
+                "not-selected"
+                    | "selected-pending"
+                    | "serving-trusted"
+                    | "serving-degraded"
+                    | "retiring"
+                    | "retired"
+            ),
+            "status.sink.groups[].service_state out of domain: {}",
+            group
+        );
+        for key in ["group_id", "primary_object_ref"] {
+            assert!(
+                group.get(key).is_some_and(Value::is_string),
+                "status.sink.groups[].{key} missing string value: {}",
+                group
+            );
+        }
+        for key in [
+            "total_nodes",
+            "live_nodes",
+            "tombstoned_count",
+            "attested_count",
+            "suspect_count",
+            "blind_spot_count",
+            "shadow_time_us",
+            "shadow_lag_us",
+            "estimated_heap_bytes",
+        ] {
+            assert!(
+                group.get(key).is_some_and(Value::is_u64),
+                "status.sink.groups[].{key} missing numeric value: {}",
+                group
+            );
+        }
+        for key in [
+            "overflow_pending_materialization",
+            "initial_audit_completed",
+        ] {
+            assert!(
+                group.get(key).is_some_and(Value::is_boolean),
+                "status.sink.groups[].{key} missing boolean value: {}",
+                group
+            );
+        }
+        let readiness = group
+            .get("materialization_readiness")
+            .and_then(Value::as_str)
+            .expect("status.sink.groups[].materialization_readiness");
+        assert!(
+            matches!(
+                readiness,
+                "pending-materialization" | "waiting-for-materialized-root" | "ready"
+            ),
+            "status.sink.groups[].materialization_readiness out of domain: {}",
+            group
+        );
+        assert_eq!(
+            group
+                .get("initial_audit_completed")
+                .and_then(Value::as_bool),
+            Some(readiness == "ready"),
+            "status.sink.groups[].initial_audit_completed should track readiness: {}",
+            group
+        );
+    }
+
+    let facade = body
+        .get("facade")
+        .expect("status.facade must exist on management status");
+    let facade_state = facade
+        .get("state")
+        .and_then(Value::as_str)
+        .expect("status.facade.state");
+    assert!(
+        matches!(
+            facade_state,
+            "unavailable" | "pending" | "serving" | "degraded"
+        ),
+        "status.facade.state out of domain: {}",
+        status.body
+    );
+    if let Some(pending) = facade.get("pending") {
+        assert!(pending.is_object(), "status.facade.pending must be object");
+        assert!(
+            pending.get("route_key").is_some_and(Value::is_string),
+            "status.facade.pending.route_key missing string value: {}",
+            pending
+        );
+        assert!(
+            pending.get("generation").is_some_and(Value::is_u64),
+            "status.facade.pending.generation missing numeric value: {}",
+            pending
+        );
+        assert!(
+            pending
+                .get("resource_ids")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().all(Value::is_string)),
+            "status.facade.pending.resource_ids missing string array: {}",
+            pending
+        );
+        for key in ["runtime_managed", "runtime_exposure_confirmed"] {
+            assert!(
+                pending.get(key).is_some_and(Value::is_boolean),
+                "status.facade.pending.{key} missing boolean value: {}",
+                pending
+            );
+        }
+        let reason = pending
+            .get("reason")
+            .and_then(Value::as_str)
+            .expect("status.facade.pending.reason");
+        assert!(
+            matches!(
+                reason,
+                "awaiting_runtime_exposure"
+                    | "awaiting_observation_eligibility"
+                    | "retrying_after_error"
+            ),
+            "status.facade.pending.reason out of domain: {}",
+            pending
+        );
+        for key in ["retry_attempts", "pending_since_us"] {
+            assert!(
+                pending.get(key).is_some_and(Value::is_u64),
+                "status.facade.pending.{key} missing numeric value: {}",
+                pending
+            );
+        }
+        assert!(
+            pending
+                .get("last_error")
+                .is_none_or(|value| value.is_string()),
+            "status.facade.pending.last_error must be omitted|string: {}",
+            pending
+        );
+        for key in [
+            "last_attempt_at_us",
+            "last_error_at_us",
+            "retry_backoff_ms",
+            "next_retry_at_us",
+        ] {
+            assert!(
+                pending.get(key).is_none_or(Value::is_u64),
+                "status.facade.pending.{key} must be omitted|u64: {}",
+                pending
+            );
+        }
+    }
+}
+
+fn assert_status_coverage_mode(value: Option<&Value>, root: &Value) {
+    let coverage_mode = value
+        .and_then(Value::as_str)
+        .expect("status coverage_mode should be string");
+    assert!(
+        matches!(
+            coverage_mode,
+            "realtime_hotset_plus_audit"
+                | "realtime_hotset_only"
+                | "audit_only"
+                | "watch_requested_without_capacity"
+                | "inactive"
+        ),
+        "status coverage_mode out of domain: {}",
+        root
+    );
+}
+
 #[test]
 fn blackbox_management_api_contract() {
     let fixture = match FsMetaApiFixture::start() {
@@ -229,6 +569,7 @@ fn blackbox_management_api_contract() {
     )
     .expect("status");
     assert_eq!(status.status, 200, "body={}", status.body);
+    assert_status_monitoring_shape(&status);
     assert_eq!(
         status
             .json
