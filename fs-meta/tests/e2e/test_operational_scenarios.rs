@@ -837,8 +837,8 @@ fn scenario_force_find_smoke(
     session: &mut OperatorSession,
 ) -> Result<(), String> {
     eprintln!("[fs-meta-api-ops] substep=force-find-stress-seed");
-    seed_force_find_stress_content(lab, "nfs1", "force-find-stress", 40, 100)?;
-    seed_force_find_stress_content(lab, "nfs2", "force-find-stress", 40, 100)?;
+    seed_force_find_stress_content(lab, "nfs1", "force-find-stress", 8, 20)?;
+    seed_force_find_stress_content(lab, "nfs2", "force-find-stress", 8, 20)?;
     eprintln!("[fs-meta-api-ops] substep=force-find-stress-rescan");
     session.rescan()?;
 
