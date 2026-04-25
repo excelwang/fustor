@@ -122,6 +122,22 @@ impl FsMetaApiClient {
         self.post_json_raw("/query-api-keys", token, &json!({ "label": label }))
     }
 
+    pub fn list_query_api_keys(&self, token: &str) -> Result<Value, String> {
+        self.ensure_success(self.get_json_raw("/query-api-keys", token)?)
+    }
+
+    pub fn revoke_query_api_key(&self, token: &str, key_id: &str) -> Result<Value, String> {
+        self.ensure_success(self.revoke_query_api_key_raw(token, key_id)?)
+    }
+
+    pub fn revoke_query_api_key_raw(
+        &self,
+        token: &str,
+        key_id: &str,
+    ) -> Result<ApiResponse, String> {
+        self.delete_json_raw(&format!("/query-api-keys/{key_id}"), token)
+    }
+
     pub fn stats(&self, token: &str, query: &[(&str, String)]) -> Result<Value, String> {
         self.ensure_success(self.stats_raw(token, query)?)
     }
@@ -246,6 +262,17 @@ impl FsMetaApiClient {
                 .json(body)
                 .send()
                 .map_err(|e| format!("PUT {} failed: {e}", path))?,
+        )
+    }
+
+    pub fn delete_json_raw(&self, path: &str, token: &str) -> Result<ApiResponse, String> {
+        self.decode(
+            self.client
+                .delete(self.url(path))
+                .timeout(self.request_timeout(path))
+                .headers(self.auth_headers(token)?)
+                .send()
+                .map_err(|e| format!("DELETE {} failed: {e}", path))?,
         )
     }
 

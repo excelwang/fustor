@@ -13,6 +13,12 @@ mod test_release_upgrade;
 
 #[test]
 #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_http_api_matrix_mini_real_nfs() {
+    test_http_api_matrix::run_mini_real_nfs_smoke().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
 fn fs_meta_http_api_matrix_real_nfs() {
     test_http_api_matrix::run().unwrap();
 }

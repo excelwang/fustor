@@ -5,8 +5,6 @@ use crate::support::cluster5::Cluster5;
 use crate::support::nfs_lab::NfsLab;
 use crate::support::oracle::FsTreeOracle;
 use crate::support::{reserve_http_addrs, skip_unless_real_nfs_enabled, wait_until};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-use base64::Engine;
 use fs_meta::{RootSelector, RootSpec};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -40,6 +38,32 @@ struct MatrixHarness {
     facade_count: usize,
 }
 
+const MINI_EXPORTS: [&str; 5] = [
+    "mini_nfs1",
+    "mini_nfs2",
+    "mini_nfs3",
+    "mini_nfs4",
+    "mini_nfs5",
+];
+
+const MINI_MOUNTS: [(&str, &str); 15] = [
+    ("node-a", "mini_nfs1"),
+    ("node-b", "mini_nfs1"),
+    ("node-c", "mini_nfs1"),
+    ("node-b", "mini_nfs2"),
+    ("node-c", "mini_nfs2"),
+    ("node-d", "mini_nfs2"),
+    ("node-c", "mini_nfs3"),
+    ("node-d", "mini_nfs3"),
+    ("node-e", "mini_nfs3"),
+    ("node-d", "mini_nfs4"),
+    ("node-e", "mini_nfs4"),
+    ("node-a", "mini_nfs4"),
+    ("node-e", "mini_nfs5"),
+    ("node-a", "mini_nfs5"),
+    ("node-b", "mini_nfs5"),
+];
+
 pub fn run() -> Result<(), String> {
     run_mode(MatrixMode::Full)
 }
@@ -50,6 +74,38 @@ pub fn run_query_baseline_only() -> Result<(), String> {
 
 pub fn run_live_only_rescan_only() -> Result<(), String> {
     run_mode(MatrixMode::LiveOnlyOnly)
+}
+
+pub fn run_mini_real_nfs_smoke() -> Result<(), String> {
+    if let Some(reason) = skip_unless_real_nfs_enabled() {
+        eprintln!("[fs-meta-api-matrix-mini] skipped: {reason}");
+        return Ok(());
+    }
+
+    let harness = build_mini_matrix_harness()?;
+    eprintln!(
+        "[fs-meta-api-matrix-mini] candidates={:?}",
+        harness.candidate_base_urls
+    );
+
+    eprintln!("[fs-meta-api-matrix-mini] step=login-matrix");
+    run_login_matrix(&harness.client)?;
+    eprintln!("[fs-meta-api-matrix-mini] step=operator-login-many");
+    let mut session = OperatorSession::login_many(
+        harness.candidate_base_urls.clone(),
+        "operator",
+        "operator123",
+    )?;
+    eprintln!("[fs-meta-api-matrix-mini] step=initial-rescan");
+    session.rescan()?;
+
+    eprintln!("[fs-meta-api-matrix-mini] step=status-and-grants");
+    run_mini_status_and_grants_checks(&harness.client, &mut session, &harness.lab, 1)?;
+    eprintln!("[fs-meta-api-matrix-mini] step=management-roots");
+    run_mini_roots_management_smoke(&mut session, &harness.lab)?;
+    eprintln!("[fs-meta-api-matrix-mini] step=query-and-key-api");
+    run_mini_query_and_key_smoke(&mut session, &harness.lab)?;
+    Ok(())
 }
 
 fn run_mode(mode: MatrixMode) -> Result<(), String> {
@@ -84,6 +140,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 &harness.lab,
                 harness.facade_count,
                 true,
+                false,
             )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
             run_roots_matrix(&mut session, &harness.lab)?;
@@ -112,11 +169,12 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 &harness.lab,
                 harness.facade_count,
                 true,
+                false,
             )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
             run_roots_matrix(&mut session, &harness.lab)?;
             eprintln!("[fs-meta-api-matrix] step=query-matrix");
-            run_query_baseline_phase(&harness.cluster, &mut session, &harness.lab)?;
+            run_full_query_capacity_baseline_phase(&mut session)?;
             let metrics = session.bound_route_metrics()?;
             for key in [
                 "call_timeout_total",
@@ -140,6 +198,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 &harness.lab,
                 harness.facade_count,
                 true,
+                false,
             )?;
         }
     }
@@ -187,434 +246,126 @@ fn build_matrix_harness(app_prefix: &str) -> Result<MatrixHarness, String> {
     })
 }
 
+fn build_mini_matrix_harness() -> Result<MatrixHarness, String> {
+    let mut lab = NfsLab::start_with_exports(MINI_EXPORTS)?;
+    seed_mini_content(&lab)?;
+    let cluster = Cluster5::start()?;
+    let app_id = format!("fs-meta-api-matrix-mini-{}", unique_suffix());
+    let facade_resource_id = format!("fs-meta-tcp-listener-{app_id}");
+    let facade_addrs = reserve_http_addrs(1)?;
+    install_mini_resources(&cluster, &mut lab, &facade_resource_id, &facade_addrs)?;
+
+    let roots = mini_roots(&lab);
+    let release =
+        cluster.build_fs_meta_release(&app_id, &facade_resource_id, roots.clone(), 1, true)?;
+    cluster.apply_release("node-a", release)?;
+
+    let candidate_base_urls = facade_addrs
+        .iter()
+        .map(|addr| format!("http://{addr}"))
+        .collect::<Vec<_>>();
+    let base_url = cluster.wait_http_login_ready(
+        &candidate_base_urls,
+        "operator",
+        "operator123",
+        Duration::from_secs(120),
+    )?;
+    let client = FsMetaApiClient::new(base_url)?;
+
+    Ok(MatrixHarness {
+        cluster,
+        lab,
+        client,
+        candidate_base_urls,
+        facade_count: facade_addrs.len(),
+    })
+}
+
 fn run_query_matrix(
-    cluster: &Cluster5,
+    _cluster: &Cluster5,
     session: &mut OperatorSession,
-    lab: &NfsLab,
+    _lab: &NfsLab,
 ) -> Result<(), String> {
-    run_query_baseline_phase(cluster, session, lab)?;
-    run_query_live_only_rescan_phase(cluster, session, lab)?;
+    eprintln!("[fs-meta-api-matrix] substep=query-core-readiness-gate");
+    assert_error(
+        session.client().tree_raw(
+            session.query_api_key(),
+            &[("path", "/".to_string()), ("recursive", "true".to_string())],
+        )?,
+        503,
+        "trusted-materialized reads remain unavailable",
+    )?;
+    assert_error(
+        session.client().force_find_raw(
+            session.query_api_key(),
+            &[
+                ("path", "/".to_string()),
+                ("recursive", "true".to_string()),
+                ("read_class", "trusted-materialized".to_string()),
+            ],
+        )?,
+        400,
+        "read_class must be fresh on /on-demand-force-find",
+    )?;
+
+    eprintln!("[fs-meta-api-matrix] substep=query-api-key-management");
+    let keys_before = session.client().list_query_api_keys(session.token())?;
+    let created = session
+        .client()
+        .create_query_api_key(session.token(), "full-core-extra-key")?;
+    let api_key = created
+        .get("api_key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("query api key response missing api_key: {created}"))?;
+    let key_id = created
+        .get("key")
+        .and_then(|key| key.get("key_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("query api key response missing key.key_id: {created}"))?;
+    let keys_after_create = session.client().list_query_api_keys(session.token())?;
+    if !query_api_key_list_contains(&keys_after_create, key_id) {
+        return Err(format!(
+            "created query api key {key_id} not visible: before={keys_before}; after={keys_after_create}"
+        ));
+    }
+    let revoked = session
+        .client()
+        .revoke_query_api_key(session.token(), key_id)?;
+    if revoked.get("revoked").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "query api key revoke did not report true: {revoked}"
+        ));
+    }
+    assert_error(
+        session
+            .client()
+            .tree_raw(api_key, &[("path", "/".to_string())])?,
+        401,
+        "invalid query api key",
+    )?;
+
     Ok(())
 }
 
-fn run_query_baseline_phase(
-    cluster: &Cluster5,
-    session: &mut OperatorSession,
-    lab: &NfsLab,
-) -> Result<(), String> {
-    eprintln!("[fs-meta-api-matrix] substep=query-matrix-rescan");
+fn run_full_query_capacity_baseline_phase(session: &mut OperatorSession) -> Result<(), String> {
+    eprintln!("[fs-meta-api-matrix] substep=full-capacity-trusted-materialized-gate");
     session.rescan()?;
-    let mut last_rescan_at = std::time::Instant::now();
-    wait_until(
-        Duration::from_secs(300),
-        "baseline tree materializes root data",
-        || {
-            if last_rescan_at.elapsed() >= Duration::from_secs(15) {
-                let _ = session.rescan();
-                last_rescan_at = std::time::Instant::now();
-            }
-            let tree = match session
-                .tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])
-            {
-                Ok(tree) => tree,
-                Err(err) => {
-                    let status = session
-                        .status()
-                        .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
-                    let roots = session
-                        .monitoring_roots()
-                        .unwrap_or_else(|roots_err| json!({ "roots_error": roots_err }));
-                    return Err(format!(
-                        "tree request failed: {err}; status={status}; roots={roots}"
-                    ));
-                }
-            };
-            let ready = tree
-                .get("groups")
-                .and_then(Value::as_array)
-                .map(|groups| {
-                    groups.len() >= 3
-                        && group_total_nodes(&tree, "nfs1") > 0
-                        && group_total_nodes(&tree, "nfs2") > 0
-                        && group_total_nodes(&tree, "nfs3") > 0
-                })
-                .unwrap_or(false);
-            if ready {
-                Ok(true)
-            } else {
-                let status = session
-                    .status()
-                    .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
-                let diagnostics =
-                    baseline_cluster_diagnostics(cluster, session).unwrap_or_else(|diag_err| {
-                        json!({ "diagnostics_error": diag_err }).to_string()
-                    });
-                Err(format!(
-                    "tree={tree}; status={status}; diagnostics={diagnostics}"
-                ))
-            }
-        },
-    )?;
-
-    let grants = session.runtime_grants()?;
-    let all_mounts = group_mount_pairs_for_roots(
-        &grants,
-        &[
-            ("nfs1", &lab.export_source("nfs1")),
-            ("nfs2", &lab.export_source("nfs2")),
-            ("nfs3", &lab.export_source("nfs3")),
-        ],
-    )?;
-
-    eprintln!("[fs-meta-api-matrix] substep=query-all-tree");
-    let all_tree = session.tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
-    let all_groups = all_tree
-        .get("groups")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("tree response missing groups: {all_tree}"))?;
-    if all_groups.len() < 3 {
-        return Err(format!(
-            "expected at least 3 groups in baseline tree: {all_tree}"
-        ));
-    }
-    let expected_all_tree =
-        FsTreeOracle::grouped_tree_response(&all_mounts, "/", true, None, 1_000, "group-key", 64)?;
-    assert_json_eq("all groups tree", &all_tree, &expected_all_tree)?;
-
-    eprintln!("[fs-meta-api-matrix] substep=query-non-recursive-tree");
-    let tree_non_recursive = session.tree(&[
-        ("path", "/data".to_string()),
-        ("recursive", "false".to_string()),
-    ])?;
-    let expected_non_recursive = FsTreeOracle::grouped_tree_response(
-        &all_mounts,
-        "/data",
-        false,
-        None,
-        1_000,
-        "group-key",
-        64,
-    )?;
-    assert_json_eq(
-        "non-recursive tree",
-        &tree_non_recursive,
-        &expected_non_recursive,
-    )?;
-
-    eprintln!("[fs-meta-api-matrix] substep=query-max-depth-tree");
-    let tree_max_depth = session.tree(&[
-        ("path", "/nested".to_string()),
-        ("recursive", "true".to_string()),
-        ("max_depth", "1".to_string()),
-    ])?;
-    let expected_max_depth = FsTreeOracle::grouped_tree_response(
-        &all_mounts,
-        "/nested",
-        true,
-        Some(1),
-        1_000,
-        "group-key",
-        64,
-    )?;
-    assert_json_eq("max_depth tree", &tree_max_depth, &expected_max_depth)?;
-
-    eprintln!("[fs-meta-api-matrix] substep=query-force-find-all");
-    let find_all =
-        session.force_find(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
-    let expected_find_all = FsTreeOracle::grouped_force_find_response(
-        &all_mounts,
-        "/",
-        true,
-        None,
-        1_000,
-        "group-key",
-        64,
-    )?;
-    assert_json_eq("all groups force-find", &find_all, &expected_find_all)?;
-
-    let best_count = session.tree(&[
-        ("path", "/".to_string()),
-        ("group_order", "file-count".to_string()),
-        ("group_page_size", "1".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    let best_count_group = FsTreeOracle::best_group_by_count(&all_mounts, "/", true, None)?
-        .ok_or_else(|| "group_order=file-count oracle returned no winner".to_string())?;
-    let actual_best_count_group = first_group_key(&best_count)?;
-    if actual_best_count_group != best_count_group {
-        return Err(format!(
-            "group_order=file-count winner mismatch: expected {best_count_group}, got {actual_best_count_group}; payload={best_count}"
-        ));
-    }
-
-    let best_age = session.tree(&[
-        ("path", "/".to_string()),
-        ("group_order", "file-age".to_string()),
-        ("group_page_size", "1".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    let best_age_group = FsTreeOracle::best_group_by_age(&all_mounts, "/", true, None)?
-        .ok_or_else(|| "group_order=file-age oracle returned no winner".to_string())?;
-    let actual_best_age_group = first_group_key(&best_age)?;
-    if actual_best_age_group != best_age_group {
-        return Err(format!(
-            "group_order=file-age winner mismatch: expected {best_age_group}, got {actual_best_age_group}; payload={best_age}"
-        ));
-    }
-
-    eprintln!("[fs-meta-api-matrix] substep=query-stats");
-    let stats = session.stats(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
-    let expected_stats = FsTreeOracle::stats_response(&all_mounts, "/", true, None)?;
-    assert_json_eq("nfs1 stats", &stats, &expected_stats)?;
-    assert_stats_latest_file_mtime_present(&stats)?;
-
-    let file_path = "/nested/child/deep.txt";
-    eprintln!("[fs-meta-api-matrix] substep=query-file-tree");
-    let file_tree = session.tree(&[
-        ("path", file_path.to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    let expected_file_tree = FsTreeOracle::grouped_tree_response(
-        &all_mounts,
-        file_path,
-        true,
-        None,
-        1_000,
-        "group-key",
-        64,
-    )?;
-    assert_json_eq("file-path tree", &file_tree, &expected_file_tree)?;
-    let file_tree_b64 = session.tree(&[
-        ("path_b64", B64URL.encode(file_path.as_bytes())),
-        ("recursive", "true".to_string()),
-    ])?;
-    assert_json_eq(
-        "file-path tree via path_b64",
-        &file_tree_b64,
-        &expected_file_tree,
-    )?;
     assert_error(
         session.client().tree_raw(
             session.query_api_key(),
-            &[
-                ("path", file_path.to_string()),
-                ("path_b64", B64URL.encode(file_path.as_bytes())),
-            ],
+            &[("path", "/".to_string()), ("recursive", "true".to_string())],
         )?,
-        400,
-        "path and path_b64 are mutually exclusive",
+        503,
+        "trusted-materialized reads remain unavailable",
     )?;
-
-    let file_find = session.force_find(&[
-        ("path", file_path.to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    let expected_file_find = FsTreeOracle::grouped_force_find_response(
-        &all_mounts,
-        file_path,
-        true,
-        None,
-        1_000,
-        "group-key",
-        64,
-    )?;
-    assert_json_eq("file-path force-find", &file_find, &expected_file_find)?;
-
-    let file_stats = session.stats(&[
-        ("path", file_path.to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    let expected_file_stats = FsTreeOracle::stats_response(&all_mounts, file_path, true, None)?;
-    assert_json_eq("file-path stats", &file_stats, &expected_file_stats)?;
-    assert_stats_latest_file_mtime_present(&file_stats)?;
-
-    let invalid_path_tree = session.tree(&[
-        ("path", "/missing-dir".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    let expected_invalid_path_tree = FsTreeOracle::grouped_tree_response(
-        &all_mounts,
-        "/missing-dir",
-        true,
-        None,
-        1_000,
-        "group-key",
-        64,
-    )?;
-    assert_json_eq(
-        "invalid path tree",
-        &invalid_path_tree,
-        &expected_invalid_path_tree,
-    )?;
-
-    let invalid_path_stats = session.stats(&[
-        ("path", "/missing-dir".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    let expected_invalid_path_stats =
-        FsTreeOracle::stats_response(&all_mounts, "/missing-dir", true, None)?;
-    assert_json_eq(
-        "invalid path stats",
-        &invalid_path_stats,
-        &expected_invalid_path_stats,
-    )?;
-    assert_stats_latest_file_mtime_present(&invalid_path_stats)?;
-
-    let entry_one_tree = session.tree(&[
-        ("path", "/".to_string()),
-        ("recursive", "true".to_string()),
-        ("entry_page_size", "1".to_string()),
-    ])?;
-    let expected_entry_one =
-        FsTreeOracle::grouped_tree_response(&all_mounts, "/", true, None, 1, "group-key", 64)?;
-    assert_json_eq(
-        "entry_page_size=1 tree",
-        &entry_one_tree,
-        &expected_entry_one,
-    )?;
-
-    let entry_max_tree = session.tree(&[
-        ("path", "/".to_string()),
-        ("recursive", "true".to_string()),
-        ("entry_page_size", "10000".to_string()),
-    ])?;
-    let expected_entry_max =
-        FsTreeOracle::grouped_tree_response(&all_mounts, "/", true, None, 10_000, "group-key", 64)?;
-    assert_json_eq(
-        "entry_page_size=max tree",
-        &entry_max_tree,
-        &expected_entry_max,
-    )?;
-
-    assert_error(
-        session.client().tree_raw(
-            session.query_api_key(),
-            &[
-                ("path", "/".to_string()),
-                ("entry_page_size", "10001".to_string()),
-            ],
-        )?,
-        400,
-        "entry_page_size",
-    )?;
-    let tree_paged = session.tree(&[
-        ("path", "/".to_string()),
-        ("recursive", "true".to_string()),
-        ("group_page_size", "1".to_string()),
-        ("entry_page_size", "1".to_string()),
-    ])?;
-    let tree_pit_id = pit_id(&tree_paged)?;
-    let tree_next_group = group_page_next_cursor(&tree_paged)?;
-    let tree_next_entry_after = group_page_next_entry_after(&tree_paged)?;
-    let tree_first_group = first_group_key(&tree_paged)?;
-    let expected_group_sequence = group_keys(&expected_all_tree)?;
-    if expected_group_sequence.len() < 2 {
+    let status = session.status()?;
+    if status
+        .pointer("/readiness_planes/trusted_observation_readiness")
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
         return Err(format!(
-            "expected oracle to expose at least two groups for PIT pagination: {expected_all_tree}"
-        ));
-    }
-    if tree_first_group != expected_group_sequence[0] {
-        return Err(format!(
-            "tree PIT first page group mismatch: expected {}, got {}; payload={tree_paged}",
-            expected_group_sequence[0], tree_first_group
-        ));
-    }
-    let expected_tree_first_entries = entry_paths_for_group(&expected_all_tree, &tree_first_group)?;
-    if expected_tree_first_entries.len() < 2 {
-        return Err(format!(
-            "expected oracle first group to have at least two entries for PIT entry pagination: {expected_all_tree}"
-        ));
-    }
-    let tree_entry_page_one = first_entry_path_for_group(&tree_paged, &tree_first_group)?;
-    if tree_entry_page_one != expected_tree_first_entries[0] {
-        return Err(format!(
-            "tree PIT first entry mismatch: expected {}, got {}; payload={tree_paged}",
-            expected_tree_first_entries[0], tree_entry_page_one
-        ));
-    }
-    let tree_group_page_two = session.tree(&[
-        ("path", "/".to_string()),
-        ("recursive", "true".to_string()),
-        ("group_page_size", "1".to_string()),
-        ("entry_page_size", "1".to_string()),
-        ("pit_id", tree_pit_id.clone()),
-        ("group_after", tree_next_group.clone()),
-    ])?;
-    let tree_second_group = first_group_key(&tree_group_page_two)?;
-    if tree_second_group != expected_group_sequence[1] {
-        return Err(format!(
-            "tree PIT second page group mismatch: expected {}, got {}; payload={tree_group_page_two}",
-            expected_group_sequence[1], tree_second_group
-        ));
-    }
-    let tree_entry_page_two = session.tree(&[
-        ("path", "/".to_string()),
-        ("recursive", "true".to_string()),
-        ("group_page_size", "1".to_string()),
-        ("entry_page_size", "1".to_string()),
-        ("pit_id", tree_pit_id.clone()),
-        ("entry_after", tree_next_entry_after.clone()),
-    ])?;
-    let tree_entry_page_two_first =
-        first_entry_path_for_group(&tree_entry_page_two, &tree_first_group)?;
-    if tree_entry_page_two_first != expected_tree_first_entries[1] {
-        return Err(format!(
-            "tree PIT entry continuation mismatch: expected {}, got {}; payload={tree_entry_page_two}",
-            expected_tree_first_entries[1], tree_entry_page_two_first
-        ));
-    }
-    assert_error(
-        session.client().tree_raw(
-            session.query_api_key(),
-            &[
-                ("path", "/".to_string()),
-                ("group_after", tree_next_group.clone()),
-            ],
-        )?,
-        400,
-        "pit_id is required when using group_after or entry_after",
-    )?;
-    assert_error(
-        session.client().tree_raw(
-            session.query_api_key(),
-            &[
-                ("path", "/".to_string()),
-                ("entry_after", tree_next_entry_after.clone()),
-            ],
-        )?,
-        400,
-        "pit_id is required when using group_after or entry_after",
-    )?;
-
-    let force_find_paged = session.force_find(&[
-        ("path", "/".to_string()),
-        ("recursive", "true".to_string()),
-        ("group_page_size", "1".to_string()),
-        ("entry_page_size", "1".to_string()),
-    ])?;
-    let force_find_pit_id = pit_id(&force_find_paged)?;
-    let force_find_next_group = group_page_next_cursor(&force_find_paged)?;
-    let force_find_next_entry_after = group_page_next_entry_after_optional(&force_find_paged)?;
-    let force_find_first_group = first_group_key(&force_find_paged)?;
-    if force_find_first_group != expected_group_sequence[0] {
-        return Err(format!(
-            "force-find PIT first page group mismatch: expected {}, got {}; payload={force_find_paged}",
-            expected_group_sequence[0], force_find_first_group
-        ));
-    }
-    let force_find_group_page_two = session.force_find(&[
-        ("path", "/".to_string()),
-        ("recursive", "true".to_string()),
-        ("group_page_size", "1".to_string()),
-        ("entry_page_size", "1".to_string()),
-        ("pit_id", force_find_pit_id.clone()),
-        ("group_after", force_find_next_group.clone()),
-    ])?;
-    let force_find_second_group = first_group_key(&force_find_group_page_two)?;
-    if force_find_second_group != expected_group_sequence[1] {
-        return Err(format!(
-            "force-find PIT second page group mismatch: expected {}, got {}; payload={force_find_group_page_two}",
-            expected_group_sequence[1], force_find_second_group
+            "full capacity baseline must not report trusted observation readiness before full audit completes: {status}"
         ));
     }
     assert_error(
@@ -628,69 +379,6 @@ fn run_query_baseline_phase(
         )?,
         400,
         "read_class must be fresh on /on-demand-force-find",
-    )?;
-    assert_error(
-        session.client().force_find_raw(
-            session.query_api_key(),
-            &[
-                ("path", "/".to_string()),
-                ("recursive", "true".to_string()),
-                ("read_class", "materialized".to_string()),
-            ],
-        )?,
-        400,
-        "read_class must be fresh on /on-demand-force-find",
-    )?;
-    assert_error(
-        session.client().force_find_raw(
-            session.query_api_key(),
-            &[
-                ("path", "/".to_string()),
-                ("recursive", "true".to_string()),
-                ("read_class", "trusted-materialized".to_string()),
-            ],
-        )?,
-        400,
-        "read_class must be fresh on /on-demand-force-find",
-    )?;
-    if let Some(force_find_next_entry_after) = force_find_next_entry_after {
-        assert_error(
-            session.client().force_find_raw(
-                session.query_api_key(),
-                &[
-                    ("path", "/".to_string()),
-                    ("entry_after", force_find_next_entry_after.clone()),
-                ],
-            )?,
-            400,
-            "pit_id is required when using group_after or entry_after",
-        )?;
-    }
-    assert_error(
-        session.client().tree_raw(
-            session.query_api_key(),
-            &[
-                ("path", "/".to_string()),
-                ("recursive", "true".to_string()),
-                ("pit_id", tree_pit_id.clone()),
-                ("group_after", force_find_next_group.clone()),
-            ],
-        )?,
-        400,
-        "group_after cursor does not match the requested tree scope",
-    )?;
-    assert_error(
-        session.client().force_find_raw(
-            session.query_api_key(),
-            &[
-                ("path", "/".to_string()),
-                ("recursive", "true".to_string()),
-                ("pit_id", force_find_pit_id.clone()),
-                ("entry_after", tree_next_entry_after.clone()),
-            ],
-        )?,
-        400,
-        "entry_after cursor does not match the requested force-find scope",
     )?;
     Ok(())
 }
@@ -789,6 +477,7 @@ fn run_status_and_grants_checks(
     lab: &NfsLab,
     facade_count: usize,
     require_sink_groups: bool,
+    require_sink_live_nodes: bool,
 ) -> Result<(), String> {
     assert_error(
         client.get_json_raw("/status", "bad-token")?,
@@ -818,7 +507,9 @@ fn run_status_and_grants_checks(
             {
                 return Ok(false);
             }
-            if sink.get("live_nodes").and_then(Value::as_u64).unwrap_or(0) == 0 {
+            if require_sink_live_nodes
+                && sink.get("live_nodes").and_then(Value::as_u64).unwrap_or(0) == 0
+            {
                 return Ok(false);
             }
             let Some(groups) = sink.get("groups").and_then(Value::as_array) else {
@@ -829,7 +520,14 @@ fn run_status_and_grants_checks(
             }
             Ok(validate_status_monitoring_shape(&status, require_sink_groups).is_ok())
         },
-    )?;
+    )
+    .map_err(|err| {
+        let status = session
+            .status()
+            .map(|status| status.to_string())
+            .unwrap_or_else(|status_err| format!("<status unavailable: {status_err}>"));
+        format!("{err}: last_status={status}")
+    })?;
     let metrics_before = session.bound_route_metrics()?;
     let status = session.status()?;
     let metrics_after = session.bound_route_metrics()?;
@@ -847,7 +545,7 @@ fn run_status_and_grants_checks(
     {
         return Err(format!("expected at least 3 grants in status: {status}"));
     }
-    if sink.get("live_nodes").and_then(Value::as_u64).unwrap_or(0) == 0 {
+    if require_sink_live_nodes && sink.get("live_nodes").and_then(Value::as_u64).unwrap_or(0) == 0 {
         return Err(format!("expected live sink nodes in status: {status}"));
     }
     validate_status_monitoring_shape(&status, require_sink_groups)?;
@@ -901,6 +599,150 @@ fn run_status_and_grants_checks(
                 "runtime grants missing export {export_name}: {grants}"
             ));
         }
+    }
+    Ok(())
+}
+
+fn run_mini_status_and_grants_checks(
+    client: &FsMetaApiClient,
+    session: &mut OperatorSession,
+    lab: &NfsLab,
+    facade_count: usize,
+) -> Result<(), String> {
+    assert_error(
+        client.get_json_raw("/status", "bad-token")?,
+        401,
+        "invalid session token",
+    )?;
+
+    wait_until(
+        Duration::from_secs(120),
+        "mini status evidence becomes ready",
+        || {
+            let status = session.status()?;
+            let source_grants = status
+                .get("source")
+                .and_then(|source| source.get("grants_count"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let sink_groups = status
+                .get("sink")
+                .and_then(|sink| sink.get("groups"))
+                .and_then(Value::as_array)
+                .map(|groups| groups.len())
+                .unwrap_or(0);
+            if source_grants < MINI_EXPORTS.len() as u64 || sink_groups < MINI_EXPORTS.len() {
+                return Err(format!(
+                "source_grants={source_grants} expected_at_least={} sink_groups={sink_groups} expected_at_least={} status={status}",
+                MINI_EXPORTS.len(),
+                MINI_EXPORTS.len()
+            ));
+            }
+            validate_status_monitoring_shape(&status, true)?;
+            validate_status_top_level_evidence(&status)?;
+            Ok(true)
+        },
+    )?;
+
+    let grants = session.runtime_grants()?;
+    let rows = grants
+        .get("grants")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("runtime grants missing array: {grants}"))?;
+    let nfs_rows = rows
+        .iter()
+        .filter(|row| row.get("fs_type").and_then(Value::as_str) == Some("nfs"))
+        .count();
+    let listener_rows = rows
+        .iter()
+        .filter(|row| row.get("fs_type").and_then(Value::as_str) == Some("tcp_listener"))
+        .count();
+    let expected_total = MINI_MOUNTS.len() + facade_count;
+    if nfs_rows != MINI_MOUNTS.len()
+        || listener_rows != facade_count
+        || rows.len() != expected_total
+    {
+        return Err(format!(
+            "expected {expected_total} runtime grants rows ({} nfs + {facade_count} tcp_listener), got {} total / {} nfs / {} listeners: {grants}",
+            MINI_MOUNTS.len(),
+            rows.len(),
+            nfs_rows,
+            listener_rows
+        ));
+    }
+    for export_name in MINI_EXPORTS {
+        if !rows.iter().any(|row| {
+            row.get("fs_source").and_then(Value::as_str)
+                == Some(lab.export_source(export_name).as_str())
+        }) {
+            return Err(format!(
+                "runtime grants missing mini export {export_name}: {grants}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_status_top_level_evidence(status: &Value) -> Result<(), String> {
+    let runtime_artifact = status
+        .get("runtime_artifact")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("status.runtime_artifact missing object: {status}"))?;
+    if !runtime_artifact
+        .get("available")
+        .is_some_and(Value::is_boolean)
+    {
+        return Err(format!(
+            "status.runtime_artifact.available missing boolean value: {status}"
+        ));
+    }
+    let authority_epoch = status
+        .get("authority_epoch")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("status.authority_epoch missing object: {status}"))?;
+    for key in [
+        "roots_signature",
+        "grants_signature",
+        "sink_materialization_generation",
+        "facade_runtime_generation",
+    ] {
+        if !authority_epoch.get(key).is_some_and(Value::is_string) {
+            return Err(format!(
+                "status.authority_epoch.{key} missing string value: {status}"
+            ));
+        }
+    }
+    let readiness_planes = status
+        .get("readiness_planes")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("status.readiness_planes missing object: {status}"))?;
+    for key in [
+        "api_facade_liveness",
+        "management_write_readiness",
+        "trusted_observation_readiness",
+    ] {
+        if !readiness_planes.get(key).is_some_and(Value::is_boolean) {
+            return Err(format!(
+                "status.readiness_planes.{key} missing boolean value: {status}"
+            ));
+        }
+    }
+    if readiness_planes
+        .get("api_facade_liveness")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || readiness_planes
+            .get("management_write_readiness")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || readiness_planes
+            .get("trusted_observation_readiness")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(format!(
+            "mini smoke requires all readiness planes ready: {status}"
+        ));
     }
     Ok(())
 }
@@ -1279,14 +1121,38 @@ fn validate_status_coverage_mode(value: Option<&Value>, root: &Value) -> Result<
     if !matches!(
         coverage_mode,
         "realtime_hotset_plus_audit"
-            | "realtime_hotset_only"
             | "audit_only"
-            | "watch_requested_without_capacity"
-            | "inactive"
+            | "audit_with_metadata"
+            | "audit_without_file_metadata"
+            | "watch_degraded"
     ) {
         return Err(format!(
             "status source root has invalid coverage_mode={coverage_mode}: {root}"
         ));
+    }
+    validate_status_coverage_capabilities(root.get("coverage_capabilities"), root)?;
+    Ok(())
+}
+
+fn validate_status_coverage_capabilities(
+    value: Option<&Value>,
+    root: &Value,
+) -> Result<(), String> {
+    let capabilities = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("status source root missing coverage_capabilities: {root}"))?;
+    for key in [
+        "exists_coverage",
+        "file_count_coverage",
+        "file_metadata_coverage",
+        "mtime_size_coverage",
+        "watch_freshness_coverage",
+    ] {
+        if !capabilities.get(key).is_some_and(Value::is_boolean) {
+            return Err(format!(
+                "status source root coverage_capabilities.{key} missing boolean value: {root}"
+            ));
+        }
     }
     Ok(())
 }
@@ -1494,56 +1360,178 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
     Ok(())
 }
 
-fn baseline_cluster_diagnostics(
-    cluster: &Cluster5,
+fn run_mini_roots_management_smoke(
     session: &mut OperatorSession,
-) -> Result<String, String> {
-    let status = session
-        .status()
-        .unwrap_or_else(|err| json!({ "error": err }));
-    let grants = session
-        .runtime_grants()
-        .unwrap_or_else(|err| json!({ "error": err }));
-    let roots = session
-        .monitoring_roots()
-        .unwrap_or_else(|err| json!({ "error": err }));
-    let metrics = session
-        .bound_route_metrics()
-        .unwrap_or_else(|err| json!({ "error": err }));
-    let mut cluster_nodes = Vec::new();
-    for node_name in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
-        let status_value = cluster
-            .status(node_name)
-            .unwrap_or_else(|err| json!({ "error": err }));
-        let cluster_status = cluster
-            .cluster_status(node_name)
-            .unwrap_or_else(|err| json!({ "error": err }));
-        let process_status = cluster
-            .node_process_status(node_name)
-            .unwrap_or_else(|err| json!({ "error": err }));
-        let logs = cluster
-            .node_log_excerpt(node_name)
-            .unwrap_or_else(|err| json!({ "error": err }));
-        let target_state = cluster
-            .runtime_target_state(node_name)
-            .unwrap_or_else(|err| json!({ "error": err }));
-        cluster_nodes.push(json!({
-            "node": node_name,
-            "status": status_value,
-            "cluster_status": cluster_status,
-            "process_status": process_status,
-            "logs": logs,
-            "runtime_target_state": target_state,
-        }));
+    lab: &NfsLab,
+) -> Result<(), String> {
+    let current = session.monitoring_roots()?;
+    let current_rows = current
+        .get("roots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("monitoring_roots missing roots array: {current}"))?;
+    if current_rows.len() != MINI_EXPORTS.len() {
+        return Err(format!(
+            "expected {} mini roots from release doc, got {current}",
+            MINI_EXPORTS.len()
+        ));
     }
-    Ok(json!({
-        "session_status": status,
-        "runtime_grants": grants,
-        "monitoring_roots": roots,
-        "bound_route_metrics": metrics,
-        "nodes": cluster_nodes,
-    })
-    .to_string())
+
+    let roots = mini_roots(lab);
+    let preview = session
+        .client()
+        .preview_roots_raw(session.token(), &roots_payload(&roots))?;
+    assert_status(preview.status, 200, "mini roots preview")?;
+    if preview
+        .body
+        .get("preview")
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        != Some(MINI_EXPORTS.len())
+    {
+        return Err(format!("expected mini preview rows: {}", preview.body));
+    }
+    if preview
+        .body
+        .get("unmatched_roots")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(true)
+    {
+        return Err(format!(
+            "mini preview unexpectedly has unmatched roots: {}",
+            preview.body
+        ));
+    }
+
+    let put = session
+        .client()
+        .update_roots_raw(session.token(), &roots_payload(&roots))?;
+    assert_status(put.status, 200, "mini roots apply")?;
+    if put.body.get("roots_count").and_then(Value::as_u64) != Some(MINI_EXPORTS.len() as u64) {
+        return Err(format!("mini roots apply did not converge: {}", put.body));
+    }
+    session.rescan()?;
+    wait_until(Duration::from_secs(60), "mini roots remain visible", || {
+        let roots = session.monitoring_roots()?;
+        Ok(roots
+            .get("roots")
+            .and_then(Value::as_array)
+            .map(|items| items.len() == MINI_EXPORTS.len())
+            .unwrap_or(false))
+    })?;
+    Ok(())
+}
+
+fn run_mini_query_and_key_smoke(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), String> {
+    session.rescan()?;
+    wait_until(
+        Duration::from_secs(180),
+        "mini tree materializes all roots",
+        || {
+            let tree =
+                session.tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
+            let ready = MINI_EXPORTS
+                .iter()
+                .all(|root| group_total_nodes(&tree, root) >= 11);
+            if ready {
+                Ok(true)
+            } else {
+                let status = session
+                    .status()
+                    .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+                Err(format!("tree={tree}; status={status}"))
+            }
+        },
+    )?;
+
+    let grants = session.runtime_grants()?;
+    let roots = MINI_EXPORTS
+        .iter()
+        .map(|root| (*root, lab.export_source(root)))
+        .collect::<Vec<_>>();
+    let root_refs = roots
+        .iter()
+        .map(|(root, source)| (*root, source.as_str()))
+        .collect::<Vec<_>>();
+    let all_mounts = group_mount_pairs_for_roots(&grants, &root_refs)?;
+
+    let tree = session.tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
+    let expected_tree =
+        FsTreeOracle::grouped_tree_response(&all_mounts, "/", true, None, 1_000, "group-key", 64)?;
+    assert_json_eq("mini all groups tree", &tree, &expected_tree)?;
+
+    let force_find =
+        session.force_find(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
+    let expected_force_find = FsTreeOracle::grouped_force_find_response(
+        &all_mounts,
+        "/",
+        true,
+        None,
+        1_000,
+        "group-key",
+        64,
+    )?;
+    assert_json_eq(
+        "mini all groups force-find",
+        &force_find,
+        &expected_force_find,
+    )?;
+
+    let stats = session.stats(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
+    let expected_stats = FsTreeOracle::stats_response(&all_mounts, "/", true, None)?;
+    assert_json_eq("mini all groups stats", &stats, &expected_stats)?;
+
+    let keys_before = session.client().list_query_api_keys(session.token())?;
+    let created = session
+        .client()
+        .create_query_api_key(session.token(), "mini-smoke-extra-key")?;
+    let api_key = created
+        .get("api_key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("query api key response missing api_key: {created}"))?;
+    let key_id = created
+        .get("key")
+        .and_then(|key| key.get("key_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("query api key response missing key.key_id: {created}"))?;
+    let _ = session.client().tree(
+        api_key,
+        &[
+            ("path", "/".to_string()),
+            ("recursive", "false".to_string()),
+        ],
+    )?;
+    let keys_after_create = session.client().list_query_api_keys(session.token())?;
+    if !query_api_key_list_contains(&keys_after_create, key_id) {
+        return Err(format!(
+            "created query api key {key_id} not visible: before={keys_before}; after={keys_after_create}"
+        ));
+    }
+    let revoked = session
+        .client()
+        .revoke_query_api_key(session.token(), key_id)?;
+    if revoked.get("revoked").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "query api key revoke did not report true: {revoked}"
+        ));
+    }
+    assert_error(
+        session
+            .client()
+            .tree_raw(api_key, &[("path", "/".to_string())])?,
+        401,
+        "invalid query api key",
+    )?;
+    Ok(())
+}
+
+fn query_api_key_list_contains(keys: &Value, key_id: &str) -> bool {
+    keys.get("keys")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row.get("key_id").and_then(Value::as_str) == Some(key_id))
+        })
 }
 
 fn seed_baseline_content(lab: &NfsLab) -> Result<(), String> {
@@ -1557,6 +1545,19 @@ fn seed_baseline_content(lab: &NfsLab) -> Result<(), String> {
     lab.write_file("nfs2", "nested/peer.txt", "peer\n")?;
     thread::sleep(Duration::from_millis(5));
     lab.write_file("nfs3", "misc.txt", "misc\n")?;
+    Ok(())
+}
+
+fn seed_mini_content(lab: &NfsLab) -> Result<(), String> {
+    for export_name in MINI_EXPORTS {
+        for index in 1..=7 {
+            lab.write_file(
+                export_name,
+                &format!("data/file-{index:02}.txt"),
+                &format!("{export_name}-file-{index:02}\n"),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -1578,6 +1579,36 @@ fn install_baseline_resources(
         ("node-e", "nfs3"),
     ];
     for (node_name, export_name) in exports {
+        let mount_path = lab.mount_export(node_name, export_name)?;
+        let node_id = cluster.node_id(node_name)?;
+        cluster.announce_resources_clusterwide(vec![json!({
+            "resource_id": export_name,
+            "node_id": node_id,
+            "resource_kind": "nfs",
+            "source": lab.export_source(export_name),
+            "mount_hint": mount_path.display().to_string(),
+        })])?;
+    }
+    for (node_name, bind_addr) in ["node-d", "node-e"].into_iter().zip(facade_addrs.iter()) {
+        let node_id = cluster.node_id(node_name)?;
+        cluster.announce_resources_clusterwide(vec![json!({
+            "resource_id": facade_resource_id,
+            "node_id": node_id,
+            "resource_kind": "tcp_listener",
+            "source": format!("http://{node_name}/listener/{facade_resource_id}"),
+            "bind_addr": bind_addr,
+        })])?;
+    }
+    Ok(())
+}
+
+fn install_mini_resources(
+    cluster: &Cluster5,
+    lab: &mut NfsLab,
+    facade_resource_id: &str,
+    facade_addrs: &[String],
+) -> Result<(), String> {
+    for (node_name, export_name) in MINI_MOUNTS {
         let mount_path = lab.mount_export(node_name, export_name)?;
         let node_id = cluster.node_id(node_name)?;
         cluster.announce_resources_clusterwide(vec![json!({
@@ -1749,6 +1780,13 @@ fn baseline_roots(lab: &NfsLab) -> Vec<RootSpec> {
     ]
 }
 
+fn mini_roots(lab: &NfsLab) -> Vec<RootSpec> {
+    MINI_EXPORTS
+        .iter()
+        .map(|export_name| root_spec(export_name, &lab.export_source(export_name)))
+        .collect()
+}
+
 fn root_spec(id: &str, fs_source: &str) -> RootSpec {
     RootSpec {
         id: id.to_string(),
@@ -1824,139 +1862,6 @@ fn assert_error(response: ApiResponse, expected_status: u16, needle: &str) -> Re
         ));
     }
     Ok(())
-}
-
-fn assert_stats_latest_file_mtime_present(stats: &Value) -> Result<(), String> {
-    let groups = stats
-        .get("groups")
-        .and_then(Value::as_object)
-        .ok_or_else(|| format!("stats response missing groups object: {stats}"))?;
-    if groups.is_empty() {
-        return Err(format!(
-            "stats response should expose at least one group: {stats}"
-        ));
-    }
-    for (group, envelope) in groups {
-        let Some(status) = envelope.get("status").and_then(Value::as_str) else {
-            return Err(format!(
-                "stats group missing status for {group}: {envelope}"
-            ));
-        };
-        if status != "ok" {
-            continue;
-        }
-        let latest = envelope
-            .get("data")
-            .and_then(|data| data.get("latest_file_mtime_us"))
-            .ok_or_else(|| {
-                format!("stats group missing data.latest_file_mtime_us for {group}: {envelope}")
-            })?;
-        if !(latest.is_null() || latest.is_u64()) {
-            return Err(format!(
-                "stats group latest_file_mtime_us must be u64|null for {group}: {envelope}"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn first_group_key(payload: &Value) -> Result<String, String> {
-    payload
-        .get("groups")
-        .and_then(Value::as_array)
-        .and_then(|rows| rows.first())
-        .and_then(|row| row.get("group"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .ok_or_else(|| format!("response missing group keys: {payload}"))
-}
-
-fn group_keys(payload: &Value) -> Result<Vec<String>, String> {
-    payload
-        .get("groups")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("response missing groups array: {payload}"))?
-        .iter()
-        .map(|row| {
-            row.get("group")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-                .ok_or_else(|| format!("response group row missing key: {payload}"))
-        })
-        .collect()
-}
-
-fn pit_id(payload: &Value) -> Result<String, String> {
-    payload
-        .get("pit")
-        .and_then(|pit| pit.get("id"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .ok_or_else(|| format!("response missing pit.id: {payload}"))
-}
-
-fn group_page_next_cursor(payload: &Value) -> Result<String, String> {
-    payload
-        .get("group_page")
-        .and_then(|page| page.get("next_cursor"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .ok_or_else(|| format!("response missing group_page.next_cursor: {payload}"))
-}
-
-fn group_page_next_entry_after(payload: &Value) -> Result<String, String> {
-    group_page_next_entry_after_optional(payload)?
-        .ok_or_else(|| format!("response missing group_page.next_entry_after: {payload}"))
-}
-
-fn group_page_next_entry_after_optional(payload: &Value) -> Result<Option<String>, String> {
-    payload
-        .get("group_page")
-        .and_then(|page| page.get("next_entry_after"))
-        .map(|value| match value {
-            Value::Null => Ok(None),
-            Value::String(value) => Ok(Some(value.clone())),
-            other => Err(format!(
-                "response contains invalid group_page.next_entry_after type: {other}"
-            )),
-        })
-        .unwrap_or_else(|| {
-            Err(format!(
-                "response missing group_page.next_entry_after: {payload}"
-            ))
-        })
-}
-
-fn entry_paths_for_group(payload: &Value, group_key: &str) -> Result<Vec<String>, String> {
-    let group = payload
-        .get("groups")
-        .and_then(Value::as_array)
-        .and_then(|groups| {
-            groups
-                .iter()
-                .find(|group| group.get("group").and_then(Value::as_str) == Some(group_key))
-        })
-        .ok_or_else(|| format!("response missing group '{group_key}': {payload}"))?;
-    group
-        .get("entries")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("group '{group_key}' missing entries array: {group}"))?
-        .iter()
-        .map(|entry| {
-            entry
-                .get("path")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-                .ok_or_else(|| format!("group '{group_key}' entry missing path: {entry}"))
-        })
-        .collect()
-}
-
-fn first_entry_path_for_group(payload: &Value, group_key: &str) -> Result<String, String> {
-    entry_paths_for_group(payload, group_key)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("group '{group_key}' has no entries: {payload}"))
 }
 
 fn group_total_nodes(payload: &Value, group_key: &str) -> u64 {

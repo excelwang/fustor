@@ -33,9 +33,17 @@ core_management_fast() {
 
 core_worker_fast() {
   CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime source -- --nocapture --test-threads=1
+    cargo test -p fs-meta-runtime --lib workers::source::tests::source_control \
+      -- --nocapture --test-threads=1
   CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime sink -- --nocapture --test-threads=1
+    cargo test -p fs-meta-runtime --lib workers::source::tests::external_source_worker_force_find \
+      -- --nocapture --test-threads=1
+  CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
+    cargo test -p fs-meta-runtime --lib workers::sink::tests::sink_control_frame_machine \
+      -- --nocapture --test-threads=1
+  CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
+    cargo test -p fs-meta-runtime --lib workers::sink::tests::status_snapshot_nonblocking \
+      -- --nocapture --test-threads=1
 }
 
 core_unit_fast() {
@@ -101,6 +109,25 @@ real_nfs_upgrade() {
       fs_meta_release_upgrade -- --ignored --nocapture --test-threads=1
 }
 
+progressive_fast() {
+  contract_fast
+  core_unit_fast
+  runtime_scope_gate
+}
+
+progressive_real() {
+  mini_real_nfs_smoke
+  real_nfs_api_core
+}
+
+progressive_full() {
+  progressive_fast
+  progressive_real
+  real_nfs_ops
+  real_nfs_component
+  real_nfs_upgrade
+}
+
 real_nfs_all() {
   real_nfs_api_core
   real_nfs_ops
@@ -120,6 +147,9 @@ Suites:
   core-worker-fast
   core-unit-fast
   runtime-scope-gate
+  progressive-fast
+  progressive-real
+  progressive-full
   mini-real-nfs-smoke
   real-nfs-api-core
   real-nfs-ops
@@ -137,6 +167,9 @@ case "${1:-}" in
   core-worker-fast) core_worker_fast ;;
   core-unit-fast) core_unit_fast ;;
   runtime-scope-gate) runtime_scope_gate ;;
+  progressive-fast) progressive_fast ;;
+  progressive-real) progressive_real ;;
+  progressive-full) progressive_full ;;
   mini-real-nfs-smoke) mini_real_nfs_smoke ;;
   real-nfs-api-core) real_nfs_api_core ;;
   real-nfs-ops) real_nfs_ops ;;

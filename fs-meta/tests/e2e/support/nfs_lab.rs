@@ -508,6 +508,14 @@ pub struct NfsLab {
 
 impl NfsLab {
     pub fn start() -> Result<Self, String> {
+        Self::start_with_exports(["nfs1", "nfs2", "nfs3"])
+    }
+
+    pub fn start_with_exports<I, S>(exports: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let preflight = RealNfsPreflight::detect();
         if !preflight.enabled {
             return Err(preflight
@@ -536,8 +544,8 @@ impl NfsLab {
             mounted_nfsd: false,
         };
         lab.ensure_nfs_stack()?;
-        for export in ["nfs1", "nfs2", "nfs3"] {
-            lab.create_export(export)?;
+        for export in exports {
+            lab.create_export(export.as_ref())?;
         }
         Ok(lab)
     }
