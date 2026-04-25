@@ -91,6 +91,18 @@ name = "specs_fs_meta_domain"
 path = "fs-meta/tests/specs_fs_meta_domain.rs"
 
 [[test]]
+name = "specs_fs_meta_contract_fast"
+path = "fs-meta/tests/specs_fs_meta_contract_fast.rs"
+
+[[test]]
+name = "app_specs"
+path = "fs-meta/tests/app_specs.rs"
+
+[[test]]
+name = "cli_specs"
+path = "fs-meta/tests/cli_specs.rs"
+
+[[test]]
 name = "fs_meta_api_e2e"
 path = "fs-meta/tests/fs_meta_api_e2e.rs"
 

@@ -79,6 +79,26 @@ fn fs_meta_operational_nfs_retire_real_nfs() {
 
 #[test]
 #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operational_activation_scope_preserved_layout_real_nfs() {
+    test_operational_scenarios::run_activation_scope_capture_preserved_layout().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operational_activation_scope_visibility_contracted_real_nfs() {
+    test_operational_scenarios::run_activation_scope_capture_nfs2_visibility_contracted_to_node_a()
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operational_activation_scope_force_find_preserved_real_nfs() {
+    test_operational_scenarios::run_activation_scope_capture_force_find_preserved_pre_force_find()
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
 fn fs_meta_release_upgrade_real_nfs() {
     test_release_upgrade::run().unwrap();
 }

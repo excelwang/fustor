@@ -162,7 +162,7 @@ fn run_mode(mode: OperationalMode) -> Result<(), String> {
     Ok(())
 }
 
-fn run_activation_scope_capture_preserved_layout() -> Result<(), String> {
+pub fn run_activation_scope_capture_preserved_layout() -> Result<(), String> {
     if let Some(reason) = skip_unless_real_nfs_enabled() {
         eprintln!("[fs-meta-api-ops] activation-scope skipped: {reason}");
         return Ok(());
@@ -264,7 +264,7 @@ fn run_activation_scope_capture_preserved_layout() -> Result<(), String> {
     Ok(())
 }
 
-fn run_activation_scope_capture_nfs2_visibility_contracted_to_node_a() -> Result<(), String> {
+pub fn run_activation_scope_capture_nfs2_visibility_contracted_to_node_a() -> Result<(), String> {
     if let Some(reason) = skip_unless_real_nfs_enabled() {
         eprintln!("[fs-meta-api-ops] activation-scope-node-a skipped: {reason}");
         return Ok(());
@@ -408,7 +408,7 @@ fn run_activation_scope_capture_nfs2_visibility_contracted_to_node_a() -> Result
     Ok(())
 }
 
-fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<(), String> {
+pub fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<(), String> {
     if let Some(reason) = skip_unless_real_nfs_enabled() {
         eprintln!("[fs-meta-api-ops] activation-scope-preserved skipped: {reason}");
         return Ok(());
