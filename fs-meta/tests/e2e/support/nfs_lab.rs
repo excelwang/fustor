@@ -508,6 +508,14 @@ pub struct NfsLab {
 
 impl NfsLab {
     pub fn start() -> Result<Self, String> {
+        Self::start_with_exports(&["nfs1", "nfs2", "nfs3"], SeedProfile::Baseline)
+    }
+
+    pub fn start_mini_10_files(exports: &[&str]) -> Result<Self, String> {
+        Self::start_with_exports(exports, SeedProfile::Mini10Files)
+    }
+
+    fn start_with_exports(exports: &[&str], seed_profile: SeedProfile) -> Result<Self, String> {
         let preflight = RealNfsPreflight::detect();
         if !preflight.enabled {
             return Err(preflight
@@ -536,8 +544,8 @@ impl NfsLab {
             mounted_nfsd: false,
         };
         lab.ensure_nfs_stack()?;
-        for export in ["nfs1", "nfs2", "nfs3"] {
-            lab.create_export(export)?;
+        for export in exports {
+            lab.create_export_with_profile(export, seed_profile)?;
         }
         Ok(lab)
     }
@@ -547,10 +555,18 @@ impl NfsLab {
     }
 
     pub fn create_export(&mut self, export_name: &str) -> Result<PathBuf, String> {
+        self.create_export_with_profile(export_name, SeedProfile::Baseline)
+    }
+
+    fn create_export_with_profile(
+        &mut self,
+        export_name: &str,
+        seed_profile: SeedProfile,
+    ) -> Result<PathBuf, String> {
         let export_dir = self.exports_dir.join(export_name);
         fs::create_dir_all(&export_dir)
             .map_err(|e| format!("create export dir {export_name} failed: {e}"))?;
-        self.seed_export_tree(&export_dir, export_name)?;
+        seed_profile.seed_export_tree(&export_dir, export_name)?;
         self.export_dir(&export_dir)?;
         Ok(export_dir)
     }
@@ -772,20 +788,55 @@ impl NfsLab {
             ))
         }
     }
+}
 
-    fn seed_export_tree(&self, export_dir: &Path, export_name: &str) -> Result<(), String> {
-        let root = export_dir.join("root.txt");
-        fs::write(&root, format!("root-{export_name}\n"))
-            .map_err(|e| format!("write {} failed: {e}", root.display()))?;
-        let dir = export_dir.join("data");
-        fs::create_dir_all(&dir).map_err(|e| format!("create {} failed: {e}", dir.display()))?;
-        fs::write(dir.join("a.txt"), format!("a-{export_name}\n"))
-            .map_err(|e| format!("seed file failed: {e}"))?;
-        fs::write(dir.join("b.txt"), format!("b-{export_name}\n"))
-            .map_err(|e| format!("seed file failed: {e}"))?;
-        Ok(())
+#[derive(Clone, Copy, Debug)]
+enum SeedProfile {
+    Baseline,
+    Mini10Files,
+}
+
+impl SeedProfile {
+    fn seed_export_tree(self, export_dir: &Path, export_name: &str) -> Result<(), String> {
+        match self {
+            Self::Baseline => seed_baseline_export_tree(export_dir, export_name),
+            Self::Mini10Files => seed_mini_10_file_export_tree(export_dir, export_name),
+        }
     }
+}
 
+fn seed_baseline_export_tree(export_dir: &Path, export_name: &str) -> Result<(), String> {
+    let root = export_dir.join("root.txt");
+    fs::write(&root, format!("root-{export_name}\n"))
+        .map_err(|e| format!("write {} failed: {e}", root.display()))?;
+    let dir = export_dir.join("data");
+    fs::create_dir_all(&dir).map_err(|e| format!("create {} failed: {e}", dir.display()))?;
+    fs::write(dir.join("a.txt"), format!("a-{export_name}\n"))
+        .map_err(|e| format!("seed file failed: {e}"))?;
+    fs::write(dir.join("b.txt"), format!("b-{export_name}\n"))
+        .map_err(|e| format!("seed file failed: {e}"))?;
+    Ok(())
+}
+
+fn seed_mini_10_file_export_tree(export_dir: &Path, export_name: &str) -> Result<(), String> {
+    for index in 0..10 {
+        let relative = if index < 5 {
+            format!("root-file-{index}.txt")
+        } else {
+            format!("data/nested-file-{index}.txt")
+        };
+        let path = export_dir.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("create {} failed: {e}", parent.display()))?;
+        }
+        fs::write(&path, format!("mini-{export_name}-{index}\n"))
+            .map_err(|e| format!("write {} failed: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+impl NfsLab {
     fn ensure_nfs_stack(&mut self) -> Result<(), String> {
         let rpcbind_running = Command::new("sh")
             .arg("-lc")

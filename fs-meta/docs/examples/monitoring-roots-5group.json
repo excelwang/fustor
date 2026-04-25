@@ -1,0 +1,54 @@
+{
+  "roots": [
+    {
+      "id": "nfs-144",
+      "selector": {
+        "host_ip": "10.0.82.144",
+        "mount_point": "/mnt/fustor-peers/nfs145"
+      },
+      "subpath_scope": "/",
+      "watch": true,
+      "scan": true
+    },
+    {
+      "id": "nfs-145",
+      "selector": {
+        "host_ip": "10.0.82.145",
+        "mount_point": "/mnt/fustor-peers/nfs146"
+      },
+      "subpath_scope": "/",
+      "watch": true,
+      "scan": true
+    },
+    {
+      "id": "nfs-146",
+      "selector": {
+        "host_ip": "10.0.82.146",
+        "mount_point": "/mnt/fustor-peers/nfs147"
+      },
+      "subpath_scope": "/",
+      "watch": true,
+      "scan": true
+    },
+    {
+      "id": "nfs-147",
+      "selector": {
+        "host_ip": "10.0.82.147",
+        "mount_point": "/mnt/fustor-peers/nfs148"
+      },
+      "subpath_scope": "/",
+      "watch": true,
+      "scan": true
+    },
+    {
+      "id": "nfs-148",
+      "selector": {
+        "host_ip": "10.0.82.148",
+        "mount_point": "/mnt/fustor-peers/nfs144"
+      },
+      "subpath_scope": "/",
+      "watch": true,
+      "scan": true
+    }
+  ]
+}

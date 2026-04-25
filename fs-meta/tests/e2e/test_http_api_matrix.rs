@@ -22,6 +22,21 @@ enum MatrixMode {
     LiveOnlyOnly,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DemoEvidenceEnvironment {
+    Full5Node,
+    Mini5Node5Nfs10Files,
+}
+
+impl DemoEvidenceEnvironment {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full5Node => "full-5node",
+            Self::Mini5Node5Nfs10Files => "mini-5node-5nfs-10files",
+        }
+    }
+}
+
 impl MatrixMode {
     fn app_prefix(self) -> &'static str {
         match self {
@@ -50,6 +65,60 @@ pub fn run_query_baseline_only() -> Result<(), String> {
 
 pub fn run_live_only_rescan_only() -> Result<(), String> {
     run_mode(MatrixMode::LiveOnlyOnly)
+}
+
+pub fn run_mini_5node_5nfs_10files() -> Result<(), String> {
+    if let Some(reason) = skip_unless_real_nfs_enabled() {
+        eprintln!("[fs-meta-api-matrix-mini] skipped: {reason}");
+        return Ok(());
+    }
+
+    let mini_exports = [
+        "mini-nfs1",
+        "mini-nfs2",
+        "mini-nfs3",
+        "mini-nfs4",
+        "mini-nfs5",
+    ];
+    let mut lab = NfsLab::start_mini_10_files(&mini_exports)?;
+    let cluster = Cluster5::start()?;
+    let app_id = format!("fs-meta-api-matrix-mini-{}", unique_suffix());
+    let facade_resource_id = format!("fs-meta-tcp-listener-{app_id}");
+    let facade_addrs = reserve_http_addrs(1)?;
+    install_mini_5node_5nfs_resources(&cluster, &mut lab, &facade_resource_id, &facade_addrs)?;
+
+    let roots = roots_for_exports(&lab, &mini_exports);
+    let release =
+        cluster.build_fs_meta_release(&app_id, &facade_resource_id, roots.clone(), 1, true)?;
+    cluster.apply_release("node-a", release)?;
+
+    let candidate_base_urls = facade_addrs
+        .iter()
+        .map(|addr| format!("http://{addr}"))
+        .collect::<Vec<_>>();
+    cluster.wait_http_login_ready(
+        &candidate_base_urls,
+        "operator",
+        "operator123",
+        Duration::from_secs(120),
+    )?;
+    let mut session = OperatorSession::login_many(candidate_base_urls, "operator", "operator123")?;
+    session.rescan()?;
+    assert_mini_mounts_live(&lab, &mini_exports);
+    wait_until(Duration::from_secs(180), "mini roots materialized", || {
+        let status = session.status()?;
+        if baseline_sink_groups_materialized_ready(&status, &mini_exports)? {
+            Ok(true)
+        } else {
+            Err(format!(
+                "mini roots not materialized: {}",
+                summarize_sink_group_readiness(&status)
+            ))
+        }
+    })?;
+    assert_mini_file_counts(&lab, &mini_exports)?;
+    emit_demo_evidence_result(&mut session, DemoEvidenceEnvironment::Mini5Node5Nfs10Files)?;
+    Ok(())
 }
 
 fn run_mode(mode: MatrixMode) -> Result<(), String> {
@@ -87,8 +156,12 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
             )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
             run_roots_matrix(&mut session, &harness.lab)?;
-            eprintln!("[fs-meta-api-matrix] step=query-matrix");
-            run_query_matrix(&harness.cluster, &mut session, &harness.lab)?;
+            // Keep the full demo matrix focused on configuration churn plus the
+            // live-only/rescan query path. Baseline trusted-materialized query
+            // coverage runs in QueryBaselineOnly on a stable baseline so it
+            // does not inherit the preceding roots-matrix perturbation.
+            eprintln!("[fs-meta-api-matrix] step=live-only-query-matrix");
+            run_query_live_only_rescan_phase(&harness.cluster, &mut session, &harness.lab)?;
             let metrics = session.bound_route_metrics()?;
             for key in [
                 "call_timeout_total",
@@ -113,8 +186,6 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 harness.facade_count,
                 true,
             )?;
-            eprintln!("[fs-meta-api-matrix] step=roots-matrix");
-            run_roots_matrix(&mut session, &harness.lab)?;
             eprintln!("[fs-meta-api-matrix] step=query-matrix");
             run_query_baseline_phase(&harness.cluster, &mut session, &harness.lab)?;
             let metrics = session.bound_route_metrics()?;
@@ -149,6 +220,109 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
         run_query_live_only_rescan_phase(&harness.cluster, &mut session, &harness.lab)?;
     }
 
+    emit_demo_evidence_result(&mut session, DemoEvidenceEnvironment::Full5Node)?;
+
+    Ok(())
+}
+
+fn emit_demo_evidence_result(
+    session: &mut OperatorSession,
+    environment: DemoEvidenceEnvironment,
+) -> Result<(), String> {
+    let status = session.status()?;
+    let source = status
+        .get("source")
+        .ok_or_else(|| format!("status missing source for demo evidence: {status}"))?;
+    let roots = source
+        .get("logical_roots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!("status.source missing logical_roots for demo evidence: {status}")
+        })?;
+    let degraded_roots = source
+        .get("degraded_roots")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let artifact_verified = status.get("runtime_artifact").is_some();
+    let mut unacceptable_reasons = Vec::<String>::new();
+    if !artifact_verified {
+        unacceptable_reasons.push("runtime_artifact_missing".to_string());
+    }
+    if !degraded_roots.is_empty() {
+        unacceptable_reasons.push("source_degraded_roots_present".to_string());
+    }
+    let mut coverage_modes = BTreeMap::<String, usize>::new();
+    for root in roots {
+        let mode = root
+            .get("coverage_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        *coverage_modes.entry(mode.to_string()).or_insert(0) += 1;
+        if mode == "watch_degraded" {
+            unacceptable_reasons.push("watch_degraded".to_string());
+        }
+        if mode == "audit_without_file_metadata" {
+            unacceptable_reasons.push("audit_without_file_metadata".to_string());
+        }
+        let file_metadata_coverage = root
+            .get("coverage_capabilities")
+            .and_then(|value| value.get("file_metadata_coverage"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !file_metadata_coverage {
+            unacceptable_reasons.push("file_metadata_coverage_missing".to_string());
+        }
+    }
+    let mut sink_unready = Vec::<String>::new();
+    let sink_groups = status
+        .get("sink")
+        .and_then(|sink| sink.get("groups"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("status.sink.groups missing for demo evidence: {status}"))?;
+    for group in sink_groups {
+        let group_id = group
+            .get("group_id")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        let readiness = group
+            .get("materialization_readiness")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        let initial_audit_completed = group
+            .get("initial_audit_completed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if readiness != "ready" || !initial_audit_completed {
+            sink_unready.push(format!("{group_id}:{readiness}"));
+        }
+    }
+    if !sink_unready.is_empty() {
+        unacceptable_reasons.push("sink_materialization_unready".to_string());
+    }
+    unacceptable_reasons.sort();
+    unacceptable_reasons.dedup();
+    let result = if unacceptable_reasons.is_empty() {
+        "passed"
+    } else {
+        "failed"
+    };
+    let evidence = json!({
+        "environment": environment.as_str(),
+        "artifact_verified": artifact_verified,
+        "root_count": roots.len(),
+        "coverage_modes": coverage_modes,
+        "degraded_roots": degraded_roots,
+        "sink_unready": sink_unready,
+        "unacceptable_reasons": unacceptable_reasons,
+        "result": result,
+    });
+    eprintln!("[fs-meta-api-matrix] demo_evidence_result={evidence}");
+    if result == "failed" {
+        return Err(format!(
+            "full demo evidence has unacceptable degradation: {evidence}"
+        ));
+    }
     Ok(())
 }
 
@@ -187,16 +361,6 @@ fn build_matrix_harness(app_prefix: &str) -> Result<MatrixHarness, String> {
     })
 }
 
-fn run_query_matrix(
-    cluster: &Cluster5,
-    session: &mut OperatorSession,
-    lab: &NfsLab,
-) -> Result<(), String> {
-    run_query_baseline_phase(cluster, session, lab)?;
-    run_query_live_only_rescan_phase(cluster, session, lab)?;
-    Ok(())
-}
-
 fn run_query_baseline_phase(
     cluster: &Cluster5,
     session: &mut OperatorSession,
@@ -204,57 +368,7 @@ fn run_query_baseline_phase(
 ) -> Result<(), String> {
     eprintln!("[fs-meta-api-matrix] substep=query-matrix-rescan");
     session.rescan()?;
-    let mut last_rescan_at = std::time::Instant::now();
-    wait_until(
-        Duration::from_secs(300),
-        "baseline tree materializes root data",
-        || {
-            if last_rescan_at.elapsed() >= Duration::from_secs(15) {
-                let _ = session.rescan();
-                last_rescan_at = std::time::Instant::now();
-            }
-            let tree = match session
-                .tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])
-            {
-                Ok(tree) => tree,
-                Err(err) => {
-                    let status = session
-                        .status()
-                        .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
-                    let roots = session
-                        .monitoring_roots()
-                        .unwrap_or_else(|roots_err| json!({ "roots_error": roots_err }));
-                    return Err(format!(
-                        "tree request failed: {err}; status={status}; roots={roots}"
-                    ));
-                }
-            };
-            let ready = tree
-                .get("groups")
-                .and_then(Value::as_array)
-                .map(|groups| {
-                    groups.len() >= 3
-                        && group_total_nodes(&tree, "nfs1") > 0
-                        && group_total_nodes(&tree, "nfs2") > 0
-                        && group_total_nodes(&tree, "nfs3") > 0
-                })
-                .unwrap_or(false);
-            if ready {
-                Ok(true)
-            } else {
-                let status = session
-                    .status()
-                    .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
-                let diagnostics =
-                    baseline_cluster_diagnostics(cluster, session).unwrap_or_else(|diag_err| {
-                        json!({ "diagnostics_error": diag_err }).to_string()
-                    });
-                Err(format!(
-                    "tree={tree}; status={status}; diagnostics={diagnostics}"
-                ))
-            }
-        },
-    )?;
+    wait_for_baseline_tree_materialization(cluster, session, lab)?;
 
     let grants = session.runtime_grants()?;
     let all_mounts = group_mount_pairs_for_roots(
@@ -762,6 +876,14 @@ fn run_query_live_only_rescan_phase(
             let current = session.monitoring_roots()?;
             Ok(current.to_string().contains("\"id\":\"nfs1\"")
                 && current.to_string().contains("\"watch\":true"))
+        },
+    )?;
+    wait_until(
+        Duration::from_secs(180),
+        "restore baseline after live-only materialized",
+        || {
+            let status = session.status()?;
+            baseline_sink_groups_materialized_ready(&status, &["nfs1", "nfs2", "nfs3"])
         },
     )?;
 
@@ -1279,14 +1401,38 @@ fn validate_status_coverage_mode(value: Option<&Value>, root: &Value) -> Result<
     if !matches!(
         coverage_mode,
         "realtime_hotset_plus_audit"
-            | "realtime_hotset_only"
             | "audit_only"
-            | "watch_requested_without_capacity"
-            | "inactive"
+            | "audit_with_metadata"
+            | "audit_without_file_metadata"
+            | "watch_degraded"
     ) {
         return Err(format!(
             "status source root has invalid coverage_mode={coverage_mode}: {root}"
         ));
+    }
+    validate_status_coverage_capabilities(root.get("coverage_capabilities"), root)?;
+    Ok(())
+}
+
+fn validate_status_coverage_capabilities(
+    value: Option<&Value>,
+    root: &Value,
+) -> Result<(), String> {
+    let capabilities = value.and_then(Value::as_object).ok_or_else(|| {
+        format!("status source root missing object coverage_capabilities: {root}")
+    })?;
+    for key in [
+        "exists_coverage",
+        "file_count_coverage",
+        "file_metadata_coverage",
+        "mtime_size_coverage",
+        "watch_freshness_coverage",
+    ] {
+        if !capabilities.get(key).is_some_and(Value::is_boolean) {
+            return Err(format!(
+                "status source root coverage_capabilities.{key} should be boolean: {root}"
+            ));
+        }
     }
     Ok(())
 }
@@ -1345,6 +1491,13 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
             preview.body
         ));
     }
+
+    // Operator-facing roots edits in the demo happen against an already
+    // materialized baseline. Waiting here prevents the matrix from contracting
+    // roots while nfs2/nfs3 are still zero-state pending groups, which would
+    // turn the later restore step into a race on new stream receipts instead of
+    // validating the intended online roots edit flow.
+    wait_for_baseline_tree_materialization_no_cluster_diagnostics(session)?;
 
     assert_error(
         session.client().preview_roots_raw(
@@ -1491,7 +1644,46 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
             .map(|items| items.len() == 3)
             .unwrap_or(false))
     })?;
+    wait_until(
+        Duration::from_secs(180),
+        "restore baseline roots materialized",
+        || {
+            let status = session.status()?;
+            if baseline_sink_groups_materialized_ready(&status, &["nfs1", "nfs2", "nfs3"])? {
+                Ok(true)
+            } else {
+                Err(format!(
+                    "restore baseline roots not materialized: {}",
+                    summarize_sink_group_readiness(&status)
+                ))
+            }
+        },
+    )?;
     Ok(())
+}
+
+fn summarize_sink_group_readiness(status: &Value) -> Value {
+    let groups = status
+        .get("sink")
+        .and_then(|sink| sink.get("groups"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Value::Array(
+        groups
+            .into_iter()
+            .map(|group| {
+                json!({
+                    "group_id": group.get("group_id"),
+                    "primary_object_ref": group.get("primary_object_ref"),
+                    "materialization_readiness": group.get("materialization_readiness"),
+                    "initial_audit_completed": group.get("initial_audit_completed"),
+                    "total_nodes": group.get("total_nodes"),
+                    "live_nodes": group.get("live_nodes"),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn baseline_cluster_diagnostics(
@@ -1601,6 +1793,114 @@ fn install_baseline_resources(
     Ok(())
 }
 
+fn install_mini_5node_5nfs_resources(
+    cluster: &Cluster5,
+    lab: &mut NfsLab,
+    facade_resource_id: &str,
+    facade_addrs: &[String],
+) -> Result<(), String> {
+    let exports = [
+        ("node-a", "mini-nfs1"),
+        ("node-b", "mini-nfs1"),
+        ("node-c", "mini-nfs2"),
+        ("node-d", "mini-nfs2"),
+        ("node-e", "mini-nfs3"),
+        ("node-a", "mini-nfs3"),
+        ("node-b", "mini-nfs4"),
+        ("node-d", "mini-nfs4"),
+        ("node-c", "mini-nfs5"),
+        ("node-e", "mini-nfs5"),
+    ];
+    for (node_name, export_name) in exports {
+        let mount_path = lab.mount_export(node_name, export_name)?;
+        let node_id = cluster.node_id(node_name)?;
+        cluster.announce_resources_clusterwide(vec![json!({
+            "resource_id": export_name,
+            "node_id": node_id,
+            "resource_kind": "nfs",
+            "source": lab.export_source(export_name),
+            "mount_hint": mount_path.display().to_string(),
+        })])?;
+    }
+    for (node_name, bind_addr) in ["node-d", "node-e"].into_iter().zip(facade_addrs.iter()) {
+        let node_id = cluster.node_id(node_name)?;
+        cluster.announce_resources_clusterwide(vec![json!({
+            "resource_id": facade_resource_id,
+            "node_id": node_id,
+            "resource_kind": "tcp_listener",
+            "source": format!("http://{node_name}/listener/{facade_resource_id}"),
+            "bind_addr": bind_addr,
+        })])?;
+    }
+    Ok(())
+}
+
+fn assert_mini_mounts_live(lab: &NfsLab, exports: &[&str]) {
+    for export_name in exports {
+        let live_mounts = ["node-a", "node-b", "node-c", "node-d", "node-e"]
+            .into_iter()
+            .filter_map(|node_name| lab.mount_path(node_name, export_name))
+            .collect::<Vec<_>>();
+        assert!(
+            !live_mounts.is_empty(),
+            "missing mini mount for {export_name}"
+        );
+        for mount_path in live_mounts {
+            let status = Command::new("mountpoint")
+                .arg("-q")
+                .arg(&mount_path)
+                .status()
+                .expect("run mountpoint");
+            assert!(
+                status.success(),
+                "mini mount is not active for {export_name}: {}",
+                mount_path.display()
+            );
+            assert!(
+                mount_path.join("root-file-0.txt").exists(),
+                "mini mounted export content is not visible for {export_name}: {}",
+                mount_path.display()
+            );
+        }
+    }
+}
+
+fn assert_mini_file_counts(lab: &NfsLab, exports: &[&str]) -> Result<(), String> {
+    for export_name in exports {
+        let root = lab
+            .mount_path("node-a", export_name)
+            .or_else(|| lab.mount_path("node-b", export_name))
+            .or_else(|| lab.mount_path("node-c", export_name))
+            .or_else(|| lab.mount_path("node-d", export_name))
+            .or_else(|| lab.mount_path("node-e", export_name))
+            .ok_or_else(|| format!("missing mounted mini export {export_name}"))?;
+        let output = Command::new("find")
+            .arg(&root)
+            .arg("-type")
+            .arg("f")
+            .output()
+            .map_err(|e| format!("find {} failed: {e}", root.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "find {} failed with status {}",
+                root.display(),
+                output.status
+            ));
+        }
+        let count = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        if count != 10 {
+            return Err(format!(
+                "mini export {export_name} expected exactly 10 files, got {count} at {}",
+                root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn assert_baseline_mounts_live(lab: &NfsLab) {
     for (node_name, export_name) in [
         ("node-a", "nfs1"),
@@ -1702,22 +2002,88 @@ fn baseline_tree_materialization_wait_keeps_real_nfs_mounts_live() {
     )
     .expect("login many");
     session.rescan().expect("initial rescan");
+    wait_for_baseline_tree_materialization(&harness.cluster, &mut session, &harness.lab)
+        .expect("baseline tree wait should preserve active mounts");
+}
 
+fn baseline_roots(lab: &NfsLab) -> Vec<RootSpec> {
+    roots_for_exports(lab, &["nfs1", "nfs2", "nfs3"])
+}
+
+fn roots_for_exports(lab: &NfsLab, exports: &[&str]) -> Vec<RootSpec> {
+    exports
+        .iter()
+        .map(|export| root_spec(export, &lab.export_source(export)))
+        .collect()
+}
+
+fn baseline_sink_groups_materialized_ready(
+    status: &Value,
+    expected_groups: &[&str],
+) -> Result<bool, String> {
+    let groups = status
+        .get("sink")
+        .and_then(|sink| sink.get("groups"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("status.sink.groups missing array: {status}"))?;
+    let expected = expected_groups
+        .iter()
+        .map(|group| group.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut ready = std::collections::BTreeSet::new();
+    for group in groups {
+        let Some(group_id) = group.get("group_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !expected.contains(group_id) {
+            continue;
+        }
+        let readiness = group
+            .get("materialization_readiness")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let initial_audit_completed = group
+            .get("initial_audit_completed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if readiness == "ready" && initial_audit_completed {
+            ready.insert(group_id.to_string());
+        }
+    }
+    Ok(ready == expected)
+}
+
+fn wait_for_baseline_tree_materialization(
+    cluster: &Cluster5,
+    session: &mut OperatorSession,
+    lab: &NfsLab,
+) -> Result<(), String> {
     let mut last_rescan_at = std::time::Instant::now();
     wait_until(
-        Duration::from_secs(90),
-        "baseline tree materializes without losing active mounts",
+        Duration::from_secs(300),
+        "baseline tree materializes root data",
         || {
-            if last_rescan_at.elapsed() >= Duration::from_secs(10) {
-                session.rescan()?;
+            if last_rescan_at.elapsed() >= Duration::from_secs(15) {
+                let _ = session.rescan();
                 last_rescan_at = std::time::Instant::now();
             }
-
-            assert_baseline_mounts_live(&harness.lab);
-
-            let tree = session
+            assert_baseline_mounts_live(lab);
+            let tree = match session
                 .tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])
-                .unwrap_or_else(|err| json!({ "tree_error": err }));
+            {
+                Ok(tree) => tree,
+                Err(err) => {
+                    let status = session
+                        .status()
+                        .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+                    let roots = session
+                        .monitoring_roots()
+                        .unwrap_or_else(|roots_err| json!({ "roots_error": roots_err }));
+                    return Err(format!(
+                        "tree request failed: {err}; status={status}; roots={roots}"
+                    ));
+                }
+            };
             let ready = tree
                 .get("groups")
                 .and_then(Value::as_array)
@@ -1728,25 +2094,73 @@ fn baseline_tree_materialization_wait_keeps_real_nfs_mounts_live() {
                         && group_total_nodes(&tree, "nfs3") > 0
                 })
                 .unwrap_or(false);
-            if ready {
+            let status = session
+                .status()
+                .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+            let sink_ready =
+                baseline_sink_groups_materialized_ready(&status, &["nfs1", "nfs2", "nfs3"])
+                    .unwrap_or(false);
+            if ready && sink_ready {
                 Ok(true)
             } else {
-                let status = session
-                    .status()
-                    .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+                let diagnostics =
+                    baseline_cluster_diagnostics(cluster, session).unwrap_or_else(|diag_err| {
+                        json!({ "diagnostics_error": diag_err }).to_string()
+                    });
+                Err(format!(
+                    "tree={tree}; status={status}; diagnostics={diagnostics}"
+                ))
+            }
+        },
+    )
+}
+
+fn wait_for_baseline_tree_materialization_no_cluster_diagnostics(
+    session: &mut OperatorSession,
+) -> Result<(), String> {
+    let mut last_rescan_at = std::time::Instant::now();
+    wait_until(
+        Duration::from_secs(300),
+        "baseline tree materializes before roots matrix",
+        || {
+            if last_rescan_at.elapsed() >= Duration::from_secs(15) {
+                let _ = session.rescan();
+                last_rescan_at = std::time::Instant::now();
+            }
+            let tree = match session
+                .tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])
+            {
+                Ok(tree) => tree,
+                Err(err) => {
+                    let status = session
+                        .status()
+                        .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+                    return Err(format!("tree request failed: {err}; status={status}"));
+                }
+            };
+            let ready = tree
+                .get("groups")
+                .and_then(Value::as_array)
+                .map(|groups| {
+                    groups.len() >= 3
+                        && group_total_nodes(&tree, "nfs1") > 0
+                        && group_total_nodes(&tree, "nfs2") > 0
+                        && group_total_nodes(&tree, "nfs3") > 0
+                })
+                .unwrap_or(false);
+            let status = session
+                .status()
+                .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+            let sink_ready =
+                baseline_sink_groups_materialized_ready(&status, &["nfs1", "nfs2", "nfs3"])
+                    .unwrap_or(false);
+            if ready && sink_ready {
+                Ok(true)
+            } else {
                 Err(format!("tree={tree}; status={status}"))
             }
         },
     )
-    .expect("baseline tree wait should preserve active mounts");
-}
-
-fn baseline_roots(lab: &NfsLab) -> Vec<RootSpec> {
-    vec![
-        root_spec("nfs1", &lab.export_source("nfs1")),
-        root_spec("nfs2", &lab.export_source("nfs2")),
-        root_spec("nfs3", &lab.export_source("nfs3")),
-    ]
 }
 
 fn root_spec(id: &str, fs_source: &str) -> RootSpec {
