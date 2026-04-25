@@ -523,12 +523,12 @@ async fn send_roots_put_control_second_wave(
         ))
     })?;
     let mut route_keys = vec![
-        ROUTE_KEY_SINK_ROOTS_CONTROL.to_string(),
         ROUTE_KEY_SOURCE_ROOTS_CONTROL.to_string(),
+        ROUTE_KEY_SINK_ROOTS_CONTROL.to_string(),
     ];
     for node_id in target_node_ids {
-        route_keys.push(sink_roots_control_route_key_for(&node_id));
         route_keys.push(source_roots_control_route_key_for(&node_id));
+        route_keys.push(sink_roots_control_route_key_for(&node_id));
     }
     for route_key in route_keys {
         eprintln!(
@@ -5814,51 +5814,46 @@ mod tests {
             request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
             control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
         };
-        let headers = management_headers(auth.as_ref());
+        let context = RootsPutSecondWaveFollowupContext::from(&state);
+        let roots = vec![
+            RootSpec {
+                id: "nfs1".to_string(),
+                selector: RootSelector {
+                    mount_point: Some(nfs1.clone()),
+                    ..RootSelector::default()
+                },
+                subpath_scope: std::path::PathBuf::from("/"),
+                watch: true,
+                scan: true,
+                audit_interval_ms: None,
+            },
+            RootSpec {
+                id: "nfs2".to_string(),
+                selector: RootSelector {
+                    mount_point: Some(nfs2.clone()),
+                    ..RootSelector::default()
+                },
+                subpath_scope: std::path::PathBuf::from("/"),
+                watch: true,
+                scan: true,
+                audit_interval_ms: None,
+            },
+        ];
+        let target_node_ids = BTreeSet::from([
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-b-222".to_string(),
+        ]);
+        send_roots_put_control_second_wave(&context, &roots, &target_node_ids)
+            .await
+            .expect("prime initial roots-put control wave");
 
-        let err = roots_put(
-            State(state),
-            headers,
-            Json(RootsUpdateRequest {
-                roots: vec![
-                    RootUpdateEntry {
-                        id: "nfs1".to_string(),
-                        selector: RootSelectorEntry {
-                            mount_point: Some(nfs1.display().to_string()),
-                            fs_source: None,
-                            fs_type: None,
-                            host_ip: None,
-                            host_ref: None,
-                        },
-                        subpath_scope: "/".to_string(),
-                        watch: true,
-                        scan: true,
-                        audit_interval_ms: None,
-                        source_locator_present: false,
-                        path_present: false,
-                    },
-                    RootUpdateEntry {
-                        id: "nfs2".to_string(),
-                        selector: RootSelectorEntry {
-                            mount_point: Some(nfs2.display().to_string()),
-                            fs_source: None,
-                            fs_type: None,
-                            host_ip: None,
-                            host_ref: None,
-                        },
-                        subpath_scope: "/".to_string(),
-                        watch: true,
-                        scan: true,
-                        audit_interval_ms: None,
-                        source_locator_present: false,
-                        path_present: false,
-                    },
-                ],
-            }),
-        )
-        .await
-        .expect_err("roots_put should fail once readiness polling loses peer status replies");
-        assert_eq!(err.status, 503);
+        let err = wait_roots_put_source_second_wave_readiness(&context, &roots, target_node_ids)
+            .await
+            .expect_err(
+                "roots_put followup should fail once readiness polling loses peer status replies",
+            );
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         let sent_routes = match sent_routes.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),

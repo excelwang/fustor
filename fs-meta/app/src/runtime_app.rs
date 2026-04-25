@@ -9465,13 +9465,6 @@ impl FSMetaApp {
             };
             (continuity.0, continuity.1, api_task_guard.is_some())
         };
-        let replacement_wait_reason = Self::facade_replacement_wait_reason(
-            source.as_ref(),
-            sink.as_ref(),
-            &pending,
-            replacing_existing,
-        )
-        .await?;
         if reuse_current_generation {
             let active_matches = registrant
                 .api_task
@@ -9484,11 +9477,11 @@ impl FSMetaApp {
                         && active.generation == pending.generation
                 });
             if active_matches {
-                if let Some(wait_reason) = replacement_wait_reason {
+                if !pending.runtime_exposure_confirmed {
                     Self::set_pending_facade_status_waiting(
                         &facade_pending_status,
                         &pending,
-                        wait_reason,
+                        FacadePendingReason::AwaitingRuntimeExposure,
                     );
                     return Ok(false);
                 }
@@ -9525,12 +9518,12 @@ impl FSMetaApp {
                     && active.generation == active_generation
             });
             if active_matches {
-                if let Some(wait_reason) = replacement_wait_reason {
+                if !pending.runtime_exposure_confirmed {
                     drop(api_task_guard);
                     Self::set_pending_facade_status_waiting(
                         &facade_pending_status,
                         &pending,
-                        wait_reason,
+                        FacadePendingReason::AwaitingRuntimeExposure,
                     );
                     return Ok(false);
                 }
@@ -9563,6 +9556,13 @@ impl FSMetaApp {
                 return Ok(true);
             }
         }
+        let replacement_wait_reason = Self::facade_replacement_wait_reason(
+            source.as_ref(),
+            sink.as_ref(),
+            &pending,
+            replacing_existing,
+        )
+        .await?;
         if let Some(wait_reason) = replacement_wait_reason {
             Self::set_pending_facade_status_waiting(&facade_pending_status, &pending, wait_reason);
             return Ok(false);
@@ -9903,14 +9903,25 @@ impl FSMetaApp {
             .await
             .as_ref()
             .is_some_and(|active| active.handle.is_running());
-        if let Some(wait_reason) = Self::facade_replacement_wait_reason(
-            self.source.as_ref(),
-            self.sink.as_ref(),
-            &pending,
-            has_active,
-        )
-        .await?
+        let same_listener_generation_advance =
+            self.api_task.lock().await.as_ref().is_some_and(|active| {
+                active.route_key == pending.route_key && active.resource_ids == pending.resource_ids
+            });
+        let wait_reason = if same_listener_generation_advance && !pending.runtime_exposure_confirmed
         {
+            Some(FacadePendingReason::AwaitingRuntimeExposure)
+        } else if same_listener_generation_advance {
+            None
+        } else {
+            Self::facade_replacement_wait_reason(
+                self.source.as_ref(),
+                self.sink.as_ref(),
+                &pending,
+                has_active,
+            )
+            .await?
+        };
+        if let Some(wait_reason) = wait_reason {
             Self::set_pending_facade_status_waiting(
                 &self.facade_pending_status,
                 &pending,

@@ -170,6 +170,10 @@ async fn roots_put_returns_applied_root_count_even_when_live_logical_roots_snaps
         handle: active_facade,
     });
 
+    app.on_control_frame(&[activate_envelope(execution_units::SOURCE_RUNTIME_UNIT_ID)])
+        .await
+        .expect("initialize source runtime control before roots_put");
+
     let client = Client::new();
     let login = client
         .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
@@ -400,6 +404,10 @@ async fn roots_put_before_response_does_not_reinflate_roots_count_after_later_ol
         handle: active_facade,
     });
 
+    app.on_control_frame(&[activate_envelope(execution_units::SOURCE_RUNTIME_UNIT_ID)])
+        .await
+        .expect("initialize source runtime control before roots_put");
+
     let client = Client::new();
     let login = client
         .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
@@ -452,29 +460,38 @@ async fn roots_put_before_response_does_not_reinflate_roots_count_after_later_ol
         .await
         .expect("roots_put should reach before-response pause after local updates");
 
-    app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
-        execution_units::SOURCE_RUNTIME_UNIT_ID,
-        format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
-        &[
-            (
-                "nfs1",
-                &["node-a::nfs1", "node-b::nfs1", "node-c::nfs1"][..],
-            ),
-            (
-                "nfs2",
-                &["node-a::nfs2", "node-c::nfs2", "node-d::nfs2"][..],
-            ),
-            (
-                "nfs3",
-                &["node-b::nfs3", "node-d::nfs3", "node-e::nfs3"][..],
-            ),
-        ],
-        2,
-    )])
-    .await
-    .expect("later old-roots source control replay should settle");
-
+    let replay = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[
+                    (
+                        "nfs1",
+                        &["node-a::nfs1", "node-b::nfs1", "node-c::nfs1"][..],
+                    ),
+                    (
+                        "nfs2",
+                        &["node-a::nfs2", "node-c::nfs2", "node-d::nfs2"][..],
+                    ),
+                    (
+                        "nfs3",
+                        &["node-b::nfs3", "node-d::nfs3", "node-e::nfs3"][..],
+                    ),
+                ],
+                2,
+            )])
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
     release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(10), replay)
+        .await
+        .expect("later old-roots source control replay should not hang")
+        .expect("join later old-roots source control replay")
+        .expect("later old-roots source control replay should settle");
 
     let response = request
         .await

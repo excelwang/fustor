@@ -304,12 +304,9 @@
             resource_ids: vec!["listener-a".to_string()],
             handle: active_facade,
         });
-        app.api_control_gate.set_ready(
-            FixedBindLifecycleMachine::from_facts(app.collect_fixed_bind_lifecycle_facts().await)
-                .snapshot()
-                .publication_ready,
-        );
+        app.api_control_gate.set_ready_state(true, false);
         let _ = app.current_facade_service_state().await;
+        app.api_control_gate.set_ready_state(true, false);
 
         let client = Client::new();
         let login = client

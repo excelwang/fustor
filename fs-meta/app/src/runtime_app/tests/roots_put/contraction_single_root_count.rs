@@ -124,6 +124,10 @@ async fn roots_put_contraction_returns_single_root_count_after_external_worker_u
         handle: active_facade,
     });
 
+    app.on_control_frame(&[activate_envelope(execution_units::SOURCE_RUNTIME_UNIT_ID)])
+        .await
+        .expect("initialize source runtime control before roots_put");
+
     let client = Client::new();
     let login = client
         .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
@@ -343,6 +347,10 @@ async fn roots_put_contraction_with_fs_source_selectors_returns_single_root_coun
         resource_ids: vec!["listener-a".to_string()],
         handle: active_facade,
     });
+
+    app.on_control_frame(&[activate_envelope(execution_units::SOURCE_RUNTIME_UNIT_ID)])
+        .await
+        .expect("initialize source runtime control before roots_put");
 
     let client = Client::new();
     let login = client

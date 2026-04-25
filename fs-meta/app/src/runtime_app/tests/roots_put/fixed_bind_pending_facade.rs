@@ -265,6 +265,19 @@ async fn pending_facade_exposure_confirmed_waits_for_inflight_roots_put_after_si
         resource_ids: vec!["listener-a".to_string()],
         handle: active_facade,
     });
+
+    app.apply_facade_activate(
+        FacadeRuntimeUnit::Facade,
+        &facade_control_stream_route(),
+        2,
+        &[RuntimeBoundScope {
+            scope_id: "test-root".to_string(),
+            resource_ids: vec!["listener-a".to_string()],
+        }],
+    )
+    .await
+    .expect("queue pending facade replacement");
+
     let client = Client::new();
     let login = client
         .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
@@ -279,6 +292,10 @@ async fn pending_facade_exposure_confirmed_waits_for_inflight_roots_put_after_si
     );
     let login_body: serde_json::Value = login.json().await.expect("decode login");
     let token = login_body["token"].as_str().expect("token").to_string();
+
+    app.on_control_frame(&[activate_envelope(execution_units::SOURCE_RUNTIME_UNIT_ID)])
+        .await
+        .expect("initialize source runtime control before roots_put");
 
     let update_entered = Arc::new(Notify::new());
     let update_release = Arc::new(Notify::new());
