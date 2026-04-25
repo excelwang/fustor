@@ -24,6 +24,7 @@ pub struct ApiRequestTracker {
 
 pub struct ApiControlGate {
     ready: AtomicBool,
+    management_write_ready: AtomicBool,
     epoch: AtomicU64,
     changed: Notify,
     facade_request_tracker: Arc<ApiRequestTracker>,
@@ -59,6 +60,7 @@ impl ApiControlGate {
     pub fn new(ready: bool) -> Self {
         Self {
             ready: AtomicBool::new(ready),
+            management_write_ready: AtomicBool::new(ready),
             epoch: AtomicU64::new(0),
             changed: Notify::new(),
             facade_request_tracker: Arc::new(ApiRequestTracker::default()),
@@ -69,11 +71,29 @@ impl ApiControlGate {
         self.ready.load(Ordering::Acquire)
     }
 
+    pub fn is_management_write_ready(&self) -> bool {
+        self.management_write_ready.load(Ordering::Acquire)
+    }
+
+    pub fn readiness_snapshot(&self) -> (bool, bool, u64) {
+        (
+            self.is_ready(),
+            self.is_management_write_ready(),
+            self.epoch(),
+        )
+    }
+
     pub fn set_ready(&self, ready: bool) {
-        if !ready {
+        self.set_ready_state(ready, ready);
+    }
+
+    pub fn set_ready_state(&self, ready: bool, management_write_ready: bool) {
+        if !ready || !management_write_ready {
             self.epoch.fetch_add(1, Ordering::AcqRel);
         }
         self.ready.store(ready, Ordering::Release);
+        self.management_write_ready
+            .store(management_write_ready, Ordering::Release);
         self.changed.notify_waiters();
     }
 
@@ -88,6 +108,19 @@ impl ApiControlGate {
             }
             let notified = self.changed.notified();
             if self.is_ready() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_management_write_ready(&self) {
+        loop {
+            if self.is_management_write_ready() {
+                return;
+            }
+            let notified = self.changed.notified();
+            if self.is_management_write_ready() {
                 return;
             }
             notified.await;
@@ -124,4 +157,5 @@ pub struct ApiState {
     pub published_facade_status: PublishedFacadeStatusReader,
     pub published_rollout_status: PublishedRolloutStatusReader,
     pub request_tracker: Arc<ApiRequestTracker>,
+    pub control_gate: Arc<ApiControlGate>,
 }

@@ -11,5 +11,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 capanix-app-test-runtime-app = { path = "app" }
-capanix-app-sdk = "0.1.0"
-capanix-unit-entry-macros = "0.1.0"
+capanix-app-sdk = { path = "../../../../../capanix/crates/app-sdk" }
+capanix-unit-entry-macros = { path = "../../../../../capanix/crates/unit-entry-macros" }

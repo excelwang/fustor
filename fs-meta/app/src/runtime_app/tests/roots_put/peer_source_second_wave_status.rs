@@ -283,7 +283,34 @@
             .expect("join successor exact-shaped second wave")
             .expect("successor exact-shaped second wave after paused source.apply");
 
+        let source_status_snapshots = internal_source_status_snapshots_with_timeout(
+            boundary.clone(),
+            NodeId("node-d".into()),
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("peer-facing source-status after successor exact-shaped second wave");
+        assert!(
+            source_status_snapshots.iter().any(|snapshot| {
+                snapshot
+                    .scheduled_source_groups_by_node
+                    .get("node-a")
+                    .is_some_and(|groups| {
+                        groups
+                            == &vec!["nfs1".to_string(), "nfs2".to_string()]
+                    })
+                    && snapshot
+                        .scheduled_scan_groups_by_node
+                        .get("node-a")
+                        .is_some_and(|groups| {
+                            groups
+                                == &vec!["nfs1".to_string(), "nfs2".to_string()]
+                        })
+            }),
+            "peer-facing source-status must republish scheduled groups after the successor exact-shaped second wave completes: {source_status_snapshots:?}"
+        );
+
         successor.close().await.expect("close successor app");
         predecessor.close().await.expect("close predecessor app");
     }
-

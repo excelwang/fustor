@@ -94,6 +94,10 @@ path = "fs-meta/tests/specs_fs_meta_domain.rs"
 name = "fs_meta_api_e2e"
 path = "fs-meta/tests/fs_meta_api_e2e.rs"
 
+[[test]]
+name = "runtime_scope_e2e"
+path = "fs-meta/tests/runtime_scope_e2e.rs"
+
 [patch.crates-io]
 capanix-app-sdk = { path = "../capanix/crates/app-sdk" }
 capanix-config = { path = "../capanix/crates/config" }

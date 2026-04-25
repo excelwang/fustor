@@ -78,6 +78,12 @@ fn deep_interval_rounds_from_env() -> u64 {
     normalize_deep_interval_rounds(raw)
 }
 
+fn audit_watch_schedule_enabled() -> bool {
+    std::env::var("FS_META_SOURCE_AUDIT_SCHEDULE_WATCHES")
+        .ok()
+        .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+}
+
 fn directory_fingerprint(entries: &[HostFsDirEntry]) -> u64 {
     let mut parts = entries
         .iter()
@@ -130,7 +136,11 @@ fn host_fs_op_timeout() -> Duration {
 fn host_fs_timeout_error(op: &str, path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::TimedOut,
-        format!("{op} timed out after {:?} for {}", host_fs_op_timeout(), path.display()),
+        format!(
+            "{op} timed out after {:?} for {}",
+            host_fs_op_timeout(),
+            path.display()
+        ),
     )
 }
 
@@ -148,12 +158,10 @@ fn metadata_once_with_timeout(
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             Err(host_fs_timeout_error("metadata", &display_path))
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(io::Error::other(format!(
-                "metadata worker disconnected for {}",
-                display_path.display()
-            )))
-        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(format!(
+            "metadata worker disconnected for {}",
+            display_path.display()
+        ))),
     }
 }
 
@@ -195,10 +203,7 @@ fn metadata_with_retry(host_fs: Arc<dyn HostFs>, path: &Path) -> io::Result<Host
     Err(last.unwrap_or_else(|| io::Error::other("metadata retry exhausted")))
 }
 
-fn read_dir_with_retry(
-    host_fs: Arc<dyn HostFs>,
-    path: &Path,
-) -> io::Result<Vec<HostFsDirEntry>> {
+fn read_dir_with_retry(host_fs: Arc<dyn HostFs>, path: &Path) -> io::Result<Vec<HostFsDirEntry>> {
     let mut last = None::<io::Error>;
     for attempt in 1..=HOST_FS_RETRY_ATTEMPTS {
         match read_dir_once_with_timeout(Arc::clone(&host_fs), path.to_path_buf()) {
@@ -365,6 +370,15 @@ impl ParallelScanner {
         watch_scheduler: Option<Arc<Mutex<crate::source::watcher::WatchManager>>>,
         audit_round: u64,
     ) -> Vec<FileMetaRecord> {
+        if self.scan_workers <= 1 {
+            return self.parallel_walk_inline(
+                mtime_cache_ref,
+                drift_estimator,
+                watch_scheduler,
+                audit_round,
+            );
+        }
+
         let (work_tx, work_rx) = cb::unbounded::<PathBuf>();
         let (result_tx, result_rx) = cb::unbounded::<Vec<FileMetaRecord>>();
         let pending_dirs = Arc::new(AtomicUsize::new(1));
@@ -380,7 +394,7 @@ impl ParallelScanner {
         let dir_state_cache = Arc::clone(&self.dir_state_cache);
         let deep_scan_interval_rounds = self.deep_scan_interval_rounds;
         let root = self.root_path.clone();
-
+        let schedule_audit_watches = audit_watch_schedule_enabled();
         // Spawn workers
         let handles: Vec<_> = (0..self.scan_workers)
             .map(|_| {
@@ -393,9 +407,12 @@ impl ParallelScanner {
                 let dir_state_cache = Arc::clone(&dir_state_cache);
                 let drift_est = Arc::clone(drift_estimator);
                 let root = root.clone();
-                let watch_sched = watch_scheduler.clone();
+                let watch_sched = if schedule_audit_watches {
+                    watch_scheduler.clone()
+                } else {
+                    None
+                };
                 let host_fs = Arc::clone(&self.host_fs);
-
                 std::thread::spawn(move || {
                     loop {
                         // Use recv_timeout instead of blocking recv to avoid deadlock.
@@ -563,12 +580,11 @@ impl ParallelScanner {
                                         }
 
                                         let entry_path = entry.path;
+                                        let relative = watcher::make_relative(&entry_path, &root);
                                         match metadata_with_retry(Arc::clone(&host_fs), &entry_path) {
                                             Ok(meta) => {
                                                 let mtime_us = to_epoch_us(meta.modified);
                                                 let ctime_us = to_epoch_us(meta.created);
-                                                let relative =
-                                                    watcher::make_relative(&entry_path, &root);
                                                 records.push(FileMetaRecord::scan_update(
                                                     relative,
                                                     entry_path
@@ -643,6 +659,189 @@ impl ParallelScanner {
             };
         }
 
+        all_records
+    }
+
+    fn parallel_walk_inline(
+        &self,
+        mtime_cache_ref: &mut HashMap<PathBuf, f64>,
+        drift_estimator: &Arc<Mutex<DriftEstimator>>,
+        watch_scheduler: Option<Arc<Mutex<crate::source::watcher::WatchManager>>>,
+        audit_round: u64,
+    ) -> Vec<FileMetaRecord> {
+        let mut pending = vec![self.root_path.clone()];
+        let mut all_records = Vec::new();
+        let mut visited = HashSet::<(u64, u64)>::new();
+        let mut mtime_cache = std::mem::take(mtime_cache_ref);
+        let root = self.root_path.clone();
+        let schedule_audit_watches = audit_watch_schedule_enabled();
+        while let Some(dir_path) = pending.pop() {
+            let mut records = Vec::new();
+
+            if schedule_audit_watches {
+                if let Some(wm) = &watch_scheduler {
+                    let schedule_result = {
+                        let mut mgr = lock_or_recover(wm, "scanner.parallel_walk_inline.watch");
+                        mgr.schedule(&dir_path)
+                    };
+                    if let Err(e) = schedule_result {
+                        log::warn!(
+                            "Failed to schedule watch for {:?}: {}. Will rely on audit compensation",
+                            dir_path,
+                            e
+                        );
+                    }
+                }
+            }
+
+            let identity = match metadata_with_retry(Arc::clone(&self.host_fs), &dir_path) {
+                Ok(meta) => {
+                    let id = (
+                        meta.dev.unwrap_or(0),
+                        meta.ino.unwrap_or_else(|| derived_ino_for_path(&dir_path)),
+                    );
+                    if !visited.insert(id) {
+                        log::warn!("Symlink loop detected at {:?}", dir_path);
+                        continue;
+                    }
+                    Some(meta)
+                }
+                Err(e) => {
+                    log::warn!("Skipping directory {:?}: metadata failed: {}", dir_path, e);
+                    continue;
+                }
+            };
+
+            if let Some(meta) = identity {
+                let Some(mtime) = meta.modified else {
+                    log::warn!("Skipping directory {:?}: modified() missing", dir_path);
+                    continue;
+                };
+
+                let mtime_secs = mtime
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                let local_now = std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                lock_or_recover(
+                    drift_estimator,
+                    "scanner.parallel_walk_inline.push_scan_drift",
+                )
+                .push_scan_sample(mtime_secs, local_now);
+
+                let current_mtime = mtime_secs;
+                let mtime_unchanged = {
+                    let cached = mtime_cache.get(&dir_path).copied();
+                    let unchanged = cached.is_some_and(|c| (c - current_mtime).abs() < 1e-6);
+                    mtime_cache.insert(dir_path.clone(), current_mtime);
+                    unchanged
+                };
+
+                let entries = match read_dir_with_retry(Arc::clone(&self.host_fs), &dir_path) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        log::warn!("Skipping directory {:?}: read_dir failed: {}", dir_path, e);
+                        continue;
+                    }
+                };
+
+                let fingerprint = directory_fingerprint(&entries);
+                let should_deep_scan = {
+                    let mut states = lock_or_recover(
+                        &self.dir_state_cache,
+                        "scanner.parallel_walk_inline.dir_state_cache",
+                    );
+                    let state = states.entry(dir_path.clone()).or_default();
+                    let fingerprint_changed = match state.last_fingerprint {
+                        Some(previous) => previous != fingerprint,
+                        None => true,
+                    };
+                    let deep_due = match state.last_deep_round {
+                        Some(last) => {
+                            audit_round.saturating_sub(last) >= self.deep_scan_interval_rounds
+                        }
+                        None => true,
+                    };
+                    let should = !mtime_unchanged || fingerprint_changed || deep_due;
+                    state.last_fingerprint = Some(fingerprint);
+                    if should {
+                        state.last_deep_round = Some(audit_round);
+                    }
+                    should
+                };
+
+                let relative = watcher::make_relative(&dir_path, &root);
+                records.push(FileMetaRecord::scan_update(
+                    relative,
+                    dir_path
+                        .file_name()
+                        .map(|n| n.as_bytes().to_vec())
+                        .unwrap_or_default(),
+                    UnixStat {
+                        is_dir: true,
+                        size: 0,
+                        mtime_us: (current_mtime * 1_000_000.0) as u64,
+                        ctime_us: 0,
+                        dev: None,
+                        ino: None,
+                    },
+                    Vec::new(),
+                    0,
+                    !should_deep_scan,
+                ));
+
+                let parent_relative = watcher::make_relative(&dir_path, &root);
+                let parent_mtime_us = (current_mtime * 1_000_000.0) as u64;
+
+                for entry in entries {
+                    if entry.is_dir {
+                        pending.push(entry.path);
+                        continue;
+                    }
+
+                    if !should_deep_scan {
+                        continue;
+                    }
+
+                    let entry_path = entry.path;
+                    let relative = watcher::make_relative(&entry_path, &root);
+                    match metadata_with_retry(Arc::clone(&self.host_fs), &entry_path) {
+                        Ok(meta) => {
+                            let mtime_us = to_epoch_us(meta.modified);
+                            let ctime_us = to_epoch_us(meta.created);
+                            records.push(FileMetaRecord::scan_update(
+                                relative,
+                                entry_path
+                                    .file_name()
+                                    .map(|n| n.as_bytes().to_vec())
+                                    .unwrap_or_default(),
+                                UnixStat {
+                                    is_dir: false,
+                                    size: meta.len,
+                                    mtime_us,
+                                    ctime_us,
+                                    dev: meta.dev,
+                                    ino: meta.ino,
+                                },
+                                parent_relative.clone(),
+                                parent_mtime_us,
+                                false,
+                            ));
+                        }
+                        Err(e) => {
+                            log::warn!("Skipping file {:?}: metadata failed: {}", entry_path, e)
+                        }
+                    }
+                }
+            }
+
+            all_records.extend(records);
+        }
+
+        *mtime_cache_ref = mtime_cache;
         all_records
     }
 

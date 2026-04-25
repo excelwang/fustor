@@ -248,7 +248,10 @@ async fn selected_group_materialized_route_reaches_external_owner_worker_twice_a
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     while tokio::time::Instant::now() < ready_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink_worker.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink_worker
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }

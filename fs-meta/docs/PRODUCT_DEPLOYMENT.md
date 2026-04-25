@@ -1,5 +1,10 @@
 # fs-meta 产品部署指南
 
+关联文档：
+
+- [部署工程师手册](./DEPLOYMENT_ENGINEER_MANUAL.md)
+- [Demo 产品说明书](./DEMO_PRODUCT_GUIDE.md)
+
 ## 概览
 
 fs-meta 的正式用户路径分成两段：
@@ -8,6 +13,9 @@ fs-meta 的正式用户路径分成两段：
 2. 再部署 `fs-meta` 产品，登录 fs-meta 管理面，发现 runtime grants，并配置 `roots`。
 
 正式路径固定为：用户维护 bootstrap config、在线资源公告、fs-meta 产品配置与版本投放；roots 通过 `ui/` 在线选择，不要求手填 selector。
+
+如果存在独立控制机或代码仓库机，它只负责下发命令、保存仓库或保存构建产物；是否成为运行节点，取决于它是否被纳入 runtime 部署目标。
+对当前 5 节点 demo，`fs-meta` 运行组件应全部部署在 `10.0.82.144~148`，不应默认落在仓库所在机器。
 
 ## 第 1 步：准备 capanix 底座
 
@@ -122,6 +130,39 @@ POST /api/fs-meta/v1/index/rescan
 
 正式 UI 不再暴露 `mount_point / host_ref / host_ip / fs_source / fs_type / watch / scan / audit_interval_ms` 的手工编辑表单。
 
+### 5-group / 10 亿文件演示示例
+
+如果这次部署的目标是现场展示“总共汇聚了 10 亿文件”，推荐直接采用：
+
+- 5 个 runtime grants
+- 5 条 monitoring roots
+- 5 个 logical groups
+
+而不是把 5 个来源讲成单一物理树。
+
+样例 roots 文件见：
+
+- [examples/monitoring-roots-5group.json](./examples/monitoring-roots-5group.json)
+
+样例做法是：
+
+1. 每条 root 用 `host_ip + mount_point` 约束到唯一 grant。
+2. 每条 root 的 `subpath_scope=/`。
+3. apply 完 roots 后，等 `/status` 中每个 group 达到可读状态。
+4. 再用查询 key 调 `/stats`，读取 5 个 group 的 `total_files` 并汇总。
+
+样例汇总脚本见：
+
+- [examples/demo-aggregate-10e8.sh](./examples/demo-aggregate-10e8.sh)
+
+这个脚本只生成 `/stats` 展示口径，不代表 full-NFS 验收完成。full demo 验收必须同时检查 `/status` 中的 artifact evidence、roots/grants、source `coverage_mode`/`coverage_capabilities`、sink `materialization_readiness`。如果 metadata audit 被关闭或不可用，结果应标记为 metadata 降级，而不是完整通过。
+
+推荐对外表述：
+
+- fs-meta 把 5 个独立文件源纳入一个统一产品边界
+- `/stats` 按 group 给出稳定统计结果
+- 当前 5 个 groups 合计约 10 亿文件
+
 ## 业务参数分层
 
 在当前基线中，操作员真正配置的是三类东西：
@@ -161,3 +202,9 @@ fsmeta local start --workdir .fsmeta-local --config fs-meta/docs/examples/fs-met
 ## 非正式路径
 
 当前产品路径不再暴露静态监听地址。operator 通过 `api.facade_resource_id` 选择被公告的 `tcp_listener` 资源，并继续使用 deploy / `ui/` / runtime grants 路径。
+
+## 关联样例
+
+- [examples/fs-meta.yaml](./examples/fs-meta.yaml)
+- [examples/monitoring-roots-5group.json](./examples/monitoring-roots-5group.json)
+- [examples/demo-aggregate-10e8.sh](./examples/demo-aggregate-10e8.sh)

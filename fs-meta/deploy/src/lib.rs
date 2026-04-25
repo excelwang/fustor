@@ -17,8 +17,11 @@ use fs_meta::product_model::routes::{
     ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_KEY_SOURCE_FIND_INTERNAL,
     ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
     ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, sink_query_request_route_for,
-    sink_query_route_key_for,
+    sink_query_route_key_for, sink_roots_control_route_key_for, source_find_request_route_for,
+    source_find_route_key_for, source_roots_control_route_key_for,
 };
+
+const EMPTY_ROOTS_BOOTSTRAP_CONTROL_SCOPE_ID: &str = "__fsmeta_empty_roots_bootstrap";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -84,6 +87,15 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
     if let Some(worker_module_path) = spec.worker_module_path.as_deref() {
         config["workers"] = build_worker_config_json(worker_module_path, spec.worker_modes);
     }
+    if config.get("workers").is_none() || config["workers"].is_null() {
+        config["workers"] = serde_json::json!({});
+    }
+    // The scope-worker declaration still owns a single top-level app worker.
+    // Keep that internal carrier embedded unless an explicit compiler path
+    // introduces a different top-level worker role.
+    config["workers"]["main"] = serde_json::json!({
+        "mode": "embedded"
+    });
     serde_json::json!({
         "schema_version": "scope-unit-intent-v1",
         "target_id": spec.app_id,
@@ -101,6 +113,12 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
                     "app_scopes": build_app_scopes_json(spec),
                     "route_units": build_route_units_json(spec),
                     "units": {
+                        "runtime.exec.source": {
+                            "enabled": true
+                        },
+                        "runtime.exec.sink": {
+                            "enabled": true
+                        },
                         "runtime.exec.query": {
                             "enabled": true
                         },
@@ -118,6 +136,12 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
                     "state_carrier": {
                         "enabled": true,
                         "units": {
+                            "runtime.exec.source": {
+                                "enabled": true
+                            },
+                            "runtime.exec.sink": {
+                                "enabled": true
+                            },
                             "runtime.exec.query": {
                                 "enabled": false
                             },
@@ -159,7 +183,7 @@ pub fn build_startup_manifest_value(
             base_manifest_path.display()
         ))
     })?;
-    ensure_scoped_sink_query_ports(&mut manifest, spec)?;
+    ensure_scoped_internal_request_reply_ports(&mut manifest, spec)?;
     Ok(manifest)
 }
 
@@ -209,15 +233,29 @@ fn activation_routes_from_manifest(
     routes
 }
 
-fn ensure_scoped_sink_query_ports(
+fn ensure_scoped_internal_request_reply_ports(
     manifest: &mut serde_yaml::Value,
     spec: &FsMetaReleaseSpec,
 ) -> Result<()> {
+    fn scoped_internal_use_port(base_use_port: &str, node_id: &str) -> String {
+        let node_suffix: String = node_id
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("{base_use_port}.{node_suffix}")
+    }
+
     let ports = manifest
         .get_mut("ports")
         .and_then(serde_yaml::Value::as_sequence_mut)
         .ok_or_else(|| CnxError::InvalidInput("fs-meta startup manifest missing ports[]".into()))?;
-    let template = ports
+    let sink_query_template = ports
         .iter()
         .find(|port| {
             port.get("route_key").and_then(serde_yaml::Value::as_str)
@@ -230,29 +268,119 @@ fn ensure_scoped_sink_query_ports(
                 ROUTE_KEY_SINK_QUERY_INTERNAL
             ))
         })?;
+    let source_find_template = ports
+        .iter()
+        .find(|port| {
+            port.get("route_key").and_then(serde_yaml::Value::as_str)
+                == Some(ROUTE_KEY_SOURCE_FIND_INTERNAL)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            CnxError::InvalidInput(format!(
+                "fs-meta startup manifest missing internal source-find port {}",
+                ROUTE_KEY_SOURCE_FIND_INTERNAL
+            ))
+        })?;
+    let source_roots_control_template = ports
+        .iter()
+        .find(|port| {
+            port.get("route_key").and_then(serde_yaml::Value::as_str)
+                == Some(ROUTE_KEY_SOURCE_ROOTS_CONTROL)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            CnxError::InvalidInput(format!(
+                "fs-meta startup manifest missing internal source-roots-control port {}",
+                ROUTE_KEY_SOURCE_ROOTS_CONTROL
+            ))
+        })?;
+    let sink_roots_control_template = ports
+        .iter()
+        .find(|port| {
+            port.get("route_key").and_then(serde_yaml::Value::as_str)
+                == Some(ROUTE_KEY_SINK_ROOTS_CONTROL)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            CnxError::InvalidInput(format!(
+                "fs-meta startup manifest missing internal sink-roots-control port {}",
+                ROUTE_KEY_SINK_ROOTS_CONTROL
+            ))
+        })?;
     for node_id in spec
         .route_plan_node_ids
         .iter()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>()
     {
-        let scoped_route_key = sink_query_route_key_for(&node_id);
-        let already_present = ports.iter().any(|port| {
-            port.get("route_key").and_then(serde_yaml::Value::as_str)
-                == Some(scoped_route_key.as_str())
-        });
-        if already_present {
-            continue;
+        for (scoped_route_key, template) in [
+            (
+                sink_query_route_key_for(&node_id),
+                sink_query_template.clone(),
+            ),
+            (
+                source_find_route_key_for(&node_id),
+                source_find_template.clone(),
+            ),
+            (
+                source_roots_control_route_key_for(&node_id),
+                source_roots_control_template.clone(),
+            ),
+            (
+                sink_roots_control_route_key_for(&node_id),
+                sink_roots_control_template.clone(),
+            ),
+        ] {
+            let already_present = ports.iter().any(|port| {
+                port.get("route_key").and_then(serde_yaml::Value::as_str)
+                    == Some(scoped_route_key.as_str())
+            });
+            if already_present {
+                continue;
+            }
+            let scoped_identity_template = matches!(
+                template
+                    .get("route_key")
+                    .and_then(serde_yaml::Value::as_str),
+                Some(
+                    ROUTE_KEY_SINK_QUERY_INTERNAL
+                        | ROUTE_KEY_SOURCE_FIND_INTERNAL
+                        | ROUTE_KEY_SOURCE_ROOTS_CONTROL
+                        | ROUTE_KEY_SINK_ROOTS_CONTROL
+                )
+            );
+            let base_use_port = if scoped_identity_template {
+                Some(
+                    template
+                        .get("use_port")
+                        .and_then(serde_yaml::Value::as_str)
+                        .ok_or_else(|| {
+                            CnxError::InvalidInput(
+                                "fs-meta startup manifest scoped internal port missing use_port"
+                                    .into(),
+                            )
+                        })?
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            let mut scoped_port = template;
+            let scoped_map = scoped_port.as_mapping_mut().ok_or_else(|| {
+                CnxError::InvalidInput("fs-meta startup manifest port must be a mapping".into())
+            })?;
+            scoped_map.insert(
+                serde_yaml::Value::String("route_key".into()),
+                serde_yaml::Value::String(scoped_route_key),
+            );
+            if let Some(base_use_port) = base_use_port.as_deref() {
+                scoped_map.insert(
+                    serde_yaml::Value::String("use_port".into()),
+                    serde_yaml::Value::String(scoped_internal_use_port(base_use_port, &node_id)),
+                );
+            }
+            ports.push(scoped_port);
         }
-        let mut scoped_port = template.clone();
-        let scoped_map = scoped_port.as_mapping_mut().ok_or_else(|| {
-            CnxError::InvalidInput("fs-meta startup manifest port must be a mapping".into())
-        })?;
-        scoped_map.insert(
-            serde_yaml::Value::String("route_key".into()),
-            serde_yaml::Value::String(scoped_route_key),
-        );
-        ports.push(scoped_port);
     }
     Ok(())
 }
@@ -295,6 +423,10 @@ fn scope_unit_intent_to_scope_worker_intent_value(
         .get("target_generation")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(1);
+    let route_plans = doc
+        .get("route_plans")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
     let workers = units
         .iter()
         .map(|entry| {
@@ -349,6 +481,7 @@ fn scope_unit_intent_to_scope_worker_intent_value(
         "schema_version": "scope-worker-declaration-v1",
         "target_id": target_id,
         "target_generation": target_generation,
+        "route_plans": route_plans,
         "workers": workers,
     }))
 }
@@ -381,6 +514,14 @@ fn build_route_plans_json(_spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
         .cloned()
         .collect::<std::collections::BTreeSet<_>>()
     {
+        push_plan(RouteKey(format!(
+            "{}.stream",
+            source_roots_control_route_key_for(&node_id)
+        )));
+        push_plan(RouteKey(format!(
+            "{}.stream",
+            sink_roots_control_route_key_for(&node_id)
+        )));
         push_plan(sink_query_request_route_for(&node_id));
     }
     push_plan(RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)));
@@ -390,6 +531,14 @@ fn build_route_plans_json(_spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
         ROUTE_KEY_SOURCE_STATUS_INTERNAL
     )));
     push_plan(RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)));
+    for node_id in _spec
+        .route_plan_node_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        push_plan(source_find_request_route_for(&node_id));
+    }
     plans
 }
 
@@ -411,6 +560,17 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
         request_reply_activation_route_key(ROUTE_KEY_SOURCE_FIND_INTERNAL),
         serde_json::json!([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
     );
+    for node_id in spec
+        .route_plan_node_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        route_units.insert(
+            source_find_request_route_for(&node_id).0,
+            serde_json::json!([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
+        );
+    }
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
         serde_json::json!([SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID]),
@@ -441,6 +601,14 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
         .cloned()
         .collect::<std::collections::BTreeSet<_>>()
     {
+        route_units.insert(
+            stream_activation_route_key(&source_roots_control_route_key_for(&node_id)),
+            serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
+        );
+        route_units.insert(
+            stream_activation_route_key(&sink_roots_control_route_key_for(&node_id)),
+            serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+        );
         route_units.insert(
             sink_query_request_route_for(&node_id).0,
             serde_json::json!([SINK_RUNTIME_UNIT_ID]),
@@ -475,8 +643,45 @@ fn build_app_scopes_json(spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
         .iter()
         .map(root_spec_app_scope_json)
         .collect::<Vec<_>>();
+    if spec.roots.is_empty() {
+        scopes.push(empty_roots_bootstrap_app_scope_json());
+    }
     scopes.push(facade_app_scope_json(spec));
     scopes
+}
+
+fn empty_roots_bootstrap_app_scope_json() -> serde_json::Value {
+    // `roots=[]` is a valid deployed state. Keep source/query-peer control
+    // reachability alive across scope members so online roots apply can fan
+    // out later without predeclared business scopes. Also keep one sink
+    // execution slot alive so sink-owned public freshness routes such as
+    // `/on-demand-force-find` can become active once roots are applied online.
+    serde_json::json!({
+        "scope_id": EMPTY_ROOTS_BOOTSTRAP_CONTROL_SCOPE_ID,
+        "resource_ids": [],
+        "unit_scopes": [
+            {
+                "unit_id": SOURCE_RUNTIME_UNIT_ID,
+                "eligibility": "scope_members",
+                "cardinality": "all"
+            },
+            {
+                "unit_id": SOURCE_SCAN_RUNTIME_UNIT_ID,
+                "eligibility": "scope_members",
+                "cardinality": "all"
+            },
+            {
+                "unit_id": QUERY_PEER_RUNTIME_UNIT_ID,
+                "eligibility": "scope_members",
+                "cardinality": "all"
+            },
+            {
+                "unit_id": SINK_RUNTIME_UNIT_ID,
+                "eligibility": "scope_members",
+                "cardinality": "one"
+            }
+        ]
+    })
 }
 
 fn facade_app_scope_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
@@ -661,6 +866,40 @@ mod tests {
     }
 
     #[test]
+    fn route_plans_include_owner_scoped_internal_source_find_for_known_nodes() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let plans = build_route_plans_json(&spec);
+        let expected_routes = spec
+            .route_plan_node_ids
+            .iter()
+            .map(|node_id| source_find_request_route_for(node_id).0)
+            .collect::<Vec<_>>();
+
+        for expected_route in expected_routes {
+            let has_scoped_route = plans.iter().any(|plan| {
+                plan.get("route_key").and_then(serde_json::Value::as_str)
+                    == Some(expected_route.as_str())
+            });
+            assert!(
+                has_scoped_route,
+                "release route_plans must include owner-scoped internal source-find route {expected_route} when runtime node ids are known"
+            );
+        }
+    }
+
+    #[test]
     fn route_plans_include_internal_logical_roots_control_streams() {
         let spec = FsMetaReleaseSpec {
             app_id: "test-app".to_string(),
@@ -684,6 +923,39 @@ mod tests {
             assert!(
                 has_route,
                 "release route_plans must include internal logical-roots control stream {expected_route}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_plans_include_owner_scoped_internal_logical_roots_control_streams_for_known_nodes() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let plans = build_route_plans_json(&spec);
+        for expected_route in spec.route_plan_node_ids.iter().flat_map(|node_id| {
+            [
+                format!("{}.stream", source_roots_control_route_key_for(node_id)),
+                format!("{}.stream", sink_roots_control_route_key_for(node_id)),
+            ]
+        }) {
+            let has_route = plans.iter().any(|plan| {
+                plan.get("route_key").and_then(serde_json::Value::as_str)
+                    == Some(expected_route.as_str())
+            });
+            assert!(
+                has_route,
+                "release route_plans must include owner-scoped logical-roots control stream {expected_route} when runtime node ids are known"
             );
         }
     }
@@ -718,6 +990,73 @@ mod tests {
             assert!(
                 scoped_units.is_some(),
                 "release route_units must include owner-scoped internal sink-query route {expected_route} when runtime node ids are known"
+            );
+        }
+    }
+
+    #[test]
+    fn route_units_include_owner_scoped_internal_source_find_for_known_nodes() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let route_units = release_doc["units"][0]["runtime"]["route_units"].clone();
+        let route_units_map = route_units.as_object().expect("route_units object");
+
+        for expected_route in spec
+            .route_plan_node_ids
+            .iter()
+            .map(|node_id| source_find_request_route_for(node_id).0)
+        {
+            let scoped_units = route_units_map
+                .get(&expected_route)
+                .and_then(serde_json::Value::as_array);
+            assert!(
+                scoped_units.is_some(),
+                "release route_units must include owner-scoped internal source-find route {expected_route} when runtime node ids are known"
+            );
+        }
+    }
+
+    #[test]
+    fn route_units_include_owner_scoped_internal_logical_roots_control_streams_for_known_nodes() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let route_units = release_doc["units"][0]["runtime"]["route_units"]
+            .as_object()
+            .expect("route_units object");
+
+        for expected_route in spec.route_plan_node_ids.iter().flat_map(|node_id| {
+            [
+                format!("{}.stream", source_roots_control_route_key_for(node_id)),
+                format!("{}.stream", sink_roots_control_route_key_for(node_id)),
+            ]
+        }) {
+            assert!(
+                route_units.contains_key(&expected_route),
+                "release route_units must include owner-scoped logical-roots control stream {expected_route} when runtime node ids are known"
             );
         }
     }
@@ -775,6 +1114,261 @@ mod tests {
             assert!(
                 activation_routes.contains(&expected_route),
                 "startup manifest activation routes must cover internal logical-roots control stream {expected_route}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_manifest_activation_routes_cover_owner_scoped_internal_logical_roots_control_streams_for_known_nodes()
+     {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let manifest_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/manifests/fs-meta.yaml");
+        let manifest =
+            build_startup_manifest_value(&manifest_path, &spec).expect("load startup manifest");
+        let activation_routes = activation_routes_from_manifest(&manifest);
+
+        for expected_route in spec.route_plan_node_ids.iter().flat_map(|node_id| {
+            [
+                format!("{}.stream", source_roots_control_route_key_for(node_id)),
+                format!("{}.stream", sink_roots_control_route_key_for(node_id)),
+            ]
+        }) {
+            assert!(
+                activation_routes.contains(&expected_route),
+                "startup manifest activation routes must cover owner-scoped logical-roots control stream {expected_route}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_manifest_scoped_source_roots_control_ports_use_distinct_use_port_identity() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let manifest_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/manifests/fs-meta.yaml");
+        let manifest =
+            build_startup_manifest_value(&manifest_path, &spec).expect("load startup manifest");
+        let ports = manifest
+            .get("ports")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("ports sequence");
+
+        let generic_use_port = ports
+            .iter()
+            .find(|port| {
+                port.get("route_key").and_then(serde_yaml::Value::as_str)
+                    == Some(ROUTE_KEY_SOURCE_ROOTS_CONTROL)
+            })
+            .and_then(|port| port.get("use_port"))
+            .and_then(serde_yaml::Value::as_str)
+            .expect("generic source roots-control use_port");
+
+        for node_id in &spec.route_plan_node_ids {
+            let scoped_use_port = ports
+                .iter()
+                .find(|port| {
+                    port.get("route_key").and_then(serde_yaml::Value::as_str)
+                        == Some(source_roots_control_route_key_for(node_id).as_str())
+                })
+                .and_then(|port| port.get("use_port"))
+                .and_then(serde_yaml::Value::as_str)
+                .expect("scoped source roots-control use_port");
+            assert_ne!(
+                scoped_use_port, generic_use_port,
+                "scoped source roots-control ports must not reuse the generic use_port identity"
+            );
+            assert!(
+                scoped_use_port.contains("node_"),
+                "scoped source roots-control use_port should remain node-distinct for runtime attach identity: {scoped_use_port}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_manifest_scoped_sink_roots_control_ports_use_distinct_use_port_identity() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let manifest_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/manifests/fs-meta.yaml");
+        let manifest =
+            build_startup_manifest_value(&manifest_path, &spec).expect("load startup manifest");
+        let ports = manifest
+            .get("ports")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("ports sequence");
+
+        let generic_use_port = ports
+            .iter()
+            .find(|port| {
+                port.get("route_key").and_then(serde_yaml::Value::as_str)
+                    == Some(ROUTE_KEY_SINK_ROOTS_CONTROL)
+            })
+            .and_then(|port| port.get("use_port"))
+            .and_then(serde_yaml::Value::as_str)
+            .expect("generic sink roots-control use_port");
+
+        for node_id in &spec.route_plan_node_ids {
+            let scoped_use_port = ports
+                .iter()
+                .find(|port| {
+                    port.get("route_key").and_then(serde_yaml::Value::as_str)
+                        == Some(sink_roots_control_route_key_for(node_id).as_str())
+                })
+                .and_then(|port| port.get("use_port"))
+                .and_then(serde_yaml::Value::as_str)
+                .expect("scoped sink roots-control use_port");
+            assert_ne!(
+                scoped_use_port, generic_use_port,
+                "scoped sink roots-control ports must not reuse the generic use_port identity"
+            );
+            assert!(
+                scoped_use_port.contains("node_"),
+                "scoped sink roots-control use_port should remain node-distinct for runtime attach identity: {scoped_use_port}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_manifest_scoped_source_find_ports_use_distinct_use_port_identity() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let manifest_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/manifests/fs-meta.yaml");
+        let manifest =
+            build_startup_manifest_value(&manifest_path, &spec).expect("load startup manifest");
+        let ports = manifest
+            .get("ports")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("ports sequence");
+
+        let generic_use_port = ports
+            .iter()
+            .find(|port| {
+                port.get("route_key").and_then(serde_yaml::Value::as_str)
+                    == Some(ROUTE_KEY_SOURCE_FIND_INTERNAL)
+            })
+            .and_then(|port| port.get("use_port"))
+            .and_then(serde_yaml::Value::as_str)
+            .expect("generic source find use_port");
+
+        for node_id in &spec.route_plan_node_ids {
+            let scoped_use_port = ports
+                .iter()
+                .find(|port| {
+                    port.get("route_key").and_then(serde_yaml::Value::as_str)
+                        == Some(source_find_route_key_for(node_id).as_str())
+                })
+                .and_then(|port| port.get("use_port"))
+                .and_then(serde_yaml::Value::as_str)
+                .expect("scoped source find use_port");
+            assert_ne!(
+                scoped_use_port, generic_use_port,
+                "scoped source find ports must not reuse the generic use_port identity"
+            );
+            assert!(
+                scoped_use_port.contains("node_"),
+                "scoped source find use_port should remain node-distinct for runtime attach identity: {scoped_use_port}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_manifest_scoped_sink_query_ports_use_distinct_use_port_identity() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let manifest_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/manifests/fs-meta.yaml");
+        let manifest =
+            build_startup_manifest_value(&manifest_path, &spec).expect("load startup manifest");
+        let ports = manifest
+            .get("ports")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("ports sequence");
+
+        let generic_use_port = ports
+            .iter()
+            .find(|port| {
+                port.get("route_key").and_then(serde_yaml::Value::as_str)
+                    == Some(ROUTE_KEY_SINK_QUERY_INTERNAL)
+            })
+            .and_then(|port| port.get("use_port"))
+            .and_then(serde_yaml::Value::as_str)
+            .expect("generic sink query use_port");
+
+        for node_id in &spec.route_plan_node_ids {
+            let scoped_use_port = ports
+                .iter()
+                .find(|port| {
+                    port.get("route_key").and_then(serde_yaml::Value::as_str)
+                        == Some(sink_query_route_key_for(node_id).as_str())
+                })
+                .and_then(|port| port.get("use_port"))
+                .and_then(serde_yaml::Value::as_str)
+                .expect("scoped sink query use_port");
+            assert_ne!(
+                scoped_use_port, generic_use_port,
+                "scoped sink query ports must not reuse the generic use_port identity"
+            );
+            assert!(
+                scoped_use_port.contains("node_"),
+                "scoped sink query use_port should remain node-distinct for runtime attach identity: {scoped_use_port}"
             );
         }
     }
@@ -846,6 +1440,89 @@ mod tests {
     }
 
     #[test]
+    fn compile_relation_target_intent_preserves_scoped_logical_roots_control_route_units() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let declaration = scope_unit_intent_to_scope_worker_intent_value(&release_doc)
+            .expect("convert scope-unit intent to scope-worker intent");
+        let worker_runtime = declaration["workers"][0]["runtime"]
+            .as_object()
+            .expect("worker runtime object");
+        let route_units = worker_runtime
+            .get("route_units")
+            .and_then(serde_json::Value::as_object)
+            .expect("compiled route_units object");
+
+        for expected_route in spec.route_plan_node_ids.iter().flat_map(|node_id| {
+            [
+                format!("{}.stream", source_roots_control_route_key_for(node_id)),
+                format!("{}.stream", sink_roots_control_route_key_for(node_id)),
+            ]
+        }) {
+            assert!(
+                route_units.contains_key(&expected_route),
+                "compiled relation target intent must preserve scoped logical-roots control route {expected_route}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_relation_target_intent_preserves_route_plans() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec!["node-a".to_string(), "node-b".to_string()],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let expected = release_doc["route_plans"]
+            .as_array()
+            .cloned()
+            .expect("release route_plans array");
+        let declaration = scope_unit_intent_to_scope_worker_intent_value(&release_doc)
+            .expect("convert scope-unit intent to scope-worker intent");
+        let actual = declaration["route_plans"]
+            .as_array()
+            .cloned()
+            .expect("compiled declaration route_plans array");
+
+        assert_eq!(
+            actual, expected,
+            "compiled relation target intent must preserve top-level route_plans"
+        );
+        assert!(
+            actual.iter().any(|plan| {
+                plan.get("route_key").and_then(serde_json::Value::as_str)
+                    == Some(&format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL))
+            }),
+            "compiled relation target intent must keep generic internal source-status route plan",
+        );
+        assert!(
+            actual.iter().any(|plan| {
+                plan.get("route_key").and_then(serde_json::Value::as_str)
+                    == Some(&format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL))
+            }),
+            "compiled relation target intent must keep generic source logical-roots control route plan",
+        );
+    }
+
+    #[test]
     fn facade_state_carrier_is_disabled_for_resource_scoped_failover() {
         let spec = FsMetaReleaseSpec {
             app_id: "test-app".to_string(),
@@ -867,6 +1544,208 @@ mod tests {
         assert!(
             facade_state_carrier != Some(true),
             "resource-scoped one-cardinality facade must not stay pinned through runtime state carrier"
+        );
+    }
+
+    #[test]
+    fn release_runtime_units_include_source_and_sink_workers() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: Vec::new(),
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let runtime_units = release_doc["units"][0]["runtime"]["units"]
+            .as_object()
+            .expect("runtime units object");
+
+        for unit_id in ["runtime.exec.source", "runtime.exec.sink"] {
+            assert_eq!(
+                runtime_units
+                    .get(unit_id)
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|row| row.get("enabled"))
+                    .and_then(serde_json::Value::as_bool),
+                Some(true),
+                "release runtime.units must explicitly enable {unit_id}",
+            );
+        }
+    }
+
+    #[test]
+    fn release_state_carrier_keeps_source_and_sink_enabled() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: Vec::new(),
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let state_carrier_units = release_doc["units"][0]["runtime"]["state_carrier"]["units"]
+            .as_object()
+            .expect("state carrier units object");
+
+        for unit_id in ["runtime.exec.source", "runtime.exec.sink"] {
+            assert_eq!(
+                state_carrier_units
+                    .get(unit_id)
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|row| row.get("enabled"))
+                    .and_then(serde_json::Value::as_bool),
+                Some(true),
+                "release state_carrier.units must keep {unit_id} enabled",
+            );
+        }
+    }
+
+    #[test]
+    fn empty_roots_release_app_scopes_keep_runtime_bootstrap_control_scope() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: Vec::new(),
+            route_plan_node_ids: Vec::new(),
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let app_scopes = release_doc["units"][0]["runtime"]["app_scopes"]
+            .as_array()
+            .expect("app_scopes array");
+        let bootstrap = app_scopes
+            .iter()
+            .find(|scope| {
+                scope.get("scope_id").and_then(serde_json::Value::as_str)
+                    == Some(EMPTY_ROOTS_BOOTSTRAP_CONTROL_SCOPE_ID)
+            })
+            .expect("empty-roots bootstrap app scope");
+        assert_eq!(
+            bootstrap.get("resource_ids"),
+            Some(&serde_json::json!([])),
+            "empty-roots bootstrap scope must not bind business resource ids",
+        );
+        let unit_scopes = bootstrap["unit_scopes"]
+            .as_array()
+            .expect("bootstrap unit_scopes array");
+        for unit_id in [
+            SOURCE_RUNTIME_UNIT_ID,
+            SOURCE_SCAN_RUNTIME_UNIT_ID,
+            QUERY_PEER_RUNTIME_UNIT_ID,
+        ] {
+            let scope = unit_scopes
+                .iter()
+                .find(|row| row.get("unit_id").and_then(serde_json::Value::as_str) == Some(unit_id))
+                .unwrap_or_else(|| panic!("missing bootstrap unit scope for {unit_id}"));
+            assert_eq!(
+                scope.get("eligibility"),
+                Some(&serde_json::json!("scope_members")),
+                "bootstrap unit {unit_id} must stay cluster-reachable through scope_members",
+            );
+            assert_eq!(
+                scope.get("cardinality"),
+                Some(&serde_json::json!("all")),
+                "bootstrap unit {unit_id} must stay active on all scope members for empty-roots online reconfiguration",
+            );
+        }
+        let sink_scope = unit_scopes
+            .iter()
+            .find(|row| {
+                row.get("unit_id").and_then(serde_json::Value::as_str) == Some(SINK_RUNTIME_UNIT_ID)
+            })
+            .expect("missing bootstrap unit scope for runtime.exec.sink");
+        assert_eq!(
+            sink_scope.get("eligibility"),
+            Some(&serde_json::json!("scope_members")),
+            "bootstrap sink unit must stay schedulable across scope members before business scopes exist",
+        );
+        assert_eq!(
+            sink_scope.get("cardinality"),
+            Some(&serde_json::json!("one")),
+            "bootstrap sink unit must keep a single active owner before roots are applied online",
+        );
+    }
+
+    #[test]
+    fn nonempty_roots_release_app_scopes_do_not_add_empty_roots_bootstrap_scope() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: Vec::new(),
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let app_scopes = release_doc["units"][0]["runtime"]["app_scopes"]
+            .as_array()
+            .expect("app_scopes array");
+        assert!(
+            app_scopes.iter().all(|scope| {
+                scope.get("scope_id").and_then(serde_json::Value::as_str)
+                    != Some(EMPTY_ROOTS_BOOTSTRAP_CONTROL_SCOPE_ID)
+            }),
+            "non-empty roots release must not add the empty-roots bootstrap scope",
+        );
+    }
+
+    #[test]
+    fn release_config_keeps_internal_main_worker_embedded() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: Vec::new(),
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        assert_eq!(
+            release_doc["units"][0]["config"]["workers"]["main"]["mode"].as_str(),
+            Some("embedded"),
+            "release config must keep the top-level main worker embedded",
+        );
+    }
+
+    #[test]
+    fn compiled_worker_declaration_keeps_main_worker_embedded() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: Vec::new(),
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let declaration = scope_unit_intent_to_scope_worker_intent_value(&release_doc)
+            .expect("convert scope-unit intent to scope-worker intent");
+
+        assert_eq!(
+            declaration["workers"][0]["worker_role"].as_str(),
+            Some("main"),
+            "release intent still compiles a single top-level main worker",
+        );
+        assert_eq!(
+            declaration["workers"][0]["mode"].as_str(),
+            Some("embedded"),
+            "compiled main worker must stay embedded",
         );
     }
 }

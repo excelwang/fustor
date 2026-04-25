@@ -153,6 +153,7 @@ async fn load_materialized_status_snapshots_supplements_missing_route_sink_group
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -465,6 +466,7 @@ async fn load_materialized_status_snapshots_retries_routed_sink_status_when_firs
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink_facade_with_group(&grants)),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -682,6 +684,7 @@ async fn load_materialized_status_snapshots_retries_routed_sink_status_when_firs
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink_facade_with_group(&grants)),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -891,6 +894,7 @@ async fn load_materialized_status_snapshots_retries_routed_sink_status_when_firs
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -1101,6 +1105,7 @@ async fn load_materialized_status_snapshots_retries_routed_sink_status_when_firs
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -1367,6 +1372,7 @@ async fn load_materialized_status_snapshots_bounds_second_routed_sink_status_rec
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -1566,6 +1572,7 @@ async fn load_materialized_status_snapshots_supplements_empty_route_sink_groups_
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };

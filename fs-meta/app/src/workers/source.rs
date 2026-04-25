@@ -1428,93 +1428,107 @@ enum SourceScheduledGroupsRefreshRetryDisposition {
     Fail(SourceFailure),
 }
 
-fn classify_source_reconnect_retry(
+#[derive(Clone, Copy, Debug)]
+struct SourceRetryMachine {
     deadline: std::time::Instant,
-    err: CnxError,
-    after: SourceProgressState,
-) -> SourceReconnectRetryDisposition {
-    if !can_retry_update_logical_roots(&err) {
-        return SourceReconnectRetryDisposition::Fail(SourceFailure::from_cause(err));
-    }
-    if matches!(
-        classify_source_retry_budget(deadline),
-        SourceRetryBudgetDisposition::Exhausted
-    ) {
-        return SourceReconnectRetryDisposition::Fail(SourceFailure::retry_budget_exhausted(
-            SourceRetryBudgetExhaustionKind::OperationWait,
-        ));
-    }
-    SourceReconnectRetryDisposition::ReconnectAfter(after)
 }
 
-fn classify_source_wait_retry(
-    deadline: std::time::Instant,
-    err: CnxError,
-    after: SourceProgressState,
-    can_retry: impl FnOnce(&CnxError) -> bool,
-) -> SourceWaitRetryDisposition {
-    if !can_retry(&err) {
-        return SourceWaitRetryDisposition::Fail(SourceFailure::from_cause(err));
+impl SourceRetryMachine {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self { deadline }
     }
-    if matches!(
-        classify_source_retry_budget(deadline),
-        SourceRetryBudgetDisposition::Exhausted
-    ) {
-        return SourceWaitRetryDisposition::Fail(SourceFailure::retry_budget_exhausted(
-            SourceRetryBudgetExhaustionKind::OperationWait,
-        ));
-    }
-    SourceWaitRetryDisposition::WaitAfter(after)
-}
 
-fn classify_source_scheduled_groups_refresh_control_reset_retry(
-    deadline: std::time::Instant,
-    after: SourceProgressState,
-    refresh_disposition: SourceScheduledGroupsRefreshDisposition,
-    recovery_observation: SourceScheduledGroupsRefreshRecoveryObservation,
-) -> SourceScheduledGroupsRefreshRetryDisposition {
-    if matches!(
-        classify_source_retry_budget(deadline),
-        SourceRetryBudgetDisposition::Exhausted
-    ) {
-        return SourceScheduledGroupsRefreshRetryDisposition::Fail(
-            source_scheduled_groups_refresh_deadline_failure(
-                refresh_disposition,
-                recovery_observation,
-            ),
-        );
+    fn budget(&self) -> SourceRetryBudgetDisposition {
+        classify_source_retry_budget(self.deadline)
     }
-    SourceScheduledGroupsRefreshRetryDisposition::ReconnectAfter(after)
-}
 
-fn classify_source_scheduled_groups_refresh_retry_failure(
-    deadline: std::time::Instant,
-    failure: SourceFailure,
-    after: SourceProgressState,
-    refresh_disposition: SourceScheduledGroupsRefreshDisposition,
-    recovery_observation: SourceScheduledGroupsRefreshRecoveryObservation,
-) -> SourceScheduledGroupsRefreshRetryDisposition {
-    match failure.reason {
-        SourceFailureReason::RetryBudgetExhausted(_) => {
-            SourceScheduledGroupsRefreshRetryDisposition::Fail(
+    fn reconnect_after_update_roots_gap(
+        &self,
+        err: CnxError,
+        after: SourceProgressState,
+    ) -> SourceReconnectRetryDisposition {
+        if !can_retry_update_logical_roots(&err) {
+            return SourceReconnectRetryDisposition::Fail(SourceFailure::from_cause(err));
+        }
+        if matches!(self.budget(), SourceRetryBudgetDisposition::Exhausted) {
+            return SourceReconnectRetryDisposition::Fail(SourceFailure::retry_budget_exhausted(
+                SourceRetryBudgetExhaustionKind::OperationWait,
+            ));
+        }
+        SourceReconnectRetryDisposition::ReconnectAfter(after)
+    }
+
+    fn wait_after_retryable_gap(
+        &self,
+        err: CnxError,
+        after: SourceProgressState,
+        can_retry: impl FnOnce(&CnxError) -> bool,
+    ) -> SourceWaitRetryDisposition {
+        if !can_retry(&err) {
+            return SourceWaitRetryDisposition::Fail(SourceFailure::from_cause(err));
+        }
+        if matches!(self.budget(), SourceRetryBudgetDisposition::Exhausted) {
+            return SourceWaitRetryDisposition::Fail(SourceFailure::retry_budget_exhausted(
+                SourceRetryBudgetExhaustionKind::OperationWait,
+            ));
+        }
+        SourceWaitRetryDisposition::WaitAfter(after)
+    }
+
+    fn scheduled_groups_refresh_after_error(
+        &self,
+        err: CnxError,
+        after: SourceProgressState,
+        refresh_disposition: SourceScheduledGroupsRefreshDisposition,
+        recovery_observation: SourceScheduledGroupsRefreshRecoveryObservation,
+    ) -> SourceScheduledGroupsRefreshRetryDisposition {
+        if !can_retry_update_logical_roots(&err) {
+            return SourceScheduledGroupsRefreshRetryDisposition::Fail(
+                source_scheduled_groups_refresh_failure_from_error(
+                    err,
+                    refresh_disposition,
+                    recovery_observation,
+                ),
+            );
+        }
+        if matches!(self.budget(), SourceRetryBudgetDisposition::Exhausted) {
+            return SourceScheduledGroupsRefreshRetryDisposition::Fail(
                 source_scheduled_groups_refresh_deadline_failure(
                     refresh_disposition,
                     recovery_observation,
                 ),
-            )
+            );
         }
-        SourceFailureReason::RefreshExhausted(_)
-        | SourceFailureReason::ProtocolViolation(_)
-        | SourceFailureReason::NonRetryable => {
-            SourceScheduledGroupsRefreshRetryDisposition::Fail(failure)
-        }
-        SourceFailureReason::ControlReset(_) => {
-            classify_source_scheduled_groups_refresh_control_reset_retry(
-                deadline,
+        SourceScheduledGroupsRefreshRetryDisposition::ReconnectAfter(after)
+    }
+
+    fn scheduled_groups_refresh_after_failure(
+        &self,
+        failure: SourceFailure,
+        after: SourceProgressState,
+        refresh_disposition: SourceScheduledGroupsRefreshDisposition,
+        recovery_observation: SourceScheduledGroupsRefreshRecoveryObservation,
+    ) -> SourceScheduledGroupsRefreshRetryDisposition {
+        match failure.reason {
+            SourceFailureReason::RetryBudgetExhausted(_) => {
+                SourceScheduledGroupsRefreshRetryDisposition::Fail(
+                    source_scheduled_groups_refresh_deadline_failure(
+                        refresh_disposition,
+                        recovery_observation,
+                    ),
+                )
+            }
+            SourceFailureReason::RefreshExhausted(_)
+            | SourceFailureReason::ProtocolViolation(_)
+            | SourceFailureReason::NonRetryable => {
+                SourceScheduledGroupsRefreshRetryDisposition::Fail(failure)
+            }
+            SourceFailureReason::ControlReset(_) => self.scheduled_groups_refresh_after_error(
+                failure.into_error(),
                 after,
                 refresh_disposition,
                 recovery_observation,
-            )
+            ),
         }
     }
 }
@@ -1821,7 +1835,11 @@ impl SourceForceFindMachine {
                 rpc_result: Err(err),
                 after,
             } => Ok(
-                match classify_source_wait_retry(self.deadline, err, after, can_retry_force_find) {
+                match SourceRetryMachine::new(self.deadline).wait_after_retryable_gap(
+                    err,
+                    after,
+                    can_retry_force_find,
+                ) {
                     SourceWaitRetryDisposition::WaitAfter(after) => {
                         SourceForceFindEffect::Wait { after }
                     }
@@ -1865,7 +1883,9 @@ impl SourceScheduledGroupIdsMachine {
                 rpc_result: Err(err),
                 after,
             } => Ok(
-                match classify_source_reconnect_retry(self.deadline, err, after) {
+                match SourceRetryMachine::new(self.deadline)
+                    .reconnect_after_update_roots_gap(err, after)
+                {
                     SourceReconnectRetryDisposition::ReconnectAfter(after) => {
                         self.pending_reconnect_wait_after = Some(after);
                         SourceScheduledGroupIdsEffect::Reconnect
@@ -1926,8 +1946,7 @@ impl SourceUpdateLogicalRootsMachine {
                 rpc_result: Err(err),
                 after,
             } => Ok(
-                match classify_source_wait_retry(
-                    self.deadline,
+                match SourceRetryMachine::new(self.deadline).wait_after_retryable_gap(
                     err,
                     after,
                     can_retry_update_logical_roots,
@@ -1972,8 +1991,7 @@ impl SourceObservabilitySnapshotMachine {
                 rpc_result: Err(err),
                 after,
             } => Ok(
-                match classify_source_wait_retry(
-                    self.deadline,
+                match SourceRetryMachine::new(self.deadline).wait_after_retryable_gap(
                     err,
                     after,
                     can_retry_update_logical_roots,
@@ -2021,7 +2039,9 @@ impl SourceStartMachine {
                 start_result: Err(err),
                 after,
             } => Ok(
-                match classify_source_reconnect_retry(self.deadline, err, after) {
+                match SourceRetryMachine::new(self.deadline)
+                    .reconnect_after_update_roots_gap(err, after)
+                {
                     SourceReconnectRetryDisposition::ReconnectAfter(after) => {
                         self.pending_reconnect_wait_after = Some(after);
                         SourceStartEffect::Reconnect
@@ -2073,7 +2093,9 @@ impl SourceReplayRetainedControlStateMachine {
             SourceReplayRetainedControlStateEvent::AttemptCompleted {
                 rpc_result: Err(err),
                 after,
-            } => match classify_source_reconnect_retry(self.deadline, err, after) {
+            } => match SourceRetryMachine::new(self.deadline)
+                .reconnect_after_update_roots_gap(err, after)
+            {
                 SourceReconnectRetryDisposition::ReconnectAfter(after) => {
                     self.pending_reconnect_wait_after = Some(after);
                     SourceReplayRetainedControlStateEffect::Reconnect
@@ -2130,8 +2152,7 @@ impl SourceScheduledGroupsRefreshMachine {
         failure: SourceFailure,
         after: SourceProgressState,
     ) -> SourceScheduledGroupsRefreshEffect {
-        match classify_source_scheduled_groups_refresh_retry_failure(
-            self.deadline,
+        match SourceRetryMachine::new(self.deadline).scheduled_groups_refresh_after_failure(
             failure,
             after,
             self.refresh_disposition,
@@ -2297,6 +2318,12 @@ fn host_ref_matches_node_id(host_ref: &str, node_id: &NodeId) -> bool {
             .0
             .strip_prefix(host_ref)
             .is_some_and(|suffix| suffix.starts_with('-'))
+        || node_id.0.strip_prefix("cluster-").is_some_and(|scoped| {
+            scoped == host_ref
+                || scoped
+                    .strip_prefix(host_ref)
+                    .is_some_and(|suffix| suffix.starts_with('-'))
+        })
 }
 
 fn stable_host_ref_for_node_id(node_id: &NodeId, grants: &[GrantedMountRoot]) -> String {
@@ -2811,6 +2838,30 @@ fn prime_cached_schedule_from_control_signals_for_replay_recovery(
     replace_groups(
         &mut cache.replay_recovery_scheduled_scan_groups_by_node,
         desired_scan,
+    );
+}
+
+#[test]
+fn source_retry_machine_removes_legacy_retry_classifier_helpers() {
+    let source = include_str!("source.rs");
+    assert!(
+        source.contains(concat!("struct ", "SourceRetryMachine")),
+        "source retry ownership should stay explicit in SourceRetryMachine",
+    );
+    assert!(
+        !source.contains(concat!("fn ", "classify_source_reconnect_retry")),
+        "source retry hard cut should not leave standalone reconnect classifier helpers",
+    );
+    assert!(
+        !source.contains(concat!("fn ", "classify_source_wait_retry")),
+        "source retry hard cut should not leave standalone wait classifier helpers",
+    );
+    assert!(
+        !source.contains(concat!(
+            "fn ",
+            "classify_source_scheduled_groups_refresh_retry_failure"
+        )),
+        "source retry hard cut should not leave standalone scheduled-groups classifier helpers",
     );
 }
 
@@ -7975,7 +8026,12 @@ impl SourceFacade {
         &self,
     ) -> std::result::Result<SourceStatusSnapshot, SourceFailure> {
         match self {
-            Self::Local(source) => source.status_snapshot_with_failure(),
+            Self::Local(source) => {
+                let _ = source
+                    .sync_logical_roots_from_authoritative_cell_if_changed()
+                    .await;
+                source.status_snapshot_with_failure()
+            }
             Self::Worker(client) => client.status_snapshot_with_failure().await,
         }
     }
@@ -8080,7 +8136,12 @@ impl SourceFacade {
         params: &InternalQueryRequest,
     ) -> std::result::Result<Vec<Event>, SourceFailure> {
         match self {
-            Self::Local(source) => source.force_find_with_failure(params),
+            Self::Local(source) => {
+                let _ = source
+                    .sync_logical_roots_from_authoritative_cell_if_changed()
+                    .await;
+                source.force_find_with_failure(params)
+            }
             Self::Worker(client) => client.force_find_with_failure(params.clone()).await,
         }
     }
@@ -8164,7 +8225,12 @@ impl SourceFacade {
         &self,
     ) -> std::result::Result<SourceObservabilitySnapshot, SourceFailure> {
         match self {
-            Self::Local(source) => source.observability_snapshot_with_failure(),
+            Self::Local(source) => {
+                let _ = source
+                    .sync_logical_roots_from_authoritative_cell_if_changed()
+                    .await;
+                source.observability_snapshot_with_failure()
+            }
             Self::Worker(client) => {
                 client
                     .observability_snapshot_with_timeout_with_failure(
@@ -8179,7 +8245,12 @@ impl SourceFacade {
         &self,
     ) -> (SourceObservabilitySnapshot, bool) {
         match self {
-            Self::Local(source) => source.observability_snapshot_nonblocking_for_status_route(),
+            Self::Local(source) => {
+                let _ = source
+                    .sync_logical_roots_from_authoritative_cell_if_changed()
+                    .await;
+                source.observability_snapshot_nonblocking_for_status_route()
+            }
             Self::Worker(client) => {
                 client
                     .observability_snapshot_nonblocking_for_status_route()

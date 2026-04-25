@@ -21,7 +21,7 @@ use fs_meta::RootSpec as RootEntry;
 use fs_meta::api::{ApiAuthConfig, BootstrapManagementConfig};
 use fs_meta_deploy::{
     FsMetaReleaseSpec, FsMetaReleaseWorkerMode, FsMetaReleaseWorkerModes, build_release_doc_value,
-    compile_release_doc_to_relation_target_intent,
+    compile_release_doc_to_relation_target_intent, write_startup_manifest,
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -270,13 +270,22 @@ async fn deploy(args: DeployArgs) -> anyhow::Result<serde_json::Value> {
     let state_dir = prepare_state_dir(args.config.parent(), ".fsmeta-state")?;
     let (auth_cfg, username, password) = build_auth_config(&product.auth, &state_dir);
     let (app_target, manifest_path) = resolve_fs_meta_runtime_inputs()?;
-    let intent = build_deploy_intent(&product, auth_cfg, &app_target, &manifest_path)?;
     let control = ControlClient::from_args(&args.control)?;
+    let route_plan_node_ids = control.discover_route_plan_node_ids().await?;
+    let intent = build_deploy_intent(
+        &product,
+        auth_cfg,
+        &app_target,
+        &manifest_path,
+        &state_dir,
+        route_plan_node_ids.clone(),
+    )?;
     let result = control.apply_relation_target_intent(&intent).await?;
     Ok(json!({
         "status": "ok",
         "app_id": DEFAULT_APP_ID,
         "api_facade_resource_id": product.api.facade_resource_id,
+        "route_plan_node_ids": route_plan_node_ids,
         "bootstrap_management": {
             "username": username,
             "password": password,
@@ -729,18 +738,25 @@ fn build_deploy_intent(
     product: &ProductConfig,
     auth: ApiAuthConfig,
     app_target: &Path,
-    manifest_path: &Path,
+    base_manifest_path: &Path,
+    generated_manifest_dir: &Path,
+    route_plan_node_ids: Vec<String>,
 ) -> anyhow::Result<serde_json::Value> {
     let worker_modes = resolve_release_worker_modes(product)?;
-    let mut release_doc = build_release_doc_value(&FsMetaReleaseSpec {
+    let spec = FsMetaReleaseSpec {
         app_id: DEFAULT_APP_ID.to_string(),
         api_facade_resource_id: product.api.facade_resource_id.clone(),
         auth,
         roots: Vec::new(),
-        route_plan_node_ids: Vec::new(),
+        route_plan_node_ids,
         worker_module_path: Some(app_target.to_path_buf()),
         worker_modes,
-    });
+    };
+    let generated_manifest_path =
+        generated_manifest_dir.join(format!("fs-meta-startup-{}.yaml", now_us()));
+    write_startup_manifest(base_manifest_path, &spec, &generated_manifest_path)
+        .map_err(|err| anyhow::anyhow!("generate fs-meta startup manifest failed: {err}"))?;
+    let mut release_doc = build_release_doc_value(&spec);
     let target_generation = release_doc
         .get("target_generation")
         .and_then(serde_json::Value::as_u64)
@@ -757,7 +773,7 @@ fn build_deploy_intent(
     startup.insert("path".into(), json!(app_target.display().to_string()));
     startup.insert(
         "manifest".into(),
-        json!(manifest_path.display().to_string()),
+        json!(generated_manifest_path.display().to_string()),
     );
     let policy = unit
         .get_mut("policy")
@@ -878,6 +894,18 @@ impl ControlClient {
             .await
     }
 
+    async fn discover_route_plan_node_ids(&self) -> anyhow::Result<Vec<String>> {
+        let config_dump = self.run_cnxctl(&["config", "dump"]).await?;
+        let node_ids = derive_route_plan_node_ids_from_config_dump(&config_dump);
+        if node_ids.is_empty() {
+            bail!(
+                "route plan node discovery returned no nodes from control socket {}",
+                self.socket_path
+            );
+        }
+        Ok(node_ids)
+    }
+
     async fn run_cnxctl(&self, args: &[&str]) -> anyhow::Result<serde_json::Value> {
         let bin = resolve_cnxctl_bin();
         let output = Command::new(&bin)
@@ -950,6 +978,47 @@ fn resolve_cnxctl_bin() -> PathBuf {
     PathBuf::from("cnxctl")
 }
 
+fn derive_route_plan_node_ids_from_config_dump(config_dump: &serde_json::Value) -> Vec<String> {
+    let mut node_ids = std::collections::BTreeSet::new();
+
+    if let Some(node_id) = config_dump
+        .get("node_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        if !node_id.is_empty() {
+            node_ids.insert(node_id.to_string());
+        }
+    }
+
+    if let Some(resources) = config_dump
+        .get("announced_resources")
+        .and_then(serde_json::Value::as_array)
+    {
+        for resource in resources {
+            if let Some(node_id) = resource.get("node_id").and_then(serde_json::Value::as_str) {
+                if !node_id.is_empty() {
+                    node_ids.insert(node_id.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(peers) = config_dump
+        .get("management_peers")
+        .and_then(serde_json::Value::as_array)
+    {
+        for peer in peers {
+            if let Some(node_id) = peer.get("node_id").and_then(serde_json::Value::as_str) {
+                if !node_id.is_empty() {
+                    node_ids.insert(node_id.to_string());
+                }
+            }
+        }
+    }
+
+    node_ids.into_iter().collect()
+}
+
 fn write_runtime_admin_temp_file(
     prefix: &str,
     value: &serde_json::Value,
@@ -963,8 +1032,8 @@ fn write_runtime_admin_temp_file(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProductAuthConfig, build_auth_config, build_deploy_intent, load_product_config,
-        workspace_root,
+        ProductAuthConfig, build_auth_config, build_deploy_intent,
+        derive_route_plan_node_ids_from_config_dump, load_product_config, workspace_root,
     };
     use serde_json::json;
     use std::fs;
@@ -1063,8 +1132,15 @@ mod tests {
             .canonicalize()
             .expect("fixture manifest path");
         let app_target = PathBuf::from("/tmp/fs-meta-runtime.so");
-        let intent = build_deploy_intent(&product, auth_cfg, &app_target, &manifest)
-            .expect("deploy intent should compile through shared config boundary");
+        let intent = build_deploy_intent(
+            &product,
+            auth_cfg,
+            &app_target,
+            &manifest,
+            &dir,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        )
+        .expect("deploy intent should compile through shared config boundary");
 
         assert_eq!(
             intent["schema_version"],
@@ -1078,9 +1154,16 @@ mod tests {
         let worker = &workers_array[0];
         assert_eq!(worker["worker_role"], json!("main"));
         assert_eq!(worker["startup"]["path"], json!("/tmp/fs-meta-runtime.so"));
-        assert_eq!(
-            worker["startup"]["manifest"],
-            json!(manifest.to_string_lossy().as_ref())
+        let generated_manifest = worker["startup"]["manifest"]
+            .as_str()
+            .expect("compiled startup manifest path");
+        assert!(
+            generated_manifest.starts_with(dir.to_string_lossy().as_ref()),
+            "generated startup manifest should live under the deploy state dir: {generated_manifest}"
+        );
+        assert!(
+            PathBuf::from(generated_manifest).exists(),
+            "generated startup manifest must be materialized on disk"
         );
         let workers = worker["config"]["workers"]
             .as_object()
@@ -1142,8 +1225,15 @@ mod tests {
             .canonicalize()
             .expect("fixture manifest path");
         let app_target = PathBuf::from("/tmp/fs-meta-runtime.so");
-        let intent = build_deploy_intent(&product, auth_cfg, &app_target, &manifest)
-            .expect("deploy intent should compile through shared config boundary");
+        let intent = build_deploy_intent(
+            &product,
+            auth_cfg,
+            &app_target,
+            &manifest,
+            &dir,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        )
+        .expect("deploy intent should compile through shared config boundary");
         let workers = intent["workers"][0]["config"]["workers"]
             .as_object()
             .expect("compiled fs-meta release config should declare workers");
@@ -1182,6 +1272,35 @@ mod tests {
         assert!(
             err_text.contains("parse config") && err_text.contains("unknown field `scan`"),
             "unexpected parse error: {err_text}"
+        );
+    }
+
+    #[test]
+    fn route_plan_node_discovery_collects_unique_nodes_from_config_dump() {
+        let dump = json!({
+            "node_id": "panda145",
+            "announced_resources": [
+                {"node_id": "panda144"},
+                {"node_id": "panda145"},
+                {"node_id": "panda147"}
+            ],
+            "management_peers": [
+                {"node_id": "panda146"},
+                {"node_id": "panda147"},
+                {"node_id": ""}
+            ]
+        });
+
+        let actual = derive_route_plan_node_ids_from_config_dump(&dump);
+
+        assert_eq!(
+            actual,
+            vec![
+                "panda144".to_string(),
+                "panda145".to_string(),
+                "panda146".to_string(),
+                "panda147".to_string(),
+            ]
         );
     }
 }

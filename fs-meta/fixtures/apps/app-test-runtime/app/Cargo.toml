@@ -8,6 +8,6 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-capanix-app-sdk = "0.1.0"
+capanix-app-sdk = { path = "../../../../../../capanix/crates/app-sdk" }
 async-trait = "0.1"
 bytes = "1"

@@ -98,6 +98,18 @@
             handle: active_facade,
         });
 
+        app.apply_facade_activate(
+            FacadeRuntimeUnit::Facade,
+            &facade_control_stream_route(),
+            2,
+            &[RuntimeBoundScope {
+                scope_id: "test-root".to_string(),
+                resource_ids: vec!["listener-a".to_string()],
+            }],
+        )
+        .await
+        .expect("queue pending facade replacement");
+
         let client = Client::new();
         let login = client
             .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
@@ -112,6 +124,10 @@
         );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
+
+        app.on_control_frame(&[activate_envelope(execution_units::SOURCE_RUNTIME_UNIT_ID)])
+            .await
+            .expect("initialize source runtime control before roots_put");
 
         let update_entered = Arc::new(Notify::new());
         let update_release = Arc::new(Notify::new());
@@ -158,14 +174,10 @@
         let control_task = tokio::spawn({
             let app = app.clone();
             async move {
-                app.on_control_frame(&[
-                    activate_envelope_with_scopes(
-                        execution_units::FACADE_RUNTIME_UNIT_ID,
-                        "test-root",
-                        &["listener-a"],
-                    ),
-                    trusted_exposure_confirmed_envelope(execution_units::FACADE_RUNTIME_UNIT_ID, 1),
-                ])
+                app.on_control_frame(&[trusted_exposure_confirmed_envelope(
+                    execution_units::FACADE_RUNTIME_UNIT_ID,
+                    2,
+                )])
                 .await
             }
         });
@@ -295,6 +307,18 @@
             handle: active_facade,
         });
 
+        app.apply_facade_activate(
+            FacadeRuntimeUnit::Facade,
+            &facade_control_stream_route(),
+            2,
+            &[RuntimeBoundScope {
+                scope_id: "test-root".to_string(),
+                resource_ids: vec!["listener-a".to_string()],
+            }],
+        )
+        .await
+        .expect("queue pending facade replacement");
+
         let client = Client::new();
         let login = client
             .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
@@ -309,6 +333,10 @@
         );
         let login_body: serde_json::Value = login.json().await.expect("decode login");
         let token = login_body["token"].as_str().expect("token").to_string();
+
+        app.on_control_frame(&[activate_envelope(execution_units::SOURCE_RUNTIME_UNIT_ID)])
+            .await
+            .expect("initialize source runtime control before roots_put");
 
         let update_entered = Arc::new(Notify::new());
         let update_release = Arc::new(Notify::new());
@@ -355,14 +383,10 @@
         let control_task = tokio::spawn({
             let app = app.clone();
             async move {
-                app.on_control_frame(&[
-                    activate_envelope_with_scopes(
-                        execution_units::FACADE_RUNTIME_UNIT_ID,
-                        "test-root",
-                        &["listener-a"],
-                    ),
-                    trusted_exposure_confirmed_envelope(execution_units::FACADE_RUNTIME_UNIT_ID, 1),
-                ])
+                app.on_control_frame(&[trusted_exposure_confirmed_envelope(
+                    execution_units::FACADE_RUNTIME_UNIT_ID,
+                    2,
+                )])
                 .await
             }
         });
@@ -391,4 +415,3 @@
             .expect("handle facade reactivation after roots_put");
         app.close().await.expect("close app");
     }
-

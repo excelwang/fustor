@@ -150,6 +150,7 @@ fn assert_status_monitoring_shape(status: &HttpResponse) {
         .json
         .as_ref()
         .expect("status response should be json payload");
+    assert_status_top_level_evidence(body, status);
     let source = body
         .get("source")
         .expect("status.source must exist on management status");
@@ -467,6 +468,81 @@ fn assert_status_monitoring_shape(status: &HttpResponse) {
     }
 }
 
+fn assert_status_top_level_evidence(body: &Value, status: &HttpResponse) {
+    let runtime_artifact = body
+        .get("runtime_artifact")
+        .and_then(Value::as_object)
+        .expect("status.runtime_artifact must be object");
+    assert!(
+        runtime_artifact
+            .get("available")
+            .is_some_and(Value::is_boolean),
+        "status.runtime_artifact.available missing boolean value: {}",
+        status.body
+    );
+    assert!(
+        runtime_artifact
+            .get("path")
+            .is_none_or(|value| value.is_string()),
+        "status.runtime_artifact.path must be omitted|string: {}",
+        status.body
+    );
+    assert!(
+        runtime_artifact
+            .get("sha256")
+            .is_none_or(|value| value.is_string()),
+        "status.runtime_artifact.sha256 must be omitted|string: {}",
+        status.body
+    );
+    assert!(
+        runtime_artifact
+            .get("error")
+            .is_none_or(|value| value.is_string()),
+        "status.runtime_artifact.error must be omitted|string: {}",
+        status.body
+    );
+
+    let authority_epoch = body
+        .get("authority_epoch")
+        .and_then(Value::as_object)
+        .expect("status.authority_epoch must be object");
+    for key in [
+        "roots_signature",
+        "grants_signature",
+        "sink_materialization_generation",
+        "facade_runtime_generation",
+    ] {
+        assert!(
+            authority_epoch.get(key).is_some_and(Value::is_string),
+            "status.authority_epoch.{key} missing string value: {}",
+            status.body
+        );
+    }
+    assert!(
+        authority_epoch
+            .get("source_stream_generation")
+            .is_some_and(|value| value.is_null() || value.is_u64()),
+        "status.authority_epoch.source_stream_generation must be null|u64: {}",
+        status.body
+    );
+
+    let readiness_planes = body
+        .get("readiness_planes")
+        .and_then(Value::as_object)
+        .expect("status.readiness_planes must be object");
+    for key in [
+        "api_facade_liveness",
+        "management_write_readiness",
+        "trusted_observation_readiness",
+    ] {
+        assert!(
+            readiness_planes.get(key).is_some_and(Value::is_boolean),
+            "status.readiness_planes.{key} missing boolean value: {}",
+            status.body
+        );
+    }
+}
+
 fn assert_status_coverage_mode(value: Option<&Value>, root: &Value) {
     let coverage_mode = value
         .and_then(Value::as_str)
@@ -475,14 +551,34 @@ fn assert_status_coverage_mode(value: Option<&Value>, root: &Value) {
         matches!(
             coverage_mode,
             "realtime_hotset_plus_audit"
-                | "realtime_hotset_only"
                 | "audit_only"
-                | "watch_requested_without_capacity"
-                | "inactive"
+                | "audit_with_metadata"
+                | "audit_without_file_metadata"
+                | "watch_degraded"
         ),
         "status coverage_mode out of domain: {}",
         root
     );
+    assert_status_coverage_capabilities(root.get("coverage_capabilities"), root);
+}
+
+fn assert_status_coverage_capabilities(value: Option<&Value>, root: &Value) {
+    let capabilities = value
+        .and_then(Value::as_object)
+        .expect("status coverage_capabilities should be object");
+    for key in [
+        "exists_coverage",
+        "file_count_coverage",
+        "file_metadata_coverage",
+        "mtime_size_coverage",
+        "watch_freshness_coverage",
+    ] {
+        assert!(
+            capabilities.get(key).is_some_and(Value::is_boolean),
+            "status coverage_capabilities.{key} should be boolean: {}",
+            root
+        );
+    }
 }
 
 #[test]

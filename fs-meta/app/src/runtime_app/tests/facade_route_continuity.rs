@@ -84,7 +84,7 @@ async fn query_peer_deactivate_does_not_shutdown_active_facade_listener() {
     });
     let shutdown_wait = shutdown_started.notified();
 
-    app.apply_facade_deactivate(FacadeRuntimeUnit::QueryPeer, &query_peer_route, 1)
+    app.apply_facade_deactivate(FacadeRuntimeUnit::QueryPeer, &query_peer_route, 1, false)
         .await
         .expect("deactivate query-peer route");
 
@@ -208,7 +208,7 @@ async fn mark_control_uninitialized_clears_retained_active_facade_continuity_bef
         "query-peer source-status route should be active before retaining facade continuity"
     );
 
-    app.apply_facade_deactivate(FacadeRuntimeUnit::Facade, &facade_control_stream_route(), 2)
+    app.apply_facade_deactivate(FacadeRuntimeUnit::Facade, &facade_control_stream_route(), 2, false)
         .await
         .expect("retain active facade continuity");
     assert!(
@@ -245,7 +245,7 @@ async fn mark_control_uninitialized_clears_retained_active_facade_continuity_bef
         "later query-peer activation should take effect before cleanup-only deactivate"
     );
 
-    app.apply_facade_deactivate(FacadeRuntimeUnit::QueryPeer, &source_status_route, 4)
+    app.apply_facade_deactivate(FacadeRuntimeUnit::QueryPeer, &source_status_route, 4, false)
         .await
         .expect("cleanup-only query-peer source-status deactivate");
 
@@ -354,7 +354,7 @@ async fn future_generation_facade_deactivate_without_successor_activate_keeps_ac
     });
     let shutdown_wait = shutdown_started.notified();
 
-    app.apply_facade_deactivate(FacadeRuntimeUnit::Facade, &facade_control_stream_route(), 3)
+    app.apply_facade_deactivate(FacadeRuntimeUnit::Facade, &facade_control_stream_route(), 3, false)
         .await
         .expect("future-generation facade deactivate should not error");
 
@@ -470,7 +470,7 @@ async fn future_generation_facade_deactivate_without_successor_activate_keeps_qu
     });
     let shutdown_wait = shutdown_started.notified();
 
-    app.apply_facade_deactivate(FacadeRuntimeUnit::Facade, &facade_control_stream_route(), 3)
+    app.apply_facade_deactivate(FacadeRuntimeUnit::Facade, &facade_control_stream_route(), 3, false)
         .await
         .expect("future-generation facade deactivate should not error");
 
@@ -594,7 +594,7 @@ async fn uninitialized_same_generation_facade_deactivate_keeps_listener_availabl
     });
     let shutdown_wait = shutdown_started.notified();
 
-    app.apply_facade_deactivate(FacadeRuntimeUnit::Facade, &facade_control_stream_route(), 1)
+    app.apply_facade_deactivate(FacadeRuntimeUnit::Facade, &facade_control_stream_route(), 1, false)
         .await
         .expect("same-generation facade deactivate should not error");
 
@@ -701,7 +701,7 @@ async fn initialized_same_generation_facade_deactivate_without_successor_keeps_l
     });
     let shutdown_wait = shutdown_started.notified();
 
-    app.apply_facade_deactivate(FacadeRuntimeUnit::Facade, &facade_control_stream_route(), 1)
+    app.apply_facade_deactivate(FacadeRuntimeUnit::Facade, &facade_control_stream_route(), 1, false)
         .await
         .expect("same-generation facade deactivate should not error");
 

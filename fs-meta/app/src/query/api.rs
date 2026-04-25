@@ -23,7 +23,7 @@ use crate::query::tree::{
 use crate::runtime::routes::{
     METHOD_SINK_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
     METHOD_SOURCE_STATUS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
-    sink_query_route_bindings_for,
+    sink_query_route_bindings_for, source_find_route_bindings_for,
 };
 use crate::runtime::seam::exchange_host_adapter;
 use crate::sink::SinkStatusSnapshot;
@@ -347,8 +347,14 @@ struct ApiState {
     force_find_route_rr: Arc<Mutex<BTreeMap<String, usize>>>,
     readiness_source: Option<Arc<SourceFacade>>,
     readiness_sink: Option<Arc<SinkFacade>>,
+    materialized_source_status_cache: Arc<Mutex<Option<CachedSourceStatusSnapshot>>>,
     materialized_sink_status_cache: Arc<Mutex<Option<CachedSinkStatusSnapshot>>>,
     tree_query_serial: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedSourceStatusSnapshot {
+    snapshot: SourceStatusSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -885,6 +891,53 @@ impl StatusRouteMachine {
             )
         }
     }
+
+    async fn collect_status_events(
+        self,
+        boundary: Arc<dyn ChannelIoSubset>,
+        origin_id: NodeId,
+        method: &'static str,
+        is_retryable_gap: fn(&CnxError) -> bool,
+    ) -> Result<Vec<Event>, CnxError> {
+        let mut phase = self.entry_phase();
+        loop {
+            match phase {
+                StatusRouteMachinePhase::Attempt(attempt) => {
+                    let adapter = exchange_host_adapter(
+                        boundary.clone(),
+                        origin_id.clone(),
+                        default_route_bindings(),
+                    );
+                    match adapter
+                        .call_collect(
+                            ROUTE_TOKEN_FS_META_INTERNAL,
+                            method,
+                            internal_status_request_payload(),
+                            attempt.attempt_timeout,
+                            attempt.collect_idle_grace,
+                        )
+                        .await
+                    {
+                        Ok(events) => return Ok(events),
+                        Err(err) => {
+                            phase = self.followup_phase_at(
+                                tokio::time::Instant::now(),
+                                err,
+                                is_retryable_gap,
+                            );
+                        }
+                    }
+                }
+                StatusRouteMachinePhase::WaitUntil(until) => {
+                    tokio::time::sleep_until(until).await;
+                    phase = self.entry_phase();
+                }
+                StatusRouteMachinePhase::Failed(err) => {
+                    return Err(err.into_error());
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -927,14 +980,15 @@ async fn route_source_status_snapshot(
     origin_id: NodeId,
     plan: StatusRoutePlan,
 ) -> Result<SourceStatusSnapshot, CnxError> {
-    let events = execute_status_route_collect(
-        boundary,
-        origin_id,
-        plan.machine(),
-        METHOD_SOURCE_STATUS,
-        is_retryable_source_status_continuity_gap,
-    )
-    .await?;
+    let events = plan
+        .machine()
+        .collect_status_events(
+            boundary,
+            origin_id,
+            METHOD_SOURCE_STATUS,
+            is_retryable_source_status_continuity_gap,
+        )
+        .await?;
     let snapshots = events
         .into_iter()
         .map(|event| {
@@ -969,14 +1023,15 @@ pub(crate) async fn route_sink_status_snapshot(
     origin_id: NodeId,
     plan: StatusRoutePlan,
 ) -> Result<SinkStatusSnapshot, CnxError> {
-    let events = execute_status_route_collect(
-        boundary,
-        origin_id,
-        plan.machine(),
-        METHOD_SINK_STATUS,
-        is_retryable_sink_status_continuity_gap,
-    )
-    .await?;
+    let events = plan
+        .machine()
+        .collect_status_events(
+            boundary,
+            origin_id,
+            METHOD_SINK_STATUS,
+            is_retryable_sink_status_continuity_gap,
+        )
+        .await?;
     let snapshots = events
         .into_iter()
         .map(|event| {
@@ -997,53 +1052,6 @@ pub(crate) async fn route_sink_status_snapshot(
         );
     }
     Ok(merge_sink_status_snapshots(snapshots))
-}
-
-async fn execute_status_route_collect(
-    boundary: Arc<dyn ChannelIoSubset>,
-    origin_id: NodeId,
-    machine: StatusRouteMachine,
-    method: &'static str,
-    is_retryable_gap: fn(&CnxError) -> bool,
-) -> Result<Vec<Event>, CnxError> {
-    let mut phase = machine.entry_phase();
-    loop {
-        match phase {
-            StatusRouteMachinePhase::Attempt(attempt) => {
-                let adapter = exchange_host_adapter(
-                    boundary.clone(),
-                    origin_id.clone(),
-                    default_route_bindings(),
-                );
-                match adapter
-                    .call_collect(
-                        ROUTE_TOKEN_FS_META_INTERNAL,
-                        method,
-                        internal_status_request_payload(),
-                        attempt.attempt_timeout,
-                        attempt.collect_idle_grace,
-                    )
-                    .await
-                {
-                    Ok(events) => return Ok(events),
-                    Err(err) => {
-                        phase = machine.followup_phase_at(
-                            tokio::time::Instant::now(),
-                            err,
-                            is_retryable_gap,
-                        );
-                    }
-                }
-            }
-            StatusRouteMachinePhase::WaitUntil(until) => {
-                tokio::time::sleep_until(until).await;
-                phase = machine.entry_phase();
-            }
-            StatusRouteMachinePhase::Failed(err) => {
-                return Err(err.into_error());
-            }
-        }
-    }
 }
 
 fn is_retryable_sink_status_continuity_gap(err: &CnxError) -> bool {
@@ -1088,7 +1096,23 @@ async fn load_materialized_status_snapshots_with_failure(
         QueryBackend::Local { .. } => source.status_snapshot_with_failure().await?,
     };
     let readiness_groups = scan_enabled_readiness_groups(state)?;
-    let source_status = filter_source_status_snapshot(source_status, &readiness_groups);
+    let source_status = {
+        let fresh = filter_source_status_snapshot(source_status, &readiness_groups);
+        let mut cache = state.materialized_source_status_cache.lock().map_err(|_| {
+            CnxError::Internal("materialized source status cache lock poisoned".into())
+        })?;
+        let merged = match cache.as_ref() {
+            Some(cached) => merge_source_status_snapshots(vec![
+                filter_source_status_snapshot(cached.snapshot.clone(), &readiness_groups),
+                fresh,
+            ]),
+            None => fresh,
+        };
+        *cache = Some(CachedSourceStatusSnapshot {
+            snapshot: merged.clone(),
+        });
+        merged
+    };
     let sink_status = match &state.backend {
         QueryBackend::Route {
             boundary,
@@ -2402,6 +2426,7 @@ pub fn create_local_router(
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -4013,6 +4038,48 @@ impl ProxyRouteMachine {
                     ProxyRouteMachinePhase::WaitUntil(now + attempt_runtime.retry_backoff)
                 }
                 None => ProxyRouteMachinePhase::Failed(RouteTerminalError::from_error(err)),
+            }
+        }
+    }
+
+    async fn collect_proxy_events(
+        self,
+        boundary: Arc<dyn ChannelIoSubset>,
+        origin_id: NodeId,
+        payload: Bytes,
+    ) -> Result<Vec<Event>, CnxError> {
+        let mut phase = self.entry_phase();
+        loop {
+            match phase {
+                ProxyRouteMachinePhase::Attempt(attempt_runtime) => {
+                    let adapter = exchange_host_adapter(
+                        boundary.clone(),
+                        origin_id.clone(),
+                        default_route_bindings(),
+                    );
+                    match adapter
+                        .call_collect(
+                            ROUTE_TOKEN_FS_META_INTERNAL,
+                            METHOD_SINK_QUERY_PROXY,
+                            payload.clone(),
+                            attempt_runtime.attempt_timeout,
+                            attempt_runtime.collect_idle_grace,
+                        )
+                        .await
+                    {
+                        Ok(events) => return Ok(events),
+                        Err(err) => {
+                            phase = self.followup_phase_at(tokio::time::Instant::now(), err);
+                        }
+                    }
+                }
+                ProxyRouteMachinePhase::WaitUntil(until) => {
+                    tokio::time::sleep_until(until).await;
+                    phase = self.entry_phase();
+                }
+                ProxyRouteMachinePhase::Failed(err) => {
+                    return Err(err.into_error());
+                }
             }
         }
     }
@@ -6269,6 +6336,81 @@ fn force_find_route_runtime_owns_tree_entry_action() {
 }
 
 #[test]
+fn selected_runner_force_find_route_uses_single_reply_call_for_scoped_source_find_route() {
+    let source = include_str!("api.rs");
+    let start = source
+        .find("\nasync fn route_force_find_events_via_node(")
+        .expect("route_force_find_events_via_node exists");
+    let end = source[start..]
+        .find("#[cfg(test)]")
+        .map(|offset| start + offset)
+        .unwrap_or(source.len());
+    let body = &source[start..end];
+    assert!(
+        body.contains(".call(") && body.contains("METHOD_SOURCE_FIND,"),
+        "selected-runner scoped source.find should use single-reply call semantics instead of collect idle-grace"
+    );
+    assert!(
+        !body.contains(".call_collect("),
+        "selected-runner scoped source.find should not wait on collect idle-grace"
+    );
+}
+
+#[test]
+fn generic_force_find_route_uses_single_reply_call_when_selected_group_is_scoped() {
+    let source = include_str!("api.rs");
+    let start = source
+        .find("\nasync fn query_force_find_events(")
+        .expect("query_force_find_events exists");
+    let end = source[start..]
+        .find("\nasync fn route_force_find_events_via_node(")
+        .map(|offset| start + offset)
+        .unwrap_or(source.len());
+    let body = &source[start..end];
+    assert!(
+        body.contains("params.scope.selected_group.is_some()"),
+        "generic force-find route should branch on selected_group so scoped freshness reads avoid collect idle-grace",
+    );
+    assert!(
+        body.contains(".call(") && body.contains("METHOD_SOURCE_FIND,"),
+        "scoped generic source.find should use single-reply call semantics instead of collect idle-grace",
+    );
+    assert!(
+        body.contains(".call_collect("),
+        "ungrouped generic source.find should keep collect semantics for multi-origin freshness reads",
+    );
+}
+
+#[test]
+fn force_find_runner_selection_uses_cached_root_and_grant_snapshots() {
+    let source = include_str!("api.rs");
+    let start = source
+        .find("\nasync fn force_find_candidate_object_refs_for_group(")
+        .expect("force_find_candidate_object_refs_for_group exists");
+    let end = source[start..]
+        .find("\nasync fn select_force_find_runner_node_for_group(")
+        .map(|offset| start + offset)
+        .unwrap_or(source.len());
+    let body = &source[start..end];
+    assert!(
+        body.contains("cached_logical_roots_snapshot()"),
+        "force-find runner selection must use cached logical roots so the freshness path is not blocked on source worker control RPCs",
+    );
+    assert!(
+        body.contains("cached_host_object_grants_snapshot()"),
+        "force-find runner selection must use cached host-object grants so the freshness path stays available while source workers are still converging",
+    );
+    assert!(
+        !body.contains("logical_roots_snapshot().await"),
+        "force-find runner selection must not await live logical-roots RPCs before dispatching freshness work",
+    );
+    assert!(
+        !body.contains("host_object_grants_snapshot().await"),
+        "force-find runner selection must not await live grants RPCs before dispatching freshness work",
+    );
+}
+
+#[test]
 fn force_find_route_plan_tree_error_lane_routes_runner_gaps_through_canonical_fallback() {
     let plan = ForceFindSessionPlan::new(Duration::from_secs(5)).route_plan();
 
@@ -7000,9 +7142,9 @@ async fn query_materialized_events_via_generic_proxy(
     }
     let payload = rmp_serde::to_vec(&params)
         .map_err(|err| CnxError::Internal(format!("encode materialized query failed: {err}")))?;
-    let result =
-        execute_tree_pit_proxy_route_collect(boundary, origin_id, Bytes::from(payload), machine)
-            .await;
+    let result = machine
+        .collect_proxy_events(boundary, origin_id, Bytes::from(payload))
+        .await;
     if debug_materialized_route_capture_enabled() {
         match &result {
             Ok(events) => {
@@ -7022,48 +7164,6 @@ async fn query_materialized_events_via_generic_proxy(
         }
     }
     result
-}
-
-async fn execute_tree_pit_proxy_route_collect(
-    boundary: Arc<dyn ChannelIoSubset>,
-    origin_id: NodeId,
-    payload: Bytes,
-    machine: ProxyRouteMachine,
-) -> Result<Vec<Event>, CnxError> {
-    let mut phase = machine.entry_phase();
-    loop {
-        match phase {
-            ProxyRouteMachinePhase::Attempt(attempt_runtime) => {
-                let adapter = exchange_host_adapter(
-                    boundary.clone(),
-                    origin_id.clone(),
-                    default_route_bindings(),
-                );
-                match adapter
-                    .call_collect(
-                        ROUTE_TOKEN_FS_META_INTERNAL,
-                        METHOD_SINK_QUERY_PROXY,
-                        payload.clone(),
-                        attempt_runtime.attempt_timeout,
-                        attempt_runtime.collect_idle_grace,
-                    )
-                    .await
-                {
-                    Ok(events) => return Ok(events),
-                    Err(err) => {
-                        phase = machine.followup_phase_at(tokio::time::Instant::now(), err);
-                    }
-                }
-            }
-            ProxyRouteMachinePhase::WaitUntil(until) => {
-                tokio::time::sleep_until(until).await;
-                phase = machine.entry_phase();
-            }
-            ProxyRouteMachinePhase::Failed(err) => {
-                return Err(err.into_error());
-            }
-        }
-    }
 }
 
 fn is_retryable_materialized_proxy_continuity_gap(err: &CnxError) -> bool {
@@ -7607,32 +7707,60 @@ async fn query_force_find_events(
             let payload = rmp_serde::to_vec_named(&params).map_err(|err| {
                 CnxError::Internal(format!("encode force-find query failed: {err}"))
             })?;
-            eprintln!("fs_meta_query_api: query_force_find_events route call_collect begin");
-            let events = adapter
-                .call_collect(
-                    ROUTE_TOKEN_FS_META_INTERNAL,
-                    METHOD_SOURCE_FIND,
-                    Bytes::from(payload),
-                    route_plan.route_timeout(),
-                    route_plan.collect_idle_grace(),
-                )
-                .await
-            .map_err(|err| {
+            if params.scope.selected_group.is_some() {
+                eprintln!("fs_meta_query_api: query_force_find_events route call begin");
+                let events = adapter
+                    .call(
+                        ROUTE_TOKEN_FS_META_INTERNAL,
+                        METHOD_SOURCE_FIND,
+                        Bytes::from(payload),
+                        route_plan.route_timeout(),
+                    )
+                    .await
+                    .map_err(|err| {
+                        eprintln!(
+                            "fs_meta_query_api: query_force_find_events route call failed err={}",
+                            err
+                        );
+                        err
+                    })?;
                 eprintln!(
-                    "fs_meta_query_api: query_force_find_events route call_collect failed err={}",
-                    err
+                    "fs_meta_query_api: query_force_find_events route call done events={} origins={:?}",
+                    events.len(),
+                    events
+                        .iter()
+                        .map(|event| event.metadata().origin_id.0.clone())
+                        .collect::<Vec<_>>()
                 );
-                err
-            })?;
-            eprintln!(
-                "fs_meta_query_api: query_force_find_events route call_collect done events={} origins={:?}",
-                events.len(),
-                events
-                    .iter()
-                    .map(|event| event.metadata().origin_id.0.clone())
-                    .collect::<Vec<_>>()
-            );
-            Ok(events)
+                Ok(events)
+            } else {
+                eprintln!("fs_meta_query_api: query_force_find_events route call_collect begin");
+                let events = adapter
+                    .call_collect(
+                        ROUTE_TOKEN_FS_META_INTERNAL,
+                        METHOD_SOURCE_FIND,
+                        Bytes::from(payload),
+                        route_plan.route_timeout(),
+                        route_plan.collect_idle_grace(),
+                    )
+                    .await
+                    .map_err(|err| {
+                        eprintln!(
+                            "fs_meta_query_api: query_force_find_events route call_collect failed err={}",
+                            err
+                        );
+                        err
+                    })?;
+                eprintln!(
+                    "fs_meta_query_api: query_force_find_events route call_collect done events={} origins={:?}",
+                    events.len(),
+                    events
+                        .iter()
+                        .map(|event| event.metadata().origin_id.0.clone())
+                        .collect::<Vec<_>>()
+                );
+                Ok(events)
+            }
         }
     }
 }
@@ -7643,16 +7771,22 @@ async fn route_force_find_events_via_node(
     params: InternalQueryRequest,
     route_plan: ForceFindRoutePlan,
 ) -> Result<Vec<Event>, CnxError> {
-    let adapter = exchange_host_adapter(boundary, node_id, default_route_bindings());
+    let adapter = exchange_host_adapter(
+        boundary,
+        node_id.clone(),
+        source_find_route_bindings_for(&node_id.0),
+    );
     let payload = rmp_serde::to_vec_named(&params)
         .map_err(|err| CnxError::Internal(format!("encode force-find query failed: {err}")))?;
+    // Per-node selected-runner source.find is single-owner/single-reply. Waiting on a
+    // collect idle-grace here stretches each group query by the full grace window and can
+    // exceed caller-facing HTTP budgets before generic fallback is even needed.
     adapter
-        .call_collect(
+        .call(
             ROUTE_TOKEN_FS_META_INTERNAL,
             METHOD_SOURCE_FIND,
             Bytes::from(payload),
             route_plan.route_timeout(),
-            route_plan.collect_idle_grace(),
         )
         .await
 }
@@ -8127,13 +8261,14 @@ async fn force_find_candidate_object_refs_for_group_with_failure(
     source: &SourceFacade,
     group_id: &str,
 ) -> std::result::Result<Vec<String>, QueryWorkerObservationFailure> {
+    // `/on-demand-force-find` remains a freshness path while source workers are
+    // still converging. Runner selection is cache-first, but failures still use
+    // typed observation errors so callers can distinguish worker recovery gaps.
     let roots = source
-        .logical_roots_snapshot_with_failure()
-        .await
+        .cached_logical_roots_snapshot_with_failure()
         .map_err(QueryWorkerObservationFailure::from)?;
     let grants = source
-        .host_object_grants_snapshot_with_failure()
-        .await
+        .cached_host_object_grants_snapshot_with_failure()
         .map_err(QueryWorkerObservationFailure::from)?;
     let Some(root) = roots.into_iter().find(|root| root.id == group_id) else {
         return Ok(Vec::new());
@@ -8402,14 +8537,33 @@ async fn execute_force_find_group_route_collect(
                         remaining.as_millis(),
                     );
                 }
-                match route_force_find_events_via_node(
-                    boundary.clone(),
-                    node_id.clone(),
-                    request.clone(),
-                    route_plan,
-                )
-                .await
-                {
+                let attempt = if matches!(
+                    &state.backend,
+                    QueryBackend::Route { origin_id, .. } if *origin_id == node_id
+                ) {
+                    run_timed_query(
+                        async {
+                            source
+                                .force_find_with_failure(&request)
+                                .await
+                                .map_err(|err| err.into_error())
+                        },
+                        route_plan.route_timeout(),
+                    )
+                    .await
+                } else {
+                    run_timed_query(
+                        route_force_find_events_via_node(
+                            boundary.clone(),
+                            node_id.clone(),
+                            request.clone(),
+                            route_plan,
+                        ),
+                        route_plan.route_timeout(),
+                    )
+                    .await
+                };
+                match attempt {
                     Ok(events) => {
                         if debug_force_find_route_capture_enabled() {
                             eprintln!(

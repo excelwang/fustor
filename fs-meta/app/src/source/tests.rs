@@ -2,11 +2,13 @@ use super::*;
 use crate::ControlEvent;
 use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
 use crate::runtime::execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID;
+use crate::runtime::orchestration::encode_logical_roots_control_payload;
 use crate::runtime::routes::{
     ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
     ROUTE_KEY_SOURCE_ROOTS_CONTROL,
 };
 use crate::sink::SinkFileMeta;
+use crate::state::cell::LogicalRootsCell;
 use capanix_app_sdk::runtime::ControlEnvelope;
 use capanix_runtime_entry_sdk::advanced::boundary::BoundaryContext;
 use capanix_runtime_entry_sdk::control::{
@@ -16,6 +18,7 @@ use capanix_runtime_entry_sdk::control::{
     encode_runtime_host_grant_change, encode_runtime_unit_tick,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 struct NoopBoundary;
 
@@ -59,6 +62,55 @@ impl ChannelIoSubset for RouteCountingTimeoutBoundary {
             .expect("route recv counts lock")
             .entry(route_key)
             .or_default() += 1;
+        Err(CnxError::Timeout)
+    }
+}
+
+struct SingleRootsControlEventBoundary {
+    route_key: String,
+    payload: bytes::Bytes,
+    delivered: AtomicBool,
+}
+
+impl SingleRootsControlEventBoundary {
+    fn new(route_key: String, payload: Vec<u8>) -> Self {
+        Self {
+            route_key,
+            payload: bytes::Bytes::from(payload),
+            delivered: AtomicBool::new(false),
+        }
+    }
+
+    fn delivered(&self) -> bool {
+        self.delivered.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelIoSubset for SingleRootsControlEventBoundary {
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+    ) -> Result<Vec<Event>> {
+        if request.channel_key.0 == self.route_key
+            && self
+                .delivered
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Ok(vec![Event::new(
+                EventMetadata {
+                    origin_id: NodeId("node-a".to_string()),
+                    timestamp_us: 1,
+                    logical_ts: None,
+                    correlation_id: None,
+                    ingress_auth: None,
+                    trace: None,
+                },
+                self.payload.clone(),
+            )]);
+        }
         Err(CnxError::Timeout)
     }
 }
@@ -471,6 +523,71 @@ async fn control_stream_endpoints_stay_gated_until_route_activation() {
 }
 
 #[tokio::test]
+async fn owner_scoped_roots_control_stream_stays_gated_until_route_activation() {
+    let source = build_source(vec![test_export(
+        "node-a",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )]);
+    let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("start runtime endpoints");
+
+    let roots_control_route =
+        crate::runtime::routes::source_roots_control_stream_route_for("node-a").0;
+    let pre_activation_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < pre_activation_deadline {
+        let roots_recv = boundary.recv_count(&roots_control_route);
+        assert_eq!(
+            roots_recv,
+            0,
+            "source owner-scoped logical-roots control stream must remain gated before runtime route activation; recv_counts={:?}",
+            boundary.recv_counts_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    source
+        .on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+            RuntimeExecActivate {
+                route_key: roots_control_route.clone(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            },
+        ))
+        .expect("encode scoped source roots-control activate")])
+        .await
+        .expect("activate owner-scoped source roots-control route");
+
+    let activated_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let roots_recv = boundary.recv_count(&roots_control_route);
+        if roots_recv > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < activated_deadline,
+            "source owner-scoped logical-roots control stream must begin receiving after route activation; recv_counts={:?}",
+            boundary.recv_counts_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    source.close().await.expect("close source");
+}
+
+#[tokio::test]
 async fn source_state_authority_log_records_runtime_mutations() {
     let source = build_source(vec![test_export(
         "node-a",
@@ -558,6 +675,153 @@ async fn logical_roots_survive_restart_on_shared_state_boundary_after_update() {
         restarted_root_ids,
         vec!["nfs2".to_string(), "nfs4".to_string()],
         "restart on the same state boundary must preserve the updated authoritative roots instead of reintroducing retired roots",
+    );
+}
+
+#[tokio::test]
+async fn authoritative_logical_roots_sync_recovers_local_runtime_after_missed_online_second_wave() {
+    let boundary = in_memory_state_boundary();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![
+        test_export("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        test_export("node-a::nfs2", "node-a", "10.0.0.11", "/mnt/nfs2", true),
+    ];
+
+    let source = FSMetaSource::with_boundaries_and_state(
+        cfg.clone(),
+        NodeId("node-a".to_string()),
+        None,
+        boundary.clone(),
+    )
+    .expect("build source");
+
+    let authoritative =
+        LogicalRootsCell::from_state_boundary(SOURCE_RUNTIME_UNIT_ID, cfg.roots.clone(), boundary)
+            .expect("authoritative logical roots cell");
+    authoritative
+        .replace(vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")])
+        .await
+        .expect("replace authoritative logical roots");
+
+    let changed = source
+        .sync_logical_roots_from_authoritative_cell_if_changed()
+        .await
+        .expect("sync logical roots from authority");
+    assert!(
+        changed,
+        "source should detect authoritative logical-roots drift"
+    );
+
+    let root_ids = source
+        .logical_roots_snapshot()
+        .into_iter()
+        .map(|root| root.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        root_ids,
+        vec!["nfs1".to_string(), "nfs2".to_string()],
+        "authoritative sync must refresh the local logical-roots view after a missed online second wave",
+    );
+    let concrete_root_ids = source
+        .status_snapshot()
+        .concrete_roots
+        .into_iter()
+        .map(|root| root.logical_root_id)
+        .collect::<Vec<_>>();
+    assert!(
+        concrete_root_ids.contains(&"nfs2".to_string()),
+        "authoritative sync must rebuild local concrete roots for newly-authoritative logical roots",
+    );
+}
+
+#[tokio::test]
+async fn roots_control_stream_persists_authoritative_roots_for_followup_status_and_force_find() {
+    let state_boundary = in_memory_state_boundary();
+    let mut cfg = SourceConfig::default();
+    cfg.roots = Vec::new();
+    cfg.host_object_grants = vec![
+        test_export("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        test_export("node-a::nfs2", "node-a", "10.0.0.11", "/mnt/nfs2", true),
+    ];
+
+    let source = FSMetaSource::with_boundaries_and_state(
+        cfg,
+        NodeId("node-a".to_string()),
+        None,
+        state_boundary.clone(),
+    )
+    .expect("build source");
+
+    let route_key = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let payload = encode_logical_roots_control_payload(&vec![
+        root("nfs1", "/mnt/nfs1"),
+        root("nfs2", "/mnt/nfs2"),
+    ])
+    .expect("encode logical-roots control payload");
+    let boundary = Arc::new(SingleRootsControlEventBoundary::new(
+        route_key.clone(),
+        payload,
+    ));
+
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("start runtime endpoints");
+    source
+        .on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+            RuntimeExecActivate {
+                route_key,
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            },
+        ))
+        .expect("encode source roots-control activate")])
+        .await
+        .expect("activate source roots-control route");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let root_ids = source
+            .logical_roots_snapshot()
+            .into_iter()
+            .map(|root| root.id)
+            .collect::<Vec<_>>();
+        if boundary.delivered() && root_ids == vec!["nfs1".to_string(), "nfs2".to_string()] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "roots-control stream should update local logical roots before timeout; delivered={} logical_roots={root_ids:?}",
+            boundary.delivered(),
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let authoritative =
+        LogicalRootsCell::from_state_boundary(SOURCE_RUNTIME_UNIT_ID, Vec::new(), state_boundary)
+            .expect("authoritative logical roots cell");
+    let authoritative_root_ids = authoritative
+        .snapshot()
+        .into_iter()
+        .map(|root| root.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        authoritative_root_ids,
+        vec!["nfs1".to_string(), "nfs2".to_string()],
+        "roots-control stream must persist authoritative logical roots so later status/force-find reads do not revert peers back to empty roots",
+    );
+
+    let changed = source
+        .sync_logical_roots_from_authoritative_cell_if_changed()
+        .await
+        .expect("sync logical roots from authoritative cell");
+    assert!(
+        !changed,
+        "once roots-control applies the authoritative declaration locally, followup status/force-find sync should not observe stale logical-root drift",
     );
 }
 
@@ -1008,6 +1272,33 @@ fn build_root_runtimes_treats_instance_suffixed_node_id_as_local_member() {
             .collect::<Vec<_>>(),
         vec!["node-b::nfs1", "node-b::nfs2"],
         "instance-suffixed worker node ids must still match bare host_ref grants for local source scheduling"
+    );
+}
+
+#[test]
+fn build_root_runtimes_treats_cluster_scoped_node_id_as_local_member() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")];
+    cfg.host_object_grants = vec![
+        test_export("node-b::nfs1", "node-b", "10.0.0.21", "/mnt/nfs1", true),
+        test_export("node-b::nfs2", "node-b", "10.0.0.22", "/mnt/nfs2", true),
+    ];
+
+    let source = FSMetaSource::with_boundaries(
+        cfg,
+        NodeId("cluster-node-b-29775277610492238759985153".to_string()),
+        None,
+    )
+    .expect("init source");
+    let runtimes =
+        lock_or_recover(&source.state_cell.roots, "test.cluster_scope_local_member").clone();
+    assert_eq!(
+        runtimes
+            .iter()
+            .map(|root| root.object_ref.as_str())
+            .collect::<Vec<_>>(),
+        vec!["node-b::nfs1", "node-b::nfs2"],
+        "cluster-scoped runtime node ids must still match bare host_ref grants for local source scheduling"
     );
 }
 
@@ -1667,6 +1958,66 @@ async fn runtime_managed_local_resource_ids_without_grant_change_build_primary_s
 
     source.close().await.expect("close source");
     let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test]
+async fn runtime_managed_source_logical_root_update_with_empty_active_scopes_uses_local_grants() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = Vec::new();
+    cfg.host_object_grants = vec![
+        test_export("node-a::nfs1", "node-a", "10.0.0.1", "/mnt/nfs1", true),
+        test_export("node-b::nfs2", "node-b", "10.0.0.2", "/mnt/nfs2", true),
+    ];
+    let source = FSMetaSource::with_boundaries(
+        cfg,
+        NodeId("node-a".to_string()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init runtime-managed source");
+
+    source
+        .on_control_frame(&[
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: METHOD_SOURCE_ROOTS_CONTROL.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: METHOD_SOURCE_RESCAN.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            }))
+            .expect("encode scan activate"),
+        ])
+        .await
+        .expect("apply empty-scope activate wave");
+
+    source
+        .update_logical_roots(vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")])
+        .await
+        .expect("update logical roots");
+
+    assert_eq!(
+        source
+            .scheduled_source_group_ids()
+            .expect("source groups after logical root update"),
+        Some(BTreeSet::from(["nfs1".to_string()])),
+        "runtime-managed logical root updates must preserve bare active scopes so local grants can schedule the elected source group",
+    );
+    assert_eq!(
+        source
+            .scheduled_scan_group_ids()
+            .expect("scan groups after logical root update"),
+        Some(BTreeSet::from(["nfs1".to_string()])),
+        "runtime-managed logical root updates must preserve bare active scopes so local grants can schedule the elected scan group",
+    );
 }
 #[tokio::test]
 async fn manual_rescan_publishes_baseline_for_each_split_primary_under_mixed_cluster_grants() {
@@ -2569,6 +2920,63 @@ fn manual_rescan_requests_are_coalesced_while_one_is_pending() {
         rx.try_recv()
             .expect("next signal should be re-armed after completion"),
         RescanReason::Manual
+    ));
+}
+
+#[test]
+fn topology_rescan_is_not_coalesced_behind_pending_manual_rescan() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::exp1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+        .expect("init source");
+    let primary_root = lock_or_recover(
+        &source.state_cell.roots,
+        "test.topology_rescan_not_coalesced.roots",
+    )
+    .iter()
+    .find(|root| root.is_group_primary)
+    .cloned()
+    .expect("primary root exists");
+    let mut rx = primary_root.rescan_tx.subscribe();
+
+    FSMetaSource::request_rescan_on_primary_roots(
+        std::slice::from_ref(&primary_root),
+        None,
+        Some(&source.state_cell.manual_rescan_intents),
+        "manual",
+    );
+    FSMetaSource::request_rescan_on_primary_roots(
+        std::slice::from_ref(&primary_root),
+        None,
+        Some(&source.state_cell.manual_rescan_intents),
+        "manual",
+    );
+    FSMetaSource::request_rescan_on_primary_roots(
+        std::slice::from_ref(&primary_root),
+        None,
+        None,
+        "topology",
+    );
+
+    assert!(matches!(
+        rx.try_recv().expect("manual signal should be sent"),
+        RescanReason::Manual
+    ));
+    assert!(matches!(
+        rx.try_recv()
+            .expect("topology signal must not be suppressed by pending manual intent"),
+        RescanReason::Manual
+    ));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
     ));
 }
 

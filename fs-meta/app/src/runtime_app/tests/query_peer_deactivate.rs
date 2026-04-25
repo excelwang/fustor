@@ -359,7 +359,7 @@ async fn query_peer_internal_status_deactivate_does_not_wait_for_inflight_source
         let app = app.clone();
         let source_status_route = source_status_route.clone();
         async move {
-            app.apply_facade_deactivate(FacadeRuntimeUnit::QueryPeer, &source_status_route, 3)
+            app.apply_facade_deactivate(FacadeRuntimeUnit::QueryPeer, &source_status_route, 3, false)
                 .await
         }
     });
@@ -539,7 +539,7 @@ async fn stale_query_peer_sink_query_proxy_deactivate_does_not_wait_for_inflight
         let app = app.clone();
         let sink_query_proxy_route = sink_query_proxy_route.clone();
         async move {
-            app.apply_facade_deactivate(FacadeRuntimeUnit::QueryPeer, &sink_query_proxy_route, 1)
+            app.apply_facade_deactivate(FacadeRuntimeUnit::QueryPeer, &sink_query_proxy_route, 1, false)
                 .await
         }
     });

@@ -71,6 +71,16 @@ struct PublishedBatchUpdate {
 
 enum SourceWorkerAction {
     Immediate(SourceWorkerResponse, bool),
+    SyncLogicalRootsAndStatusSnapshot {
+        source: Arc<FSMetaSource>,
+        authoritative_roots: Vec<crate::source::config::RootSpec>,
+    },
+    SyncLogicalRootsAndObservabilitySnapshot {
+        source: Arc<FSMetaSource>,
+        authoritative_roots: Vec<crate::source::config::RootSpec>,
+        last_control_frame_signals: Vec<String>,
+        published_stats: Arc<StdMutex<PublishedBatchStats>>,
+    },
     UpdateLogicalRoots {
         source: Arc<FSMetaSource>,
         roots: Vec<crate::source::config::RootSpec>,
@@ -155,6 +165,12 @@ fn host_ref_matches_node_id(host_ref: &str, node_id: &NodeId) -> bool {
             .0
             .strip_prefix(host_ref)
             .is_some_and(|suffix| suffix.starts_with('-'))
+        || node_id.0.strip_prefix("cluster-").is_some_and(|scoped| {
+            scoped == host_ref
+                || scoped
+                    .strip_prefix(host_ref)
+                    .is_some_and(|suffix| suffix.starts_with('-'))
+        })
 }
 
 fn stable_host_ref_for_node_id(
@@ -861,14 +877,26 @@ fn plan_worker_request(
             ),
         },
         SourceWorkerRequest::StatusSnapshot => match state.source.as_ref() {
-            Some(source) => match source.status_snapshot_with_failure() {
-                Ok(snapshot) => SourceWorkerAction::Immediate(
-                    SourceWorkerResponse::StatusSnapshot(snapshot),
+            Some(source) => match source.authoritative_logical_roots_if_changed() {
+                Ok(Some(authoritative_roots)) => {
+                    SourceWorkerAction::SyncLogicalRootsAndStatusSnapshot {
+                        source: source.clone(),
+                        authoritative_roots,
+                    }
+                }
+                Ok(None) => match source.status_snapshot_with_failure() {
+                    Ok(snapshot) => SourceWorkerAction::Immediate(
+                        SourceWorkerResponse::StatusSnapshot(snapshot),
+                        false,
+                    ),
+                    Err(err) => {
+                        SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                    }
+                },
+                Err(err) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::Error(err.to_string()),
                     false,
                 ),
-                Err(err) => {
-                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
-                }
             },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
@@ -891,18 +919,32 @@ fn plan_worker_request(
             ),
         },
         SourceWorkerRequest::ObservabilitySnapshot => match state.source.as_ref() {
-            Some(source) => match source_observability_snapshot_with_failure(
-                source,
-                &state.last_control_frame_signals,
-                &state.published_stats,
-            ) {
-                Ok(snapshot) => SourceWorkerAction::Immediate(
-                    SourceWorkerResponse::ObservabilitySnapshot(snapshot),
+            Some(source) => match source.authoritative_logical_roots_if_changed() {
+                Ok(Some(authoritative_roots)) => {
+                    SourceWorkerAction::SyncLogicalRootsAndObservabilitySnapshot {
+                        source: source.clone(),
+                        authoritative_roots,
+                        last_control_frame_signals: state.last_control_frame_signals.clone(),
+                        published_stats: state.published_stats.clone(),
+                    }
+                }
+                Ok(None) => match source_observability_snapshot_with_failure(
+                    source,
+                    &state.last_control_frame_signals,
+                    &state.published_stats,
+                ) {
+                    Ok(snapshot) => SourceWorkerAction::Immediate(
+                        SourceWorkerResponse::ObservabilitySnapshot(snapshot),
+                        false,
+                    ),
+                    Err(err) => {
+                        SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                    }
+                },
+                Err(err) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::Error(err.to_string()),
                     false,
                 ),
-                Err(err) => {
-                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
-                }
             },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
@@ -1112,6 +1154,46 @@ fn plan_worker_request(
 async fn execute_worker_action(action: SourceWorkerAction) -> (SourceWorkerResponse, bool) {
     match action {
         SourceWorkerAction::Immediate(response, stop) => (response, stop),
+        SourceWorkerAction::SyncLogicalRootsAndStatusSnapshot {
+            source,
+            authoritative_roots,
+        } => match source
+            .apply_logical_roots_snapshot(
+                authoritative_roots,
+                false,
+                "source_worker_server.status_snapshot_authority_sync",
+            )
+            .await
+        {
+            Ok(()) => (
+                SourceWorkerResponse::StatusSnapshot(source.status_snapshot()),
+                false,
+            ),
+            Err(err) => (classify_source_worker_error(err), false),
+        },
+        SourceWorkerAction::SyncLogicalRootsAndObservabilitySnapshot {
+            source,
+            authoritative_roots,
+            last_control_frame_signals,
+            published_stats,
+        } => match source
+            .apply_logical_roots_snapshot(
+                authoritative_roots,
+                false,
+                "source_worker_server.observability_snapshot_authority_sync",
+            )
+            .await
+        {
+            Ok(()) => match source_observability_snapshot_with_failure(
+                &source,
+                &last_control_frame_signals,
+                &published_stats,
+            ) {
+                Ok(snapshot) => (SourceWorkerResponse::ObservabilitySnapshot(snapshot), false),
+                Err(err) => (classify_source_worker_failure(err), false),
+            },
+            Err(err) => (classify_source_worker_error(err), false),
+        },
         SourceWorkerAction::UpdateLogicalRoots { source, roots } => {
             eprintln!(
                 "fs_meta_source_worker_server: update_logical_roots begin roots={}",

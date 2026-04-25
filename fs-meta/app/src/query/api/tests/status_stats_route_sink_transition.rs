@@ -113,6 +113,7 @@ async fn load_materialized_status_snapshots_preserves_cached_ready_groups_when_r
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(Some(CachedSinkStatusSnapshot {
             snapshot: cached_snapshot,
         }))),

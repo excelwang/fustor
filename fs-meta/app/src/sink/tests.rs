@@ -390,6 +390,59 @@ async fn roots_control_stream_stays_gated_until_route_activation() {
 }
 
 #[tokio::test]
+async fn owner_scoped_roots_control_stream_stays_gated_until_route_activation() {
+    let sink = build_single_group_sink();
+    let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+
+    sink.start_runtime_endpoints(boundary.clone(), NodeId("node-a".to_string()))
+        .expect("start runtime endpoints");
+
+    let roots_control_route =
+        crate::runtime::routes::sink_roots_control_stream_route_for("node-a").0;
+    let pre_activation_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < pre_activation_deadline {
+        let recv = boundary.recv_count(&roots_control_route);
+        assert_eq!(
+            recv,
+            0,
+            "sink owner-scoped roots-control stream must remain gated before runtime route activation; recv_counts={:?}",
+            boundary.recv_counts_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: roots_control_route.clone(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope("nfs1")],
+        },
+    ))
+    .expect("encode scoped sink roots-control activate")])
+        .await
+        .expect("activate owner-scoped sink roots-control route");
+
+    let activated_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let recv = boundary.recv_count(&roots_control_route);
+        if recv > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < activated_deadline,
+            "sink owner-scoped roots-control stream must begin receiving after route activation; recv_counts={:?}",
+            boundary.recv_counts_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
 async fn events_stream_stays_gated_until_route_activation() {
     let sink = build_single_group_sink();
     let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
@@ -401,7 +454,6 @@ async fn events_stream_stays_gated_until_route_activation() {
 
     sink.start_runtime_endpoints(boundary.clone(), NodeId("node-a".to_string()))
         .expect("start runtime endpoints");
-    sink.enable_stream_receive();
 
     let events_route = format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS);
     let pre_activation_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
@@ -626,6 +678,25 @@ async fn sink_runtime_exec_failover_reactivate_replaces_scoped_holder_without_st
             resource_ids: vec!["node-c::nfs2-new".to_string()],
         }],
         "successor scoped holder activate must replace the stale activated scope instead of merging the dead holder resource into runtime.exec.sink state",
+    );
+}
+
+#[test]
+fn stable_host_ref_treats_cluster_scoped_node_id_as_local_member() {
+    let grants = vec![granted_mount_root(
+        "node-b::nfs2",
+        "node-b",
+        "10.0.0.12",
+        "/mnt/nfs2",
+        true,
+    )];
+    let stable = crate::workers::sink::stable_host_ref_for_node_id(
+        &NodeId("cluster-node-b-29775277610492238759985153".to_string()),
+        &grants,
+    );
+    assert_eq!(
+        stable, "node-b",
+        "cluster-scoped runtime node ids must collapse back to the bare host_ref for sink-side local ownership"
     );
 }
 
@@ -1482,6 +1553,126 @@ fn group_primary_prefers_lowest_active_process_member() {
 }
 
 #[test]
+fn group_primary_prefers_concrete_source_member_over_logical_group_placeholder() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs3", "/mnt/nfs3")];
+    cfg.host_object_grants = vec![
+        granted_mount_root("nfs3", "node-b", "10.0.0.12", "/mnt/nfs3", true),
+        granted_mount_root("node-b::nfs3", "node-b", "10.0.0.12", "/mnt/nfs3", true),
+        granted_mount_root("node-d::nfs3", "node-d", "10.0.0.14", "/mnt/nfs3", true),
+    ];
+
+    let state = SinkState::new(&cfg);
+    let group = state.groups.get("nfs3").expect("group must exist");
+    assert_eq!(
+        group.primary_object_ref, "node-b::nfs3",
+        "the logical group id may only be a placeholder primary when no concrete source object is available"
+    );
+}
+
+#[test]
+fn restored_logical_root_keeps_ready_materialization_after_temporary_omission() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+        RootSpec::new("nfs3", "/mnt/nfs3"),
+    ];
+    let host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-a::nfs2", "node-a", "10.0.0.11", "/mnt/nfs2", true),
+        granted_mount_root("node-b::nfs3", "node-b", "10.0.0.12", "/mnt/nfs3", true),
+    ];
+    cfg.host_object_grants = host_object_grants.clone();
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-b".to_string()), None, cfg).expect("init sink");
+
+    sink.ingest_stream_events(&[
+        mk_source_event(
+            "node-b::nfs3",
+            FileMetaRecord::scan_update(
+                b"/".to_vec(),
+                b"".to_vec(),
+                UnixStat {
+                    is_dir: true,
+                    size: 0,
+                    mtime_us: 1,
+                    ctime_us: 1,
+                    dev: None,
+                    ino: None,
+                },
+                b"/".to_vec(),
+                1,
+                false,
+            ),
+        ),
+        mk_control_event(
+            "node-b::nfs3",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            2,
+        ),
+        mk_source_event(
+            "node-b::nfs3",
+            mk_record(b"/ready-c.txt", "ready-c.txt", 3, EventKind::Update),
+        ),
+        mk_control_event(
+            "node-b::nfs3",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            4,
+        ),
+    ])
+    .expect("nfs3 should materialize before temporary omission");
+    let before = sink.status_snapshot().expect("status before omission");
+    assert_eq!(
+        before
+            .groups
+            .iter()
+            .find(|group| group.group_id == "nfs3")
+            .expect("nfs3 before omission")
+            .readiness,
+        GroupReadinessState::Ready,
+        "precondition: nfs3 should be ready before roots contraction: {before:?}"
+    );
+
+    sink.update_logical_roots(
+        vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+        &host_object_grants,
+    )
+    .expect("contract roots to nfs1");
+    sink.update_logical_roots(
+        vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+            RootSpec::new("nfs3", "/mnt/nfs3"),
+        ],
+        &host_object_grants,
+    )
+    .expect("restore roots to nfs1/nfs2/nfs3");
+
+    let after = sink.status_snapshot().expect("status after restore");
+    let nfs3 = after
+        .groups
+        .iter()
+        .find(|group| group.group_id == "nfs3")
+        .expect("nfs3 after restore");
+    assert_eq!(
+        nfs3.readiness,
+        GroupReadinessState::Ready,
+        "restoring a temporarily omitted ready root must preserve materialized evidence: {after:?}"
+    );
+    assert!(
+        nfs3.total_nodes > 0 && nfs3.live_nodes > 0,
+        "restored nfs3 should keep its materialized tree counters: {after:?}"
+    );
+}
+
+#[test]
 fn update_logical_roots_repartitions_groups_with_current_exports() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![RootSpec::new("old-root", "/mnt/nfs1")];
@@ -1510,6 +1701,72 @@ fn update_logical_roots_repartitions_groups_with_current_exports() {
     let state = sink.state.read().expect("state lock");
     assert!(!state.groups.contains_key("old-root"));
     assert!(state.groups.contains_key("new-root"));
+}
+
+#[test]
+fn runtime_managed_sink_without_active_scope_preserves_groups_across_logical_root_update() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("root-a", "/mnt/nfs1"),
+        RootSpec::new("root-b", "/mnt/nfs2"),
+    ];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::exp-a", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-b::exp-b", "node-b", "10.0.0.12", "/mnt/nfs2", true),
+    ];
+
+    let sink = SinkFileMeta::with_boundaries(
+        NodeId("node-a".to_string()),
+        Some(Arc::new(NoopBoundary)),
+        cfg.clone(),
+    )
+    .expect("init runtime-managed sink");
+
+    assert_eq!(
+        sink.scheduled_group_ids_snapshot()
+            .expect("scheduled group ids before any runtime activation"),
+        None,
+        "runtime-managed sink must treat missing runtime.exec.sink route state as no scope restriction, not an explicit empty schedule"
+    );
+
+    let snapshot_before = sink
+        .status_snapshot()
+        .expect("status before logical-root refresh");
+    let before_groups = snapshot_before
+        .groups
+        .iter()
+        .map(|group| group.group_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        before_groups,
+        std::collections::BTreeSet::from(["root-a", "root-b"]),
+        "runtime-managed sink must retain configured groups before any runtime.exec.sink activate instead of collapsing to zero groups: {snapshot_before:?}"
+    );
+    assert!(
+        snapshot_before.scheduled_groups_by_node.is_empty(),
+        "runtime-managed sink without an active runtime.exec.sink route must not fabricate scheduled_groups_by_node entries before scope truth arrives: {snapshot_before:?}"
+    );
+
+    sink.update_logical_roots(cfg.roots.clone(), &cfg.host_object_grants)
+        .expect("logical-roots refresh before any runtime.exec.sink activate");
+
+    let snapshot_after = sink
+        .status_snapshot()
+        .expect("status after logical-root refresh");
+    let after_groups = snapshot_after
+        .groups
+        .iter()
+        .map(|group| group.group_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        after_groups,
+        std::collections::BTreeSet::from(["root-a", "root-b"]),
+        "logical-roots refresh must preserve configured groups before runtime.exec.sink route truth arrives instead of collapsing sink.groups to zero: {snapshot_after:?}"
+    );
+    assert!(
+        snapshot_after.scheduled_groups_by_node.is_empty(),
+        "logical-roots refresh before any runtime.exec.sink activate must still leave scheduled_groups_by_node empty: {snapshot_after:?}"
+    );
 }
 
 #[tokio::test]

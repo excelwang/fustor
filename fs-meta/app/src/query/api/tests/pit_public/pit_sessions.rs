@@ -150,6 +150,7 @@ async fn build_tree_pit_session_excludes_unscheduled_groups_after_root_transitio
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -358,6 +359,7 @@ async fn build_tree_pit_session_preserves_materialized_target_groups_when_later_
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -565,6 +567,7 @@ async fn build_tree_pit_session_preserves_materialized_target_groups_when_first_
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -808,6 +811,7 @@ async fn build_tree_pit_session_prefers_cached_sink_primary_when_later_sink_stat
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };

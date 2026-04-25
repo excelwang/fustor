@@ -30,6 +30,10 @@ pub(crate) enum HealthSignal {
     },
     /// A concrete root pipeline experienced a transient error.
     PipelineError { root_key: String, error: String },
+    /// Host-fs facade timed out while collecting observation evidence.
+    HostFsTimeout { root_key: String, op: String },
+    /// Host-fs facade reported backpressure while collecting observation evidence.
+    HostFsBackpressure { root_key: String, op: String },
     /// Pipeline recovered after a previous error.
     PipelineRecovered { root_key: String },
 }
@@ -60,6 +64,8 @@ struct RootHealthEntry {
     last_audit_drift: usize,
     /// Timestamp of last audit signal.
     last_audit_at: Option<Instant>,
+    /// Last explicit domain-visible degradation reason.
+    last_error: Option<String>,
 }
 
 impl Default for RootHealthEntry {
@@ -71,6 +77,7 @@ impl Default for RootHealthEntry {
             consecutive_errors: 0,
             last_audit_drift: 0,
             last_audit_at: None,
+            last_error: None,
         }
     }
 }
@@ -232,9 +239,36 @@ impl Sentinel {
                 }
             }
 
+            HealthSignal::HostFsTimeout {
+                ref root_key,
+                ref op,
+            } => {
+                let entry = state.entry(root_key.clone()).or_default();
+                entry.is_degraded = true;
+                entry.last_error = Some("HOST_FS_TIMEOUT".to_string());
+                actions.push(SentinelAction::ReportDegraded {
+                    root_key: root_key.clone(),
+                    reason: format!("HOST_FS_TIMEOUT: {op}"),
+                });
+            }
+
+            HealthSignal::HostFsBackpressure {
+                ref root_key,
+                ref op,
+            } => {
+                let entry = state.entry(root_key.clone()).or_default();
+                entry.is_degraded = true;
+                entry.last_error = Some("HOST_FS_BACKPRESSURE".to_string());
+                actions.push(SentinelAction::ReportDegraded {
+                    root_key: root_key.clone(),
+                    reason: format!("HOST_FS_BACKPRESSURE: {op}"),
+                });
+            }
+
             HealthSignal::PipelineRecovered { ref root_key } => {
                 let entry = state.entry(root_key.clone()).or_default();
                 entry.consecutive_errors = 0;
+                entry.last_error = None;
                 if entry.is_degraded {
                     entry.is_degraded = false;
                     actions.push(SentinelAction::ReportRecovered {
@@ -254,7 +288,9 @@ impl Sentinel {
             .iter()
             .filter(|(_, e)| e.is_degraded)
             .map(|(k, e)| {
-                let reason = if e.overflow_count > 0 {
+                let reason = if let Some(last_error) = e.last_error.as_ref() {
+                    last_error.clone()
+                } else if e.overflow_count > 0 {
                     format!("overflow({})", e.overflow_count)
                 } else if e.consecutive_errors > 0 {
                     format!("errors({})", e.consecutive_errors)

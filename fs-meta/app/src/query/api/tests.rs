@@ -2,7 +2,7 @@ use super::*;
 use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::routes::{
     METHOD_SINK_QUERY, METHOD_SOURCE_FIND, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
-    sink_query_request_route_for,
+    sink_query_request_route_for, source_find_request_route_for,
 };
 use crate::sink::SinkFileMeta;
 use crate::source::FSMetaSource;
@@ -760,6 +760,24 @@ impl ForceFindProtocolRetryThenReplyBoundary {
             .get(channel)
             .unwrap_or(&0)
     }
+
+    fn total_send_batch_count(&self) -> usize {
+        self.send_batches_by_channel
+            .lock()
+            .expect("force-find retry boundary send batches lock")
+            .values()
+            .copied()
+            .sum()
+    }
+
+    fn total_recv_batch_count(&self) -> usize {
+        self.recv_batches_by_channel
+            .lock()
+            .expect("force-find retry boundary recv batches lock")
+            .values()
+            .copied()
+            .sum()
+    }
 }
 
 impl ForceFindGroupMissingThenReplyBoundary {
@@ -793,6 +811,24 @@ impl ForceFindGroupMissingThenReplyBoundary {
             .expect("force-find group-missing boundary recv batches lock")
             .get(channel)
             .unwrap_or(&0)
+    }
+
+    fn total_send_batch_count(&self) -> usize {
+        self.send_batches_by_channel
+            .lock()
+            .expect("force-find group-missing boundary send batches lock")
+            .values()
+            .copied()
+            .sum()
+    }
+
+    fn total_recv_batch_count(&self) -> usize {
+        self.recv_batches_by_channel
+            .lock()
+            .expect("force-find group-missing boundary recv batches lock")
+            .values()
+            .copied()
+            .sum()
     }
 }
 
@@ -837,6 +873,15 @@ impl ForceFindSingleCandidateGroupMissingThenFallbackBoundary {
             }
             _ => None,
         }
+    }
+
+    fn total_send_batch_count(&self) -> usize {
+        self.send_batches_by_channel
+            .lock()
+            .expect("force-find single-candidate boundary send batches lock")
+            .values()
+            .copied()
+            .sum()
     }
 }
 
@@ -2140,17 +2185,11 @@ impl ChannelIoSubset for ForceFindProtocolRetryThenReplyBoundary {
             .or_default() += 1;
         drop(recv_batches);
 
-        if request.channel_key.0 != self.source_reply_channel {
+        if !request.channel_key.0.ends_with(":reply") {
             return Err(CnxError::Timeout);
         }
-        let request_channel = self.source_reply_channel.trim_end_matches(":reply");
-        let send_count = self
-            .send_batches_by_channel
-            .lock()
-            .expect("force-find retry boundary send batches lock")
-            .get(request_channel)
-            .copied()
-            .unwrap_or_default();
+        let request_channel = request.channel_key.0.trim_end_matches(":reply");
+        let send_count = self.total_send_batch_count();
         if send_count < 2 {
             return Err(CnxError::ProtocolViolation(
                 "bound route protocol violation: unexpected correlation_id in reply batch (11)"
@@ -2217,17 +2256,11 @@ impl ChannelIoSubset for ForceFindGroupMissingThenReplyBoundary {
             .or_default() += 1;
         drop(recv_batches);
 
-        if request.channel_key.0 != self.source_reply_channel {
+        if !request.channel_key.0.ends_with(":reply") {
             return Err(CnxError::Timeout);
         }
-        let request_channel = self.source_reply_channel.trim_end_matches(":reply");
-        let send_count = self
-            .send_batches_by_channel
-            .lock()
-            .expect("force-find group-missing boundary send batches lock")
-            .get(request_channel)
-            .copied()
-            .unwrap_or_default();
+        let request_channel = request.channel_key.0.trim_end_matches(":reply");
+        let send_count = self.total_send_batch_count();
         if send_count < 2 {
             return Err(CnxError::PeerError(
                 "force-find selected_group matched no group: nfs1".to_string(),
@@ -2276,7 +2309,9 @@ impl ChannelIoSubset for ForceFindSingleCandidateGroupMissingThenFallbackBoundar
             .expect("force-find single-candidate boundary send batches lock");
         let batch_count = send_batches.entry(request.channel_key.0).or_default();
         *batch_count += 1;
-        if *batch_count == 2 {
+        let total_send_batches = send_batches.values().copied().sum::<usize>();
+        drop(send_batches);
+        if total_send_batches == 2 {
             *self
                 .second_send_at
                 .lock()
@@ -2300,17 +2335,11 @@ impl ChannelIoSubset for ForceFindSingleCandidateGroupMissingThenFallbackBoundar
             .or_default() += 1;
         drop(recv_batches);
 
-        if request.channel_key.0 != self.source_reply_channel {
+        if !request.channel_key.0.ends_with(":reply") {
             return Err(CnxError::Timeout);
         }
-        let request_channel = self.source_reply_channel.trim_end_matches(":reply");
-        let send_count = self
-            .send_batches_by_channel
-            .lock()
-            .expect("force-find single-candidate boundary send batches lock")
-            .get(request_channel)
-            .copied()
-            .unwrap_or_default();
+        let request_channel = request.channel_key.0.trim_end_matches(":reply");
+        let send_count = self.total_send_batch_count();
         if send_count < 2 {
             *self
                 .first_retryable_gap_at
@@ -2949,6 +2978,7 @@ fn test_api_state_for_source(source: Arc<SourceFacade>, sink: Arc<SinkFacade>) -
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: None,
         readiness_sink: None,
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     }
@@ -2973,6 +3003,7 @@ fn test_api_state_for_route_source(
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: None,
         readiness_sink: None,
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     }
@@ -3459,9 +3490,7 @@ async fn selected_group_force_find_route_uses_source_find_endpoint_for_chosen_no
     let source = source_facade_with_group("nfs1", &grants);
     let sink = sink_facade_with_group(&grants);
     let boundary = Arc::new(LoopbackRouteBoundary::default());
-    let route = default_route_bindings()
-        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
-        .expect("resolve source-find route");
+    let route = source_find_request_route_for("node-a");
     let routed_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let routed_calls_for_handler = routed_calls.clone();
     let mut endpoint = ManagedEndpointTask::spawn(
@@ -3543,10 +3572,7 @@ async fn selected_group_force_find_route_retries_protocol_violation_and_reaches_
     let source = source_facade_with_group("nfs1", &grants);
     let sink = sink_facade_with_group(&grants);
     let boundary = Arc::new(ForceFindProtocolRetryThenReplyBoundary::new(vec![1, 2, 3]));
-    let route = default_route_bindings()
-        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
-        .expect("resolve source-find route");
-    let reply_route = format!("{}:reply", route.0);
+    let route = source_find_request_route_for("node-a");
     let state = test_api_state_for_route_source(
         source,
         sink,
@@ -3567,17 +3593,17 @@ async fn selected_group_force_find_route_retries_protocol_violation_and_reaches_
 
     assert!(
         result.is_ok(),
-        "selected-group force-find should retry a transient correlation mismatch on the chosen source-find route; request_send_batches={} reply_recv_batches={} err={:?}",
-        boundary.send_batch_count(&route.0),
-        boundary.recv_batch_count(&reply_route),
+        "selected-group force-find should retry a transient correlation mismatch on the chosen source-find route; total_request_send_batches={} total_reply_recv_batches={} err={:?}",
+        boundary.total_send_batch_count(),
+        boundary.total_recv_batch_count(),
         result.as_ref().err(),
     );
     assert!(
-        boundary.send_batch_count(&route.0) >= 2,
+        boundary.total_send_batch_count() >= 2,
         "selected-group force-find retry should send the chosen source-find route at least twice"
     );
     assert!(
-        boundary.recv_batch_count(&reply_route) >= 2,
+        boundary.total_recv_batch_count() >= 2,
         "selected-group force-find retry should observe at least one failed reply attempt before the successful one"
     );
     assert_eq!(
@@ -3635,10 +3661,7 @@ async fn selected_group_force_find_route_reroutes_when_chosen_runner_reports_sel
     let source = source_facade_with_group("nfs1", &grants);
     let sink = sink_facade_with_group(&grants);
     let boundary = Arc::new(ForceFindGroupMissingThenReplyBoundary::new(vec![7, 8, 9]));
-    let route = default_route_bindings()
-        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
-        .expect("resolve source-find route");
-    let reply_route = format!("{}:reply", route.0);
+    let route = source_find_request_route_for("node-a");
     let state = test_api_state_for_route_source(
         source,
         sink,
@@ -3659,17 +3682,17 @@ async fn selected_group_force_find_route_reroutes_when_chosen_runner_reports_sel
 
     assert!(
         result.is_ok(),
-        "selected-group force-find should reroute when the chosen runner reports selected_group missing; request_send_batches={} reply_recv_batches={} err={:?}",
-        boundary.send_batch_count(&route.0),
-        boundary.recv_batch_count(&reply_route),
+        "selected-group force-find should reroute when the chosen runner reports selected_group missing; total_request_send_batches={} total_reply_recv_batches={} err={:?}",
+        boundary.total_send_batch_count(),
+        boundary.total_recv_batch_count(),
         result.as_ref().err(),
     );
     assert!(
-        boundary.send_batch_count(&route.0) >= 2,
+        boundary.total_send_batch_count() >= 2,
         "selected-group force-find reroute should send the source-find route at least twice"
     );
     assert!(
-        boundary.recv_batch_count(&reply_route) >= 2,
+        boundary.total_recv_batch_count() >= 2,
         "selected-group force-find reroute should observe one failed selected-group-missing reply before succeeding"
     );
     assert_eq!(
@@ -3708,9 +3731,7 @@ async fn selected_group_force_find_route_falls_back_when_single_candidate_runner
     let sink = sink_facade_with_group(&grants);
     let boundary =
         Arc::new(ForceFindSingleCandidateGroupMissingThenFallbackBoundary::new(vec![4, 5, 6]));
-    let route = default_route_bindings()
-        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
-        .expect("resolve source-find route");
+    let route = source_find_request_route_for("node-b");
     let state = test_api_state_for_route_source(
         source,
         sink,
@@ -3731,15 +3752,15 @@ async fn selected_group_force_find_route_falls_back_when_single_candidate_runner
 
     assert!(
         result.is_ok(),
-        "selected-group force-find should immediately fall back within the same retry window when the only chosen runner reports selected_group missing; request_send_batches={} retry_reissue_delay_ms={:?} err={:?}",
-        boundary.send_batch_count(&route.0),
+        "selected-group force-find should immediately fall back within the same retry window when the only chosen runner reports selected_group missing; total_request_send_batches={} retry_reissue_delay_ms={:?} err={:?}",
+        boundary.total_send_batch_count(),
         boundary
             .retry_reissue_delay()
             .map(|delay| delay.as_millis()),
         result.as_ref().err(),
     );
     assert!(
-        boundary.send_batch_count(&route.0) >= 2,
+        boundary.total_send_batch_count() >= 2,
         "single-candidate reroute should issue an immediate re-send after the retryable runner gap"
     );
     assert!(
@@ -4621,6 +4642,7 @@ async fn load_request_scoped_materialized_sink_status_snapshot_accepts_immediate
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };

@@ -47,6 +47,27 @@ User-visible and operator-visible state names consumed by these workflows are ow
 16. audit 扫描产生的文件级 `FileMetaRecord` 必须携带 `parent_path` 与 `parent_mtime_us`，供 sink 进行 parent-staleness 拒绝判定。
 17. source 通过 schema 约定输出 MessagePack `FileMetaRecord`：`path` 为 raw-bytes 且在 in-root emission 中保持 leading-slash 相对路径；`source` 字段按产出轨道显式标记 `Realtime/Scan`。
 
+## [workflow] CoverageEvidenceAggregation
+
+**Steps**
+
+1. source reports each group/root coverage using one `AuditCoverageMode` and the five `ObservationCoverageCapability` booleans.
+2. when realtime watch is healthy and audit is active, source reports `realtime_hotset_plus_audit` with watch freshness coverage enabled.
+3. when realtime watch freshness is unavailable but audit continues, source reports `audit_only`; metadata completeness remains expressed by capability bits.
+4. when metadata collection is complete through audit, source may report `audit_with_metadata`; when file metadata collection is disabled or unavailable, source reports `audit_without_file_metadata` and disables `file_metadata_coverage` plus `mtime_size_coverage`.
+5. sink/query propagate disabled capabilities into `meta.metadata_available=false`, `withheld_reason`, degraded reason, or partial evidence rather than manufacturing metadata.
+6. status exposes the same mode/capability evidence so operators can distinguish count/existence coverage from full metadata coverage.
+
+## [workflow] HostFsTimeoutBackpressureEvidence
+
+**Steps**
+
+1. source performs host-fs scan, stat, list, and watch setup through bounded/cancellable facade operations.
+2. a host-fs timeout or backpressure event is recorded as observation evidence for the affected root or group.
+3. isolated timeout may produce partial/degraded evidence for that root/group without aborting unrelated groups.
+4. repeated timeout updates status with root/group degraded reason `HOST_FS_TIMEOUT`; repeated backpressure updates status with root/group degraded reason `HOST_FS_BACKPRESSURE`; either prevents trusted-materialized promotion for the affected coverage until recovery evidence arrives.
+5. source does not use unbounded thread spawn as the routine way to wait out slow host-fs operations.
+
 ## [workflow] GroupFormationFromHostObjectDescriptorsWorkflow
 
 **Steps**
@@ -292,6 +313,26 @@ fn delete_aware_aggregate(records: &[FileMetaRecord]) -> Vec<FsMetaQueryNode>
 4. fs-meta 业务层仅处理域策略与域数据融合，不处理 host-operation ABI 细节，也不拼装位置透明的远程宿主调用目录。
 5. host-object descriptors 到 groups 的映射由 fs-meta app 维护；runtime/kernel 不实现业务 fanout。
 
+## [workflow] RuntimeArtifactEvidenceValidation
+
+**Steps**
+
+1. deploy records the expected fs-meta runtime/app artifact hash for each participating node.
+2. runtime/app startup records the actually loaded artifact path and content hash as RuntimeArtifactEvidence.
+3. status or deployment diagnostics expose expected-vs-actual artifact evidence without making it business observation truth.
+4. deploy validation compares expected and actual hashes across all nodes before treating the environment as artifact-consistent.
+5. demo/test harness fails closed when the run/bin artifact and actually loaded runtime artifact differ.
+
+## [workflow] DemoEvidenceDiscipline
+
+**Steps**
+
+1. mini demo environments may reduce file counts for fast debugging, but preserve the full demo topology, roots/grants shape, and runtime parameters.
+2. mini demo evidence and full demo evidence remain separate; mini success is not full demo acceptance.
+3. `/stats` aggregation output is display evidence only unless `/status` also proves artifact consistency, roots/grants activation, source coverage, and sink materialization readiness.
+4. disabled metadata audit is not an allowed full-demo acceleration path; metadata coverage loss may be reported only as degraded evidence.
+5. full demo acceptance fails when artifact mismatch, host-fs timeout/backpressure, missing metadata coverage, or materialization unreadiness remains.
+
 ## [workflow] BinaryUpgradeContinuity
 
 **Steps**
@@ -361,21 +402,24 @@ fn delete_aware_aggregate(records: &[FileMetaRecord]) -> Vec<FsMetaQueryNode>
 2. caller sends draft roots to `POST /api/fs-meta/v1/monitoring/roots/preview`.
 3. api validates the payload, resolves matching grants, and returns per-root monitor path previews.
 4. caller applies the approved set with `PUT /api/fs-meta/v1/monitoring/roots`.
-5. api revalidates the submitted roots against the current runtime grants; if any root has no current grant match, api rejects the whole write with explicit unmatched root ids and preserves the previous authoritative root set.
-6. once revalidation passes, api updates the app-owned authoritative roots/group definition set in-memory.
-7. source refreshes group membership against current host object grants, and sink refreshes projection partitioning against the same roots plus current bound scopes.
-8. runtime remains the owner of bind/run realization for affected execution scopes; api/app consume the resulting runtime state and do not become bind/run semantic owners.
-9. if source/sink refresh against current grants or bound scopes fails, api returns explicit internal error and reverts to the previous authoritative root set.
-10. empty roots remain a valid deployed-but-unconfigured state.
+5. api checks Management Write Ready for the current Authority Epoch; if the HTTP facade is reachable but the active control stream is not ready, api rejects the write with explicit `NOT_READY` and preserves the previous authoritative root set.
+6. api revalidates the submitted roots against the current runtime grants; if any root has no current grant match, api rejects the whole write with explicit unmatched root ids and preserves the previous authoritative root set.
+7. once revalidation passes, api updates the app-owned authoritative roots/group definition set in-memory.
+8. source refreshes group membership against current host object grants, and sink refreshes projection partitioning against the same roots plus current bound scopes.
+9. runtime remains the owner of bind/run realization for affected execution scopes; api/app consume the resulting runtime state and do not become bind/run semantic owners.
+10. if source/sink refresh against current grants or bound scopes fails, api returns explicit internal error and reverts to the previous authoritative root set.
+11. empty roots remain a valid deployed-but-unconfigured state.
 
 ## [workflow] ApiManualRescan
 
 **Steps**
 
 1. caller sends `POST /api/fs-meta/v1/index/rescan`.
-2. api authorizes admin role and forwards trigger to source-primary executor rescan path.
-3. source sends manual rescan signal only to each group source-primary executor pipeline.
-4. api returns accepted response.
+2. api authorizes admin role.
+3. api checks Management Write Ready for the current Authority Epoch; if the HTTP facade is reachable but the active control stream is not ready, api rejects the write with explicit `NOT_READY`.
+4. api forwards trigger to source-primary executor rescan path.
+5. source sends manual rescan signal only to each group source-primary executor pipeline.
+6. api returns accepted response.
 
 ## [workflow] QueryApiKeyLifecycle
 
@@ -383,7 +427,26 @@ fn delete_aware_aggregate(records: &[FileMetaRecord]) -> Vec<FsMetaQueryNode>
 
 1. caller authenticates as a management-session subject with `admin` capability.
 2. caller reads current query-consumer credentials through `GET /api/fs-meta/v1/query-api-keys`.
-3. caller creates a new query-consumer credential through `POST /api/fs-meta/v1/query-api-keys`; api persists the key metadata and returns the one-time `api_key` secret together with its summary row.
-4. query consumers use that `api_key` only on `/tree`, `/stats`, and `/on-demand-force-find`; management endpoints continue to reject query-api-key bearer tokens.
-5. caller revokes a credential through `DELETE /api/fs-meta/v1/query-api-keys/:key_id`.
-6. after revocation, subsequent query requests with that key are rejected; revocation does not grant management-session access or mutate roots/runtime grants by itself.
+3. api checks Management Write Ready before credential creation or revocation; if the HTTP facade is reachable but the active control stream is not ready, api rejects the write with explicit `NOT_READY`.
+4. caller creates a new query-consumer credential through `POST /api/fs-meta/v1/query-api-keys`; api persists the key metadata and returns the one-time `api_key` secret together with its summary row.
+5. query consumers use that `api_key` only on `/tree`, `/stats`, and `/on-demand-force-find`; management endpoints continue to reject query-api-key bearer tokens.
+6. caller revokes a credential through `DELETE /api/fs-meta/v1/query-api-keys/:key_id`.
+7. after revocation, subsequent query requests with that key are rejected; revocation does not grant management-session access or mutate roots/runtime grants by itself.
+
+## [workflow] ForceFindAvailability
+
+**Steps**
+
+1. caller sends `GET /api/fs-meta/v1/on-demand-force-find` with a query API key.
+2. api identifies the current Authority Epoch from roots signature, grants signature, source stream generation, sink materialization generation, and facade/runtime generation.
+3. if monitoring roots are empty, api returns explicit `NOT_READY` with `monitoring_roots_empty`.
+4. if runtime grants are unavailable for the current Authority Epoch, api returns explicit `NOT_READY` with `runtime_grants_unavailable`.
+5. api resolves Runner Binding Evidence for each requested group inside the current Authority Epoch; cached evidence may be used only when it belongs to that same Authority Epoch.
+6. if runner binding has not yet been built for the current Authority Epoch, api returns explicit `NOT_READY` with `runner_binding_not_ready` instead of using older evidence.
+7. if a requested group has no runner candidate in the current Authority Epoch, the group returns explicit `GROUP_UNBOUND` while other groups continue independently.
+8. if a requested group already has an in-flight fresh scan, fs-meta applies the group-local exclusivity policy and either joins that in-flight work within the request budget or returns an explicit group-local conflict/unavailable result.
+9. once a group is Force-Find Ready, fs-meta selects one runner bound to that group and dispatches fresh execution to that selected runner; it does not wait for source initial audit completion, sink materialization readiness, or trusted materialized observation eligibility.
+10. the group enters Selected-Runner Fresh Execution: the group result is decided by the selected runner's success, explicit failure, or timeout, and fs-meta does not keep that group open to wait for unrelated runners.
+11. for multi-group force-find, fs-meta repeats the same selected-runner decision per group and assembles independent group buckets; one group's wait or failure does not redefine another group's result.
+12. successful results return `read_class=fresh` and `observation_status.state=fresh-only`; they do not promote `/tree` or `/stats` materialized observation to trusted state.
+13. fresh execution failures remain explicit group-level errors such as `RUNNER_UNAVAILABLE` or `HOST_FS_UNAVAILABLE`; fs-meta does not silently substitute materialized results for failed fresh execution.
