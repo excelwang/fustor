@@ -54,6 +54,7 @@ use crate::runtime::routes::{
     METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SOURCE_FIND,
     METHOD_STREAM, ROUTE_KEY_EVENTS, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_EVENTS,
     ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, sink_query_request_route_for,
+    sink_query_route_bindings_for, sink_roots_control_stream_route_for,
 };
 use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::unit_gate::RuntimeUnitGate;
@@ -81,6 +82,15 @@ fn debug_sink_query_route_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("FSMETA_DEBUG_SINK_QUERY_ROUTE_TRACE")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
+fn debug_events_gate_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_EVENTS_GATE")
             .ok()
             .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
     })
@@ -1342,11 +1352,7 @@ impl SinkState {
                 .collect::<Vec<_>>();
             active_member_ids.sort();
             active_member_ids.dedup();
-            let primary = active_member_ids
-                .first()
-                .cloned()
-                .or_else(|| member_ids.first().cloned())
-                .unwrap_or_else(|| root.id.clone());
+            let primary = select_primary_object_ref(&root.id, &active_member_ids, &member_ids);
             let mut group = previous_groups
                 .remove(&root.id)
                 .or_else(|| retained_groups.remove(&root.id))
@@ -1412,6 +1418,25 @@ impl SinkState {
         let is_primary = group.primary_object_ref == object_ref;
         Ok((group_id, is_primary, group))
     }
+}
+
+fn select_primary_object_ref(
+    root_id: &str,
+    active_member_ids: &[String],
+    member_ids: &[String],
+) -> String {
+    active_member_ids
+        .iter()
+        .find(|object_ref| object_ref.as_str() != root_id)
+        .or_else(|| {
+            member_ids
+                .iter()
+                .find(|object_ref| object_ref.as_str() != root_id)
+        })
+        .or_else(|| active_member_ids.first())
+        .or_else(|| member_ids.first())
+        .cloned()
+        .unwrap_or_else(|| root_id.to_string())
 }
 
 /// In-memory state carrier for sink group trees/clocks/epochs.
@@ -1744,9 +1769,10 @@ impl SinkFileMeta {
         }
 
         if let Some(sys) = boundary {
+            let scoped_routes = sink_query_route_bindings_for(&node_id.0);
             let adapter =
-                exchange_host_adapter(sys.clone(), node_id.clone(), default_route_bindings());
-            let routes = default_route_bindings();
+                exchange_host_adapter(sys.clone(), node_id.clone(), scoped_routes.clone());
+            let routes = scoped_routes;
 
             // 1. Materialized query endpoints.
             let query_state = state.clone();
@@ -2180,6 +2206,12 @@ impl SinkFileMeta {
         });
     }
 
+    fn endpoint_task_route_present(&self, route_key: &str, context: &str) -> bool {
+        lock_or_recover(&self.endpoint_tasks, context)
+            .iter()
+            .any(|task| task.route_key() == route_key)
+    }
+
     pub(crate) fn start_runtime_endpoints_on_boundary(
         &self,
         boundary: Arc<dyn ChannelIoSubset>,
@@ -2191,14 +2223,6 @@ impl SinkFileMeta {
             node_id.0
         );
         self.prune_finished_endpoint_tasks("sink.start_runtime_endpoints.prune");
-        if !lock_or_recover(&self.endpoint_tasks, "sink.start_runtime_endpoints").is_empty() {
-            eprintln!(
-                "fs_meta_sink: start_runtime_endpoints skip node={} reason=already-started elapsed_ms={}",
-                node_id.0,
-                start.elapsed().as_millis()
-            );
-            return Ok(());
-        }
 
         self.disable_stream_receive();
 
@@ -2207,14 +2231,15 @@ impl SinkFileMeta {
             node_id.0,
             start.elapsed().as_millis()
         );
+        let scoped_routes = sink_query_route_bindings_for(&node_id.0);
         let adapter =
-            exchange_host_adapter(boundary.clone(), node_id.clone(), default_route_bindings());
+            exchange_host_adapter(boundary.clone(), node_id.clone(), scoped_routes.clone());
         eprintln!(
             "fs_meta_sink: start_runtime_endpoints adapter ok node={} elapsed_ms={}",
             node_id.0,
             start.elapsed().as_millis()
         );
-        let routes = default_route_bindings();
+        let routes = scoped_routes;
 
         let query_state = self.state.clone();
         let node_id_cloned = node_id.clone();
@@ -2226,87 +2251,97 @@ impl SinkFileMeta {
         let query_stream_receive_enabled = self.stream_receive_enabled.clone();
         let query_unit_control = self.unit_control.clone();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_QUERY) {
-            eprintln!(
-                "fs_meta_sink: start_runtime_endpoints query spawn begin node={} route={} elapsed_ms={}",
-                node_id_cloned.0,
-                route.0,
-                start.elapsed().as_millis()
-            );
-            log::info!(
-                "bound route listening on {}.{} for sink {}",
-                ROUTE_TOKEN_FS_META,
-                METHOD_QUERY,
-                node_id_cloned.0
-            );
-            let endpoint = ManagedEndpointTask::spawn_with_unit(
-                boundary.clone(),
-                route,
-                format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
-                SINK_RUNTIME_UNIT_ID,
-                self.shutdown.clone(),
-                {
-                    let query_node_id = node_id_cloned.clone();
-                    move |requests| {
-                        let query_state = query_state.clone();
-                        let query_root_specs = query_root_specs.clone();
-                        let query_host_object_grants = query_host_object_grants.clone();
-                        let query_visibility_lag = query_visibility_lag.clone();
-                        let query_stream_delivery_stats = query_stream_delivery_stats.clone();
-                        let query_pending_stream_events = query_pending_stream_events.clone();
-                        let query_stream_receive_enabled = query_stream_receive_enabled.clone();
-                        let query_unit_control = query_unit_control.clone();
-                        let query_node_id = query_node_id.clone();
-                        async move {
-                            let mut responses = Vec::new();
-                            for req in requests {
-                                if let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
-                                    req.payload_bytes(),
-                                ) {
-                                    let sink_impl = SinkFileMeta {
-                                        node_id: query_node_id.clone(),
-                                        state: query_state.clone(),
-                                        root_specs: query_root_specs.clone(),
-                                        host_object_grants: query_host_object_grants.clone(),
-                                        visibility_lag: query_visibility_lag.clone(),
-                                        stream_delivery_stats: query_stream_delivery_stats.clone(),
-                                        pending_stream_events: query_pending_stream_events.clone(),
-                                        stream_receive_enabled: query_stream_receive_enabled
-                                            .clone(),
-                                        unit_control: query_unit_control.clone(),
-                                        stream_recv_observer: None,
-                                        stream_recv_ready_notify: None,
-                                        shutdown: CancellationToken::new(),
-                                        endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-                                    };
-                                    let mut events =
-                                        sink_impl.materialized_query(&params).unwrap_or_default();
-                                    for event in &mut events {
-                                        let mut meta = event.metadata().clone();
-                                        meta.correlation_id = req.metadata().correlation_id;
-                                        responses.push(Event::new(
-                                            meta,
-                                            Bytes::copy_from_slice(event.payload_bytes()),
-                                        ));
+            if !self.endpoint_task_route_present(
+                &route.0,
+                "sink.start_runtime_endpoints.route_present.query",
+            ) {
+                eprintln!(
+                    "fs_meta_sink: start_runtime_endpoints query spawn begin node={} route={} elapsed_ms={}",
+                    node_id_cloned.0,
+                    route.0,
+                    start.elapsed().as_millis()
+                );
+                log::info!(
+                    "bound route listening on {}.{} for sink {}",
+                    ROUTE_TOKEN_FS_META,
+                    METHOD_QUERY,
+                    node_id_cloned.0
+                );
+                let endpoint = ManagedEndpointTask::spawn_with_unit(
+                    boundary.clone(),
+                    route,
+                    format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
+                    SINK_RUNTIME_UNIT_ID,
+                    self.shutdown.clone(),
+                    {
+                        let query_node_id = node_id_cloned.clone();
+                        move |requests| {
+                            let query_state = query_state.clone();
+                            let query_root_specs = query_root_specs.clone();
+                            let query_host_object_grants = query_host_object_grants.clone();
+                            let query_visibility_lag = query_visibility_lag.clone();
+                            let query_stream_delivery_stats = query_stream_delivery_stats.clone();
+                            let query_pending_stream_events = query_pending_stream_events.clone();
+                            let query_stream_receive_enabled = query_stream_receive_enabled.clone();
+                            let query_unit_control = query_unit_control.clone();
+                            let query_node_id = query_node_id.clone();
+                            async move {
+                                let mut responses = Vec::new();
+                                for req in requests {
+                                    if let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
+                                        req.payload_bytes(),
+                                    ) {
+                                        let sink_impl = SinkFileMeta {
+                                            node_id: query_node_id.clone(),
+                                            state: query_state.clone(),
+                                            root_specs: query_root_specs.clone(),
+                                            host_object_grants: query_host_object_grants.clone(),
+                                            visibility_lag: query_visibility_lag.clone(),
+                                            stream_delivery_stats: query_stream_delivery_stats
+                                                .clone(),
+                                            pending_stream_events: query_pending_stream_events
+                                                .clone(),
+                                            stream_receive_enabled: query_stream_receive_enabled
+                                                .clone(),
+                                            unit_control: query_unit_control.clone(),
+                                            stream_recv_observer: None,
+                                            stream_recv_ready_notify: None,
+                                            shutdown: CancellationToken::new(),
+                                            endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                                        };
+                                        let mut events = sink_impl
+                                            .materialized_query(&params)
+                                            .unwrap_or_default();
+                                        for event in &mut events {
+                                            let mut meta = event.metadata().clone();
+                                            meta.correlation_id = req.metadata().correlation_id;
+                                            responses.push(Event::new(
+                                                meta,
+                                                Bytes::copy_from_slice(event.payload_bytes()),
+                                            ));
+                                        }
+                                    } else {
+                                        log::warn!(
+                                            "bound route failed to parse InternalQueryRequest"
+                                        );
                                     }
-                                } else {
-                                    log::warn!("bound route failed to parse InternalQueryRequest");
                                 }
+                                responses
                             }
-                            responses
                         }
-                    }
-                },
-            );
-            eprintln!(
-                "fs_meta_sink: start_runtime_endpoints query spawn ok node={} elapsed_ms={}",
-                node_id_cloned.0,
-                start.elapsed().as_millis()
-            );
-            lock_or_recover(
-                &self.endpoint_tasks,
-                "sink.start_runtime_endpoints.query_tasks",
-            )
-            .push(endpoint);
+                    },
+                );
+                eprintln!(
+                    "fs_meta_sink: start_runtime_endpoints query spawn ok node={} elapsed_ms={}",
+                    node_id_cloned.0,
+                    start.elapsed().as_millis()
+                );
+                lock_or_recover(
+                    &self.endpoint_tasks,
+                    "sink.start_runtime_endpoints.query_tasks",
+                )
+                .push(endpoint);
+            }
         }
 
         let internal_query_state = self.state.clone();
@@ -2323,6 +2358,12 @@ impl SinkFileMeta {
         }
         internal_query_routes.push(sink_query_request_route_for(&node_id_cloned.0));
         for route in internal_query_routes {
+            if self.endpoint_task_route_present(
+                &route.0,
+                "sink.start_runtime_endpoints.route_present.internal_query",
+            ) {
+                continue;
+            }
             let internal_query_state_for_route = internal_query_state.clone();
             let internal_query_root_specs_for_route = internal_query_root_specs.clone();
             let internal_query_host_object_grants_for_route =
@@ -2454,93 +2495,103 @@ impl SinkFileMeta {
         let node_id_proxy_log = node_id_proxy.clone();
         let proxy_adapter = adapter.clone();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_FIND) {
-            eprintln!(
-                "fs_meta_sink: start_runtime_endpoints find spawn begin node={} route={} elapsed_ms={}",
-                node_id_proxy_log.0,
-                route.0,
-                start.elapsed().as_millis()
-            );
-            log::info!(
-                "bound route listening on {}.{} for sink {}",
-                ROUTE_TOKEN_FS_META,
-                METHOD_FIND,
-                node_id_proxy.0
-            );
-            let endpoint = ManagedEndpointTask::spawn_with_unit(
-                boundary.clone(),
-                route,
-                format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_FIND),
-                SINK_RUNTIME_UNIT_ID,
-                self.shutdown.clone(),
-                move |requests| {
-                    let node_id_proxy = node_id_proxy.clone();
-                    let proxy_adapter = proxy_adapter.clone();
-                    async move {
-                        let mut responses = Vec::new();
+            if !self.endpoint_task_route_present(
+                &route.0,
+                "sink.start_runtime_endpoints.route_present.find",
+            ) {
+                eprintln!(
+                    "fs_meta_sink: start_runtime_endpoints find spawn begin node={} route={} elapsed_ms={}",
+                    node_id_proxy_log.0,
+                    route.0,
+                    start.elapsed().as_millis()
+                );
+                log::info!(
+                    "bound route listening on {}.{} for sink {}",
+                    ROUTE_TOKEN_FS_META,
+                    METHOD_FIND,
+                    node_id_proxy.0
+                );
+                let endpoint = ManagedEndpointTask::spawn_with_unit(
+                    boundary.clone(),
+                    route,
+                    format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_FIND),
+                    SINK_RUNTIME_UNIT_ID,
+                    self.shutdown.clone(),
+                    move |requests| {
+                        let node_id_proxy = node_id_proxy.clone();
+                        let proxy_adapter = proxy_adapter.clone();
+                        async move {
+                            let mut responses = Vec::new();
 
-                        for req in requests {
-                            let _params = match rmp_serde::from_slice::<InternalQueryRequest>(
-                                req.payload_bytes(),
-                            ) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    log::warn!(
-                                        "find proxy failed to parse InternalQueryRequest: {:?}",
-                                        e
-                                    );
-                                    responses.push(build_error_marker_event(
-                                        &node_id_proxy,
-                                        req.metadata().correlation_id,
-                                        "find proxy invalid request payload",
-                                    ));
-                                    continue;
-                                }
-                            };
+                            for req in requests {
+                                let _params = match rmp_serde::from_slice::<InternalQueryRequest>(
+                                    req.payload_bytes(),
+                                ) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        log::warn!(
+                                            "find proxy failed to parse InternalQueryRequest: {:?}",
+                                            e
+                                        );
+                                        responses.push(build_error_marker_event(
+                                            &node_id_proxy,
+                                            req.metadata().correlation_id,
+                                            "find proxy invalid request payload",
+                                        ));
+                                        continue;
+                                    }
+                                };
 
-                            match proxy_adapter
-                                .call_collect(
-                                    ROUTE_TOKEN_FS_META_INTERNAL,
-                                    METHOD_SOURCE_FIND,
-                                    Bytes::copy_from_slice(req.payload_bytes()),
-                                    Duration::from_secs(60),
-                                    Duration::from_millis(FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS),
-                                )
-                                .await
-                            {
-                                Ok(source_events) => {
-                                    for event in source_events {
-                                        let mut meta = event.metadata().clone();
-                                        meta.correlation_id = req.metadata().correlation_id;
-                                        responses.push(Event::new(
-                                            meta,
-                                            Bytes::copy_from_slice(event.payload_bytes()),
+                                match proxy_adapter
+                                    .call_collect(
+                                        ROUTE_TOKEN_FS_META_INTERNAL,
+                                        METHOD_SOURCE_FIND,
+                                        Bytes::copy_from_slice(req.payload_bytes()),
+                                        Duration::from_secs(60),
+                                        Duration::from_millis(
+                                            FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS,
+                                        ),
+                                    )
+                                    .await
+                                {
+                                    Ok(source_events) => {
+                                        for event in source_events {
+                                            let mut meta = event.metadata().clone();
+                                            meta.correlation_id = req.metadata().correlation_id;
+                                            responses.push(Event::new(
+                                                meta,
+                                                Bytes::copy_from_slice(event.payload_bytes()),
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "find proxy upstream route call failed: {:?}",
+                                            e
+                                        );
+                                        responses.push(build_error_marker_event(
+                                            &node_id_proxy,
+                                            req.metadata().correlation_id,
+                                            "find proxy upstream request failed",
                                         ));
                                     }
                                 }
-                                Err(e) => {
-                                    log::error!("find proxy upstream route call failed: {:?}", e);
-                                    responses.push(build_error_marker_event(
-                                        &node_id_proxy,
-                                        req.metadata().correlation_id,
-                                        "find proxy upstream request failed",
-                                    ));
-                                }
                             }
+                            responses
                         }
-                        responses
-                    }
-                },
-            );
-            eprintln!(
-                "fs_meta_sink: start_runtime_endpoints find spawn ok node={} elapsed_ms={}",
-                node_id_proxy_log.0,
-                start.elapsed().as_millis()
-            );
-            lock_or_recover(
-                &self.endpoint_tasks,
-                "sink.start_runtime_endpoints.find_tasks",
-            )
-            .push(endpoint);
+                    },
+                );
+                eprintln!(
+                    "fs_meta_sink: start_runtime_endpoints find spawn ok node={} elapsed_ms={}",
+                    node_id_proxy_log.0,
+                    start.elapsed().as_millis()
+                );
+                lock_or_recover(
+                    &self.endpoint_tasks,
+                    "sink.start_runtime_endpoints.find_tasks",
+                )
+                .push(endpoint);
+            }
         }
 
         let stream_state = self.state.clone();
@@ -2551,65 +2602,71 @@ impl SinkFileMeta {
         let stream_receive_enabled = self.stream_receive_enabled.clone();
         let stream_unit_control = self.unit_control.clone();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM) {
-            eprintln!(
-                "fs_meta_sink: start_runtime_endpoints stream spawn begin node={} route={} elapsed_ms={}",
-                node_id.0,
-                route.0,
-                start.elapsed().as_millis()
-            );
-            let stream_sink = Arc::new(SinkFileMeta {
-                node_id: node_id.clone(),
-                state: stream_state,
-                root_specs: stream_root_specs,
-                host_object_grants: stream_host_object_grants,
-                visibility_lag: stream_visibility_lag,
-                stream_delivery_stats,
-                pending_stream_events: self.pending_stream_events.clone(),
-                stream_receive_enabled: stream_receive_enabled,
-                unit_control: stream_unit_control,
-                stream_recv_observer: self.stream_recv_observer.clone(),
-                stream_recv_ready_notify: self.stream_recv_ready_notify.clone(),
-                shutdown: CancellationToken::new(),
-                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-            });
-            let stream_sink_ready = stream_sink.clone();
-            let stream_sink_wait = stream_sink.clone();
-            let stream_sink_observe = stream_sink.clone();
-            let stream_sink_apply = stream_sink.clone();
-            let endpoint = ManagedEndpointTask::spawn_stream_with_before_recv_and_wait(
-                boundary.clone(),
-                route,
-                format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
-                SINK_RUNTIME_UNIT_ID,
-                self.shutdown.clone(),
-                move || stream_sink_ready.should_receive_stream_events(),
-                move || {
-                    let stream_sink_wait = stream_sink_wait.clone();
-                    async move { stream_sink_wait.wait_until_stream_can_receive().await }.boxed()
-                },
-                move || stream_sink_observe.mark_before_stream_recv(),
-                move |events| {
-                    let stream_sink_apply = stream_sink_apply.clone();
-                    async move {
-                        if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
-                            log::error!("sink stream ingest failed: {:?}", err);
+            if !self.endpoint_task_route_present(
+                &route.0,
+                "sink.start_runtime_endpoints.route_present.stream",
+            ) {
+                eprintln!(
+                    "fs_meta_sink: start_runtime_endpoints stream spawn begin node={} route={} elapsed_ms={}",
+                    node_id.0,
+                    route.0,
+                    start.elapsed().as_millis()
+                );
+                let stream_sink = Arc::new(SinkFileMeta {
+                    node_id: node_id.clone(),
+                    state: stream_state,
+                    root_specs: stream_root_specs,
+                    host_object_grants: stream_host_object_grants,
+                    visibility_lag: stream_visibility_lag,
+                    stream_delivery_stats,
+                    pending_stream_events: self.pending_stream_events.clone(),
+                    stream_receive_enabled: stream_receive_enabled,
+                    unit_control: stream_unit_control,
+                    stream_recv_observer: self.stream_recv_observer.clone(),
+                    stream_recv_ready_notify: self.stream_recv_ready_notify.clone(),
+                    shutdown: CancellationToken::new(),
+                    endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                });
+                let stream_sink_ready = stream_sink.clone();
+                let stream_sink_wait = stream_sink.clone();
+                let stream_sink_observe = stream_sink.clone();
+                let stream_sink_apply = stream_sink.clone();
+                let endpoint = ManagedEndpointTask::spawn_stream_with_before_recv_and_wait(
+                    boundary.clone(),
+                    route,
+                    format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
+                    SINK_RUNTIME_UNIT_ID,
+                    self.shutdown.clone(),
+                    move || stream_sink_ready.should_receive_stream_events(),
+                    move || {
+                        let stream_sink_wait = stream_sink_wait.clone();
+                        async move { stream_sink_wait.wait_until_stream_can_receive().await }
+                            .boxed()
+                    },
+                    move || stream_sink_observe.mark_before_stream_recv(),
+                    move |events| {
+                        let stream_sink_apply = stream_sink_apply.clone();
+                        async move {
+                            if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
+                                log::error!("sink stream ingest failed: {:?}", err);
+                            }
                         }
-                    }
-                },
-            );
-            eprintln!(
-                "fs_meta_sink: start_runtime_endpoints stream spawn ok node={} elapsed_ms={}",
-                node_id.0,
-                start.elapsed().as_millis()
-            );
-            lock_or_recover(
-                &self.endpoint_tasks,
-                "sink.start_runtime_endpoints.stream_tasks",
-            )
-            .push(endpoint);
+                    },
+                );
+                eprintln!(
+                    "fs_meta_sink: start_runtime_endpoints stream spawn ok node={} elapsed_ms={}",
+                    node_id.0,
+                    start.elapsed().as_millis()
+                );
+                lock_or_recover(
+                    &self.endpoint_tasks,
+                    "sink.start_runtime_endpoints.stream_tasks",
+                )
+                .push(endpoint);
+            }
         }
 
-        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_ROOTS_CONTROL) {
+        let mut spawn_roots_control_stream = |route: RouteKey, route_label: String| {
             eprintln!(
                 "fs_meta_sink: start_runtime_endpoints roots_control spawn begin node={} route={} elapsed_ms={}",
                 node_id.0,
@@ -2635,12 +2692,9 @@ impl SinkFileMeta {
             });
             let roots_control_ready = sink.clone();
             let endpoint = ManagedEndpointTask::spawn_stream(
-                boundary,
+                boundary.clone(),
                 route,
-                format!(
-                    "sink:{}:{}",
-                    ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_ROOTS_CONTROL
-                ),
+                format!("sink:{route_label}"),
                 SINK_RUNTIME_UNIT_ID,
                 self.shutdown.clone(),
                 move || {
@@ -2689,6 +2743,30 @@ impl SinkFileMeta {
                 "sink.start_runtime_endpoints.roots_control_tasks",
             )
             .push(endpoint);
+        };
+
+        if let Ok(route) = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_ROOTS_CONTROL)
+        {
+            if !self.endpoint_task_route_present(
+                &route.0,
+                "sink.start_runtime_endpoints.route_present.roots_control_default",
+            ) {
+                spawn_roots_control_stream(
+                    route,
+                    format!(
+                        "{}.{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_ROOTS_CONTROL
+                    ),
+                );
+            }
+        }
+        let scoped_roots_route = sink_roots_control_stream_route_for(&self.node_id.0);
+        if !self.endpoint_task_route_present(
+            &scoped_roots_route.0,
+            "sink.start_runtime_endpoints.route_present.roots_control_scoped",
+        ) {
+            spawn_roots_control_stream(scoped_roots_route.clone(), scoped_roots_route.0);
         }
 
         eprintln!(
@@ -2696,6 +2774,7 @@ impl SinkFileMeta {
             node_id.0,
             start.elapsed().as_millis()
         );
+        self.enable_stream_receive();
         Ok(())
     }
 
@@ -2727,7 +2806,7 @@ impl SinkFileMeta {
 
         self.disable_stream_receive();
 
-        let routes = default_route_bindings();
+        let routes = sink_query_route_bindings_for(&self.node_id.0);
         let stream_state = self.state.clone();
         let stream_root_specs = self.root_specs.clone();
         let stream_host_object_grants = self.host_object_grants.clone();
@@ -2831,7 +2910,8 @@ impl SinkFileMeta {
         }
         let scopes = match self.unit_control.unit_state(SINK_RUNTIME_UNIT_ID)? {
             Some((true, rows)) => rows,
-            Some((false, _)) | None => Vec::new(),
+            Some((false, _)) => Vec::new(),
+            None => return Ok(None),
         };
         Ok(Some(scopes))
     }
@@ -3460,21 +3540,61 @@ impl SinkFileMeta {
 
     fn should_receive_stream_events(&self) -> bool {
         let route_key = format!("{}.{}", ROUTE_KEY_EVENTS, METHOD_STREAM);
-        self.stream_receive_enabled.load(Ordering::Acquire)
-            && self.has_scheduled_stream_targets()
-            && self.should_receive_control_stream_route(&route_key)
+        let enabled = self.stream_receive_enabled.load(Ordering::Acquire);
+        let has_targets = self.has_scheduled_stream_targets();
+        let gate = self.should_receive_control_stream_route(&route_key);
+        if debug_events_gate_enabled() {
+            eprintln!(
+                "fs_meta_sink: events_gate node={} enabled={} has_targets={} gate={} scheduled_groups={:?} scheduled_stream_targets={:?}",
+                self.node_id.0,
+                enabled,
+                has_targets,
+                gate,
+                self.scheduled_group_ids().ok(),
+                self.scheduled_stream_object_refs().ok(),
+            );
+        }
+        enabled && has_targets && gate
     }
 
     fn should_receive_control_stream_route(&self, route_key: &str) -> bool {
-        let Ok(Some(generation)) = self
+        let generation = self
             .unit_control
             .route_generation(SINK_RUNTIME_UNIT_ID, route_key)
-        else {
+            .ok()
+            .flatten();
+        if std::env::var_os("FSMETA_DEBUG_ROOTS_CONTROL_GATE").is_some()
+            && route_key.contains("logical-roots-control")
+        {
+            eprintln!(
+                "fs_meta_sink: roots_control gate node={} route={} generation={:?}",
+                self.node_id.0, route_key, generation
+            );
+        }
+        let Some(generation) = generation else {
             return false;
         };
-        self.unit_control
+        let accepted = self
+            .unit_control
             .accept_tick(SINK_RUNTIME_UNIT_ID, route_key, generation)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if debug_events_gate_enabled()
+            && route_key == &format!("{}.{}", ROUTE_KEY_EVENTS, METHOD_STREAM)
+        {
+            eprintln!(
+                "fs_meta_sink: events_gate accept node={} route={} generation={} accepted={}",
+                self.node_id.0, route_key, generation, accepted
+            );
+        }
+        if std::env::var_os("FSMETA_DEBUG_ROOTS_CONTROL_GATE").is_some()
+            && route_key.contains("logical-roots-control")
+        {
+            eprintln!(
+                "fs_meta_sink: roots_control gate accept node={} route={} generation={} accepted={}",
+                self.node_id.0, route_key, generation, accepted
+            );
+        }
+        accepted
     }
 
     pub(crate) fn enable_stream_receive(&self) {

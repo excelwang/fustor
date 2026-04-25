@@ -137,6 +137,40 @@ QueryObservationState =
    2. materialized `/tree` and `/stats` availability MUST be a superset of trusted-materialized `/tree` and `/stats` availability
 8. Internal replay, retained, tick-fast-path, bridge-reset, or cache-fallback diagnostics MAY explain why a request is unavailable, but they MUST NOT define a competing service-level availability window outside the rules above.
 
+## [decision] ReadinessPlaneSeparation
+
+1. fs-meta readiness MUST be reported and evaluated across separate domain planes instead of a single `ready` boolean.
+2. `API Facade Liveness` means the resource-scoped HTTP namespace is reachable enough to accept and authenticate product API requests.
+3. `Management Write Ready` means the current Authority Epoch has an active control stream that can safely submit management writes such as roots apply, manual rescan, and query-api-key mutation.
+4. `Trusted Observation Ready` means materialized readiness evidence and observation eligibility allow trusted-materialized `/tree` and `/stats` reads.
+5. API Facade Liveness MAY be open while Management Write Ready is closed; in that case read-only status/diagnostics can answer, but management writes fail closed with explicit not-ready evidence.
+6. Management Write Ready MAY be open while Trusted Observation Ready is still closed; in that case roots apply/rescan can be accepted, but trusted-materialized reads remain closed until observation evidence catches up.
+7. Trusted Observation Ready MUST NOT be inferred from API Facade Liveness or Management Write Ready; it follows `QueryObservationState=trusted-materialized` and package-local observation eligibility.
+
+## [decision] MaterializedReadinessEvidenceEpochMonotonicity
+
+1. Materialized readiness evidence is evaluated per Authority Epoch.
+2. Within one Authority Epoch, completed group readiness evidence is monotonic against transient status fan-in loss: a missing or delayed fan-in sample alone MUST NOT downgrade a ready group.
+3. Same-epoch explicit failure evidence, such as overflow pending materialization, audit invalidation, stale-writer fencing, sink loss, or host/object unavailability, MAY downgrade the group because it is contradictory evidence rather than missing fan-in.
+4. Authority Epoch equality is based on roots signature, grants signature, source stream generation, sink materialization generation, and facade/runtime generation.
+5. Any Authority Epoch component change invalidates cached materialized readiness evidence and requires fresh evidence before a group can be treated as ready in the new epoch.
+6. This monotonicity applies only to readiness evidence. It does not turn materialized observation into authoritative truth, and it does not bypass trusted observation gates after an epoch change.
+
+## [decision] ObservationCoverageCapability
+
+1. fs-meta MUST describe reduced observation coverage with coarse mode and capability evidence instead of silently changing query meaning.
+2. `AuditCoverageMode` values are fixed to `realtime_hotset_plus_audit`, `audit_only`, `audit_with_metadata`, `audit_without_file_metadata`, and `watch_degraded`; `audit_only` means realtime watch freshness is unavailable, while metadata completeness is expressed by capability bits.
+3. coverage capability evidence uses five booleans: `exists_coverage`, `file_count_coverage`, `file_metadata_coverage`, `mtime_size_coverage`, and `watch_freshness_coverage`.
+4. `audit_without_file_metadata` MAY support existence and count coverage while disabling file metadata and mtime/size coverage.
+5. When a capability is disabled, query payloads MUST expose withheld or degraded evidence instead of fabricating unavailable metadata.
+
+## [decision] HostFsOperationEvidence
+
+1. host-fs facade scan, stat, list, and watch setup operations MUST be bounded by an explicit latency/cancellation policy.
+2. timeout and backpressure are observation evidence and MUST be visible as degraded, partial, or not-ready status.
+3. repeated timeout for a root or group MUST produce degraded reason `HOST_FS_TIMEOUT`; repeated backpressure MUST produce degraded reason `HOST_FS_BACKPRESSURE`.
+4. unbounded thread spawning is not an acceptable routine policy for handling slow host-fs operations.
+
 ## [state-machine] FacadeServiceState
 
 **Rationale**

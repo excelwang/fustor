@@ -456,6 +456,41 @@ impl LogicalRootsCell {
         }
     }
 
+    pub(crate) fn refresh_from_boundary_blocking(&self) -> Result<Vec<RootSpec>, CnxError> {
+        let response = statecell_read_blocking(
+            &self.state_boundary,
+            &self.scope,
+            StateCellReadRequest {
+                handle: self.handle.clone(),
+            },
+        )?;
+        if response.status != "ok" {
+            return Err(CnxError::Internal(format!(
+                "statecell_read returned non-ok status for logical roots scope={}: {}",
+                self.scope, response.status
+            )));
+        }
+        if response.payload.is_empty() {
+            return Ok(self.snapshot());
+        }
+        let decoded: LogicalRootsSnapshot =
+            rmp_serde::from_slice(&response.payload).map_err(|err| {
+                CnxError::Internal(format!("decode logical roots snapshot failed: {err}"))
+            })?;
+        if decoded.scope != self.scope.as_ref() {
+            return Err(CnxError::Internal(format!(
+                "logical roots snapshot scope mismatch: expected {}, got {}",
+                self.scope, decoded.scope
+            )));
+        }
+        let roots = decoded.roots.clone();
+        match self.state.lock() {
+            Ok(mut state) => *state = decoded,
+            Err(poisoned) => *poisoned.into_inner() = decoded,
+        }
+        Ok(roots)
+    }
+
     pub(crate) async fn replace(&self, roots: Vec<RootSpec>) -> Result<(), CnxError> {
         let (payload, lease_epoch) = {
             let mut state = self

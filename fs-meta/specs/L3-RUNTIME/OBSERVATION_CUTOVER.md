@@ -40,12 +40,23 @@ Cutover and exposure semantics in this file consume the domain states from [STAT
 **Steps**
 
 1. HTTP facade listener readiness is necessary but not sufficient for trusted exposure.
-2. app evaluates `observation_eligible` from the same package-local observation evaluator and materialized observation evidence that feeds query `observation_status`: initial-audit completion on active scan-enabled primary groups, materialized degraded/overflow status, and stale-writer fencing evidence.
-3. the worker-facing runtime wrapper lowers runtime loading through the bounded app/runtime entry surface; exact helper API names and wrapper composition remain implementation detail as long as the observation evaluator stays app-owned.
-4. package-local status/health surfaces expose the materialized readiness evidence through source coverage and audit timing plus sink `initial_audit_completed` and `overflow_pending_materialization`; these signals support cutover diagnostics but do not become a competing truth source.
-5. when facade activation remains pending because runtime exposure proof is still outstanding or listener spawn is retrying, package-local status/health surfaces also expose optional `facade.pending` diagnostics so operators can distinguish cutover waiting from generic host-boundary liveness.
-6. runtime consumes generation/bind/route proof to decide which active facade unit owns the resource-scoped one-cardinality HTTP facade, while the app uses `observation_eligible` to decide when `trusted-materialized` `/tree` and `/stats` may answer as current observation.
-7. when `observation_eligible` is absent or proof is incomplete, the app keeps `trusted-materialized` `/tree` and `/stats` explicitly not-ready and surfaces weaker materialized reads as `materialized-untrusted`; `/on-demand-force-find` stays a freshness path and may be externally available earlier.
+2. HTTP facade listener readiness is also not sufficient for management writes; roots apply, manual rescan, and query-api-key mutation require Management Write Ready from the current-epoch active control stream.
+3. app evaluates `observation_eligible` from the same package-local observation evaluator and materialized observation evidence that feeds query `observation_status`: initial-audit completion on active scan-enabled primary groups, materialized degraded/overflow status, and stale-writer fencing evidence.
+4. the worker-facing runtime wrapper lowers runtime loading through the bounded app/runtime entry surface; exact helper API names and wrapper composition remain implementation detail as long as the observation evaluator stays app-owned.
+5. package-local status/health surfaces expose the materialized readiness evidence through source coverage and audit timing plus sink `initial_audit_completed` and `overflow_pending_materialization`; these signals support cutover diagnostics but do not become a competing truth source.
+6. when facade activation remains pending because runtime exposure proof is still outstanding or listener spawn is retrying, package-local status/health surfaces also expose optional `facade.pending` diagnostics so operators can distinguish cutover waiting from generic host-boundary liveness.
+7. runtime consumes generation/bind/route proof to decide which active facade unit owns the resource-scoped one-cardinality HTTP facade, while the app uses Management Write Ready to decide whether management writes may be accepted and `observation_eligible` to decide when `trusted-materialized` `/tree` and `/stats` may answer as current observation.
+8. when `observation_eligible` is absent or proof is incomplete, the app keeps `trusted-materialized` `/tree` and `/stats` explicitly not-ready and surfaces weaker materialized reads as `materialized-untrusted`; `/on-demand-force-find` stays a freshness path and may be externally available earlier.
+
+## [workflow] MaterializedReadinessEvidenceFanIn
+
+**Steps**
+
+1. source/sink status fan-in produces Materialized Readiness Evidence for each group inside the current Authority Epoch.
+2. when same-epoch evidence has already completed for a group, transient fan-in absence, delayed status delivery, or a temporarily missing status sample does not by itself downgrade that group from ready.
+3. explicit same-epoch contradictory evidence, including overflow pending materialization, audit invalidation, stale-writer fencing, sink loss, or host/object unavailability, downgrades or closes readiness according to the reported failure.
+4. monitoring-root signature changes, runtime-grant signature changes, source stream generation changes, sink materialization generation changes, or facade/runtime generation changes create a new Authority Epoch and invalidate the previous monotonic evidence.
+5. after invalidation, the group must rebuild Materialized Readiness Evidence before it can serve trusted materialized observation in the new epoch.
 
 ## [workflow] QueryAvailabilityOrderingAcrossCutover
 

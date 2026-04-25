@@ -66,6 +66,22 @@ pub fn source_rescan_route_key_for(node_id: &str) -> String {
     scoped_internal_route_key(ROUTE_KEY_SOURCE_RESCAN_INTERNAL, node_id)
 }
 
+pub fn source_roots_control_route_key_for(node_id: &str) -> String {
+    scoped_internal_route_key(ROUTE_KEY_SOURCE_ROOTS_CONTROL, node_id)
+}
+
+pub fn source_find_route_key_for(node_id: &str) -> String {
+    scoped_internal_route_key(ROUTE_KEY_SOURCE_FIND_INTERNAL, node_id)
+}
+
+pub fn source_find_request_route_for(node_id: &str) -> RouteKey {
+    request_reply_route_key(&source_find_route_key_for(node_id))
+}
+
+pub fn source_roots_control_stream_route_for(node_id: &str) -> RouteKey {
+    stream_route_key(&source_roots_control_route_key_for(node_id))
+}
+
 pub fn sink_query_route_key_for(node_id: &str) -> String {
     scoped_internal_route_key(ROUTE_KEY_SINK_QUERY_INTERNAL, node_id)
 }
@@ -74,7 +90,20 @@ pub fn sink_query_request_route_for(node_id: &str) -> RouteKey {
     request_reply_route_key(&sink_query_route_key_for(node_id))
 }
 
-fn build_route_bindings(sink_query_route_key: &str) -> Arc<PostBindDispatchTable> {
+pub fn sink_roots_control_route_key_for(node_id: &str) -> String {
+    scoped_internal_route_key(ROUTE_KEY_SINK_ROOTS_CONTROL, node_id)
+}
+
+pub fn sink_roots_control_stream_route_for(node_id: &str) -> RouteKey {
+    stream_route_key(&sink_roots_control_route_key_for(node_id))
+}
+
+fn build_route_bindings(
+    sink_query_route_key: &str,
+    source_find_route_key: &str,
+    source_roots_control_route_key: &str,
+    sink_roots_control_route_key: &str,
+) -> Arc<PostBindDispatchTable> {
     Arc::new(PostBindDispatchTable::new([
         PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_EVENTS.into(),
@@ -114,7 +143,7 @@ fn build_route_bindings(sink_query_route_key: &str) -> Arc<PostBindDispatchTable
         PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SOURCE_FIND.into(),
-            route: request_reply_route_key(ROUTE_KEY_SOURCE_FIND_INTERNAL),
+            route: request_reply_route_key(source_find_route_key),
         },
         PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
@@ -129,12 +158,12 @@ fn build_route_bindings(sink_query_route_key: &str) -> Arc<PostBindDispatchTable
         PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SOURCE_ROOTS_CONTROL.into(),
-            route: stream_route_key(ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            route: stream_route_key(source_roots_control_route_key),
         },
         PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SINK_ROOTS_CONTROL.into(),
-            route: stream_route_key(ROUTE_KEY_SINK_ROOTS_CONTROL),
+            route: stream_route_key(sink_roots_control_route_key),
         },
         PostBindDispatch {
             route_token: ROUTE_TOKEN_HOST_OBJECT.into(),
@@ -145,10 +174,65 @@ fn build_route_bindings(sink_query_route_key: &str) -> Arc<PostBindDispatchTable
 }
 
 pub fn default_route_bindings() -> Arc<PostBindDispatchTable> {
-    build_route_bindings(ROUTE_KEY_SINK_QUERY_INTERNAL)
+    build_route_bindings(
+        ROUTE_KEY_SINK_QUERY_INTERNAL,
+        ROUTE_KEY_SOURCE_FIND_INTERNAL,
+        ROUTE_KEY_SOURCE_ROOTS_CONTROL,
+        ROUTE_KEY_SINK_ROOTS_CONTROL,
+    )
 }
 
 pub fn sink_query_route_bindings_for(node_id: &str) -> Arc<PostBindDispatchTable> {
     let route_key = sink_query_route_key_for(node_id);
-    build_route_bindings(&route_key)
+    let sink_roots_control_route_key = sink_roots_control_route_key_for(node_id);
+    build_route_bindings(
+        &route_key,
+        ROUTE_KEY_SOURCE_FIND_INTERNAL,
+        ROUTE_KEY_SOURCE_ROOTS_CONTROL,
+        &sink_roots_control_route_key,
+    )
+}
+
+pub fn source_find_route_bindings_for(node_id: &str) -> Arc<PostBindDispatchTable> {
+    let route_key = source_find_route_key_for(node_id);
+    let source_roots_control_route_key = source_roots_control_route_key_for(node_id);
+    build_route_bindings(
+        ROUTE_KEY_SINK_QUERY_INTERNAL,
+        &route_key,
+        &source_roots_control_route_key,
+        ROUTE_KEY_SINK_ROOTS_CONTROL,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_find_route_bindings_bind_scoped_source_roots_control_for_known_node() {
+        let node_id = "node-b-987654321";
+        let routes = source_find_route_bindings_for(node_id);
+        let route = routes
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_ROOTS_CONTROL)
+            .expect("resolve source roots control route");
+        assert_eq!(
+            route.0,
+            format!("{}.stream", source_roots_control_route_key_for(node_id)),
+            "node-scoped source route bindings must listen on the owner-scoped roots-control stream",
+        );
+    }
+
+    #[test]
+    fn sink_query_route_bindings_bind_scoped_sink_roots_control_for_known_node() {
+        let node_id = "node-b-987654321";
+        let routes = sink_query_route_bindings_for(node_id);
+        let route = routes
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_ROOTS_CONTROL)
+            .expect("resolve sink roots control route");
+        assert_eq!(
+            route.0,
+            format!("{}.stream", sink_roots_control_route_key_for(node_id)),
+            "node-scoped sink route bindings must listen on the owner-scoped roots-control stream",
+        );
+    }
 }

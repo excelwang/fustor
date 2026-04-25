@@ -43,6 +43,22 @@
 2. 校验流程先运行 repo-local precheck，再运行 upstream vibespec validator。
 3. repo-local precheck 负责：
    - formal spec front matter 统一性
+
+## ENGINEERING_GOVERNANCE.RUNTIME_ARTIFACT_TRACEABILITY
+
+1. Runtime/demo validation must treat loaded artifact path and content hash as first-class evidence for the run being tested.
+2. Startup logs or status diagnostics must expose the actually loaded runtime/app artifact path and hash for the current facade node.
+3. Deploy validation must compare the expected artifact hash with the actual loaded hash on every node participating in the fs-meta environment.
+4. Demo and regression harnesses must fail closed when the executable under test and the actually loaded runtime artifact differ.
+5. This baseline intentionally requires only path/hash evidence; SBOM, signatures, and supply-chain attestation remain out of scope unless promoted by a later formal spec.
+
+## ENGINEERING_GOVERNANCE.DEMO_EVIDENCE_DISCIPLINE
+
+1. Mini demo environments are valid debug accelerators only when they preserve the full demo topology and runtime parameters while reducing data volume.
+2. Mini demo success MUST NOT be reported as full demo success; harness output must keep mini and full environment results separate.
+3. Demo aggregation scripts MAY report display totals from `/stats`, but MUST NOT claim full audit/materialization completion unless `/status` evidence proves it.
+4. Demo and regression harnesses MUST surface metadata/audit degradation through coverage mode, capability bits, and degraded reasons rather than silently skipping expensive NFS work.
+5. Full demo acceptance MUST fail or report degraded status when host-fs timeout/backpressure, missing metadata coverage, or artifact mismatch is present.
    - `L0-GLOSSARY` 不出现规范性 RFC2119 语句
    - `L0-VISION` 不重新定义实现细节和 package/runtime vocabulary
 4. upstream 对齐要求直接体现在主 specs 与 contract tests 中；不保留独立的上游对齐备忘录。

@@ -357,3 +357,150 @@ async fn pending_facade_exposure_confirmed_waits_for_inflight_roots_put_after_si
         .expect("handle exposure confirmation after roots_put");
     app.close().await.expect("close app");
 }
+
+#[tokio::test]
+async fn roots_put_reaches_handler_while_control_route_replacement_awaits_runtime_exposure() {
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let root = tmp.path().join("root-a");
+    fs::create_dir_all(&root).expect("create root");
+    let fs_source = root.display().to_string();
+    let app = Arc::new(
+        FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![],
+                    host_object_grants: vec![granted_mount_root(
+                        "single-app-node::root-1",
+                        &root,
+                    )],
+                    ..local_source_config()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: "listener-a".to_string(),
+                    local_listener_resources: vec![api::config::ApiListenerResource {
+                        resource_id: "listener-a".to_string(),
+                        bind_addr: bind_addr.clone(),
+                    }],
+                    auth: api::ApiAuthConfig {
+                        passwd_path,
+                        shadow_path,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            NodeId("single-app-node".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init app"),
+    );
+    if cfg!(target_os = "linux") {
+        if !app.install_active_facade_for_tests(&["listener-a"], 1).await {
+            return;
+        }
+    } else {
+        return;
+    }
+    set_control_initialized_for_tests(&app, true);
+    let _ = app.current_facade_service_state().await;
+
+    let pending = PendingFacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 2,
+        resource_ids: vec!["listener-a".to_string()],
+        bound_scopes: vec![RuntimeBoundScope {
+            scope_id: "listener-a".to_string(),
+            resource_ids: vec!["listener-a".to_string()],
+        }],
+        group_ids: Vec::new(),
+        runtime_managed: true,
+        runtime_exposure_confirmed: false,
+        resolved: app
+            .config
+            .api
+            .resolve_for_candidate_ids(&["listener-a".to_string()])
+            .expect("resolve pending facade config"),
+    };
+    *app.pending_facade.lock().await = Some(pending.clone());
+    FSMetaApp::set_pending_facade_status_waiting(
+        &app.facade_pending_status,
+        &pending,
+        FacadePendingReason::AwaitingRuntimeExposure,
+    );
+    assert_eq!(
+        app.current_facade_service_state().await,
+        FacadeServiceState::Pending,
+        "published facade state must surface the runtime-managed pending facade while replacement awaits runtime exposure"
+    );
+
+    let client = Client::new();
+    let login = client
+        .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+        .json(&json!({"username":"admin","password":"admin"}))
+        .send()
+        .await
+        .expect("login request");
+    assert!(
+        login.status().is_success(),
+        "login failed: {}",
+        login.status()
+    );
+    let login_body: serde_json::Value = login.json().await.expect("decode login");
+    let token = login_body["token"].as_str().expect("token").to_string();
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let _reset = RootsPutPauseHookReset;
+    crate::api::install_roots_put_pause_hook(crate::api::RootsPutPauseHook {
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+
+    let roots_body = json!({
+        "roots": [{
+            "id": "test-root",
+            "selector": { "fs_source": fs_source },
+            "subpath_scope": "/",
+            "watch": false,
+            "scan": true,
+        }]
+    });
+    let request = tokio::spawn({
+        let client = client.clone();
+        let bind_addr = bind_addr.clone();
+        let token = token.clone();
+        async move {
+            client
+                .put(format!(
+                    "http://{bind_addr}/api/fs-meta/v1/monitoring/roots"
+                ))
+                .bearer_auth(token)
+                .json(&roots_body)
+                .send()
+                .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_millis(600), entered.notified())
+        .await
+        .expect(
+            "roots_put should still reach the handler while a runtime-managed control-route replacement only awaits runtime exposure on the pending facade",
+        );
+    release.notify_waiters();
+
+    let response = request
+        .await
+        .expect("join roots_put request")
+        .expect("roots_put request should complete");
+    let status = response.status();
+    let body = response.text().await.expect("decode roots_put body");
+    assert!(
+        status != reqwest::StatusCode::SERVICE_UNAVAILABLE
+            || !body.contains("runtime control initializes the app"),
+        "roots_put should not fail closed behind the runtime-control initialization gate while listener continuity still serves and replacement only awaits runtime exposure: status={status} body={body}"
+    );
+
+    app.close().await.expect("close app");
+}

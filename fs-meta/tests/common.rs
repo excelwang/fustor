@@ -307,3 +307,15 @@ pub fn assert_single_entrypoint_distributed_apply_e2e() {
         panic!("{err}");
     }
 }
+
+#[allow(dead_code)]
+pub fn assert_empty_roots_online_roots_apply_distributed_force_find_e2e() {
+    if std::env::var("CAPANIX_RUNTIME_SCOPE_E2E").ok().as_deref() != Some("1") {
+        eprintln!("skip runtime-scope e2e: requires CAPANIX_RUNTIME_SCOPE_E2E=1");
+        return;
+    }
+    if let Err(err) = harness::scenario_empty_roots_online_roots_apply_distributed_force_find_e2e()
+    {
+        panic!("{err}");
+    }
+}

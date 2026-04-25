@@ -1221,9 +1221,15 @@ fn host_ref_matches_node_id(host_ref: &str, node_id: &NodeId) -> bool {
             .0
             .strip_prefix(host_ref)
             .is_some_and(|suffix| suffix.starts_with('-'))
+        || node_id.0.strip_prefix("cluster-").is_some_and(|scoped| {
+            scoped == host_ref
+                || scoped
+                    .strip_prefix(host_ref)
+                    .is_some_and(|suffix| suffix.starts_with('-'))
+        })
 }
 
-fn stable_host_ref_for_node_id(node_id: &NodeId, grants: &[GrantedMountRoot]) -> String {
+pub(crate) fn stable_host_ref_for_node_id(node_id: &NodeId, grants: &[GrantedMountRoot]) -> String {
     let host_refs = grants
         .iter()
         .filter(|grant| host_ref_matches_node_id(&grant.host_ref, node_id))
@@ -3662,7 +3668,10 @@ impl SinkWorkerClientHandle {
         }
     }
 
-    async fn send_with_failure(&self, events: Vec<Event>) -> std::result::Result<(), SinkFailure> {
+    pub(crate) async fn send_with_failure(
+        &self,
+        events: Vec<Event>,
+    ) -> std::result::Result<(), SinkFailure> {
         let response = self
             .with_started_retry_with_failure(|client| {
                 let events = events.clone();
@@ -3682,6 +3691,13 @@ impl SinkWorkerClientHandle {
             SinkWorkerResponse::Ack => Ok(()),
             other => unexpected_sink_worker_response_result("for send", other),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn send(&self, events: Vec<Event>) -> Result<()> {
+        self.send_with_failure(events)
+            .await
+            .map_err(SinkFailure::into_error)
     }
 
     async fn query_node_with_failure(
@@ -4404,6 +4420,13 @@ impl SinkFacade {
             Self::Local(sink) => sink.send_with_failure(events).await,
             Self::Worker(client) => client.send_with_failure(events.to_vec()).await,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn send(&self, events: &[Event]) -> Result<()> {
+        self.send_with_failure(events)
+            .await
+            .map_err(SinkFailure::into_error)
     }
 
     pub(crate) async fn recv_with_failure(

@@ -37,6 +37,7 @@ use crate::runtime::routes::{
     ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SINK_STATUS_INTERNAL,
     ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META,
     ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, sink_query_route_bindings_for,
+    source_find_request_route_for, source_find_route_bindings_for,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::workers::sink::{SinkFacade, SinkFailure, SinkWorkerClientHandle};
@@ -365,6 +366,7 @@ enum FacadePublicationPhase {
 struct FacadePublicationSnapshot {
     phase: FacadePublicationPhase,
     control_gate_ready: bool,
+    management_write_ready: bool,
     publication_ready: bool,
     published_state: FacadeServiceState,
 }
@@ -410,7 +412,6 @@ struct RolloutGenerationMachine {
     publication_ready: bool,
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingFixedBindHandoffAttemptDecisionInput {
     claim_conflict: bool,
@@ -425,6 +426,7 @@ enum FixedBindLifecycleRequest {
         generation: u64,
         retain_active_facade: bool,
         retain_pending_spawn: bool,
+        restart_deferred_retire_pending: bool,
     },
     Shutdown,
 }
@@ -618,7 +620,6 @@ fn fixed_bind_after_release_machine_promotes_completion_without_outer_branching(
     );
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingFixedBindHandoffAttemptDisposition {
     NoAttempt,
@@ -686,6 +687,11 @@ impl FixedBindLifecycleMachine {
                 FacadePublicationPhase::NoFacade
             },
             control_gate_ready: ready_tail.control_gate_ready,
+            management_write_ready: self
+                .observation
+                .runtime
+                .control_gate_ready(self.observation.allow_facade_only_handoff)
+                && self.observation.active_control_stream_present,
             publication_ready: self.publication_ready,
             published_state: ready_tail.published_state,
         }
@@ -706,10 +712,12 @@ impl FixedBindLifecycleMachine {
                 generation,
                 retain_active_facade,
                 retain_pending_spawn,
+                restart_deferred_retire_pending,
             } => {
                 let pending_fixed_bind_conflict =
                     self.fixed_bind.conflicting_process_claim.is_some();
                 if retain_active_facade
+                    && !restart_deferred_retire_pending
                     && !pending_fixed_bind_conflict
                     && self.release_handoff.is_none()
                 {
@@ -3101,7 +3109,6 @@ impl PendingFixedBindHandoffRegistrant {
         self.runtime_state_changed.notify_waiters();
     }
 
-    #[cfg(test)]
     async fn release_handoff_blocker_for_publication(
         &self,
         pending: &PendingFacadeActivation,
@@ -3116,29 +3123,38 @@ impl PendingFixedBindHandoffRegistrant {
                 .load(Ordering::Acquire),
         )
         .await;
-        if fixed_bind.conflicting_process_claim.is_none() || !pending.runtime_exposure_confirmed {
-            return None;
+        let active_owner = active_fixed_bind_facade_owner_for(&bind_addr, self.instance_id);
+        match FSMetaApp::pending_fixed_bind_handoff_attempt_disposition(
+            PendingFixedBindHandoffAttemptDecisionInput {
+                claim_conflict: fixed_bind.conflicting_process_claim.is_some(),
+                pending_runtime_exposure_confirmed: pending.runtime_exposure_confirmed,
+                active_owner_present: active_owner.is_some(),
+                conflicting_process_claim_owner_instance_id: fixed_bind
+                    .conflicting_process_claim
+                    .as_ref()
+                    .map(|claim| claim.owner_instance_id),
+            },
+        ) {
+            PendingFixedBindHandoffAttemptDisposition::NoAttempt => None,
+            PendingFixedBindHandoffAttemptDisposition::ReleaseActiveOwner => {
+                let owner = active_owner
+                    .expect("active fixed-bind handoff disposition must retain an active owner");
+                owner.release_for_handoff(&bind_addr).await;
+                Some(PendingFixedBindHandoffContinuation {
+                    bind_addr,
+                    registrant: self.clone(),
+                })
+            }
+            PendingFixedBindHandoffAttemptDisposition::ReleaseConflictingProcessClaim {
+                owner_instance_id,
+            } => {
+                clear_process_facade_claim_for_bind_addr(&bind_addr, owner_instance_id);
+                Some(PendingFixedBindHandoffContinuation {
+                    bind_addr,
+                    registrant: self.clone(),
+                })
+            }
         }
-        if let Some(owner) = active_fixed_bind_facade_owner_for(&bind_addr, self.instance_id) {
-            owner.release_for_handoff(&bind_addr).await;
-            return Some(PendingFixedBindHandoffContinuation {
-                bind_addr,
-                registrant: self.clone(),
-            });
-        }
-        if let Some(owner_instance_id) = fixed_bind
-            .claim_release_followup_pending
-            .then(|| fixed_bind.conflicting_process_claim.clone())
-            .flatten()
-            .map(|claim| claim.owner_instance_id)
-        {
-            clear_process_facade_claim_for_bind_addr(&bind_addr, owner_instance_id);
-            return Some(PendingFixedBindHandoffContinuation {
-                bind_addr,
-                registrant: self.clone(),
-            });
-        }
-        None
     }
 
     async fn try_spawn_pending_facade(&self) -> Result<bool> {
@@ -3952,12 +3968,14 @@ fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
                 || route_key == sink_status_route
                 || route_key == source_status_route
                 || route_key == source_find_route
+                || is_per_peer_source_find_request_route(route_key)
         }
         FacadeRuntimeUnit::QueryPeer => {
             route_key == sink_query_proxy_route
                 || route_key == sink_status_route
                 || route_key == source_status_route
                 || route_key == source_find_route
+                || is_per_peer_source_find_request_route(route_key)
         }
     }
 }
@@ -3990,6 +4008,7 @@ fn is_dual_lane_internal_query_route(route_key: &str) -> bool {
         || route_key == format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
         || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
         || route_key == format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)
+        || is_per_peer_source_find_request_route(route_key)
 }
 
 fn internal_query_route_still_active(facade_gate: &RuntimeUnitGate, route_key: &str) -> bool {
@@ -4013,11 +4032,13 @@ fn is_facade_dependent_query_route(route_key: &str) -> bool {
         || route_key == format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
         || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
         || route_key == format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)
+        || is_per_peer_source_find_request_route(route_key)
 }
 
 fn is_uninitialized_cleanup_query_route(route_key: &str) -> bool {
     is_internal_status_route(route_key)
         || route_key == format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)
+        || is_per_peer_source_find_request_route(route_key)
 }
 
 fn is_per_peer_sink_query_request_route(route_key: &str) -> bool {
@@ -4026,6 +4047,19 @@ fn is_per_peer_sink_query_request_route(route_key: &str) -> bool {
     };
     let Some((stem, version)) = ROUTE_KEY_SINK_QUERY_INTERNAL.rsplit_once(':') else {
         return request_route.starts_with(&format!("{ROUTE_KEY_SINK_QUERY_INTERNAL}."));
+    };
+    let Some(route_stem) = request_route.strip_suffix(&format!(":{version}")) else {
+        return false;
+    };
+    route_stem.starts_with(&format!("{stem}."))
+}
+
+fn is_per_peer_source_find_request_route(route_key: &str) -> bool {
+    let Some(request_route) = route_key.strip_suffix(".req") else {
+        return false;
+    };
+    let Some((stem, version)) = ROUTE_KEY_SOURCE_FIND_INTERNAL.rsplit_once(':') else {
+        return request_route.starts_with(&format!("{ROUTE_KEY_SOURCE_FIND_INTERNAL}."));
     };
     let Some(route_stem) = request_route.strip_suffix(&format!(":{version}")) else {
         return false;
@@ -6014,7 +6048,7 @@ impl FSMetaApp {
             )
             .await?;
         if !sink_cleanup_only_while_uninitialized {
-            self.ensure_runtime_proxy_endpoints_started().await?;
+            self.ensure_runtime_endpoints_started().await?;
         }
         for expected_groups in &sink_recovery_tail_plan.immediate_local_sink_status_republish_waits
         {
@@ -6571,7 +6605,6 @@ impl FSMetaApp {
         FacadeOnlyHandoffAllowanceDecision::Blocked
     }
 
-    #[cfg(test)]
     fn pending_fixed_bind_handoff_attempt_disposition(
         input: PendingFixedBindHandoffAttemptDecisionInput,
     ) -> PendingFixedBindHandoffAttemptDisposition {
@@ -6718,7 +6751,8 @@ impl FSMetaApp {
         api_control_gate: &ApiControlGate,
         snapshot: FacadePublicationSnapshot,
     ) -> FacadeServiceState {
-        api_control_gate.set_ready(snapshot.control_gate_ready);
+        api_control_gate
+            .set_ready_state(snapshot.control_gate_ready, snapshot.management_write_ready);
         *facade_service_state
             .write()
             .expect("write published facade service state") = snapshot.published_state;
@@ -7618,7 +7652,7 @@ impl FSMetaApp {
         drop(guard);
 
         eprintln!("fs_meta_runtime_app: initialize_from_control endpoints begin");
-        let ensure_endpoints = self.ensure_runtime_proxy_endpoints_started();
+        let ensure_endpoints = self.ensure_runtime_endpoints_started();
         if let Some(deadline) = deadline {
             Self::map_runtime_initialize_timeout_result(
                 tokio::time::timeout(
@@ -7690,6 +7724,31 @@ impl FSMetaApp {
             .recv_with_failure(opts)
             .await
             .map_err(RuntimeServiceIoFailure::from)
+    }
+
+    async fn ensure_runtime_endpoints_started(&self) -> Result<()> {
+        self.ensure_embedded_runtime_worker_endpoints_started()
+            .await?;
+        self.ensure_runtime_proxy_endpoints_started().await
+    }
+
+    async fn ensure_embedded_runtime_worker_endpoints_started(&self) -> Result<()> {
+        let Some(boundary) = self.runtime_boundary.clone() else {
+            return Ok(());
+        };
+        match &*self.source {
+            SourceFacade::Local(source) => {
+                source.start_runtime_endpoints(boundary.clone()).await?;
+            }
+            SourceFacade::Worker(_) => {}
+        }
+        match &*self.sink {
+            SinkFacade::Local(sink) => {
+                sink.start_runtime_endpoints(boundary, self.node_id.clone())?;
+            }
+            SinkFacade::Worker(_) => {}
+        }
+        Ok(())
     }
 
     async fn ensure_runtime_proxy_endpoints_started(&self) -> Result<()> {
@@ -8221,7 +8280,7 @@ impl FSMetaApp {
                                 if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
                                     responses.push(Event::new(
                                         EventMetadata {
-                                            origin_id: req.metadata().origin_id.clone(),
+                                            origin_id: node_id.clone(),
                                             timestamp_us: now_us(),
                                             logical_ts: None,
                                             correlation_id: req.metadata().correlation_id,
@@ -8699,6 +8758,155 @@ impl FSMetaApp {
                 tasks.push(endpoint);
             }
         }
+        let scoped_source_find_routes = source_find_route_bindings_for(&self.node_id.0);
+        if let Ok(route) =
+            scoped_source_find_routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
+        {
+            if !internal_query_active || !spawned_routes.insert(route.0.clone()) {
+                // Not currently selected as query/query-peer source-find owner, or already running.
+            } else {
+                let prefer_query_peer_first = self
+                    .mirrored_query_peer_routes
+                    .lock()
+                    .await
+                    .contains_key(&route.0);
+                let endpoint_unit_ids = preferred_internal_query_endpoint_units(
+                    query_active,
+                    query_peer_active,
+                    prefer_query_peer_first,
+                );
+                assert!(
+                    !endpoint_unit_ids.is_empty(),
+                    "internal query endpoint unit must exist when scoped source-find route is active"
+                );
+                eprintln!(
+                    "fs_meta_runtime_app: spawning source find proxy endpoint route={}",
+                    route.0
+                );
+                let source = self.source.clone();
+                let node_id = self.node_id.clone();
+                let endpoint = ManagedEndpointTask::spawn_with_units(
+                    boundary.clone(),
+                    route,
+                    format!(
+                        "app:{}:{}:scoped",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND
+                    ),
+                    endpoint_unit_ids,
+                    tokio_util::sync::CancellationToken::new(),
+                    move |requests| {
+                        let source = source.clone();
+                        let node_id = node_id.clone();
+                        async move {
+                            let mut responses = Vec::new();
+                            for req in requests {
+                                let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
+                                    req.payload_bytes(),
+                                ) else {
+                                    continue;
+                                };
+                                eprintln!(
+                                    "fs_meta_runtime_app: source find proxy request selected_group={:?} recursive={} path={}",
+                                    params.scope.selected_group,
+                                    params.scope.recursive,
+                                    String::from_utf8_lossy(&params.scope.path)
+                                );
+                                #[cfg(test)]
+                                maybe_pause_runtime_proxy_request("source_find").await;
+                                match source.force_find_with_failure(&params).await {
+                                    Ok(mut events) => {
+                                        eprintln!(
+                                            "fs_meta_runtime_app: source find proxy response events={}",
+                                            events.len()
+                                        );
+                                        if debug_force_find_runner_capture_enabled() {
+                                            let last_runner = source
+                                                .last_force_find_runner_by_group_snapshot_with_failure()
+                                                .await
+                                                .unwrap_or_default();
+                                            let inflight = source
+                                                .force_find_inflight_groups_snapshot_with_failure()
+                                                .await
+                                                .unwrap_or_default();
+                                            let response_origins = events
+                                                .iter()
+                                                .map(|event| event.metadata().origin_id.0.clone())
+                                                .collect::<Vec<_>>();
+                                            eprintln!(
+                                                "fs_meta_runtime_app: source find proxy runner_capture node={} selected_group={:?} path={} response_events={} response_origins={:?} last_runner={:?} inflight={:?}",
+                                                node_id.0,
+                                                params.scope.selected_group,
+                                                String::from_utf8_lossy(&params.scope.path),
+                                                events.len(),
+                                                response_origins,
+                                                summarize_group_string_map(&last_runner),
+                                                inflight
+                                            );
+                                        }
+                                        for event in &mut events {
+                                            let mut meta = event.metadata().clone();
+                                            meta.correlation_id = req.metadata().correlation_id;
+                                            responses.push(Event::new(
+                                                meta,
+                                                bytes::Bytes::copy_from_slice(
+                                                    event.payload_bytes(),
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!(
+                                            "fs_meta_runtime_app: source find proxy failed err={}",
+                                            err.as_error()
+                                        );
+                                        if debug_force_find_runner_capture_enabled() {
+                                            let last_runner = source
+                                                .last_force_find_runner_by_group_snapshot_with_failure()
+                                                .await
+                                                .unwrap_or_default();
+                                            let inflight = source
+                                                .force_find_inflight_groups_snapshot_with_failure()
+                                                .await
+                                                .unwrap_or_default();
+                                            eprintln!(
+                                                "fs_meta_runtime_app: source find proxy runner_capture_failed node={} selected_group={:?} path={} err={} last_runner={:?} inflight={:?}",
+                                                node_id.0,
+                                                params.scope.selected_group,
+                                                String::from_utf8_lossy(&params.scope.path),
+                                                err.as_error(),
+                                                summarize_group_string_map(&last_runner),
+                                                inflight
+                                            );
+                                        }
+                                        responses.push(Event::new(
+                                            EventMetadata {
+                                                origin_id: NodeId(
+                                                    params
+                                                        .scope
+                                                        .selected_group
+                                                        .clone()
+                                                        .unwrap_or_else(|| {
+                                                            "source-find-proxy".to_string()
+                                                        }),
+                                                ),
+                                                timestamp_us: now_us(),
+                                                logical_ts: None,
+                                                correlation_id: req.metadata().correlation_id,
+                                                ingress_auth: None,
+                                                trace: None,
+                                            },
+                                            bytes::Bytes::from(err.into_error().to_string()),
+                                        ));
+                                    }
+                                }
+                            }
+                            responses
+                        }
+                    },
+                );
+                tasks.push(endpoint);
+            }
+        }
         Ok(())
     }
 
@@ -8804,6 +9012,10 @@ impl FSMetaApp {
         sink: &SinkFacade,
         pending: &PendingFacadeActivation,
     ) -> std::result::Result<bool, RuntimeWorkerObservationFailure> {
+        let configured_roots = source
+            .logical_roots_snapshot_with_failure()
+            .await
+            .map_err(RuntimeWorkerObservationFailure::from)?;
         let source_status = source
             .status_snapshot_with_failure()
             .await
@@ -8813,6 +9025,14 @@ impl FSMetaApp {
             .await
             .map_err(RuntimeWorkerObservationFailure::from)?;
         let candidate_groups = Self::observation_candidate_group_ids(source, sink, pending).await?;
+        // Empty-roots is a valid deployed state for the management API surface.
+        // Runtime grants may already project candidate groups before the operator
+        // has selected business monitoring scope, but that must not block the
+        // facade from coming up so `/runtime/grants -> roots preview/apply` can
+        // complete.
+        if configured_roots.is_empty() {
+            return Ok(true);
+        }
         let status = evaluate_observation_status(
             &candidate_group_observation_evidence(&source_status, &sink_status, &candidate_groups),
             ObservationTrustPolicy::candidate_generation(),
@@ -9466,6 +9686,35 @@ impl FSMetaApp {
             pending_guard.take();
         }
         Self::clear_pending_facade_status(&facade_pending_status);
+        let ready_tail_allows_facade_only_handoff =
+            Self::facade_only_handoff_allowance_decision(FacadeOnlyHandoffAllowanceDecisionInput {
+                pending_facade_present: true,
+                pending_facade_is_control_route: pending.route_key
+                    == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+                pending_fixed_bind_has_suppressed_dependent_routes: registrant
+                    .pending_fixed_bind_has_suppressed_dependent_routes
+                    .load(Ordering::Acquire),
+                pending_bind_is_ephemeral: facade_bind_addr_is_ephemeral(
+                    &pending.resolved.bind_addr,
+                ),
+                pending_bind_owned_by_instance: !facade_bind_addr_is_ephemeral(
+                    &pending.resolved.bind_addr,
+                ) && active_fixed_bind_facade_owned_by(
+                    &pending.resolved.bind_addr,
+                    instance_id,
+                ),
+            })
+            .allows_handoff();
+        let ready_tail_decision = registrant
+            .runtime_control_state()
+            .facade_ready_tail_decision(true, false, ready_tail_allows_facade_only_handoff);
+        registrant
+            .api_control_gate
+            .set_ready(ready_tail_decision.control_gate_ready);
+        *registrant
+            .facade_service_state
+            .write()
+            .expect("write published facade service state") = ready_tail_decision.published_state;
         registrant.notify_runtime_state_changed();
         drop(pending_guard);
         if let Some(current) = previous {
@@ -9648,7 +9897,12 @@ impl FSMetaApp {
         else {
             return Ok(());
         };
-        let has_active = self.api_task.lock().await.is_some();
+        let has_active = self
+            .api_task
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|active| active.handle.is_running());
         if let Some(wait_reason) = Self::facade_replacement_wait_reason(
             self.source.as_ref(),
             self.sink.as_ref(),
@@ -9664,7 +9918,16 @@ impl FSMetaApp {
             );
             return Ok(());
         }
-        if from_tick && !Self::pending_facade_retry_due(&self.facade_pending_status, &pending) {
+        let fixed_bind_handoff_completed = self
+            .release_pending_fixed_bind_handoff_blocker_if_needed(&pending)
+            .await?;
+        if fixed_bind_handoff_completed == Some(false) {
+            return Ok(());
+        }
+        if fixed_bind_handoff_completed.is_none()
+            && from_tick
+            && !Self::pending_facade_retry_due(&self.facade_pending_status, &pending)
+        {
             return Ok(());
         }
         match self.try_spawn_pending_facade().await {
@@ -9679,6 +9942,55 @@ impl FSMetaApp {
                 Ok(())
             }
         }
+    }
+
+    async fn release_pending_fixed_bind_handoff_blocker_if_needed(
+        &self,
+        pending: &PendingFacadeActivation,
+    ) -> Result<Option<bool>> {
+        if pending.route_key != format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+            || facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr)
+            || !pending.runtime_exposure_confirmed
+        {
+            return Ok(None);
+        }
+        let registrant = PendingFixedBindHandoffRegistrant {
+            instance_id: self.instance_id,
+            api_task: self.api_task.clone(),
+            pending_facade: self.pending_facade.clone(),
+            pending_fixed_bind_claim_release_followup: self
+                .pending_fixed_bind_claim_release_followup
+                .clone(),
+            pending_fixed_bind_has_suppressed_dependent_routes: self
+                .pending_fixed_bind_has_suppressed_dependent_routes
+                .clone(),
+            facade_spawn_in_progress: self.facade_spawn_in_progress.clone(),
+            facade_pending_status: self.facade_pending_status.clone(),
+            facade_service_state: self.facade_service_state.clone(),
+            rollout_status: self.rollout_status.clone(),
+            api_request_tracker: self.api_request_tracker.clone(),
+            api_control_gate: self.api_control_gate.clone(),
+            runtime_gate_state: self.runtime_gate_state.clone(),
+            runtime_state_changed: self.runtime_state_changed.clone(),
+            node_id: self.node_id.clone(),
+            runtime_boundary: self.runtime_boundary.clone(),
+            source: self.source.clone(),
+            sink: self.sink.clone(),
+            query_sink: self.query_sink.clone(),
+            query_runtime_boundary: self.runtime_boundary.clone(),
+        };
+        let Some(handoff) = registrant
+            .release_handoff_blocker_for_publication(pending)
+            .await
+        else {
+            return Ok(None);
+        };
+        self.pending_fixed_bind_claim_release_followup
+            .store(true, Ordering::Release);
+        self.notify_runtime_state_changed();
+        Ok(Some(
+            execute_fixed_bind_after_release_handoff(handoff).await?,
+        ))
     }
 
     fn facade_signal_apply_priority(signal: &FacadeControlSignal) -> u8 {
@@ -10135,6 +10447,7 @@ impl FSMetaApp {
             format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
             format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
             format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+            source_find_request_route_for(&self.node_id.0).0,
         ];
         for route_key in &query_routes {
             let _ = self
@@ -10976,6 +11289,7 @@ impl FSMetaApp {
         unit: FacadeRuntimeUnit,
         route_key: &str,
         generation: u64,
+        _restart_deferred_retire_pending: bool,
     ) -> Result<()> {
         let session = self.begin_fixed_bind_lifecycle_session().await;
         let _ = self
@@ -11114,6 +11428,7 @@ impl FSMetaApp {
                     generation,
                     retain_active_facade,
                     retain_pending_spawn,
+                    restart_deferred_retire_pending: false,
                 },
             )
             .await?;
@@ -11171,6 +11486,7 @@ impl FSMetaApp {
                 unit,
                 route_key,
                 generation,
+                restart_deferred_retire_pending: _,
             } => {
                 return self
                     .apply_facade_deactivate_with_session(session, unit, &route_key, generation)
@@ -11437,7 +11753,7 @@ impl FSMetaApp {
             && !source_cleanup_only_while_uninitialized
             && !sink_cleanup_only_while_uninitialized
         {
-            self.ensure_runtime_proxy_endpoints_started().await?;
+            self.ensure_runtime_endpoints_started().await?;
         }
         if source_cleanup_only_while_uninitialized {
             self.record_shared_source_route_claims(&source_signals)

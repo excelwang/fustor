@@ -199,6 +199,7 @@ pub(crate) enum FacadeControlSignal {
         unit: FacadeRuntimeUnit,
         route_key: String,
         generation: u64,
+        restart_deferred_retire_pending: bool,
     },
     Tick {
         unit: FacadeRuntimeUnit,
@@ -480,6 +481,13 @@ pub(crate) fn split_app_control_signals(
                             unit,
                             route_key: deactivate.route_key.clone(),
                             generation: deactivate.generation,
+                            restart_deferred_retire_pending: deactivate.reason
+                                == "restart_deferred_retire_pending"
+                                && deactivate
+                                    .lease
+                                    .as_ref()
+                                    .and_then(|lease| lease.drain_started_at_ms)
+                                    .is_some(),
                         });
                     }
                 }

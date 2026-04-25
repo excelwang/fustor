@@ -6,7 +6,7 @@ use crate::runtime::routes::{
     METHOD_SINK_QUERY, ROUTE_KEY_EVENTS, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_SINK_QUERY_INTERNAL,
     ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
     ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_TOKEN_FS_META_INTERNAL,
-    sink_query_request_route_for,
+    sink_query_request_route_for, source_find_request_route_for, source_find_route_bindings_for,
 };
 use crate::{ControlEvent, FileMetaRecord};
 use crate::{FSMetaConfig, FSMetaProductConfig, api, query, source};
@@ -221,6 +221,47 @@ fn compiled_runtime_worker_bindings(
 struct NoopBoundary;
 
 impl ChannelIoSubset for NoopBoundary {}
+
+#[derive(Default)]
+struct RouteCountingTimeoutBoundary {
+    recv_counts: StdMutex<std::collections::BTreeMap<String, usize>>,
+}
+
+impl RouteCountingTimeoutBoundary {
+    fn recv_count(&self, route_key: &str) -> usize {
+        self.recv_counts
+            .lock()
+            .expect("route recv counts lock")
+            .get(route_key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn recv_counts_snapshot(&self) -> std::collections::BTreeMap<String, usize> {
+        self.recv_counts
+            .lock()
+            .expect("route recv counts lock")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelIoSubset for RouteCountingTimeoutBoundary {
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelRecvRequest,
+    ) -> Result<Vec<Event>> {
+        let route_key = request.channel_key.0;
+        *self
+            .recv_counts
+            .lock()
+            .expect("route recv counts lock")
+            .entry(route_key)
+            .or_default() += 1;
+        Err(CnxError::Timeout)
+    }
+}
 
 fn facade_control_stream_route() -> String {
     format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
@@ -604,6 +645,18 @@ fn selected_group_dir_request(path: &[u8], group_id: &str) -> InternalQueryReque
     )
 }
 
+fn selected_group_force_find_dir_request(path: &[u8], group_id: &str) -> InternalQueryRequest {
+    InternalQueryRequest::force_find(
+        query::QueryOp::Tree,
+        query::QueryScope {
+            path: path.to_vec(),
+            recursive: true,
+            max_depth: None,
+            selected_group: Some(group_id.to_string()),
+        },
+    )
+}
+
 fn decode_tree_group_payloads(
     events: Vec<Event>,
 ) -> Result<std::collections::BTreeMap<String, TreeGroupPayload>> {
@@ -738,6 +791,71 @@ fn reserve_bind_addr() -> String {
     addr.to_string()
 }
 
+#[tokio::test]
+async fn embedded_runtime_app_starts_source_and_sink_roots_control_endpoints() {
+    let tmp = tempdir().expect("create temp dir");
+    let root = tmp.path().join("root-a");
+    fs::create_dir_all(&root).expect("create root");
+    let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+    let app = FSMetaApp::with_boundaries_and_state(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("test-root", &root)],
+                host_object_grants: vec![granted_mount_root("single-app-node::root-1", &root)],
+                ..local_source_config()
+            },
+            ..FSMetaConfig::default()
+        },
+        local_runtime_worker_binding("source"),
+        local_runtime_worker_binding("sink"),
+        NodeId("single-app-node".into()),
+        Some(boundary.clone()),
+        None,
+        in_memory_state_boundary(),
+    )
+    .expect("init app");
+
+    app.start().await.expect("start app");
+
+    let source_roots_control_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let sink_roots_control_route = format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL);
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_roots_control_route.clone(),
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_roots_control_route.clone(),
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("activate roots-control routes");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let source_recv = boundary.recv_count(&source_roots_control_route);
+        let sink_recv = boundary.recv_count(&sink_roots_control_route);
+        if source_recv > 0 && sink_recv > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "embedded runtime app must start source/sink roots-control endpoints once initialized and routes activate; source_recv={} sink_recv={} recv_counts={:?}",
+            source_recv,
+            sink_recv,
+            boundary.recv_counts_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    app.close().await.expect("close app");
+}
+
 #[derive(Default)]
 struct LoopbackWorkerBoundary {
     channels: StdMutex<HashMap<String, Vec<Event>>>,
@@ -800,6 +918,22 @@ impl RuntimeProxyUnitAwareBoundary {
             sink_status_recv_unit_ids: StdMutex::new(Vec::new()),
         }
     }
+}
+
+fn is_source_find_request_route(route_key: &str) -> bool {
+    if route_key == format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL) {
+        return true;
+    }
+    let Some(request_route) = route_key.strip_suffix(".req") else {
+        return false;
+    };
+    let Some((stem, version)) = ROUTE_KEY_SOURCE_FIND_INTERNAL.rsplit_once(':') else {
+        return request_route.starts_with(&format!("{ROUTE_KEY_SOURCE_FIND_INTERNAL}."));
+    };
+    let Some(route_stem) = request_route.strip_suffix(&format!(":{version}")) else {
+        return false;
+    };
+    route_stem.starts_with(&format!("{stem}."))
 }
 
 impl RuntimeProxyFallbackUnitBoundary {
@@ -940,7 +1074,7 @@ impl ChannelIoSubset for RuntimeProxyUnitAwareBoundary {
                 )));
             }
         }
-        if request.channel_key.0 == format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL) {
+        if is_source_find_request_route(&request.channel_key.0) {
             self.source_find_recv_unit_ids
                 .lock()
                 .expect("source_find_recv_unit_ids lock")
@@ -3599,6 +3733,7 @@ async fn facade_deactivate_continuity_execution_plan_for_tests(
     pending_fixed_bind_conflict: bool,
     release_for_fixed_bind_handoff: bool,
     retain_pending_spawn: bool,
+    restart_deferred_retire_pending: bool,
 ) -> FixedBindLifecycleExecution {
     let release_handoff = if release_for_fixed_bind_handoff {
         Some(pending_fixed_bind_handoff_continuation_for_tests("127.0.0.1:4100").await)
@@ -3635,6 +3770,7 @@ async fn facade_deactivate_continuity_execution_plan_for_tests(
         generation: 1,
         retain_active_facade,
         retain_pending_spawn,
+        restart_deferred_retire_pending,
     })
 }
 
@@ -3642,7 +3778,8 @@ async fn facade_deactivate_continuity_execution_plan_for_tests(
 async fn facade_deactivate_continuity_execution_plan_retains_active_continuity_without_conflict_or_handoff_release()
  {
     assert!(matches!(
-        facade_deactivate_continuity_execution_plan_for_tests(true, false, false, false).await,
+        facade_deactivate_continuity_execution_plan_for_tests(true, false, false, false, false)
+            .await,
         FixedBindLifecycleExecution::RetainActiveContinuity { .. }
     ));
 }
@@ -3651,7 +3788,8 @@ async fn facade_deactivate_continuity_execution_plan_retains_active_continuity_w
 async fn facade_deactivate_continuity_execution_plan_retains_active_facade_while_pending_fixed_bind_claim_conflict_remains()
  {
     assert!(matches!(
-        facade_deactivate_continuity_execution_plan_for_tests(true, true, false, false).await,
+        facade_deactivate_continuity_execution_plan_for_tests(true, true, false, false, false)
+            .await,
         FixedBindLifecycleExecution::RetainActiveWhilePendingFixedBindClaimConflict { .. }
     ));
 }
@@ -3660,7 +3798,8 @@ async fn facade_deactivate_continuity_execution_plan_retains_active_facade_while
 async fn facade_deactivate_continuity_execution_plan_retains_pending_facade_while_pending_fixed_bind_claim_conflict_remains()
  {
     assert!(matches!(
-        facade_deactivate_continuity_execution_plan_for_tests(false, true, false, false).await,
+        facade_deactivate_continuity_execution_plan_for_tests(false, true, false, false, false)
+            .await,
         FixedBindLifecycleExecution::RetainPendingWhilePendingFixedBindClaimConflict { .. }
     ));
 }
@@ -3669,7 +3808,8 @@ async fn facade_deactivate_continuity_execution_plan_retains_pending_facade_whil
 async fn facade_deactivate_continuity_execution_plan_releases_active_facade_for_fixed_bind_handoff()
 {
     assert!(matches!(
-        facade_deactivate_continuity_execution_plan_for_tests(true, false, true, false).await,
+        facade_deactivate_continuity_execution_plan_for_tests(true, false, true, false, false)
+            .await,
         FixedBindLifecycleExecution::ReleaseActiveForFixedBindHandoff { .. }
     ));
 }
@@ -3678,7 +3818,8 @@ async fn facade_deactivate_continuity_execution_plan_releases_active_facade_for_
 async fn facade_deactivate_continuity_execution_plan_retains_pending_facade_while_spawn_is_still_in_flight()
  {
     assert!(matches!(
-        facade_deactivate_continuity_execution_plan_for_tests(false, false, false, true).await,
+        facade_deactivate_continuity_execution_plan_for_tests(false, false, false, true, false)
+            .await,
         FixedBindLifecycleExecution::RetainPendingWhileSpawnInFlight { .. }
     ));
 }
@@ -3686,7 +3827,18 @@ async fn facade_deactivate_continuity_execution_plan_retains_pending_facade_whil
 #[tokio::test]
 async fn facade_deactivate_continuity_execution_plan_shuts_down_when_no_continuity_lane_applies() {
     assert!(matches!(
-        facade_deactivate_continuity_execution_plan_for_tests(false, false, false, false).await,
+        facade_deactivate_continuity_execution_plan_for_tests(false, false, false, false, false)
+            .await,
+        FixedBindLifecycleExecution::Shutdown { handoff: None }
+    ));
+}
+
+#[tokio::test]
+async fn facade_deactivate_continuity_execution_plan_does_not_retain_active_continuity_for_restart_deferred_retire_pending()
+ {
+    assert!(matches!(
+        facade_deactivate_continuity_execution_plan_for_tests(true, false, false, false, true)
+            .await,
         FixedBindLifecycleExecution::Shutdown { handoff: None }
     ));
 }
@@ -3708,6 +3860,7 @@ async fn facade_deactivate_continuity_execution_plan_reuses_observed_handoff_sta
         generation: 1,
         retain_active_facade: true,
         retain_pending_spawn: false,
+        restart_deferred_retire_pending: false,
     });
 
     assert!(matches!(
@@ -3734,6 +3887,7 @@ async fn facade_deactivate_continuity_execution_plan_reuses_observed_handoff_sta
         generation: 1,
         retain_active_facade: false,
         retain_pending_spawn: false,
+        restart_deferred_retire_pending: false,
     });
 
     assert!(matches!(
@@ -3829,6 +3983,29 @@ fn classify_uninitialized_cleanup_disposition_detects_facade_only_cleanup_wave()
         },),
         UninitializedCleanupDisposition::FacadeOnly
     );
+}
+
+#[test]
+fn split_app_control_signals_preserves_restart_deferred_retire_pending_for_facade_deactivate() {
+    let (_, _, facade_signals) =
+        split_app_control_signals(&[deactivate_envelope_with_route_key_reason_and_lease(
+            execution_units::FACADE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+            3,
+            "restart_deferred_retire_pending",
+            7,
+            11,
+            22,
+        )])
+        .expect("split facade generation-cutover signals");
+
+    assert!(matches!(
+        facade_signals.as_slice(),
+        [FacadeControlSignal::Deactivate {
+            restart_deferred_retire_pending: true,
+            ..
+        }]
+    ));
 }
 
 #[test]
@@ -4951,7 +5128,8 @@ async fn start_embedded_runtime_boundary_accepts_cold_start_before_initial_scan_
 }
 
 #[tokio::test]
-async fn facade_cutover_waits_for_observation_eligibility_before_replacing_previous() {
+async fn facade_cutover_replaces_previous_before_observation_eligibility_when_runtime_exposure_is_ready()
+ {
     let tmp = tempdir().expect("create temp dir");
     let root = tmp.path().join("root-a");
     fs::create_dir_all(&root).expect("create root");
@@ -5043,27 +5221,30 @@ async fn facade_cutover_waits_for_observation_eligibility_before_replacing_previ
     );
     *app.pending_facade.lock().await = Some(readiness_pending);
     assert!(
-        !app.try_spawn_pending_facade()
+        app.try_spawn_pending_facade()
             .await
             .expect("replacement facade gating check"),
-        "replacement facade must not replace the active listener before generation-scoped observation evidence is trusted"
+        "replacement facade should come up once runtime exposure is ready, even before generation-scoped trusted materialized evidence"
     );
     assert_eq!(
         app.api_task
             .lock()
             .await
             .as_ref()
-            .expect("previous active facade must remain installed")
+            .expect("replacement facade must become active")
             .generation,
-        1
+        2
     );
     assert!(
-        app.pending_facade.lock().await.is_some(),
-        "pending facade must remain queued until generation-scoped observation evidence is trusted"
+        app.pending_facade.lock().await.is_none(),
+        "replacement facade should not remain queued behind trusted-materialized readiness once runtime exposure is already confirmed"
     );
-    assert_eq!(
-        facade_pending_status(&app).reason,
-        FacadePendingReason::AwaitingObservationEligibility
+    assert!(
+        app.facade_pending_status
+            .read()
+            .expect("read pending facade status after replacement")
+            .is_none(),
+        "replacement facade must clear the pending observation-eligibility gate instead of preserving a stale pending facade status"
     );
     app.close().await.expect("close fs-meta app");
 }
@@ -6105,6 +6286,7 @@ async fn facade_deactivate_during_inflight_spawn_keeps_login_transport_available
         FacadeRuntimeUnit::Facade,
         &facade_control_stream_route(),
         pending.generation,
+        false,
     )
     .await
     .expect("facade deactivate while spawn is in flight");
@@ -8064,8 +8246,13 @@ async fn query_peer_sink_query_proxy_deactivate_does_not_wait_for_inflight_sourc
         let app = app.clone();
         let sink_query_proxy_route = sink_query_proxy_route.clone();
         async move {
-            app.apply_facade_deactivate(FacadeRuntimeUnit::QueryPeer, &sink_query_proxy_route, 3)
-                .await
+            app.apply_facade_deactivate(
+                FacadeRuntimeUnit::QueryPeer,
+                &sink_query_proxy_route,
+                3,
+                false,
+            )
+            .await
         }
     });
 
@@ -19354,8 +19541,11 @@ async fn source_find_route_serves_mixed_query_and_query_peer_requests_under_quer
         NodeId("node-a".to_string()),
         crate::runtime::routes::default_route_bindings(),
     );
-    let payload = rmp_serde::to_vec(&selected_group_dir_request(b"/force-find-stress", "nfs2"))
-        .expect("encode source-find request");
+    let payload = rmp_serde::to_vec(&selected_group_force_find_dir_request(
+        b"/force-find-stress",
+        "nfs2",
+    ))
+    .expect("encode source-find request");
     let events = capanix_host_adapter_fs::HostAdapter::call_collect(
         &adapter,
         ROUTE_TOKEN_FS_META_INTERNAL,
@@ -19369,6 +19559,15 @@ async fn source_find_route_serves_mixed_query_and_query_peer_requests_under_quer
     assert!(
         !events.is_empty(),
         "mixed query/query-peer source-find route must return at least one response event"
+    );
+    let payload = rmp_serde::from_slice::<query::ForceFindQueryPayload>(events[0].payload_bytes())
+        .expect("decode mixed query/query-peer force-find payload");
+    let query::ForceFindQueryPayload::Tree(tree) = payload else {
+        panic!("expected tree payload for mixed query/query-peer force-find route");
+    };
+    assert!(
+        tree.root.exists,
+        "mixed query/query-peer source-find route should return an existing tree root payload"
     );
 
     let recv_unit_ids = boundary
@@ -19515,8 +19714,11 @@ async fn source_find_route_serves_peer_only_requests_under_query_peer_runtime_un
         NodeId("node-a".to_string()),
         crate::runtime::routes::default_route_bindings(),
     );
-    let payload = rmp_serde::to_vec(&selected_group_dir_request(b"/force-find-stress", "nfs1"))
-        .expect("encode source-find request");
+    let payload = rmp_serde::to_vec(&selected_group_force_find_dir_request(
+        b"/force-find-stress",
+        "nfs1",
+    ))
+    .expect("encode source-find request");
     let events = capanix_host_adapter_fs::HostAdapter::call_collect(
         &adapter,
         ROUTE_TOKEN_FS_META_INTERNAL,
@@ -19531,6 +19733,15 @@ async fn source_find_route_serves_peer_only_requests_under_query_peer_runtime_un
         !events.is_empty(),
         "peer-only source-find route must return at least one response event after turnover"
     );
+    let payload = rmp_serde::from_slice::<query::ForceFindQueryPayload>(events[0].payload_bytes())
+        .expect("decode peer-only force-find payload");
+    let query::ForceFindQueryPayload::Tree(tree) = payload else {
+        panic!("expected tree payload for peer-only source-find route");
+    };
+    assert!(
+        tree.root.exists,
+        "peer-only source-find route should return an existing tree root payload after turnover"
+    );
 
     let recv_unit_ids = boundary
         .source_find_recv_unit_ids
@@ -19542,6 +19753,152 @@ async fn source_find_route_serves_peer_only_requests_under_query_peer_runtime_un
             .iter()
             .any(|unit_id| unit_id.as_deref() == Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)),
         "peer-only source-find requests must recv under runtime.exec.query-peer: {recv_unit_ids:?}"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scoped_source_find_route_serves_peer_only_requests_under_query_peer_runtime_unit() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 force-find dir");
+    fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
+    let nfs1_source = nfs1.display().to_string();
+    let boundary = Arc::new(RuntimeProxyUnitAwareBoundary::new(
+        None,
+        Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID),
+        None,
+        None,
+    ));
+    let node_id = NodeId("node-c-source-find-scoped-peer-only".into());
+    let app = Arc::new(
+        FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_watch_scan_root("nfs1", &nfs1_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "node-c::nfs1",
+                        "node-c",
+                        "10.0.0.31",
+                        &nfs1_source,
+                        nfs1.clone(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            node_id.clone(),
+            Some(boundary.clone()),
+        )
+        .expect("init app"),
+    );
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            &[("nfs1", &["node-c::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            &[("nfs1", &["node-c::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-c::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-c::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            source_find_request_route_for(&node_id.0).0,
+            &[("nfs1", &["listener-a"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("peer-only scoped source-find wave should succeed");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let source_groups = app
+            .source
+            .scheduled_source_group_ids()
+            .await
+            .expect("source groups")
+            .unwrap_or_default();
+        let scan_groups = app
+            .source
+            .scheduled_scan_group_ids()
+            .await
+            .expect("scan groups")
+            .unwrap_or_default();
+        if source_groups == std::collections::BTreeSet::from(["nfs1".to_string()])
+            && scan_groups == std::collections::BTreeSet::from(["nfs1".to_string()])
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for peer-only scoped source-find convergence: source={source_groups:?} scan={scan_groups:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("node-a".to_string()),
+        source_find_route_bindings_for(&node_id.0),
+    );
+    let payload = rmp_serde::to_vec(&selected_group_force_find_dir_request(
+        b"/force-find-stress",
+        "nfs1",
+    ))
+    .expect("encode scoped source-find request");
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_FIND,
+        Bytes::from(payload),
+        Duration::from_secs(5),
+        Duration::from_millis(250),
+    )
+    .await
+    .expect("peer-only scoped source-find route should serve a request");
+    assert!(
+        !events.is_empty(),
+        "peer-only scoped source-find route must return at least one response event"
+    );
+    let payload = rmp_serde::from_slice::<query::ForceFindQueryPayload>(events[0].payload_bytes())
+        .expect("decode peer-only scoped force-find payload");
+    let query::ForceFindQueryPayload::Tree(tree) = payload else {
+        panic!("expected tree payload for peer-only scoped source-find route");
+    };
+    assert!(
+        tree.root.exists,
+        "peer-only scoped source-find route should return an existing tree root payload"
+    );
+
+    let recv_unit_ids = boundary
+        .source_find_recv_unit_ids
+        .lock()
+        .expect("source_find_recv_unit_ids lock")
+        .clone();
+    assert!(
+        recv_unit_ids
+            .iter()
+            .any(|unit_id| unit_id.as_deref() == Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)),
+        "peer-only scoped source-find requests must recv under runtime.exec.query-peer: {recv_unit_ids:?}"
     );
 
     app.close().await.expect("close app");
@@ -32306,7 +32663,7 @@ async fn mirrored_query_lane_activation_clears_when_query_peer_route_deactivates
     .await
     .expect("activate query-peer source-status route");
 
-    app.apply_facade_deactivate(FacadeRuntimeUnit::QueryPeer, &source_status_route, 3)
+    app.apply_facade_deactivate(FacadeRuntimeUnit::QueryPeer, &source_status_route, 3, false)
         .await
         .expect("deactivate query-peer source-status route");
 
@@ -32382,6 +32739,125 @@ async fn runtime_managed_listener_only_facade_requires_generation_scoped_group_e
 }
 
 #[tokio::test]
+async fn runtime_managed_empty_roots_listener_only_facade_is_observation_eligible() {
+    let tmp = tempdir().expect("create temp dir");
+    let root_a = tmp.path().join("root-a");
+    fs::create_dir_all(&root_a).expect("create root-a");
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let cfg = FSMetaConfig {
+        source: SourceConfig {
+            roots: vec![],
+            host_object_grants: vec![granted_mount_root("single-app-node::root-a-1", &root_a)],
+            ..local_source_config()
+        },
+        api: api::ApiConfig {
+            enabled: true,
+            facade_resource_id: "single-app-listener".to_string(),
+            local_listener_resources: vec![api::config::ApiListenerResource {
+                resource_id: "single-app-listener".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+            }],
+            auth: api::ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                ..api::ApiAuthConfig::default()
+            },
+        },
+    };
+    let app = FSMetaApp::with_boundaries(
+        cfg,
+        NodeId("single-app-node".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init app");
+
+    let pending = PendingFacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 2,
+        resource_ids: vec!["single-app-listener".to_string()],
+        bound_scopes: vec![RuntimeBoundScope {
+            scope_id: "single-app-listener".to_string(),
+            resource_ids: vec!["single-app-listener".to_string()],
+        }],
+        group_ids: Vec::new(),
+        runtime_managed: true,
+        runtime_exposure_confirmed: true,
+        resolved: app
+            .config
+            .api
+            .resolve_for_candidate_ids(&["single-app-listener".to_string()])
+            .expect("resolve facade config"),
+    };
+    assert!(
+        FSMetaApp::observation_eligible_for(app.source.as_ref(), app.sink.as_ref(), &pending)
+            .await
+            .expect("evaluate observation eligibility"),
+        "empty-roots deployed state must not block runtime-managed facade replacement behind missing group evidence"
+    );
+    app.close().await.expect("close app");
+}
+
+#[tokio::test]
+async fn runtime_managed_empty_roots_listener_only_facade_ignores_runtime_scoped_candidate_groups()
+{
+    let tmp = tempdir().expect("create temp dir");
+    let root_a = tmp.path().join("root-a");
+    fs::create_dir_all(&root_a).expect("create root-a");
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let cfg = FSMetaConfig {
+        source: SourceConfig {
+            roots: vec![],
+            host_object_grants: vec![granted_mount_root("single-app-node::root-a-1", &root_a)],
+            ..local_source_config()
+        },
+        api: api::ApiConfig {
+            enabled: true,
+            facade_resource_id: "single-app-listener".to_string(),
+            local_listener_resources: vec![api::config::ApiListenerResource {
+                resource_id: "single-app-listener".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+            }],
+            auth: api::ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                ..api::ApiAuthConfig::default()
+            },
+        },
+    };
+    let app = FSMetaApp::with_boundaries(
+        cfg,
+        NodeId("single-app-node".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init app");
+
+    let pending = PendingFacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 2,
+        resource_ids: vec!["single-app-listener".to_string()],
+        bound_scopes: vec![RuntimeBoundScope {
+            scope_id: "single-app-listener".to_string(),
+            resource_ids: vec!["single-app-listener".to_string()],
+        }],
+        group_ids: vec!["runtime-grant-derived-group".to_string()],
+        runtime_managed: true,
+        runtime_exposure_confirmed: true,
+        resolved: app
+            .config
+            .api
+            .resolve_for_candidate_ids(&["single-app-listener".to_string()])
+            .expect("resolve facade config"),
+    };
+    assert!(
+        FSMetaApp::observation_eligible_for(app.source.as_ref(), app.sink.as_ref(), &pending)
+            .await
+            .expect("evaluate observation eligibility"),
+        "empty-roots deployed state must keep the management facade available even when runtime grants already imply candidate groups"
+    );
+    app.close().await.expect("close app");
+}
+
+#[tokio::test]
 async fn runtime_managed_cold_start_facade_starts_before_generation_scoped_group_evidence() {
     let tmp = tempdir().expect("create temp dir");
     let root_a = tmp.path().join("root-a");
@@ -32449,6 +32925,17 @@ async fn runtime_managed_cold_start_facade_starts_before_generation_scoped_group
     assert!(
         app.api_task.lock().await.is_some(),
         "cold-start facade activation must own an HTTP task"
+    );
+    assert!(
+        app.api_control_gate.is_ready(),
+        "cold-start runtime-managed facade publication must reopen the api control gate once the facade handle becomes active"
+    );
+    assert_eq!(
+        *app.facade_service_state
+            .read()
+            .expect("read published facade service state after cold-start spawn"),
+        FacadeServiceState::Serving,
+        "cold-start runtime-managed facade publication must republish serving once the facade handle becomes active"
     );
     app.close().await.expect("close app");
 }

@@ -54,11 +54,16 @@ GET /status -> StatusResponse
 ```
 
 1. `GET /status`
-   1. response: source degraded roots, host-object-grant version, source coverage details, sink health/capacity stats, a `rollout` object whose `state` uses `RolloutGenerationState`, and a `facade` object whose `state` uses `FacadeServiceState` (`unavailable|pending|serving|degraded`) plus optional facade-pending diagnostics. These status/health surfaces are the current fs-meta observation-evidence boundary for materialized-query readiness, `GroupServiceState`, `FacadeServiceState`, `RolloutGenerationState`, and `NodeParticipationState`; they do not rely on legacy revision-pair status fields.
-   2. source payload MUST expose per logical-root `service_state` plus coverage summary (`matched_grants`, `active_members`, `coverage_mode`) and per concrete-root `participation_state` plus operational evidence (`root_key`, `object_ref`, `watch_lru_capacity`, `audit_interval_ms`, `overflow_count`, `overflow_pending`, `rescan_pending`, `last_rescan_reason`, `last_error`, `last_audit_started_at_us`, `last_audit_completed_at_us`, `last_audit_duration_ms`). Source lifecycle text MAY remain in `source.debug.lifecycle_state` as diagnostic evidence only.
-   3. sink payload MUST expose aggregate counts plus per-group capacity and materialization-evidence details (`estimated_heap_bytes`, `groups[].estimated_heap_bytes`, `groups[].shadow_lag_us`, `groups[].overflow_pending_materialization`, `groups[].initial_audit_completed`, `groups[].materialization_readiness`) so large-NFS deployments can distinguish liveness from coverage pressure, first-audit completion, and materialized catch-up readiness. `groups[].materialization_readiness` is evidence beneath `GroupServiceState`, not a competing service-state vocabulary.
-   4. when facade activation is pending or retrying, status MAY expose `facade.pending` with `route_key`, `generation`, `resource_ids`, `runtime_exposure_confirmed`, `reason`, `retry_attempts`, `pending_since_us`, and optional retry diagnostics such as `last_error`, `last_attempt_at_us`, `last_error_at_us`, `retry_backoff_ms`, and `next_retry_at_us`.
-   5. empty-roots deployment is valid; status must still report service health instead of configuration failure.
+   1. response: source degraded roots, host-object-grant version, source coverage details, sink health/capacity stats, a current `authority_epoch` summary, current facade-node `runtime_artifact` evidence, a `rollout` object whose `state` uses `RolloutGenerationState`, and a `facade` object whose `state` uses `FacadeServiceState` (`unavailable|pending|serving|degraded`) plus optional facade-pending diagnostics. These status/health surfaces are the current fs-meta observation-evidence boundary for materialized-query readiness, `GroupServiceState`, `FacadeServiceState`, `RolloutGenerationState`, and `NodeParticipationState`; they do not rely on legacy revision-pair status fields.
+   2. `authority_epoch` evidence MUST identify the current epoch inputs at least by roots signature, grants signature, source stream generation, sink materialization generation, and facade/runtime generation; exact hash formatting is implementation-owned as long as equality comparison is stable.
+   3. source payload MUST expose per logical-root `service_state` plus coverage summary (`matched_grants`, `active_members`, `coverage_mode`, `coverage_capabilities`) and per concrete-root `participation_state` plus operational evidence (`root_key`, `object_ref`, `watch_lru_capacity`, `audit_interval_ms`, `overflow_count`, `overflow_pending`, `rescan_pending`, `last_rescan_reason`, `last_error`, `last_audit_started_at_us`, `last_audit_completed_at_us`, `last_audit_duration_ms`). Source lifecycle text MAY remain in `source.debug.lifecycle_state` as diagnostic evidence only.
+   4. `coverage_mode` MUST be one of `realtime_hotset_plus_audit`, `audit_only`, `audit_with_metadata`, `audit_without_file_metadata`, or `watch_degraded`; `coverage_capabilities` MUST expose the booleans `exists_coverage`, `file_count_coverage`, `file_metadata_coverage`, `mtime_size_coverage`, and `watch_freshness_coverage`.
+   5. sink payload MUST expose aggregate counts plus per-group capacity and materialization-evidence details (`estimated_heap_bytes`, `groups[].estimated_heap_bytes`, `groups[].shadow_lag_us`, `groups[].overflow_pending_materialization`, `groups[].initial_audit_completed`, `groups[].materialization_readiness`) so large-NFS deployments can distinguish liveness from coverage pressure, first-audit completion, and materialized catch-up readiness. `groups[].materialization_readiness` is evidence beneath `GroupServiceState`, not a competing service-state vocabulary.
+   6. host-fs timeout/backpressure evidence MUST be surfaced as root/group degraded reason or partial evidence; repeated timeout uses `HOST_FS_TIMEOUT`, repeated backpressure uses `HOST_FS_BACKPRESSURE`, and neither can be represented only as an internal log line.
+   7. current facade-node `runtime_artifact` evidence MUST include the loaded artifact path and content hash so deploy/demo validation can compare expected and actual artifacts; cross-node artifact comparison belongs to deploy validation or deployment diagnostics.
+   8. when facade activation is pending or retrying, status MAY expose `facade.pending` with `route_key`, `generation`, `resource_ids`, `runtime_exposure_confirmed`, `reason`, `retry_attempts`, `pending_since_us`, and optional retry diagnostics such as `last_error`, `last_attempt_at_us`, `last_error_at_us`, `retry_backoff_ms`, and `next_retry_at_us`.
+   9. status MUST keep API facade liveness, management write readiness, and trusted observation readiness distinguishable; a serving HTTP facade is not sufficient evidence that management writes or trusted-materialized reads are open.
+   10. empty-roots deployment is valid; status must still report service health instead of configuration failure.
 
 ## [interface] RuntimeGrantEndpoints
 
@@ -101,6 +106,7 @@ PUT  /monitoring/roots         -> { roots_count: usize }
    2. response: `{ "roots_count": usize }`
    3. validation: reject duplicated/empty `id`; reject legacy `path` and `source_locator`; allow empty `roots`; each non-empty root must provide at least one selector field and an absolute `subpath_scope`.
    4. write guard: server MUST revalidate each submitted root against the current runtime grants and reject the whole write when any submitted root has no current grant match; the error response MUST keep the unmatched root ids explicit.
+   5. write readiness: server MUST require Management Write Ready before accepting roots apply. If the HTTP facade is reachable but the current-epoch control stream is not active, the server returns explicit `NOT_READY` instead of accepting the write.
 
 ## [interface] IndexEndpoints
 
@@ -117,6 +123,7 @@ POST /index/rescan -> { accepted: true }
 1. `POST /index/rescan`
    1. response: `{ "accepted": true }`
    2. write access requires `admin`.
+   3. write readiness: server MUST require Management Write Ready before accepting manual rescan. HTTP facade liveness alone is insufficient to enqueue source repair work.
 
 ## [interface] QueryApiKeyManagementEndpoints
 
@@ -186,10 +193,15 @@ GET /bound-route-metrics  -> BoundRouteMetricsResponse
 6. `GET /on-demand-force-find` payload details
    1. `observation_status.state` MUST stay `fresh-only`, which is the live/fresh member of `QueryObservationState` in `STATE_MODEL.md`.
    2. `stability` keys use the same object shape as `/tree`, but `state` MUST stay `not-evaluated` and `mode` MUST stay `none`.
-   3. `meta.read_class` is always `fresh`; `meta.metadata_available` is always `true`.
-   4. each returned group item owns its own `root`, `entries`, and `entry_page`, using the same field shapes as `/tree`, including optional `path_b64` when display strings would be lossy.
+   3. `meta.read_class` is always `fresh`; `meta.metadata_available` is `true` only when the selected runner returned the metadata required for that group item.
+   4. each returned group item owns its own `root`, `entries`, and `entry_page` when `meta.metadata_available=true`, using the same field shapes as `/tree`, including optional `path_b64` when display strings would be lossy; when required coverage is unavailable, the group item keeps explicit `meta.metadata_available=false` with `withheld_reason` or degraded reason.
    5. `group_after` and `entry_after` cursors MUST be treated as opaque PIT cursors by clients; after the first page, force-find continuation reuses frozen PIT results instead of rerunning the live query.
    6. `/on-demand-force-find` remains a freshness path and is not blocked by the trusted-materialized observation gate that protects `/tree` and `/stats`.
+   7. `/on-demand-force-find` is Force-Find Ready for a group only when the current Authority Epoch has non-empty monitoring roots, available runtime grants, and Runner Binding Evidence for that group.
+   8. request-level `NOT_READY` reasons include `monitoring_roots_empty`, `runtime_grants_unavailable`, and `runner_binding_not_ready`.
+   9. group-level fresh execution errors include `GROUP_UNBOUND`, `RUNNER_UNAVAILABLE`, and `HOST_FS_UNAVAILABLE`; these errors do not authorize fallback to materialized results.
+   10. after fs-meta selects a runner for a group, that group item is completed by the selected runner's fresh success, explicit error, or timeout; the group is not held open to wait for unrelated runner replies.
+   11. multi-group force-find may return several group items, but each group item follows its own Selected-Runner Fresh Execution outcome.
 7. `PitHandle`
    1. required keys: `id`, `expires_at_ms`.
    2. `id` is an opaque server-issued query session id; clients do not derive meaning from it.
@@ -201,6 +213,7 @@ GET /bound-route-metrics  -> BoundRouteMetricsResponse
 4. Default `/tree` and `/stats` behavior inherits the narrowest window because their default `read_class` is `trusted-materialized`.
 5. The public availability ordering is contractual: `/on-demand-force-find` availability ⊇ materialized `/tree|/stats` availability ⊇ trusted-materialized `/tree|/stats` availability.
 6. Status, degraded evidence, or diagnostics MAY explain why a narrower window is currently closed, but they MUST NOT collapse the wider `/on-demand-force-find` window into the trusted-materialized gate unless the facade itself or fresh source execution is unavailable.
+7. Fresh source execution is available only from current-epoch Runner Binding Evidence; cached evidence from a previous Authority Epoch is treated as unavailable until rebuilt for the current monitoring scope.
 
 8. `GroupEnvelopeStats` (used by `/stats`)
    1. required keys: `status`, `errors`; `members` key MUST be absent.

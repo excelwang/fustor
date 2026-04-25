@@ -49,12 +49,13 @@ use crate::runtime::seam::resolve_host_fs_facade;
 use crate::FileMetaRecord;
 use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNITS};
 use crate::runtime::orchestration::{
-    SourceControlSignal, SourceRuntimeUnit, decode_logical_roots_control_payload,
-    source_control_signals_from_envelopes,
+    MANUAL_RESCAN_CONTROL_FRAME_KIND, ManualRescanControlPayload, SourceControlSignal,
+    SourceRuntimeUnit, decode_logical_roots_control_payload, source_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{
     METHOD_SOURCE_RESCAN, METHOD_SOURCE_RESCAN_CONTROL, METHOD_SOURCE_ROOTS_CONTROL,
-    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, source_rescan_route_key_for,
+    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, source_find_route_bindings_for,
+    source_rescan_route_key_for, source_roots_control_stream_route_for,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
@@ -135,6 +136,39 @@ fn count_events_under_query_path(events: &[Event], query_path: &[u8]) -> u64 {
         .filter_map(|event| rmp_serde::from_slice::<FileMetaRecord>(event.payload_bytes()).ok())
         .filter(|record| is_under_query_path(&record.path, query_path))
         .count() as u64
+}
+
+fn root_specs_signature(
+    roots: &[RootSpec],
+) -> Vec<(
+    String,
+    Option<std::path::PathBuf>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    std::path::PathBuf,
+    bool,
+    bool,
+    Option<u64>,
+)> {
+    roots
+        .iter()
+        .map(|root| {
+            (
+                root.id.clone(),
+                root.selector.mount_point.clone(),
+                root.selector.fs_source.clone(),
+                root.selector.fs_type.clone(),
+                root.selector.host_ip.clone(),
+                root.selector.host_ref.clone(),
+                root.subpath_scope.clone(),
+                root.watch,
+                root.scan,
+                root.audit_interval_ms,
+            )
+        })
+        .collect()
 }
 
 fn summarize_bound_scopes(bound_scopes: &[RuntimeBoundScope]) -> Vec<String> {
@@ -222,12 +256,15 @@ fn coverage_mode_for_root(
     scan_enabled: bool,
     watch_lru_capacity: usize,
 ) -> &'static str {
-    match (watch_enabled && watch_lru_capacity > 0, scan_enabled) {
-        (true, true) => "realtime_hotset_plus_audit",
-        (true, false) => "realtime_hotset_only",
-        (false, true) => "audit_only",
-        (false, false) if watch_enabled => "watch_requested_without_capacity",
-        (false, false) => "inactive",
+    match (
+        watch_enabled && watch_lru_capacity > 0,
+        scan_enabled,
+        watch_enabled,
+    ) {
+        (true, true, _) => "realtime_hotset_plus_audit",
+        (_, true, _) => "audit_with_metadata",
+        (false, false, true) => "watch_degraded",
+        _ => "watch_degraded",
     }
 }
 
@@ -237,6 +274,12 @@ fn host_ref_matches_node_id(host_ref: &str, node_id: &NodeId) -> bool {
             .0
             .strip_prefix(host_ref)
             .is_some_and(|suffix| suffix.starts_with('-'))
+        || node_id.0.strip_prefix("cluster-").is_some_and(|scoped| {
+            scoped == host_ref
+                || scoped
+                    .strip_prefix(host_ref)
+                    .is_some_and(|suffix| suffix.starts_with('-'))
+        })
 }
 
 fn runtime_scope_resource_matches_logical_root(resource_id: &str, logical_root_id: &str) -> bool {
@@ -631,6 +674,8 @@ pub struct FSMetaSource {
     force_find_last_runner: Arc<Mutex<BTreeMap<String, String>>>,
     /// Last accepted runtime control summary for local observability snapshots.
     last_control_frame_signals: Arc<Mutex<Vec<String>>>,
+    /// Highest manual-rescan control request timestamp accepted from runtime control streams.
+    manual_rescan_control_high_watermark_us: Arc<AtomicU64>,
     /// Canonical retained source control state for local/runtime replay.
     control_state: Arc<tokio::sync::Mutex<SourceControlState>>,
     /// Coalesced runtime-topology refresh trigger.
@@ -1017,15 +1062,35 @@ impl FSMetaSource {
     }
 
     fn should_receive_control_stream_route(&self, route_key: &str) -> bool {
-        let Ok(Some(generation)) = self
+        let generation = self
             .unit_control
             .route_generation(SOURCE_RUNTIME_UNIT_ID, route_key)
-        else {
+            .ok()
+            .flatten();
+        if std::env::var_os("FSMETA_DEBUG_ROOTS_CONTROL_GATE").is_some()
+            && route_key.contains("logical-roots-control")
+        {
+            eprintln!(
+                "fs_meta_source: roots_control gate node={} route={} generation={:?}",
+                self.node_id.0, route_key, generation
+            );
+        }
+        let Some(generation) = generation else {
             return false;
         };
-        self.unit_control
+        let accepted = self
+            .unit_control
             .accept_tick(SOURCE_RUNTIME_UNIT_ID, route_key, generation)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if std::env::var_os("FSMETA_DEBUG_ROOTS_CONTROL_GATE").is_some()
+            && route_key.contains("logical-roots-control")
+        {
+            eprintln!(
+                "fs_meta_source: roots_control gate accept node={} route={} generation={} accepted={}",
+                self.node_id.0, route_key, generation, accepted
+            );
+        }
+        accepted
     }
 
     fn apply_activate_signal(
@@ -1151,7 +1216,10 @@ impl FSMetaSource {
                 SourceControlSignal::RuntimeHostGrantChange { changed, .. } => {
                     actions.push(PendingAction::UpdateHostObjectGrants(changed.clone()));
                 }
-                SourceControlSignal::ManualRescan { .. } => {
+                SourceControlSignal::ManualRescan { envelope } => {
+                    if !self.accept_manual_rescan_control_envelope(envelope)? {
+                        continue;
+                    }
                     let roots_snapshot = lock_or_recover(
                         &self.state_cell.roots,
                         "source.control.manual_rescan.roots",
@@ -1458,9 +1526,24 @@ impl FSMetaSource {
             self.reconcile_root_tasks(&desired_roots).await;
         }
         if trigger_rescan && topology_changed {
-            self.trigger_rescan_when_ready().await;
+            self.trigger_topology_rescan_when_ready().await;
         }
         Ok(())
+    }
+
+    async fn trigger_topology_rescan_when_ready(&self) {
+        if !self.wait_for_group_primary_scan_roots_ready().await {
+            log::debug!(
+                "source-fs-meta: queue topology rescan before primary scan roots report running"
+            );
+        }
+        let roots = lock_or_recover(&self.state_cell.roots, "source.topology_rescan.roots").clone();
+        Self::request_rescan_on_primary_roots(
+            &roots,
+            Some(&self.state_cell.fanout_health),
+            None,
+            "topology",
+        );
     }
 
     fn build_root_runtimes(
@@ -2426,6 +2509,7 @@ impl FSMetaSource {
             force_find_inflight: Arc::new(Mutex::new(HashSet::new())),
             force_find_last_runner: Arc::new(Mutex::new(BTreeMap::new())),
             last_control_frame_signals: Arc::new(Mutex::new(Vec::new())),
+            manual_rescan_control_high_watermark_us: Arc::new(AtomicU64::new(0)),
             control_state: Arc::new(tokio::sync::Mutex::new(SourceControlState::default())),
             runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
             runtime_refresh_rescan: Arc::new(AtomicBool::new(false)),
@@ -2445,7 +2529,7 @@ impl FSMetaSource {
             let rescan_roots_scoped = rescan_roots.clone();
             let rescan_fanout_health_scoped = rescan_fanout_health.clone();
             let rescan_manual_intents_scoped = rescan_manual_intents.clone();
-            let routes = default_route_bindings();
+            let routes = source_find_route_bindings_for(&node_id.0);
             match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN) {
                 Ok(route) => {
                     log::info!(
@@ -2675,14 +2759,17 @@ impl FSMetaSource {
         });
     }
 
+    fn endpoint_task_route_present(&self, route_key: &str, context: &str) -> bool {
+        lock_or_recover(&self.endpoint_tasks, context)
+            .iter()
+            .any(|task| task.route_key() == route_key)
+    }
+
     pub(crate) async fn start_runtime_endpoints_on_boundary(
         &self,
         boundary: Arc<dyn ChannelIoSubset>,
     ) -> Result<()> {
         self.prune_finished_endpoint_tasks("source.start_runtime_endpoints.prune");
-        if !lock_or_recover(&self.endpoint_tasks, "source.start_runtime_endpoints").is_empty() {
-            return Ok(());
-        }
         self.start_manual_rescan_watch().await?;
 
         let rescan_roots = self.state_cell.roots_handle();
@@ -2693,10 +2780,15 @@ impl FSMetaSource {
         let rescan_roots_scoped = rescan_roots.clone();
         let rescan_fanout_health_scoped = rescan_fanout_health.clone();
         let rescan_manual_intents_scoped = rescan_manual_intents.clone();
-        let routes = default_route_bindings();
+        let routes = source_find_route_bindings_for(&self.node_id.0);
 
         match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN) {
-            Ok(route) => {
+            Ok(route)
+                if !self.endpoint_task_route_present(
+                    &route.0,
+                    "source.start_runtime_endpoints.route_present.rescan",
+                ) =>
+            {
                 log::info!(
                     "bound route listening on {}.{} for deferred source {}",
                     ROUTE_TOKEN_FS_META_INTERNAL,
@@ -2800,10 +2892,16 @@ impl FSMetaSource {
                     err
                 );
             }
+            Ok(_) => {}
         }
 
         match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN_CONTROL) {
-            Ok(route) => {
+            Ok(route)
+                if !self.endpoint_task_route_present(
+                    &route.0,
+                    "source.start_runtime_endpoints.route_present.rescan_control",
+                ) =>
+            {
                 log::info!(
                     "bound stream listening on {}.{} for deferred source {}",
                     ROUTE_TOKEN_FS_META_INTERNAL,
@@ -2860,14 +2958,14 @@ impl FSMetaSource {
                     err
                 );
             }
+            Ok(_) => {}
         }
 
-        match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_ROOTS_CONTROL) {
-            Ok(route) => {
+        let mut spawn_roots_control_stream =
+            |route: capanix_app_sdk::runtime::RouteKey, route_label: String| {
                 log::info!(
-                    "bound stream listening on {}.{} for deferred source {}",
-                    ROUTE_TOKEN_FS_META_INTERNAL,
-                    METHOD_SOURCE_ROOTS_CONTROL,
+                    "bound stream listening on {} for deferred source {}",
+                    route_label,
                     self.node_id.0
                 );
                 let source = self.clone();
@@ -2877,10 +2975,7 @@ impl FSMetaSource {
                 let endpoint_task = ManagedEndpointTask::spawn_stream(
                     boundary.clone(),
                     route,
-                    format!(
-                        "source:{}:{}",
-                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_ROOTS_CONTROL
-                    ),
+                    format!("source:{route_label}"),
                     SOURCE_RUNTIME_UNIT_ID,
                     self.shutdown.clone(),
                     move || control_ready.should_receive_control_stream_route(&control_route_key),
@@ -2907,7 +3002,14 @@ impl FSMetaSource {
                                         continue;
                                     }
                                 };
-                                if let Err(err) = source.update_logical_roots(payload.roots).await {
+                                if let Err(err) = source
+                                    .apply_logical_roots_snapshot(
+                                        payload.roots,
+                                        true,
+                                        "source.roots_control_stream",
+                                    )
+                                    .await
+                                {
                                     log::warn!(
                                         "source logical-roots control apply failed on node {}: {:?}",
                                         control_node_id.0,
@@ -2923,6 +3025,24 @@ impl FSMetaSource {
                     "source.start_runtime_endpoints.roots_control_stream_tasks",
                 )
                 .push(endpoint_task);
+            };
+
+        match default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_ROOTS_CONTROL)
+        {
+            Ok(route)
+                if !self.endpoint_task_route_present(
+                    &route.0,
+                    "source.start_runtime_endpoints.route_present.roots_control_default",
+                ) =>
+            {
+                spawn_roots_control_stream(
+                    route,
+                    format!(
+                        "{}.{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_ROOTS_CONTROL
+                    ),
+                )
             }
             Err(err) => {
                 log::error!(
@@ -2932,104 +3052,119 @@ impl FSMetaSource {
                     err
                 );
             }
+            Ok(_) => {}
+        }
+
+        let scoped_roots_route = source_roots_control_stream_route_for(&self.node_id.0);
+        if !self.endpoint_task_route_present(
+            &scoped_roots_route.0,
+            "source.start_runtime_endpoints.route_present.roots_control_scoped",
+        ) {
+            spawn_roots_control_stream(scoped_roots_route.clone(), scoped_roots_route.0);
         }
 
         {
             let route = capanix_app_sdk::runtime::RouteKey(source_rescan_route_key_for(
                 &node_id_rescan_scoped.0,
             ));
-            log::info!(
-                "bound route listening on {} for deferred source {}",
-                route.0,
-                node_id_rescan_scoped.0
-            );
-            let endpoint_task = ManagedEndpointTask::spawn_with_unit(
-                boundary,
-                route.clone(),
-                format!("source:{}", route.0),
-                SOURCE_RUNTIME_UNIT_ID,
-                self.shutdown.clone(),
-                move |requests| {
-                    let node_id_rescan_scoped = node_id_rescan_scoped.clone();
-                    let rescan_roots_scoped = rescan_roots_scoped.clone();
-                    let rescan_fanout_health_scoped = rescan_fanout_health_scoped.clone();
-                    let rescan_manual_intents_scoped = rescan_manual_intents_scoped.clone();
-                    async move {
-                        eprintln!(
-                            "fs_meta_source: source.rescan scoped endpoint start node={} requests={}",
-                            node_id_rescan_scoped.0,
-                            requests.len()
-                        );
-                        let expected = lock_or_recover(
-                            &rescan_roots_scoped,
-                            "source.rescan.scoped_endpoint.roots.expected",
-                        )
-                        .iter()
-                        .filter(|root| root.is_group_primary && root.spec.scan)
-                        .map(FSMetaSource::root_runtime_key)
-                        .collect::<Vec<_>>();
-                        if !expected.is_empty() {
-                            let deadline = std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
-                            loop {
-                                let ready = {
-                                    let health = lock_or_recover(
-                                        &rescan_fanout_health_scoped,
-                                        "source.rescan.scoped_endpoint.health",
-                                    );
-                                    expected.iter().all(|root_key| {
-                                        health
-                                            .object_ref
-                                            .get(root_key)
-                                            .is_some_and(|status| status == "running")
-                                    })
-                                };
-                                if ready || std::time::Instant::now() >= deadline {
-                                    break;
+            if !self.endpoint_task_route_present(
+                &route.0,
+                "source.start_runtime_endpoints.route_present.scoped_rescan",
+            ) {
+                log::info!(
+                    "bound route listening on {} for deferred source {}",
+                    route.0,
+                    node_id_rescan_scoped.0
+                );
+                let endpoint_task = ManagedEndpointTask::spawn_with_unit(
+                    boundary,
+                    route.clone(),
+                    format!("source:{}", route.0),
+                    SOURCE_RUNTIME_UNIT_ID,
+                    self.shutdown.clone(),
+                    move |requests| {
+                        let node_id_rescan_scoped = node_id_rescan_scoped.clone();
+                        let rescan_roots_scoped = rescan_roots_scoped.clone();
+                        let rescan_fanout_health_scoped = rescan_fanout_health_scoped.clone();
+                        let rescan_manual_intents_scoped = rescan_manual_intents_scoped.clone();
+                        async move {
+                            eprintln!(
+                                "fs_meta_source: source.rescan scoped endpoint start node={} requests={}",
+                                node_id_rescan_scoped.0,
+                                requests.len()
+                            );
+                            let expected = lock_or_recover(
+                                &rescan_roots_scoped,
+                                "source.rescan.scoped_endpoint.roots.expected",
+                            )
+                            .iter()
+                            .filter(|root| root.is_group_primary && root.spec.scan)
+                            .map(FSMetaSource::root_runtime_key)
+                            .collect::<Vec<_>>();
+                            if !expected.is_empty() {
+                                let deadline =
+                                    std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
+                                loop {
+                                    let ready = {
+                                        let health = lock_or_recover(
+                                            &rescan_fanout_health_scoped,
+                                            "source.rescan.scoped_endpoint.health",
+                                        );
+                                        expected.iter().all(|root_key| {
+                                            health
+                                                .object_ref
+                                                .get(root_key)
+                                                .is_some_and(|status| status == "running")
+                                        })
+                                    };
+                                    if ready || std::time::Instant::now() >= deadline {
+                                        break;
+                                    }
+                                    tokio::time::sleep(RESCAN_READY_POLL_INTERVAL).await;
                                 }
-                                tokio::time::sleep(RESCAN_READY_POLL_INTERVAL).await;
                             }
+
+                            let roots_snapshot = lock_or_recover(
+                                &rescan_roots_scoped,
+                                "source.rescan.scoped_endpoint.roots.trigger",
+                            )
+                            .clone();
+                            FSMetaSource::request_rescan_on_primary_roots(
+                                &roots_snapshot,
+                                Some(&rescan_fanout_health_scoped),
+                                Some(&rescan_manual_intents_scoped),
+                                "manual",
+                            );
+                            eprintln!(
+                                "fs_meta_source: source.rescan scoped endpoint triggered node={} expected_roots={}",
+                                node_id_rescan_scoped.0,
+                                expected.len()
+                            );
+
+                            requests
+                                .into_iter()
+                                .map(|req| {
+                                    let mut meta = EventMetadata {
+                                        origin_id: node_id_rescan_scoped.clone(),
+                                        timestamp_us: now_us(),
+                                        logical_ts: None,
+                                        correlation_id: None,
+                                        ingress_auth: None,
+                                        trace: None,
+                                    };
+                                    meta.correlation_id = req.metadata().correlation_id;
+                                    Event::new(meta, bytes::Bytes::from_static(b"accepted"))
+                                })
+                                .collect()
                         }
-
-                        let roots_snapshot = lock_or_recover(
-                            &rescan_roots_scoped,
-                            "source.rescan.scoped_endpoint.roots.trigger",
-                        )
-                        .clone();
-                        FSMetaSource::request_rescan_on_primary_roots(
-                            &roots_snapshot,
-                            Some(&rescan_fanout_health_scoped),
-                            Some(&rescan_manual_intents_scoped),
-                            "manual",
-                        );
-                        eprintln!(
-                            "fs_meta_source: source.rescan scoped endpoint triggered node={} expected_roots={}",
-                            node_id_rescan_scoped.0,
-                            expected.len()
-                        );
-
-                        requests
-                            .into_iter()
-                            .map(|req| {
-                                let mut meta = EventMetadata {
-                                    origin_id: node_id_rescan_scoped.clone(),
-                                    timestamp_us: now_us(),
-                                    logical_ts: None,
-                                    correlation_id: None,
-                                    ingress_auth: None,
-                                    trace: None,
-                                };
-                                meta.correlation_id = req.metadata().correlation_id;
-                                Event::new(meta, bytes::Bytes::from_static(b"accepted"))
-                            })
-                            .collect()
-                    }
-                },
-            );
-            lock_or_recover(
-                &self.endpoint_tasks,
-                "source.start_runtime_endpoints.scoped_tasks",
-            )
-            .push(endpoint_task);
+                    },
+                );
+                lock_or_recover(
+                    &self.endpoint_tasks,
+                    "source.start_runtime_endpoints.scoped_tasks",
+                )
+                .push(endpoint_task);
+            }
         }
 
         Ok(())
@@ -3137,6 +3272,97 @@ impl FSMetaSource {
 
     pub(crate) fn snapshot_lifecycle_state_label(&self) -> String {
         format!("{:?}", self.state()).to_ascii_lowercase()
+    }
+
+    pub(crate) async fn apply_logical_roots_snapshot(
+        &self,
+        roots: Vec<RootSpec>,
+        persist_authoritative: bool,
+        commit_label: &'static str,
+    ) -> Result<()> {
+        let mut cfg = self.config.clone();
+        cfg.roots = roots;
+        let root_specs = cfg.effective_roots().map_err(CnxError::InvalidInput)?;
+        let host_object_grants = self.host_object_grants_snapshot();
+        let fanout = Self::compute_logical_root_fanout(&root_specs, &host_object_grants);
+        let root_count = root_specs.len();
+        let grant_count = host_object_grants.len();
+        let bound_scopes = root_specs
+            .iter()
+            .map(|root| RuntimeBoundScope {
+                scope_id: root.id.clone(),
+                resource_ids: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        self.unit_control
+            .sync_active_scopes(SourceRuntimeUnit::Source.unit_id(), &bound_scopes)?;
+        self.unit_control
+            .sync_active_scopes(SourceRuntimeUnit::Scan.unit_id(), &bound_scopes)?;
+
+        *lock_or_recover(
+            &self.state_cell.logical_roots,
+            "source.apply.logical_roots_snapshot",
+        ) = root_specs.clone();
+        Self::set_logical_root_health(
+            &self.state_cell.fanout_health,
+            &root_specs,
+            &fanout,
+            self.config.lru_capacity,
+        );
+        *lock_or_recover(
+            &self.state_cell.logical_root_fanout,
+            "source.apply.logical_root_fanout",
+        ) = fanout;
+        self.refresh_runtime_roots(true).await?;
+        if persist_authoritative {
+            self.state_cell
+                .logical_roots_cell
+                .replace(root_specs.clone())
+                .await?;
+        }
+        self.state_cell.record_authoritative_commit(
+            commit_label,
+            format!("roots={} host_object_grants={}", root_count, grant_count),
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn sync_logical_roots_from_authoritative_cell_if_changed(
+        &self,
+    ) -> Result<bool> {
+        let Some(authoritative_roots) = self.authoritative_logical_roots_if_changed()? else {
+            return Ok(false);
+        };
+        eprintln!(
+            "fs_meta_source: authoritative logical-roots sync begin node={} roots={}",
+            self.node_id.0,
+            authoritative_roots.len()
+        );
+        self.apply_logical_roots_snapshot(
+            authoritative_roots.clone(),
+            false,
+            "source.sync_logical_roots_from_authority",
+        )
+        .await?;
+        eprintln!(
+            "fs_meta_source: authoritative logical-roots sync ok node={} roots={}",
+            self.node_id.0,
+            authoritative_roots.len()
+        );
+        Ok(true)
+    }
+
+    pub(crate) fn authoritative_logical_roots_if_changed(&self) -> Result<Option<Vec<RootSpec>>> {
+        let authoritative_roots = self
+            .state_cell
+            .logical_roots_cell
+            .refresh_from_boundary_blocking()?;
+        if root_specs_signature(&authoritative_roots)
+            == root_specs_signature(&self.logical_roots_snapshot())
+        {
+            return Ok(None);
+        }
+        Ok(Some(authoritative_roots))
     }
 
     /// Snapshot logical-root fanout mapping.
@@ -3460,6 +3686,44 @@ impl FSMetaSource {
         self.snapshot_last_control_frame_signals()
     }
 
+    fn accept_manual_rescan_control_envelope(&self, envelope: &ControlEnvelope) -> Result<bool> {
+        let requested_at_us = match envelope {
+            ControlEnvelope::Frame(frame) if frame.kind == MANUAL_RESCAN_CONTROL_FRAME_KIND => {
+                rmp_serde::from_slice::<ManualRescanControlPayload>(&frame.payload)
+                    .map_err(|err| {
+                        CnxError::InvalidInput(format!(
+                            "decode manual rescan control payload failed: {err}"
+                        ))
+                    })?
+                    .requested_at_us
+            }
+            _ => {
+                return Err(CnxError::InvalidInput(
+                    "manual rescan signal missing manual rescan control frame".into(),
+                ));
+            }
+        };
+        let mut observed = self
+            .manual_rescan_control_high_watermark_us
+            .load(Ordering::Acquire);
+        loop {
+            if requested_at_us <= observed {
+                return Ok(false);
+            }
+            match self
+                .manual_rescan_control_high_watermark_us
+                .compare_exchange(
+                    observed,
+                    requested_at_us,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                Ok(_) => return Ok(true),
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
     async fn wait_for_group_primary_scan_roots_ready(&self) -> bool {
         let expected = lock_or_recover(
             &self.state_cell.roots,
@@ -3511,51 +3775,14 @@ impl FSMetaSource {
             self.node_id.0,
             roots.len()
         );
-        let mut cfg = self.config.clone();
-        cfg.roots = roots;
-        let root_specs = cfg.effective_roots().map_err(CnxError::InvalidInput)?;
-        let host_object_grants = self.host_object_grants_snapshot();
-        let fanout = Self::compute_logical_root_fanout(&root_specs, &host_object_grants);
-        let root_count = root_specs.len();
-        let grant_count = host_object_grants.len();
-        let bound_scopes = root_specs
-            .iter()
-            .map(|root| RuntimeBoundScope {
-                scope_id: root.id.clone(),
-                resource_ids: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        self.unit_control
-            .sync_active_scopes(SourceRuntimeUnit::Source.unit_id(), &bound_scopes)?;
-        self.unit_control
-            .sync_active_scopes(SourceRuntimeUnit::Scan.unit_id(), &bound_scopes)?;
-
-        *lock_or_recover(
-            &self.state_cell.logical_roots,
-            "source.update.logical_roots",
-        ) = root_specs.clone();
-        Self::set_logical_root_health(
-            &self.state_cell.fanout_health,
-            &root_specs,
-            &fanout,
-            self.config.lru_capacity,
-        );
-        *lock_or_recover(
-            &self.state_cell.logical_root_fanout,
-            "source.update.logical_root_fanout",
-        ) = fanout;
-        self.refresh_runtime_roots(true).await?;
-        self.state_cell
-            .logical_roots_cell
-            .replace(root_specs.clone())
+        let root_count = roots.len();
+        self.apply_logical_roots_snapshot(roots, true, "source.update_logical_roots")
             .await?;
-        self.state_cell.record_authoritative_commit(
-            "source.update_logical_roots",
-            format!("roots={} host_object_grants={}", root_count, grant_count),
-        );
         eprintln!(
             "fs_meta_source: update_logical_roots ok node={} roots={} grants={}",
-            self.node_id.0, root_count, grant_count
+            self.node_id.0,
+            root_count,
+            self.host_object_grants_snapshot().len()
         );
         Ok(())
     }
@@ -4450,16 +4677,25 @@ impl FSMetaSource {
                     backoff = std::cmp::min(backoff * 2, max_backoff);
                 }
                 Err(_) => {
-                    let e = io::Error::new(io::ErrorKind::TimedOut, "root availability probe timed out after 15s");
                     eprintln!(
-                        "fs_meta_source: root availability probe timeout root_key={} path={}",
+                        "fs_meta_source: root availability probe timeout root_key={} path={} timeout_ms=15000",
                         root_key,
                         root_path.display()
+                    );
+                    let actions = sentinel.handle_signal(HealthSignal::HostFsTimeout {
+                        root_key: root_key.clone(),
+                        op: "root availability metadata probe".to_string(),
+                    });
+                    Self::execute_sentinel_actions(
+                        &actions,
+                        &root_key,
+                        Some(&root.rescan_tx),
+                        Some(&fanout_health),
                     );
                     Self::update_object_health(
                         &fanout_health,
                         &root_key,
-                        format!("waiting_for_root: {e}"),
+                        "degraded: HOST_FS_TIMEOUT",
                     );
                     tokio::select! {
                         _ = global_shutdown.cancelled() => return Err(CnxError::ChannelClosed),

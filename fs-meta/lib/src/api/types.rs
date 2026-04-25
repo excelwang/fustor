@@ -63,12 +63,22 @@ pub struct DegradedRoot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ObservationCoverageCapabilities {
+    pub exists_coverage: bool,
+    pub file_count_coverage: bool,
+    pub file_metadata_coverage: bool,
+    pub mtime_size_coverage: bool,
+    pub watch_freshness_coverage: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct StatusSourceLogicalRoot {
     pub root_id: String,
     pub service_state: GroupServiceState,
     pub matched_grants: usize,
     pub active_members: usize,
     pub coverage_mode: String,
+    pub coverage_capabilities: ObservationCoverageCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,6 +88,7 @@ pub struct StatusSourceConcreteRoot {
     pub object_ref: String,
     pub participation_state: NodeParticipationState,
     pub coverage_mode: String,
+    pub coverage_capabilities: ObservationCoverageCapabilities,
     pub watch_enabled: bool,
     pub scan_enabled: bool,
     pub is_group_primary: bool,
@@ -255,7 +266,37 @@ pub struct StatusRollout {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RuntimeArtifactEvidence {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthorityEpochEvidence {
+    pub roots_signature: String,
+    pub grants_signature: String,
+    pub source_stream_generation: Option<u64>,
+    pub sink_materialization_generation: String,
+    pub facade_runtime_generation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadinessPlanesEvidence {
+    pub api_facade_liveness: bool,
+    pub management_write_readiness: bool,
+    pub trusted_observation_readiness: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct StatusResponse {
+    pub runtime_artifact: RuntimeArtifactEvidence,
+    pub authority_epoch: AuthorityEpochEvidence,
+    pub readiness_planes: ReadinessPlanesEvidence,
     pub source: StatusSource,
     pub sink: StatusSink,
     pub rollout: StatusRollout,

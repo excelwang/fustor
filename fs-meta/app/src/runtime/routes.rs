@@ -9,5 +9,8 @@ pub use fs_meta::product_model::routes::{
     ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META,
     ROUTE_TOKEN_FS_META_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
     sink_query_request_route_for, sink_query_route_bindings_for, sink_query_route_key_for,
-    source_rescan_route_key_for,
+    sink_roots_control_route_key_for, sink_roots_control_stream_route_for,
+    source_find_request_route_for, source_find_route_bindings_for, source_find_route_key_for,
+    source_rescan_route_key_for, source_roots_control_route_key_for,
+    source_roots_control_stream_route_for,
 };

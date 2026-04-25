@@ -186,6 +186,7 @@ pub(crate) async fn spawn_with_rollout_status(
         ),
         published_rollout_status: PublishedRolloutStatusReader::new(rollout_status),
         request_tracker,
+        control_gate: control_gate.clone(),
     };
     refresh_policy_from_host_object_grants(
         &state.projection_policy,
@@ -376,12 +377,14 @@ fn api_request_route_policy(method: &Method, path: &str) -> ApiRequestRoutePolic
     let query_api_key_delete =
         matches!(method, &Method::DELETE) && path.starts_with("/api/fs-meta/v1/query-api-keys/");
     let roots_put = matches!(method, &Method::PUT) && path == "/api/fs-meta/v1/monitoring/roots";
+    let rescan = matches!(method, &Method::POST) && path == "/api/fs-meta/v1/index/rescan";
+    let query_api_key_create =
+        matches!(method, &Method::POST) && path == "/api/fs-meta/v1/query-api-keys";
+    let management_write = roots_put || rescan || query_api_key_create || query_api_key_delete;
 
     ApiRequestRoutePolicy {
-        requires_control_readiness: roots_put,
-        counts_toward_control_drain: roots_put
-            || matches!(method, &Method::POST) && path == "/api/fs-meta/v1/query-api-keys"
-            || query_api_key_delete,
+        requires_control_readiness: management_write,
+        counts_toward_control_drain: management_write,
         counts_toward_facade_request_drain: matches!(
             (method, path),
             (&Method::POST, "/api/fs-meta/v1/session/login")
@@ -425,12 +428,15 @@ async fn request_control_readiness_guard(
     if !policy.requires_control_readiness {
         return next.run(request).await;
     }
-    if control_gate.is_ready() {
+    if control_gate.is_management_write_ready() {
         return response_with_owned_guards(next.run(request).await, None, facade_request_guard);
     }
-    if tokio::time::timeout(Duration::from_secs(15), control_gate.wait_ready())
-        .await
-        .is_err()
+    if tokio::time::timeout(
+        Duration::from_secs(15),
+        control_gate.wait_management_write_ready(),
+    )
+    .await
+    .is_err()
     {
         return response_with_owned_guards(
             ApiError::service_unavailable(
@@ -624,12 +630,14 @@ mod tests {
                 shared_rollout_status_cell(),
             ),
             request_tracker,
+            control_gate: Arc::new(ApiControlGate::new(true)),
         }
     }
     #[test]
     fn request_control_drain_counts_only_management_writes() {
         for (method, path) in [
             (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
+            (Method::POST, "/api/fs-meta/v1/index/rescan"),
             (Method::POST, "/api/fs-meta/v1/query-api-keys"),
             (Method::DELETE, "/api/fs-meta/v1/query-api-keys/key-1"),
         ] {
@@ -645,7 +653,6 @@ mod tests {
             (Method::GET, "/api/fs-meta/v1/runtime/grants"),
             (Method::GET, "/api/fs-meta/v1/monitoring/roots"),
             (Method::POST, "/api/fs-meta/v1/monitoring/roots/preview"),
-            (Method::POST, "/api/fs-meta/v1/index/rescan"),
             (Method::GET, "/api/fs-meta/v1/query-api-keys"),
             (Method::GET, "/api/fs-meta/v1/tree"),
             (Method::GET, "/api/fs-meta/v1/stats"),
@@ -660,8 +667,13 @@ mod tests {
     }
 
     #[test]
-    fn request_control_readiness_stays_limited_to_roots_put() {
-        for (method, path) in [(Method::PUT, "/api/fs-meta/v1/monitoring/roots")] {
+    fn request_control_readiness_covers_management_writes() {
+        for (method, path) in [
+            (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
+            (Method::POST, "/api/fs-meta/v1/index/rescan"),
+            (Method::POST, "/api/fs-meta/v1/query-api-keys"),
+            (Method::DELETE, "/api/fs-meta/v1/query-api-keys/key-1"),
+        ] {
             assert!(
                 api_request_route_policy(&method, path).requires_control_readiness,
                 "{method} {path} should require control readiness"
@@ -673,7 +685,7 @@ mod tests {
             (Method::GET, "/api/fs-meta/v1/status"),
             (Method::GET, "/api/fs-meta/v1/runtime/grants"),
             (Method::POST, "/api/fs-meta/v1/monitoring/roots/preview"),
-            (Method::POST, "/api/fs-meta/v1/index/rescan"),
+            (Method::GET, "/api/fs-meta/v1/query-api-keys"),
             (Method::GET, "/api/fs-meta/v1/tree"),
         ] {
             assert!(
@@ -724,6 +736,26 @@ mod tests {
                 counts_toward_facade_request_drain: true,
             }
         );
+    }
+
+    #[test]
+    fn api_request_route_policy_assigns_management_writes_to_all_three_gates() {
+        for (method, path) in [
+            (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
+            (Method::POST, "/api/fs-meta/v1/index/rescan"),
+            (Method::POST, "/api/fs-meta/v1/query-api-keys"),
+            (Method::DELETE, "/api/fs-meta/v1/query-api-keys/key-1"),
+        ] {
+            assert_eq!(
+                api_request_route_policy(&method, path),
+                ApiRequestRoutePolicy {
+                    requires_control_readiness: true,
+                    counts_toward_control_drain: true,
+                    counts_toward_facade_request_drain: true,
+                },
+                "{method} {path} should use all management-write gates"
+            );
+        }
     }
 
     #[test]

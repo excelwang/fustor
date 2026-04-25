@@ -6,3 +6,5 @@ auth:
 # workers:
 #   source:
 #     mode: embedded
+#   sink:
+#     mode: embedded
