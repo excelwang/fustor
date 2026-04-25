@@ -62,13 +62,13 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -83,7 +83,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
 
     let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     let live_snapshot = loop {
-        match sink.status_snapshot().await {
+        match sink.status_snapshot_with_failure().await {
             Ok(snapshot)
                 if snapshot
                     .groups
@@ -93,7 +93,8 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
             {
                 break snapshot;
             }
-            Ok(_) | Err(CnxError::Timeout) => {}
+            Ok(_) => {}
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => {}
             Err(err) => panic!("snapshot after materialization: {err:?}"),
         }
         assert!(
@@ -218,13 +219,13 @@ async fn status_snapshot_nonblocking_fails_closed_while_actual_second_wave_sink_
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -238,7 +239,7 @@ async fn status_snapshot_nonblocking_fails_closed_while_actual_second_wave_sink_
     }
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("snapshot after initial materialization");
     assert!(
@@ -374,13 +375,13 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -394,7 +395,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
     }
 
     let live_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("snapshot after materialization");
     assert!(
@@ -623,7 +624,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
     );
 
     let cached_snapshot = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached sink status after live partially stale split snapshot");
     assert!(
         cached_snapshot.has_ready_scheduled_groups(),
@@ -832,13 +833,13 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -853,7 +854,7 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
 
     let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     let live_snapshot = loop {
-        match sink.status_snapshot().await {
+        match sink.status_snapshot_with_failure().await {
             Ok(snapshot)
                 if snapshot
                     .groups
@@ -863,7 +864,8 @@ async fn status_snapshot_nonblocking_does_not_return_partially_stale_split_cache
             {
                 break snapshot;
             }
-            Ok(_) | Err(CnxError::Timeout) => {}
+            Ok(_) => {}
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => {}
             Err(err) => panic!("snapshot after materialization: {err:?}"),
         }
         assert!(

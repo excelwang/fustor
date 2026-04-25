@@ -254,7 +254,7 @@ async fn selected_group_materialized_route_reaches_external_owner_worker_twice_a
         }
         let nfs1_ready = decode_materialized_selected_group_response(
             &sink_worker
-                .materialized_query(build_materialized_tree_request(
+                .materialized_query_with_failure(build_materialized_tree_request(
                     b"/force-find-stress",
                     false,
                     Some(0),
@@ -272,7 +272,7 @@ async fn selected_group_materialized_route_reaches_external_owner_worker_twice_a
         .exists;
         let nfs2_ready = decode_materialized_selected_group_response(
             &sink_worker
-                .materialized_query(build_materialized_tree_request(
+                .materialized_query_with_failure(build_materialized_tree_request(
                     b"/force-find-stress",
                     false,
                     Some(0),
@@ -295,7 +295,7 @@ async fn selected_group_materialized_route_reaches_external_owner_worker_twice_a
 
     let source = source_facade_with_roots(roots, &grants);
     let owner_map_before = source
-        .source_primary_by_group_snapshot()
+        .source_primary_by_group_snapshot_with_failure()
         .await
         .expect("source primary snapshot before");
     assert_eq!(
@@ -328,7 +328,7 @@ async fn selected_group_materialized_route_reaches_external_owner_worker_twice_a
     )
     .await;
     let owner_map_after_first = source
-        .source_primary_by_group_snapshot()
+        .source_primary_by_group_snapshot_with_failure()
         .await
         .expect("source primary snapshot after first");
     let second = query_materialized_events(

@@ -2,25 +2,29 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+#[cfg(test)]
 use bytes::Bytes;
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RecvOpts, RuntimeWorkerBinding};
 use capanix_app_sdk::{CnxError, Event, Result};
+#[cfg(test)]
 use capanix_host_adapter_fs::{HostAdapter, exchange_host_adapter_from_channel_boundary};
-use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
+use capanix_runtime_entry_sdk::advanced::boundary::{ChannelIoSubset, StateBoundary};
 use capanix_runtime_entry_sdk::worker_runtime::{
     RuntimeWorkerClientFactory, TypedRuntimeWorkerClient, TypedWorkerClient, TypedWorkerInit,
 };
 
-use crate::query::models::{HealthStats, QueryNode};
+use crate::query::models::QueryNode;
 use crate::query::path::root_file_name_bytes;
 use crate::query::request::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
 use crate::runtime::orchestration::{SinkControlSignal, sink_control_signals_from_envelopes};
+#[cfg(test)]
 use crate::runtime::routes::{METHOD_FIND, ROUTE_TOKEN_FS_META, default_route_bindings};
 #[cfg(test)]
 use crate::sink::SinkStatusSnapshotIssue;
+use crate::sink::VisibilityLagSample;
 use crate::sink::{
     SinkFileMeta, SinkStatusConcern, SinkStatusConcernProjection, SinkStatusSnapshot,
-    SinkStatusSnapshotReadinessSummary, VisibilityLagSample, sink_status_origin_entry_group_id,
+    SinkStatusSnapshotReadinessSummary, sink_status_origin_entry_group_id,
 };
 use crate::source::config::{GrantedMountRoot, SourceConfig};
 use crate::workers::sink_ipc::{
@@ -32,7 +36,9 @@ const SINK_WORKER_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const SINK_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const SINK_WORKER_CONTROL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
 const SINK_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
 const SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE: Duration = Duration::from_secs(5);
 const SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 const SINK_WORKER_CLOSE_DRAIN_TIMEOUT: Duration = SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT;
@@ -91,18 +97,22 @@ enum SinkFailureReason {
 }
 
 #[derive(Debug)]
-struct SinkFailure {
+pub(crate) struct SinkFailure {
     cause: CnxError,
     reason: SinkFailureReason,
 }
 
 impl SinkFailure {
+    fn timeout_like() -> Self {
+        Self {
+            cause: CnxError::Timeout,
+            reason: SinkFailureReason::TimeoutLike,
+        }
+    }
+
     fn from_cause(cause: CnxError) -> Self {
         match cause {
-            CnxError::Timeout => Self {
-                cause,
-                reason: SinkFailureReason::TimeoutLike,
-            },
+            CnxError::Timeout => Self::timeout_like(),
             _ => match classify_sink_control_reset(&cause) {
                 Some(kind) => Self {
                     cause,
@@ -150,11 +160,11 @@ impl SinkFailure {
         }
     }
 
-    fn into_error(self) -> CnxError {
+    pub(crate) fn into_error(self) -> CnxError {
         self.cause
     }
 
-    fn as_error(&self) -> &CnxError {
+    pub(crate) fn as_error(&self) -> &CnxError {
         &self.cause
     }
 }
@@ -190,18 +200,21 @@ fn unexpected_sink_worker_response_failure(
     })
 }
 
-fn unexpected_sink_worker_response(
-    context: &'static str,
-    response: SinkWorkerResponse,
-) -> CnxError {
-    unexpected_sink_worker_response_failure(context, response).into_error()
-}
-
 fn unexpected_sink_worker_response_result<T>(
     context: &'static str,
     response: SinkWorkerResponse,
 ) -> std::result::Result<T, SinkFailure> {
     Err(unexpected_sink_worker_response_failure(context, response))
+}
+
+fn map_sink_failure_timeout_result<T>(
+    result: std::result::Result<std::result::Result<T, SinkFailure>, tokio::time::error::Elapsed>,
+    exhaustion_kind: SinkRetryBudgetExhaustionKind,
+) -> std::result::Result<T, SinkFailure> {
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(SinkFailure::retry_budget_exhausted(exhaustion_kind)),
+    }
 }
 
 fn classify_sink_control_reset(err: &CnxError) -> Option<SinkControlResetKind> {
@@ -245,6 +258,7 @@ enum SinkRetryDisposition {
     Fail(SinkFailure),
 }
 
+#[cfg(test)]
 fn classify_sink_retry_disposition(
     deadline: std::time::Instant,
     err: CnxError,
@@ -259,6 +273,20 @@ fn classify_sink_retry_disposition(
         } else {
             SinkRetryDisposition::Fail(failure)
         }
+    }
+}
+
+fn classify_sink_retry_failure_disposition(
+    deadline: std::time::Instant,
+    failure: SinkFailure,
+    exhaustion_kind: SinkRetryBudgetExhaustionKind,
+) -> SinkRetryDisposition {
+    if std::time::Instant::now() >= deadline {
+        SinkRetryDisposition::Fail(SinkFailure::retry_budget_exhausted(exhaustion_kind))
+    } else if failure.allows_retry() {
+        SinkRetryDisposition::Retry
+    } else {
+        SinkRetryDisposition::Fail(failure)
     }
 }
 
@@ -396,7 +424,6 @@ fn readiness_summary_ready_groups_cover_expected(
     !expected_groups.is_empty() && expected_groups.is_subset(&summary.ready_groups)
 }
 
-#[cfg(test)]
 #[cfg(test)]
 fn classify_sink_status_snapshot_issue(
     snapshot: &SinkStatusSnapshot,
@@ -714,10 +741,9 @@ impl SinkStatusProbeMachine {
 
     fn classify_replay_failure_disposition(
         self,
-        err: CnxError,
+        failure: SinkFailure,
         replay_required_for_attempt: bool,
     ) -> SinkStatusProbeReplayDisposition {
-        let failure = SinkFailure::from_cause(err);
         let best_effort = replay_required_for_attempt
             && matches!(self.phase, SinkStatusProbePhase::ReplayAfterRetryReset)
             && failure.supports_best_effort_replay()
@@ -835,12 +861,7 @@ impl SinkControlFrameMachine {
         }
     }
 
-    fn followup_after_error(self, err: CnxError) -> SinkControlFrameFollowup {
-        let failure = if std::time::Instant::now() >= self.deadline {
-            SinkFailure::retry_budget_exhausted(SinkRetryBudgetExhaustionKind::ControlFrameRetry)
-        } else {
-            SinkFailure::from_cause(err)
-        };
+    fn followup_after_failure(self, failure: SinkFailure) -> SinkControlFrameFollowup {
         match self.classify_failure_disposition(&failure) {
             SinkControlFrameFailureDisposition::RetrySamePhase => {
                 SinkControlFrameFollowup::RestartAndRetry(self)
@@ -856,6 +877,16 @@ impl SinkControlFrameMachine {
             }
             SinkControlFrameFailureDisposition::Fail => SinkControlFrameFollowup::Failed(failure),
         }
+    }
+
+    #[cfg(test)]
+    fn followup_after_error(self, err: CnxError) -> SinkControlFrameFollowup {
+        let failure = if std::time::Instant::now() >= self.deadline {
+            SinkFailure::retry_budget_exhausted(SinkRetryBudgetExhaustionKind::ControlFrameRetry)
+        } else {
+            SinkFailure::from_cause(err)
+        };
+        self.followup_after_failure(failure)
     }
 }
 
@@ -2241,13 +2272,14 @@ impl SinkWorkerClientHandle {
         self.shared_worker().await.1
     }
 
-    async fn existing_client(&self) -> Result<Option<TypedWorkerClient<SinkWorkerRpc>>> {
-        self.worker_client().await.existing_client().await
-    }
-
     async fn current_generation_tick_fast_path_eligible(&self) -> bool {
         self.control_state_replay_required.load(Ordering::Acquire) == 0
-            && self.existing_client().await.ok().flatten().is_some()
+            && self
+                .existing_client_with_failure()
+                .await
+                .ok()
+                .flatten()
+                .is_some()
     }
 
     fn current_config(&self) -> Result<SourceConfig> {
@@ -2293,13 +2325,6 @@ impl SinkWorkerClientHandle {
         self.worker_client().await.shutdown(timeout).await
     }
 
-    fn cached_logical_roots(&self) -> Result<Vec<crate::source::config::RootSpec>> {
-        self.logical_roots_cache
-            .lock()
-            .map(|guard| guard.clone())
-            .map_err(|_| CnxError::Internal("sink worker logical roots cache lock poisoned".into()))
-    }
-
     fn update_cached_logical_roots(
         &self,
         roots: Vec<crate::source::config::RootSpec>,
@@ -2311,11 +2336,17 @@ impl SinkWorkerClientHandle {
         Ok(())
     }
 
-    pub(crate) fn cached_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+    fn cached_status_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
         self.status_cache
             .lock()
             .map(|guard| guard.clone())
-            .map_err(|_| CnxError::Internal("sink worker status cache lock poisoned".into()))
+            .map_err(|_| {
+                SinkFailure::from_cause(CnxError::Internal(
+                    "sink worker status cache lock poisoned".into(),
+                ))
+            })
     }
 
     fn update_cached_status_snapshot(&self, snapshot: SinkStatusSnapshot) -> Result<()> {
@@ -2333,6 +2364,19 @@ impl SinkWorkerClientHandle {
             .map(|guard| guard.clone())
             .map_err(|_| {
                 CnxError::Internal("sink worker scheduled groups cache lock poisoned".into())
+            })
+    }
+
+    fn cached_scheduled_group_ids_with_failure(
+        &self,
+    ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SinkFailure> {
+        self.scheduled_groups_cache
+            .lock()
+            .map(|guard| guard.clone())
+            .map_err(|_| {
+                SinkFailure::from_cause(CnxError::Internal(
+                    "sink worker scheduled groups cache lock poisoned".into(),
+                ))
             })
     }
 
@@ -2440,42 +2484,6 @@ impl SinkWorkerClientHandle {
         Ok(())
     }
 
-    async fn with_started_retry<T, F, Fut>(&self, op: F) -> Result<T>
-    where
-        F: Fn(TypedWorkerClient<SinkWorkerRpc>) -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
-    {
-        let closure_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let worker = self.worker_client().await;
-        let existing_client = worker.existing_client().await?.is_some();
-        if debug_sink_worker_pre_dispatch_enabled() {
-            eprintln!(
-                "fs_meta_sink_worker_client: pre_dispatch with_started_retry begin node={} existing_client={}",
-                self.node_id.0, existing_client
-            );
-        }
-        let result = worker
-            .with_started_retry(|client| {
-                closure_entered.store(true, std::sync::atomic::Ordering::Relaxed);
-                op(client)
-            })
-            .await;
-        let closure_entered = closure_entered.load(std::sync::atomic::Ordering::Relaxed);
-        if debug_sink_worker_pre_dispatch_enabled() {
-            match &result {
-                Ok(_) => eprintln!(
-                    "fs_meta_sink_worker_client: pre_dispatch with_started_retry done node={} ok=true closure_entered={}",
-                    self.node_id.0, closure_entered
-                ),
-                Err(err) => eprintln!(
-                    "fs_meta_sink_worker_client: pre_dispatch with_started_retry done node={} ok=false closure_entered={} err={}",
-                    self.node_id.0, closure_entered, err
-                ),
-            }
-        }
-        result
-    }
-
     async fn replace_shared_worker_client(
         &self,
     ) -> Result<Arc<TypedRuntimeWorkerClient<SinkWorkerRpc, SourceConfig>>> {
@@ -2503,28 +2511,34 @@ impl SinkWorkerClientHandle {
     async fn restart_shared_worker_client_for_retry_until(
         &self,
         deadline: std::time::Instant,
-    ) -> Result<()> {
-        let stale_client = self.replace_shared_worker_client().await?;
+        exhaustion_kind: SinkRetryBudgetExhaustionKind,
+    ) -> std::result::Result<(), SinkFailure> {
+        let stale_client = self
+            .replace_shared_worker_client()
+            .await
+            .map_err(SinkFailure::from)?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return Err(CnxError::Timeout);
+            return Err(SinkFailure::retry_budget_exhausted(exhaustion_kind));
         }
         let stale_shutdown_timeout = remaining.min(Duration::from_millis(250));
         if !stale_shutdown_timeout.is_zero() {
             let _ = stale_client.shutdown(stale_shutdown_timeout).await;
         }
-        match tokio::time::timeout(remaining, self.ensure_started()).await {
+        match tokio::time::timeout(remaining, self.ensure_started_with_failure()).await {
             Ok(result) => result,
-            Err(_) => Err(CnxError::Timeout),
+            Err(_) => Err(SinkFailure::retry_budget_exhausted(exhaustion_kind)),
         }
     }
 
     fn scheduled_group_ids_retry_action(
         deadline: std::time::Instant,
-    ) -> Result<std::time::Instant> {
+    ) -> std::result::Result<std::time::Instant, SinkFailure> {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            Err(CnxError::Timeout)
+            Err(SinkFailure::retry_budget_exhausted(
+                SinkRetryBudgetExhaustionKind::ControlFrameRetry,
+            ))
         } else {
             Ok(deadline)
         }
@@ -2565,7 +2579,7 @@ impl SinkWorkerClientHandle {
         &self,
         total_timeout: Duration,
         rpc_timeout: Duration,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), SinkFailure> {
         if self
             .control_state_replay_required
             .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
@@ -2590,18 +2604,20 @@ impl SinkWorkerClientHandle {
         if envelopes.is_empty() {
             return Ok(());
         }
-        if let Err(err) = self
-            .on_control_frame_with_timeouts(envelopes, total_timeout, rpc_timeout)
+        if let Err(failure) = self
+            .on_control_frame_with_timeouts_with_failure(envelopes, total_timeout, rpc_timeout)
             .await
         {
             self.control_state_replay_required
                 .store(1, Ordering::Release);
-            return Err(err);
+            return Err(failure);
         }
         Ok(())
     }
 
-    async fn replay_retained_control_state_if_needed(&self) -> Result<()> {
+    async fn replay_retained_control_state_if_needed(
+        &self,
+    ) -> std::result::Result<(), SinkFailure> {
         self.replay_retained_control_state_if_needed_with_timeouts(
             SINK_WORKER_CONTROL_TOTAL_TIMEOUT,
             SINK_WORKER_CONTROL_RPC_TIMEOUT,
@@ -2609,10 +2625,12 @@ impl SinkWorkerClientHandle {
         .await
     }
 
+    #[cfg(test)]
     async fn client(&self) -> Result<TypedWorkerClient<SinkWorkerRpc>> {
         self.worker_client().await.client().await
     }
 
+    #[cfg(test)]
     async fn call_worker(
         client: &TypedWorkerClient<SinkWorkerRpc>,
         request: SinkWorkerRequest,
@@ -2621,17 +2639,105 @@ impl SinkWorkerClientHandle {
         client.call_with_timeout(request, timeout).await
     }
 
+    async fn call_worker_with_failure(
+        client: &TypedWorkerClient<SinkWorkerRpc>,
+        request: SinkWorkerRequest,
+        timeout: Duration,
+    ) -> std::result::Result<SinkWorkerResponse, SinkFailure> {
+        client
+            .call_with_timeout(request, timeout)
+            .await
+            .map_err(SinkFailure::from)
+    }
+
+    async fn with_started_retry_with_failure<T, F, Fut>(
+        &self,
+        op: F,
+    ) -> std::result::Result<T, SinkFailure>
+    where
+        F: Fn(TypedWorkerClient<SinkWorkerRpc>) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, SinkFailure>>,
+    {
+        let closure_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = self.worker_client().await;
+        let existing_client = worker
+            .existing_client()
+            .await
+            .map_err(SinkFailure::from)?
+            .is_some();
+        if debug_sink_worker_pre_dispatch_enabled() {
+            eprintln!(
+                "fs_meta_sink_worker_client: pre_dispatch with_started_retry begin node={} existing_client={}",
+                self.node_id.0, existing_client
+            );
+        }
+        let result = worker
+            .with_started_retry_mapped(
+                |client| {
+                    closure_entered.store(true, std::sync::atomic::Ordering::Relaxed);
+                    op(client)
+                },
+                SinkFailure::into_error,
+            )
+            .await;
+        let closure_entered = closure_entered.load(std::sync::atomic::Ordering::Relaxed);
+        if debug_sink_worker_pre_dispatch_enabled() {
+            match &result {
+                Ok(_) => eprintln!(
+                    "fs_meta_sink_worker_client: pre_dispatch with_started_retry done node={} ok=true closure_entered={}",
+                    self.node_id.0, closure_entered
+                ),
+                Err(failure) => eprintln!(
+                    "fs_meta_sink_worker_client: pre_dispatch with_started_retry done node={} ok=false closure_entered={} err={}",
+                    self.node_id.0,
+                    closure_entered,
+                    failure.as_error()
+                ),
+            }
+        }
+        result
+    }
+
+    #[cfg(test)]
+    async fn client_with_failure(
+        &self,
+    ) -> std::result::Result<TypedWorkerClient<SinkWorkerRpc>, SinkFailure> {
+        self.client().await.map_err(SinkFailure::from)
+    }
+
+    async fn existing_client_with_failure(
+        &self,
+    ) -> std::result::Result<Option<TypedWorkerClient<SinkWorkerRpc>>, SinkFailure> {
+        self.worker_client()
+            .await
+            .existing_client()
+            .await
+            .map_err(SinkFailure::from)
+    }
+
+    #[cfg(test)]
     pub async fn ensure_started(&self) -> Result<()> {
+        self.ensure_started_with_failure()
+            .await
+            .map_err(SinkFailure::into_error)
+    }
+
+    pub(crate) async fn ensure_started_with_failure(&self) -> std::result::Result<(), SinkFailure> {
         eprintln!(
             "fs_meta_sink_worker_client: ensure_started begin node={}",
             self.node_id.0
         );
-        self.worker_client().await.ensure_started().await.map(|_| {
-            eprintln!(
-                "fs_meta_sink_worker_client: ensure_started ok node={}",
-                self.node_id.0
-            );
-        })
+        self.worker_client()
+            .await
+            .ensure_started()
+            .await
+            .map(|_| {
+                eprintln!(
+                    "fs_meta_sink_worker_client: ensure_started ok node={}",
+                    self.node_id.0
+                );
+            })
+            .map_err(SinkFailure::from)
     }
 
     async fn update_logical_roots_with_failure(
@@ -2646,38 +2752,41 @@ impl SinkWorkerClientHandle {
             roots.len(),
             host_object_grants.len()
         );
-        self.with_started_retry(|client| {
-            let roots = roots.clone();
-            let host_object_grants = host_object_grants.clone();
-            async move {
-                #[cfg(test)]
-                maybe_pause_before_update_logical_roots_rpc().await;
-                match Self::call_worker(
-                    &client,
-                    SinkWorkerRequest::UpdateLogicalRoots {
-                        roots: roots.clone(),
-                        host_object_grants: host_object_grants.clone(),
-                    },
-                    SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
-                )
-                .await
-                ?
-                {
-                    SinkWorkerResponse::Ack => {
-                        eprintln!(
-                            "fs_meta_sink_worker_client: update_logical_roots ok node={} roots={} grants={}",
-                            self.node_id.0,
-                            roots.len(),
-                            host_object_grants.len()
-                        );
-                        Ok(())
-                    }
-                    other => Err(unexpected_sink_worker_response("for update roots", other)),
+        let response = self
+            .with_started_retry_with_failure(|client| {
+                let roots = roots.clone();
+                let host_object_grants = host_object_grants.clone();
+                async move {
+                    #[cfg(test)]
+                    maybe_pause_before_update_logical_roots_rpc().await;
+                    Self::call_worker_with_failure(
+                        &client,
+                        SinkWorkerRequest::UpdateLogicalRoots {
+                            roots: roots.clone(),
+                            host_object_grants: host_object_grants.clone(),
+                        },
+                        SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
+                    )
+                    .await
                 }
+            })
+            .await?;
+        match response {
+            SinkWorkerResponse::Ack => {
+                eprintln!(
+                    "fs_meta_sink_worker_client: update_logical_roots ok node={} roots={} grants={}",
+                    self.node_id.0,
+                    roots.len(),
+                    host_object_grants.len()
+                );
             }
-        })
-        .await
-        .map_err(SinkFailure::from)?;
+            other => {
+                return Err(unexpected_sink_worker_response_failure(
+                    "for update roots",
+                    other,
+                ));
+            }
+        }
         self.update_cached_logical_roots(roots.clone())
             .map_err(SinkFailure::from)?;
         self.update_cached_runtime_config(&roots, &host_object_grants)
@@ -2686,30 +2795,29 @@ impl SinkWorkerClientHandle {
             .map_err(SinkFailure::from)
     }
 
-    pub async fn update_logical_roots(
+    fn cached_logical_roots_snapshot_with_failure(
         &self,
-        roots: Vec<crate::source::config::RootSpec>,
-        host_object_grants: Vec<GrantedMountRoot>,
-    ) -> Result<()> {
-        self.update_logical_roots_with_failure(roots, host_object_grants)
-            .await
-            .map_err(SinkFailure::into_error)
+    ) -> std::result::Result<Vec<crate::source::config::RootSpec>, SinkFailure> {
+        self.logical_roots_cache
+            .lock()
+            .map(|guard| guard.clone())
+            .map_err(|_| {
+                SinkFailure::from_cause(CnxError::Internal(
+                    "sink worker logical roots cache lock poisoned".into(),
+                ))
+            })
     }
 
-    pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
-        self.cached_logical_roots()
-    }
-
+    #[cfg(test)]
     async fn logical_roots_snapshot_with_failure(
         &self,
     ) -> std::result::Result<Vec<crate::source::config::RootSpec>, SinkFailure> {
-        let response = Self::call_worker(
-            &self.client().await?,
+        let response = Self::call_worker_with_failure(
+            &self.client_with_failure().await?,
             SinkWorkerRequest::LogicalRootsSnapshot,
             Duration::from_secs(5),
         )
-        .await
-        .map_err(SinkFailure::from)?;
+        .await?;
         let roots = match response {
             SinkWorkerResponse::LogicalRoots(roots) => roots,
             other => return unexpected_sink_worker_response_result("for logical roots", other),
@@ -2717,32 +2825,6 @@ impl SinkWorkerClientHandle {
         self.update_cached_logical_roots(roots.clone())
             .map_err(SinkFailure::from)?;
         Ok(roots)
-    }
-
-    pub async fn logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
-        self.logical_roots_snapshot_with_failure()
-            .await
-            .map_err(SinkFailure::into_error)
-    }
-
-    async fn health_with_failure(&self) -> std::result::Result<HealthStats, SinkFailure> {
-        match Self::call_worker(
-            &self.client().await?,
-            SinkWorkerRequest::Health,
-            Duration::from_secs(5),
-        )
-        .await
-        .map_err(SinkFailure::from)?
-        {
-            SinkWorkerResponse::Health(health) => Ok(health),
-            other => unexpected_sink_worker_response_result("for health", other),
-        }
-    }
-
-    pub async fn health(&self) -> Result<HealthStats> {
-        self.health_with_failure()
-            .await
-            .map_err(SinkFailure::into_error)
     }
 
     fn prepare_status_snapshot_for_evaluation(
@@ -2771,6 +2853,14 @@ impl SinkWorkerClientHandle {
             );
         }
         Ok(snapshot)
+    }
+
+    fn prepare_status_snapshot_for_evaluation_with_failure(
+        &self,
+        snapshot: SinkStatusSnapshot,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        self.prepare_status_snapshot_for_evaluation(snapshot)
+            .map_err(SinkFailure::from)
     }
 
     fn nonblocking_cached_status_snapshot_reason(
@@ -2864,10 +2954,12 @@ impl SinkWorkerClientHandle {
         }
     }
 
-    async fn nonblocking_status_entry_action(&self) -> Result<SinkStatusNonblockingEntryAction> {
+    async fn nonblocking_status_entry_action(
+        &self,
+    ) -> std::result::Result<SinkStatusNonblockingEntryAction, SinkFailure> {
         if self.control_op_inflight() {
-            let snapshot = self.cached_status_snapshot()?;
-            if self.existing_client().await?.is_some() {
+            let snapshot = self.cached_status_snapshot_with_failure()?;
+            if self.existing_client_with_failure().await?.is_some() {
                 return Ok(SinkStatusNonblockingEntryAction::ProbeLive(
                     SinkStatusNonblockingProbePlan {
                         mode: SinkStatusNonblockingMode::ControlInflight,
@@ -2882,11 +2974,12 @@ impl SinkWorkerClientHandle {
             });
         }
 
-        let mut snapshot = self.cached_status_snapshot()?;
-        if self.existing_client().await?.is_some() {
+        let mut snapshot = self.cached_status_snapshot_with_failure()?;
+        if self.existing_client_with_failure().await?.is_some() {
             if snapshot_looks_stale_empty(&snapshot) {
-                self.republish_cached_scheduled_groups_into_empty_status_summary()?;
-                snapshot = self.cached_status_snapshot()?;
+                self.republish_cached_scheduled_groups_into_empty_status_summary()
+                    .map_err(SinkFailure::from)?;
+                snapshot = self.cached_status_snapshot_with_failure()?;
             }
             return Ok(SinkStatusNonblockingEntryAction::ProbeLive(
                 SinkStatusNonblockingProbePlan {
@@ -2951,8 +3044,9 @@ impl SinkWorkerClientHandle {
         &self,
         plan: SinkStatusNonblockingProbePlan,
         probe_outcome: SinkStatusSnapshotProbeOutcome,
-    ) -> Result<SinkStatusSnapshot> {
-        let live_snapshot = self.prepare_status_snapshot_for_evaluation(probe_outcome.snapshot)?;
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        let live_snapshot =
+            self.prepare_status_snapshot_for_evaluation_with_failure(probe_outcome.snapshot)?;
         if matches!(plan.mode, SinkStatusNonblockingMode::ControlInflight)
             && !snapshot_reflects_inflight_control_frame_summaries(
                 &live_snapshot,
@@ -2968,10 +3062,10 @@ impl SinkWorkerClientHandle {
                     summarize_sink_status_snapshot(&live_snapshot)
                 );
             }
-            return Err(CnxError::Timeout);
+            return Err(SinkFailure::timeout_like());
         }
 
-        let cached_snapshot = self.cached_status_snapshot()?;
+        let cached_snapshot = self.cached_status_snapshot_with_failure()?;
         let cached_concern = sink_status_snapshot_concern(&cached_snapshot);
         let outcome = evaluate_live_sink_status_snapshot(
             &live_snapshot,
@@ -2979,7 +3073,8 @@ impl SinkWorkerClientHandle {
             cached_concern,
             plan.live_access_path(probe_outcome.recovered_after_retry_reset),
         );
-        apply_live_sink_status_snapshot_outcome_side_effects(self, &live_snapshot, &outcome)?;
+        apply_live_sink_status_snapshot_outcome_side_effects(self, &live_snapshot, &outcome)
+            .map_err(SinkFailure::from)?;
         match outcome.kind {
             SinkStatusOutcomeKind::ReturnLive => {
                 if debug_control_scope_capture_enabled() {
@@ -3041,7 +3136,7 @@ impl SinkWorkerClientHandle {
                         summarize_sink_status_snapshot(&live_snapshot)
                     );
                 }
-                Err(CnxError::Timeout)
+                Err(SinkFailure::timeout_like())
             }
             SinkStatusOutcomeKind::PropagateError => {
                 unreachable!("live sink status evaluation never propagates error")
@@ -3053,14 +3148,16 @@ impl SinkWorkerClientHandle {
         &self,
         snapshot: SinkStatusSnapshot,
         access_path: SinkStatusAccessPath,
-        err: Option<CnxError>,
-    ) -> Result<SinkStatusSnapshot> {
+        err: Option<SinkFailure>,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
         let outcome = evaluate_cached_sink_status_snapshot(&snapshot, access_path);
         if outcome.should_republish_zero_row_summary {
-            self.republish_cached_scheduled_groups_into_empty_status_summary()?;
+            self.republish_cached_scheduled_groups_into_empty_status_summary()
+                .map_err(SinkFailure::from)?;
         }
+        let err_cause = err.as_ref().map(SinkFailure::as_error);
         let reason =
-            Self::nonblocking_cached_status_snapshot_reason(access_path, &outcome, err.as_ref());
+            Self::nonblocking_cached_status_snapshot_reason(access_path, &outcome, err_cause);
         match outcome.kind {
             SinkStatusOutcomeKind::ReturnCached => {
                 if debug_control_scope_capture_enabled() {
@@ -3069,7 +3166,7 @@ impl SinkWorkerClientHandle {
                             "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason={} err={} {}",
                             self.node_id.0,
                             reason,
-                            err,
+                            err.as_error(),
                             summarize_sink_status_snapshot(&snapshot)
                         ),
                         None => eprintln!(
@@ -3089,7 +3186,7 @@ impl SinkWorkerClientHandle {
                             "fs_meta_sink_worker_client: status_snapshot fail_closed node={} reason={} err={} {}",
                             self.node_id.0,
                             reason,
-                            err,
+                            err.as_error(),
                             summarize_sink_status_snapshot(&snapshot)
                         ),
                         None => eprintln!(
@@ -3100,7 +3197,7 @@ impl SinkWorkerClientHandle {
                         ),
                     }
                 }
-                Err(CnxError::Timeout)
+                Err(SinkFailure::timeout_like())
             }
             SinkStatusOutcomeKind::PropagateError => Err(err.expect(
                 "cached sink status propagation requires the original worker-unavailable error",
@@ -3115,8 +3212,8 @@ impl SinkWorkerClientHandle {
         &self,
         snapshot: SinkStatusSnapshot,
         replay_required: bool,
-    ) -> Result<SinkStatusSnapshot> {
-        let snapshot = self.prepare_status_snapshot_for_evaluation(snapshot)?;
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        let snapshot = self.prepare_status_snapshot_for_evaluation_with_failure(snapshot)?;
         let cached_snapshot = SinkStatusSnapshot::default();
         let outcome = evaluate_live_sink_status_snapshot(
             &snapshot,
@@ -3124,7 +3221,8 @@ impl SinkWorkerClientHandle {
             None,
             SinkStatusAccessPath::Blocking,
         );
-        apply_live_sink_status_snapshot_outcome_side_effects(self, &snapshot, &outcome)?;
+        apply_live_sink_status_snapshot_outcome_side_effects(self, &snapshot, &outcome)
+            .map_err(SinkFailure::from)?;
         match outcome.kind {
             SinkStatusOutcomeKind::ReturnLive => Ok(snapshot),
             SinkStatusOutcomeKind::FailClosed => {
@@ -3152,7 +3250,7 @@ impl SinkWorkerClientHandle {
                         summarize_sink_status_snapshot(&snapshot)
                     );
                 }
-                Err(CnxError::Timeout)
+                Err(SinkFailure::timeout_like())
             }
             SinkStatusOutcomeKind::ReturnCached => {
                 unreachable!("blocking live sink status evaluation never returns cached")
@@ -3173,28 +3271,33 @@ impl SinkWorkerClientHandle {
         Ok(snapshot)
     }
 
-    pub async fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+    pub(crate) async fn status_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
         let replay_required = self.control_state_replay_required.load(Ordering::Acquire) > 0;
         #[cfg(test)]
         if let Some(snapshot) = take_sink_worker_status_snapshot_hook(self.shared_worker().await.0)
         {
-            return self.finalize_test_hooked_blocking_status_snapshot(snapshot);
+            return self
+                .finalize_test_hooked_blocking_status_snapshot(snapshot)
+                .map_err(SinkFailure::from);
         }
         self.replay_retained_control_state_if_needed().await?;
         let snapshot = self
-            .status_snapshot_with_timeout(Duration::from_secs(5))
+            .status_snapshot_with_timeout_with_failure(Duration::from_secs(5))
             .await?;
         self.finalize_blocking_status_snapshot(snapshot, replay_required)
+            .map_err(SinkFailure::from)
     }
 
     async fn status_snapshot_nonblocking_with_access_path(
         &self,
-    ) -> Result<(SinkStatusSnapshot, bool)> {
+    ) -> std::result::Result<(SinkStatusSnapshot, bool), SinkFailure> {
         #[cfg(test)]
         {
             let current_worker_instance_id = self.shared_worker().await.0;
             if take_sink_worker_status_nonblocking_cache_fallback_hook(current_worker_instance_id) {
-                let snapshot = self.cached_status_snapshot()?;
+                let snapshot = self.cached_status_snapshot_with_failure()?;
                 if debug_control_scope_capture_enabled() {
                     eprintln!(
                         "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=test_hook {}",
@@ -3228,7 +3331,7 @@ impl SinkWorkerClientHandle {
                         self.finalize_nonblocking_cached_status_snapshot(
                             plan.cached_snapshot,
                             access_path,
-                            Some(err.into_error()),
+                            Some(err),
                         )
                         .map(|snapshot| (snapshot, true))
                     }
@@ -3237,7 +3340,17 @@ impl SinkWorkerClientHandle {
         }
     }
 
+    #[cfg(test)]
     pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
+        self.status_snapshot_nonblocking_with_access_path()
+            .await
+            .map(|(snapshot, _)| snapshot)
+            .map_err(SinkFailure::into_error)
+    }
+
+    pub(crate) async fn status_snapshot_nonblocking_with_failure(
+        &self,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
         self.status_snapshot_nonblocking_with_access_path()
             .await
             .map(|(snapshot, _)| snapshot)
@@ -3245,10 +3358,27 @@ impl SinkWorkerClientHandle {
 
     pub(crate) async fn status_snapshot_nonblocking_for_status_route(
         &self,
-    ) -> Result<(SinkStatusSnapshot, bool)> {
-        self.status_snapshot_nonblocking_with_access_path().await
+    ) -> (SinkStatusSnapshot, bool) {
+        match self.status_snapshot_nonblocking_with_access_path().await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let snapshot = self
+                    .cached_status_snapshot_with_failure()
+                    .unwrap_or_else(|_| SinkStatusSnapshot::default());
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=worker_unavailable err={} {}",
+                        self.node_id.0,
+                        err.as_error(),
+                        summarize_sink_status_snapshot(&snapshot)
+                    );
+                }
+                (snapshot, true)
+            }
+        }
     }
 
+    #[cfg(test)]
     async fn status_snapshot_probe_once_with_timeout(
         &self,
         timeout: Duration,
@@ -3258,6 +3388,7 @@ impl SinkWorkerClientHandle {
             .map_err(SinkFailure::into_error)
     }
 
+    #[cfg(test)]
     async fn status_snapshot_probe_once_with_timeout_with_failure(
         &self,
         timeout: Duration,
@@ -3265,7 +3396,7 @@ impl SinkWorkerClientHandle {
         self.replay_retained_control_state_if_needed().await?;
         #[cfg(test)]
         let current_worker_instance_id = self.shared_worker().await.0;
-        let client = self.client().await?;
+        let client = self.client_with_failure().await?;
         #[cfg(test)]
         if let Some(reply) = take_sink_worker_status_response_queue_hook() {
             return match reply? {
@@ -3284,7 +3415,9 @@ impl SinkWorkerClientHandle {
         if let Some(err) = take_sink_worker_status_error_hook(current_worker_instance_id) {
             return Err(err.into());
         }
-        match Self::call_worker(&client, SinkWorkerRequest::StatusSnapshot, timeout).await? {
+        match Self::call_worker_with_failure(&client, SinkWorkerRequest::StatusSnapshot, timeout)
+            .await?
+        {
             SinkWorkerResponse::StatusSnapshot(snapshot) => Ok(snapshot),
             other => Err(unexpected_sink_worker_response_failure(
                 "for status snapshot",
@@ -3347,10 +3480,10 @@ impl SinkWorkerClientHandle {
             #[cfg(test)]
             let current_worker_instance_id = self.shared_worker().await.0;
             let rpc_result = self
-                .with_started_retry(|client| async move {
+                .with_started_retry_with_failure(|client| async move {
                     #[cfg(test)]
                     if let Some(reply) = take_sink_worker_status_response_queue_hook() {
-                        return reply;
+                        return reply.map_err(SinkFailure::from);
                     }
                     #[cfg(test)]
                     if let Some(snapshot) =
@@ -3362,9 +3495,9 @@ impl SinkWorkerClientHandle {
                     if let Some(err) =
                         take_sink_worker_status_error_hook(current_worker_instance_id)
                     {
-                        return Err(err);
+                        return Err(SinkFailure::from(err));
                     }
-                    Self::call_worker(
+                    Self::call_worker_with_failure(
                         &client,
                         SinkWorkerRequest::StatusSnapshot,
                         attempt_plan.attempt_timeout,
@@ -3377,21 +3510,27 @@ impl SinkWorkerClientHandle {
                     machine = machine.phase_after_retry_reset();
                     self.control_state_replay_required
                         .store(1, Ordering::Release);
-                    self.restart_shared_worker_client_for_retry_until(machine.deadline)
-                        .await?;
+                    self.restart_shared_worker_client_for_retry_until(
+                        machine.deadline,
+                        SinkRetryBudgetExhaustionKind::StatusProbeAttempt,
+                    )
+                    .await?;
                 }
                 Ok(response) => break response,
-                Err(err) => match classify_sink_retry_disposition(
+                Err(failure) => match classify_sink_retry_failure_disposition(
                     machine.deadline,
-                    err,
+                    failure,
                     SinkRetryBudgetExhaustionKind::StatusProbeAttempt,
                 ) {
                     SinkRetryDisposition::Retry => {
                         machine = machine.phase_after_retry_reset();
                         self.control_state_replay_required
                             .store(1, Ordering::Release);
-                        self.restart_shared_worker_client_for_retry_until(machine.deadline)
-                            .await?;
+                        self.restart_shared_worker_client_for_retry_until(
+                            machine.deadline,
+                            SinkRetryBudgetExhaustionKind::StatusProbeAttempt,
+                        )
+                        .await?;
                     }
                     SinkRetryDisposition::Fail(failure) => {
                         return Err(failure);
@@ -3422,12 +3561,6 @@ impl SinkWorkerClientHandle {
             .map(|outcome| outcome.snapshot)
     }
 
-    async fn status_snapshot_with_timeout(&self, timeout: Duration) -> Result<SinkStatusSnapshot> {
-        self.status_snapshot_with_timeout_with_failure(timeout)
-            .await
-            .map_err(SinkFailure::into_error)
-    }
-
     async fn scheduled_group_ids_result_with_failure(
         &self,
     ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SinkFailure> {
@@ -3443,15 +3576,22 @@ impl SinkWorkerClientHandle {
                         .map_err(SinkFailure::from)?;
                     return Ok(Some(groups.clone()));
                 }
-                self.cached_scheduled_group_ids().map_err(SinkFailure::from)
+                self.cached_scheduled_group_ids_with_failure()
             }
             other => unexpected_sink_worker_response_result("for scheduled groups", other),
         }
     }
 
-    pub async fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
+    pub(crate) async fn scheduled_group_ids_with_failure(
+        &self,
+    ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SinkFailure> {
         self.replay_retained_control_state_if_needed().await?;
-        self.scheduled_group_ids_result_with_failure()
+        self.scheduled_group_ids_result_with_failure().await
+    }
+
+    #[cfg(test)]
+    pub async fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
+        self.scheduled_group_ids_with_failure()
             .await
             .map_err(SinkFailure::into_error)
     }
@@ -3470,12 +3610,12 @@ impl SinkWorkerClientHandle {
                 ));
             }
             let rpc_result = self
-                .with_started_retry(|client| async move {
+                .with_started_retry_with_failure(|client| async move {
                     #[cfg(test)]
                     if let Some(err) = take_sink_worker_scheduled_groups_error_hook() {
-                        return Err(err);
+                        return Err(SinkFailure::from(err));
                     }
-                    Self::call_worker(
+                    Self::call_worker_with_failure(
                         &client,
                         SinkWorkerRequest::ScheduledGroupIds,
                         attempt_timeout,
@@ -3485,14 +3625,15 @@ impl SinkWorkerClientHandle {
                 .await;
             match rpc_result {
                 Ok(response) => return Ok(response),
-                Err(err) => match classify_sink_retry_disposition(
+                Err(failure) => match classify_sink_retry_failure_disposition(
                     deadline,
-                    err,
+                    failure,
                     SinkRetryBudgetExhaustionKind::ControlFrameRetry,
                 ) {
                     SinkRetryDisposition::Retry => {
                         self.restart_shared_worker_client_for_retry_until(
                             Self::scheduled_group_ids_retry_action(deadline)?,
+                            SinkRetryBudgetExhaustionKind::ControlFrameRetry,
                         )
                         .await?;
                     }
@@ -3504,38 +3645,29 @@ impl SinkWorkerClientHandle {
         }
     }
 
+    #[cfg(test)]
     async fn visibility_lag_samples_since_with_failure(
         &self,
         since_us: u64,
     ) -> std::result::Result<Vec<VisibilityLagSample>, SinkFailure> {
-        match Self::call_worker(
-            &self.client().await?,
+        match Self::call_worker_with_failure(
+            &self.client_with_failure().await?,
             SinkWorkerRequest::VisibilityLagSamplesSince { since_us },
             Duration::from_secs(5),
         )
-        .await
-        .map_err(SinkFailure::from)?
+        .await?
         {
             SinkWorkerResponse::VisibilityLagSamples(samples) => Ok(samples),
             other => unexpected_sink_worker_response_result("for visibility lag samples", other),
         }
     }
 
-    pub async fn visibility_lag_samples_since(
-        &self,
-        since_us: u64,
-    ) -> Result<Vec<VisibilityLagSample>> {
-        self.visibility_lag_samples_since_with_failure(since_us)
-            .await
-            .map_err(SinkFailure::into_error)
-    }
-
     async fn send_with_failure(&self, events: Vec<Event>) -> std::result::Result<(), SinkFailure> {
         let response = self
-            .with_started_retry(|client| {
+            .with_started_retry_with_failure(|client| {
                 let events = events.clone();
                 async move {
-                    Self::call_worker(
+                    Self::call_worker_with_failure(
                         &client,
                         SinkWorkerRequest::Send {
                             events: events.clone(),
@@ -3545,8 +3677,7 @@ impl SinkWorkerClientHandle {
                     .await
                 }
             })
-            .await
-            .map_err(SinkFailure::from)?;
+            .await?;
         match response {
             SinkWorkerResponse::Ack => Ok(()),
             other => unexpected_sink_worker_response_result("for send", other),
@@ -3557,82 +3688,68 @@ impl SinkWorkerClientHandle {
         &self,
         path: Vec<u8>,
     ) -> std::result::Result<Option<QueryNode>, SinkFailure> {
-        self.with_started_retry(|client| {
-            let path = path.clone();
-            async move {
-                let request = InternalQueryRequest::materialized(
-                    QueryOp::Tree,
-                    QueryScope {
-                        path: path.clone(),
-                        recursive: false,
-                        max_depth: Some(0),
-                        selected_group: None,
-                    },
-                    None,
-                );
-                decode_exact_query_node(
-                    match Self::call_worker(
+        let response = self
+            .with_started_retry_with_failure(|client| {
+                let path = path.clone();
+                async move {
+                    let request = InternalQueryRequest::materialized(
+                        QueryOp::Tree,
+                        QueryScope {
+                            path: path.clone(),
+                            recursive: false,
+                            max_depth: Some(0),
+                            selected_group: None,
+                        },
+                        None,
+                    );
+                    Self::call_worker_with_failure(
                         &client,
                         SinkWorkerRequest::MaterializedQuery { request },
                         SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
                     )
-                    .await?
-                    {
-                        SinkWorkerResponse::Events(events) => events,
-                        other => {
-                            return Err(unexpected_sink_worker_response(
-                                "for materialized query",
-                                other,
-                            ));
-                        }
-                    },
-                    &path,
-                )
+                    .await
+                }
+            })
+            .await?;
+        let events = match response {
+            SinkWorkerResponse::Events(events) => events,
+            other => {
+                return Err(unexpected_sink_worker_response_failure(
+                    "for materialized query",
+                    other,
+                ));
             }
-        })
-        .await
-        .map_err(SinkFailure::from)
+        };
+        decode_exact_query_node(events, &path).map_err(SinkFailure::from)
     }
 
-    pub async fn query_node(&self, path: Vec<u8>) -> Result<Option<QueryNode>> {
-        self.query_node_with_failure(path)
-            .await
-            .map_err(SinkFailure::into_error)
-    }
-
-    async fn materialized_query_with_failure(
+    pub(crate) async fn materialized_query_with_failure(
         &self,
         request: InternalQueryRequest,
     ) -> std::result::Result<Vec<Event>, SinkFailure> {
         self.replay_retained_control_state_if_needed().await?;
-        self.with_started_retry(|client| {
-            let request = request.clone();
-            async move {
-                match Self::call_worker(
-                    &client,
-                    SinkWorkerRequest::MaterializedQuery {
-                        request: request.clone(),
-                    },
-                    SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
-                )
-                .await?
-                {
-                    SinkWorkerResponse::Events(events) => Ok(events),
-                    other => Err(unexpected_sink_worker_response(
-                        "for materialized query",
-                        other,
-                    )),
+        let response = self
+            .with_started_retry_with_failure(|client| {
+                let request = request.clone();
+                async move {
+                    Self::call_worker_with_failure(
+                        &client,
+                        SinkWorkerRequest::MaterializedQuery {
+                            request: request.clone(),
+                        },
+                        SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
+                    )
+                    .await
                 }
-            }
-        })
-        .await
-        .map_err(SinkFailure::from)
-    }
-
-    pub async fn materialized_query(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
-        self.materialized_query_with_failure(request)
-            .await
-            .map_err(SinkFailure::into_error)
+            })
+            .await?;
+        match response {
+            SinkWorkerResponse::Events(events) => Ok(events),
+            other => Err(unexpected_sink_worker_response_failure(
+                "for materialized query",
+                other,
+            )),
+        }
     }
 
     async fn materialized_query_nonblocking_with_failure(
@@ -3642,10 +3759,10 @@ impl SinkWorkerClientHandle {
         if self.control_op_inflight() {
             return Ok(Vec::new());
         }
-        match self.existing_client().await? {
+        match self.existing_client_with_failure().await? {
             Some(client) => {
                 self.replay_retained_control_state_if_needed().await?;
-                match Self::call_worker(
+                match Self::call_worker_with_failure(
                     &client,
                     SinkWorkerRequest::MaterializedQuery { request },
                     SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
@@ -3663,96 +3780,41 @@ impl SinkWorkerClientHandle {
         }
     }
 
-    pub async fn materialized_query_nonblocking(
-        &self,
-        request: InternalQueryRequest,
-    ) -> Result<Vec<Event>> {
-        self.materialized_query_nonblocking_with_failure(request)
-            .await
-            .map_err(SinkFailure::into_error)
-    }
-
     async fn subtree_stats_with_failure(
         &self,
         path: Vec<u8>,
     ) -> std::result::Result<Vec<Event>, SinkFailure> {
-        self.with_started_retry(|client| {
-            let path = path.clone();
-            async move {
-                match Self::call_worker(
-                    &client,
-                    SinkWorkerRequest::MaterializedQuery {
-                        request: InternalQueryRequest::materialized(
-                            QueryOp::Stats,
-                            QueryScope {
-                                path: path.clone(),
-                                recursive: true,
-                                max_depth: None,
-                                selected_group: None,
-                            },
-                            None,
-                        ),
-                    },
-                    SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
-                )
-                .await?
-                {
-                    SinkWorkerResponse::Events(events) => Ok(events),
-                    other => Err(unexpected_sink_worker_response(
-                        "for materialized query",
-                        other,
-                    )),
+        let response = self
+            .with_started_retry_with_failure(|client| {
+                let path = path.clone();
+                async move {
+                    Self::call_worker_with_failure(
+                        &client,
+                        SinkWorkerRequest::MaterializedQuery {
+                            request: InternalQueryRequest::materialized(
+                                QueryOp::Stats,
+                                QueryScope {
+                                    path: path.clone(),
+                                    recursive: true,
+                                    max_depth: None,
+                                    selected_group: None,
+                                },
+                                None,
+                            ),
+                        },
+                        SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
+                    )
+                    .await
                 }
-            }
-        })
-        .await
-        .map_err(SinkFailure::from)
-    }
-
-    pub async fn subtree_stats(&self, path: Vec<u8>) -> Result<Vec<Event>> {
-        self.subtree_stats_with_failure(path)
-            .await
-            .map_err(SinkFailure::into_error)
-    }
-
-    pub async fn force_find_proxy(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
-        self.ensure_started().await?;
-        eprintln!(
-            "fs-meta sink worker proxy: force_find start node={} path={:?} recursive={}",
-            self.node_id.0, request.scope.path, request.scope.recursive
-        );
-        let adapter = exchange_host_adapter_from_channel_boundary(
-            self.worker_factory.io_boundary(),
-            self.node_id.clone(),
-            default_route_bindings(),
-        );
-        let payload = rmp_serde::to_vec(&request).map_err(|err| {
-            CnxError::Internal(format!("sink worker force-find encode failed: {err}"))
-        })?;
-        let result = adapter
-            .call_collect(
-                ROUTE_TOKEN_FS_META,
-                METHOD_FIND,
-                Bytes::from(payload),
-                SINK_WORKER_FORCE_FIND_TIMEOUT,
-                SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE,
-            )
-            .await;
-        eprintln!(
-            "fs-meta sink worker proxy: force_find end node={} result={:?}",
-            self.node_id.0,
-            result
-                .as_ref()
-                .map(|events| events.len())
-                .map_err(|err| err.to_string())
-        );
-        result
-    }
-
-    pub async fn send(&self, events: Vec<Event>) -> Result<()> {
-        self.send_with_failure(events)
-            .await
-            .map_err(SinkFailure::into_error)
+            })
+            .await?;
+        match response {
+            SinkWorkerResponse::Events(events) => Ok(events),
+            other => Err(unexpected_sink_worker_response_failure(
+                "for materialized query",
+                other,
+            )),
+        }
     }
 
     async fn recv_with_failure(
@@ -3762,46 +3824,30 @@ impl SinkWorkerClientHandle {
         let timeout_ms = opts.timeout.map(|d| d.as_millis() as u64);
         let limit = opts.limit;
         let response = self
-            .with_started_retry(|client| async move {
-                Self::call_worker(
+            .with_started_retry_with_failure(|client| async move {
+                Self::call_worker_with_failure(
                     &client,
                     SinkWorkerRequest::Recv { timeout_ms, limit },
                     Duration::from_secs(5),
                 )
                 .await
             })
-            .await
-            .map_err(SinkFailure::from)?;
+            .await?;
         match response {
             SinkWorkerResponse::Events(events) => Ok(events),
             other => unexpected_sink_worker_response_result("for recv", other),
         }
     }
 
-    pub async fn recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
-        self.recv_with_failure(opts)
-            .await
-            .map_err(SinkFailure::into_error)
-    }
-
+    #[cfg(test)]
     pub async fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
-        self.on_control_frame_with_timeouts(
+        self.on_control_frame_with_timeouts_with_failure(
             envelopes,
             SINK_WORKER_CONTROL_TOTAL_TIMEOUT,
             SINK_WORKER_CONTROL_RPC_TIMEOUT,
         )
         .await
-    }
-
-    async fn on_control_frame_with_timeouts(
-        &self,
-        envelopes: Vec<ControlEnvelope>,
-        total_timeout: Duration,
-        rpc_timeout: Duration,
-    ) -> Result<()> {
-        self.on_control_frame_with_timeouts_with_failure(envelopes, total_timeout, rpc_timeout)
-            .await
-            .map_err(SinkFailure::into_error)
+        .map_err(SinkFailure::into_error)
     }
 
     async fn on_control_frame_with_timeouts_with_failure(
@@ -3838,36 +3884,36 @@ impl SinkWorkerClientHandle {
             SinkControlFrameMachine::new(std::time::Instant::now() + total_timeout, &envelopes);
         loop {
             let attempt_timeout = machine.attempt_timeout(rpc_timeout)?;
-            let (_current_worker_instance_id, worker_client) = self.shared_worker().await;
-            let rpc_result = match tokio::time::timeout(
-                attempt_timeout,
-                worker_client.with_started_retry(|client| {
-                    let envelopes = envelopes.clone();
-                    async move {
-                        #[cfg(test)]
-                        maybe_pause_before_on_control_frame_rpc().await;
-                        #[cfg(test)]
-                        if let Some(err) =
-                            take_sink_worker_control_frame_error_hook(_current_worker_instance_id)
-                        {
-                            return Err(err);
+            #[cfg(test)]
+            let current_worker_instance_id = self.worker_instance_id_for_tests().await;
+            let rpc_result = map_sink_failure_timeout_result(
+                tokio::time::timeout(
+                    attempt_timeout,
+                    self.with_started_retry_with_failure(|client| {
+                        let envelopes = envelopes.clone();
+                        async move {
+                            #[cfg(test)]
+                            maybe_pause_before_on_control_frame_rpc().await;
+                            #[cfg(test)]
+                            if let Some(err) = take_sink_worker_control_frame_error_hook(
+                                current_worker_instance_id,
+                            ) {
+                                return Err(SinkFailure::from(err));
+                            }
+                            Self::call_worker_with_failure(
+                                &client,
+                                SinkWorkerRequest::OnControlFrame {
+                                    envelopes: envelopes.clone(),
+                                },
+                                attempt_timeout,
+                            )
+                            .await
                         }
-                        Self::call_worker(
-                            &client,
-                            SinkWorkerRequest::OnControlFrame {
-                                envelopes: envelopes.clone(),
-                            },
-                            attempt_timeout,
-                        )
-                        .await
-                    }
-                }),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(CnxError::Timeout),
-            };
+                    }),
+                )
+                .await,
+                SinkRetryBudgetExhaustionKind::ControlFrameAttempt,
+            );
             match rpc_result {
                 Ok(SinkWorkerResponse::Ack) => {
                     if let Some(signals) = decoded_signals.as_ref() {
@@ -3889,15 +3935,21 @@ impl SinkWorkerClientHandle {
                         other,
                     ));
                 }
-                Err(err) => match machine.followup_after_error(err) {
+                Err(err) => match machine.followup_after_failure(err) {
                     SinkControlFrameFollowup::RestartAndRetry(next_machine) => {
-                        self.restart_shared_worker_client_for_retry_until(machine.deadline)
-                            .await?;
+                        self.restart_shared_worker_client_for_retry_until(
+                            machine.deadline,
+                            SinkRetryBudgetExhaustionKind::ControlFrameRetry,
+                        )
+                        .await?;
                         machine = next_machine;
                     }
                     SinkControlFrameFollowup::RestartAndFailFast(failure) => {
-                        self.restart_shared_worker_client_for_retry_until(machine.deadline)
-                            .await?;
+                        self.restart_shared_worker_client_for_retry_until(
+                            machine.deadline,
+                            SinkRetryBudgetExhaustionKind::ControlFrameRetry,
+                        )
+                        .await?;
                         let lane = if machine.restart_deferred_retire_pending_deactivate {
                             "restart_deferred_retire_pending_events_deactivate"
                         } else {
@@ -3931,11 +3983,12 @@ impl SinkWorkerClientHandle {
         total_timeout: Duration,
         rpc_timeout: Duration,
     ) -> Result<()> {
-        self.on_control_frame_with_timeouts(envelopes, total_timeout, rpc_timeout)
+        self.on_control_frame_with_timeouts_with_failure(envelopes, total_timeout, rpc_timeout)
             .await
+            .map_err(SinkFailure::into_error)
     }
 
-    pub async fn close(&self) -> Result<()> {
+    async fn close_with_failure(&self) -> std::result::Result<(), SinkFailure> {
         #[cfg(test)]
         notify_sink_worker_close_started();
         self.wait_for_control_ops_to_drain(SINK_WORKER_CLOSE_DRAIN_TIMEOUT)
@@ -3947,6 +4000,14 @@ impl SinkWorkerClientHandle {
             .await
             .shutdown(Duration::from_secs(2))
             .await
+            .map_err(SinkFailure::from)
+    }
+
+    #[cfg(test)]
+    pub async fn close(&self) -> Result<()> {
+        self.close_with_failure()
+            .await
+            .map_err(SinkFailure::into_error)
     }
 }
 
@@ -3954,6 +4015,192 @@ impl SinkWorkerClientHandle {
 pub enum SinkFacade {
     Local(Arc<SinkFileMeta>),
     Worker(Arc<SinkWorkerClientHandle>),
+}
+
+impl SinkFileMeta {
+    pub(crate) fn with_boundaries_and_state_with_failure(
+        node_id: NodeId,
+        boundary: Option<Arc<dyn ChannelIoSubset>>,
+        state_boundary: Arc<dyn StateBoundary>,
+        source_cfg: SourceConfig,
+    ) -> std::result::Result<Self, SinkFailure> {
+        Self::with_boundaries_and_state_internal(
+            node_id,
+            boundary,
+            state_boundary,
+            source_cfg,
+            false,
+        )
+        .map_err(SinkFailure::from)
+    }
+
+    pub(crate) fn with_boundaries_and_state_deferred_authority_with_failure(
+        node_id: NodeId,
+        boundary: Option<Arc<dyn ChannelIoSubset>>,
+        state_boundary: Arc<dyn StateBoundary>,
+        source_cfg: SourceConfig,
+    ) -> std::result::Result<Self, SinkFailure> {
+        Self::with_boundaries_and_state_internal(
+            node_id,
+            boundary,
+            state_boundary,
+            source_cfg,
+            true,
+        )
+        .map_err(SinkFailure::from)
+    }
+
+    pub(crate) fn start_runtime_endpoints_with_failure(
+        &self,
+        io_boundary: Arc<dyn ChannelIoSubset>,
+        node_id: NodeId,
+    ) -> std::result::Result<(), SinkFailure> {
+        self.start_runtime_endpoints_on_boundary(io_boundary, node_id)
+            .map_err(SinkFailure::from)
+    }
+
+    pub(crate) fn update_logical_roots_with_failure(
+        &self,
+        roots: Vec<crate::source::config::RootSpec>,
+        host_object_grants: &[GrantedMountRoot],
+    ) -> std::result::Result<(), SinkFailure> {
+        self.perform_update_logical_roots(roots, host_object_grants)
+            .map_err(SinkFailure::from)
+    }
+
+    pub(crate) fn logical_roots_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<crate::source::config::RootSpec>, SinkFailure> {
+        self.snapshot_logical_roots().map_err(SinkFailure::from)
+    }
+
+    pub(crate) fn cached_logical_roots_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<crate::source::config::RootSpec>, SinkFailure> {
+        self.snapshot_cached_logical_roots()
+            .map_err(SinkFailure::from)
+    }
+
+    pub(crate) fn status_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        self.build_status_snapshot().map_err(SinkFailure::from)
+    }
+
+    pub(crate) fn cached_status_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        self.build_cached_status_snapshot()
+            .map_err(SinkFailure::from)
+    }
+
+    pub(crate) fn status_snapshot_nonblocking_with_failure(
+        &self,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        self.build_status_snapshot().map_err(SinkFailure::from)
+    }
+
+    pub(crate) fn scheduled_group_ids_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SinkFailure> {
+        self.snapshot_scheduled_group_ids()
+            .map_err(SinkFailure::from)
+    }
+
+    pub(crate) fn health_with_failure(
+        &self,
+    ) -> std::result::Result<crate::query::models::HealthStats, SinkFailure> {
+        self.build_health_snapshot().map_err(SinkFailure::from)
+    }
+
+    pub(crate) fn visibility_lag_samples_since_with_failure(
+        &self,
+        since_us: u64,
+    ) -> std::result::Result<Vec<VisibilityLagSample>, SinkFailure> {
+        Ok(self.snapshot_visibility_lag_samples_since(since_us))
+    }
+
+    fn query_node_with_failure(
+        &self,
+        path: &[u8],
+    ) -> std::result::Result<Option<QueryNode>, SinkFailure> {
+        let request = InternalQueryRequest::materialized(
+            QueryOp::Tree,
+            QueryScope {
+                path: path.to_vec(),
+                recursive: false,
+                max_depth: Some(0),
+                selected_group: None,
+            },
+            None,
+        );
+        decode_exact_query_node(self.perform_materialized_query(&request)?, path)
+            .map_err(SinkFailure::from)
+    }
+
+    pub(crate) fn materialized_query_with_failure(
+        &self,
+        request: &InternalQueryRequest,
+    ) -> std::result::Result<Vec<Event>, SinkFailure> {
+        self.perform_materialized_query(request)
+            .map_err(SinkFailure::from)
+    }
+
+    fn subtree_stats_with_failure(
+        &self,
+        path: &[u8],
+    ) -> std::result::Result<Vec<Event>, SinkFailure> {
+        self.perform_materialized_query(&InternalQueryRequest::materialized(
+            QueryOp::Stats,
+            QueryScope {
+                path: path.to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: None,
+            },
+            None,
+        ))
+        .map_err(SinkFailure::from)
+    }
+
+    pub(crate) async fn send_with_failure(
+        &self,
+        events: &[Event],
+    ) -> std::result::Result<(), SinkFailure> {
+        self.apply_events(events).map_err(SinkFailure::from)
+    }
+
+    pub(crate) async fn recv_with_failure(
+        &self,
+        opts: RecvOpts,
+    ) -> std::result::Result<Vec<Event>, SinkFailure> {
+        let _ = opts;
+        self.perform_materialized_query(&InternalQueryRequest::default())
+            .map_err(SinkFailure::from)
+    }
+
+    pub(crate) async fn apply_orchestration_signals_with_failure(
+        &self,
+        signals: &[SinkControlSignal],
+    ) -> std::result::Result<(), SinkFailure> {
+        self.perform_apply_orchestration_signals(signals)
+            .await
+            .map(|_| ())
+            .map_err(SinkFailure::from)
+    }
+
+    pub(crate) async fn on_control_frame_with_failure(
+        &self,
+        envelopes: &[ControlEnvelope],
+    ) -> std::result::Result<(), SinkFailure> {
+        let signals = sink_control_signals_from_envelopes(envelopes).map_err(SinkFailure::from)?;
+        self.apply_orchestration_signals_with_failure(&signals)
+            .await
+    }
+
+    pub(crate) async fn close_with_failure(&self) -> std::result::Result<(), SinkFailure> {
+        self.perform_close().await.map_err(SinkFailure::from)
+    }
 }
 
 impl SinkFacade {
@@ -3969,106 +4216,104 @@ impl SinkFacade {
         matches!(self, Self::Worker(_))
     }
 
-    pub async fn ensure_started(&self) -> Result<()> {
+    pub(crate) async fn ensure_started_with_failure(&self) -> std::result::Result<(), SinkFailure> {
         match self {
             Self::Local(_) => Ok(()),
-            Self::Worker(client) => client.ensure_started().await,
+            Self::Worker(client) => client.ensure_started_with_failure().await,
         }
     }
 
-    pub fn start_stream_endpoint(
-        &self,
-        boundary: Arc<dyn ChannelIoSubset>,
-        node_id: NodeId,
-    ) -> Result<()> {
-        match self {
-            Self::Local(sink) => sink.start_stream_endpoint(boundary, node_id),
-            Self::Worker(_) => Ok(()),
-        }
+    #[cfg(test)]
+    pub async fn ensure_started(&self) -> Result<()> {
+        self.ensure_started_with_failure()
+            .await
+            .map_err(SinkFailure::into_error)
     }
 
-    pub async fn update_logical_roots(
+    pub(crate) async fn update_logical_roots_with_failure(
         &self,
         roots: Vec<crate::source::config::RootSpec>,
         host_object_grants: &[GrantedMountRoot],
-    ) -> Result<()> {
+    ) -> std::result::Result<(), SinkFailure> {
         match self {
-            Self::Local(sink) => sink.update_logical_roots(roots, host_object_grants),
+            Self::Local(sink) => sink.update_logical_roots_with_failure(roots, host_object_grants),
             Self::Worker(client) => {
                 client
-                    .update_logical_roots(roots, host_object_grants.to_vec())
+                    .update_logical_roots_with_failure(roots, host_object_grants.to_vec())
                     .await
             }
         }
     }
 
-    pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
-        match self {
-            Self::Local(sink) => sink.logical_roots_snapshot(),
-            Self::Worker(client) => client.cached_logical_roots_snapshot(),
-        }
-    }
-
-    pub async fn logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
-        match self {
-            Self::Local(sink) => sink.logical_roots_snapshot(),
-            Self::Worker(client) => client.logical_roots_snapshot().await,
-        }
-    }
-
-    pub async fn health(&self) -> Result<HealthStats> {
-        match self {
-            Self::Local(sink) => sink.health(),
-            Self::Worker(client) => client.health().await,
-        }
-    }
-
-    pub async fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
-        match self {
-            Self::Local(sink) => sink.status_snapshot(),
-            Self::Worker(client) => client.status_snapshot().await,
-        }
-    }
-
-    pub(crate) async fn progress_snapshot(&self) -> Result<crate::sink::SinkProgressSnapshot> {
-        self.status_snapshot()
-            .await
-            .map(|snapshot| snapshot.progress_snapshot())
-    }
-
-    pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
-        match self {
-            Self::Local(sink) => sink.status_snapshot(),
-            Self::Worker(client) => client.status_snapshot_nonblocking().await,
-        }
-    }
-
-    pub(crate) async fn progress_snapshot_nonblocking(
+    pub(crate) fn cached_logical_roots_snapshot_with_failure(
         &self,
-    ) -> Result<crate::sink::SinkProgressSnapshot> {
-        self.status_snapshot_nonblocking()
+    ) -> std::result::Result<Vec<crate::source::config::RootSpec>, SinkFailure> {
+        match self {
+            Self::Local(sink) => sink.cached_logical_roots_snapshot_with_failure(),
+            Self::Worker(client) => client.cached_logical_roots_snapshot_with_failure(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn logical_roots_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<crate::source::config::RootSpec>, SinkFailure> {
+        match self {
+            Self::Local(sink) => sink.logical_roots_snapshot_with_failure(),
+            Self::Worker(client) => client.logical_roots_snapshot_with_failure().await,
+        }
+    }
+
+    pub(crate) async fn status_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        match self {
+            Self::Local(sink) => sink.status_snapshot_with_failure(),
+            Self::Worker(client) => client.status_snapshot_with_failure().await,
+        }
+    }
+
+    pub(crate) async fn status_snapshot_nonblocking_with_failure(
+        &self,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        match self {
+            Self::Local(sink) => sink.status_snapshot_nonblocking_with_failure(),
+            Self::Worker(client) => client.status_snapshot_nonblocking_with_failure().await,
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
+        self.status_snapshot_nonblocking_with_failure()
             .await
-            .map(|snapshot| snapshot.progress_snapshot())
+            .map_err(SinkFailure::into_error)
     }
 
     pub(crate) async fn status_snapshot_nonblocking_for_status_route(
         &self,
     ) -> Result<(SinkStatusSnapshot, bool)> {
         match self {
-            Self::Local(sink) => Ok((sink.status_snapshot()?, false)),
-            Self::Worker(client) => client.status_snapshot_nonblocking_for_status_route().await,
+            Self::Local(sink) => sink
+                .status_snapshot_nonblocking_with_failure()
+                .map(|snapshot| (snapshot, false))
+                .map_err(SinkFailure::into_error),
+            Self::Worker(client) => Ok(client.status_snapshot_nonblocking_for_status_route().await),
         }
     }
 
-    pub fn cached_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+    pub(crate) fn cached_status_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
         match self {
-            Self::Local(sink) => sink.status_snapshot(),
-            Self::Worker(client) => client.cached_status_snapshot(),
+            Self::Local(sink) => sink.cached_status_snapshot_with_failure(),
+            Self::Worker(client) => client.cached_status_snapshot_with_failure(),
         }
     }
 
-    pub(crate) fn cached_progress_snapshot(&self) -> Result<crate::sink::SinkProgressSnapshot> {
-        self.cached_status_snapshot()
+    pub(crate) fn cached_progress_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<crate::sink::SinkProgressSnapshot, SinkFailure> {
+        self.cached_status_snapshot_with_failure()
             .map(|snapshot| snapshot.progress_snapshot())
     }
 
@@ -4080,18 +4325,20 @@ impl SinkFacade {
         }
     }
 
-    pub async fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
+    pub(crate) async fn scheduled_group_ids_with_failure(
+        &self,
+    ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SinkFailure> {
         match self {
-            Self::Local(sink) => sink.scheduled_group_ids_snapshot(),
-            Self::Worker(client) => client.scheduled_group_ids().await,
+            Self::Local(sink) => sink.scheduled_group_ids_snapshot_with_failure(),
+            Self::Worker(client) => client.scheduled_group_ids_with_failure().await,
         }
     }
 
-    pub async fn shadow_time_us(&self) -> Result<u64> {
-        match self {
-            Self::Local(sink) => sink.shadow_time_us(),
-            Self::Worker(client) => client.health().await.map(|stats| stats.shadow_time_us),
-        }
+    #[cfg(test)]
+    pub async fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
+        self.scheduled_group_ids_with_failure()
+            .await
+            .map_err(SinkFailure::into_error)
     }
 
     pub(crate) async fn control_op_inflight(&self) -> bool {
@@ -4101,94 +4348,83 @@ impl SinkFacade {
         }
     }
 
-    pub async fn visibility_lag_samples_since(&self, since_us: u64) -> Vec<VisibilityLagSample> {
+    pub(crate) async fn query_node_with_failure(
+        &self,
+        path: &[u8],
+    ) -> std::result::Result<Option<QueryNode>, SinkFailure> {
         match self {
-            Self::Local(sink) => sink.visibility_lag_samples_since(since_us),
-            Self::Worker(client) => client
-                .visibility_lag_samples_since(since_us)
-                .await
-                .unwrap_or_default(),
+            Self::Local(sink) => sink.query_node_with_failure(path),
+            Self::Worker(client) => client.query_node_with_failure(path.to_vec()).await,
         }
     }
 
-    pub async fn query_node(&self, path: &[u8]) -> Result<Option<QueryNode>> {
-        match self {
-            Self::Local(sink) => {
-                let request = InternalQueryRequest::materialized(
-                    QueryOp::Tree,
-                    QueryScope {
-                        path: path.to_vec(),
-                        recursive: false,
-                        max_depth: Some(0),
-                        selected_group: None,
-                    },
-                    None,
-                );
-                decode_exact_query_node(sink.materialized_query(&request)?, path)
-            }
-            Self::Worker(client) => client.query_node(path.to_vec()).await,
-        }
-    }
-
-    pub async fn materialized_query(&self, request: &InternalQueryRequest) -> Result<Vec<Event>> {
-        match self {
-            Self::Local(sink) => sink.materialized_query(request),
-            Self::Worker(client) => client.materialized_query(request.clone()).await,
-        }
-    }
-
-    pub async fn materialized_query_nonblocking(
+    pub(crate) async fn materialized_query_with_failure(
         &self,
         request: &InternalQueryRequest,
-    ) -> Result<Vec<Event>> {
+    ) -> std::result::Result<Vec<Event>, SinkFailure> {
         match self {
-            Self::Local(sink) => sink.materialized_query(request),
-            Self::Worker(client) => client.materialized_query_nonblocking(request.clone()).await,
+            Self::Local(sink) => sink.materialized_query_with_failure(request),
+            Self::Worker(client) => {
+                client
+                    .materialized_query_with_failure(request.clone())
+                    .await
+            }
         }
     }
 
-    pub async fn subtree_stats(&self, path: &[u8]) -> Result<Vec<Event>> {
+    pub(crate) async fn materialized_query_nonblocking_with_failure(
+        &self,
+        request: &InternalQueryRequest,
+    ) -> std::result::Result<Vec<Event>, SinkFailure> {
         match self {
-            Self::Local(sink) => sink.materialized_query(&InternalQueryRequest::materialized(
-                QueryOp::Stats,
-                QueryScope {
-                    path: path.to_vec(),
-                    recursive: true,
-                    max_depth: None,
-                    selected_group: None,
-                },
-                None,
-            )),
-            Self::Worker(client) => client.subtree_stats(path.to_vec()).await,
+            Self::Local(sink) => sink.materialized_query_with_failure(request),
+            Self::Worker(client) => {
+                client
+                    .materialized_query_nonblocking_with_failure(request.clone())
+                    .await
+            }
         }
     }
 
-    pub async fn force_find_proxy(&self, request: &InternalQueryRequest) -> Result<Vec<Event>> {
+    pub(crate) async fn subtree_stats_with_failure(
+        &self,
+        path: &[u8],
+    ) -> std::result::Result<Vec<Event>, SinkFailure> {
         match self {
-            Self::Local(_) => Err(CnxError::InvalidInput(
-                "force-find proxy requires sink worker execution mode".into(),
-            )),
-            Self::Worker(client) => client.force_find_proxy(request.clone()).await,
+            Self::Local(sink) => sink.subtree_stats_with_failure(path),
+            Self::Worker(client) => client.subtree_stats_with_failure(path.to_vec()).await,
         }
     }
 
-    pub async fn send(&self, events: &[Event]) -> Result<()> {
+    pub(crate) async fn send_with_failure(
+        &self,
+        events: &[Event],
+    ) -> std::result::Result<(), SinkFailure> {
         match self {
-            Self::Local(sink) => sink.send(events).await,
-            Self::Worker(client) => client.send(events.to_vec()).await,
+            Self::Local(sink) => sink.send_with_failure(events).await,
+            Self::Worker(client) => client.send_with_failure(events.to_vec()).await,
         }
     }
 
-    pub async fn recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
+    pub(crate) async fn recv_with_failure(
+        &self,
+        opts: RecvOpts,
+    ) -> std::result::Result<Vec<Event>, SinkFailure> {
         match self {
-            Self::Local(sink) => sink.recv(opts).await,
-            Self::Worker(client) => client.recv(opts).await,
+            Self::Local(sink) => sink.recv_with_failure(opts).await,
+            Self::Worker(client) => client.recv_with_failure(opts).await,
         }
     }
 
+    #[cfg(test)]
     pub async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
         let signals = sink_control_signals_from_envelopes(envelopes)?;
-        self.apply_orchestration_signals(&signals).await
+        self.apply_orchestration_signals_with_total_timeout_with_failure(
+            &signals,
+            SINK_WORKER_CONTROL_TOTAL_TIMEOUT,
+        )
+        .await
+        .map_err(SinkFailure::into_error)
     }
 
     pub(crate) async fn current_generation_tick_fast_path_eligible(&self) -> bool {
@@ -4198,29 +4434,15 @@ impl SinkFacade {
         }
     }
 
-    pub(crate) async fn apply_orchestration_signals(
-        &self,
-        signals: &[SinkControlSignal],
-    ) -> Result<()> {
-        match self {
-            Self::Local(sink) => sink.apply_orchestration_signals(signals).await,
-            Self::Worker(client) => {
-                let envelopes = signals
-                    .iter()
-                    .map(SinkControlSignal::envelope)
-                    .collect::<Vec<_>>();
-                client.on_control_frame(envelopes).await
-            }
-        }
-    }
-
-    pub(crate) async fn apply_orchestration_signals_with_total_timeout(
+    pub(crate) async fn apply_orchestration_signals_with_total_timeout_with_failure(
         &self,
         signals: &[SinkControlSignal],
         total_timeout: Duration,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), SinkFailure> {
         if total_timeout.is_zero() {
-            return Err(CnxError::Timeout);
+            return Err(SinkFailure::retry_budget_exhausted(
+                SinkRetryBudgetExhaustionKind::ControlFrameAttempt,
+            ));
         }
         // runtime_app owns the outer recovery loop for mixed source/sink recovery.
         // Keep each nested sink-client control attempt short so retryable resets
@@ -4230,17 +4452,14 @@ impl SinkFacade {
             SINK_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT,
         );
         match self {
-            Self::Local(sink) => {
-                match tokio::time::timeout(
+            Self::Local(sink) => map_sink_failure_timeout_result(
+                tokio::time::timeout(
                     single_attempt_total_timeout,
-                    sink.apply_orchestration_signals(signals),
+                    sink.apply_orchestration_signals_with_failure(signals),
                 )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(CnxError::Timeout),
-                }
-            }
+                .await,
+                SinkRetryBudgetExhaustionKind::ControlFrameAttempt,
+            ),
             Self::Worker(client) => {
                 let envelopes = signals
                     .iter()
@@ -4251,7 +4470,7 @@ impl SinkFacade {
                     single_attempt_total_timeout,
                 );
                 client
-                    .on_control_frame_with_timeouts(
+                    .on_control_frame_with_timeouts_with_failure(
                         envelopes,
                         single_attempt_total_timeout,
                         rpc_timeout,
@@ -4261,11 +4480,18 @@ impl SinkFacade {
         }
     }
 
-    pub async fn close(&self) -> Result<()> {
+    pub(crate) async fn close_with_failure(&self) -> std::result::Result<(), SinkFailure> {
         match self {
-            Self::Local(sink) => sink.close().await,
-            Self::Worker(client) => client.close().await,
+            Self::Local(sink) => sink.close_with_failure().await,
+            Self::Worker(client) => client.close_with_failure().await,
         }
+    }
+
+    #[cfg(test)]
+    pub async fn close(&self) -> Result<()> {
+        self.close_with_failure()
+            .await
+            .map_err(SinkFailure::into_error)
     }
 
     pub(crate) async fn wait_for_control_ops_to_drain_for_handoff(&self) {

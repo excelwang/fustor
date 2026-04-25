@@ -644,7 +644,7 @@ fn source_scheduled_groups_refresh_machine_owns_reconnect_retry_and_timeout_term
         SourceScheduledGroupsRefreshDisposition::OrdinaryScheduleRefresh,
     );
     let reconnect = machine.advance(SourceScheduledGroupsRefreshEvent::EnsureStartedCompleted {
-        result: Err(SourceFailure::from(CnxError::Timeout)),
+        result: Err(SourceFailure::timeout_reset()),
         after: SourceProgressState::default(),
     });
     let wait = machine.advance(SourceScheduledGroupsRefreshEvent::ReconnectCompleted);
@@ -656,7 +656,7 @@ fn source_scheduled_groups_refresh_machine_owns_reconnect_retry_and_timeout_term
     );
     let terminal =
         expired_machine.advance(SourceScheduledGroupsRefreshEvent::EnsureStartedCompleted {
-            result: Err(SourceFailure::from(CnxError::Timeout)),
+            result: Err(SourceFailure::timeout_reset()),
             after: SourceProgressState::default(),
         });
 
@@ -669,7 +669,7 @@ fn source_scheduled_groups_refresh_machine_owns_reconnect_retry_and_timeout_term
                 SourceScheduledGroupsRefreshEffect::Fail(SourceFailure {
                     cause: CnxError::Internal(_),
                     reason: SourceFailureReason::RefreshExhausted(
-                        SourceScheduledGroupsRefreshExhaustionReason::NoLiveWorkerRecovery
+                        SourceScheduledGroupsRefreshExhaustionReason::Timeout
                     ),
                 })
             ),
@@ -825,8 +825,9 @@ fn source_operations_hard_cut_removed_generic_operation_machine_family() {
         "fn missing_control_frame_pending_reconnect_resume(",
         "fn missing_control_frame_pending_refresh_state(",
         "fn expect_source_worker_ack(",
-        "fn unexpected_source_worker_response(",
-        "fn map_source_timeout_result<T>(",
+        "fn unexpected_source_worker_response_failure(",
+        "fn unexpected_source_worker_response_result<",
+        "fn map_source_timeout_result_with_failure<T>(",
         "enum SourceRetryBudgetDisposition {",
         "fn classify_source_retry_budget(",
         "enum SourceWorkerControlResetKind {",
@@ -897,7 +898,7 @@ fn source_operations_hard_cut_removed_generic_operation_machine_family() {
             .matches("unexpected source worker response ")
             .count(),
         1,
-        "workers/source hard cut regressed; unexpected source-worker response protocol-violation formatting should stay centralized in unexpected_source_worker_response(...) instead of drifting back into per-callsite strings",
+        "workers/source hard cut regressed; unexpected source-worker response protocol-violation formatting should stay centralized in typed unexpected-response helpers instead of drifting back into per-callsite strings",
     );
     assert_eq!(
         source_impl
@@ -920,12 +921,9 @@ fn source_operations_hard_cut_removed_generic_operation_machine_family() {
         1,
         "workers/source hard cut regressed; missing control-frame refresh-state protocol-violation formatting should stay centralized in missing_control_frame_pending_refresh_state(...) instead of drifting back into per-callsite strings",
     );
-    assert_eq!(
-        source_impl
-            .matches("Err(_) => Err(CnxError::Timeout),")
-            .count(),
-        1,
-        "workers/source hard cut regressed; timeout elapsed -> CnxError::Timeout shaping should stay centralized in map_source_timeout_result(...) instead of drifting back into per-callsite wrappers",
+    assert!(
+        !source_impl.contains("fn map_source_timeout_result<"),
+        "workers/source hard cut regressed; zero-call raw timeout result helper should stay removed",
     );
     assert_eq!(
         source_impl
@@ -1084,7 +1082,7 @@ fn source_control_frame_machine_owns_rpc_phase_dispatch_loop() {
         "enum SourceControlFramePostAckRefreshRequirement {",
         "struct SourceControlFrameSignalPolicies {",
         "fn from_signals(signals: &[SourceControlSignal]) -> Self {",
-        "fn map_source_timeout_result<T>(",
+        "fn map_source_timeout_result_with_failure<T>(",
         "enum SourceRetryBudgetDisposition {",
         "enum SourceRetryBudgetExhaustionKind {",
         "fn classify_source_retry_budget(",
@@ -1613,7 +1611,7 @@ fn source_worker_rescan_epoch_truth_uses_worker_owned_epoch_request() {
         "RescanRequestEpoch(u64)",
         "SourceWorkerRequest::TriggerRescanWhenReadyEpoch",
         "SourceWorkerResponse::RescanRequestEpoch(epoch)",
-        "source.trigger_rescan_when_ready_epoch().await",
+        "source.trigger_rescan_when_ready_epoch_with_failure().await",
     ] {
         assert!(
             source_impl.contains(required_symbol)
@@ -1646,9 +1644,9 @@ fn source_progress_snapshot_uses_live_worker_retry_before_cached_fallback() {
     let source_impl = include_str!("../source.rs");
 
     for required_symbol in [
-        "pub(crate) async fn progress_snapshot(&self) -> Result<crate::source::SourceProgressSnapshot>",
-        "async fn progress_snapshot_with_timeout(",
-        ".with_started_retry(|client| async move {",
+        "pub(crate) async fn progress_snapshot_with_failure(",
+        "async fn progress_snapshot_with_timeout_with_failure(",
+        ".with_started_retry_with_failure(|client| async move {",
         "SourceWorkerRequest::ProgressSnapshot",
     ] {
         assert!(
@@ -1666,6 +1664,70 @@ fn source_progress_snapshot_uses_live_worker_retry_before_cached_fallback() {
 }
 
 #[test]
+fn source_worker_client_retry_helper_uses_typed_runtime_adapter_mapping() {
+    let source_impl = include_str!("../source.rs");
+
+    assert!(
+        source_impl.contains(".with_started_retry_mapped(op, SourceFailure::into_error)"),
+        "workers/source hard cut regressed; source worker typed retry helper should use the runtime typed adapter mapping surface",
+    );
+
+    assert!(
+        !source_impl.contains(".with_started_retry(|client| {"),
+        "workers/source hard cut regressed; source worker typed retry helper bounced back through the raw runtime retry shell",
+    );
+}
+
+#[test]
+fn source_worker_timeout_mapping_uses_typed_timeout_carrier() {
+    let source_impl = include_str!("../source.rs");
+
+    assert!(
+        source_impl.contains("fn timeout_reset() -> Self {"),
+        "workers/source hard cut regressed; source worker timeout reset should keep an explicit typed carrier constructor",
+    );
+
+    assert!(
+        source_impl.contains("CnxError::Timeout => Self::timeout_reset(),"),
+        "workers/source hard cut regressed; source worker timeout cause classification should stay on the explicit typed timeout carrier",
+    );
+
+    assert!(
+        source_impl.contains("Err(_) => Err(SourceFailure::timeout_reset()),"),
+        "workers/source hard cut regressed; source worker timeout mapping should stay on the typed timeout carrier",
+    );
+
+    assert!(
+        !source_impl.contains("Err(_) => Err(SourceFailure::from(CnxError::Timeout)),"),
+        "workers/source hard cut regressed; source worker timeout mapping bounced back through raw timeout materialization",
+    );
+
+    assert!(
+        !source_impl.contains("map_source_timeout_result(result).map_err(SourceFailure::from)"),
+        "workers/source hard cut regressed; source worker timeout helper bounced back through a raw timeout result before rebuilding typed failure",
+    );
+}
+
+#[test]
+fn source_scheduled_groups_refresh_cached_grants_fallback_uses_typed_helper() {
+    let source_impl = include_str!("../source.rs");
+
+    assert!(
+        source_impl.contains(
+            ".cached_host_object_grants_snapshot_with_failure()\n                .map(|grants| self.scheduled_groups_refresh_stable_host_ref(&grants))?"
+        ),
+        "workers/source hard cut regressed; scheduled-groups refresh cached-grants fallback should stay on the typed cache helper",
+    );
+
+    assert!(
+        !source_impl.contains(
+            ".cached_host_object_grants_snapshot()\n                .map(|grants| self.scheduled_groups_refresh_stable_host_ref(&grants))\n                .map_err(SourceFailure::from)?"
+        ),
+        "workers/source hard cut regressed; scheduled-groups refresh cached-grants fallback bounced back through the raw cache wrapper",
+    );
+}
+
+#[test]
 fn source_post_recovery_rescan_gate_uses_live_progress_snapshot() {
     let source_impl = include_str!("../source.rs");
     let runtime_impl = include_str!("../../runtime_app.rs");
@@ -1677,7 +1739,8 @@ fn source_post_recovery_rescan_gate_uses_live_progress_snapshot() {
         "workers/source rescan hard cut regressed; production source facade still exposes cached nonblocking rescan epoch truth",
     );
     assert!(
-        runtime_impl.contains("if let Ok(snapshot) = source.progress_snapshot().await {")
+        runtime_impl
+            .contains("if let Ok(snapshot) = source.progress_snapshot_with_failure().await {")
             && runtime_impl.contains("if snapshot.rescan_observed_epoch >= request_epoch {"),
         "runtime post-recovery rescan gate should clear request state only from live source progress truth",
     );
@@ -1693,9 +1756,7 @@ fn source_facade_degraded_progress_surface_is_removed() {
     let source_impl = include_str!("../source.rs");
 
     assert!(
-        source_impl.contains(
-            "pub(crate) async fn progress_snapshot(&self) -> Result<crate::source::SourceProgressSnapshot>"
-        ),
+        source_impl.contains("pub(crate) async fn progress_snapshot_with_failure("),
         "workers/source progress hard cut regressed; facade should continue exposing the live progress truth API",
     );
     assert!(
@@ -1709,6 +1770,665 @@ fn source_facade_degraded_progress_surface_is_removed() {
             "pub(crate) async fn progress_snapshot_nonblocking(&self) -> crate::source::SourceProgressSnapshot {"
         ),
         "workers/source progress hard cut regressed; facade still exposes degraded cached progress under a truth-like API name",
+    );
+}
+
+#[test]
+fn source_local_control_frame_typed_helper_does_not_bounce_through_raw_wrapper() {
+    let source_impl = include_str!("../source.rs");
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+
+    assert!(
+        !source_impl.contains(
+            "self.on_control_frame(&envelopes)\n            .await\n            .map_err(SourceFailure::from)"
+        ),
+        "workers/source hard cut regressed; local control-frame typed helper bounced back through the raw wrapper",
+    );
+    for typed_surface in [
+        "let signals =\n            source_control_signals_from_envelopes(&envelopes).map_err(SourceFailure::from)?;",
+        "self.apply_control_frame_signals(&signals)\n            .await\n            .map_err(SourceFailure::from)",
+    ] {
+        assert!(
+            source_impl.contains(typed_surface),
+            "workers/source hard cut regressed; local control-frame typed helper drifted away from the direct typed path: {typed_surface}",
+        );
+    }
+    assert!(
+        source_runtime_impl.contains("pub(crate) async fn apply_control_frame_signals("),
+        "workers/source hard cut regressed; source runtime should expose a direct control-signal helper instead of forcing typed callers back through the raw envelope wrapper",
+    );
+}
+
+#[test]
+fn source_local_update_roots_typed_helper_does_not_bounce_through_raw_wrapper() {
+    let source_impl = include_str!("../source.rs");
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+
+    assert!(
+        !source_impl.contains(
+            "self.update_logical_roots(roots)\n            .await\n            .map_err(SourceFailure::from)"
+        ),
+        "workers/source hard cut regressed; local update-roots typed helper bounced back through the raw wrapper",
+    );
+    assert!(
+        source_impl.contains(
+            "self.apply_logical_roots_update(roots)\n            .await\n            .map_err(SourceFailure::from)"
+        ),
+        "workers/source hard cut regressed; local update-roots typed helper should drive the direct typed path",
+    );
+    assert!(
+        source_runtime_impl.contains("pub(crate) async fn apply_logical_roots_update("),
+        "workers/source hard cut regressed; source runtime should expose a direct logical-roots update helper instead of forcing typed callers back through the raw wrapper",
+    );
+}
+
+#[test]
+fn source_local_manual_rescan_typed_helper_does_not_bounce_through_raw_wrapper() {
+    let source_impl = include_str!("../source.rs");
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+
+    assert!(
+        !source_impl.contains(
+            "self.publish_manual_rescan_signal()\n            .await\n            .map_err(SourceFailure::from)"
+        ),
+        "workers/source hard cut regressed; local manual-rescan typed helper bounced back through the raw wrapper",
+    );
+    assert!(
+        source_impl.contains(
+            "self.emit_manual_rescan_signal()\n            .await\n            .map_err(SourceFailure::from)"
+        ),
+        "workers/source hard cut regressed; local manual-rescan typed helper should drive the direct typed path",
+    );
+    assert!(
+        source_runtime_impl.contains("pub(crate) async fn emit_manual_rescan_signal("),
+        "workers/source hard cut regressed; source runtime should expose a direct manual-rescan helper instead of forcing typed callers back through the raw wrapper",
+    );
+}
+
+#[test]
+fn source_local_close_typed_helper_does_not_bounce_through_raw_wrapper() {
+    let source_impl = include_str!("../source.rs");
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+
+    assert!(
+        !source_impl.contains("self.close().await.map_err(SourceFailure::from)"),
+        "workers/source hard cut regressed; local close typed helper bounced back through the raw wrapper",
+    );
+    assert!(
+        source_impl.contains("self.perform_close().await.map_err(SourceFailure::from)"),
+        "workers/source hard cut regressed; local close typed helper should drive the direct typed path",
+    );
+    assert!(
+        source_runtime_impl.contains("pub(crate) async fn perform_close(&self) -> Result<()> {"),
+        "workers/source hard cut regressed; source runtime should expose a direct close helper instead of forcing typed callers back through the raw wrapper",
+    );
+}
+
+#[test]
+fn source_local_scheduled_group_snapshot_helpers_do_not_bounce_through_raw_wrappers() {
+    let source_impl = include_str!("../source.rs");
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+
+    for legacy_bounce in [
+        "self.scheduled_source_group_ids()\n            .map_err(SourceFailure::from)",
+        "self.scheduled_scan_group_ids().map_err(SourceFailure::from)",
+    ] {
+        assert!(
+            !source_impl.contains(legacy_bounce),
+            "workers/source hard cut regressed; local scheduled-group typed helper bounced back through a raw wrapper: {legacy_bounce}",
+        );
+    }
+    for typed_surface in [
+        "self.snapshot_scheduled_source_group_ids()\n            .map_err(SourceFailure::from)",
+        "self.snapshot_scheduled_scan_group_ids()\n            .map_err(SourceFailure::from)",
+        "pub(crate) fn snapshot_scheduled_source_group_ids(",
+        "pub(crate) fn snapshot_scheduled_scan_group_ids(",
+        "pub(crate) fn scheduled_source_group_ids_snapshot(&self) -> Result<Option<BTreeSet<String>>> {",
+        "pub(crate) fn scheduled_scan_group_ids_snapshot(&self) -> Result<Option<BTreeSet<String>>> {",
+    ] {
+        let haystack = if typed_surface.starts_with("pub(crate) fn ") {
+            source_runtime_impl
+        } else {
+            source_impl
+        };
+        assert!(
+            haystack.contains(typed_surface),
+            "workers/source hard cut regressed; local scheduled-group typed helper drifted away from the direct typed path: {typed_surface}",
+        );
+    }
+}
+
+#[test]
+fn source_server_snapshot_requests_use_local_typed_helpers() {
+    let source_impl = include_str!("../source.rs");
+    let source_server_impl = include_str!("../source_server.rs");
+
+    for typed_surface in [
+        "pub(crate) fn logical_roots_snapshot_with_failure(",
+        "pub(crate) fn host_object_grants_snapshot_with_failure(",
+        "pub(crate) fn host_object_grants_version_snapshot_with_failure(",
+        "pub(crate) fn status_snapshot_with_failure(",
+        "pub(crate) fn progress_snapshot_with_failure(",
+        "fn source_observability_snapshot_with_failure(",
+        "match source.logical_roots_snapshot_with_failure() {",
+        "match source.host_object_grants_snapshot_with_failure() {",
+        "match source.host_object_grants_version_snapshot_with_failure() {",
+        "match source.status_snapshot_with_failure() {",
+        "match source.progress_snapshot_with_failure() {",
+        "match source_observability_snapshot_with_failure(",
+    ] {
+        assert!(
+            source_impl.contains(typed_surface) || source_server_impl.contains(typed_surface),
+            "workers/source hard cut regressed; source server snapshot request path should stay on local typed helpers: {typed_surface}",
+        );
+    }
+
+    for legacy_surface in [
+        "SourceWorkerResponse::LogicalRoots(source.logical_roots_snapshot())",
+        "SourceWorkerResponse::HostObjectGrants(source.host_object_grants_snapshot())",
+        "source.host_object_grants_version_snapshot(),",
+        "SourceWorkerResponse::StatusSnapshot(source.status_snapshot())",
+        "SourceWorkerResponse::ProgressSnapshot(source.progress_snapshot())",
+        "SourceWorkerResponse::ObservabilitySnapshot(source_observability_snapshot(",
+    ] {
+        assert!(
+            !source_server_impl.contains(legacy_surface),
+            "workers/source hard cut regressed; source server snapshot request path bounced back through a raw local wrapper: {legacy_surface}",
+        );
+    }
+}
+
+#[test]
+fn source_local_snapshot_typed_helpers_do_not_bounce_through_raw_wrappers() {
+    let source_impl = include_str!("../source.rs");
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+
+    for legacy_bounce in [
+        "Ok(self.logical_roots_snapshot())",
+        "Ok(self.host_object_grants_snapshot())",
+        "Ok(self.host_object_grants_version_snapshot())",
+        "Ok(self.status_snapshot())",
+        "Ok(self.progress_snapshot())",
+    ] {
+        assert!(
+            !source_impl.contains(legacy_bounce),
+            "workers/source hard cut regressed; local snapshot typed helper bounced back through a raw wrapper: {legacy_bounce}",
+        );
+    }
+
+    assert!(
+        !source_impl
+            .contains("pub async fn host_object_grants_version_snapshot(&self) -> Result<u64> {"),
+        "workers/source hard cut regressed; zero-call raw grants-version wrapper should stay removed",
+    );
+    assert!(
+        !source_impl.contains(
+            "pub async fn host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {"
+        ),
+        "workers/source hard cut regressed; zero-call raw grants wrapper should stay removed",
+    );
+    assert!(
+        !source_impl
+            .contains("pub async fn status_snapshot(&self) -> Result<SourceStatusSnapshot> {"),
+        "workers/source hard cut regressed; zero-call raw status wrapper should stay removed",
+    );
+    assert!(
+        !source_impl
+            .contains("pub async fn logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {"),
+        "workers/source hard cut regressed; zero-call raw logical-roots wrapper should stay removed",
+    );
+    assert!(
+        !source_impl.contains("pub async fn last_force_find_runner_by_group_snapshot("),
+        "workers/source hard cut regressed; zero-call raw last-runner wrapper should stay removed",
+    );
+    assert!(
+        !source_impl.contains(
+            "pub async fn force_find_inflight_groups_snapshot(&self) -> Result<Vec<String>> {"
+        ),
+        "workers/source hard cut regressed; zero-call raw inflight-groups wrapper should stay removed",
+    );
+    assert!(
+        !source_impl.contains("pub async fn resolve_group_id_for_object_ref("),
+        "workers/source hard cut regressed; zero-call raw resolve-group wrapper should stay removed",
+    );
+    assert!(
+        !source_impl.contains("pub async fn lifecycle_state_label(&self) -> Result<String> {"),
+        "workers/source hard cut regressed; zero-call raw lifecycle-state wrapper should stay removed",
+    );
+    assert!(
+        !source_impl.contains("pub async fn source_primary_by_group_snapshot("),
+        "workers/source hard cut regressed; zero-call raw source-primary wrapper should stay removed",
+    );
+    assert!(
+        !source_impl.contains("async fn reconnect_shared_worker_client(&self) -> Result<()> {"),
+        "workers/source hard cut regressed; zero-call raw reconnect-shared-worker wrapper should stay removed",
+    );
+    assert!(
+        !source_impl.contains("pub async fn force_find_via_node("),
+        "workers/source hard cut regressed; zero-call raw force-find-via-node wrapper should stay removed",
+    );
+    assert!(
+        !source_impl.contains("pub async fn publish_manual_rescan_signal(&self) -> Result<()> {"),
+        "workers/source hard cut regressed; zero-call raw manual-rescan wrapper should stay removed",
+    );
+    assert!(
+        !source_impl.contains(
+            "pub async fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {"
+        ),
+        "workers/source hard cut regressed; zero-call raw update-roots wrapper should stay removed",
+    );
+    assert!(
+        !source_impl.contains(
+            "pub(crate) async fn observability_snapshot(&self) -> Result<SourceObservabilitySnapshot> {"
+        ),
+        "workers/source hard cut regressed; zero-call raw observability wrapper should stay removed",
+    );
+    assert!(
+        !source_impl.contains(
+            "pub async fn force_find(&self, params: InternalQueryRequest) -> Result<Vec<Event>> {"
+        ),
+        "workers/source hard cut regressed; zero-call raw worker force-find wrapper should stay removed",
+    );
+    assert!(
+        !source_impl.contains(
+            "pub async fn force_find(&self, params: &InternalQueryRequest) -> Result<Vec<Event>> {"
+        ),
+        "workers/source hard cut regressed; zero-call raw facade force-find wrapper should stay removed",
+    );
+
+    for typed_surface in [
+        "Ok(self.snapshot_logical_roots())",
+        "Ok(self.snapshot_host_object_grants())",
+        "Ok(self.snapshot_host_object_grants_version())",
+        "Ok(self.build_status_snapshot())",
+        "Ok(self.build_progress_snapshot())",
+        "pub(crate) fn snapshot_logical_roots(&self) -> Vec<RootSpec> {",
+        "pub(crate) fn snapshot_host_object_grants(&self) -> Vec<GrantedMountRoot> {",
+        "pub(crate) fn snapshot_host_object_grants_version(&self) -> u64 {",
+        "pub(crate) fn build_status_snapshot(&self) -> SourceStatusSnapshot {",
+        "pub(crate) fn build_progress_snapshot(&self) -> SourceProgressSnapshot {",
+    ] {
+        let haystack = if typed_surface.starts_with("pub(crate) fn ") {
+            source_runtime_impl
+        } else {
+            source_impl
+        };
+        assert!(
+            haystack.contains(typed_surface),
+            "workers/source hard cut regressed; local snapshot typed helper drifted away from the direct typed path: {typed_surface}",
+        );
+    }
+}
+
+#[test]
+fn source_local_metadata_and_observability_sidecar_use_direct_internal_snapshots() {
+    let source_impl = include_str!("../source.rs");
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+
+    for legacy_bounce in [
+        "Ok(format!(\"{:?}\", self.state()).to_ascii_lowercase())",
+        "Ok(self.source_primary_by_group_snapshot())",
+        "Ok(self.last_force_find_runner_by_group_snapshot())",
+        "Ok(self.force_find_inflight_groups_snapshot())",
+        "Ok(self.resolve_group_id_for_object_ref(object_ref))",
+        "lifecycle_state: format!(\"{:?}\", source.state()).to_ascii_lowercase(),",
+        "let grants = source.host_object_grants_snapshot();",
+        "let status = source.status_snapshot();",
+        "source.last_force_find_runner_by_group_snapshot();",
+        "source.force_find_inflight_groups_snapshot();",
+        "source.scheduled_source_group_ids()",
+        "source.scheduled_scan_group_ids()",
+        "host_object_grants_version: source.host_object_grants_version_snapshot(),",
+        "logical_roots: source.logical_roots_snapshot(),",
+        "source_primary_by_group: source.source_primary_by_group_snapshot(),",
+        "last_control_frame_signals_snapshot: source.last_control_frame_signals_snapshot(),",
+        "source.scheduled_source_group_ids_snapshot()",
+        "source.scheduled_scan_group_ids_snapshot()",
+    ] {
+        assert!(
+            !source_impl.contains(legacy_bounce),
+            "workers/source hard cut regressed; local metadata/observability path bounced back through a raw wrapper: {legacy_bounce}",
+        );
+    }
+
+    for typed_surface in [
+        "Ok(self.snapshot_lifecycle_state_label())",
+        "Ok(self.snapshot_source_primary_by_group())",
+        "Ok(self.snapshot_last_force_find_runner_by_group())",
+        "Ok(self.snapshot_force_find_inflight_groups())",
+        "Ok(self.snapshot_group_id_for_object_ref(object_ref))",
+        "lifecycle_state: source.snapshot_lifecycle_state_label(),",
+        "let grants = source.snapshot_host_object_grants();",
+        "let status = source.build_status_snapshot();",
+        "let last_force_find_runner_by_group = source.snapshot_last_force_find_runner_by_group();",
+        "let force_find_inflight_groups = source.snapshot_force_find_inflight_groups();",
+        "source.snapshot_scheduled_source_group_ids()",
+        "source.snapshot_scheduled_scan_group_ids()",
+        "host_object_grants_version: source.snapshot_host_object_grants_version(),",
+        "logical_roots: source.snapshot_logical_roots(),",
+        "source_primary_by_group: source.snapshot_source_primary_by_group(),",
+        "last_control_frame_signals_snapshot: source.snapshot_last_control_frame_signals(),",
+        "pub(crate) fn snapshot_scheduled_source_group_ids(",
+        "pub(crate) fn snapshot_scheduled_scan_group_ids(",
+        "pub(crate) fn snapshot_lifecycle_state_label(&self) -> String {",
+        "pub(crate) fn snapshot_group_id_for_object_ref(&self, object_ref: &str) -> Option<String> {",
+        "pub(crate) fn snapshot_source_primary_by_group(&self) -> BTreeMap<String, String> {",
+        "pub(crate) fn snapshot_force_find_inflight_groups(&self) -> Vec<String> {",
+        "pub(crate) fn snapshot_last_force_find_runner_by_group(&self) -> BTreeMap<String, String> {",
+        "pub(crate) fn snapshot_last_control_frame_signals(&self) -> Vec<String> {",
+    ] {
+        let haystack = if typed_surface.starts_with("pub(crate) fn snapshot_") {
+            source_runtime_impl
+        } else {
+            source_impl
+        };
+        assert!(
+            haystack.contains(typed_surface),
+            "workers/source hard cut regressed; local metadata/observability path drifted away from the direct internal snapshot shape: {typed_surface}",
+        );
+    }
+}
+
+#[test]
+fn source_server_metadata_requests_use_local_typed_helpers() {
+    let source_impl = include_str!("../source.rs");
+    let source_server_impl = include_str!("../source_server.rs");
+
+    for typed_surface in [
+        "pub(crate) fn lifecycle_state_label_with_failure(",
+        "pub(crate) fn source_primary_by_group_snapshot_with_failure(",
+        "pub(crate) fn last_force_find_runner_by_group_snapshot_with_failure(",
+        "pub(crate) fn force_find_inflight_groups_snapshot_with_failure(",
+        "pub(crate) fn resolve_group_id_for_object_ref_with_failure(",
+        "pub(crate) async fn trigger_rescan_when_ready_epoch_with_failure(",
+        "fn source_force_find_debug_metadata(",
+        "match source.lifecycle_state_label_with_failure() {",
+        "match source.source_primary_by_group_snapshot_with_failure() {",
+        "match source.last_force_find_runner_by_group_snapshot_with_failure() {",
+        "match source.force_find_inflight_groups_snapshot_with_failure() {",
+        ".resolve_group_id_for_object_ref_with_failure(&object_ref)",
+        "match source.trigger_rescan_when_ready_epoch_with_failure().await {",
+        "source_force_find_debug_metadata(source)",
+    ] {
+        assert!(
+            source_impl.contains(typed_surface) || source_server_impl.contains(typed_surface),
+            "workers/source hard cut regressed; source server metadata request path should stay on local typed helpers: {typed_surface}",
+        );
+    }
+
+    for legacy_surface in [
+        "format!(\"{:?}\", source.state()).to_ascii_lowercase()",
+        "SourceWorkerResponse::SourcePrimaryByGroup(\n                    source.source_primary_by_group_snapshot(),",
+        "SourceWorkerResponse::LastForceFindRunnerByGroup(\n                    source.last_force_find_runner_by_group_snapshot(),",
+        "SourceWorkerResponse::ForceFindInflightGroups(\n                    source.force_find_inflight_groups_snapshot(),",
+        "SourceWorkerResponse::ResolveGroupIdForObjectRef(\n                        source.resolve_group_id_for_object_ref(&object_ref),",
+        "let epoch = source.trigger_rescan_when_ready_epoch_with_failure().await;",
+        "&source.last_force_find_runner_by_group_snapshot()",
+        "source.force_find_inflight_groups_snapshot()",
+    ] {
+        assert!(
+            !source_server_impl.contains(legacy_surface),
+            "workers/source hard cut regressed; source server metadata request path bounced back through a raw local surface: {legacy_surface}",
+        );
+    }
+}
+
+#[test]
+fn source_facade_local_snapshot_metadata_and_progress_helpers_use_local_typed_helpers() {
+    let source_impl = include_str!("../source.rs");
+
+    for typed_surface in [
+        "Self::Local(source) => source.logical_roots_snapshot_with_failure(),",
+        "Self::Local(source) => source.host_object_grants_snapshot_with_failure(),",
+        "Self::Local(source) => source.host_object_grants_version_snapshot_with_failure(),",
+        "Self::Local(source) => source.status_snapshot_with_failure(),",
+        "Self::Local(source) => source.lifecycle_state_label_with_failure(),",
+        "Self::Local(source) => source.source_primary_by_group_snapshot_with_failure(),",
+        "Self::Local(source) => source.last_force_find_runner_by_group_snapshot_with_failure(),",
+        "Self::Local(source) => source.force_find_inflight_groups_snapshot_with_failure(),",
+        "Self::Local(source) => source.resolve_group_id_for_object_ref_with_failure(object_ref),",
+        "Self::Local(source) => source.progress_snapshot_with_failure(),",
+    ] {
+        assert!(
+            source_impl.contains(typed_surface),
+            "workers/source hard cut regressed; source facade local snapshot/metadata/progress path should stay on local typed helpers: {typed_surface}",
+        );
+    }
+}
+
+#[test]
+fn source_facade_cached_snapshot_local_branches_use_typed_helpers() {
+    let source_impl = include_str!("../source.rs");
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+
+    for typed_surface in [
+        "pub(crate) fn cached_logical_roots_snapshot_with_failure(",
+        "Self::Local(source) => source.cached_logical_roots_snapshot_with_failure(),",
+        "pub(crate) fn cached_host_object_grants_snapshot_with_failure(",
+        "Self::Local(source) => source.cached_host_object_grants_snapshot_with_failure(),",
+        "Ok(self.snapshot_cached_logical_roots())",
+        "Ok(self.snapshot_cached_host_object_grants())",
+    ] {
+        assert!(
+            source_impl.contains(typed_surface),
+            "workers/source hard cut regressed; source facade cached local branch should stay on a typed helper: {typed_surface}",
+        );
+    }
+
+    for typed_surface in [
+        "pub(crate) fn snapshot_cached_logical_roots(&self) -> Vec<RootSpec> {",
+        "pub(crate) fn snapshot_cached_host_object_grants(&self) -> Vec<GrantedMountRoot> {",
+    ] {
+        assert!(
+            source_runtime_impl.contains(typed_surface),
+            "workers/source hard cut regressed; source facade cached local branch should stay on a typed helper: {typed_surface}",
+        );
+    }
+
+    for legacy_surface in [
+        "Self::Local(source) => Ok(source.logical_roots_snapshot()),",
+        "Self::Local(source) => Ok(source.host_object_grants_snapshot()),",
+    ] {
+        assert!(
+            !source_impl.contains(legacy_surface),
+            "workers/source hard cut regressed; source facade cached local branch bounced back through a raw getter: {legacy_surface}",
+        );
+    }
+
+    for removed_surface in [
+        "self.cached_logical_roots_snapshot_with_failure()\n            .map_err(SourceFailure::into_error)",
+        "self.cached_host_object_grants_snapshot_with_failure()\n            .map_err(SourceFailure::into_error)",
+        "pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {",
+        "pub fn cached_host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {",
+    ] {
+        assert!(
+            !source_impl.contains(removed_surface),
+            "workers/source hard cut regressed; zero-call raw cached source wrappers should stay removed: {removed_surface}",
+        );
+    }
+}
+
+#[test]
+fn source_facade_trigger_rescan_local_branch_uses_typed_helper() {
+    let source_impl = include_str!("../source.rs");
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+
+    for typed_surface in [
+        "pub(crate) async fn trigger_rescan_when_ready_epoch_with_failure(\n        &self,\n    ) -> std::result::Result<u64, SourceFailure> {\n        Ok(self.perform_trigger_rescan_when_ready_epoch().await)\n    }",
+        "Self::Local(source) => source.trigger_rescan_when_ready_epoch_with_failure().await,",
+        "pub(crate) async fn perform_trigger_rescan_when_ready_epoch(&self) -> u64 {",
+    ] {
+        let haystack = if typed_surface.starts_with("pub(crate) async fn perform_") {
+            source_runtime_impl
+        } else {
+            source_impl
+        };
+        assert!(
+            haystack.contains(typed_surface),
+            "workers/source hard cut regressed; source facade/local trigger-rescan path should stay on a typed helper: {typed_surface}",
+        );
+    }
+
+    assert!(
+        !source_impl
+            .contains("Self::Local(source) => Ok(source.trigger_rescan_when_ready_epoch_with_failure().await),"),
+        "workers/source hard cut regressed; source facade trigger-rescan local branch bounced back through the raw runtime method",
+    );
+
+    for removed_surface in [
+        "pub async fn trigger_rescan_when_ready_epoch(&self) -> Result<u64> {",
+        "pub(crate) async fn trigger_rescan_when_ready_epoch(&self) -> Result<u64> {",
+    ] {
+        assert!(
+            !source_impl.contains(removed_surface),
+            "workers/source hard cut regressed; zero-call raw trigger-rescan wrappers should stay removed: {removed_surface}",
+        );
+    }
+}
+
+#[test]
+fn source_facade_apply_orchestration_local_branch_uses_typed_helper() {
+    let source_impl = include_str!("../source.rs");
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+
+    for typed_surface in [
+        "pub(crate) async fn apply_orchestration_signals_with_failure(",
+        "Self::Local(source) => map_source_failure_timeout_result(",
+        "source.apply_orchestration_signals_with_failure(signals),",
+        "self.perform_apply_orchestration_signals(signals)\n            .await\n            .map_err(SourceFailure::from)",
+    ] {
+        assert!(
+            source_impl.contains(typed_surface) || source_runtime_impl.contains(typed_surface),
+            "workers/source hard cut regressed; source facade local apply-orchestration lane should stay on a typed helper: {typed_surface}",
+        );
+    }
+
+    for legacy_surface in [
+        "Self::Local(source) => map_source_timeout_result_with_failure(",
+        "source.apply_orchestration_signals(signals),",
+        "self.apply_orchestration_signals(signals)\n            .await\n            .map_err(SourceFailure::from)",
+        "pub(crate) async fn apply_orchestration_signals_with_total_timeout(",
+    ] {
+        assert!(
+            !source_impl.contains(legacy_surface),
+            "workers/source hard cut regressed; source facade local apply-orchestration lane bounced back through a raw helper: {legacy_surface}",
+        );
+    }
+}
+
+#[test]
+fn source_facade_local_observability_branches_use_local_typed_helpers() {
+    let source_impl = include_str!("../source.rs");
+
+    for typed_surface in [
+        "fn local_observability_snapshot(&self) -> SourceObservabilitySnapshot {",
+        "pub(crate) fn observability_snapshot_with_failure(",
+        "pub(crate) fn observability_snapshot_nonblocking_for_status_route(",
+        "Self::Local(source) => source.observability_snapshot_with_failure(),",
+        "Self::Local(source) => source.observability_snapshot_nonblocking_for_status_route(),",
+    ] {
+        assert!(
+            source_impl.contains(typed_surface),
+            "workers/source hard cut regressed; source facade/local observability path should stay on local typed helpers: {typed_surface}",
+        );
+    }
+
+    for legacy_surface in [
+        "let snapshot = build_local_source_observability_snapshot(source);",
+        "source.maybe_mark_rescan_observed_if_publication_advanced(",
+        "Self::Local(source) => {\n                source\n                    .observability_snapshot_nonblocking_for_status_route()\n                    .0\n            }",
+    ] {
+        let facade_region = &source_impl[8330..8460.min(source_impl.len())];
+        assert!(
+            !facade_region.contains(legacy_surface),
+            "workers/source hard cut regressed; source facade local observability branch bounced back through inline local snapshot shaping: {legacy_surface}",
+        );
+    }
+
+    for removed_surface in [
+        "pub(crate) async fn observability_snapshot_nonblocking(&self) -> SourceObservabilitySnapshot {",
+        "pub(crate) fn observability_snapshot_nonblocking(&self) -> SourceObservabilitySnapshot {",
+        "Self::Local(source) => source.observability_snapshot_nonblocking(),",
+        "Self::Worker(client) => client.observability_snapshot_nonblocking().await,",
+    ] {
+        assert!(
+            !source_impl.contains(removed_surface),
+            "workers/source hard cut regressed; raw observability nonblocking compatibility wrapper should stay removed: {removed_surface}",
+        );
+    }
+}
+
+#[test]
+fn source_local_force_find_typed_helper_does_not_bounce_through_raw_wrapper() {
+    let source_impl = include_str!("../source.rs");
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+
+    assert!(
+        !source_impl.contains("self.force_find(params).map_err(SourceFailure::from)"),
+        "workers/source hard cut regressed; local force-find typed helper bounced back through the raw wrapper",
+    );
+    assert!(
+        source_impl.contains("self.perform_force_find(params).map_err(SourceFailure::from)"),
+        "workers/source hard cut regressed; local force-find typed helper should call the direct runtime helper",
+    );
+    assert!(
+        source_runtime_impl.contains("pub(crate) fn perform_force_find(&self, params: &InternalQueryRequest) -> Result<Vec<Event>> {"),
+        "workers/source hard cut regressed; source runtime should expose a direct force-find helper instead of forcing typed callers back through the raw wrapper",
+    );
+}
+
+#[test]
+fn source_local_runtime_endpoint_typed_helpers_do_not_bounce_through_raw_wrappers() {
+    let source_impl = include_str!("../source.rs");
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+
+    for legacy_bounce in [
+        "self.pub_().await.map_err(SourceFailure::from)",
+        "self.start_runtime_endpoints(boundary)\n            .await\n            .map_err(SourceFailure::from)",
+    ] {
+        assert!(
+            !source_impl.contains(legacy_bounce),
+            "workers/source hard cut regressed; local runtime-endpoint typed helper bounced back through a raw wrapper: {legacy_bounce}",
+        );
+    }
+    for typed_surface in [
+        "self.build_pub_stream().await.map_err(SourceFailure::from)",
+        "self.start_runtime_endpoints_on_boundary(boundary)\n            .await\n            .map_err(SourceFailure::from)",
+        "pub(crate) async fn build_pub_stream(",
+        "pub(crate) async fn start_runtime_endpoints_on_boundary(",
+    ] {
+        let haystack = if typed_surface.starts_with("pub(crate) async fn") {
+            source_runtime_impl
+        } else {
+            source_impl
+        };
+        assert!(
+            haystack.contains(typed_surface),
+            "workers/source hard cut regressed; local runtime-endpoint typed helper drifted away from the direct typed path: {typed_surface}",
+        );
+    }
+}
+
+#[test]
+fn source_local_constructor_typed_helper_does_not_bounce_through_raw_wrapper() {
+    let source_impl = include_str!("../source.rs");
+    let source_runtime_impl = include_str!("../../source/mod.rs");
+
+    assert!(
+        !source_impl.contains(
+            "Self::with_boundaries_and_state(config, node_id, boundary, state_boundary)\n            .map_err(SourceFailure::from)"
+        ),
+        "workers/source hard cut regressed; local constructor typed helper bounced back through the raw wrapper",
+    );
+    assert!(
+        source_impl.contains(
+            "Self::with_boundaries_and_state_internal(config, node_id, boundary, state_boundary, false)\n            .map_err(SourceFailure::from)"
+        ),
+        "workers/source hard cut regressed; local constructor typed helper should call the direct runtime helper",
+    );
+    assert!(
+        source_runtime_impl.contains("pub(crate) fn with_boundaries_and_state_internal("),
+        "workers/source hard cut regressed; source runtime should expose a direct constructor helper instead of forcing typed callers back through the raw wrapper",
     );
 }
 
@@ -2439,7 +3159,7 @@ fn selected_group_tree_contains_path(
     expected_path: &[u8],
 ) -> bool {
     let events = sink
-        .materialized_query(&selected_group_request(query_path, group_id))
+        .materialized_query_with_failure(&selected_group_request(query_path, group_id))
         .expect("selected-group materialized query");
     events.iter().any(|event| {
         let payload = rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes())
@@ -3373,7 +4093,7 @@ async fn publish_manual_rescan_signal_succeeds_without_started_worker_and_update
     let offset = signal.current_seq();
 
     client
-        .publish_manual_rescan_signal()
+        .publish_manual_rescan_signal_with_failure()
         .await
         .expect("publish manual rescan signal without started worker");
 
@@ -3464,7 +4184,7 @@ async fn external_source_worker_manual_rescan_replays_baseline_batches_for_fresh
 
     tokio::time::timeout(
         Duration::from_secs(8),
-        client.publish_manual_rescan_signal(),
+        client.publish_manual_rescan_signal_with_failure(),
     )
     .await
     .expect("manual rescan publish timed out")
@@ -3583,7 +4303,7 @@ async fn external_source_worker_emits_initial_and_manual_rescan_batches_for_each
     .expect("append nfs2 file");
     tokio::time::timeout(
         Duration::from_secs(8),
-        client.publish_manual_rescan_signal(),
+        client.publish_manual_rescan_signal_with_failure(),
     )
     .await
     .expect("manual rescan publish timed out")
@@ -3665,7 +4385,7 @@ async fn external_source_worker_force_find_updates_last_runner_snapshot_and_obse
 
     let params = selected_group_force_find_request("nfs1");
     let first = client
-        .force_find(params.clone())
+        .force_find_with_failure(params.clone())
         .await
         .expect("first force-find over worker");
     assert!(
@@ -3673,7 +4393,7 @@ async fn external_source_worker_force_find_updates_last_runner_snapshot_and_obse
         "first worker force-find should return at least one response event"
     );
     let first_runner = client
-        .last_force_find_runner_by_group_snapshot()
+        .last_force_find_runner_by_group_snapshot_with_failure()
         .await
         .expect("first last-runner snapshot");
     assert_eq!(
@@ -3682,7 +4402,7 @@ async fn external_source_worker_force_find_updates_last_runner_snapshot_and_obse
     );
 
     let second = client
-        .force_find(params.clone())
+        .force_find_with_failure(params.clone())
         .await
         .expect("second force-find over worker");
     assert!(
@@ -3690,7 +4410,7 @@ async fn external_source_worker_force_find_updates_last_runner_snapshot_and_obse
         "second worker force-find should return at least one response event"
     );
     let second_runner = client
-        .last_force_find_runner_by_group_snapshot()
+        .last_force_find_runner_by_group_snapshot_with_failure()
         .await
         .expect("second last-runner snapshot");
     assert_eq!(
@@ -3699,7 +4419,7 @@ async fn external_source_worker_force_find_updates_last_runner_snapshot_and_obse
     );
 
     let third = client
-        .force_find(params)
+        .force_find_with_failure(params)
         .await
         .expect("third force-find over worker");
     assert!(
@@ -3707,7 +4427,7 @@ async fn external_source_worker_force_find_updates_last_runner_snapshot_and_obse
         "third worker force-find should return at least one response event"
     );
     let third_runner = client
-        .last_force_find_runner_by_group_snapshot()
+        .last_force_find_runner_by_group_snapshot_with_failure()
         .await
         .expect("third last-runner snapshot");
     assert_eq!(
@@ -3716,7 +4436,7 @@ async fn external_source_worker_force_find_updates_last_runner_snapshot_and_obse
     );
 
     let observability = SourceFacade::Worker(client.clone().into())
-        .observability_snapshot()
+        .observability_snapshot_with_failure()
         .await
         .expect("worker observability snapshot after force-find");
     assert_eq!(
@@ -3768,7 +4488,7 @@ async fn external_source_worker_force_find_preserves_last_runner_in_degraded_obs
         .expect("start source worker");
 
     let events = client
-        .force_find(selected_group_force_find_request("nfs1"))
+        .force_find_with_failure(selected_group_force_find_request("nfs1"))
         .await
         .expect("force-find over worker");
     assert!(
@@ -3782,8 +4502,9 @@ async fn external_source_worker_force_find_preserves_last_runner_in_degraded_obs
         .expect("shutdown source worker after force-find");
 
     let observability = SourceFacade::Worker(client.clone().into())
-        .observability_snapshot_nonblocking()
-        .await;
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     assert_eq!(
         observability
             .last_force_find_runner_by_group
@@ -3858,7 +4579,7 @@ async fn external_source_worker_force_find_retries_unexpected_correlation_protoc
 
     let events = tokio::time::timeout(
             Duration::from_secs(4),
-            client.force_find(selected_group_force_find_request("nfs1")),
+            client.force_find_with_failure(selected_group_force_find_request("nfs1")),
         )
         .await
         .expect(
@@ -3879,7 +4600,7 @@ async fn external_source_worker_force_find_retries_unexpected_correlation_protoc
     );
 
     let runner = client
-        .last_force_find_runner_by_group_snapshot()
+        .last_force_find_runner_by_group_snapshot_with_failure()
         .await
         .expect("last runner snapshot after unexpected-correlation recovery");
     assert_eq!(
@@ -3926,7 +4647,7 @@ async fn logical_roots_snapshot_uses_cached_roots_when_worker_resets_mid_handoff
         .expect("start source worker");
 
     let initial_roots = client
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
         .expect("initial logical roots snapshot");
     assert_eq!(
@@ -3941,7 +4662,7 @@ async fn logical_roots_snapshot_uses_cached_roots_when_worker_resets_mid_handoff
     client.close().await.expect("close source worker");
 
     let cached_roots = client
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
         .expect("cached logical roots snapshot after worker reset");
     assert_eq!(
@@ -3989,7 +4710,7 @@ async fn host_object_grants_snapshot_uses_cached_grants_when_worker_resets_mid_h
         .expect("start source worker");
 
     let initial_grants = client
-        .host_object_grants_snapshot()
+        .host_object_grants_snapshot_with_failure()
         .await
         .expect("initial host-object grants snapshot");
     assert_eq!(
@@ -4004,7 +4725,7 @@ async fn host_object_grants_snapshot_uses_cached_grants_when_worker_resets_mid_h
     client.close().await.expect("close source worker");
 
     let cached_grants = client
-        .host_object_grants_snapshot()
+        .host_object_grants_snapshot_with_failure()
         .await
         .expect("cached host-object grants snapshot after worker reset");
     assert_eq!(
@@ -4085,7 +4806,7 @@ async fn status_snapshot_retries_stale_drained_fenced_pid_errors() {
             ),
         });
 
-    let snapshot = client.status_snapshot().await.expect(
+    let snapshot = client.status_snapshot_with_failure().await.expect(
         "status_snapshot should retry a stale drained/fenced pid error and reach the live worker",
     );
 
@@ -4203,7 +4924,10 @@ async fn observability_snapshot_nonblocking_retries_stale_drained_fenced_pid_err
             ),
         });
 
-    let snapshot = client.observability_snapshot_nonblocking().await;
+    let snapshot = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     let expected = vec!["nfs1".to_string(), "nfs2".to_string()];
     assert_ne!(
         snapshot.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
@@ -4332,7 +5056,10 @@ async fn observability_snapshot_nonblocking_retries_bound_route_unexpected_corre
         ),
     });
 
-    let snapshot = client.observability_snapshot_nonblocking().await;
+    let snapshot = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     let expected = vec!["nfs1".to_string(), "nfs2".to_string()];
     assert_ne!(
         snapshot.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
@@ -4457,7 +5184,10 @@ async fn observability_snapshot_nonblocking_retries_peer_bridge_stopped_errors_a
         err: CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
     });
 
-    let snapshot = client.observability_snapshot_nonblocking().await;
+    let snapshot = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     let expected = vec!["nfs1".to_string(), "nfs2".to_string()];
     assert_ne!(
         snapshot.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
@@ -4605,7 +5335,7 @@ async fn update_logical_roots_replays_start_after_runtime_reverts_to_initialized
 
     tokio::time::timeout(
         Duration::from_secs(5),
-        client.update_logical_roots(vec![
+        client.update_logical_roots_with_failure(vec![
             worker_source_root("nfs1", &nfs1),
             worker_source_root("nfs2", &nfs2),
         ]),
@@ -4615,7 +5345,7 @@ async fn update_logical_roots_replays_start_after_runtime_reverts_to_initialized
     .expect("update_logical_roots should replay Start and reach the live worker");
 
     let roots = client
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
         .expect("logical roots snapshot after bootstrap replay");
     assert_eq!(
@@ -4680,7 +5410,7 @@ async fn update_logical_roots_reacquires_worker_client_after_transport_closes_mi
         let nfs2 = nfs2.clone();
         async move {
             client
-                .update_logical_roots(vec![
+                .update_logical_roots_with_failure(vec![
                     worker_source_root("nfs1", &nfs1),
                     worker_source_root("nfs2", &nfs2),
                 ])
@@ -4706,7 +5436,7 @@ async fn update_logical_roots_reacquires_worker_client_after_transport_closes_mi
         .expect("update_logical_roots after worker restart");
 
     let roots = client
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
         .expect("logical roots snapshot after update");
     assert_eq!(
@@ -5526,7 +6256,7 @@ async fn distinct_worker_bindings_share_started_source_worker_client_on_same_nod
     );
 
     let roots = successor
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
         .expect("successor logical_roots_snapshot through shared started worker");
     assert_eq!(
@@ -5721,7 +6451,7 @@ async fn concurrent_recovery_starts_on_same_shared_source_handle_serialize_worke
         .expect("successor recovery start");
 
     let roots = successor
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
         .expect("logical roots snapshot after serialized recovery start");
     assert_eq!(
@@ -5847,7 +6577,7 @@ async fn update_logical_roots_waits_for_shared_control_frame_handoff_before_disp
         let nfs2 = nfs2.clone();
         async move {
             update_client
-                .update_logical_roots(vec![
+                .update_logical_roots_with_failure(vec![
                     worker_source_root("nfs1", &nfs1),
                     worker_source_root("nfs2", &nfs2),
                 ])
@@ -5876,7 +6606,7 @@ async fn update_logical_roots_waits_for_shared_control_frame_handoff_before_disp
         .expect("update logical roots after shared control handoff");
 
     let roots = update_client
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
         .expect("logical roots snapshot after shared handoff");
     assert_eq!(
@@ -5956,7 +6686,7 @@ async fn close_keeps_shared_source_worker_client_alive_when_another_handle_still
     );
 
     let roots = successor
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
         .expect("successor source logical_roots_snapshot after predecessor close");
     assert_eq!(
@@ -6019,7 +6749,7 @@ async fn update_logical_roots_retries_stale_drained_fenced_pid_errors() {
         });
 
     client
-            .update_logical_roots(vec![
+            .update_logical_roots_with_failure(vec![
                 worker_source_root("nfs1", &nfs1),
                 worker_source_root("nfs2", &nfs2),
             ])
@@ -6029,7 +6759,7 @@ async fn update_logical_roots_retries_stale_drained_fenced_pid_errors() {
             );
 
     let roots = client
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
         .expect("logical roots snapshot after stale-pid retry");
     assert_eq!(
@@ -6088,7 +6818,7 @@ async fn update_logical_roots_contraction_drops_removed_roots_from_snapshot_imme
         .expect("start source worker");
 
     let initial_roots = client
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
         .expect("initial logical roots snapshot");
     assert_eq!(
@@ -6101,12 +6831,12 @@ async fn update_logical_roots_contraction_drops_removed_roots_from_snapshot_imme
     );
 
     client
-        .update_logical_roots(vec![worker_source_root("nfs1", &nfs1)])
+        .update_logical_roots_with_failure(vec![worker_source_root("nfs1", &nfs1)])
         .await
         .expect("shrink logical roots to single root");
 
     let roots = client
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
         .expect("logical roots snapshot after contraction");
     assert_eq!(
@@ -6781,10 +7511,11 @@ async fn multi_restart_deferred_retire_pending_source_cleanup_wave_through_sourc
     let started = std::time::Instant::now();
     let err = tokio::time::timeout(
         Duration::from_secs(2),
-        SourceFacade::Worker(client.clone().into()).apply_orchestration_signals_with_total_timeout(
-            &cleanup_signals,
-            SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT,
-        ),
+        SourceFacade::Worker(client.clone().into())
+            .apply_orchestration_signals_with_total_timeout_with_failure(
+                &cleanup_signals,
+                SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT,
+            ),
     )
     .await
     .expect("cleanup wave should settle within the short source-owned timeout budget")
@@ -6793,7 +7524,7 @@ async fn multi_restart_deferred_retire_pending_source_cleanup_wave_through_sourc
     );
 
     assert!(
-        !matches!(err, CnxError::Timeout),
+        !matches!(err.as_error(), CnxError::Timeout),
         "restart_deferred_retire_pending cleanup wave should return the bridge reset error instead of collapsing to timeout through the source-owned budget: err={err:?}"
     );
     assert!(
@@ -7628,7 +8359,7 @@ async fn tick_only_followup_replays_retained_activates_before_forwarding_same_ge
 
     let previous_instance_id = client.worker_instance_id_for_tests().await;
     client
-        .reconnect_shared_worker_client()
+        .reconnect_shared_worker_client_with_failure()
         .await
         .expect("force shared worker replacement before same-generation tick");
     let next_instance_id = client.worker_instance_id_for_tests().await;
@@ -7828,14 +8559,17 @@ async fn real_source_route_on_control_frame_retries_stale_drained_fenced_pid_err
                 tokio::time::Instant::now() < deadline,
                 "{label}: timed out waiting for scheduled groups after real source route replay: source={source_groups:?} scan={scan_groups:?} grants_version={} grants={:?} logical_roots={:?} stderr={}",
                 client
-                    .host_object_grants_version_snapshot()
+                    .host_object_grants_version_snapshot_with_failure()
                     .await
                     .unwrap_or_default(),
                 client
-                    .host_object_grants_snapshot()
+                    .host_object_grants_snapshot_with_failure()
                     .await
                     .unwrap_or_default(),
-                client.logical_roots_snapshot().await.unwrap_or_default(),
+                client
+                    .logical_roots_snapshot_with_failure()
+                    .await
+                    .unwrap_or_default(),
                 worker_stderr_excerpt(worker_socket_dir),
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -8344,10 +9078,11 @@ async fn generation_two_real_source_four_envelope_wave_early_eof_after_begin_doe
 
     let err = tokio::time::timeout(
         Duration::from_secs(2),
-        SourceFacade::Worker(client.clone().into()).apply_orchestration_signals_with_total_timeout(
-            &source_wave(2),
-            SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT,
-        ),
+        SourceFacade::Worker(client.clone().into())
+            .apply_orchestration_signals_with_total_timeout_with_failure(
+                &source_wave(2),
+                SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT,
+            ),
     )
     .await
     .expect("generation-two real source route replay should settle within the short source-owned timeout budget")
@@ -8356,7 +9091,7 @@ async fn generation_two_real_source_four_envelope_wave_early_eof_after_begin_doe
     );
     assert!(
         matches!(
-            &err,
+            err.as_error(),
             CnxError::PeerError(message)
                 if message.contains("transport closed") && message.contains("early eof")
         ),
@@ -9106,7 +9841,7 @@ async fn generation_two_real_source_route_replay_required_post_ack_schedule_refr
         .expect("initial real source route wave should succeed");
 
     client
-        .reconnect_shared_worker_client()
+        .reconnect_shared_worker_client_with_failure()
         .await
         .expect("force replay-required source worker rebind");
     let replay_required_instance_id = client.worker_instance_id_for_tests().await;
@@ -9787,7 +10522,7 @@ async fn generation_two_real_source_route_post_ack_schedule_refresh_aborts_infli
 
     let stale_snapshot = tokio::spawn({
         let client = client.clone();
-        async move { client.logical_roots_snapshot().await }
+        async move { client.logical_roots_snapshot_with_failure().await }
     });
 
     entered.notified().await;
@@ -9826,7 +10561,7 @@ async fn generation_two_real_source_route_post_ack_schedule_refresh_aborts_infli
         );
     assert!(
         matches!(
-            stale_err,
+            stale_err.as_error(),
             CnxError::TransportClosed(_) | CnxError::AccessDenied(_) | CnxError::PeerError(_)
         ),
         "inflight stale pre-rebind logical_roots_snapshot should fail closed after shared-client rebind, got {stale_err:?}"
@@ -9959,7 +10694,7 @@ async fn single_root_real_source_route_on_control_frame_retries_stale_drained_fe
                 snapshot.scheduled_source_groups_by_node,
                 snapshot.scheduled_scan_groups_by_node,
                 client
-                    .host_object_grants_snapshot()
+                    .host_object_grants_snapshot_with_failure()
                     .await
                     .unwrap_or_default(),
                 worker_stderr_excerpt(worker_socket_dir),
@@ -10133,7 +10868,7 @@ async fn fs_source_selected_real_source_route_on_control_frame_retries_stale_dra
                 snapshot.scheduled_source_groups_by_node,
                 snapshot.scheduled_scan_groups_by_node,
                 client
-                    .host_object_grants_snapshot()
+                    .host_object_grants_snapshot_with_failure()
                     .await
                     .unwrap_or_default(),
                 worker_stderr_excerpt(worker_socket_dir),
@@ -10490,7 +11225,7 @@ async fn force_find_via_node_shares_runner_state_with_existing_target_worker_han
     let routed = SourceFacade::worker(routing_client);
     let params = selected_group_force_find_request("nfs1");
     let first = routed
-        .force_find_via_node(&NodeId("node-a".to_string()), &params)
+        .force_find_via_node_with_failure(&NodeId("node-a".to_string()), &params)
         .await
         .expect("routed force-find via node");
     assert!(
@@ -10499,7 +11234,7 @@ async fn force_find_via_node_shares_runner_state_with_existing_target_worker_han
     );
 
     let shared_runner = target_client
-        .last_force_find_runner_by_group_snapshot()
+        .last_force_find_runner_by_group_snapshot_with_failure()
         .await
         .expect("target handle last-runner snapshot");
     assert_eq!(
@@ -10632,7 +11367,7 @@ async fn external_source_worker_stream_batches_reach_sink_worker_for_each_schedu
             .expect("scan groups")
             .unwrap_or_default();
         let sink_groups = sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect("sink status")
             .scheduled_groups_by_node
@@ -10685,7 +11420,7 @@ async fn external_source_worker_stream_batches_reach_sink_worker_for_each_schedu
                 && data_counts.get(*origin).copied().unwrap_or(0) > 0
         });
         let nfs1_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_file, "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(selected_file, "nfs1"))
                 .await
                 .expect("query nfs1"),
             selected_file,
@@ -10693,7 +11428,7 @@ async fn external_source_worker_stream_batches_reach_sink_worker_for_each_schedu
         .expect("decode nfs1")
         .is_some();
         let nfs2_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_file, "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(selected_file, "nfs2"))
                 .await
                 .expect("query nfs2"),
             selected_file,
@@ -10723,7 +11458,7 @@ async fn external_source_worker_stream_batches_reach_sink_worker_for_each_schedu
     );
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_file, "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(selected_file, "nfs1"))
                 .await
                 .expect("query nfs1 final"),
             selected_file,
@@ -10734,7 +11469,7 @@ async fn external_source_worker_stream_batches_reach_sink_worker_for_each_schedu
     );
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_file, "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(selected_file, "nfs2"))
                 .await
                 .expect("query nfs2 final"),
             selected_file,
@@ -10845,7 +11580,7 @@ async fn external_source_worker_real_nfs_manual_rescan_publishes_newly_seeded_su
 
     tokio::time::timeout(
         Duration::from_secs(8),
-        client.publish_manual_rescan_signal(),
+        client.publish_manual_rescan_signal_with_failure(),
     )
     .await
     .expect("manual rescan publish timed out")
@@ -10974,7 +11709,7 @@ async fn external_source_worker_nonblocking_observability_can_serve_stale_publis
 
     tokio::time::timeout(
         Duration::from_secs(8),
-        client.publish_manual_rescan_signal(),
+        client.publish_manual_rescan_signal_with_failure(),
     )
     .await
     .expect("manual rescan publish timed out")
@@ -11004,7 +11739,10 @@ async fn external_source_worker_nonblocking_observability_can_serve_stale_publis
     );
 
     let inflight = client.begin_control_op();
-    let stale = client.observability_snapshot_nonblocking().await;
+    let stale = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     drop(inflight);
     assert_eq!(
         stale.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
@@ -11154,7 +11892,10 @@ async fn external_source_worker_nonblocking_observability_preserves_scheduled_gr
     );
 
     let inflight = client.begin_control_op();
-    let stale = client.observability_snapshot_nonblocking().await;
+    let stale = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     drop(inflight);
     assert_eq!(
         stale.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
@@ -11279,7 +12020,10 @@ async fn nonblocking_observability_reissues_live_rpc_when_recent_cache_is_active
         count: observability_rpc_count.clone(),
     });
 
-    let nonblocking = client.observability_snapshot_nonblocking().await;
+    let nonblocking = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
 
     assert_eq!(
         observability_rpc_count.load(Ordering::Relaxed),
@@ -11415,7 +12159,10 @@ async fn nonblocking_observability_accepts_recent_active_cache_when_only_force_f
         count: observability_rpc_count.clone(),
     });
 
-    let nonblocking = client.observability_snapshot_nonblocking().await;
+    let nonblocking = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
 
     assert_eq!(
         observability_rpc_count.load(Ordering::Relaxed),
@@ -11530,7 +12277,10 @@ async fn recent_live_cache_preserves_last_control_summary_when_later_active_snap
     client.update_cached_observability_snapshot(&first_live);
     client.update_cached_observability_snapshot(&later_live);
 
-    let nonblocking = client.observability_snapshot_nonblocking().await;
+    let nonblocking = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     assert!(
         nonblocking
             .last_control_frame_signals_by_node
@@ -11644,7 +12394,10 @@ async fn recent_live_cache_preserves_scheduled_groups_when_later_active_snapshot
     client.update_cached_observability_snapshot(&first_live);
     client.update_cached_observability_snapshot(&later_live);
 
-    let nonblocking = client.observability_snapshot_nonblocking().await;
+    let nonblocking = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     assert_eq!(
         nonblocking.scheduled_source_groups_by_node.get("node-a"),
         Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
@@ -11771,7 +12524,10 @@ async fn control_inflight_nonblocking_observability_preserves_published_maps_whe
     client.update_cached_observability_snapshot(&later_live);
 
     let inflight = client.begin_control_op();
-    let degraded = client.observability_snapshot_nonblocking().await;
+    let degraded = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     drop(inflight);
 
     assert_eq!(
@@ -11970,7 +12726,10 @@ async fn recent_live_cache_preserves_published_observability_when_later_active_s
     client.update_cached_observability_snapshot(&first_live);
     client.update_cached_observability_snapshot(&later_live);
 
-    let nonblocking = client.observability_snapshot_nonblocking().await;
+    let nonblocking = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     assert_eq!(
         nonblocking.published_batches_by_node.get("node-a"),
         Some(&4),
@@ -12421,7 +13180,10 @@ async fn recent_live_cache_preserves_published_observability_when_later_live_sna
     client.update_cached_observability_snapshot(&first_live);
     client.update_cached_observability_snapshot(&later_live);
 
-    let nonblocking = client.observability_snapshot_nonblocking().await;
+    let nonblocking = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     assert_eq!(
         nonblocking.scheduled_source_groups_by_node.get("node-a"),
         Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
@@ -12639,7 +13401,10 @@ async fn recent_live_cache_clears_published_path_observability_when_later_active
     client.update_cached_observability_snapshot(&first_live);
     client.update_cached_observability_snapshot(&later_live);
 
-    let nonblocking = client.observability_snapshot_nonblocking().await;
+    let nonblocking = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     assert_eq!(
         nonblocking.published_batches_by_node.get("node-a"),
         Some(&0),
@@ -12812,7 +13577,10 @@ async fn observability_snapshot_nonblocking_fail_closes_incomplete_active_cache_
         err: CnxError::Internal("synthetic observability failure".to_string()),
     });
 
-    let degraded = client.observability_snapshot_nonblocking().await;
+    let degraded = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     assert_eq!(
         degraded.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
         "worker-unavailable fallback should degrade the snapshot instead of returning a live-looking active cache"
@@ -12896,7 +13664,10 @@ async fn on_control_frame_refresh_retries_transient_empty_scheduled_groups_befor
         .expect("apply control wave");
 
     let inflight = client.begin_control_op();
-    let stale = client.observability_snapshot_nonblocking().await;
+    let stale = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     drop(inflight);
 
     assert_eq!(
@@ -13029,7 +13800,10 @@ async fn control_inflight_nonblocking_observability_primes_runtime_managed_group
         .expect("apply runtime-managed multi-root control wave");
 
     let inflight = client.begin_control_op();
-    let degraded = client.observability_snapshot_nonblocking().await;
+    let degraded = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     drop(inflight);
 
     let expected = std::collections::BTreeMap::from([(
@@ -13152,7 +13926,10 @@ async fn control_inflight_nonblocking_observability_preserves_latest_control_fra
         .expect("apply runtime-managed multi-root control wave");
 
     let inflight = client.begin_control_op();
-    let degraded = client.observability_snapshot_nonblocking().await;
+    let degraded = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     drop(inflight);
 
     let expected = std::collections::BTreeMap::from([(
@@ -13276,7 +14053,10 @@ async fn control_inflight_nonblocking_observability_primes_runtime_managed_group
         .expect("apply runtime-managed multi-root control wave without grant change");
 
     let inflight = client.begin_control_op();
-    let degraded = client.observability_snapshot_nonblocking().await;
+    let degraded = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     drop(inflight);
 
     let expected = std::collections::BTreeMap::from([(
@@ -13494,7 +14274,10 @@ async fn control_inflight_nonblocking_observability_limits_bare_logical_scope_id
         .expect("apply mixed-grant fs_source-selected control wave");
 
     let inflight = client.begin_control_op();
-    let degraded = client.observability_snapshot_nonblocking().await;
+    let degraded = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     drop(inflight);
 
     let expected = std::collections::BTreeMap::from([(
@@ -13713,7 +14496,10 @@ async fn on_control_frame_does_not_exhaust_post_ack_schedule_refresh_when_mixed_
             "mixed-cluster wave with no local runnable groups should preserve an empty schedule instead of exhausting post-ack schedule refresh",
         );
 
-    let observability = client.observability_snapshot_nonblocking().await;
+    let observability = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     assert!(
         observability.scheduled_source_groups_by_node.is_empty(),
         "node-e should preserve an empty source schedule when the mixed-cluster wave carries only nfs1/nfs2 and all refreshed scheduled groups are legitimately empty for the local node"
@@ -13847,7 +14633,10 @@ async fn control_inflight_nonblocking_observability_primes_runtime_managed_group
         .expect("apply runtime-managed fs_source-selected control wave");
 
     let inflight = client.begin_control_op();
-    let degraded = client.observability_snapshot_nonblocking().await;
+    let degraded = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     drop(inflight);
 
     let expected = std::collections::BTreeMap::from([(
@@ -14115,7 +14904,7 @@ async fn local_source_observability_normalizes_instance_suffixed_node_id_to_host
         .expect("apply source+scan control");
 
     let snapshot = SourceFacade::Local(source)
-        .observability_snapshot()
+        .observability_snapshot_with_failure()
         .await
         .expect("fetch local observability");
     let expected = vec!["nfs2".to_string()];
@@ -14212,7 +15001,7 @@ async fn local_source_observability_preserves_published_maps_after_local_stream_
     );
 
     let snapshot = SourceFacade::Local(source.clone())
-        .observability_snapshot()
+        .observability_snapshot_with_failure()
         .await
         .expect("fetch local source observability after local stream publish");
 
@@ -14304,7 +15093,7 @@ async fn local_source_observability_does_not_fall_back_to_source_control_summary
     );
 
     let snapshot = SourceFacade::Local(source)
-        .observability_snapshot()
+        .observability_snapshot_with_failure()
         .await
         .expect("fetch local observability");
 
@@ -14515,7 +15304,10 @@ async fn restarted_instance_suffixed_source_worker_recovers_schedule_from_real_s
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "{label}: timed out waiting for scheduled groups after real source route wave: source={source_groups:?} scan={scan_groups:?} logical_roots={:?} stderr={}",
-                client.logical_roots_snapshot().await.unwrap_or_default(),
+                client
+                    .logical_roots_snapshot_with_failure()
+                    .await
+                    .unwrap_or_default(),
                 worker_stderr_excerpt(worker_socket_dir),
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -14686,13 +15478,16 @@ async fn restarted_external_source_worker_preserves_runtime_host_grants_for_real
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "{label}: timed out waiting for scheduled groups after restart-preserved host grants: source={source_groups:?} scan={scan_groups:?} logical_roots={:?} grants_version={} grants={:?} stderr={}",
-                client.logical_roots_snapshot().await.unwrap_or_default(),
                 client
-                    .host_object_grants_version_snapshot()
+                    .logical_roots_snapshot_with_failure()
                     .await
                     .unwrap_or_default(),
                 client
-                    .host_object_grants_snapshot()
+                    .host_object_grants_version_snapshot_with_failure()
+                    .await
+                    .unwrap_or_default(),
+                client
+                    .host_object_grants_snapshot_with_failure()
                     .await
                     .unwrap_or_default(),
                 worker_stderr_excerpt(worker_socket_dir),
@@ -14869,7 +15664,7 @@ async fn restarted_external_source_worker_preserves_multi_root_observability_aft
                 snapshot.scheduled_source_groups_by_node,
                 snapshot.scheduled_scan_groups_by_node,
                 client
-                    .host_object_grants_snapshot()
+                    .host_object_grants_snapshot_with_failure()
                     .await
                     .unwrap_or_default(),
                 worker_stderr_excerpt(worker_socket_dir),
@@ -15184,7 +15979,7 @@ async fn restarted_external_source_worker_preserves_single_root_observability_af
                 snapshot.scheduled_source_groups_by_node,
                 snapshot.scheduled_scan_groups_by_node,
                 client
-                    .host_object_grants_snapshot()
+                    .host_object_grants_snapshot_with_failure()
                     .await
                     .unwrap_or_default(),
                 worker_stderr_excerpt(worker_socket_dir),
@@ -15339,7 +16134,10 @@ async fn restarted_external_source_worker_cache_fallback_preserves_stable_host_r
         .expect("restarted control wave without new host grants should succeed");
 
     let inflight = client.begin_control_op();
-    let degraded = client.observability_snapshot_nonblocking().await;
+    let degraded = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     drop(inflight);
 
     let expected = vec!["nfs1".to_string()];

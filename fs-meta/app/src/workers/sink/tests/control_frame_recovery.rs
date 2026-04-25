@@ -145,12 +145,12 @@ async fn on_control_frame_retries_stale_drained_fenced_pid_errors_after_first_wa
     let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < initial_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply initial batch"),
+            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply initial batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let nfs1_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1"),
             b"/force-find-stress",
@@ -158,7 +158,7 @@ async fn on_control_frame_retries_stale_drained_fenced_pid_errors_after_first_wa
         .expect("decode nfs1")
         .is_some();
         let nfs2_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2"),
             b"/force-find-stress",
@@ -172,7 +172,7 @@ async fn on_control_frame_retries_stale_drained_fenced_pid_errors_after_first_wa
 
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1 after initial"),
             b"/force-find-stress",
@@ -183,7 +183,7 @@ async fn on_control_frame_retries_stale_drained_fenced_pid_errors_after_first_wa
     );
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2 after initial"),
             b"/force-find-stress",
@@ -218,7 +218,7 @@ async fn on_control_frame_retries_stale_drained_fenced_pid_errors_after_first_wa
 
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1 after drained/fenced retry"),
             b"/force-find-stress",
@@ -229,7 +229,7 @@ async fn on_control_frame_retries_stale_drained_fenced_pid_errors_after_first_wa
     );
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2 after drained/fenced retry"),
             b"/force-find-stress",
@@ -979,12 +979,12 @@ async fn single_restart_deferred_retire_pending_events_deactivate_retries_stale_
     let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < initial_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply initial batch"),
+            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply initial batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let nfs1_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1"),
             b"/force-find-stress",
@@ -992,7 +992,7 @@ async fn single_restart_deferred_retire_pending_events_deactivate_retries_stale_
         .expect("decode nfs1")
         .is_some();
         let nfs2_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2"),
             b"/force-find-stress",
@@ -1006,7 +1006,7 @@ async fn single_restart_deferred_retire_pending_events_deactivate_retries_stale_
 
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1 after initial"),
             b"/force-find-stress",
@@ -1017,7 +1017,7 @@ async fn single_restart_deferred_retire_pending_events_deactivate_retries_stale_
     );
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2 after initial"),
             b"/force-find-stress",
@@ -1056,7 +1056,7 @@ async fn single_restart_deferred_retire_pending_events_deactivate_retries_stale_
 
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1 after restart_deferred_retire_pending retry"),
             b"/force-find-stress",
@@ -1067,7 +1067,7 @@ async fn single_restart_deferred_retire_pending_events_deactivate_retries_stale_
     );
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2 after restart_deferred_retire_pending retry"),
             b"/force-find-stress",
@@ -1124,7 +1124,7 @@ async fn status_snapshot_retries_stale_drained_fenced_pid_errors() {
         });
 
     let snapshot = sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect("status_snapshot should retry a stale drained/fenced pid error and reach the live sink worker");
 
@@ -1440,7 +1440,7 @@ async fn status_snapshot_nonblocking_retries_peer_bridge_stopped_errors_after_be
         .expect("start sink worker");
 
     let first_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("prime cached status snapshot");
     assert!(
@@ -1639,7 +1639,7 @@ async fn update_logical_roots_reacquires_worker_client_after_transport_closes_mi
         let nfs2 = nfs2.clone();
         async move {
             client
-                .update_logical_roots(
+                .update_logical_roots_with_failure(
                     vec![
                         sink_worker_root("nfs1", &nfs1),
                         sink_worker_root("nfs2", &nfs2),
@@ -1671,7 +1671,7 @@ async fn update_logical_roots_reacquires_worker_client_after_transport_closes_mi
         .expect("update_logical_roots after worker restart");
 
     let roots = client
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
         .expect("logical roots snapshot after update");
     assert_eq!(
@@ -1749,7 +1749,7 @@ async fn update_logical_roots_does_not_clear_cached_ready_status_for_surviving_g
         .expect("apply sink control");
 
     client
-        .send(vec![
+        .send_with_failure(vec![
             mk_worker_sink_source_event(
                 "node-d::nfs2",
                 FileMetaRecord::scan_update(
@@ -1869,7 +1869,7 @@ async fn update_logical_roots_does_not_clear_cached_ready_status_for_surviving_g
         .expect("seed ready sink state before logical-root retire");
 
     let primed_snapshot = client
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("primed live sink status snapshot");
     assert!(
@@ -1886,7 +1886,7 @@ async fn update_logical_roots_does_not_clear_cached_ready_status_for_surviving_g
     );
 
     client
-        .update_logical_roots(
+        .update_logical_roots_with_failure(
             vec![
                 sink_worker_root("nfs2", &nfs2),
                 sink_worker_root("nfs4", &nfs4),
@@ -1900,7 +1900,7 @@ async fn update_logical_roots_does_not_clear_cached_ready_status_for_surviving_g
         .expect("retire nfs3 from logical roots");
 
     let cached = client
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached status after update_logical_roots");
     let ready_groups = cached
         .groups

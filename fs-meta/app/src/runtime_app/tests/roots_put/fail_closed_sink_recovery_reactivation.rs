@@ -893,7 +893,7 @@
         loop {
             let snapshot = app
                 .sink
-                .status_snapshot()
+                .status_snapshot_with_failure()
                 .await
                 .expect("sink status snapshot");
             let ready_groups = snapshot
@@ -1295,7 +1295,7 @@
         loop {
             let snapshot = app
                 .sink
-                .status_snapshot()
+                .status_snapshot_with_failure()
                 .await
                 .expect("sink status snapshot");
             let ready_groups = snapshot

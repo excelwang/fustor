@@ -220,25 +220,25 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
         }
         if tokio::time::Instant::now() >= initial_ready_deadline {
             app.source
-                .trigger_rescan_when_ready_epoch()
+                .trigger_rescan_when_ready_epoch_with_failure()
                 .await
                 .expect("direct trigger_rescan_when_ready after failed deferred initial trigger");
             let direct_trigger_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             let mut direct_trigger_restored_ready = false;
             let mut latest_source_observability =
-                app.source.observability_snapshot_nonblocking().await;
+                app.source.observability_snapshot_nonblocking_for_status_route().await.0;
             let mut latest_cached_sink_status = app
                 .sink
-                .cached_status_snapshot()
+                .cached_status_snapshot_with_failure()
                 .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
-                .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"));
+                .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err:?}"));
             while tokio::time::Instant::now() < direct_trigger_deadline {
-                latest_source_observability = app.source.observability_snapshot_nonblocking().await;
+                latest_source_observability = app.source.observability_snapshot_nonblocking_for_status_route().await.0;
                 latest_cached_sink_status = app
                     .sink
-                    .cached_status_snapshot()
+                    .cached_status_snapshot_with_failure()
                     .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
-                    .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"));
+                    .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err:?}"));
                 if latest_source_observability
                     .published_batches_by_node
                     .values()
@@ -296,9 +296,9 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
                 .unwrap_or_default();
             let cached_sink_status = app
                 .sink
-                .cached_status_snapshot()
+                .cached_status_snapshot_with_failure()
                 .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
-                .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"));
+                .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err:?}"));
             let source_observability =
                 summarize_source_observability_endpoint(&latest_source_observability);
             let initial_trigger_count = initial_trigger_rescan_count.load(Ordering::SeqCst);
@@ -426,19 +426,21 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
             .unwrap_or_default();
         let cached_sink_status_summary = app
             .sink
-            .cached_status_snapshot()
+            .cached_status_snapshot_with_failure()
             .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
             .unwrap_or_else(|cached_err| {
-                format!("cached_sink_status_unavailable err={cached_err}")
+                format!("cached_sink_status_unavailable err={cached_err:?}")
             });
         let blocking_sink_status_summary =
-            match tokio::time::timeout(Duration::from_secs(2), app.sink.status_snapshot()).await {
+            match tokio::time::timeout(Duration::from_secs(2), app.sink.status_snapshot_with_failure()).await {
                 Ok(Ok(snapshot)) => summarize_sink_status_endpoint(&snapshot),
-                Ok(Err(snapshot_err)) => format!("blocking_status_err={snapshot_err}"),
+                Ok(Err(snapshot_err)) => {
+                    format!("blocking_status_err={}", snapshot_err.as_error())
+                }
                 Err(_) => "blocking_status_timeout".to_string(),
             };
         let source_observability_summary = summarize_source_observability_endpoint(
-            &app.source.observability_snapshot_nonblocking().await,
+            &app.source.observability_snapshot_nonblocking_for_status_route().await.0,
         );
         (
             source_groups,
@@ -606,22 +608,24 @@ async fn wait_for_local_sink_status_republish_after_recovery_restores_ready_grou
             .unwrap_or_default();
         let cached_sink_status_summary = app
             .sink
-            .cached_status_snapshot()
+            .cached_status_snapshot_with_failure()
             .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
             .unwrap_or_else(|cached_err| {
-                format!("cached_sink_status_unavailable err={cached_err}")
+                format!("cached_sink_status_unavailable err={cached_err:?}")
             });
         let blocking_sink_status_summary =
-            match tokio::time::timeout(Duration::from_secs(2), app.sink.status_snapshot()).await {
+            match tokio::time::timeout(Duration::from_secs(2), app.sink.status_snapshot_with_failure()).await {
                 Ok(Ok(snapshot)) => summarize_sink_status_endpoint(&snapshot),
-                Ok(Err(snapshot_err)) => format!("blocking_status_err={snapshot_err}"),
+                Ok(Err(snapshot_err)) => {
+                    format!("blocking_status_err={}", snapshot_err.as_error())
+                }
                 Err(_) => "blocking_status_timeout".to_string(),
             };
         let source_observability_summary = summarize_source_observability_endpoint(
-            &app.source.observability_snapshot_nonblocking().await,
+            &app.source.observability_snapshot_nonblocking_for_status_route().await.0,
         );
         panic!(
-            "direct local sink-status republish helper must restore ready groups once post-return source->sink convergence has been retriggered; err={err}; trigger_count_before_helper={trigger_count_before_helper} trigger_count_after_helper={trigger_count_after_helper} source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary}"
+            "direct local sink-status republish helper must restore ready groups once post-return source->sink convergence has been retriggered; err={err:?}; trigger_count_before_helper={trigger_count_before_helper} trigger_count_after_helper={trigger_count_after_helper} source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary}"
         );
     }
 
@@ -831,25 +835,25 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
         }
         if tokio::time::Instant::now() >= initial_ready_deadline {
             app.source
-                .trigger_rescan_when_ready_epoch()
+                .trigger_rescan_when_ready_epoch_with_failure()
                 .await
                 .expect("direct trigger_rescan_when_ready after failed deferred initial trigger");
             let direct_trigger_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             let mut direct_trigger_restored_ready = false;
             let mut latest_source_observability =
-                app.source.observability_snapshot_nonblocking().await;
+                app.source.observability_snapshot_nonblocking_for_status_route().await.0;
             let mut latest_cached_sink_status = app
                 .sink
-                .cached_status_snapshot()
+                .cached_status_snapshot_with_failure()
                 .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
-                .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"));
+                .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err:?}"));
             while tokio::time::Instant::now() < direct_trigger_deadline {
-                latest_source_observability = app.source.observability_snapshot_nonblocking().await;
+                latest_source_observability = app.source.observability_snapshot_nonblocking_for_status_route().await.0;
                 latest_cached_sink_status = app
                     .sink
-                    .cached_status_snapshot()
+                    .cached_status_snapshot_with_failure()
                     .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
-                    .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"));
+                    .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err:?}"));
                 if latest_source_observability
                     .published_batches_by_node
                     .values()
@@ -907,9 +911,9 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
                 .unwrap_or_default();
             let cached_sink_status = app
                 .sink
-                .cached_status_snapshot()
+                .cached_status_snapshot_with_failure()
                 .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
-                .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err}"));
+                .unwrap_or_else(|err| format!("cached_sink_status_unavailable err={err:?}"));
             let source_observability =
                 summarize_source_observability_endpoint(&latest_source_observability);
             let initial_trigger_count = initial_trigger_rescan_count.load(Ordering::SeqCst);
@@ -1068,7 +1072,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
             snapshot: cached_not_ready_snapshot,
         },
     );
-    let cached_snapshot_before_helper = app.sink.status_snapshot().await.expect(
+    let cached_snapshot_before_helper = app.sink.status_snapshot_with_failure().await.expect(
         "poison local cached sink status with a current but non-ready snapshot before helper runs",
     );
     assert!(
@@ -1101,19 +1105,21 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
             .unwrap_or_default();
         let cached_sink_status_summary = app
             .sink
-            .cached_status_snapshot()
+            .cached_status_snapshot_with_failure()
             .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
             .unwrap_or_else(|cached_err| {
-                format!("cached_sink_status_unavailable err={cached_err}")
+                format!("cached_sink_status_unavailable err={cached_err:?}")
             });
         let blocking_sink_status_summary =
-            match tokio::time::timeout(Duration::from_secs(2), app.sink.status_snapshot()).await {
+            match tokio::time::timeout(Duration::from_secs(2), app.sink.status_snapshot_with_failure()).await {
                 Ok(Ok(snapshot)) => summarize_sink_status_endpoint(&snapshot),
-                Ok(Err(snapshot_err)) => format!("blocking_status_err={snapshot_err}"),
+                Ok(Err(snapshot_err)) => {
+                    format!("blocking_status_err={}", snapshot_err.as_error())
+                }
                 Err(_) => "blocking_status_timeout".to_string(),
             };
         let source_observability_summary = summarize_source_observability_endpoint(
-            &app.source.observability_snapshot_nonblocking().await,
+            &app.source.observability_snapshot_nonblocking_for_status_route().await.0,
         );
         (
             source_groups,
@@ -1194,7 +1200,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
 
     let cached_snapshot_before_probe = app
         .sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached sink status before blocking-truth probe");
     assert!(
         !sink_status_snapshot_ready_for_expected_groups(
@@ -1293,7 +1299,7 @@ async fn wait_for_local_sink_status_republish_after_recovery_uses_blocking_sink_
             source_observability_summary,
         ) = gather_helper_stall_context().await;
         panic!(
-            "local sink-status republish helper must accept a bounded blocking sink-status truth once runtime scope already converged instead of failing closed on a cached zeroish nonblocking view; err={err}; source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary}"
+            "local sink-status republish helper must accept a bounded blocking sink-status truth once runtime scope already converged instead of failing closed on a cached zeroish nonblocking view; err={err:?}; source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary}"
         );
     }
 
@@ -1853,7 +1859,7 @@ async fn wait_for_local_sink_status_republish_requiring_probe_checks_first_probe
 
     let cached_snapshot_before_helper = app
         .sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached sink status before requiring-probe helper");
     assert!(
         sink_status_snapshot_ready_for_expected_groups(
@@ -1930,13 +1936,13 @@ async fn wait_for_local_sink_status_republish_requiring_probe_checks_first_probe
     if let Err(err) = helper_result {
         let cached_sink_status_summary = app
             .sink
-            .cached_status_snapshot()
+            .cached_status_snapshot_with_failure()
             .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
             .unwrap_or_else(|cached_err| {
-                format!("cached_sink_status_unavailable err={cached_err}")
+                format!("cached_sink_status_unavailable err={cached_err:?}")
             });
         panic!(
-            "requiring-probe helper should accept an already-ready first sink-side probe without falling into post-return retrigger logic: err={err} cached_sink_status={cached_sink_status_summary}"
+            "requiring-probe helper should accept an already-ready first sink-side probe without falling into post-return retrigger logic: err={err:?} cached_sink_status={cached_sink_status_summary}"
         );
     }
 
@@ -2119,20 +2125,20 @@ async fn wait_for_local_sink_status_republish_requiring_probe_replays_retained_s
                     eprintln!(
                         "require-probe replay precondition not ready snapshot={:?} cached={:?}",
                         snapshot,
-                        app.sink.cached_status_snapshot().ok()
+                        app.sink.cached_status_snapshot_with_failure().ok()
                     );
                 }
                 Ok(Err(err)) => {
                     eprintln!(
                         "require-probe replay precondition status_snapshot_nonblocking err={} cached={:?}",
                         err,
-                        app.sink.cached_status_snapshot().ok()
+                        app.sink.cached_status_snapshot_with_failure().ok()
                     );
                 }
                 Err(_) => {
                     eprintln!(
                         "require-probe replay precondition status_snapshot_nonblocking timeout cached={:?}",
-                        app.sink.cached_status_snapshot().ok()
+                        app.sink.cached_status_snapshot_with_failure().ok()
                     );
                 }
             }
@@ -2146,7 +2152,7 @@ async fn wait_for_local_sink_status_republish_requiring_probe_replays_retained_s
 
     let cached_snapshot_before_helper = app
         .sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached sink status before requiring-probe replay helper");
     assert!(
         sink_status_snapshot_ready_for_expected_groups(
@@ -2275,13 +2281,13 @@ async fn wait_for_local_sink_status_republish_requiring_probe_replays_retained_s
     if let Err(err) = helper_result {
         let cached_sink_status_summary = app
             .sink
-            .cached_status_snapshot()
+            .cached_status_snapshot_with_failure()
             .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
             .unwrap_or_else(|cached_err| {
-                format!("cached_sink_status_unavailable err={cached_err}")
+                format!("cached_sink_status_unavailable err={cached_err:?}")
             });
         panic!(
-            "requiring-probe replay helper should settle after replaying the retained sink control wave on top of a cached-ready first sink-side probe: err={err} cached_sink_status={cached_sink_status_summary}"
+            "requiring-probe replay helper should settle after replaying the retained sink control wave on top of a cached-ready first sink-side probe: err={err:?} cached_sink_status={cached_sink_status_summary}"
         );
     }
 
@@ -4059,13 +4065,13 @@ async fn source_led_uninitialized_mixed_recovery_keeps_control_gate_closed_until
         let control_gate_ready = app.api_control_gate.is_ready();
         let cached_sink_status_summary = app
             .sink
-            .cached_status_snapshot()
+            .cached_status_snapshot_with_failure()
             .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
             .unwrap_or_else(|cached_err| {
-                format!("cached_sink_status_unavailable err={cached_err}")
+                format!("cached_sink_status_unavailable err={cached_err:?}")
             });
         let source_observability_summary = summarize_source_observability_endpoint(
-            &app.source.observability_snapshot_nonblocking().await,
+            &app.source.observability_snapshot_nonblocking_for_status_route().await.0,
         );
         if later_task.is_finished() {
             let later_result = tokio::time::timeout(Duration::from_secs(1), later_task)
@@ -4103,16 +4109,16 @@ async fn source_led_uninitialized_mixed_recovery_keeps_control_gate_closed_until
     if let Err(err) = later_result {
         let cached_sink_status_summary = app
             .sink
-            .cached_status_snapshot()
+            .cached_status_snapshot_with_failure()
             .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
             .unwrap_or_else(|cached_err| {
-                format!("cached_sink_status_unavailable err={cached_err}")
+                format!("cached_sink_status_unavailable err={cached_err:?}")
             });
         let source_observability_summary = summarize_source_observability_endpoint(
-            &app.source.observability_snapshot_nonblocking().await,
+            &app.source.observability_snapshot_nonblocking_for_status_route().await.0,
         );
         panic!(
-            "source-led uninitialized mixed recovery failed after local sink-status republish unblocked: err={err} cached_sink_status={cached_sink_status_summary} source_observability={source_observability_summary}"
+            "source-led uninitialized mixed recovery failed after local sink-status republish unblocked: err={err:?} cached_sink_status={cached_sink_status_summary} source_observability={source_observability_summary}"
         );
     }
 

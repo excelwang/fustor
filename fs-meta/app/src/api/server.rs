@@ -28,7 +28,7 @@ use crate::query::api::{
     refresh_policy_from_host_object_grants,
 };
 use crate::workers::sink::SinkFacade;
-use crate::workers::source::SourceFacade;
+use crate::workers::source::{SourceFacade, SourceFailure};
 
 use super::auth::AuthService;
 use super::config::ResolvedApiConfig;
@@ -159,8 +159,11 @@ pub(crate) async fn spawn_with_rollout_status(
         cfg.bind_addr
     );
 
-    let initial_policy =
-        projection_policy_from_host_object_grants(&source.cached_host_object_grants_snapshot()?);
+    let initial_policy = projection_policy_from_host_object_grants(
+        &source
+            .cached_host_object_grants_snapshot_with_failure()
+            .map_err(SourceFailure::into_error)?,
+    );
     eprintln!(
         "fs_meta_api_server: initial policy ready bind_addr={}",
         cfg.bind_addr
@@ -186,7 +189,10 @@ pub(crate) async fn spawn_with_rollout_status(
     };
     refresh_policy_from_host_object_grants(
         &state.projection_policy,
-        &state.source.cached_host_object_grants_snapshot()?,
+        &state
+            .source
+            .cached_host_object_grants_snapshot_with_failure()
+            .map_err(SourceFailure::into_error)?,
     );
     eprintln!(
         "fs_meta_api_server: policy refreshed bind_addr={}",
@@ -524,6 +530,35 @@ mod tests {
     use crate::sink::SinkFileMeta;
     use crate::source::FSMetaSource;
     use crate::source::config::SourceConfig;
+
+    #[test]
+    fn api_server_policy_bootstrap_uses_typed_cached_source_helper() {
+        let source = include_str!("server.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(source);
+
+        for typed_surface in [
+            ".cached_host_object_grants_snapshot_with_failure()",
+            ".map_err(SourceFailure::into_error)?",
+        ] {
+            assert!(
+                production.contains(typed_surface),
+                "api/server hard cut regressed; policy bootstrap should stay on typed cached source helpers: {typed_surface}",
+            );
+        }
+
+        for legacy_surface in [
+            "projection_policy_from_host_object_grants(&source.cached_host_object_grants_snapshot()?);",
+            "&state.source.cached_host_object_grants_snapshot()?,",
+        ] {
+            assert!(
+                !production.contains(legacy_surface),
+                "api/server hard cut regressed; policy bootstrap bounced back through raw cached source helpers: {legacy_surface}",
+            );
+        }
+    }
 
     fn write_auth_files(dir: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
         let passwd_path = dir.path().join("passwd");

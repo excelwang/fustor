@@ -1639,16 +1639,45 @@ impl SinkFileMeta {
         state_boundary: Arc<dyn StateBoundary>,
         source_cfg: SourceConfig,
     ) -> Result<Self> {
-        Self::with_boundaries_and_state_inner(node_id, boundary, state_boundary, source_cfg, false)
+        Self::with_boundaries_and_state_internal(
+            node_id,
+            boundary,
+            state_boundary,
+            source_cfg,
+            false,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_boundaries_and_state_deferred_authority(
         node_id: NodeId,
         boundary: Option<Arc<dyn ChannelIoSubset>>,
         state_boundary: Arc<dyn StateBoundary>,
         source_cfg: SourceConfig,
     ) -> Result<Self> {
-        Self::with_boundaries_and_state_inner(node_id, boundary, state_boundary, source_cfg, true)
+        Self::with_boundaries_and_state_internal(
+            node_id,
+            boundary,
+            state_boundary,
+            source_cfg,
+            true,
+        )
+    }
+
+    pub(crate) fn with_boundaries_and_state_internal(
+        node_id: NodeId,
+        boundary: Option<Arc<dyn ChannelIoSubset>>,
+        state_boundary: Arc<dyn StateBoundary>,
+        source_cfg: SourceConfig,
+        defer_authority_read: bool,
+    ) -> Result<Self> {
+        Self::with_boundaries_and_state_inner(
+            node_id,
+            boundary,
+            state_boundary,
+            source_cfg,
+            defer_authority_read,
+        )
     }
 
     fn with_boundaries_and_state_inner(
@@ -2151,7 +2180,7 @@ impl SinkFileMeta {
         });
     }
 
-    pub fn start_runtime_endpoints(
+    pub(crate) fn start_runtime_endpoints_on_boundary(
         &self,
         boundary: Arc<dyn ChannelIoSubset>,
         node_id: NodeId,
@@ -2670,6 +2699,14 @@ impl SinkFileMeta {
         Ok(())
     }
 
+    pub fn start_runtime_endpoints(
+        &self,
+        boundary: Arc<dyn ChannelIoSubset>,
+        node_id: NodeId,
+    ) -> Result<()> {
+        self.start_runtime_endpoints_on_boundary(boundary, node_id)
+    }
+
     pub fn start_stream_endpoint(
         &self,
         boundary: Arc<dyn ChannelIoSubset>,
@@ -2812,8 +2849,12 @@ impl SinkFileMeta {
         ))
     }
 
-    pub fn scheduled_group_ids_snapshot(&self) -> Result<Option<BTreeSet<String>>> {
+    pub(crate) fn snapshot_scheduled_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
         self.scheduled_group_ids()
+    }
+
+    pub fn scheduled_group_ids_snapshot(&self) -> Result<Option<BTreeSet<String>>> {
+        self.snapshot_scheduled_group_ids()
     }
 
     fn scheduled_stream_object_refs(&self) -> Result<Option<BTreeSet<String>>> {
@@ -2951,7 +2992,7 @@ impl SinkFileMeta {
         Ok(())
     }
 
-    pub(crate) async fn apply_orchestration_signals(
+    pub(crate) async fn perform_apply_orchestration_signals(
         &self,
         signals: &[SinkControlSignal],
     ) -> Result<()> {
@@ -3091,6 +3132,13 @@ impl SinkFileMeta {
         Ok(())
     }
 
+    pub(crate) async fn apply_orchestration_signals(
+        &self,
+        signals: &[SinkControlSignal],
+    ) -> Result<()> {
+        self.perform_apply_orchestration_signals(signals).await
+    }
+
     fn logical_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
         self.host_object_grants
             .read()
@@ -3098,7 +3146,7 @@ impl SinkFileMeta {
             .map_err(|_| CnxError::Internal("Sink host_object_grants lock poisoned".into()))
     }
 
-    pub fn update_logical_roots(
+    pub(crate) fn perform_update_logical_roots(
         &self,
         roots: Vec<RootSpec>,
         host_object_grants: &[GrantedMountRoot],
@@ -3175,11 +3223,27 @@ impl SinkFileMeta {
         Ok(())
     }
 
-    pub fn logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
+    pub fn update_logical_roots(
+        &self,
+        roots: Vec<RootSpec>,
+        host_object_grants: &[GrantedMountRoot],
+    ) -> Result<()> {
+        self.perform_update_logical_roots(roots, host_object_grants)
+    }
+
+    pub(crate) fn snapshot_logical_roots(&self) -> Result<Vec<RootSpec>> {
         self.root_specs
             .read()
             .map(|guard| guard.clone())
             .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))
+    }
+
+    pub(crate) fn snapshot_cached_logical_roots(&self) -> Result<Vec<RootSpec>> {
+        self.snapshot_logical_roots()
+    }
+
+    pub fn logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
+        self.snapshot_logical_roots()
     }
 
     /// Get health statistics for the entire sink.
@@ -3187,7 +3251,7 @@ impl SinkFileMeta {
     /// Returns aggregate counts of live nodes, tombstones, attested nodes,
     /// suspect nodes, blind spots, and the current shadow time.
     #[allow(dead_code)]
-    pub fn health(&self) -> Result<HealthStats> {
+    pub(crate) fn build_health_snapshot(&self) -> Result<HealthStats> {
         let state = self.state.read()?;
         let mut out = HealthStats::default();
         for group in state.groups.values() {
@@ -3197,7 +3261,11 @@ impl SinkFileMeta {
         Ok(out)
     }
 
-    pub fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+    pub fn health(&self) -> Result<HealthStats> {
+        self.build_health_snapshot()
+    }
+
+    pub(crate) fn build_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
         let state = self.state.read()?;
         let now = now_us();
         let mut snapshot = SinkStatusSnapshot::default();
@@ -3326,12 +3394,27 @@ impl SinkFileMeta {
         Ok(snapshot)
     }
 
-    pub fn visibility_lag_samples_since(&self, since_us: u64) -> Vec<VisibilityLagSample> {
+    pub(crate) fn build_cached_status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+        self.build_status_snapshot()
+    }
+
+    pub fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+        self.build_status_snapshot()
+    }
+
+    pub(crate) fn snapshot_visibility_lag_samples_since(
+        &self,
+        since_us: u64,
+    ) -> Vec<VisibilityLagSample> {
         lock_or_recover(
             &self.visibility_lag,
             "sink.visibility_lag_samples_since.visibility_lag",
         )
         .recent_since(since_us)
+    }
+
+    pub fn visibility_lag_samples_since(&self, since_us: u64) -> Vec<VisibilityLagSample> {
+        self.snapshot_visibility_lag_samples_since(since_us)
     }
 
     /// Query a single node by exact path.
@@ -3615,7 +3698,7 @@ impl SinkFileMeta {
         Ok(())
     }
 
-    fn apply_events(&self, events: &[Event]) -> Result<()> {
+    pub(crate) fn apply_events(&self, events: &[Event]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -3801,8 +3884,10 @@ impl SinkFileMeta {
         Ok(())
     }
 
-    /// Domain-specific materialized query used by projection and tests.
-    pub fn materialized_query(&self, request: &InternalQueryRequest) -> Result<Vec<Event>> {
+    pub(crate) fn perform_materialized_query(
+        &self,
+        request: &InternalQueryRequest,
+    ) -> Result<Vec<Event>> {
         if request.transport != crate::query::request::QueryTransport::Materialized {
             return Err(CnxError::InvalidInput(
                 "materialized_query requires materialized transport".into(),
@@ -3880,6 +3965,11 @@ impl SinkFileMeta {
         Ok(out)
     }
 
+    /// Domain-specific materialized query used by projection and tests.
+    pub fn materialized_query(&self, request: &InternalQueryRequest) -> Result<Vec<Event>> {
+        self.perform_materialized_query(request)
+    }
+
     /// Domain-specific query: get aggregate stats for a subtree.
     ///
     /// This is a domain helper, not part of the `RuntimeBoundaryApp` trait. Used by
@@ -3941,7 +4031,7 @@ impl SinkFileMeta {
         self.apply_orchestration_signals(&signals).await.map(|_| ())
     }
 
-    pub async fn close(&self) -> Result<()> {
+    pub(crate) async fn perform_close(&self) -> Result<()> {
         self.disable_stream_receive();
         self.shutdown.cancel();
         let mut endpoint_tasks = std::mem::take(&mut *lock_or_recover(
@@ -3973,6 +4063,10 @@ impl SinkFileMeta {
         }
         self.state.persist_snapshot()?;
         Ok(())
+    }
+
+    pub async fn close(&self) -> Result<()> {
+        self.perform_close().await
     }
 }
 

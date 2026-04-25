@@ -10,6 +10,7 @@ pub(crate) mod sentinel;
 pub(crate) mod watcher;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1088,7 +1089,7 @@ impl FSMetaSource {
         Ok(())
     }
 
-    pub(crate) async fn apply_orchestration_signals(
+    pub(crate) async fn perform_apply_orchestration_signals(
         &self,
         signals: &[SourceControlSignal],
     ) -> Result<()> {
@@ -1254,6 +1255,13 @@ impl FSMetaSource {
         Ok(())
     }
 
+    pub(crate) async fn apply_orchestration_signals(
+        &self,
+        signals: &[SourceControlSignal],
+    ) -> Result<()> {
+        self.perform_apply_orchestration_signals(signals).await
+    }
+
     pub(crate) async fn control_signals_with_replay(
         &self,
         signals: &[SourceControlSignal],
@@ -1371,12 +1379,28 @@ impl FSMetaSource {
         Ok(Some(groups))
     }
 
-    pub fn scheduled_source_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
+    pub(crate) fn snapshot_scheduled_source_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
         self.scheduled_group_ids(SourceRuntimeUnit::Source)
     }
 
-    pub fn scheduled_scan_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
+    pub(crate) fn snapshot_scheduled_scan_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
         self.scheduled_group_ids(SourceRuntimeUnit::Scan)
+    }
+
+    pub(crate) fn scheduled_source_group_ids_snapshot(&self) -> Result<Option<BTreeSet<String>>> {
+        self.snapshot_scheduled_source_group_ids()
+    }
+
+    pub(crate) fn scheduled_scan_group_ids_snapshot(&self) -> Result<Option<BTreeSet<String>>> {
+        self.snapshot_scheduled_scan_group_ids()
+    }
+
+    pub fn scheduled_source_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
+        self.scheduled_source_group_ids_snapshot()
+    }
+
+    pub fn scheduled_scan_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
+        self.scheduled_scan_group_ids_snapshot()
     }
 
     async fn refresh_runtime_roots(&self, trigger_rescan: bool) -> Result<()> {
@@ -2276,7 +2300,23 @@ impl FSMetaSource {
         boundary: Option<Arc<dyn ChannelIoSubset>>,
         state_boundary: Arc<dyn StateBoundary>,
     ) -> Result<Self> {
-        Self::with_boundaries_and_state_inner(config, node_id, boundary, state_boundary, false)
+        Self::with_boundaries_and_state_internal(config, node_id, boundary, state_boundary, false)
+    }
+
+    pub(crate) fn with_boundaries_and_state_internal(
+        config: SourceConfig,
+        node_id: NodeId,
+        boundary: Option<Arc<dyn ChannelIoSubset>>,
+        state_boundary: Arc<dyn StateBoundary>,
+        defer_authority_read: bool,
+    ) -> Result<Self> {
+        Self::with_boundaries_and_state_inner(
+            config,
+            node_id,
+            boundary,
+            state_boundary,
+            defer_authority_read,
+        )
     }
 
     fn with_boundaries_and_state_inner(
@@ -2635,7 +2675,10 @@ impl FSMetaSource {
         });
     }
 
-    pub async fn start_runtime_endpoints(&self, boundary: Arc<dyn ChannelIoSubset>) -> Result<()> {
+    pub(crate) async fn start_runtime_endpoints_on_boundary(
+        &self,
+        boundary: Arc<dyn ChannelIoSubset>,
+    ) -> Result<()> {
         self.prune_finished_endpoint_tasks("source.start_runtime_endpoints.prune");
         if !lock_or_recover(&self.endpoint_tasks, "source.start_runtime_endpoints").is_empty() {
             return Ok(());
@@ -2992,6 +3035,10 @@ impl FSMetaSource {
         Ok(())
     }
 
+    pub async fn start_runtime_endpoints(&self, boundary: Arc<dyn ChannelIoSubset>) -> Result<()> {
+        self.start_runtime_endpoints_on_boundary(boundary).await
+    }
+
     /// Current lifecycle state.
     #[allow(dead_code)]
     pub fn state(&self) -> LifecycleState {
@@ -3018,7 +3065,7 @@ impl FSMetaSource {
         self.trigger_rescan();
     }
 
-    pub(crate) async fn trigger_rescan_when_ready_epoch(&self) -> u64 {
+    pub(crate) async fn perform_trigger_rescan_when_ready_epoch(&self) -> u64 {
         let status = self.status_snapshot();
         let (published_batches, last_published_at_us) = source_status_publication_marker(&status);
         let last_audit_completed_at_us = source_status_rescan_completion_marker(&status);
@@ -3031,6 +3078,11 @@ impl FSMetaSource {
         epoch
     }
 
+    #[cfg(test)]
+    pub(crate) async fn trigger_rescan_when_ready_epoch(&self) -> u64 {
+        self.perform_trigger_rescan_when_ready_epoch().await
+    }
+
     /// Trigger an overflow diagnostic signal. Intended for tests simulating IN_Q_OVERFLOW recovery-path.
     #[allow(dead_code)]
     pub fn trigger_overflow_rescan(&self) {
@@ -3040,8 +3092,7 @@ impl FSMetaSource {
         }
     }
 
-    /// Snapshot currently configured logical roots.
-    pub fn logical_roots_snapshot(&self) -> Vec<RootSpec> {
+    pub(crate) fn snapshot_logical_roots(&self) -> Vec<RootSpec> {
         lock_or_recover(
             &self.state_cell.logical_roots,
             "source.logical_roots.snapshot",
@@ -3049,8 +3100,16 @@ impl FSMetaSource {
         .clone()
     }
 
-    /// Snapshot current granted mount roots.
-    pub fn host_object_grants_snapshot(&self) -> Vec<GrantedMountRoot> {
+    pub(crate) fn snapshot_cached_logical_roots(&self) -> Vec<RootSpec> {
+        self.snapshot_logical_roots()
+    }
+
+    /// Snapshot currently configured logical roots.
+    pub fn logical_roots_snapshot(&self) -> Vec<RootSpec> {
+        self.snapshot_logical_roots()
+    }
+
+    pub(crate) fn snapshot_host_object_grants(&self) -> Vec<GrantedMountRoot> {
         lock_or_recover(
             &self.state_cell.host_object_grants,
             "source.host_object_grants.snapshot",
@@ -3058,9 +3117,26 @@ impl FSMetaSource {
         .clone()
     }
 
+    pub(crate) fn snapshot_cached_host_object_grants(&self) -> Vec<GrantedMountRoot> {
+        self.snapshot_host_object_grants()
+    }
+
+    /// Snapshot current granted mount roots.
+    pub fn host_object_grants_snapshot(&self) -> Vec<GrantedMountRoot> {
+        self.snapshot_host_object_grants()
+    }
+
+    pub(crate) fn snapshot_host_object_grants_version(&self) -> u64 {
+        self.host_object_grants_version.load(Ordering::Relaxed)
+    }
+
     /// Snapshot current host object grants version.
     pub fn host_object_grants_version_snapshot(&self) -> u64 {
-        self.host_object_grants_version.load(Ordering::Relaxed)
+        self.snapshot_host_object_grants_version()
+    }
+
+    pub(crate) fn snapshot_lifecycle_state_label(&self) -> String {
+        format!("{:?}", self.state()).to_ascii_lowercase()
     }
 
     /// Snapshot logical-root fanout mapping.
@@ -3072,7 +3148,7 @@ impl FSMetaSource {
         .clone()
     }
 
-    pub fn resolve_group_id_for_object_ref(&self, object_ref: &str) -> Option<String> {
+    pub(crate) fn snapshot_group_id_for_object_ref(&self, object_ref: &str) -> Option<String> {
         let fanout = lock_or_recover(
             &self.state_cell.logical_root_fanout,
             "source.logical_root_fanout.lookup",
@@ -3083,6 +3159,10 @@ impl FSMetaSource {
                 .any(|member| member.object_ref == object_ref)
                 .then(|| group_id.clone())
         })
+    }
+
+    pub fn resolve_group_id_for_object_ref(&self, object_ref: &str) -> Option<String> {
+        self.snapshot_group_id_for_object_ref(object_ref)
     }
 
     /// Snapshot fanout health projection.
@@ -3115,7 +3195,7 @@ impl FSMetaSource {
         self.sentinel.degraded_roots()
     }
 
-    pub fn status_snapshot(&self) -> SourceStatusSnapshot {
+    pub(crate) fn build_status_snapshot(&self) -> SourceStatusSnapshot {
         let current_stream_generation = lock_or_recover(
             &self.state_cell.stream_binding,
             "source.status.snapshot.stream_binding",
@@ -3193,6 +3273,10 @@ impl FSMetaSource {
         }
     }
 
+    pub fn status_snapshot(&self) -> SourceStatusSnapshot {
+        self.build_status_snapshot()
+    }
+
     pub fn yielded_path_origin_counts_snapshot(&self) -> BTreeMap<String, u64> {
         lock_or_recover(
             &self.yielded_path_origin_counts,
@@ -3223,17 +3307,21 @@ impl FSMetaSource {
         pending
     }
 
-    pub fn source_primary_by_group_snapshot(&self) -> BTreeMap<String, String> {
+    pub(crate) fn snapshot_source_primary_by_group(&self) -> BTreeMap<String, String> {
         Self::compute_group_primary_by_logical_root(
-            &self.logical_roots_snapshot(),
-            &self.host_object_grants_snapshot(),
+            &self.snapshot_logical_roots(),
+            &self.snapshot_host_object_grants(),
             None,
         )
         .into_iter()
         .collect()
     }
 
-    pub async fn publish_manual_rescan_signal(&self) -> Result<()> {
+    pub fn source_primary_by_group_snapshot(&self) -> BTreeMap<String, String> {
+        self.snapshot_source_primary_by_group()
+    }
+
+    pub(crate) async fn emit_manual_rescan_signal(&self) -> Result<()> {
         self.manual_rescan_signal
             .emit(&self.node_id.0)
             .await
@@ -3243,11 +3331,15 @@ impl FSMetaSource {
             })
     }
 
+    pub async fn publish_manual_rescan_signal(&self) -> Result<()> {
+        self.emit_manual_rescan_signal().await
+    }
+
     pub(crate) fn current_rescan_observed_epoch(&self) -> u64 {
         self.state_cell.current_rescan_observed_epoch()
     }
 
-    pub(crate) fn progress_snapshot(&self) -> SourceProgressSnapshot {
+    pub(crate) fn build_progress_snapshot(&self) -> SourceProgressSnapshot {
         SourceProgressSnapshot {
             rescan_observed_epoch: self.current_rescan_observed_epoch(),
             scheduled_source_groups: self
@@ -3262,6 +3354,11 @@ impl FSMetaSource {
                 .unwrap_or_default(),
             published_group_epoch: self.state_cell.published_group_epoch_snapshot(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn progress_snapshot(&self) -> SourceProgressSnapshot {
+        self.build_progress_snapshot()
     }
 
     pub(crate) fn maybe_mark_rescan_observed_if_publication_advanced(
@@ -3323,7 +3420,7 @@ impl FSMetaSource {
         Ok(())
     }
 
-    pub fn force_find_inflight_groups_snapshot(&self) -> Vec<String> {
+    pub(crate) fn snapshot_force_find_inflight_groups(&self) -> Vec<String> {
         let mut groups = lock_or_recover(
             &self.force_find_inflight,
             "source.force_find.inflight.snapshot",
@@ -3335,7 +3432,11 @@ impl FSMetaSource {
         groups
     }
 
-    pub fn last_force_find_runner_by_group_snapshot(&self) -> BTreeMap<String, String> {
+    pub fn force_find_inflight_groups_snapshot(&self) -> Vec<String> {
+        self.snapshot_force_find_inflight_groups()
+    }
+
+    pub(crate) fn snapshot_last_force_find_runner_by_group(&self) -> BTreeMap<String, String> {
         lock_or_recover(
             &self.force_find_last_runner,
             "source.force_find.last_runner.snapshot",
@@ -3343,12 +3444,20 @@ impl FSMetaSource {
         .clone()
     }
 
-    pub fn last_control_frame_signals_snapshot(&self) -> Vec<String> {
+    pub fn last_force_find_runner_by_group_snapshot(&self) -> BTreeMap<String, String> {
+        self.snapshot_last_force_find_runner_by_group()
+    }
+
+    pub(crate) fn snapshot_last_control_frame_signals(&self) -> Vec<String> {
         lock_or_recover(
             &self.last_control_frame_signals,
             "source.last_control_frame_signals.snapshot",
         )
         .clone()
+    }
+
+    pub fn last_control_frame_signals_snapshot(&self) -> Vec<String> {
+        self.snapshot_last_control_frame_signals()
     }
 
     async fn wait_for_group_primary_scan_roots_ready(&self) -> bool {
@@ -3396,8 +3505,7 @@ impl FSMetaSource {
         }
     }
 
-    /// Update logical roots online and reconcile concrete-root tasks without restart.
-    pub async fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {
+    pub(crate) async fn apply_logical_roots_update(&self, roots: Vec<RootSpec>) -> Result<()> {
         eprintln!(
             "fs_meta_source: update_logical_roots begin node={} roots={}",
             self.node_id.0,
@@ -3450,6 +3558,11 @@ impl FSMetaSource {
             self.node_id.0, root_count, grant_count
         );
         Ok(())
+    }
+
+    /// Update logical roots online and reconcile concrete-root tasks without restart.
+    pub async fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {
+        self.apply_logical_roots_update(roots).await
     }
 }
 
@@ -4140,7 +4253,9 @@ impl FSMetaSource {
     ///
     /// This is a domain helper, not part of `RuntimeBoundaryApp`. Runtime orchestrators
     /// use this for the continuous event pipeline.
-    pub async fn pub_(&self) -> Result<Pin<Box<dyn Stream<Item = Vec<Event>> + Send>>> {
+    pub(crate) async fn build_pub_stream(
+        &self,
+    ) -> Result<Pin<Box<dyn Stream<Item = Vec<Event>> + Send>>> {
         if cfg!(not(target_os = "linux")) {
             return Err(CnxError::NotSupported(
                 "fs-meta realtime watch requires linux host".into(),
@@ -4242,6 +4357,10 @@ impl FSMetaSource {
         Ok(Box::pin(output_stream))
     }
 
+    pub async fn pub_(&self) -> Result<Pin<Box<dyn Stream<Item = Vec<Event>> + Send>>> {
+        self.build_pub_stream().await
+    }
+
     async fn root_stream(
         config: SourceConfig,
         drift_estimator: Arc<Mutex<DriftEstimator>>,
@@ -4269,9 +4388,23 @@ impl FSMetaSource {
                 root_key,
                 root_path.display()
             );
-            match root.host_fs.metadata(&root_path) {
-                Ok(_) => break,
-                Err(e) => {
+            let probe_host_fs = Arc::clone(&root.host_fs);
+            let probe_path = root_path.clone();
+            let probe_result = tokio::time::timeout(
+                Duration::from_secs(15),
+                tokio::task::spawn_blocking(move || probe_host_fs.metadata(&probe_path)),
+            )
+            .await;
+            match probe_result {
+                Ok(Ok(Ok(_))) => {
+                    eprintln!(
+                        "fs_meta_source: root availability ok root_key={} path={}",
+                        root_key,
+                        root_path.display()
+                    );
+                    break;
+                }
+                Ok(Ok(Err(e))) => {
                     eprintln!(
                         "fs_meta_source: root unavailable root_key={} path={} err={}",
                         root_key,
@@ -4288,6 +4421,45 @@ impl FSMetaSource {
                         root.spec.id,
                         e,
                         backoff.as_secs()
+                    );
+                    tokio::select! {
+                        _ = global_shutdown.cancelled() => return Err(CnxError::ChannelClosed),
+                        _ = task_shutdown.cancelled() => return Err(CnxError::ChannelClosed),
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                }
+                Ok(Err(err)) => {
+                    let e = io::Error::other(format!("root availability probe join failed: {err}"));
+                    eprintln!(
+                        "fs_meta_source: root availability probe join failed root_key={} path={} err={}",
+                        root_key,
+                        root_path.display(),
+                        e
+                    );
+                    Self::update_object_health(
+                        &fanout_health,
+                        &root_key,
+                        format!("waiting_for_root: {e}"),
+                    );
+                    tokio::select! {
+                        _ = global_shutdown.cancelled() => return Err(CnxError::ChannelClosed),
+                        _ = task_shutdown.cancelled() => return Err(CnxError::ChannelClosed),
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                }
+                Err(_) => {
+                    let e = io::Error::new(io::ErrorKind::TimedOut, "root availability probe timed out after 15s");
+                    eprintln!(
+                        "fs_meta_source: root availability probe timeout root_key={} path={}",
+                        root_key,
+                        root_path.display()
+                    );
+                    Self::update_object_health(
+                        &fanout_health,
+                        &root_key,
+                        format!("waiting_for_root: {e}"),
                     );
                     tokio::select! {
                         _ = global_shutdown.cancelled() => return Err(CnxError::ChannelClosed),
@@ -4703,11 +4875,7 @@ impl FSMetaSource {
         Ok(merged)
     }
 
-    /// Force-find query path used by projection API.
-    ///
-    /// Unlike `req`, this path supports per-object targeting and degrades
-    /// gracefully when one object scan fails.
-    pub fn force_find(&self, params: &InternalQueryRequest) -> Result<Vec<Event>> {
+    pub(crate) fn perform_force_find(&self, params: &InternalQueryRequest) -> Result<Vec<Event>> {
         if params.transport != QueryTransport::ForceFind {
             return Err(CnxError::InvalidInput(
                 "force_find requires force-find transport".into(),
@@ -4858,6 +5026,14 @@ impl FSMetaSource {
 
         result
     }
+
+    /// Force-find query path used by projection API.
+    ///
+    /// Unlike `req`, this path supports per-object targeting and degrades
+    /// gracefully when one object scan fails.
+    pub fn force_find(&self, params: &InternalQueryRequest) -> Result<Vec<Event>> {
+        self.perform_force_find(params)
+    }
 }
 
 impl FSMetaSource {
@@ -4871,18 +5047,25 @@ impl FSMetaSource {
         self.query_scan(&crate::query::request::LiveScanRequest::default())
     }
 
-    pub async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
-        let signals = source_control_signals_from_envelopes(envelopes)?;
-        self.apply_orchestration_signals(&signals).await?;
-        self.record_retained_control_signals(&signals).await;
+    pub(crate) async fn apply_control_frame_signals(
+        &self,
+        signals: &[SourceControlSignal],
+    ) -> Result<()> {
+        self.apply_orchestration_signals(signals).await?;
+        self.record_retained_control_signals(signals).await;
         *lock_or_recover(
             &self.last_control_frame_signals,
             "source.on_control_frame.last_control_frame_signals",
-        ) = summarize_source_control_signals(&signals);
+        ) = summarize_source_control_signals(signals);
         Ok(())
     }
 
-    pub async fn close(&self) -> Result<()> {
+    pub async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
+        let signals = source_control_signals_from_envelopes(envelopes)?;
+        self.apply_control_frame_signals(&signals).await
+    }
+
+    pub(crate) async fn perform_close(&self) -> Result<()> {
         self.shutdown.cancel();
         let mut tasks = std::mem::take(&mut *lock_or_recover(
             &self.state_cell.root_tasks,
@@ -4917,6 +5100,10 @@ impl FSMetaSource {
         }
         *lock_or_recover(&self.state, "source.close.state") = LifecycleState::Closed;
         Ok(())
+    }
+
+    pub async fn close(&self) -> Result<()> {
+        self.perform_close().await
     }
 }
 

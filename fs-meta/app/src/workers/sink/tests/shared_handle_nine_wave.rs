@@ -126,13 +126,13 @@ async fn second_exact_shaped_sink_nine_wave_reacquires_worker_client_after_first
     let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < initial_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => client.send(batch).await.expect("apply initial batch"),
+            Ok(Some(batch)) => client.send_with_failure(batch).await.expect("apply initial batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let nfs1_ready = decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1"),
             b"/force-find-stress",
@@ -141,7 +141,7 @@ async fn second_exact_shaped_sink_nine_wave_reacquires_worker_client_after_first
         .is_some();
         let nfs2_ready = decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2"),
             b"/force-find-stress",
@@ -156,7 +156,7 @@ async fn second_exact_shaped_sink_nine_wave_reacquires_worker_client_after_first
     assert!(
         decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1 after initial"),
             b"/force-find-stress",
@@ -168,7 +168,7 @@ async fn second_exact_shaped_sink_nine_wave_reacquires_worker_client_after_first
     assert!(
         decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2 after initial"),
             b"/force-find-stress",
@@ -224,7 +224,7 @@ async fn second_exact_shaped_sink_nine_wave_reacquires_worker_client_after_first
     assert!(
         decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1 after second wave restart"),
             b"/force-find-stress",
@@ -236,7 +236,7 @@ async fn second_exact_shaped_sink_nine_wave_reacquires_worker_client_after_first
     assert!(
         decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2 after second wave restart"),
             b"/force-find-stress",
@@ -378,13 +378,13 @@ async fn second_exact_shaped_sink_nine_wave_reacquires_worker_client_after_first
     let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < initial_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => client.send(batch).await.expect("apply initial batch"),
+            Ok(Some(batch)) => client.send_with_failure(batch).await.expect("apply initial batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let nfs1_ready = decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1"),
             b"/force-find-stress",
@@ -393,7 +393,7 @@ async fn second_exact_shaped_sink_nine_wave_reacquires_worker_client_after_first
         .is_some();
         let nfs2_ready = decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2"),
             b"/force-find-stress",
@@ -408,7 +408,7 @@ async fn second_exact_shaped_sink_nine_wave_reacquires_worker_client_after_first
     assert!(
         decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1 after initial"),
             b"/force-find-stress",
@@ -420,7 +420,7 @@ async fn second_exact_shaped_sink_nine_wave_reacquires_worker_client_after_first
     assert!(
         decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2 after initial"),
             b"/force-find-stress",
@@ -500,7 +500,7 @@ async fn second_exact_shaped_sink_nine_wave_reacquires_worker_client_after_first
     assert!(
         decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1 after repeated early-eof recovery"),
             b"/force-find-stress",
@@ -512,7 +512,7 @@ async fn second_exact_shaped_sink_nine_wave_reacquires_worker_client_after_first
     assert!(
         decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2 after repeated early-eof recovery"),
             b"/force-find-stress",
@@ -662,13 +662,13 @@ async fn second_exact_shaped_sink_nine_wave_first_post_replay_status_snapshot_no
     let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < initial_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => client.send(batch).await.expect("apply initial batch"),
+            Ok(Some(batch)) => client.send_with_failure(batch).await.expect("apply initial batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let nfs1_ready = decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1"),
             b"/force-find-stress",
@@ -677,7 +677,7 @@ async fn second_exact_shaped_sink_nine_wave_first_post_replay_status_snapshot_no
         .is_some();
         let nfs2_ready = decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2"),
             b"/force-find-stress",
@@ -692,7 +692,7 @@ async fn second_exact_shaped_sink_nine_wave_first_post_replay_status_snapshot_no
     assert!(
         decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1 after initial"),
             b"/force-find-stress",
@@ -704,7 +704,7 @@ async fn second_exact_shaped_sink_nine_wave_first_post_replay_status_snapshot_no
     assert!(
         decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2 after initial"),
             b"/force-find-stress",
@@ -919,13 +919,13 @@ async fn second_exact_shaped_sink_nine_wave_first_post_replay_status_snapshot_re
     let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < initial_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => client.send(batch).await.expect("apply initial batch"),
+            Ok(Some(batch)) => client.send_with_failure(batch).await.expect("apply initial batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let nfs1_ready = decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1"),
             b"/force-find-stress",
@@ -934,7 +934,7 @@ async fn second_exact_shaped_sink_nine_wave_first_post_replay_status_snapshot_re
         .is_some();
         let nfs2_ready = decode_exact_query_node(
             client
-                .materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                .materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs2"))
                 .await
                 .expect("query nfs2"),
             b"/force-find-stress",
@@ -989,7 +989,7 @@ async fn second_exact_shaped_sink_nine_wave_first_post_replay_status_snapshot_re
         .update_cached_status_snapshot(SinkStatusSnapshot::default())
         .expect("clear cached status before first post-replay blocking status snapshot");
 
-    match client.status_snapshot().await {
+    match client.status_snapshot_with_failure().await {
         Ok(snapshot) => {
             assert!(
                 snapshot
@@ -1005,9 +1005,10 @@ async fn second_exact_shaped_sink_nine_wave_first_post_replay_status_snapshot_re
                 "first post-replay blocking status_snapshot after same-handle reset must restore ready state instead of reopening with replay-only/not-ready groups: {snapshot:?}"
             );
         }
-        Err(CnxError::Timeout) => {}
+        Err(err) if matches!(err.as_error(), CnxError::Timeout) => {}
         Err(err) => panic!(
-            "first post-replay blocking status_snapshot after same-handle reset must restore ready state or fail-close, got {err}"
+            "first post-replay blocking status_snapshot after same-handle reset must restore ready state or fail-close, got {}",
+            err.as_error()
         ),
     }
 

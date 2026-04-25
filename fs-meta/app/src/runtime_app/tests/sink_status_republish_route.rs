@@ -769,12 +769,12 @@ async fn peer_only_sink_status_route_triggers_source_rescan_before_sink_readines
                         .expect("query-peer sink-query-proxy route state after later source-only recovery error");
                     if !source_status_active || !source_find_active {
                         panic!(
-                            "later source-only recovery may keep source-owned peer routes live while sink readiness is still restoring; source_status_active={source_status_active} source_find_active={source_find_active} err={err}"
+                            "later source-only recovery may keep source-owned peer routes live while sink readiness is still restoring; source_status_active={source_status_active} source_find_active={source_find_active} err={err:?}"
                         );
                     }
                     assert!(
                         !sink_status_active && !sink_query_proxy_active,
-                        "later source-only recovery must keep sink-owned peer routes suppressed until local sink status republish succeeds; sink_status_active={sink_status_active} sink_query_proxy_active={sink_query_proxy_active} err={err}"
+                        "later source-only recovery must keep sink-owned peer routes suppressed until local sink status republish succeeds; sink_status_active={sink_status_active} sink_query_proxy_active={sink_query_proxy_active} err={err:?}"
                     );
                     app.close().await.expect("close app");
                     return;
@@ -845,23 +845,25 @@ async fn peer_only_sink_status_route_triggers_source_rescan_before_sink_readines
                 .unwrap_or_default();
             let cached_sink_status_summary = app
                 .sink
-                .cached_status_snapshot()
+                .cached_status_snapshot_with_failure()
                 .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
                 .unwrap_or_else(|cached_err| {
-                    format!("cached_sink_status_unavailable err={cached_err}")
+                    format!("cached_sink_status_unavailable err={cached_err:?}")
                 });
             let blocking_sink_status_summary = match tokio::time::timeout(
                 Duration::from_secs(2),
-                app.sink.status_snapshot(),
+                app.sink.status_snapshot_with_failure(),
             )
             .await
             {
                 Ok(Ok(snapshot)) => summarize_sink_status_endpoint(&snapshot),
-                Ok(Err(snapshot_err)) => format!("blocking_status_err={snapshot_err}"),
+                Ok(Err(snapshot_err)) => {
+                    format!("blocking_status_err={}", snapshot_err.as_error())
+                }
                 Err(_) => "blocking_status_timeout".to_string(),
             };
             let source_observability_summary = summarize_source_observability_endpoint(
-                &app.source.observability_snapshot_nonblocking().await,
+                &app.source.observability_snapshot_nonblocking_for_status_route().await.0,
             );
             let sink_status_active = app
                     .facade_gate
@@ -879,10 +881,10 @@ async fn peer_only_sink_status_route_triggers_source_rescan_before_sink_readines
                     .expect("query-peer sink-query-proxy route state while local sink status republish remains unavailable");
             assert!(
                 !sink_status_active && !sink_query_proxy_active,
-                "runtime-app must keep sink-owned peer routes suppressed while post-return local sink-status republish is still unavailable; sink_status_active={sink_status_active} sink_query_proxy_active={sink_query_proxy_active} sink_groups_after_local_wait={sink_groups_after_local_wait:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary} err={err}"
+                "runtime-app must keep sink-owned peer routes suppressed while post-return local sink-status republish is still unavailable; sink_status_active={sink_status_active} sink_query_proxy_active={sink_query_proxy_active} sink_groups_after_local_wait={sink_groups_after_local_wait:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary} err={err:?}"
             );
             panic!(
-                "runtime-app kept sink-owned peer routes suppressed after later source-only recovery returned, but local sink status still failed before republish: trigger_count_after_return={trigger_count_after_return} trigger_count_after_local_wait={trigger_count_after_local_wait} sink_groups_after_local_wait={sink_groups_after_local_wait:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary} err={err}"
+                "runtime-app kept sink-owned peer routes suppressed after later source-only recovery returned, but local sink status still failed before republish: trigger_count_after_return={trigger_count_after_return} trigger_count_after_local_wait={trigger_count_after_local_wait} sink_groups_after_local_wait={sink_groups_after_local_wait:?} cached_sink_status={cached_sink_status_summary} blocking_sink_status={blocking_sink_status_summary} source_observability={source_observability_summary} err={err:?}"
             );
         }
         Err(_) => {
@@ -894,23 +896,25 @@ async fn peer_only_sink_status_route_triggers_source_rescan_before_sink_readines
                 .unwrap_or_default();
             let cached_sink_status_summary = app
                 .sink
-                .cached_status_snapshot()
+                .cached_status_snapshot_with_failure()
                 .map(|snapshot| summarize_sink_status_endpoint(&snapshot))
                 .unwrap_or_else(|cached_err| {
-                    format!("cached_sink_status_unavailable err={cached_err}")
+                    format!("cached_sink_status_unavailable err={cached_err:?}")
                 });
             let blocking_sink_status_summary = match tokio::time::timeout(
                 Duration::from_secs(2),
-                app.sink.status_snapshot(),
+                app.sink.status_snapshot_with_failure(),
             )
             .await
             {
                 Ok(Ok(snapshot)) => summarize_sink_status_endpoint(&snapshot),
-                Ok(Err(snapshot_err)) => format!("blocking_status_err={snapshot_err}"),
+                Ok(Err(snapshot_err)) => {
+                    format!("blocking_status_err={}", snapshot_err.as_error())
+                }
                 Err(_) => "blocking_status_timeout".to_string(),
             };
             let source_observability_summary = summarize_source_observability_endpoint(
-                &app.source.observability_snapshot_nonblocking().await,
+                &app.source.observability_snapshot_nonblocking_for_status_route().await.0,
             );
             let sink_status_active = app
                     .facade_gate
@@ -1341,9 +1345,9 @@ async fn sink_status_route_reuses_cached_ready_snapshot_when_replay_required_pro
 
     let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
-        let snapshot = match app.sink.status_snapshot().await {
+        let snapshot = match app.sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => {
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => {
                 assert!(
                     tokio::time::Instant::now() < readiness_deadline,
                     "precondition: local sink status must become ready before forcing replay-required route fallback"
@@ -1351,7 +1355,7 @@ async fn sink_status_route_reuses_cached_ready_snapshot_when_replay_required_pro
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
-            Err(err) => panic!("prime ready local sink status: {err}"),
+            Err(err) => panic!("prime ready local sink status: {}", err.as_error()),
         };
         if snapshot.groups.iter().any(|group| {
             group.group_id == "nfs2" && group.is_ready() && group.total_nodes > 0

@@ -11,7 +11,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use bytes::Bytes;
 use crossbeam_channel as cb;
@@ -49,6 +49,9 @@ fn to_epoch_us(t: Option<std::time::SystemTime>) -> u64 {
 }
 
 const HOST_FS_RETRY_ATTEMPTS: usize = 4;
+const HOST_FS_OP_TIMEOUT_ENV: &str = "FS_META_SOURCE_HOST_FS_OP_TIMEOUT_SECS";
+const HOST_FS_OP_TIMEOUT_DEFAULT_SECS: u64 = 15;
+
 const AUDIT_DEEP_INTERVAL_ROUNDS_ENV: &str = "FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS";
 const AUDIT_DEEP_INTERVAL_ROUNDS_DEFAULT: u64 = 24;
 const AUDIT_DEEP_INTERVAL_ROUNDS_MIN: u64 = 1;
@@ -115,11 +118,72 @@ fn should_retry_host_fs_error(kind: io::ErrorKind) -> bool {
     )
 }
 
-fn metadata_with_retry(host_fs: &dyn HostFs, path: &Path) -> io::Result<HostFsMetadata> {
+fn host_fs_op_timeout() -> Duration {
+    let secs = std::env::var(HOST_FS_OP_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(HOST_FS_OP_TIMEOUT_DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
+
+fn host_fs_timeout_error(op: &str, path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("{op} timed out after {:?} for {}", host_fs_op_timeout(), path.display()),
+    )
+}
+
+fn metadata_once_with_timeout(
+    host_fs: Arc<dyn HostFs>,
+    path: PathBuf,
+) -> io::Result<HostFsMetadata> {
+    let display_path = path.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(host_fs.metadata(&path));
+    });
+    match rx.recv_timeout(host_fs_op_timeout()) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(host_fs_timeout_error("metadata", &display_path))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(io::Error::other(format!(
+                "metadata worker disconnected for {}",
+                display_path.display()
+            )))
+        }
+    }
+}
+
+fn read_dir_once_with_timeout(
+    host_fs: Arc<dyn HostFs>,
+    path: PathBuf,
+) -> io::Result<Vec<HostFsDirEntry>> {
+    let display_path = path.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(host_fs.read_dir(&path));
+    });
+    match rx.recv_timeout(host_fs_op_timeout()) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(host_fs_timeout_error("read_dir", &display_path))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(format!(
+            "read_dir worker disconnected for {}",
+            display_path.display()
+        ))),
+    }
+}
+
+fn metadata_with_retry(host_fs: Arc<dyn HostFs>, path: &Path) -> io::Result<HostFsMetadata> {
     let mut last = None::<io::Error>;
     for attempt in 1..=HOST_FS_RETRY_ATTEMPTS {
-        match host_fs.metadata(path) {
+        match metadata_once_with_timeout(Arc::clone(&host_fs), path.to_path_buf()) {
             Ok(meta) => return Ok(meta),
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => return Err(err),
             Err(err)
                 if attempt < HOST_FS_RETRY_ATTEMPTS && should_retry_host_fs_error(err.kind()) =>
             {
@@ -131,11 +195,15 @@ fn metadata_with_retry(host_fs: &dyn HostFs, path: &Path) -> io::Result<HostFsMe
     Err(last.unwrap_or_else(|| io::Error::other("metadata retry exhausted")))
 }
 
-fn read_dir_with_retry(host_fs: &dyn HostFs, path: &Path) -> io::Result<Vec<HostFsDirEntry>> {
+fn read_dir_with_retry(
+    host_fs: Arc<dyn HostFs>,
+    path: &Path,
+) -> io::Result<Vec<HostFsDirEntry>> {
     let mut last = None::<io::Error>;
     for attempt in 1..=HOST_FS_RETRY_ATTEMPTS {
-        match host_fs.read_dir(path) {
+        match read_dir_once_with_timeout(Arc::clone(&host_fs), path.to_path_buf()) {
             Ok(entries) => return Ok(entries),
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => return Err(err),
             Err(err)
                 if attempt < HOST_FS_RETRY_ATTEMPTS && should_retry_host_fs_error(err.kind()) =>
             {
@@ -241,7 +309,7 @@ impl ParallelScanner {
             self.root_path.join(path_str.trim_start_matches('/'))
         };
 
-        let meta = match metadata_with_retry(self.host_fs.as_ref(), &target) {
+        let meta = match metadata_with_retry(Arc::clone(&self.host_fs), &target) {
             Ok(meta) => meta,
             Err(err) if err.kind() == io::ErrorKind::NotFound && target != self.root_path => {
                 return Ok(Vec::new());
@@ -353,7 +421,7 @@ impl ParallelScanner {
                                 }
 
                                 // Check symlink loop
-                                let identity = match metadata_with_retry(host_fs.as_ref(), &dir_path) {
+                                let identity = match metadata_with_retry(Arc::clone(&host_fs), &dir_path) {
                                     Ok(meta) => {
                                         let id = (
                                             meta.dev.unwrap_or(0),
@@ -417,7 +485,7 @@ impl ParallelScanner {
                                         unchanged
                                     };
 
-                                    let entries = match read_dir_with_retry(host_fs.as_ref(), &dir_path)
+                                    let entries = match read_dir_with_retry(Arc::clone(&host_fs), &dir_path)
                                     {
                                         Ok(entries) => entries,
                                         Err(e) => {
@@ -495,7 +563,7 @@ impl ParallelScanner {
                                         }
 
                                         let entry_path = entry.path;
-                                        match metadata_with_retry(host_fs.as_ref(), &entry_path) {
+                                        match metadata_with_retry(Arc::clone(&host_fs), &entry_path) {
                                             Ok(meta) => {
                                                 let mtime_us = to_epoch_us(meta.modified);
                                                 let ctime_us = to_epoch_us(meta.created);
@@ -595,7 +663,7 @@ impl ParallelScanner {
             records.push(rec);
         }
 
-        match read_dir_with_retry(self.host_fs.as_ref(), dir) {
+        match read_dir_with_retry(Arc::clone(&self.host_fs), dir) {
             Ok(entries) => {
                 for entry in entries {
                     if entry.is_dir {
@@ -613,7 +681,7 @@ impl ParallelScanner {
 
     /// Stat a single path and produce a FileMetaRecord.
     fn stat_to_record(&self, path: &Path) -> Option<FileMetaRecord> {
-        let meta = match metadata_with_retry(self.host_fs.as_ref(), path) {
+        let meta = match metadata_with_retry(Arc::clone(&self.host_fs), path) {
             Ok(m) => m,
             Err(e) => {
                 log::warn!("Skipping path {:?}: metadata failed: {}", path, e);
@@ -642,7 +710,7 @@ impl ParallelScanner {
         let relative = watcher::make_relative_with_prefix(path, &self.root_path, &self.emit_prefix);
 
         let (parent_path, parent_mtime_us) = if let Some(parent) = path.parent() {
-            let parent_meta = metadata_with_retry(self.host_fs.as_ref(), parent).ok();
+            let parent_meta = metadata_with_retry(Arc::clone(&self.host_fs), parent).ok();
             let parent_mtime = parent_meta
                 .and_then(|m| m.modified)
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())

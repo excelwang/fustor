@@ -1587,7 +1587,7 @@ async fn deactivate_then_reactivate_preserves_ready_materialized_group_state() {
         .await
         .expect("activate both should pass");
 
-    sink.send(&[
+    sink.send_with_failure(&[
         mk_source_event(
             "node-a::exp-a",
             mk_record(b"/ready-a.txt", "ready-a.txt", 1, EventKind::Update),
@@ -4086,7 +4086,7 @@ async fn runtime_scoped_send_ignores_out_of_scope_group_events() {
         .await
         .expect("activate root-a should pass");
 
-    sink.send(&[
+    sink.send_with_failure(&[
         mk_source_event(
             "node-a::exp-a",
             mk_record(b"/kept.txt", "kept.txt", 10, EventKind::Update),
@@ -4179,7 +4179,7 @@ fn sink_state_authority_log_records_root_updates() {
 #[tokio::test]
 async fn watch_overflow_marks_group_unreliable_until_audit_end() {
     let sink = build_single_group_sink();
-    sink.send(&[mk_control_event(
+    sink.send_with_failure(&[mk_control_event(
         "node-a::exp",
         ControlEvent::WatchOverflow,
         1,
@@ -4197,7 +4197,7 @@ async fn watch_overflow_marks_group_unreliable_until_audit_end() {
         Some(UnreliableReason::WatchOverflowPendingMaterialization)
     );
 
-    sink.send(&[
+    sink.send_with_failure(&[
         mk_control_event(
             "node-a::exp",
             ControlEvent::EpochStart {
@@ -4229,14 +4229,14 @@ async fn watch_overflow_marks_group_unreliable_until_audit_end() {
 #[tokio::test]
 async fn watch_overflow_reason_has_higher_priority_than_node_level_reasons() {
     let sink = build_single_group_sink();
-    sink.send(&[mk_source_event(
+    sink.send_with_failure(&[mk_source_event(
         "node-a::exp",
         mk_record(b"/a.txt", "a.txt", 10, EventKind::Update),
     )])
     .await
     .expect("apply scan record");
 
-    sink.send(&[mk_control_event(
+    sink.send_with_failure(&[mk_control_event(
         "node-a::exp",
         ControlEvent::WatchOverflow,
         11,
@@ -4258,7 +4258,7 @@ async fn watch_overflow_reason_has_higher_priority_than_node_level_reasons() {
 #[tokio::test]
 async fn initial_audit_completion_waits_for_materialized_root() {
     let sink = build_single_group_sink();
-    sink.send(&[
+    sink.send_with_failure(&[
         mk_control_event(
             "node-a::exp",
             ControlEvent::EpochStart {
@@ -4286,7 +4286,7 @@ async fn initial_audit_completion_waits_for_materialized_root() {
         "audit epoch without a materialized root must stay not-ready"
     );
 
-    sink.send(&[mk_source_event(
+    sink.send_with_failure(&[mk_source_event(
         "node-a::exp",
         mk_record(b"/ready.txt", "ready.txt", 3, EventKind::Update),
     )])
@@ -4306,7 +4306,7 @@ async fn initial_audit_completion_waits_for_materialized_root() {
 async fn status_snapshot_exports_waiting_for_materialized_root_after_audit_completes_without_materialized_root()
  {
     let sink = build_single_group_sink();
-    sink.send(&[
+    sink.send_with_failure(&[
         mk_control_event(
             "node-a::exp",
             ControlEvent::EpochStart {
@@ -4343,7 +4343,7 @@ async fn status_snapshot_exports_waiting_for_materialized_root_after_audit_compl
 #[tokio::test]
 async fn status_snapshot_exports_readiness_only_when_waiting_for_materialized_root() {
     let sink = build_single_group_sink();
-    sink.send(&[
+    sink.send_with_failure(&[
         mk_control_event(
             "node-a::exp",
             ControlEvent::EpochStart {
@@ -4880,7 +4880,7 @@ async fn sink_reopen_with_same_state_boundary_preserves_materialized_state_and_i
         cfg.clone(),
     )
     .expect("init sink");
-    sink.send(&[
+    sink.send_with_failure(&[
         mk_source_event(
             "node-a::exp",
             mk_record(b"/ready.txt", "ready.txt", 1, EventKind::Update),
@@ -4952,7 +4952,7 @@ async fn sink_reopen_with_same_state_boundary_preserves_materialized_state_and_i
 #[tokio::test]
 async fn initial_audit_completion_rejects_tombstone_only_state() {
     let sink = build_single_group_sink();
-    sink.send(&[
+    sink.send_with_failure(&[
         mk_source_event(
             "node-a::exp",
             mk_record_with_track(
@@ -5014,7 +5014,7 @@ async fn initial_audit_completion_rejects_tombstone_only_state() {
 #[tokio::test]
 async fn initial_audit_completion_clears_when_group_regresses_to_structural_root_only() {
     let sink = build_single_group_sink();
-    sink.send(&[
+    sink.send_with_failure(&[
         mk_source_event(
             "node-a::exp",
             mk_record(b"/ready.txt", "ready.txt", 1, EventKind::Update),
@@ -5049,7 +5049,7 @@ async fn initial_audit_completion_clears_when_group_regresses_to_structural_root
         "precondition: ready group should have live materialized nodes"
     );
 
-    sink.send(&[mk_source_event(
+    sink.send_with_failure(&[mk_source_event(
         "node-a::exp",
         mk_record(b"/ready.txt", "ready.txt", 4, EventKind::Delete),
     )])

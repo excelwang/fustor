@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RuntimeWorkerBinding};
 use capanix_app_sdk::{CnxError, Event, Result};
 use capanix_runtime_entry_sdk::advanced::boundary::{
-    BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest,
+    BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest, StateBoundary,
 };
 use capanix_runtime_entry_sdk::control::{RuntimeBoundScope, RuntimeHostGrantState};
 use capanix_runtime_entry_sdk::worker_runtime::{
@@ -1011,12 +1011,21 @@ fn clip_retry_deadline(deadline: std::time::Instant, budget: Duration) -> std::t
     std::cmp::min(deadline, std::time::Instant::now() + budget)
 }
 
-fn map_source_timeout_result<T>(
+fn map_source_timeout_result_with_failure<T>(
     result: std::result::Result<Result<T>, tokio::time::error::Elapsed>,
-) -> Result<T> {
+) -> std::result::Result<T, SourceFailure> {
+    match result {
+        Ok(result) => result.map_err(SourceFailure::from),
+        Err(_) => Err(SourceFailure::timeout_reset()),
+    }
+}
+
+fn map_source_failure_timeout_result<T>(
+    result: std::result::Result<std::result::Result<T, SourceFailure>, tokio::time::error::Elapsed>,
+) -> std::result::Result<T, SourceFailure> {
     match result {
         Ok(result) => result,
-        Err(_) => Err(CnxError::Timeout),
+        Err(_) => Err(SourceFailure::timeout_reset()),
     }
 }
 
@@ -1088,12 +1097,19 @@ enum SourceFailureReason {
 }
 
 #[derive(Debug)]
-struct SourceFailure {
+pub(crate) struct SourceFailure {
     cause: CnxError,
     reason: SourceFailureReason,
 }
 
 impl SourceFailure {
+    fn timeout_reset() -> Self {
+        Self {
+            cause: CnxError::Timeout,
+            reason: SourceFailureReason::ControlReset(SourceWorkerControlResetKind::Timeout),
+        }
+    }
+
     fn non_retryable(cause: CnxError) -> Self {
         Self {
             cause,
@@ -1102,12 +1118,15 @@ impl SourceFailure {
     }
 
     fn from_cause(cause: CnxError) -> Self {
-        match classify_source_worker_control_reset(&cause) {
-            Some(kind) => Self {
-                cause,
-                reason: SourceFailureReason::ControlReset(kind),
+        match cause {
+            CnxError::Timeout => Self::timeout_reset(),
+            _ => match classify_source_worker_control_reset(&cause) {
+                Some(kind) => Self {
+                    cause,
+                    reason: SourceFailureReason::ControlReset(kind),
+                },
+                None => Self::non_retryable(cause),
             },
-            None => Self::non_retryable(cause),
         }
     }
 
@@ -1132,11 +1151,11 @@ impl SourceFailure {
         }
     }
 
-    fn as_error(&self) -> &CnxError {
+    pub(crate) fn as_error(&self) -> &CnxError {
         &self.cause
     }
 
-    fn into_error(self) -> CnxError {
+    pub(crate) fn into_error(self) -> CnxError {
         self.cause
     }
 }
@@ -1448,22 +1467,12 @@ fn classify_source_wait_retry(
     SourceWaitRetryDisposition::WaitAfter(after)
 }
 
-fn classify_source_scheduled_groups_refresh_retry(
+fn classify_source_scheduled_groups_refresh_control_reset_retry(
     deadline: std::time::Instant,
-    err: CnxError,
     after: SourceProgressState,
     refresh_disposition: SourceScheduledGroupsRefreshDisposition,
     recovery_observation: SourceScheduledGroupsRefreshRecoveryObservation,
 ) -> SourceScheduledGroupsRefreshRetryDisposition {
-    if !can_retry_update_logical_roots(&err) {
-        return SourceScheduledGroupsRefreshRetryDisposition::Fail(
-            source_scheduled_groups_refresh_failure_from_error(
-                err,
-                refresh_disposition,
-                recovery_observation,
-            ),
-        );
-    }
     if matches!(
         classify_source_retry_budget(deadline),
         SourceRetryBudgetDisposition::Exhausted
@@ -1499,13 +1508,14 @@ fn classify_source_scheduled_groups_refresh_retry_failure(
         | SourceFailureReason::NonRetryable => {
             SourceScheduledGroupsRefreshRetryDisposition::Fail(failure)
         }
-        SourceFailureReason::ControlReset(_) => classify_source_scheduled_groups_refresh_retry(
-            deadline,
-            failure.into_error(),
-            after,
-            refresh_disposition,
-            recovery_observation,
-        ),
+        SourceFailureReason::ControlReset(_) => {
+            classify_source_scheduled_groups_refresh_control_reset_retry(
+                deadline,
+                after,
+                refresh_disposition,
+                recovery_observation,
+            )
+        }
     }
 }
 
@@ -1551,15 +1561,21 @@ fn expect_source_worker_ack(
     }
 }
 
-fn unexpected_source_worker_response(
+fn unexpected_source_worker_response_failure(
     context: &'static str,
     response: SourceWorkerResponse,
-) -> CnxError {
-    SourceProtocolViolationKind::UnexpectedWorkerResponse {
+) -> SourceFailure {
+    SourceFailure::protocol_violation(SourceProtocolViolationKind::UnexpectedWorkerResponse {
         context,
         response: format!("{:?}", response),
-    }
-    .into_error()
+    })
+}
+
+fn unexpected_source_worker_response_result<T>(
+    context: &'static str,
+    response: SourceWorkerResponse,
+) -> std::result::Result<T, SourceFailure> {
+    Err(unexpected_source_worker_response_failure(context, response))
 }
 
 struct SourceForceFindMachine {
@@ -4951,7 +4967,9 @@ impl SourceWorkerClientHandle {
         Ok(stale_client)
     }
 
-    async fn reconnect_shared_worker_client(&self) -> Result<()> {
+    async fn reconnect_shared_worker_client_with_failure(
+        &self,
+    ) -> std::result::Result<(), SourceFailure> {
         let stale_client = self.replace_shared_worker_client().await?;
         let _ = stale_client.shutdown(Duration::from_millis(250)).await;
         Ok(())
@@ -5021,8 +5039,8 @@ impl SourceWorkerClientHandle {
         (rpc_result, self.current_source_progress_state())
     }
 
-    async fn reconnect_for_control_frame(&self) -> Result<()> {
-        self.reconnect_shared_worker_client().await
+    async fn reconnect_for_control_frame(&self) -> std::result::Result<(), SourceFailure> {
+        self.reconnect_shared_worker_client_with_failure().await
     }
 
     async fn wait_control_frame_retry_after(
@@ -5089,13 +5107,11 @@ impl SourceWorkerClientHandle {
                         )
                     }
                     SourceReplayRetainedControlStateEffect::Reconnect => {
-                        match self.reconnect_shared_worker_client().await {
+                        match self.reconnect_shared_worker_client_with_failure().await {
                             Ok(()) => SourceOperationLoopStep::Event(
                                 SourceReplayRetainedControlStateEvent::ReconnectCompleted,
                             ),
-                            Err(err) => {
-                                SourceOperationLoopStep::Fail(SourceFailure::from_cause(err))
-                            }
+                            Err(err) => SourceOperationLoopStep::Fail(err),
                         }
                     }
                     SourceReplayRetainedControlStateEffect::Wait { after } => {
@@ -5335,13 +5351,13 @@ impl SourceWorkerClientHandle {
                         },
                     ),
                     SourceScheduledGroupsRefreshEffect::Reconnect => {
-                        match self.reconnect_shared_worker_client().await {
+                        match self.reconnect_shared_worker_client_with_failure().await {
                             Ok(()) => SourceOperationLoopStep::Event(
                                 SourceScheduledGroupsRefreshEvent::ReconnectCompleted,
                             ),
                             Err(err) => SourceOperationLoopStep::Fail(
                                 source_scheduled_groups_refresh_failure_from_error(
-                                    err,
+                                    err.into_error(),
                                     refresh_disposition,
                                     SourceScheduledGroupsRefreshRecoveryObservation::from_atomic_u8(
                                         recovery_observation.load(Ordering::Relaxed),
@@ -5400,20 +5416,15 @@ impl SourceWorkerClientHandle {
         let worker = self.worker_client().await;
         let ensure_started_timeout =
             source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)?;
-        map_source_timeout_result(
+        map_source_timeout_result_with_failure(
             tokio::time::timeout(ensure_started_timeout, worker.ensure_started()).await,
         )
-        .map_err(SourceFailure::from)
     }
 
     async fn execute_scheduled_groups_refresh_acquire_client(
         &self,
     ) -> std::result::Result<TypedWorkerClient<SourceWorkerRpc>, SourceFailure> {
-        self.worker_client()
-            .await
-            .client()
-            .await
-            .map_err(SourceFailure::from)
+        self.client_with_failure().await
     }
 
     fn scheduled_groups_refresh_stable_host_ref(&self, grants: &[GrantedMountRoot]) -> String {
@@ -5432,13 +5443,12 @@ impl SourceWorkerClientHandle {
         client: &TypedWorkerClient<SourceWorkerRpc>,
         deadline: std::time::Instant,
     ) -> std::result::Result<SourceWorkerResponse, SourceFailure> {
-        Self::call_worker(
+        Self::call_worker_with_failure(
             client,
             SourceWorkerRequest::HostObjectGrantsSnapshot,
             source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)?,
         )
         .await
-        .map_err(SourceFailure::from)
     }
 
     async fn execute_scheduled_groups_refresh_grants(
@@ -5457,15 +5467,13 @@ impl SourceWorkerClientHandle {
                 self.bump_source_progress(SourceProgressReason::HostObjectGrantsUpdated);
                 Ok(self.scheduled_groups_refresh_stable_host_ref(&grants))
             }
-            Ok(other) => Err(unexpected_source_worker_response(
+            Ok(other) => unexpected_source_worker_response_result(
                 "for scheduled groups host grants refresh",
                 other,
-            )
-            .into()),
+            ),
             Err(err) if can_use_cached_grant_derived_snapshot(err.as_error()) => Ok(self
-                .cached_host_object_grants_snapshot()
-                .map(|grants| self.scheduled_groups_refresh_stable_host_ref(&grants))
-                .map_err(SourceFailure::from)?),
+                .cached_host_object_grants_snapshot_with_failure()
+                .map(|grants| self.scheduled_groups_refresh_stable_host_ref(&grants))?),
             Err(err) => Err(err),
         }
     }
@@ -5557,13 +5565,12 @@ impl SourceWorkerClientHandle {
             return Ok((to_map(source_groups), to_map(scan_groups)));
         }
 
-        let scheduled_source = match Self::call_worker(
+        let scheduled_source = match Self::call_worker_with_failure(
             client,
             SourceWorkerRequest::ScheduledSourceGroupIds,
             source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)?,
         )
-        .await
-        .map_err(SourceFailure::from)?
+        .await?
         {
             SourceWorkerResponse::ScheduledGroupIds(groups) => groups
                 .map(|groups| {
@@ -5574,20 +5581,18 @@ impl SourceWorkerClientHandle {
                 })
                 .unwrap_or_default(),
             other => {
-                return Err(unexpected_source_worker_response(
+                return unexpected_source_worker_response_result(
                     "for scheduled source groups cache refresh",
                     other,
-                )
-                .into());
+                );
             }
         };
-        let scheduled_scan = match Self::call_worker(
+        let scheduled_scan = match Self::call_worker_with_failure(
             client,
             SourceWorkerRequest::ScheduledScanGroupIds,
             source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)?,
         )
-        .await
-        .map_err(SourceFailure::from)?
+        .await?
         {
             SourceWorkerResponse::ScheduledGroupIds(groups) => groups
                 .map(|groups| {
@@ -5598,16 +5603,16 @@ impl SourceWorkerClientHandle {
                 })
                 .unwrap_or_default(),
             other => {
-                return Err(unexpected_source_worker_response(
+                return unexpected_source_worker_response_result(
                     "for scheduled scan groups cache refresh",
                     other,
-                )
-                .into());
+                );
             }
         };
         Ok((scheduled_source, scheduled_scan))
     }
 
+    #[cfg(test)]
     async fn call_worker(
         client: &TypedWorkerClient<SourceWorkerRpc>,
         request: SourceWorkerRequest,
@@ -5616,20 +5621,70 @@ impl SourceWorkerClientHandle {
         client.call_with_timeout(request, timeout).await
     }
 
-    async fn with_started_retry<T, F, Fut>(&self, op: F) -> Result<T>
-    where
-        F: Fn(TypedWorkerClient<SourceWorkerRpc>) -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
-    {
-        self.worker_client().await.with_started_retry(op).await
+    async fn call_worker_with_failure(
+        client: &TypedWorkerClient<SourceWorkerRpc>,
+        request: SourceWorkerRequest,
+        timeout: Duration,
+    ) -> std::result::Result<SourceWorkerResponse, SourceFailure> {
+        client
+            .call_with_timeout(request, timeout)
+            .await
+            .map_err(SourceFailure::from)
     }
 
+    async fn with_started_retry_with_failure<T, F, Fut>(
+        &self,
+        op: F,
+    ) -> std::result::Result<T, SourceFailure>
+    where
+        F: Fn(TypedWorkerClient<SourceWorkerRpc>) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, SourceFailure>>,
+    {
+        self.worker_client()
+            .await
+            .with_started_retry_mapped(op, SourceFailure::into_error)
+            .await
+    }
+
+    #[cfg(test)]
     async fn client(&self) -> Result<TypedWorkerClient<SourceWorkerRpc>> {
         self.worker_client().await.client().await
     }
 
+    async fn client_with_failure(
+        &self,
+    ) -> std::result::Result<TypedWorkerClient<SourceWorkerRpc>, SourceFailure> {
+        self.worker_client()
+            .await
+            .client()
+            .await
+            .map_err(SourceFailure::from)
+    }
+
+    #[cfg(test)]
     async fn existing_client(&self) -> Result<Option<TypedWorkerClient<SourceWorkerRpc>>> {
         self.worker_client().await.existing_client().await
+    }
+
+    async fn existing_client_with_failure(
+        &self,
+    ) -> std::result::Result<Option<TypedWorkerClient<SourceWorkerRpc>>, SourceFailure> {
+        self.worker_client()
+            .await
+            .existing_client()
+            .await
+            .map_err(SourceFailure::from)
+    }
+
+    async fn shared_existing_client_with_failure(
+        &self,
+    ) -> std::result::Result<(u64, Option<TypedWorkerClient<SourceWorkerRpc>>), SourceFailure> {
+        let (worker_instance_id, worker) = self.shared_worker().await;
+        let client = worker
+            .existing_client()
+            .await
+            .map_err(SourceFailure::from)?;
+        Ok((worker_instance_id, client))
     }
 
     async fn observability_snapshot_with_timeout_with_failure(
@@ -5706,15 +5761,11 @@ impl SourceWorkerClientHandle {
                 self.update_cached_observability_snapshot(&snapshot);
                 Ok(snapshot)
             }
-            other => Err(SourceFailure::protocol_violation(
-                SourceProtocolViolationKind::UnexpectedWorkerResponse {
-                    context: "for observability snapshot",
-                    response: format!("{:?}", other),
-                },
-            )),
+            other => unexpected_source_worker_response_result("for observability snapshot", other),
         }
     }
 
+    #[cfg(test)]
     async fn observability_snapshot_with_timeout(
         &self,
         timeout: Duration,
@@ -5744,23 +5795,12 @@ impl SourceWorkerClientHandle {
             };
             let snapshot_timeout = remaining.min(SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT);
             let snapshot = self
-                .progress_snapshot_with_timeout(snapshot_timeout)
-                .await
-                .map_err(SourceFailure::from)?;
+                .progress_snapshot_with_timeout_with_failure(snapshot_timeout)
+                .await?;
             if snapshot.rescan_observed_epoch >= request_epoch {
                 return Ok(());
             }
         }
-    }
-
-    async fn wait_for_rescan_observed_epoch(
-        &self,
-        request_epoch: u64,
-        total_timeout: Duration,
-    ) -> Result<()> {
-        self.wait_for_rescan_observed_epoch_with_failure(request_epoch, total_timeout)
-            .await
-            .map_err(SourceFailure::into_error)
     }
 
     async fn start_with_failure(&self) -> std::result::Result<(), SourceFailure> {
@@ -5785,13 +5825,11 @@ impl SourceWorkerClientHandle {
                         })
                     }
                     SourceStartEffect::Reconnect => {
-                        match self.reconnect_shared_worker_client().await {
+                        match self.reconnect_shared_worker_client_with_failure().await {
                             Ok(()) => {
                                 SourceOperationLoopStep::Event(SourceStartEvent::ReconnectCompleted)
                             }
-                            Err(err) => {
-                                SourceOperationLoopStep::Fail(SourceFailure::from_cause(err))
-                            }
+                            Err(err) => SourceOperationLoopStep::Fail(err),
                         }
                     }
                     SourceStartEffect::Wait { after } => {
@@ -5819,13 +5857,14 @@ impl SourceWorkerClientHandle {
         .await
     }
 
+    #[cfg(test)]
     pub async fn start(&self) -> Result<()> {
         self.start_with_failure()
             .await
             .map_err(SourceFailure::into_error)
     }
 
-    async fn update_logical_roots_with_failure(
+    pub(crate) async fn update_logical_roots_with_failure(
         &self,
         roots: Vec<RootSpec>,
     ) -> std::result::Result<(), SourceFailure> {
@@ -5883,40 +5922,41 @@ impl SourceWorkerClientHandle {
         .await
     }
 
-    pub async fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {
-        self.update_logical_roots_with_failure(roots)
-            .await
-            .map_err(SourceFailure::into_error)
-    }
-
-    pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
+    fn cached_logical_roots_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<RootSpec>, SourceFailure> {
         self.with_cache_mut(|cache| {
-            Ok(cache
-                .logical_roots
-                .clone()
-                .unwrap_or_else(|| self.config.roots.clone()))
+            Ok::<Vec<RootSpec>, CnxError>(
+                cache
+                    .logical_roots
+                    .clone()
+                    .unwrap_or_else(|| self.config.roots.clone()),
+            )
         })
+        .map_err(SourceFailure::from)
     }
 
-    pub async fn logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
-        let (worker_instance_id, worker) = self.shared_worker().await;
-        let Some(client) = worker.existing_client().await? else {
-            return self.cached_logical_roots_snapshot();
+    async fn logical_roots_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<RootSpec>, SourceFailure> {
+        let (worker_instance_id, client) = self.shared_existing_client_with_failure().await?;
+        let Some(client) = client else {
+            return self.cached_logical_roots_snapshot_with_failure();
         };
         #[cfg(test)]
         if let Some(roots) = maybe_pause_before_logical_roots_snapshot_rpc().await {
             return Ok(roots);
         }
-        let result = Self::call_worker(
+        let result = Self::call_worker_with_failure(
             &client,
             SourceWorkerRequest::LogicalRootsSnapshot,
             SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
         )
         .await;
         if self.shared_worker().await.0 != worker_instance_id {
-            return Err(CnxError::TransportClosed(
+            return Err(SourceFailure::from_cause(CnxError::TransportClosed(
                 "stale shared source worker client detached during logical_roots_snapshot".into(),
-            ));
+            )));
         }
         match result {
             Ok(SourceWorkerResponse::LogicalRoots(roots)) => {
@@ -5925,31 +5965,35 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(roots)
             }
-            Ok(other) => Err(unexpected_source_worker_response(
-                "for logical roots",
-                other,
-            )),
-            Err(err) if can_use_cached_grant_derived_snapshot(&err) => {
-                self.cached_logical_roots_snapshot()
+            Ok(other) => unexpected_source_worker_response_result("for logical roots", other),
+            Err(err) if can_use_cached_grant_derived_snapshot(err.as_error()) => {
+                self.cached_logical_roots_snapshot_with_failure()
             }
             Err(err) => Err(err),
         }
     }
 
-    pub fn cached_host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
+    fn cached_host_object_grants_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<GrantedMountRoot>, SourceFailure> {
         self.with_cache_mut(|cache| {
-            Ok(cache
-                .grants
-                .clone()
-                .unwrap_or_else(|| self.config.host_object_grants.clone()))
+            Ok::<Vec<GrantedMountRoot>, CnxError>(
+                cache
+                    .grants
+                    .clone()
+                    .unwrap_or_else(|| self.config.host_object_grants.clone()),
+            )
         })
+        .map_err(SourceFailure::from)
     }
 
-    pub async fn host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
-        let Some(client) = self.existing_client().await? else {
-            return self.cached_host_object_grants_snapshot();
+    async fn host_object_grants_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<GrantedMountRoot>, SourceFailure> {
+        let Some(client) = self.existing_client_with_failure().await? else {
+            return self.cached_host_object_grants_snapshot_with_failure();
         };
-        let result = Self::call_worker(
+        let result = Self::call_worker_with_failure(
             &client,
             SourceWorkerRequest::HostObjectGrantsSnapshot,
             SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
@@ -5962,20 +6006,20 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(grants)
             }
-            Ok(other) => Err(unexpected_source_worker_response(
-                "for host object grants",
-                other,
-            )),
-            Err(err) if can_use_cached_grant_derived_snapshot(&err) => {
-                self.cached_host_object_grants_snapshot()
+            Ok(other) => unexpected_source_worker_response_result("for host object grants", other),
+            Err(err) if can_use_cached_grant_derived_snapshot(err.as_error()) => {
+                self.cached_host_object_grants_snapshot_with_failure()
             }
             Err(err) => Err(err),
         }
     }
 
-    pub async fn host_object_grants_version_snapshot(&self) -> Result<u64> {
-        match Self::call_worker(
-            &self.client().await?,
+    #[cfg(test)]
+    async fn host_object_grants_version_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SourceFailure> {
+        match Self::call_worker_with_failure(
+            &self.client_with_failure().await?,
             SourceWorkerRequest::HostObjectGrantsVersionSnapshot,
             SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
         )
@@ -5987,45 +6031,47 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(version)
             }
-            Ok(other) => Err(unexpected_source_worker_response(
-                "for host object grants version",
-                other,
-            )),
+            Ok(other) => {
+                unexpected_source_worker_response_result("for host object grants version", other)
+            }
             Err(err) => Err(err),
         }
     }
 
-    pub async fn status_snapshot(&self) -> Result<SourceStatusSnapshot> {
-        self.with_started_retry(|client| async move {
-            #[cfg(test)]
-            if let Some(err) = take_source_worker_status_error_hook() {
-                return Err(err);
-            }
-            Self::call_worker(
-                &client,
-                SourceWorkerRequest::StatusSnapshot,
-                SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-            )
-            .await
-        })
-        .await
-        .and_then(|response| match response {
+    async fn status_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<SourceStatusSnapshot, SourceFailure> {
+        let response = self
+            .with_started_retry_with_failure(|client| async move {
+                #[cfg(test)]
+                if let Some(err) = take_source_worker_status_error_hook() {
+                    return Err(SourceFailure::from(err));
+                }
+                Self::call_worker_with_failure(
+                    &client,
+                    SourceWorkerRequest::StatusSnapshot,
+                    SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                )
+                .await
+            })
+            .await?;
+        match response {
             SourceWorkerResponse::StatusSnapshot(snapshot) => {
                 self.with_cache_mut(|cache| {
                     cache.status = Some(snapshot.clone());
                 });
                 Ok(snapshot)
             }
-            other => Err(unexpected_source_worker_response(
-                "for status snapshot",
-                other,
-            )),
-        })
+            other => unexpected_source_worker_response_result("for status snapshot", other),
+        }
     }
 
-    pub async fn lifecycle_state_label(&self) -> Result<String> {
-        match Self::call_worker(
-            &self.client().await?,
+    #[cfg(test)]
+    async fn lifecycle_state_label_with_failure(
+        &self,
+    ) -> std::result::Result<String, SourceFailure> {
+        match Self::call_worker_with_failure(
+            &self.client_with_failure().await?,
             SourceWorkerRequest::LifecycleState,
             SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
         )
@@ -6037,10 +6083,7 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(state)
             }
-            Ok(other) => Err(unexpected_source_worker_response(
-                "for lifecycle state",
-                other,
-            )),
+            Ok(other) => unexpected_source_worker_response_result("for lifecycle state", other),
             Err(err) => Err(err),
         }
     }
@@ -6072,15 +6115,11 @@ impl SourceWorkerClientHandle {
                     &cache.replay_recovery_scheduled_source_groups_by_node,
                 )
             })),
-            other => Err(SourceFailure::protocol_violation(
-                SourceProtocolViolationKind::UnexpectedWorkerResponse {
-                    context: "for scheduled source groups",
-                    response: format!("{:?}", other),
-                },
-            )),
+            other => unexpected_source_worker_response_result("for scheduled source groups", other),
         }
     }
 
+    #[cfg(test)]
     pub async fn scheduled_source_group_ids(
         &self,
     ) -> Result<Option<std::collections::BTreeSet<String>>> {
@@ -6104,15 +6143,11 @@ impl SourceWorkerClientHandle {
                     &cache.replay_recovery_scheduled_scan_groups_by_node,
                 )
             })),
-            other => Err(SourceFailure::protocol_violation(
-                SourceProtocolViolationKind::UnexpectedWorkerResponse {
-                    context: "for scheduled scan groups",
-                    response: format!("{:?}", other),
-                },
-            )),
+            other => unexpected_source_worker_response_result("for scheduled scan groups", other),
         }
     }
 
+    #[cfg(test)]
     pub async fn scheduled_scan_group_ids(
         &self,
     ) -> Result<Option<std::collections::BTreeSet<String>>> {
@@ -6145,13 +6180,11 @@ impl SourceWorkerClientHandle {
                         )
                     }
                     SourceScheduledGroupIdsEffect::Reconnect => {
-                        match self.reconnect_shared_worker_client().await {
+                        match self.reconnect_shared_worker_client_with_failure().await {
                             Ok(()) => SourceOperationLoopStep::Event(
                                 SourceScheduledGroupIdsEvent::ReconnectCompleted,
                             ),
-                            Err(err) => {
-                                SourceOperationLoopStep::Fail(SourceFailure::from_cause(err))
-                            }
+                            Err(err) => SourceOperationLoopStep::Fail(err),
                         }
                     }
                     SourceScheduledGroupIdsEffect::Wait { after } => {
@@ -6176,11 +6209,11 @@ impl SourceWorkerClientHandle {
         .await
     }
 
-    pub async fn source_primary_by_group_snapshot(
+    async fn source_primary_by_group_snapshot_with_failure(
         &self,
-    ) -> Result<std::collections::BTreeMap<String, String>> {
-        match Self::call_worker(
-            &self.client().await?,
+    ) -> std::result::Result<std::collections::BTreeMap<String, String>, SourceFailure> {
+        match Self::call_worker_with_failure(
+            &self.client_with_failure().await?,
             SourceWorkerRequest::SourcePrimaryByGroupSnapshot,
             SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
         )
@@ -6192,18 +6225,15 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(groups)
             }
-            other => Err(unexpected_source_worker_response(
-                "for primary groups",
-                other,
-            )),
+            other => unexpected_source_worker_response_result("for primary groups", other),
         }
     }
 
-    pub async fn last_force_find_runner_by_group_snapshot(
+    async fn last_force_find_runner_by_group_snapshot_with_failure(
         &self,
-    ) -> Result<std::collections::BTreeMap<String, String>> {
-        match Self::call_worker(
-            &self.client().await?,
+    ) -> std::result::Result<std::collections::BTreeMap<String, String>, SourceFailure> {
+        match Self::call_worker_with_failure(
+            &self.client_with_failure().await?,
             SourceWorkerRequest::LastForceFindRunnerByGroupSnapshot,
             SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
         )
@@ -6215,16 +6245,15 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(groups)
             }
-            other => Err(unexpected_source_worker_response(
-                "for last force-find runner",
-                other,
-            )),
+            other => unexpected_source_worker_response_result("for last force-find runner", other),
         }
     }
 
-    pub async fn force_find_inflight_groups_snapshot(&self) -> Result<Vec<String>> {
-        match Self::call_worker(
-            &self.client().await?,
+    async fn force_find_inflight_groups_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<String>, SourceFailure> {
+        match Self::call_worker_with_failure(
+            &self.client_with_failure().await?,
             SourceWorkerRequest::ForceFindInflightGroupsSnapshot,
             SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
         )
@@ -6236,19 +6265,18 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(groups)
             }
-            other => Err(unexpected_source_worker_response(
-                "for force-find inflight groups",
-                other,
-            )),
+            other => {
+                unexpected_source_worker_response_result("for force-find inflight groups", other)
+            }
         }
     }
 
-    pub async fn resolve_group_id_for_object_ref(
+    async fn resolve_group_id_for_object_ref_with_failure(
         &self,
         object_ref: &str,
-    ) -> Result<Option<String>> {
-        match Self::call_worker(
-            &self.client().await?,
+    ) -> std::result::Result<Option<String>, SourceFailure> {
+        match Self::call_worker_with_failure(
+            &self.client_with_failure().await?,
             SourceWorkerRequest::ResolveGroupIdForObjectRef {
                 object_ref: object_ref.to_string(),
             },
@@ -6257,10 +6285,7 @@ impl SourceWorkerClientHandle {
         .await?
         {
             SourceWorkerResponse::ResolveGroupIdForObjectRef(group) => Ok(group),
-            other => Err(unexpected_source_worker_response(
-                "for resolve group",
-                other,
-            )),
+            other => unexpected_source_worker_response_result("for resolve group", other),
         }
     }
 
@@ -6272,7 +6297,7 @@ impl SourceWorkerClientHandle {
     ) -> std::result::Result<Vec<Event>, CnxError> {
         #[cfg(test)]
         let worker_instance_id = self.worker_instance_id_for_tests().await;
-        self.with_started_retry(|client| {
+        self.with_started_retry_with_failure(|client| {
             let params = params.clone();
             let target_node = target_node.clone();
             async move {
@@ -6289,9 +6314,9 @@ impl SourceWorkerClientHandle {
                 #[cfg(test)]
                 if let Some(err) = take_source_worker_force_find_error_queue_hook(worker_instance_id)
                 {
-                    return Err(err);
+                    return Err(SourceFailure::from(err));
                 }
-                let response = Self::call_worker(
+                let response = Self::call_worker_with_failure(
                     &client,
                     SourceWorkerRequest::ForceFind {
                         request: params.clone(),
@@ -6304,7 +6329,8 @@ impl SourceWorkerClientHandle {
                         if debug_force_find_route_capture_enabled() {
                             eprintln!(
                                 "fs_meta_source_worker_client: force_find rpc failed target_node={} err={}",
-                                target_node.0, err
+                                target_node.0,
+                                err.as_error()
                             );
                         }
                         Err(err)
@@ -6320,7 +6346,7 @@ impl SourceWorkerClientHandle {
                         }
                         Ok(events)
                     }
-                    Ok(other) => Err(unexpected_source_worker_response(
+                    Ok(other) => Err(unexpected_source_worker_response_failure(
                         "for force-find",
                         other,
                     )),
@@ -6328,6 +6354,7 @@ impl SourceWorkerClientHandle {
             }
         })
         .await
+        .map_err(SourceFailure::into_error)
     }
 
     async fn execute_force_find_wait(
@@ -6344,33 +6371,40 @@ impl SourceWorkerClientHandle {
         request: &SourceWorkerRequest,
         timeout: Duration,
     ) -> std::result::Result<SourceWorkerResponse, CnxError> {
-        self.with_started_retry(|client| {
+        self.with_started_retry_with_failure(|client| {
             let request = request.clone();
             async move {
                 #[cfg(test)]
                 if let Some(err) = take_source_worker_scheduled_groups_error_hook() {
-                    return Err(err);
+                    return Err(SourceFailure::from(err));
                 }
-                Self::call_worker(&client, request, timeout).await
+                Self::call_worker_with_failure(&client, request, timeout).await
             }
         })
         .await
+        .map_err(SourceFailure::into_error)
     }
 
     async fn execute_observability_snapshot_attempt(
         &self,
         timeout: Duration,
     ) -> std::result::Result<SourceWorkerResponse, CnxError> {
-        self.with_started_retry(|client| async move {
+        self.with_started_retry_with_failure(|client| async move {
             #[cfg(test)]
             record_source_worker_observability_rpc_attempt();
             #[cfg(test)]
             if let Some(err) = take_source_worker_observability_error_hook() {
-                return Err(err);
+                return Err(SourceFailure::from(err));
             }
-            Self::call_worker(&client, SourceWorkerRequest::ObservabilitySnapshot, timeout).await
+            Self::call_worker_with_failure(
+                &client,
+                SourceWorkerRequest::ObservabilitySnapshot,
+                timeout,
+            )
+            .await
         })
         .await
+        .map_err(SourceFailure::into_error)
     }
 
     async fn execute_observability_snapshot_wait(
@@ -6394,14 +6428,14 @@ impl SourceWorkerClientHandle {
         let injected_delay = take_source_worker_start_delay_hook();
         let worker = self.worker_client().await;
         let start_result = match injected {
-            Some(err) => Err(err),
-            None => map_source_timeout_result(
+            Some(err) => Err(SourceFailure::from(err)),
+            None => map_source_failure_timeout_result(
                 tokio::time::timeout(timeout, async {
                     #[cfg(test)]
                     if let Some(delay) = injected_delay {
                         tokio::time::sleep(delay).await;
                     }
-                    worker.ensure_started().await
+                    worker.ensure_started().await.map_err(SourceFailure::from)
                 })
                 .await,
             ),
@@ -6409,10 +6443,11 @@ impl SourceWorkerClientHandle {
         if let Err(err) = &start_result {
             eprintln!(
                 "fs_meta_source_worker_client: on_control_frame retry node={} err={}",
-                self.node_id.0, err
+                self.node_id.0,
+                err.as_error()
             );
         }
-        start_result
+        start_result.map_err(SourceFailure::into_error)
     }
 
     async fn execute_on_control_frame_request_attempt(
@@ -6421,11 +6456,10 @@ impl SourceWorkerClientHandle {
         timeout: Duration,
         attempt_kind: SourceControlFrameRequestAttemptKind,
     ) -> std::result::Result<SourceWorkerResponse, CnxError> {
-        let worker = self.worker_client().await;
-        map_source_timeout_result(
+        map_source_failure_timeout_result(
             tokio::time::timeout(
                 timeout,
-                worker.with_started_retry(|client| {
+                self.with_started_retry_with_failure(|client| {
                     let envelopes = envelopes.to_vec();
                     async move {
                         if matches!(
@@ -6438,11 +6472,11 @@ impl SourceWorkerClientHandle {
                                 if let Some(err) = take_on_control_frame_error_hook(
                                     self.worker_instance_id_for_tests().await,
                                 ) {
-                                    return Err(err);
+                                    return Err(SourceFailure::from(err));
                                 }
                             }
                         }
-                        Self::call_worker(
+                        Self::call_worker_with_failure(
                             &client,
                             SourceWorkerRequest::OnControlFrame { envelopes },
                             timeout,
@@ -6453,6 +6487,7 @@ impl SourceWorkerClientHandle {
             )
             .await,
         )
+        .map_err(SourceFailure::into_error)
     }
 
     async fn execute_update_logical_roots_attempt(
@@ -6460,16 +6495,16 @@ impl SourceWorkerClientHandle {
         roots: &[RootSpec],
         timeout: Duration,
     ) -> std::result::Result<SourceWorkerResponse, CnxError> {
-        self.with_started_retry(|client| {
+        self.with_started_retry_with_failure(|client| {
             let roots = roots.to_vec();
             async move {
                 #[cfg(test)]
                 maybe_pause_before_update_logical_roots_rpc().await;
                 #[cfg(test)]
                 if let Some(err) = take_update_logical_roots_error_hook() {
-                    return Err(err);
+                    return Err(SourceFailure::from(err));
                 }
-                Self::call_worker(
+                Self::call_worker_with_failure(
                     &client,
                     SourceWorkerRequest::UpdateLogicalRoots { roots },
                     timeout,
@@ -6478,6 +6513,7 @@ impl SourceWorkerClientHandle {
             }
         })
         .await
+        .map_err(SourceFailure::into_error)
     }
 
     async fn execute_update_logical_roots_wait(
@@ -6516,7 +6552,9 @@ impl SourceWorkerClientHandle {
                         SourceOperationLoopStep::Event(SourceForceFindEvent::WaitCompleted)
                     }
                     SourceForceFindEffect::Complete(events) => {
-                        let _ = self.last_force_find_runner_by_group_snapshot().await;
+                        let _ = self
+                            .last_force_find_runner_by_group_snapshot_with_failure()
+                            .await;
                         SourceOperationLoopStep::Complete(events)
                     }
                     SourceForceFindEffect::Fail(failure) => SourceOperationLoopStep::Fail(failure),
@@ -6527,22 +6565,21 @@ impl SourceWorkerClientHandle {
         .await
     }
 
-    pub async fn force_find(&self, params: InternalQueryRequest) -> Result<Vec<Event>> {
-        self.force_find_with_failure(params)
-            .await
-            .map_err(SourceFailure::into_error)
-    }
-
-    pub async fn publish_manual_rescan_signal(&self) -> Result<()> {
+    pub(crate) async fn publish_manual_rescan_signal_with_failure(
+        &self,
+    ) -> std::result::Result<(), SourceFailure> {
         self.manual_rescan_signal
             .emit(&self.node_id.0)
             .await
             .map(|_| ())
             .map_err(|err| {
-                CnxError::Internal(format!("publish manual rescan signal failed: {err}"))
+                SourceFailure::from(CnxError::Internal(format!(
+                    "publish manual rescan signal failed: {err}"
+                )))
             })
     }
 
+    #[cfg(test)]
     pub async fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
         self.on_control_frame_with_timeouts(
             envelopes,
@@ -6620,7 +6657,10 @@ impl SourceWorkerClientHandle {
         };
         let post_ack_refresh_requirement = signal_policies.post_ack_refresh_requirement;
         let existing_client_present = if initial_step.is_none() {
-            self.existing_client().await?.is_some()
+            self.existing_client_with_failure()
+                .await
+                .map_err(SourceFailure::into_error)?
+                .is_some()
         } else {
             false
         };
@@ -6690,27 +6730,25 @@ impl SourceWorkerClientHandle {
     async fn trigger_rescan_when_ready_epoch_with_failure(
         &self,
     ) -> std::result::Result<u64, SourceFailure> {
-        let epoch = self
-            .with_started_retry(|client| async move {
-                match Self::call_worker(
+        let response = self
+            .with_started_retry_with_failure(|client| async move {
+                Self::call_worker_with_failure(
                     &client,
                     SourceWorkerRequest::TriggerRescanWhenReadyEpoch,
                     SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
                 )
-                .await?
-                {
-                    SourceWorkerResponse::RescanRequestEpoch(epoch) => Ok(epoch),
-                    other => Err(SourceFailure::protocol_violation(
-                        SourceProtocolViolationKind::UnexpectedWorkerResponse {
-                            context: "for trigger_rescan_when_ready_epoch",
-                            response: format!("{:?}", other),
-                        },
-                    )
-                    .into_error()),
-                }
+                .await
             })
-            .await
-            .map_err(SourceFailure::from)?;
+            .await?;
+        let epoch = match response {
+            SourceWorkerResponse::RescanRequestEpoch(epoch) => epoch,
+            other => {
+                return Err(unexpected_source_worker_response_failure(
+                    "for trigger_rescan_when_ready_epoch",
+                    other,
+                ));
+            }
+        };
         self.with_cache_mut(|cache| {
             let last_audit_completed_at_us = cache
                 .status
@@ -6731,19 +6769,18 @@ impl SourceWorkerClientHandle {
         Ok(epoch)
     }
 
-    pub async fn trigger_rescan_when_ready_epoch(&self) -> Result<u64> {
-        self.trigger_rescan_when_ready_epoch_with_failure()
-            .await
-            .map_err(SourceFailure::into_error)
-    }
-
-    async fn progress_snapshot_with_timeout(
+    async fn progress_snapshot_with_timeout_with_failure(
         &self,
         timeout: Duration,
-    ) -> Result<crate::source::SourceProgressSnapshot> {
+    ) -> std::result::Result<crate::source::SourceProgressSnapshot, SourceFailure> {
         let response = self
-            .with_started_retry(|client| async move {
-                Self::call_worker(&client, SourceWorkerRequest::ProgressSnapshot, timeout).await
+            .with_started_retry_with_failure(|client| async move {
+                Self::call_worker_with_failure(
+                    &client,
+                    SourceWorkerRequest::ProgressSnapshot,
+                    timeout,
+                )
+                .await
             })
             .await?;
         match response {
@@ -6763,14 +6800,11 @@ impl SourceWorkerClientHandle {
                 });
                 Ok(snapshot)
             }
-            other => Err(unexpected_source_worker_response(
-                "for progress_snapshot",
-                other,
-            )),
+            other => unexpected_source_worker_response_result("for progress_snapshot", other),
         }
     }
 
-    pub async fn close(&self) -> Result<()> {
+    async fn close_with_failure(&self) -> std::result::Result<(), SourceFailure> {
         #[cfg(test)]
         notify_source_worker_close_started();
         self.wait_for_control_ops_to_drain(SOURCE_WORKER_CLOSE_DRAIN_TIMEOUT)
@@ -6781,11 +6815,19 @@ impl SourceWorkerClientHandle {
         self.worker_client()
             .await
             .shutdown(Duration::from_secs(2))
-            .await?;
+            .await
+            .map_err(SourceFailure::from)?;
         self.with_cache_mut(|cache| {
             cache.lifecycle_state = Some("closed".to_string());
         });
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn close(&self) -> Result<()> {
+        self.close_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)
     }
 
     #[cfg(test)]
@@ -6796,7 +6838,9 @@ impl SourceWorkerClientHandle {
             .await
     }
 
-    async fn try_observability_snapshot_nonblocking(&self) -> Result<SourceObservabilitySnapshot> {
+    async fn observability_snapshot_nonblocking_with_access_path(
+        &self,
+    ) -> std::result::Result<(SourceObservabilitySnapshot, bool), SourceFailure> {
         if self.control_op_inflight() {
             let snapshot =
                 self.degraded_observability_snapshot_from_cache("source worker control in flight");
@@ -6807,9 +6851,9 @@ impl SourceWorkerClientHandle {
                     summarize_source_observability_snapshot(&snapshot)
                 );
             }
-            return Ok(snapshot);
+            return Ok((snapshot, true));
         }
-        let Some(_client) = self.existing_client().await? else {
+        let Some(_client) = self.existing_client_with_failure().await? else {
             let snapshot =
                 self.degraded_observability_snapshot_from_cache("source worker status not started");
             if debug_control_scope_capture_enabled() {
@@ -6819,7 +6863,7 @@ impl SourceWorkerClientHandle {
                     summarize_source_observability_snapshot(&snapshot)
                 );
             }
-            return Ok(snapshot);
+            return Ok((snapshot, true));
         };
         if let Some(snapshot) = self.with_cache_mut(|cache| {
             cache
@@ -6835,7 +6879,7 @@ impl SourceWorkerClientHandle {
                         summarize_source_observability_snapshot(&snapshot)
                     );
                 }
-                return Ok(snapshot);
+                return Ok((snapshot, true));
             }
         }
         let trace_id = next_source_status_trace_id();
@@ -6848,7 +6892,9 @@ impl SourceWorkerClientHandle {
             trace_id
         );
         let result = self
-            .observability_snapshot_with_timeout(SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT)
+            .observability_snapshot_with_timeout_with_failure(
+                SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
+            )
             .await;
         trace_guard.phase("after_rpc_await");
         eprintln!(
@@ -6858,25 +6904,31 @@ impl SourceWorkerClientHandle {
             trace_id
         );
         trace_guard.complete();
-        result
+        result.map(|snapshot| (snapshot, false))
     }
 
-    pub(crate) async fn observability_snapshot_nonblocking(&self) -> SourceObservabilitySnapshot {
-        match self.try_observability_snapshot_nonblocking().await {
-            Ok(snapshot) => snapshot,
+    async fn observability_snapshot_nonblocking_for_status_route(
+        &self,
+    ) -> (SourceObservabilitySnapshot, bool) {
+        match self
+            .observability_snapshot_nonblocking_with_access_path()
+            .await
+        {
+            Ok(outcome) => outcome,
             Err(err) => {
                 let snapshot = self.degraded_observability_snapshot_from_cache(format!(
-                    "source worker unavailable: {err}"
+                    "source worker unavailable: {}",
+                    err.as_error()
                 ));
                 if debug_control_scope_capture_enabled() {
                     eprintln!(
                         "fs_meta_source_worker_client: observability_snapshot cache_fallback node={} reason=worker_unavailable err={} {}",
                         self.node_id.0,
-                        err,
+                        err.as_error(),
                         summarize_source_observability_snapshot(&snapshot)
                     );
                 }
-                snapshot
+                (snapshot, true)
             }
         }
     }
@@ -7020,30 +7072,38 @@ pub(crate) fn build_source_observability_live_source_context(
     source: &FSMetaSource,
 ) -> SourceObservabilityLiveSourceContext {
     let node_id = source.node_id();
-    let grants = source.host_object_grants_snapshot();
+    let grants = source.snapshot_host_object_grants();
     let stable_host_ref = stable_host_ref_for_node_id(&node_id, &grants);
-    let status = source.status_snapshot();
-    let last_force_find_runner_by_group = source.last_force_find_runner_by_group_snapshot();
-    let force_find_inflight_groups = source.force_find_inflight_groups_snapshot();
+    let status = source.build_status_snapshot();
+    let last_force_find_runner_by_group = source.snapshot_last_force_find_runner_by_group();
+    let force_find_inflight_groups = source.snapshot_force_find_inflight_groups();
     let recovery = source_observability_recovery_projection(
         stable_host_ref,
         &status,
         &last_force_find_runner_by_group,
         &force_find_inflight_groups,
-        scheduled_groups_by_node(&node_id, &grants, source.scheduled_source_group_ids()),
-        scheduled_groups_by_node(&node_id, &grants, source.scheduled_scan_group_ids()),
+        scheduled_groups_by_node(
+            &node_id,
+            &grants,
+            source.snapshot_scheduled_source_group_ids(),
+        ),
+        scheduled_groups_by_node(
+            &node_id,
+            &grants,
+            source.snapshot_scheduled_scan_group_ids(),
+        ),
     );
     SourceObservabilityLiveSourceContext {
-        lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
-        host_object_grants_version: source.host_object_grants_version_snapshot(),
+        lifecycle_state: source.snapshot_lifecycle_state_label(),
+        host_object_grants_version: source.snapshot_host_object_grants_version(),
         grants,
-        logical_roots: source.logical_roots_snapshot(),
+        logical_roots: source.snapshot_logical_roots(),
         status,
-        source_primary_by_group: source.source_primary_by_group_snapshot(),
+        source_primary_by_group: source.snapshot_source_primary_by_group(),
         last_force_find_runner_by_group,
         force_find_inflight_groups,
         recovery,
-        last_control_frame_signals_snapshot: source.last_control_frame_signals_snapshot(),
+        last_control_frame_signals_snapshot: source.snapshot_last_control_frame_signals(),
     }
 }
 
@@ -7540,6 +7600,202 @@ pub enum SourceFacade {
     Worker(Arc<SourceWorkerClientHandle>),
 }
 
+impl FSMetaSource {
+    pub(crate) fn with_boundaries_and_state_with_failure(
+        config: SourceConfig,
+        node_id: NodeId,
+        boundary: Option<Arc<dyn ChannelIoSubset>>,
+        state_boundary: Arc<dyn StateBoundary>,
+    ) -> std::result::Result<Self, SourceFailure> {
+        Self::with_boundaries_and_state_internal(config, node_id, boundary, state_boundary, false)
+            .map_err(SourceFailure::from)
+    }
+
+    pub(crate) async fn pub_stream_with_failure(
+        &self,
+    ) -> std::result::Result<
+        std::pin::Pin<Box<dyn futures_core::Stream<Item = Vec<Event>> + Send>>,
+        SourceFailure,
+    > {
+        self.build_pub_stream().await.map_err(SourceFailure::from)
+    }
+
+    pub(crate) async fn start_runtime_endpoints_with_failure(
+        &self,
+        boundary: Arc<dyn ChannelIoSubset>,
+    ) -> std::result::Result<(), SourceFailure> {
+        self.start_runtime_endpoints_on_boundary(boundary)
+            .await
+            .map_err(SourceFailure::from)
+    }
+
+    pub(crate) async fn apply_orchestration_signals_with_failure(
+        &self,
+        signals: &[SourceControlSignal],
+    ) -> std::result::Result<(), SourceFailure> {
+        self.perform_apply_orchestration_signals(signals)
+            .await
+            .map_err(SourceFailure::from)
+    }
+
+    pub(crate) async fn update_logical_roots_with_failure(
+        &self,
+        roots: Vec<RootSpec>,
+    ) -> std::result::Result<(), SourceFailure> {
+        self.apply_logical_roots_update(roots)
+            .await
+            .map_err(SourceFailure::from)
+    }
+
+    pub(crate) fn logical_roots_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<RootSpec>, SourceFailure> {
+        Ok(self.snapshot_logical_roots())
+    }
+
+    pub(crate) fn cached_logical_roots_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<RootSpec>, SourceFailure> {
+        Ok(self.snapshot_cached_logical_roots())
+    }
+
+    pub(crate) fn host_object_grants_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<GrantedMountRoot>, SourceFailure> {
+        Ok(self.snapshot_host_object_grants())
+    }
+
+    pub(crate) fn cached_host_object_grants_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<GrantedMountRoot>, SourceFailure> {
+        Ok(self.snapshot_cached_host_object_grants())
+    }
+
+    pub(crate) fn host_object_grants_version_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SourceFailure> {
+        Ok(self.snapshot_host_object_grants_version())
+    }
+
+    pub(crate) fn status_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<SourceStatusSnapshot, SourceFailure> {
+        Ok(self.build_status_snapshot())
+    }
+
+    pub(crate) fn progress_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<crate::source::SourceProgressSnapshot, SourceFailure> {
+        Ok(self.build_progress_snapshot())
+    }
+
+    fn local_observability_snapshot(&self) -> SourceObservabilitySnapshot {
+        let snapshot = build_local_source_observability_snapshot(self);
+        let last_audit_completed_at_us = source_status_rescan_completion_marker(&snapshot.status);
+        let (published_batches, last_published_at_us) =
+            source_observability_publication_marker(&snapshot);
+        self.maybe_mark_rescan_observed_if_publication_advanced(
+            published_batches,
+            last_published_at_us,
+            last_audit_completed_at_us,
+        );
+        snapshot
+    }
+
+    pub(crate) fn observability_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<SourceObservabilitySnapshot, SourceFailure> {
+        Ok(self.local_observability_snapshot())
+    }
+
+    pub(crate) fn observability_snapshot_nonblocking_for_status_route(
+        &self,
+    ) -> (SourceObservabilitySnapshot, bool) {
+        (self.local_observability_snapshot(), false)
+    }
+
+    pub(crate) fn lifecycle_state_label_with_failure(
+        &self,
+    ) -> std::result::Result<String, SourceFailure> {
+        Ok(self.snapshot_lifecycle_state_label())
+    }
+
+    pub(crate) fn scheduled_source_group_ids_with_failure(
+        &self,
+    ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SourceFailure> {
+        self.snapshot_scheduled_source_group_ids()
+            .map_err(SourceFailure::from)
+    }
+
+    pub(crate) fn scheduled_scan_group_ids_with_failure(
+        &self,
+    ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SourceFailure> {
+        self.snapshot_scheduled_scan_group_ids()
+            .map_err(SourceFailure::from)
+    }
+
+    pub(crate) fn force_find_with_failure(
+        &self,
+        params: &InternalQueryRequest,
+    ) -> std::result::Result<Vec<Event>, SourceFailure> {
+        self.perform_force_find(params).map_err(SourceFailure::from)
+    }
+
+    pub(crate) fn source_primary_by_group_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<std::collections::BTreeMap<String, String>, SourceFailure> {
+        Ok(self.snapshot_source_primary_by_group())
+    }
+
+    pub(crate) fn last_force_find_runner_by_group_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<std::collections::BTreeMap<String, String>, SourceFailure> {
+        Ok(self.snapshot_last_force_find_runner_by_group())
+    }
+
+    pub(crate) fn force_find_inflight_groups_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<String>, SourceFailure> {
+        Ok(self.snapshot_force_find_inflight_groups())
+    }
+
+    pub(crate) fn resolve_group_id_for_object_ref_with_failure(
+        &self,
+        object_ref: &str,
+    ) -> std::result::Result<Option<String>, SourceFailure> {
+        Ok(self.snapshot_group_id_for_object_ref(object_ref))
+    }
+
+    pub(crate) async fn publish_manual_rescan_signal_with_failure(
+        &self,
+    ) -> std::result::Result<(), SourceFailure> {
+        self.emit_manual_rescan_signal()
+            .await
+            .map_err(SourceFailure::from)
+    }
+
+    pub(crate) async fn trigger_rescan_when_ready_epoch_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SourceFailure> {
+        Ok(self.perform_trigger_rescan_when_ready_epoch().await)
+    }
+
+    pub(crate) async fn on_control_frame_with_failure(
+        &self,
+        envelopes: Vec<ControlEnvelope>,
+    ) -> std::result::Result<(), SourceFailure> {
+        let signals =
+            source_control_signals_from_envelopes(&envelopes).map_err(SourceFailure::from)?;
+        self.apply_control_frame_signals(&signals)
+            .await
+            .map_err(SourceFailure::from)
+    }
+
+    pub(crate) async fn close_with_failure(&self) -> std::result::Result<(), SourceFailure> {
+        self.perform_close().await.map_err(SourceFailure::from)
+    }
+}
+
 impl SourceFacade {
     pub fn local(source: Arc<FSMetaSource>) -> Self {
         Self::Local(source)
@@ -7553,46 +7809,43 @@ impl SourceFacade {
         matches!(self, Self::Worker(_))
     }
 
-    pub async fn start(
+    pub(crate) async fn start_with_failure(
         &self,
         sink: Arc<SinkFacade>,
         boundary: Option<Arc<dyn ChannelIoSubset>>,
-    ) -> Result<Option<JoinHandle<()>>> {
+    ) -> std::result::Result<Option<JoinHandle<()>>, SourceFailure> {
         match self {
             Self::Local(source) => {
-                let stream = source.pub_().await?;
+                let stream = source.pub_stream_with_failure().await?;
                 Ok(Some(spawn_local_source_pump(stream, sink, boundary)))
             }
             Self::Worker(client) => {
-                client.start().await?;
+                client.start_with_failure().await?;
                 Ok(None)
             }
         }
     }
 
-    pub(crate) async fn apply_orchestration_signals(
+    #[cfg(test)]
+    pub async fn start(
         &self,
-        signals: &[SourceControlSignal],
-    ) -> Result<()> {
-        match self {
-            Self::Local(source) => source.apply_orchestration_signals(signals).await,
-            Self::Worker(client) => {
-                let envelopes = signals
-                    .iter()
-                    .map(SourceControlSignal::envelope)
-                    .collect::<Vec<_>>();
-                client.on_control_frame(envelopes).await
-            }
-        }
+        sink: Arc<SinkFacade>,
+        boundary: Option<Arc<dyn ChannelIoSubset>>,
+    ) -> Result<Option<JoinHandle<()>>> {
+        self.start_with_failure(sink, boundary)
+            .await
+            .map_err(SourceFailure::into_error)
     }
 
-    pub(crate) async fn apply_orchestration_signals_with_total_timeout(
+    pub(crate) async fn apply_orchestration_signals_with_total_timeout_with_failure(
         &self,
         signals: &[SourceControlSignal],
         total_timeout: Duration,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), SourceFailure> {
         if total_timeout.is_zero() {
-            return Err(CnxError::Timeout);
+            return Err(SourceFailure::retry_budget_exhausted(
+                SourceRetryBudgetExhaustionKind::OperationAttempt,
+            ));
         }
         // runtime_app owns the outer recovery loop for local source recovery.
         // Keep each nested source-client control attempt short so retryable resets
@@ -7602,10 +7855,10 @@ impl SourceFacade {
             SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT,
         );
         match self {
-            Self::Local(source) => map_source_timeout_result(
+            Self::Local(source) => map_source_failure_timeout_result(
                 tokio::time::timeout(
                     single_attempt_total_timeout,
-                    source.apply_orchestration_signals(signals),
+                    source.apply_orchestration_signals_with_failure(signals),
                 )
                 .await,
             ),
@@ -7625,7 +7878,6 @@ impl SourceFacade {
                         rpc_timeout,
                     )
                     .await
-                    .map_err(SourceFailure::into_error)
             }
         }
     }
@@ -7659,132 +7911,191 @@ impl SourceFacade {
         }
     }
 
-    pub async fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {
+    pub(crate) async fn update_logical_roots_with_failure(
+        &self,
+        roots: Vec<RootSpec>,
+    ) -> std::result::Result<(), SourceFailure> {
         match self {
-            Self::Local(source) => source.update_logical_roots(roots).await,
-            Self::Worker(client) => client.update_logical_roots(roots).await,
+            Self::Local(source) => source.update_logical_roots_with_failure(roots).await,
+            Self::Worker(client) => client.update_logical_roots_with_failure(roots).await,
         }
     }
 
-    pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
+    pub(crate) fn cached_logical_roots_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<RootSpec>, SourceFailure> {
         match self {
-            Self::Local(source) => Ok(source.logical_roots_snapshot()),
-            Self::Worker(client) => client.cached_logical_roots_snapshot(),
+            Self::Local(source) => source.cached_logical_roots_snapshot_with_failure(),
+            Self::Worker(client) => client.cached_logical_roots_snapshot_with_failure(),
         }
     }
 
-    pub async fn logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
+    pub(crate) async fn logical_roots_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<RootSpec>, SourceFailure> {
         match self {
-            Self::Local(source) => Ok(source.logical_roots_snapshot()),
-            Self::Worker(client) => client.logical_roots_snapshot().await,
+            Self::Local(source) => source.logical_roots_snapshot_with_failure(),
+            Self::Worker(client) => client.logical_roots_snapshot_with_failure().await,
         }
     }
 
-    pub fn cached_host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
+    pub(crate) fn cached_host_object_grants_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<GrantedMountRoot>, SourceFailure> {
         match self {
-            Self::Local(source) => Ok(source.host_object_grants_snapshot()),
-            Self::Worker(client) => client.cached_host_object_grants_snapshot(),
+            Self::Local(source) => source.cached_host_object_grants_snapshot_with_failure(),
+            Self::Worker(client) => client.cached_host_object_grants_snapshot_with_failure(),
         }
     }
 
-    pub async fn host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
+    pub(crate) async fn host_object_grants_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<GrantedMountRoot>, SourceFailure> {
         match self {
-            Self::Local(source) => Ok(source.host_object_grants_snapshot()),
-            Self::Worker(client) => client.host_object_grants_snapshot().await,
+            Self::Local(source) => source.host_object_grants_snapshot_with_failure(),
+            Self::Worker(client) => client.host_object_grants_snapshot_with_failure().await,
         }
     }
 
-    pub async fn host_object_grants_version_snapshot(&self) -> Result<u64> {
+    #[cfg(test)]
+    pub(crate) async fn host_object_grants_version_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SourceFailure> {
         match self {
-            Self::Local(source) => Ok(source.host_object_grants_version_snapshot()),
-            Self::Worker(client) => client.host_object_grants_version_snapshot().await,
+            Self::Local(source) => source.host_object_grants_version_snapshot_with_failure(),
+            Self::Worker(client) => {
+                client
+                    .host_object_grants_version_snapshot_with_failure()
+                    .await
+            }
         }
     }
 
-    pub async fn status_snapshot(&self) -> Result<SourceStatusSnapshot> {
+    pub(crate) async fn status_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<SourceStatusSnapshot, SourceFailure> {
         match self {
-            Self::Local(source) => Ok(source.status_snapshot()),
-            Self::Worker(client) => client.status_snapshot().await,
+            Self::Local(source) => source.status_snapshot_with_failure(),
+            Self::Worker(client) => client.status_snapshot_with_failure().await,
         }
     }
 
-    pub async fn lifecycle_state_label(&self) -> Result<String> {
+    #[cfg(test)]
+    pub(crate) async fn lifecycle_state_label_with_failure(
+        &self,
+    ) -> std::result::Result<String, SourceFailure> {
         match self {
-            Self::Local(source) => Ok(format!("{:?}", source.state()).to_ascii_lowercase()),
-            Self::Worker(client) => client.lifecycle_state_label().await,
+            Self::Local(source) => source.lifecycle_state_label_with_failure(),
+            Self::Worker(client) => client.lifecycle_state_label_with_failure().await,
         }
     }
 
+    pub(crate) async fn scheduled_source_group_ids_with_failure(
+        &self,
+    ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SourceFailure> {
+        match self {
+            Self::Local(source) => source.scheduled_source_group_ids_with_failure(),
+            Self::Worker(client) => client.scheduled_source_group_ids_with_failure().await,
+        }
+    }
+
+    #[cfg(test)]
     pub async fn scheduled_source_group_ids(
         &self,
     ) -> Result<Option<std::collections::BTreeSet<String>>> {
+        self.scheduled_source_group_ids_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)
+    }
+
+    pub(crate) async fn scheduled_scan_group_ids_with_failure(
+        &self,
+    ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SourceFailure> {
         match self {
-            Self::Local(source) => source.scheduled_source_group_ids(),
-            Self::Worker(client) => client.scheduled_source_group_ids().await,
+            Self::Local(source) => source.scheduled_scan_group_ids_with_failure(),
+            Self::Worker(client) => client.scheduled_scan_group_ids_with_failure().await,
         }
     }
 
+    #[cfg(test)]
     pub async fn scheduled_scan_group_ids(
         &self,
     ) -> Result<Option<std::collections::BTreeSet<String>>> {
-        match self {
-            Self::Local(source) => source.scheduled_scan_group_ids(),
-            Self::Worker(client) => client.scheduled_scan_group_ids().await,
-        }
+        self.scheduled_scan_group_ids_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)
     }
 
-    pub async fn source_primary_by_group_snapshot(
+    pub(crate) async fn source_primary_by_group_snapshot_with_failure(
         &self,
-    ) -> Result<std::collections::BTreeMap<String, String>> {
+    ) -> std::result::Result<std::collections::BTreeMap<String, String>, SourceFailure> {
         match self {
-            Self::Local(source) => Ok(source.source_primary_by_group_snapshot()),
-            Self::Worker(client) => client.source_primary_by_group_snapshot().await,
+            Self::Local(source) => source.source_primary_by_group_snapshot_with_failure(),
+            Self::Worker(client) => client.source_primary_by_group_snapshot_with_failure().await,
         }
     }
 
-    pub async fn last_force_find_runner_by_group_snapshot(
+    pub(crate) async fn last_force_find_runner_by_group_snapshot_with_failure(
         &self,
-    ) -> Result<std::collections::BTreeMap<String, String>> {
+    ) -> std::result::Result<std::collections::BTreeMap<String, String>, SourceFailure> {
         match self {
-            Self::Local(source) => Ok(source.last_force_find_runner_by_group_snapshot()),
-            Self::Worker(client) => client.last_force_find_runner_by_group_snapshot().await,
+            Self::Local(source) => source.last_force_find_runner_by_group_snapshot_with_failure(),
+            Self::Worker(client) => {
+                client
+                    .last_force_find_runner_by_group_snapshot_with_failure()
+                    .await
+            }
         }
     }
 
-    pub async fn force_find_inflight_groups_snapshot(&self) -> Result<Vec<String>> {
+    pub(crate) async fn force_find_inflight_groups_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<Vec<String>, SourceFailure> {
         match self {
-            Self::Local(source) => Ok(source.force_find_inflight_groups_snapshot()),
-            Self::Worker(client) => client.force_find_inflight_groups_snapshot().await,
+            Self::Local(source) => source.force_find_inflight_groups_snapshot_with_failure(),
+            Self::Worker(client) => {
+                client
+                    .force_find_inflight_groups_snapshot_with_failure()
+                    .await
+            }
         }
     }
 
-    pub async fn resolve_group_id_for_object_ref(
+    pub(crate) async fn resolve_group_id_for_object_ref_with_failure(
         &self,
         object_ref: &str,
-    ) -> Result<Option<String>> {
+    ) -> std::result::Result<Option<String>, SourceFailure> {
         match self {
-            Self::Local(source) => Ok(source.resolve_group_id_for_object_ref(object_ref)),
-            Self::Worker(client) => client.resolve_group_id_for_object_ref(object_ref).await,
+            Self::Local(source) => source.resolve_group_id_for_object_ref_with_failure(object_ref),
+            Self::Worker(client) => {
+                client
+                    .resolve_group_id_for_object_ref_with_failure(object_ref)
+                    .await
+            }
         }
     }
 
-    pub async fn force_find(&self, params: &InternalQueryRequest) -> Result<Vec<Event>> {
+    pub(crate) async fn force_find_with_failure(
+        &self,
+        params: &InternalQueryRequest,
+    ) -> std::result::Result<Vec<Event>, SourceFailure> {
         match self {
-            Self::Local(source) => source.force_find(params),
-            Self::Worker(client) => client.force_find(params.clone()).await,
+            Self::Local(source) => source.force_find_with_failure(params),
+            Self::Worker(client) => client.force_find_with_failure(params.clone()).await,
         }
     }
 
-    pub async fn force_find_via_node(
+    #[cfg(test)]
+    pub(crate) async fn force_find_via_node_with_failure(
         &self,
         node_id: &NodeId,
         params: &InternalQueryRequest,
-    ) -> Result<Vec<Event>> {
+    ) -> std::result::Result<Vec<Event>, SourceFailure> {
         match self {
-            Self::Local(source) => source.force_find(params),
+            Self::Local(source) => source.force_find_with_failure(params),
             Self::Worker(client) => {
                 if client.node_id == *node_id {
-                    client.force_find(params.clone()).await
+                    client.force_find_with_failure(params.clone()).await
                 } else {
                     let remote = SourceWorkerClientHandle::new(
                         node_id.clone(),
@@ -7792,40 +8103,53 @@ impl SourceFacade {
                         client.worker_binding.clone(),
                         client.worker_factory.clone(),
                     )?;
-                    remote.force_find(params.clone()).await
+                    remote.force_find_with_failure(params.clone()).await
                 }
             }
         }
     }
 
-    pub async fn publish_manual_rescan_signal(&self) -> Result<()> {
+    pub(crate) async fn publish_manual_rescan_signal_with_failure(
+        &self,
+    ) -> std::result::Result<(), SourceFailure> {
         match self {
-            Self::Local(source) => source.publish_manual_rescan_signal().await,
-            Self::Worker(client) => client.publish_manual_rescan_signal().await,
+            Self::Local(source) => source.publish_manual_rescan_signal_with_failure().await,
+            Self::Worker(client) => client.publish_manual_rescan_signal_with_failure().await,
         }
     }
 
-    pub(crate) async fn trigger_rescan_when_ready_epoch(&self) -> Result<u64> {
+    pub(crate) async fn trigger_rescan_when_ready_epoch_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SourceFailure> {
         #[cfg(test)]
         record_source_worker_trigger_rescan_when_ready_attempt();
         match self {
-            Self::Local(source) => Ok(source.trigger_rescan_when_ready_epoch().await),
-            Self::Worker(client) => client.trigger_rescan_when_ready_epoch().await,
+            Self::Local(source) => source.trigger_rescan_when_ready_epoch_with_failure().await,
+            Self::Worker(client) => client.trigger_rescan_when_ready_epoch_with_failure().await,
         }
     }
 
-    pub(crate) async fn reconnect_shared_worker_client(&self) -> Result<()> {
+    pub(crate) async fn reconnect_shared_worker_client_with_failure(
+        &self,
+    ) -> std::result::Result<(), SourceFailure> {
         match self {
             Self::Local(_) => Ok(()),
-            Self::Worker(client) => client.reconnect_shared_worker_client().await,
+            Self::Worker(client) => client.reconnect_shared_worker_client_with_failure().await,
         }
     }
 
-    pub async fn close(&self) -> Result<()> {
+    pub(crate) async fn close_with_failure(&self) -> std::result::Result<(), SourceFailure> {
         match self {
-            Self::Local(source) => source.close().await,
-            Self::Worker(client) => client.close().await,
+            Self::Local(source) => source.close_with_failure().await,
+            Self::Worker(client) => client.close_with_failure().await,
         }
+    }
+
+    #[cfg(test)]
+    pub async fn close(&self) -> Result<()> {
+        self.close_with_failure()
+            .await
+            .map_err(SourceFailure::into_error)
     }
 
     pub(crate) async fn wait_for_control_ops_to_drain_for_handoff(&self) {
@@ -7836,54 +8160,42 @@ impl SourceFacade {
         }
     }
 
-    pub(crate) async fn observability_snapshot(&self) -> Result<SourceObservabilitySnapshot> {
+    pub(crate) async fn observability_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<SourceObservabilitySnapshot, SourceFailure> {
         match self {
-            Self::Local(source) => {
-                let snapshot = build_local_source_observability_snapshot(source);
-                let last_audit_completed_at_us =
-                    source_status_rescan_completion_marker(&snapshot.status);
-                let (published_batches, last_published_at_us) =
-                    source_observability_publication_marker(&snapshot);
-                source.maybe_mark_rescan_observed_if_publication_advanced(
-                    published_batches,
-                    last_published_at_us,
-                    last_audit_completed_at_us,
-                );
-                Ok(snapshot)
-            }
+            Self::Local(source) => source.observability_snapshot_with_failure(),
             Self::Worker(client) => {
                 client
-                    .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+                    .observability_snapshot_with_timeout_with_failure(
+                        SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                    )
                     .await
             }
         }
     }
 
-    pub(crate) async fn observability_snapshot_nonblocking(&self) -> SourceObservabilitySnapshot {
+    pub(crate) async fn observability_snapshot_nonblocking_for_status_route(
+        &self,
+    ) -> (SourceObservabilitySnapshot, bool) {
         match self {
-            Self::Local(source) => {
-                let snapshot = build_local_source_observability_snapshot(source);
-                let last_audit_completed_at_us =
-                    source_status_rescan_completion_marker(&snapshot.status);
-                let (published_batches, last_published_at_us) =
-                    source_observability_publication_marker(&snapshot);
-                source.maybe_mark_rescan_observed_if_publication_advanced(
-                    published_batches,
-                    last_published_at_us,
-                    last_audit_completed_at_us,
-                );
-                snapshot
+            Self::Local(source) => source.observability_snapshot_nonblocking_for_status_route(),
+            Self::Worker(client) => {
+                client
+                    .observability_snapshot_nonblocking_for_status_route()
+                    .await
             }
-            Self::Worker(client) => client.observability_snapshot_nonblocking().await,
         }
     }
 
-    pub(crate) async fn progress_snapshot(&self) -> Result<crate::source::SourceProgressSnapshot> {
+    pub(crate) async fn progress_snapshot_with_failure(
+        &self,
+    ) -> std::result::Result<crate::source::SourceProgressSnapshot, SourceFailure> {
         match self {
-            Self::Local(source) => Ok(source.progress_snapshot()),
+            Self::Local(source) => source.progress_snapshot_with_failure(),
             Self::Worker(client) => {
                 client
-                    .progress_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+                    .progress_snapshot_with_timeout_with_failure(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
                     .await
             }
         }
@@ -7925,8 +8237,11 @@ fn spawn_local_source_pump(
         } else {
             tokio::pin!(stream);
             while let Some(batch) = stream.next().await {
-                if let Err(err) = sink.send(&batch).await {
-                    log::error!("fs-meta app pump failed to apply batch: {:?}", err);
+                if let Err(err) = sink.send_with_failure(&batch).await {
+                    log::error!(
+                        "fs-meta app pump failed to apply batch: {:?}",
+                        err.as_error()
+                    );
                 }
             }
         }

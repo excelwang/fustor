@@ -22,6 +22,7 @@ use crate::query::path::is_under_query_path;
 use crate::runtime::orchestration::{SourceControlSignal, source_control_signals_from_envelopes};
 use crate::source::FSMetaSource;
 use crate::source::config::SourceConfig;
+use crate::workers::source::SourceFailure;
 use crate::workers::source::SourceObservabilitySnapshot;
 use crate::workers::source::SourceWorkerRpc;
 use crate::workers::source::{
@@ -172,6 +173,19 @@ fn stable_host_ref_for_node_id(
             .unwrap_or_else(|| node_id.0.clone()),
         _ => node_id.0.clone(),
     }
+}
+
+fn source_force_find_debug_metadata(
+    source: &FSMetaSource,
+) -> (std::collections::BTreeMap<String, String>, Vec<String>) {
+    (
+        source
+            .last_force_find_runner_by_group_snapshot_with_failure()
+            .unwrap_or_default(),
+        source
+            .force_find_inflight_groups_snapshot_with_failure()
+            .unwrap_or_default(),
+    )
 }
 
 fn debug_stream_path_capture_target() -> Option<Vec<u8>> {
@@ -493,13 +507,17 @@ fn classify_source_worker_error(err: CnxError) -> SourceWorkerResponse {
     }
 }
 
+fn classify_source_worker_failure(err: SourceFailure) -> SourceWorkerResponse {
+    classify_source_worker_error(err.into_error())
+}
+
 async fn stop_source_runtime_with_timeouts(
     state: &mut SourceWorkerState,
     join_timeout: Duration,
     abort_timeout: Duration,
 ) {
     if let Some(source) = state.source.as_ref() {
-        let _ = source.close().await;
+        let _ = source.close_with_failure().await;
     }
     if let Some(mut handle) = state.pump_task.take() {
         if tokio::time::timeout(join_timeout, &mut handle)
@@ -628,16 +646,16 @@ async fn fail_closed_if_publish_pump_dead(
     false
 }
 
-fn source_observability_snapshot(
+fn source_observability_snapshot_with_failure(
     source: &FSMetaSource,
     last_control_frame_signals: &[String],
     published_stats: &Arc<StdMutex<PublishedBatchStats>>,
-) -> SourceObservabilitySnapshot {
+) -> std::result::Result<SourceObservabilitySnapshot, SourceFailure> {
     let published = lock_publish_stats(published_stats);
     let enqueued_path_origin_counts = source.enqueued_path_origin_counts_snapshot();
     let pending_path_origin_counts = source.pending_path_origin_counts_snapshot();
     let yielded_path_origin_counts = source.yielded_path_origin_counts_snapshot();
-    build_live_source_observability_snapshot(
+    Ok(build_live_source_observability_snapshot(
         source,
         SourceObservabilityPublicationView {
             last_control_frame_signals: last_control_frame_signals.to_vec(),
@@ -657,7 +675,17 @@ fn source_observability_snapshot(
             summarized_path_origin_counts: published.summarized_path_origin_counts.clone(),
             published_path_origin_counts: published.published_path_origin_counts.clone(),
         },
-    )
+    ))
+}
+
+#[cfg(test)]
+fn source_observability_snapshot(
+    source: &FSMetaSource,
+    last_control_frame_signals: &[String],
+    published_stats: &Arc<StdMutex<PublishedBatchStats>>,
+) -> SourceObservabilitySnapshot {
+    source_observability_snapshot_with_failure(source, last_control_frame_signals, published_stats)
+        .expect("test-only raw observability helper should stay aligned with typed helper")
 }
 
 async fn bootstrap_init_source_runtime(
@@ -677,22 +705,24 @@ async fn bootstrap_init_source_runtime(
     eprintln!("fs_meta_source_worker_server: bootstrap_init ok");
 }
 
-async fn bootstrap_start_source_runtime(
+async fn bootstrap_start_source_runtime_with_failure(
     state: &mut SourceWorkerState,
     boundary: Arc<dyn ChannelIoSubset>,
     state_boundary: Arc<dyn StateBoundary>,
-) -> Result<()> {
+) -> std::result::Result<(), SourceFailure> {
     let should_restart = state
         .pump_task
         .as_ref()
         .is_some_and(tokio::task::JoinHandle::is_finished);
     if should_restart {
         let _ = stop_source_runtime(state).await;
-        return Err(CnxError::NotReady("worker not initialized".to_string()));
+        return Err(SourceFailure::from(CnxError::NotReady(
+            "worker not initialized".to_string(),
+        )));
     }
     if state.source.is_none() {
         let Some((node_id, config)) = state.pending_init.clone() else {
-            return Err(bootstrap_not_ready());
+            return Err(SourceFailure::from(bootstrap_not_ready()));
         };
         let deadline = std::time::Instant::now() + SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_TIMEOUT;
         loop {
@@ -702,7 +732,7 @@ async fn bootstrap_start_source_runtime(
                 config.roots.len(),
                 config.host_object_grants.len()
             );
-            match FSMetaSource::with_boundaries_and_state(
+            match FSMetaSource::with_boundaries_and_state_with_failure(
                 config.clone(),
                 node_id.clone(),
                 None,
@@ -714,17 +744,19 @@ async fn bootstrap_start_source_runtime(
                     break;
                 }
                 Err(err)
-                    if is_transient_statecell_fenced_init_error(&err)
+                    if is_transient_statecell_fenced_init_error(err.as_error())
                         && std::time::Instant::now() < deadline =>
                 {
                     eprintln!(
-                        "fs_meta_source_worker_server: bootstrap_start build_source retry err={err}"
+                        "fs_meta_source_worker_server: bootstrap_start build_source retry err={}",
+                        err.as_error()
                     );
                     tokio::time::sleep(SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_BACKOFF).await;
                 }
                 Err(err) => {
                     eprintln!(
-                        "fs_meta_source_worker_server: bootstrap_start build_source err={err}"
+                        "fs_meta_source_worker_server: bootstrap_start build_source err={}",
+                        err.as_error()
                     );
                     return Err(err);
                 }
@@ -732,12 +764,14 @@ async fn bootstrap_start_source_runtime(
         }
     }
     let Some(source) = state.source.as_ref() else {
-        return Err(CnxError::Internal(
+        return Err(SourceFailure::from(CnxError::Internal(
             "source worker runtime missing during start".into(),
-        ));
+        )));
     };
     eprintln!("fs_meta_source_worker_server: bootstrap_start endpoints begin");
-    source.start_runtime_endpoints(boundary.clone()).await?;
+    source
+        .start_runtime_endpoints_with_failure(boundary.clone())
+        .await?;
     eprintln!("fs_meta_source_worker_server: bootstrap_start endpoints ok");
     let pump_boundary = state
         .pump_boundary
@@ -747,7 +781,7 @@ async fn bootstrap_start_source_runtime(
     if state.pump_task.is_none() {
         let source = source.clone();
         eprintln!("fs_meta_source_worker_server: bootstrap_start pub begin");
-        let stream = source.pub_().await?;
+        let stream = source.pub_stream_with_failure().await?;
         eprintln!("fs_meta_source_worker_server: bootstrap_start pub ok");
         state.pump_task = Some(start_source_pump_with_stream(
             stream,
@@ -758,6 +792,16 @@ async fn bootstrap_start_source_runtime(
     }
     eprintln!("fs_meta_source_worker_server: bootstrap_start ok");
     Ok(())
+}
+
+async fn bootstrap_start_source_runtime(
+    state: &mut SourceWorkerState,
+    boundary: Arc<dyn ChannelIoSubset>,
+    state_boundary: Arc<dyn StateBoundary>,
+) -> Result<()> {
+    bootstrap_start_source_runtime_with_failure(state, boundary, state_boundary)
+        .await
+        .map_err(SourceFailure::into_error)
 }
 
 fn plan_worker_request(
@@ -773,95 +817,124 @@ fn plan_worker_request(
             ),
         },
         SourceWorkerRequest::LogicalRootsSnapshot => match state.source.as_ref() {
-            Some(source) => SourceWorkerAction::Immediate(
-                SourceWorkerResponse::LogicalRoots(source.logical_roots_snapshot()),
-                false,
-            ),
+            Some(source) => match source.logical_roots_snapshot_with_failure() {
+                Ok(roots) => {
+                    SourceWorkerAction::Immediate(SourceWorkerResponse::LogicalRoots(roots), false)
+                }
+                Err(err) => {
+                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                }
+            },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::HostObjectGrantsSnapshot => match state.source.as_ref() {
-            Some(source) => SourceWorkerAction::Immediate(
-                SourceWorkerResponse::HostObjectGrants(source.host_object_grants_snapshot()),
-                false,
-            ),
+            Some(source) => match source.host_object_grants_snapshot_with_failure() {
+                Ok(grants) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::HostObjectGrants(grants),
+                    false,
+                ),
+                Err(err) => {
+                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                }
+            },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::HostObjectGrantsVersionSnapshot => match state.source.as_ref() {
-            Some(source) => SourceWorkerAction::Immediate(
-                SourceWorkerResponse::HostObjectGrantsVersion(
-                    source.host_object_grants_version_snapshot(),
+            Some(source) => match source.host_object_grants_version_snapshot_with_failure() {
+                Ok(version) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::HostObjectGrantsVersion(version),
+                    false,
                 ),
-                false,
-            ),
+                Err(err) => {
+                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                }
+            },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::StatusSnapshot => match state.source.as_ref() {
-            Some(source) => SourceWorkerAction::Immediate(
-                SourceWorkerResponse::StatusSnapshot(source.status_snapshot()),
-                false,
-            ),
+            Some(source) => match source.status_snapshot_with_failure() {
+                Ok(snapshot) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::StatusSnapshot(snapshot),
+                    false,
+                ),
+                Err(err) => {
+                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                }
+            },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::ProgressSnapshot => match state.source.as_ref() {
-            Some(source) => SourceWorkerAction::Immediate(
-                SourceWorkerResponse::ProgressSnapshot(source.progress_snapshot()),
-                false,
-            ),
+            Some(source) => match source.progress_snapshot_with_failure() {
+                Ok(snapshot) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::ProgressSnapshot(snapshot),
+                    false,
+                ),
+                Err(err) => {
+                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                }
+            },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::ObservabilitySnapshot => match state.source.as_ref() {
-            Some(source) => SourceWorkerAction::Immediate(
-                SourceWorkerResponse::ObservabilitySnapshot(source_observability_snapshot(
-                    source,
-                    &state.last_control_frame_signals,
-                    &state.published_stats,
-                )),
-                false,
-            ),
+            Some(source) => match source_observability_snapshot_with_failure(
+                source,
+                &state.last_control_frame_signals,
+                &state.published_stats,
+            ) {
+                Ok(snapshot) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::ObservabilitySnapshot(snapshot),
+                    false,
+                ),
+                Err(err) => {
+                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                }
+            },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::LifecycleState => match state.source.as_ref() {
-            Some(source) => SourceWorkerAction::Immediate(
-                SourceWorkerResponse::LifecycleState(
-                    format!("{:?}", source.state()).to_ascii_lowercase(),
+            Some(source) => match source.lifecycle_state_label_with_failure() {
+                Ok(state) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::LifecycleState(state),
+                    false,
                 ),
-                false,
-            ),
+                Err(err) => {
+                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                }
+            },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::ScheduledSourceGroupIds => match state.source.as_ref() {
-            Some(source) => match source.scheduled_source_group_ids() {
+            Some(source) => match source.scheduled_source_group_ids_with_failure() {
                 Ok(groups) => SourceWorkerAction::Immediate(
                     SourceWorkerResponse::ScheduledGroupIds(
                         groups.map(|group_ids| group_ids.into_iter().collect()),
                     ),
                     false,
                 ),
-                Err(err) => SourceWorkerAction::Immediate(
-                    SourceWorkerResponse::Error(err.to_string()),
-                    false,
-                ),
+                Err(err) => {
+                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                }
             },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
@@ -869,17 +942,16 @@ fn plan_worker_request(
             ),
         },
         SourceWorkerRequest::ScheduledScanGroupIds => match state.source.as_ref() {
-            Some(source) => match source.scheduled_scan_group_ids() {
+            Some(source) => match source.scheduled_scan_group_ids_with_failure() {
                 Ok(groups) => SourceWorkerAction::Immediate(
                     SourceWorkerResponse::ScheduledGroupIds(
                         groups.map(|group_ids| group_ids.into_iter().collect()),
                     ),
                     false,
                 ),
-                Err(err) => SourceWorkerAction::Immediate(
-                    SourceWorkerResponse::Error(err.to_string()),
-                    false,
-                ),
+                Err(err) => {
+                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                }
             },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
@@ -887,36 +959,45 @@ fn plan_worker_request(
             ),
         },
         SourceWorkerRequest::SourcePrimaryByGroupSnapshot => match state.source.as_ref() {
-            Some(source) => SourceWorkerAction::Immediate(
-                SourceWorkerResponse::SourcePrimaryByGroup(
-                    source.source_primary_by_group_snapshot(),
+            Some(source) => match source.source_primary_by_group_snapshot_with_failure() {
+                Ok(snapshot) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::SourcePrimaryByGroup(snapshot),
+                    false,
                 ),
-                false,
-            ),
+                Err(err) => {
+                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                }
+            },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::LastForceFindRunnerByGroupSnapshot => match state.source.as_ref() {
-            Some(source) => SourceWorkerAction::Immediate(
-                SourceWorkerResponse::LastForceFindRunnerByGroup(
-                    source.last_force_find_runner_by_group_snapshot(),
+            Some(source) => match source.last_force_find_runner_by_group_snapshot_with_failure() {
+                Ok(snapshot) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::LastForceFindRunnerByGroup(snapshot),
+                    false,
                 ),
-                false,
-            ),
+                Err(err) => {
+                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                }
+            },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::ForceFindInflightGroupsSnapshot => match state.source.as_ref() {
-            Some(source) => SourceWorkerAction::Immediate(
-                SourceWorkerResponse::ForceFindInflightGroups(
-                    source.force_find_inflight_groups_snapshot(),
+            Some(source) => match source.force_find_inflight_groups_snapshot_with_failure() {
+                Ok(groups) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::ForceFindInflightGroups(groups),
+                    false,
                 ),
-                false,
-            ),
+                Err(err) => {
+                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                }
+            },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
@@ -934,38 +1015,35 @@ fn plan_worker_request(
                         String::from_utf8_lossy(&request.scope.path)
                     );
                 }
-                match source.force_find(&request) {
+                match source.force_find_with_failure(&request) {
                     Ok(events) => {
                         if debug_force_find_route_capture_enabled() {
+                            let (last_runner_by_group, inflight_groups) =
+                                source_force_find_debug_metadata(source);
                             eprintln!(
                                 "fs_meta_source_worker_server: force_find done node={} events={} origins={:?} last_runner={:?} inflight={:?}",
                                 source.node_id().0,
                                 events.len(),
                                 summarize_event_counts_by_origin(&events),
-                                summarize_group_string_map(
-                                    &source.last_force_find_runner_by_group_snapshot()
-                                ),
-                                source.force_find_inflight_groups_snapshot()
+                                summarize_group_string_map(&last_runner_by_group),
+                                inflight_groups
                             );
                         }
                         SourceWorkerAction::Immediate(SourceWorkerResponse::Events(events), false)
                     }
                     Err(err) => {
                         if debug_force_find_route_capture_enabled() {
+                            let (last_runner_by_group, inflight_groups) =
+                                source_force_find_debug_metadata(source);
                             eprintln!(
                                 "fs_meta_source_worker_server: force_find failed node={} err={} last_runner={:?} inflight={:?}",
                                 source.node_id().0,
-                                err,
-                                summarize_group_string_map(
-                                    &source.last_force_find_runner_by_group_snapshot()
-                                ),
-                                source.force_find_inflight_groups_snapshot()
+                                err.as_error(),
+                                summarize_group_string_map(&last_runner_by_group),
+                                inflight_groups
                             );
                         }
-                        SourceWorkerAction::Immediate(
-                            SourceWorkerResponse::Error(err.to_string()),
-                            false,
-                        )
+                        SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
                     }
                 }
             }
@@ -976,12 +1054,17 @@ fn plan_worker_request(
         },
         SourceWorkerRequest::ResolveGroupIdForObjectRef { object_ref } => {
             match state.source.as_ref() {
-                Some(source) => SourceWorkerAction::Immediate(
-                    SourceWorkerResponse::ResolveGroupIdForObjectRef(
-                        source.resolve_group_id_for_object_ref(&object_ref),
+                Some(source) => match source
+                    .resolve_group_id_for_object_ref_with_failure(&object_ref)
+                {
+                    Ok(group) => SourceWorkerAction::Immediate(
+                        SourceWorkerResponse::ResolveGroupIdForObjectRef(group),
+                        false,
                     ),
-                    false,
-                ),
+                    Err(err) => {
+                        SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                    }
+                },
                 None => SourceWorkerAction::Immediate(
                     SourceWorkerResponse::Error("worker not initialized".into()),
                     false,
@@ -1037,45 +1120,50 @@ async fn execute_worker_action(action: SourceWorkerAction) -> (SourceWorkerRespo
             let deadline =
                 tokio::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_FENCED_RETRY_TIMEOUT;
             loop {
-                match source.update_logical_roots(roots.clone()).await {
+                match source
+                    .update_logical_roots_with_failure(roots.clone())
+                    .await
+                {
                     Ok(_) => {
                         eprintln!("fs_meta_source_worker_server: update_logical_roots ok");
                         return (SourceWorkerResponse::Ack, false);
                     }
                     Err(err)
-                        if is_transient_logical_roots_fenced_write_error(&err)
+                        if is_transient_logical_roots_fenced_write_error(err.as_error())
                             && tokio::time::Instant::now() < deadline =>
                     {
                         eprintln!(
                             "fs_meta_source_worker_server: update_logical_roots retry err={}",
-                            err
+                            err.as_error()
                         );
                         tokio::time::sleep(SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_BACKOFF).await;
                     }
                     Err(err) => {
                         eprintln!(
                             "fs_meta_source_worker_server: update_logical_roots err={}",
-                            err
+                            err.as_error()
                         );
-                        return (classify_source_worker_error(err), false);
+                        return (classify_source_worker_failure(err), false);
                     }
                 }
             }
         }
         SourceWorkerAction::PublishManualRescanSignal { source } => {
-            match source.publish_manual_rescan_signal().await {
+            match source.publish_manual_rescan_signal_with_failure().await {
                 Ok(()) => (SourceWorkerResponse::Ack, false),
-                Err(err) => (classify_source_worker_error(err), false),
+                Err(err) => (classify_source_worker_failure(err), false),
             }
         }
         SourceWorkerAction::TriggerRescanWhenReadyEpoch { source } => {
-            let epoch = source.trigger_rescan_when_ready_epoch().await;
-            (SourceWorkerResponse::RescanRequestEpoch(epoch), false)
+            match source.trigger_rescan_when_ready_epoch_with_failure().await {
+                Ok(epoch) => (SourceWorkerResponse::RescanRequestEpoch(epoch), false),
+                Err(err) => (classify_source_worker_failure(err), false),
+            }
         }
         SourceWorkerAction::OnControlFrame { source, envelopes } => {
-            match source.on_control_frame(&envelopes).await {
+            match source.on_control_frame_with_failure(envelopes).await {
                 Ok(_) => (SourceWorkerResponse::Ack, false),
-                Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
+                Err(err) => (classify_source_worker_failure(err), false),
             }
         }
     }
@@ -1168,7 +1256,9 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
                 "worker runtime not initialized for runtime control frames".into(),
             ));
         };
-        let result = source.on_control_frame(envelopes).await;
+        let result = source
+            .on_control_frame_with_failure(envelopes.to_vec())
+            .await;
         if result.is_ok() {
             let mut guard = self.state.lock().await;
             guard.last_control_frame_signals = summary.clone();
@@ -1185,7 +1275,7 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
             envelopes.len(),
             result.is_ok()
         );
-        result
+        result.map_err(SourceFailure::into_error)
     }
 }
 

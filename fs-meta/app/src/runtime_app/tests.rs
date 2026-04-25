@@ -3097,10 +3097,10 @@ fn runtime_app_fixed_bind_projection_symbols_are_removed() {
                 "async fn publish_facade_service_state_with_session(",
             )
             && source.contains(
-                "async fn begin_fixed_bind_lifecycle_session(&self) -> FixedBindLifecycleSession {",
+                "async fn begin_fixed_bind_lifecycle_root_session(\n        &self,\n        reason: FixedBindLifecycleRootReason,\n    ) -> FixedBindLifecycleSession {",
             )
             && source.contains(
-                "async fn rebuild_fixed_bind_lifecycle_session(",
+                "async fn rebuild_fixed_bind_lifecycle_session(\n        &self,\n        session: &FixedBindLifecycleSession,\n        reason: FixedBindLifecycleRebuildReason,\n    ) -> FixedBindLifecycleSession {",
             )
             && source.contains("struct FixedBindClaimReleaseFollowupSnapshot {")
             && source.contains(
@@ -3117,7 +3117,19 @@ fn runtime_app_fixed_bind_projection_symbols_are_removed() {
             )
             && source.contains("async fn apply_facade_signal_with_session(")
             && source.contains(
-                "let mut fixed_bind_session = self.begin_fixed_bind_lifecycle_session().await;",
+                "async fn service_on_control_frame_with_failure_and_session(\n        &self,\n        envelopes: &[ControlEnvelope],\n        fixed_bind_session: FixedBindLifecycleSession,\n    ) -> std::result::Result<(), RuntimeControlFrameFailure> {",
+            )
+            && source.contains(
+                "pub async fn start(&self) -> Result<()> {\n        let fixed_bind_session = self\n            .begin_fixed_bind_lifecycle_root_session(FixedBindLifecycleRootReason::PublicStart)\n            .await;",
+            )
+            && source.contains(
+                "pub async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {\n        let fixed_bind_session = self\n            .begin_fixed_bind_lifecycle_root_session(\n                FixedBindLifecycleRootReason::PublicOnControlFrame,\n            )\n            .await;\n        self.service_on_control_frame_with_failure_and_session(envelopes, fixed_bind_session)\n            .await\n            .map_err(RuntimeControlFrameFailure::into_error)\n    }",
+            )
+            && source.contains(
+                "async fn service_close_with_failure_and_session(\n        &self,\n        fixed_bind_session: FixedBindLifecycleSession,\n    ) -> std::result::Result<(), RuntimeCloseFailure> {",
+            )
+            && source.contains(
+                "pub async fn close(&self) -> Result<()> {\n        let fixed_bind_session = self\n            .begin_fixed_bind_lifecycle_root_session(FixedBindLifecycleRootReason::PublicClose)\n            .await;\n        self.service_close_with_failure_and_session(fixed_bind_session)\n            .await\n            .map_err(RuntimeCloseFailure::into_error)\n    }",
             )
             && source.contains(
                 ".settle_fixed_bind_claim_release_followup_with_session(fixed_bind_session)",
@@ -3133,6 +3145,8 @@ fn runtime_app_fixed_bind_projection_symbols_are_removed() {
             && source.contains("fn evaluate(&self, request: FixedBindLifecycleRequest)")
             && source.contains("async fn drive_fixed_bind_lifecycle_request(")
             && source.contains("async fn execute_fixed_bind_lifecycle_execution(")
+            && !source.contains("async fn service_on_control_frame_with_session(")
+            && !source.contains("async fn service_close_with_session(")
             && !source.contains("struct FixedBindLifecycleReadSide {")
             && !source.contains("current_fixed_bind_lifecycle_read_side(")
             && !source.contains("enum FixedBindHandoffAction {")
@@ -3200,6 +3214,9 @@ fn runtime_app_fixed_bind_projection_symbols_are_removed() {
             )
             && !source.contains(
                 "let facade_snapshot =\n            FixedBindLifecycleMachine::from_facts(self.collect_fixed_bind_lifecycle_facts().await)\n                .snapshot();",
+            )
+            && !source.contains(
+                "async fn service_on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {",
             )
             && !source.contains("let snapshot = FixedBindLifecycleMachine {")
             && !source.contains(
@@ -3449,6 +3466,91 @@ fn runtime_app_fixed_bind_projection_symbols_are_removed() {
     assert!(
         !source.contains("async fn observe_facade_gate("),
         "fixed-bind hard cut should not keep an app-side facade gate wrapper once publication observes the gate directly from app parts",
+    );
+}
+
+#[test]
+fn runtime_app_internal_cached_sink_reads_use_typed_helpers() {
+    let source = include_str!("../runtime_app.rs");
+
+    for typed_surface in [
+        "sink.cached_status_snapshot_with_failure()",
+        "sink.cached_progress_snapshot_with_failure().ok();",
+    ] {
+        assert!(
+            source.contains(typed_surface),
+            "runtime_app hard cut regressed; internal cached sink reads should stay on typed helpers: {typed_surface}",
+        );
+    }
+
+    for legacy_surface in [
+        "sink.cached_status_snapshot()\n                    .map(|snapshot| summarize_sink_status_endpoint(&snapshot))",
+        "let cached_sink_progress = sink.cached_progress_snapshot().ok();",
+    ] {
+        assert!(
+            !source.contains(legacy_surface),
+            "runtime_app hard cut regressed; internal cached sink reads bounced back through raw cached helpers: {legacy_surface}",
+        );
+    }
+}
+
+#[test]
+fn runtime_app_fixed_bind_session_rebuild_preserves_lineage() {
+    let source = include_str!("../runtime_app.rs");
+    assert!(
+        source.contains("lineage_token: u64,")
+            && source.contains("enum FixedBindLifecycleRootReason {")
+            && source.contains("root_reason: FixedBindLifecycleRootReason,")
+            && source.contains("enum FixedBindLifecycleRebuildReason {")
+            && source.contains("last_rebuild_reason: Option<FixedBindLifecycleRebuildReason>,"),
+        "fixed-bind session should carry transaction-level root provenance metadata instead of being a bare view snapshot",
+    );
+    assert!(
+        source.contains(
+            "fn rebuild(\n        &self,\n        view: FixedBindLifecycleView,\n        reason: FixedBindLifecycleRebuildReason,\n    ) -> Self {",
+        ) && source.contains("lineage_token: self.lineage_token,")
+            && source.contains("root_reason: self.root_reason,")
+            && source.contains("last_rebuild_reason: Some(reason),"),
+        "fixed-bind session rebuild should preserve lineage, preserve the root provenance, and record the last rebuild reason",
+    );
+    assert!(
+        source.contains(
+            "session.rebuild(self.current_fixed_bind_lifecycle_view().await, reason)",
+        ) && !source.contains(
+            "async fn rebuild_fixed_bind_lifecycle_session(\n        &self,\n        _session: &FixedBindLifecycleSession,\n        _reason: &'static str,\n    ) -> FixedBindLifecycleSession {\n        FixedBindLifecycleSession::new(self.current_fixed_bind_lifecycle_view().await, \"fresh_session\")\n    }",
+        ),
+        "fixed-bind rebuild should preserve the current transaction session instead of minting a fresh session from a raw view snapshot",
+    );
+    assert!(
+        source.contains(
+            "async fn begin_fixed_bind_lifecycle_root_session(\n        &self,\n        reason: FixedBindLifecycleRootReason,\n    ) -> FixedBindLifecycleSession {",
+        ) && source.contains(
+            "FixedBindLifecycleSession::new(self.current_fixed_bind_lifecycle_view().await, reason)",
+        ) && source.contains(
+            "debug_assert_eq!(rebuilt.root_reason(), session.root_reason());",
+        ),
+        "fixed-bind root sessions should be opened with explicit root provenance and preserve it across rebuilds",
+    );
+    assert!(
+        source.matches("FixedBindLifecycleSession::new(").count() == 1
+            && source
+                .matches(".begin_fixed_bind_lifecycle_root_session(")
+                .count()
+                == 4
+            && source.contains(
+                "#[cfg(test)]\n    async fn begin_fixed_bind_lifecycle_session(&self) -> FixedBindLifecycleSession {",
+            )
+            && source.matches(".begin_fixed_bind_lifecycle_session().await").count() == 13
+            && source
+                .matches("FixedBindLifecycleRootReason::Public")
+                .count()
+                == 3
+            && source
+                .matches("FixedBindLifecycleRootReason::TestFixedBindSession")
+                .count()
+                == 1
+            && source.matches("FixedBindLifecycleRebuildReason::").count() == 10,
+        "fixed-bind session construction should stay centralized: exactly one constructor site, one test-only session helper, bounded test-only helper callsites, three public transaction roots, and a bounded typed rebuild-reason surface",
     );
 }
 
@@ -4228,7 +4330,7 @@ async fn service_close_republishes_unavailable_facade_state_after_closing_contro
         FacadeServiceState::Serving
     );
 
-    app.service_close().await.expect("service close");
+    app.close().await.expect("close app");
 
     assert_eq!(
         *app.facade_service_state
@@ -7312,7 +7414,11 @@ async fn external_worker_status_uses_cached_observation_reason_before_blocking_s
     .await
     .expect("source-only wave should establish untrusted local observation evidence");
 
-    let expected_local_source = app.source.observability_snapshot_nonblocking().await;
+    let expected_local_source = app
+        .source
+        .observability_snapshot_nonblocking_for_status_route()
+        .await
+        .0;
     let expected_local_sink = primed_cached_sink.clone();
     let mut expected_candidate_groups = expected_local_source
         .scheduled_source_groups_by_node
@@ -21472,7 +21578,7 @@ async fn cleanup_only_sink_query_tail_preserves_retained_sink_activate_before_la
             .unwrap_or_default();
         let snapshot = app
             .sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect("sink status snapshot after later node-a mixed recovery");
         let ready_groups = snapshot
@@ -21763,7 +21869,7 @@ async fn cleanup_only_sink_query_tail_later_node_a_mixed_recovery_settles_after_
             .unwrap_or_default();
         let snapshot = app
             .sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect("sink status snapshot after later node-a mixed recovery");
         let ready_groups = snapshot
@@ -22689,7 +22795,7 @@ async fn source_cleanup_only_and_query_peer_cleanup_tails_preserve_sink_converge
             .unwrap_or_default();
         let snapshot = app
             .sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect("sink status snapshot after later source+query-peer recovery");
         let ready_groups = snapshot
@@ -27344,9 +27450,15 @@ async fn filtered_stale_shared_source_deactivate_does_not_clear_desired_source_s
         )])
         .expect("split stale source deactivate");
 
-    app.apply_source_signals_with_recovery(&stale_source_deactivate, true, false)
-        .await
-        .expect("stale source deactivate should be filtered");
+    let fixed_bind_session = app.begin_fixed_bind_lifecycle_session().await;
+    app.apply_source_signals_with_recovery(
+        &fixed_bind_session,
+        &stale_source_deactivate,
+        true,
+        false,
+    )
+    .await
+    .expect("stale source deactivate should be filtered");
 
     match app
         .source
@@ -27532,9 +27644,15 @@ async fn generation_cutover_restart_deferred_cleanup_tail_fail_closes_before_rep
             .collect::<VecDeque<_>>(),
     });
 
+    let fixed_bind_session = app.begin_fixed_bind_lifecycle_session().await;
     tokio::time::timeout(
         Duration::from_millis(900),
-        app.apply_source_signals_with_recovery(&cleanup_source_signals, true, true),
+        app.apply_source_signals_with_recovery(
+            &fixed_bind_session,
+            &cleanup_source_signals,
+            true,
+            true,
+        ),
     )
     .await
     .expect(
@@ -27591,7 +27709,8 @@ async fn filtered_stale_shared_sink_deactivate_does_not_clear_desired_sink_state
         )])
         .expect("split stale sink deactivate");
 
-    app.apply_sink_signals_with_recovery(&stale_sink_deactivate, true, false)
+    let fixed_bind_session = app.begin_fixed_bind_lifecycle_session().await;
+    app.apply_sink_signals_with_recovery(&fixed_bind_session, &stale_sink_deactivate, true, false)
         .await
         .expect("stale sink deactivate should be filtered");
 
@@ -29108,7 +29227,7 @@ async fn same_node_recovery_preserves_runtime_host_grants_injected_by_control_af
     loop {
         let grants_version = app
             .source
-            .host_object_grants_version_snapshot()
+            .host_object_grants_version_snapshot_with_failure()
             .await
             .expect("host object grants version after recovery");
         let source_groups = app
@@ -30102,7 +30221,7 @@ async fn current_generation_source_roots_tick_followup_keeps_tick_after_generati
 
     let snapshot = app
         .source
-        .observability_snapshot()
+        .observability_snapshot_with_failure()
         .await
         .expect("source observability snapshot after current-generation tick recovery");
     let last_signals = snapshot
@@ -31600,7 +31719,7 @@ async fn sink_only_deactivate_on_unready_runtime_stays_cleanup_only_without_reta
 
     let snapshot = app
         .sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("sink status snapshot after sink-only cleanup");
     let last_signals = snapshot
@@ -32384,7 +32503,7 @@ async fn observation_eligibility_ignores_unbound_sink_overflow_for_listener_only
         loop {
             let groups = app
                 .source
-                .status_snapshot()
+                .status_snapshot_with_failure()
                 .await
                 .expect("source status")
                 .concrete_roots
@@ -32423,7 +32542,11 @@ async fn observation_eligibility_ignores_unbound_sink_overflow_for_listener_only
         .await
         .expect("seed sink state");
 
-    let sink_status = app.sink.status_snapshot().await.expect("sink status");
+    let sink_status = app
+        .sink
+        .status_snapshot_with_failure()
+        .await
+        .expect("sink status");
     assert!(
         sink_status
             .groups
@@ -32491,7 +32614,7 @@ async fn on_control_frame_rejects_batch_atomically_on_unknown_unit() {
     let app = FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app");
     assert_eq!(
         app.source
-            .host_object_grants_version_snapshot()
+            .host_object_grants_version_snapshot_with_failure()
             .await
             .expect("snapshot version"),
         0
@@ -32510,7 +32633,7 @@ async fn on_control_frame_rejects_batch_atomically_on_unknown_unit() {
     ));
     assert_eq!(
         app.source
-            .host_object_grants_version_snapshot()
+            .host_object_grants_version_snapshot_with_failure()
             .await
             .expect("snapshot version"),
         0,
@@ -32809,7 +32932,7 @@ async fn external_runtime_app_selected_group_proxy_materializes_each_local_prima
     loop {
         let snapshot = app
             .sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect("sink status snapshot");
         let ready_groups = snapshot
@@ -33099,7 +33222,7 @@ async fn external_runtime_app_selected_group_proxy_rematerializes_each_local_pri
             loop {
                 let snapshot = app
                     .sink
-                    .status_snapshot()
+                    .status_snapshot_with_failure()
                     .await
                     .expect("sink status snapshot");
                 let ready_groups = snapshot
@@ -33339,7 +33462,7 @@ async fn current_generation_sink_events_tick_after_sink_worker_reset_and_manual_
         .expect("shutdown sink worker before manual rescan");
 
     app.source
-        .publish_manual_rescan_signal()
+        .publish_manual_rescan_signal_with_failure()
         .await
         .expect("publish manual rescan signal");
 
@@ -33357,7 +33480,7 @@ async fn current_generation_sink_events_tick_after_sink_worker_reset_and_manual_
     loop {
         let snapshot = app
             .sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect("sink status snapshot after sink tick replay");
         let ready_groups = snapshot
@@ -33611,7 +33734,7 @@ async fn external_runtime_app_selected_group_proxy_materializes_each_local_prima
     loop {
         let snapshot = app
             .sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect("sink status snapshot");
         let ready_groups = snapshot
@@ -33841,12 +33964,12 @@ async fn external_runtime_app_selected_group_proxy_real_nfs_remote_same_group_gr
     loop {
         let primary = app
             .source
-            .source_primary_by_group_snapshot()
+            .source_primary_by_group_snapshot_with_failure()
             .await
             .expect("source primary snapshot");
         let matched_grants = app
             .source
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect("source status snapshot")
             .logical_roots
@@ -34053,7 +34176,7 @@ async fn external_runtime_app_selected_group_proxy_real_nfs_grant_change_after_a
     loop {
         let grants_version = app
             .source
-            .host_object_grants_version_snapshot()
+            .host_object_grants_version_snapshot_with_failure()
             .await
             .expect("host object grants version");
         let source_groups = app
@@ -34076,7 +34199,7 @@ async fn external_runtime_app_selected_group_proxy_real_nfs_grant_change_after_a
             .unwrap_or_default();
         let source_status = app
             .source
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect("source status snapshot");
         let nfs2_grants = source_status
@@ -34303,7 +34426,7 @@ async fn external_runtime_app_selected_group_proxy_real_nfs_peer_owned_source_sc
             .unwrap_or_default();
         let source_status = app
             .source
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect("source status snapshot");
         let nfs2_grants = source_status

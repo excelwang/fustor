@@ -873,16 +873,17 @@ fn status_paths_use_nonblocking_worker_observation_reads() {
     let worker_source_ipc = read_app_spec("src/workers/source_ipc.rs");
 
     assert!(handlers.contains("status_snapshot_nonblocking_for_status_route()"));
-    assert!(handlers.contains("state.source.observability_snapshot_nonblocking().await"));
+    assert!(handlers.contains("observability_snapshot_nonblocking_for_status_route()"));
     assert!(!handlers.contains("state.sink.cached_status_snapshot_for_status_route()"));
     assert!(!handlers.contains("state.source.cached_observability_snapshot()"));
     assert!(query_api.contains("pub(crate) fn internal_status_request_payload() -> Bytes"));
-    assert!(runtime_app.contains("sink.status_snapshot_nonblocking().await"));
-    assert!(runtime_app.contains("source.observability_snapshot_nonblocking().await"));
+    assert!(runtime_app.contains("sink.status_snapshot_nonblocking_with_failure().await"));
+    assert!(runtime_app.contains("observability_snapshot_nonblocking_for_status_route()"));
     assert!(!query_api.contains("METHOD_SOURCE_STATUS,\n            Bytes::new()"));
     assert!(!query_api.contains("METHOD_SINK_STATUS,\n            Bytes::new()"));
     assert!(!handlers.contains("METHOD_SOURCE_STATUS,\n            Bytes::new()"));
-    assert!(worker_source.contains("try_observability_snapshot_nonblocking"));
+    assert!(worker_source.contains("observability_snapshot_nonblocking_with_access_path"));
+    assert!(worker_source.contains("observability_snapshot_nonblocking_for_status_route"));
     assert!(worker_source.contains("observability_snapshot_nonblocking"));
     assert!(worker_source.contains("control_op_inflight()"));
     assert!(worker_sink.contains("control_op_inflight()"));

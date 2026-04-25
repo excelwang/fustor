@@ -29,8 +29,8 @@ use crate::runtime::seam::exchange_host_adapter;
 use crate::sink::SinkStatusSnapshot;
 use crate::source::SourceStatusSnapshot;
 use crate::source::config::GrantedMountRoot;
-use crate::workers::sink::SinkFacade;
-use crate::workers::source::{SourceFacade, SourceObservabilitySnapshot};
+use crate::workers::sink::{SinkFacade, SinkFailure};
+use crate::workers::source::{SourceFacade, SourceFailure, SourceObservabilitySnapshot};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -130,6 +130,41 @@ fn debug_materialized_route_capture_enabled() -> bool {
             .ok()
             .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
     })
+}
+
+#[derive(Debug)]
+enum QueryWorkerObservationFailure {
+    Source(SourceFailure),
+    Sink(SinkFailure),
+    Other(CnxError),
+}
+
+impl QueryWorkerObservationFailure {
+    fn into_error(self) -> CnxError {
+        match self {
+            Self::Source(err) => err.into_error(),
+            Self::Sink(err) => err.into_error(),
+            Self::Other(err) => err,
+        }
+    }
+}
+
+impl From<SourceFailure> for QueryWorkerObservationFailure {
+    fn from(value: SourceFailure) -> Self {
+        Self::Source(value)
+    }
+}
+
+impl From<SinkFailure> for QueryWorkerObservationFailure {
+    fn from(value: SinkFailure) -> Self {
+        Self::Sink(value)
+    }
+}
+
+impl From<CnxError> for QueryWorkerObservationFailure {
+    fn from(value: CnxError) -> Self {
+        Self::Other(value)
+    }
 }
 
 fn summarize_groups_by_node(groups: &BTreeMap<String, Vec<String>>) -> Vec<String> {
@@ -1021,9 +1056,9 @@ fn is_retryable_sink_status_continuity_gap(err: &CnxError) -> bool {
     )
 }
 
-async fn load_materialized_status_snapshots(
+async fn load_materialized_status_snapshots_with_failure(
     state: &ApiState,
-) -> Result<(SourceStatusSnapshot, SinkStatusSnapshot), CnxError> {
+) -> Result<(SourceStatusSnapshot, SinkStatusSnapshot), QueryWorkerObservationFailure> {
     let status_load_plan = MaterializedStatusLoadPlan::default();
     let (Some(source), Some(sink)) = (&state.readiness_source, &state.readiness_sink) else {
         return Ok((
@@ -1044,12 +1079,13 @@ async fn load_materialized_status_snapshots(
         .await
         {
             Ok(snapshot) => snapshot,
-            Err(err) if is_retryable_source_status_continuity_gap(&err) => {
-                source.status_snapshot().await.map_err(|_| err)?
-            }
-            Err(err) => return Err(err),
+            Err(err) if is_retryable_source_status_continuity_gap(&err) => source
+                .status_snapshot_with_failure()
+                .await
+                .map_err(|_| QueryWorkerObservationFailure::from(err))?,
+            Err(err) => return Err(err.into()),
         },
-        QueryBackend::Local { .. } => source.status_snapshot().await?,
+        QueryBackend::Local { .. } => source.status_snapshot_with_failure().await?,
     };
     let readiness_groups = scan_enabled_readiness_groups(state)?;
     let source_status = filter_source_status_snapshot(source_status, &readiness_groups);
@@ -1069,10 +1105,11 @@ async fn load_materialized_status_snapshots(
                 Ok(snapshot) => snapshot,
                 Err(err @ CnxError::Timeout)
                 | Err(err @ CnxError::TransportClosed(_))
-                | Err(err @ CnxError::ProtocolViolation(_)) => {
-                    sink.status_snapshot().await.map_err(|_| err)?
-                }
-                Err(err) => return Err(err),
+                | Err(err @ CnxError::ProtocolViolation(_)) => sink
+                    .status_snapshot_with_failure()
+                    .await
+                    .map_err(|_| QueryWorkerObservationFailure::from(err))?,
+                Err(err) => return Err(err.into()),
             };
             if sink_status_snapshot_reports_explicit_empty_for_all_active_readiness_groups(
                 &source_status,
@@ -1091,7 +1128,7 @@ async fn load_materialized_status_snapshots(
             }
             snapshot
         }
-        QueryBackend::Local { .. } => sink.status_snapshot().await?,
+        QueryBackend::Local { .. } => sink.status_snapshot_with_failure().await?,
     };
     let route_explicit_empty_groups = sink_status
         .groups
@@ -1120,7 +1157,7 @@ async fn load_materialized_status_snapshots(
     if matches!(&state.backend, QueryBackend::Route { .. })
         && let Some(local_sink) = &state.readiness_sink
     {
-        if let Ok(local_sink_status) = local_sink.cached_status_snapshot() {
+        if let Ok(local_sink_status) = local_sink.cached_status_snapshot_with_failure() {
             let local_sink_status =
                 filter_sink_status_snapshot(local_sink_status, &readiness_groups);
             let explicit_empty_groups_to_clear =
@@ -1149,6 +1186,15 @@ async fn load_materialized_status_snapshots(
     Ok((source_status, sink_status))
 }
 
+#[cfg(test)]
+async fn load_materialized_status_snapshots(
+    state: &ApiState,
+) -> Result<(SourceStatusSnapshot, SinkStatusSnapshot), CnxError> {
+    load_materialized_status_snapshots_with_failure(state)
+        .await
+        .map_err(QueryWorkerObservationFailure::into_error)
+}
+
 async fn load_request_scoped_materialized_sink_status_snapshot(
     state: &ApiState,
     plan: TreePitRequestScopedSinkStatusPlan,
@@ -1168,7 +1214,7 @@ async fn load_request_scoped_materialized_sink_status_snapshot(
         .ok()
         .map(|snapshot| filter_sink_status_snapshot(snapshot, &readiness_groups)),
         QueryBackend::Local { sink, .. } => sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .ok()
             .map(|snapshot| filter_sink_status_snapshot(snapshot, &readiness_groups)),
@@ -1508,13 +1554,16 @@ fn scan_enabled_readiness_groups(state: &ApiState) -> Result<BTreeSet<String>, C
         .readiness_source
         .as_ref()
         .map(|source| {
-            source.cached_logical_roots_snapshot().map(|roots| {
-                roots
-                    .into_iter()
-                    .filter(|root| root.scan)
-                    .map(|root| root.id)
-                    .collect()
-            })
+            source
+                .cached_logical_roots_snapshot_with_failure()
+                .map(|roots| {
+                    roots
+                        .into_iter()
+                        .filter(|root| root.scan)
+                        .map(|root| root.id)
+                        .collect()
+                })
+                .map_err(SourceFailure::into_error)
         })
         .transpose()
         .map(|groups| groups.unwrap_or_default())
@@ -2380,6 +2429,32 @@ where
         .map_err(|_| CnxError::Timeout)?
 }
 
+async fn run_timed_query_with_failure<Fut, E>(fut: Fut, timeout: Duration) -> Result<Vec<Event>, E>
+where
+    Fut: std::future::Future<Output = Result<Vec<Event>, E>>,
+    E: From<CnxError>,
+{
+    tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| E::from(CnxError::Timeout))?
+}
+
+async fn query_local_materialized_events_with_failure(
+    sink: &Arc<SinkFacade>,
+    params: &InternalQueryRequest,
+    timeout: Duration,
+) -> Result<Vec<Event>, QueryWorkerObservationFailure> {
+    run_timed_query_with_failure(
+        async {
+            sink.materialized_query_with_failure(params)
+                .await
+                .map_err(QueryWorkerObservationFailure::from)
+        },
+        timeout,
+    )
+    .await
+}
+
 async fn query_materialized_events(
     backend: QueryBackend,
     params: InternalQueryRequest,
@@ -2402,7 +2477,9 @@ async fn query_materialized_events_with_sink_status_snapshot(
     );
     match backend {
         QueryBackend::Local { sink, .. } => {
-            let result = run_timed_query(sink.materialized_query(&params), timeout).await;
+            let result = query_local_materialized_events_with_failure(&sink, &params, timeout)
+                .await
+                .map_err(QueryWorkerObservationFailure::into_error);
             eprintln!(
                 "fs_meta_query_api: query_materialized_events local done ok={}",
                 result.is_ok()
@@ -2431,16 +2508,20 @@ async fn query_materialized_events_with_sink_status_snapshot(
                 None
             };
             if let Some(group_id) = params.scope.selected_group.as_deref()
-                && let Some(node_id) = materialized_owner_node_for_group(
+                && let Some(node_id) = materialized_owner_node_for_group_with_failure(
                     source.as_ref(),
                     selected_group_sink_status.as_ref(),
                     group_id,
                     MaterializedOwnerOmissionPolicy::Authoritative,
                 )
-                .await?
+                .await
+                .map_err(QueryWorkerObservationFailure::into_error)?
             {
                 if node_id == origin_id {
-                    let result = run_timed_query(sink.materialized_query(&params), timeout).await;
+                    let result =
+                        query_local_materialized_events_with_failure(&sink, &params, timeout)
+                            .await
+                            .map_err(QueryWorkerObservationFailure::into_error);
                     eprintln!(
                         "fs_meta_query_api: query_materialized_events selected-group route owner_node={} local_owner=true ok={}",
                         node_id.0,
@@ -3699,7 +3780,9 @@ impl ForceFindRouteMachine {
     ) -> Result<ForceFindRouteMachinePhase, CnxError> {
         Ok(self.phase_for_selected_runner_at(
             tokio::time::Instant::now(),
-            select_force_find_runner_node_for_group(state, source, group_id).await?,
+            select_force_find_runner_node_for_group_with_failure(state, source, group_id)
+                .await
+                .map_err(QueryWorkerObservationFailure::into_error)?,
         ))
     }
 
@@ -4210,8 +4293,8 @@ async fn rescue_trusted_materialized_empty_tree_response(
     response: &mut TreeGroupPayload,
 ) -> Result<(), CnxError> {
     if !input.empty_response_plan.owner_retry_timeout.is_zero() {
-        match run_timed_query(
-            query_materialized_events_via_selected_group_owner_direct(
+        match run_timed_query_with_failure(
+            query_materialized_events_via_selected_group_owner_direct_with_failure(
                 input.state,
                 input.tree_params.clone(),
                 input.empty_response_plan.owner_retry_timeout,
@@ -4240,19 +4323,21 @@ async fn rescue_trusted_materialized_empty_tree_response(
                     }
                 }
             }
-            Err(CnxError::Timeout)
-            | Err(CnxError::TransportClosed(_))
-            | Err(CnxError::ProtocolViolation(_))
-                if input.group_plan.stage_plan.empty_root_requires_fail_closed =>
-            {
-                return Err(trusted_materialized_empty_selected_group_tree_error(
-                    input.group_key,
-                ));
-            }
-            Err(CnxError::Timeout)
-            | Err(CnxError::TransportClosed(_))
-            | Err(CnxError::ProtocolViolation(_)) => {}
-            Err(err) => return Err(err),
+            Err(err) => match err.into_error() {
+                CnxError::Timeout
+                | CnxError::TransportClosed(_)
+                | CnxError::ProtocolViolation(_)
+                    if input.group_plan.stage_plan.empty_root_requires_fail_closed =>
+                {
+                    return Err(trusted_materialized_empty_selected_group_tree_error(
+                        input.group_key,
+                    ));
+                }
+                CnxError::Timeout
+                | CnxError::TransportClosed(_)
+                | CnxError::ProtocolViolation(_) => {}
+                err => return Err(err),
+            },
         }
     }
 
@@ -4544,8 +4629,8 @@ async fn handle_retryable_tree_pit_stage_gap(
                     outer_owner_retry_timeout.as_millis()
                 );
             }
-            if let Ok(retry_events) = run_timed_query(
-                query_materialized_events_via_selected_group_owner_direct(
+            if let Ok(retry_events) = run_timed_query_with_failure(
+                query_materialized_events_via_selected_group_owner_direct_with_failure(
                     input.state,
                     input.tree_params.clone(),
                     outer_owner_retry_timeout,
@@ -6747,7 +6832,8 @@ async fn proxy_selected_group_empty_tree_rescue(
                 params,
                 retry_owner_timeout,
             )
-            .await?;
+            .await
+            .map_err(QueryWorkerObservationFailure::into_error)?;
             if !selected_group_events_require_proxy_fallback(
                 policy,
                 params,
@@ -6841,9 +6927,16 @@ async fn execute_selected_group_owner_empty_tree_rescue(
                         None => Ok(events),
                     }
                 }
-                Err(CnxError::Timeout)
-                | Err(CnxError::TransportClosed(_))
-                | Err(CnxError::ProtocolViolation(_)) => {
+                Err(err) => {
+                    let err = err.into_error();
+                    if !matches!(
+                        err,
+                        CnxError::Timeout
+                            | CnxError::TransportClosed(_)
+                            | CnxError::ProtocolViolation(_)
+                    ) {
+                        return Err(err);
+                    }
                     if matches!(rescue_plan.lane, EmptyTreeRescueLane::OwnerRetryThenSettle) {
                         return Ok(events);
                     }
@@ -6868,7 +6961,6 @@ async fn execute_selected_group_owner_empty_tree_rescue(
                         None => Ok(events),
                     }
                 }
-                Err(err) => Err(err),
             }
         }
         EmptyTreeRescueLane::ProxyFallback => Ok(proxy_selected_group_empty_tree_rescue(
@@ -7045,20 +7137,19 @@ async fn query_materialized_events_via_selected_group_owner_attempt(
     boundary: Arc<dyn ChannelIoSubset>,
     params: &InternalQueryRequest,
     timeout: Duration,
-) -> Result<Vec<Event>, CnxError> {
+) -> Result<Vec<Event>, QueryWorkerObservationFailure> {
     match owner_attempt {
         SelectedGroupOwnerAttempt::Local => {
-            run_timed_query(sink.materialized_query(params), timeout).await
+            query_local_materialized_events_with_failure(sink, params, timeout).await
         }
-        SelectedGroupOwnerAttempt::Routed(node_id) => {
-            route_materialized_events_via_node(
-                boundary,
-                node_id.clone(),
-                params.clone(),
-                SelectedGroupOwnerRoutePlan::new(timeout),
-            )
-            .await
-        }
+        SelectedGroupOwnerAttempt::Routed(node_id) => route_materialized_events_via_node(
+            boundary,
+            node_id.clone(),
+            params.clone(),
+            SelectedGroupOwnerRoutePlan::new(timeout),
+        )
+        .await
+        .map_err(QueryWorkerObservationFailure::from),
     }
 }
 
@@ -7210,13 +7301,14 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                 ));
             }
             if let Some(group_id) = params.scope.selected_group.as_deref()
-                && let Some(node_id) = materialized_owner_node_for_group(
+                && let Some(node_id) = materialized_owner_node_for_group_with_failure(
                     source.as_ref(),
                     selected_group_sink_status.as_ref(),
                     group_id,
                     MaterializedOwnerOmissionPolicy::TreatAsCollectionGap,
                 )
-                .await?
+                .await
+                .map_err(QueryWorkerObservationFailure::into_error)?
             {
                 if node_id == *origin_id {
                     let owner_attempt_timeout = group_plan.owner_attempt_timeout(
@@ -7231,7 +7323,8 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                         &params,
                         owner_attempt_timeout,
                     )
-                    .await?;
+                    .await
+                    .map_err(QueryWorkerObservationFailure::into_error)?;
                     return finalize_selected_group_owner_success(
                         policy,
                         &params,
@@ -7411,12 +7504,29 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
     }
 }
 
+#[cfg(test)]
 async fn query_materialized_events_via_selected_group_owner_direct(
     state: &ApiState,
     params: InternalQueryRequest,
     timeout: Duration,
     selected_group_sink_status: Option<&SinkStatusSnapshot>,
 ) -> Result<Vec<Event>, CnxError> {
+    query_materialized_events_via_selected_group_owner_direct_with_failure(
+        state,
+        params,
+        timeout,
+        selected_group_sink_status,
+    )
+    .await
+    .map_err(QueryWorkerObservationFailure::into_error)
+}
+
+async fn query_materialized_events_via_selected_group_owner_direct_with_failure(
+    state: &ApiState,
+    params: InternalQueryRequest,
+    timeout: Duration,
+    selected_group_sink_status: Option<&SinkStatusSnapshot>,
+) -> Result<Vec<Event>, QueryWorkerObservationFailure> {
     match &state.backend {
         QueryBackend::Route {
             boundary,
@@ -7425,7 +7535,7 @@ async fn query_materialized_events_via_selected_group_owner_direct(
             source,
         } => {
             if let Some(group_id) = params.scope.selected_group.as_deref()
-                && let Some(node_id) = materialized_owner_node_for_group(
+                && let Some(node_id) = materialized_owner_node_for_group_with_failure(
                     source.as_ref(),
                     selected_group_sink_status,
                     group_id,
@@ -7434,7 +7544,8 @@ async fn query_materialized_events_via_selected_group_owner_direct(
                 .await?
             {
                 if node_id == *origin_id {
-                    return run_timed_query(sink.materialized_query(&params), timeout).await;
+                    return query_local_materialized_events_with_failure(sink, &params, timeout)
+                        .await;
                 }
                 return route_materialized_events_via_node(
                     boundary.clone(),
@@ -7442,12 +7553,17 @@ async fn query_materialized_events_via_selected_group_owner_direct(
                     params,
                     SelectedGroupOwnerRoutePlan::new(timeout),
                 )
-                .await;
+                .await
+                .map_err(QueryWorkerObservationFailure::from);
             }
-            query_materialized_events(state.backend.clone(), params, timeout).await
+            query_materialized_events(state.backend.clone(), params, timeout)
+                .await
+                .map_err(QueryWorkerObservationFailure::from)
         }
         QueryBackend::Local { .. } => {
-            query_materialized_events(state.backend.clone(), params, timeout).await
+            query_materialized_events(state.backend.clone(), params, timeout)
+                .await
+                .map_err(QueryWorkerObservationFailure::from)
         }
     }
 }
@@ -7465,8 +7581,17 @@ async fn query_force_find_events(
     );
     match backend {
         QueryBackend::Local { source, .. } => {
-            let result =
-                run_timed_query(source.force_find(&params), route_plan.route_timeout()).await;
+            let result = run_timed_query_with_failure(
+                async {
+                    source
+                        .force_find_with_failure(&params)
+                        .await
+                        .map_err(QueryWorkerObservationFailure::from)
+                },
+                route_plan.route_timeout(),
+            )
+            .await
+            .map_err(QueryWorkerObservationFailure::into_error);
             eprintln!(
                 "fs_meta_query_api: query_force_find_events local done ok={}",
                 result.is_ok()
@@ -7805,13 +7930,16 @@ async fn materialized_target_groups(
             source
                 .as_ref()
                 .map(|source| {
-                    source.cached_logical_roots_snapshot().map(|roots| {
-                        roots
-                            .into_iter()
-                            .filter(|root| root.scan)
-                            .map(|root| root.id)
-                            .collect::<Vec<_>>()
-                    })
+                    source
+                        .cached_logical_roots_snapshot_with_failure()
+                        .map(|roots| {
+                            roots
+                                .into_iter()
+                                .filter(|root| root.scan)
+                                .map(|root| root.id)
+                                .collect::<Vec<_>>()
+                        })
+                        .map_err(SourceFailure::into_error)
                 })
                 .transpose()?
                 .unwrap_or_default()
@@ -7856,7 +7984,7 @@ async fn materialized_target_groups(
             })
             .transpose()?,
             (QueryBackend::Local { .. }, Some(sink)) => sink
-                .status_snapshot()
+                .status_snapshot_with_failure()
                 .await
                 .ok()
                 .map(|snapshot| {
@@ -7959,12 +8087,12 @@ enum MaterializedOwnerOmissionPolicy {
     TreatAsCollectionGap,
 }
 
-async fn materialized_owner_node_for_group(
+async fn materialized_owner_node_for_group_with_failure(
     source: &SourceFacade,
     sink_status: Option<&SinkStatusSnapshot>,
     group_id: &str,
     omission_policy: MaterializedOwnerOmissionPolicy,
-) -> Result<Option<NodeId>, CnxError> {
+) -> std::result::Result<Option<NodeId>, QueryWorkerObservationFailure> {
     if let Some(sink_status) = sink_status {
         if let Some(node_id) = scheduled_sink_owner_node_for_group(sink_status, group_id) {
             return Ok(Some(node_id));
@@ -7976,18 +8104,37 @@ async fn materialized_owner_node_for_group(
         }
     }
     Ok(source
-        .source_primary_by_group_snapshot()
-        .await?
+        .source_primary_by_group_snapshot_with_failure()
+        .await
+        .map_err(QueryWorkerObservationFailure::from)?
         .get(group_id)
         .and_then(|object_ref| node_id_from_object_ref(object_ref)))
 }
 
-async fn force_find_candidate_object_refs_for_group(
+#[cfg(test)]
+async fn materialized_owner_node_for_group(
+    source: &SourceFacade,
+    sink_status: Option<&SinkStatusSnapshot>,
+    group_id: &str,
+    omission_policy: MaterializedOwnerOmissionPolicy,
+) -> Result<Option<NodeId>, CnxError> {
+    materialized_owner_node_for_group_with_failure(source, sink_status, group_id, omission_policy)
+        .await
+        .map_err(QueryWorkerObservationFailure::into_error)
+}
+
+async fn force_find_candidate_object_refs_for_group_with_failure(
     source: &SourceFacade,
     group_id: &str,
-) -> Result<Vec<String>, CnxError> {
-    let roots = source.logical_roots_snapshot().await?;
-    let grants = source.host_object_grants_snapshot().await?;
+) -> std::result::Result<Vec<String>, QueryWorkerObservationFailure> {
+    let roots = source
+        .logical_roots_snapshot_with_failure()
+        .await
+        .map_err(QueryWorkerObservationFailure::from)?;
+    let grants = source
+        .host_object_grants_snapshot_with_failure()
+        .await
+        .map_err(QueryWorkerObservationFailure::from)?;
     let Some(root) = roots.into_iter().find(|root| root.id == group_id) else {
         return Ok(Vec::new());
     };
@@ -8001,14 +8148,15 @@ async fn force_find_candidate_object_refs_for_group(
     Ok(candidates)
 }
 
-async fn select_force_find_runner_node_for_group(
+async fn select_force_find_runner_node_for_group_with_failure(
     state: &ApiState,
     source: &SourceFacade,
     group_id: &str,
-) -> Result<Option<NodeId>, CnxError> {
-    let candidates = force_find_candidate_object_refs_for_group(source, group_id).await?;
+) -> std::result::Result<Option<NodeId>, QueryWorkerObservationFailure> {
+    let candidates =
+        force_find_candidate_object_refs_for_group_with_failure(source, group_id).await?;
     if candidates.is_empty() {
-        return materialized_owner_node_for_group(
+        return materialized_owner_node_for_group_with_failure(
             source,
             None,
             group_id,
@@ -8018,15 +8166,27 @@ async fn select_force_find_runner_node_for_group(
     }
     let len = candidates.len();
     let idx = {
-        let mut rr = state
-            .force_find_route_rr
-            .lock()
-            .map_err(|_| CnxError::Internal("force-find route rr lock poisoned".into()))?;
+        let mut rr = state.force_find_route_rr.lock().map_err(|_| {
+            QueryWorkerObservationFailure::Other(CnxError::Internal(
+                "force-find route rr lock poisoned".into(),
+            ))
+        })?;
         let idx = rr.get(group_id).copied().unwrap_or(0) % len;
         rr.insert(group_id.to_string(), (idx + 1) % len);
         idx
     };
     Ok(node_id_from_object_ref(&candidates[idx]))
+}
+
+#[cfg(test)]
+async fn select_force_find_runner_node_for_group(
+    state: &ApiState,
+    source: &SourceFacade,
+    group_id: &str,
+) -> Result<Option<NodeId>, CnxError> {
+    select_force_find_runner_node_for_group_with_failure(state, source, group_id)
+        .await
+        .map_err(QueryWorkerObservationFailure::into_error)
 }
 
 fn acquire_force_find_group(
@@ -8242,14 +8402,11 @@ async fn execute_force_find_group_route_collect(
                         remaining.as_millis(),
                     );
                 }
-                match run_timed_query(
-                    route_force_find_events_via_node(
-                        boundary.clone(),
-                        node_id.clone(),
-                        request.clone(),
-                        route_plan,
-                    ),
-                    route_plan.route_timeout(),
+                match route_force_find_events_via_node(
+                    boundary.clone(),
+                    node_id.clone(),
+                    request.clone(),
+                    route_plan,
                 )
                 .await
                 {
@@ -9146,14 +9303,17 @@ impl TreePitGroupMachine<'_, '_> {
         let selected_group_owner_known =
             if group_plan.stage_plan.should_resolve_selected_group_owner {
                 match &input.state.backend {
-                    QueryBackend::Route { source, .. } => materialized_owner_node_for_group(
-                        source.as_ref(),
-                        selected_group_sink_status.as_ref(),
-                        &group_key,
-                        MaterializedOwnerOmissionPolicy::Authoritative,
-                    )
-                    .await?
-                    .is_some(),
+                    QueryBackend::Route { source, .. } => {
+                        materialized_owner_node_for_group_with_failure(
+                            source.as_ref(),
+                            selected_group_sink_status.as_ref(),
+                            &group_key,
+                            MaterializedOwnerOmissionPolicy::Authoritative,
+                        )
+                        .await
+                        .map_err(QueryWorkerObservationFailure::into_error)?
+                        .is_some()
+                    }
                     QueryBackend::Local { .. } => true,
                 }
             } else {
@@ -10358,9 +10518,11 @@ async fn get_stats(
         ReadClass::Fresh => ObservationStatus::fresh_only(),
         ReadClass::Materialized | ReadClass::TrustedMaterialized => {
             let (source_status, sink_status) =
-                match load_materialized_status_snapshots(&state).await {
+                match load_materialized_status_snapshots_with_failure(&state).await {
                     Ok(statuses) => statuses,
-                    Err(err) => return error_response_with_context(err, Some(&params.path)),
+                    Err(err) => {
+                        return error_response_with_context(err.into_error(), Some(&params.path));
+                    }
                 };
             let status = materialized_observation_status(&source_status, &sink_status);
             if read_class == ReadClass::TrustedMaterialized
@@ -10456,9 +10618,11 @@ async fn get_tree(
             Err(err) => error_response_with_context(err, Some(&path_for_error)),
         };
     }
-    let (source_status, sink_status) = match load_materialized_status_snapshots(&state).await {
+    let (source_status, sink_status) = match load_materialized_status_snapshots_with_failure(&state)
+        .await
+    {
         Ok(statuses) => statuses,
-        Err(err) => return error_response_with_context(err, Some(&path_for_error)),
+        Err(err) => return error_response_with_context(err.into_error(), Some(&path_for_error)),
     };
     let observation_status = materialized_observation_status(&source_status, &sink_status);
     if read_class == ReadClass::TrustedMaterialized
@@ -10571,13 +10735,14 @@ async fn resolve_force_find_groups(
         source: &Arc<SourceFacade>,
     ) -> Result<Vec<String>, CnxError> {
         let scan_enabled_groups = source
-            .cached_logical_roots_snapshot()?
+            .cached_logical_roots_snapshot_with_failure()
+            .map_err(SourceFailure::into_error)?
             .into_iter()
             .filter(|root| root.scan)
             .map(|root| root.id)
             .collect::<BTreeSet<_>>();
         let mut groups = scan_enabled_groups.iter().cloned().collect::<Vec<_>>();
-        if let Ok(snapshot) = source.observability_snapshot().await {
+        if let Ok(snapshot) = source.observability_snapshot_with_failure().await {
             groups.extend(
                 snapshot
                     .source_primary_by_group

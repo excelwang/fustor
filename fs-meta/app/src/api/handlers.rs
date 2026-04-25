@@ -471,7 +471,13 @@ pub async fn status(
             return Err(ApiError::internal(format!("sink status failed: {err}")));
         }
     };
-    let local_source = state.source.observability_snapshot_nonblocking().await;
+    let (local_source, local_source_used_cached_fallback) = state
+        .source
+        .observability_snapshot_nonblocking_for_status_route()
+        .await;
+    if local_source_used_cached_fallback && state.source.is_worker() {
+        log::warn!("status using cached/degraded source observability snapshot");
+    }
     if state.source.is_worker() || state.sink.is_worker() {
         let active_candidate_groups =
             status_local_observation_candidate_groups(&local_source, &local_sink);
@@ -1351,9 +1357,11 @@ pub async fn runtime_grants(
     Ok(Json(RuntimeGrantsResponse {
         grants: state
             .source
-            .host_object_grants_snapshot()
+            .host_object_grants_snapshot_with_failure()
             .await
-            .map_err(|err| ApiError::internal(format!("source grants snapshot failed: {err}")))?,
+            .map_err(|err| {
+                ApiError::internal(format!("source grants snapshot failed: {}", err.as_error()))
+            })?,
     }))
 }
 
@@ -1364,9 +1372,14 @@ pub async fn roots_get(
     let _ = authorize_management(&state, &headers)?;
     let roots = state
         .source
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
-        .map_err(|err| ApiError::internal(format!("source logical roots snapshot failed: {err}")))?
+        .map_err(|err| {
+            ApiError::internal(format!(
+                "source logical roots snapshot failed: {}",
+                err.as_error()
+            ))
+        })?
         .into_iter()
         .map(root_entry_from_spec)
         .collect();
@@ -1395,11 +1408,14 @@ pub async fn roots_preview(
     }
     let grants = state
         .source
-        .host_object_grants_snapshot()
+        .host_object_grants_snapshot_with_failure()
         .await
         .map_err(|err| {
-            eprintln!("fs_meta_api: roots_preview grants snapshot failed: {err}");
-            ApiError::internal(format!("source grants snapshot failed: {err}"))
+            eprintln!(
+                "fs_meta_api: roots_preview grants snapshot failed: {}",
+                err.as_error()
+            );
+            ApiError::internal(format!("source grants snapshot failed: {}", err.as_error()))
         })?;
     Ok(Json(preview_roots(&roots, &grants)?))
 }
@@ -1420,9 +1436,11 @@ pub async fn roots_put(
 
     let grants = state
         .source
-        .host_object_grants_snapshot()
+        .host_object_grants_snapshot_with_failure()
         .await
-        .map_err(|err| ApiError::internal(format!("source grants snapshot failed: {err}")))?;
+        .map_err(|err| {
+            ApiError::internal(format!("source grants snapshot failed: {}", err.as_error()))
+        })?;
     eprintln!(
         "fs_meta_api: roots_put grants snapshot ok grants={}",
         grants.len()
@@ -1436,9 +1454,16 @@ pub async fn roots_put(
     }
     eprintln!("fs_meta_api: roots_put preview ok roots={}", roots.len());
 
-    let previous_source_roots = state.source.logical_roots_snapshot().await.map_err(|err| {
-        ApiError::internal(format!("source logical roots snapshot failed: {err}"))
-    })?;
+    let previous_source_roots = state
+        .source
+        .logical_roots_snapshot_with_failure()
+        .await
+        .map_err(|err| {
+            ApiError::internal(format!(
+                "source logical roots snapshot failed: {}",
+                err.as_error()
+            ))
+        })?;
     eprintln!(
         "fs_meta_api: roots_put previous source roots ok roots={}",
         previous_source_roots.len()
@@ -1452,47 +1477,73 @@ pub async fn roots_put(
     // realization.
     state
         .source
-        .update_logical_roots(roots.clone())
+        .update_logical_roots_with_failure(roots.clone())
         .await
         .map_err(|err| {
-            eprintln!("fs_meta_api: roots_put source update failed: {err}");
-            err
+            eprintln!(
+                "fs_meta_api: roots_put source update failed: {}",
+                err.as_error()
+            );
+            ApiError::internal(format!("source roots update failed: {}", err.as_error()))
         })?;
     eprintln!(
         "fs_meta_api: roots_put source update ok roots={}",
         roots.len()
     );
-    let previous_sink_roots = state.sink.cached_logical_roots_snapshot()?;
+    let previous_sink_roots = state
+        .sink
+        .cached_logical_roots_snapshot_with_failure()
+        .map_err(|err| {
+            eprintln!(
+                "fs_meta_api: roots_put previous sink roots unavailable: {}",
+                err.as_error()
+            );
+            ApiError::internal(format!(
+                "previous sink roots snapshot unavailable: {}",
+                err.as_error()
+            ))
+        })?;
     eprintln!(
         "fs_meta_api: roots_put previous sink roots ok roots={}",
         previous_sink_roots.len()
     );
     if let Err(err) = state
         .sink
-        .update_logical_roots(roots.clone(), &grants)
+        .update_logical_roots_with_failure(roots.clone(), &grants)
         .await
     {
-        eprintln!("fs_meta_api: roots_put sink sync failed: {err}");
+        eprintln!(
+            "fs_meta_api: roots_put sink sync failed: {}",
+            err.as_error()
+        );
         let sink_rollback = state
             .sink
-            .update_logical_roots(previous_sink_roots, &previous_grants)
+            .update_logical_roots_with_failure(previous_sink_roots, &previous_grants)
             .await;
         let source_rollback = state
             .source
-            .update_logical_roots(previous_source_roots)
+            .update_logical_roots_with_failure(previous_source_roots)
             .await;
         return match (sink_rollback, source_rollback) {
             (Ok(()), Ok(())) => Err(ApiError::internal(format!(
-                "roots update aborted: sink sync failed: {err}"
+                "roots update aborted: sink sync failed: {}",
+                err.as_error()
             ))),
             (Err(sink_rollback_err), Ok(())) => Err(ApiError::internal(format!(
-                "roots update diverged after sink sync failure: sink={err}; sink_rollback={sink_rollback_err}"
+                "roots update diverged after sink sync failure: sink={}; sink_rollback={}",
+                err.as_error(),
+                sink_rollback_err.as_error()
             ))),
             (Ok(()), Err(source_rollback_err)) => Err(ApiError::internal(format!(
-                "roots update diverged after sink sync failure: sink={err}; source_rollback={source_rollback_err}"
+                "roots update diverged after sink sync failure: sink={}; source_rollback={}",
+                err.as_error(),
+                source_rollback_err.as_error()
             ))),
             (Err(sink_rollback_err), Err(source_rollback_err)) => Err(ApiError::internal(format!(
-                "roots update diverged after sink sync failure: sink={err}; sink_rollback={sink_rollback_err}; source_rollback={source_rollback_err}"
+                "roots update diverged after sink sync failure: sink={}; sink_rollback={}; source_rollback={}",
+                err.as_error(),
+                sink_rollback_err.as_error(),
+                source_rollback_err.as_error()
             ))),
         };
     }
@@ -1615,11 +1666,16 @@ pub async fn rescan(
                     "fs_meta_api: rescan control send tolerated stale drained pid route={} err={}",
                     ROUTE_KEY_SOURCE_RESCAN_CONTROL, err
                 );
-                state.source.publish_manual_rescan_signal().await.map_err(|signal_err| {
-                    ApiError::internal(format!(
-                        "manual rescan signal publish failed after stale drained control pid: {signal_err}"
-                    ))
-                })?;
+                state
+                    .source
+                    .publish_manual_rescan_signal_with_failure()
+                    .await
+                    .map_err(|signal_err| {
+                        ApiError::internal(format!(
+                            "manual rescan signal publish failed after stale drained control pid: {}",
+                            signal_err.as_error()
+                        ))
+                    })?;
             }
             Err(err) => {
                 return Err(ApiError::internal(format!(
@@ -1632,7 +1688,16 @@ pub async fn rescan(
             "fs_meta_api: rescan via local source node={}",
             state.node_id.0
         );
-        let _ = state.source.trigger_rescan_when_ready_epoch().await?;
+        let _ = state
+            .source
+            .trigger_rescan_when_ready_epoch_with_failure()
+            .await
+            .map_err(|err| {
+                ApiError::internal(format!(
+                    "trigger rescan when ready failed: {}",
+                    err.as_error()
+                ))
+            })?;
     }
     #[cfg(test)]
     maybe_pause_rescan_before_return().await;
@@ -2596,7 +2661,7 @@ mod tests {
     use crate::source::config::SourceConfig;
     use crate::source::{SourceConcreteRootHealthSnapshot, SourceLogicalRootHealthSnapshot};
     use crate::state::cell::SignalCell;
-    use crate::workers::sink::SinkFacade;
+    use crate::workers::sink::{SinkFacade, SinkFailure};
     use crate::workers::source::SourceFacade;
     use crate::workers::source::SourceObservabilitySnapshot;
     use axum::Json;
@@ -2608,6 +2673,31 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex as StdMutex, RwLock};
     use tempfile::tempdir;
+
+    #[test]
+    fn api_handlers_roots_put_uses_typed_cached_sink_helper() {
+        let source = include_str!("handlers.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(source);
+
+        for typed_surface in [
+            ".cached_logical_roots_snapshot_with_failure()",
+            "previous sink roots snapshot unavailable:",
+        ] {
+            assert!(
+                production.contains(typed_surface),
+                "api/handlers hard cut regressed; roots_put should stay on typed cached sink helpers: {typed_surface}",
+            );
+        }
+
+        assert!(
+            !production
+                .contains("let previous_sink_roots = state.sink.cached_logical_roots_snapshot()?;"),
+            "api/handlers hard cut regressed; roots_put bounced back through raw cached sink roots helper",
+        );
+    }
 
     struct NoopBoundary;
 
@@ -4145,14 +4235,15 @@ mod tests {
         assert_eq!(response.0.roots_count, 2);
         assert_eq!(
             source
-                .logical_roots_snapshot()
+                .logical_roots_snapshot_with_failure()
                 .await
                 .expect("source roots snapshot")
                 .len(),
             2
         );
         assert_eq!(
-            sink.cached_logical_roots_snapshot()
+            sink.cached_logical_roots_snapshot_with_failure()
+                .map_err(SinkFailure::into_error)
                 .expect("sink roots snapshot")
                 .len(),
             2

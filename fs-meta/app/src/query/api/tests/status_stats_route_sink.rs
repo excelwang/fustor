@@ -59,7 +59,7 @@ async fn load_materialized_status_snapshots_supplements_missing_route_sink_group
         .expect("build sink"),
     );
     local_sink
-        .send(&[
+        .send_with_failure(&[
             mk_source_record_event("node-b::nfs2", b"/ready.txt", b"ready.txt", 1),
             mk_control_event(
                 "node-b::nfs2",
@@ -1445,7 +1445,7 @@ async fn load_materialized_status_snapshots_supplements_empty_route_sink_groups_
         .expect("build sink"),
     );
     local_sink
-        .send(&[
+        .send_with_failure(&[
             mk_source_record_event("node-a::nfs1", b"/ready-a.txt", b"ready-a.txt", 1),
             mk_source_record_event("node-b::nfs2", b"/ready-b.txt", b"ready-b.txt", 2),
             mk_control_event(

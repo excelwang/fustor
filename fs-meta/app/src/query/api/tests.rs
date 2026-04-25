@@ -98,6 +98,36 @@ fn stats_query_machine_owns_orchestration_only() {
     );
 }
 
+#[test]
+fn query_api_readiness_and_force_find_fallbacks_use_typed_cached_helpers() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/query/api.rs"),
+    )
+    .expect("read query/api.rs");
+
+    for typed_surface in [
+        "source\n                .cached_logical_roots_snapshot_with_failure()",
+        "local_sink.cached_status_snapshot_with_failure()",
+        ".cached_logical_roots_snapshot_with_failure()\n            .map_err(SourceFailure::into_error)?",
+    ] {
+        assert!(
+            source.contains(typed_surface),
+            "query/api hard cut regressed; readiness and force-find fallbacks should stay on typed cached helpers: {typed_surface}"
+        );
+    }
+
+    for legacy_surface in [
+        "source.cached_logical_roots_snapshot().map(|roots| {",
+        "if let Ok(local_sink_status) = local_sink.cached_status_snapshot() {",
+        ".cached_logical_roots_snapshot()?",
+    ] {
+        assert!(
+            !source.contains(legacy_surface),
+            "query/api hard cut regressed; readiness and force-find fallbacks bounced back through raw cached helpers: {legacy_surface}"
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ForceFindFixtureScenario {
     Standard,

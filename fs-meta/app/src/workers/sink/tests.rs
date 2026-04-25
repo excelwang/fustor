@@ -498,7 +498,9 @@ fn sink_status_probe_replay_after_retry_reset_treats_timeout_as_best_effort_befo
         .phase_after_retry_reset()
         .phase_after_retry_reset();
 
-    match machine.classify_replay_failure_disposition(CnxError::Timeout, true) {
+    match machine
+        .classify_replay_failure_disposition(SinkFailure::from_cause(CnxError::Timeout), true)
+    {
         SinkStatusProbeReplayDisposition::BestEffort(SinkFailure {
             cause: CnxError::Timeout,
             reason:
@@ -547,9 +549,440 @@ fn sink_legacy_bool_driven_recovery_symbols_are_removed() {
     ] {
         assert!(
             !sink_impl.contains(unexpected_response_string),
-            "workers/sink hard cut regressed; protocol violation shaping must flow through unexpected_sink_worker_response(...) instead of scattered direct strings: {unexpected_response_string}",
+            "workers/sink hard cut regressed; protocol violation shaping must stay centralized in typed unexpected-response helpers instead of scattered direct strings: {unexpected_response_string}",
         );
     }
+}
+
+#[test]
+fn sink_local_typed_helpers_do_not_bounce_through_raw_wrappers() {
+    let sink_impl = include_str!("../sink.rs");
+    for legacy_bounce in [
+        "self.send(events).await.map_err(SinkFailure::from)",
+        "self.recv(opts).await.map_err(SinkFailure::from)",
+        "self.on_control_frame(envelopes)\n            .await\n            .map_err(SinkFailure::from)",
+    ] {
+        assert!(
+            !sink_impl.contains(legacy_bounce),
+            "workers/sink hard cut regressed; local typed helper bounced back through a raw wrapper: {legacy_bounce}",
+        );
+    }
+    for removed_surface in [
+        "pub async fn send(&self, events: Vec<Event>) -> Result<()> {",
+        "pub async fn send(&self, events: &[Event]) -> Result<()> {",
+        "pub async fn recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {",
+    ] {
+        assert!(
+            !sink_impl.contains(removed_surface),
+            "workers/sink hard cut regressed; zero-call raw send/recv wrappers should stay removed: {removed_surface}",
+        );
+    }
+    for typed_surface in [
+        "self.apply_events(events).map_err(SinkFailure::from)",
+        "self.perform_materialized_query(&InternalQueryRequest::default())",
+        "let signals = sink_control_signals_from_envelopes(envelopes).map_err(SinkFailure::from)?;",
+        "self.apply_orchestration_signals_with_failure(&signals)\n            .await",
+    ] {
+        assert!(
+            sink_impl.contains(typed_surface),
+            "workers/sink hard cut regressed; local typed helper surface drifted away from the direct typed path: {typed_surface}",
+        );
+    }
+}
+
+#[test]
+fn sink_local_runtime_bootstrap_and_roots_typed_helpers_do_not_bounce_through_raw_wrappers() {
+    let sink_impl = include_str!("../sink.rs");
+    let sink_runtime_impl = include_str!("../../sink/mod.rs");
+
+    for legacy_bounce in [
+        "Self::with_boundaries_and_state(node_id, boundary, state_boundary, source_cfg)\n            .map_err(SinkFailure::from)",
+        "Self::with_boundaries_and_state_deferred_authority(\n            node_id,\n            boundary,\n            state_boundary,\n            source_cfg,\n        )\n        .map_err(SinkFailure::from)",
+        "self.start_runtime_endpoints(io_boundary, node_id)\n            .map_err(SinkFailure::from)",
+        "self.update_logical_roots(roots, host_object_grants)\n            .map_err(SinkFailure::from)",
+        "self.scheduled_group_ids_snapshot()\n            .map_err(SinkFailure::from)",
+    ] {
+        assert!(
+            !sink_impl.contains(legacy_bounce),
+            "workers/sink hard cut regressed; local runtime bootstrap/root typed helper bounced back through a raw wrapper: {legacy_bounce}",
+        );
+    }
+
+    for typed_surface in [
+        "Self::with_boundaries_and_state_internal(",
+        "false,\n        )\n        .map_err(SinkFailure::from)",
+        "true,\n        )\n        .map_err(SinkFailure::from)",
+        "self.start_runtime_endpoints_on_boundary(io_boundary, node_id)\n            .map_err(SinkFailure::from)",
+        "self.perform_update_logical_roots(roots, host_object_grants)\n            .map_err(SinkFailure::from)",
+        "self.snapshot_scheduled_group_ids()\n            .map_err(SinkFailure::from)",
+        "pub(crate) fn start_runtime_endpoints_on_boundary(",
+        "pub(crate) fn perform_update_logical_roots(",
+        "pub(crate) fn snapshot_scheduled_group_ids(&self) -> Result<Option<BTreeSet<String>>> {",
+    ] {
+        let haystack = if typed_surface.starts_with("pub(crate)")
+            || typed_surface == "Self::with_boundaries_and_state_internal("
+        {
+            sink_runtime_impl
+        } else {
+            sink_impl
+        };
+        assert!(
+            haystack.contains(typed_surface),
+            "workers/sink hard cut regressed; local runtime bootstrap/root typed helper drifted away from the direct typed path: {typed_surface}",
+        );
+    }
+
+    for removed_surface in [
+        "pub async fn update_logical_roots(\n        &self,\n        roots: Vec<crate::source::config::RootSpec>,\n        host_object_grants: Vec<GrantedMountRoot>,",
+        "pub async fn update_logical_roots(\n        &self,\n        roots: Vec<crate::source::config::RootSpec>,\n        host_object_grants: &[GrantedMountRoot],",
+    ] {
+        assert!(
+            !sink_impl.contains(removed_surface),
+            "workers/sink hard cut regressed; raw update-logical-roots compatibility wrapper should stay removed: {removed_surface}",
+        );
+    }
+}
+
+#[test]
+fn sink_local_snapshot_query_and_close_typed_helpers_do_not_bounce_through_raw_wrappers() {
+    let sink_impl = include_str!("../sink.rs");
+    let sink_runtime_impl = include_str!("../../sink/mod.rs");
+
+    for legacy_bounce in [
+        "self.logical_roots_snapshot().map_err(SinkFailure::from)",
+        "self.status_snapshot().map_err(SinkFailure::from)",
+        "self.health().map_err(SinkFailure::from)",
+        "Ok(self.visibility_lag_samples_since(since_us))",
+        "self.materialized_query(request).map_err(SinkFailure::from)",
+        "self.close().await.map_err(SinkFailure::from)",
+    ] {
+        assert!(
+            !sink_impl.contains(legacy_bounce),
+            "workers/sink hard cut regressed; local snapshot/query/close typed helper bounced back through a raw wrapper: {legacy_bounce}",
+        );
+    }
+
+    for removed_surface in [
+        "async fn health_with_failure(",
+        "pub async fn health(&self) -> Result<crate::query::models::HealthStats> {",
+        "pub async fn visibility_lag_samples_since(",
+        "pub async fn logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {",
+        "pub async fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {",
+        "pub async fn materialized_query(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {",
+        "pub async fn materialized_query(&self, request: &InternalQueryRequest) -> Result<Vec<Event>> {",
+        "pub async fn materialized_query_nonblocking(",
+        "pub async fn query_node(&self, path: Vec<u8>) -> Result<Option<QueryNode>> {",
+        "pub async fn query_node(&self, path: &[u8]) -> Result<Option<QueryNode>> {",
+        "pub async fn subtree_stats(&self, path: Vec<u8>) -> Result<Vec<Event>> {",
+        "pub async fn subtree_stats(&self, path: &[u8]) -> Result<Vec<Event>> {",
+        "pub async fn force_find_proxy(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {",
+        "pub async fn force_find_proxy(&self, request: &InternalQueryRequest) -> Result<Vec<Event>> {",
+    ] {
+        assert!(
+            !sink_impl.contains(removed_surface),
+            "workers/sink hard cut regressed; zero-call raw worker wrapper should stay removed: {removed_surface}",
+        );
+    }
+
+    for typed_surface in [
+        "self.snapshot_logical_roots().map_err(SinkFailure::from)",
+        "self.build_status_snapshot().map_err(SinkFailure::from)",
+        "self.build_health_snapshot().map_err(SinkFailure::from)",
+        "Ok(self.snapshot_visibility_lag_samples_since(since_us))",
+        "self.perform_materialized_query(request)\n            .map_err(SinkFailure::from)",
+        "self.perform_close().await.map_err(SinkFailure::from)",
+        "pub(crate) fn snapshot_logical_roots(&self) -> Result<Vec<RootSpec>> {",
+        "pub(crate) fn build_health_snapshot(&self) -> Result<HealthStats> {",
+        "pub(crate) fn build_status_snapshot(&self) -> Result<SinkStatusSnapshot> {",
+        "pub(crate) fn snapshot_visibility_lag_samples_since(",
+        "pub(crate) fn perform_materialized_query(",
+        "pub(crate) async fn perform_close(&self) -> Result<()> {",
+    ] {
+        let haystack = if typed_surface.starts_with("pub(crate)") {
+            sink_runtime_impl
+        } else {
+            sink_impl
+        };
+        assert!(
+            haystack.contains(typed_surface),
+            "workers/sink hard cut regressed; local snapshot/query/close typed helper drifted away from the direct typed path: {typed_surface}",
+        );
+    }
+}
+
+#[test]
+fn sink_server_visibility_lag_request_uses_local_typed_helper() {
+    let sink_impl = include_str!("../sink.rs");
+    let sink_server_impl = include_str!("../sink_server.rs");
+
+    for typed_surface in [
+        "pub(crate) fn visibility_lag_samples_since_with_failure(",
+        "match sink.visibility_lag_samples_since_with_failure(since_us) {",
+    ] {
+        assert!(
+            sink_impl.contains(typed_surface) || sink_server_impl.contains(typed_surface),
+            "workers/sink hard cut regressed; sink server visibility-lag request should stay on a local typed helper: {typed_surface}",
+        );
+    }
+
+    assert!(
+        !sink_server_impl.contains(
+            "SinkWorkerResponse::VisibilityLagSamples(\n                    sink.visibility_lag_samples_since(since_us),"
+        ),
+        "workers/sink hard cut regressed; sink server visibility-lag request bounced back through the raw local surface",
+    );
+}
+
+#[test]
+fn sink_facade_visibility_lag_local_branch_uses_typed_helper() {
+    let sink_impl = include_str!("../sink.rs");
+
+    assert!(
+        !sink_impl.contains("pub async fn visibility_lag_samples_since(&self, since_us: u64) -> Vec<VisibilityLagSample> {"),
+        "workers/sink hard cut regressed; zero-call raw facade visibility-lag wrapper should stay removed",
+    );
+
+    assert!(
+        !sink_impl.contains("Self::Local(sink) => sink.visibility_lag_samples_since(since_us),"),
+        "workers/sink hard cut regressed; sink facade visibility-lag local branch bounced back through the raw local surface",
+    );
+}
+
+#[test]
+fn sink_worker_client_retry_helper_uses_typed_runtime_adapter_mapping() {
+    let sink_impl = include_str!("../sink.rs");
+
+    assert!(
+        sink_impl.contains(".with_started_retry_mapped(")
+            && sink_impl.contains("SinkFailure::into_error,"),
+        "workers/sink hard cut regressed; sink worker typed retry helper should use the runtime typed adapter mapping surface",
+    );
+
+    assert!(
+        !sink_impl.contains(".with_started_retry(|client| {"),
+        "workers/sink hard cut regressed; sink worker typed retry helper bounced back through the raw runtime retry shell",
+    );
+}
+
+#[test]
+fn sink_worker_timeout_fail_closed_paths_use_typed_timeout_carrier() {
+    let sink_impl = include_str!("../sink.rs");
+
+    assert!(
+        sink_impl.contains("fn timeout_like() -> Self {"),
+        "workers/sink hard cut regressed; sink worker timeout-like failure should keep an explicit typed carrier constructor",
+    );
+
+    assert!(
+        !sink_impl.contains("SinkFailure::from(CnxError::Timeout)"),
+        "workers/sink hard cut regressed; sink worker fail-closed timeout paths bounced back through raw timeout materialization",
+    );
+}
+
+#[test]
+fn sink_facade_status_route_local_branch_uses_typed_snapshot_helper() {
+    let sink_impl = include_str!("../sink.rs");
+
+    assert!(
+        sink_impl.contains(
+            "Self::Local(sink) => sink\n                .status_snapshot_nonblocking_with_failure()\n                .map(|snapshot| (snapshot, false))\n                .map_err(SinkFailure::into_error),"
+        ),
+        "workers/sink hard cut regressed; sink facade status-route local branch should stay on the typed snapshot helper",
+    );
+
+    assert!(
+        !sink_impl.contains("Self::Local(sink) => Ok((sink.status_snapshot()?, false)),"),
+        "workers/sink hard cut regressed; sink facade status-route local branch bounced back through the raw status snapshot getter",
+    );
+}
+
+#[test]
+fn sink_facade_cached_snapshot_local_branches_use_typed_helpers() {
+    let sink_impl = include_str!("../sink.rs");
+    let sink_runtime_impl = include_str!("../../sink/mod.rs");
+
+    for typed_surface in [
+        "pub(crate) fn cached_logical_roots_snapshot_with_failure(",
+        "Self::Local(sink) => sink.cached_logical_roots_snapshot_with_failure(),",
+        "pub(crate) fn cached_status_snapshot_with_failure(",
+        "Self::Local(sink) => sink.cached_status_snapshot_with_failure(),",
+        "pub(crate) fn status_snapshot_nonblocking_with_failure(",
+        "Self::Local(sink) => sink.status_snapshot_nonblocking_with_failure(),",
+        "Self::Local(sink) => sink\n                .status_snapshot_nonblocking_with_failure()\n                .map(|snapshot| (snapshot, false))\n                .map_err(SinkFailure::into_error),",
+        "self.cached_status_snapshot_with_failure()\n            .map_err(SinkFailure::into_error)",
+        "self.snapshot_cached_logical_roots()\n            .map_err(SinkFailure::from)",
+        "self.build_cached_status_snapshot()\n            .map_err(SinkFailure::from)",
+    ] {
+        assert!(
+            sink_impl.contains(typed_surface),
+            "workers/sink hard cut regressed; sink facade cached local branch should stay on a typed helper: {typed_surface}",
+        );
+    }
+
+    for typed_surface in [
+        "pub(crate) fn snapshot_cached_logical_roots(&self) -> Result<Vec<RootSpec>> {",
+        "pub(crate) fn build_cached_status_snapshot(&self) -> Result<SinkStatusSnapshot> {",
+    ] {
+        assert!(
+            sink_runtime_impl.contains(typed_surface),
+            "workers/sink hard cut regressed; sink facade cached local branch should stay on a typed helper: {typed_surface}",
+        );
+    }
+
+    for legacy_surface in [
+        "Self::Local(sink) => sink.logical_roots_snapshot(),",
+        "Self::Local(sink) => sink.status_snapshot(),",
+    ] {
+        assert!(
+            !sink_impl.contains(legacy_surface),
+            "workers/sink hard cut regressed; sink facade cached local branch bounced back through a raw getter: {legacy_surface}",
+        );
+    }
+
+    assert!(
+        !sink_impl.contains("pub async fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {"),
+        "workers/sink hard cut regressed; zero-call raw status facade/worker wrappers should stay removed",
+    );
+
+    assert!(
+        !sink_impl.contains(
+            "pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {"
+        ),
+        "workers/sink hard cut regressed; zero-call raw cached logical-roots facade wrapper should stay removed",
+    );
+}
+
+#[test]
+fn sink_facade_apply_orchestration_local_branch_uses_typed_helper() {
+    let sink_impl = include_str!("../sink.rs");
+    let sink_runtime_impl = include_str!("../../sink/mod.rs");
+
+    for typed_surface in [
+        "pub(crate) async fn apply_orchestration_signals_with_failure(",
+        "self.apply_orchestration_signals_with_failure(&signals)\n            .await",
+        "Self::Local(sink) => map_sink_failure_timeout_result(",
+        "sink.apply_orchestration_signals_with_failure(signals),",
+        "self.perform_apply_orchestration_signals(signals)\n            .await\n            .map(|_| ())\n            .map_err(SinkFailure::from)",
+    ] {
+        assert!(
+            sink_impl.contains(typed_surface) || sink_runtime_impl.contains(typed_surface),
+            "workers/sink hard cut regressed; sink facade/local apply-orchestration lane should stay on a typed helper: {typed_surface}",
+        );
+    }
+
+    for legacy_surface in [
+        "sink.apply_orchestration_signals(signals),",
+        "self.apply_orchestration_signals(&signals)\n            .await\n            .map(|_| ())\n            .map_err(SinkFailure::from)",
+    ] {
+        assert!(
+            !sink_impl.contains(legacy_surface),
+            "workers/sink hard cut regressed; sink facade/local apply-orchestration lane bounced back through a raw helper: {legacy_surface}",
+        );
+    }
+}
+
+#[test]
+fn sink_worker_cached_status_access_stays_on_typed_helper() {
+    let sink_impl = include_str!("../sink.rs");
+
+    assert!(
+        sink_impl.contains("fn cached_status_snapshot_with_failure("),
+        "workers/sink hard cut regressed; sink worker cached status access should keep a typed helper",
+    );
+    assert!(
+        !sink_impl.contains("cached_status_snapshot().map_err(SinkFailure::from)?"),
+        "workers/sink hard cut regressed; sink worker status paths bounced back through a raw cached status wrapper",
+    );
+    assert!(
+        sink_impl.contains("pub(crate) fn cached_progress_snapshot_with_failure("),
+        "workers/sink hard cut regressed; sink facade/runtime callers should keep a typed cached progress helper",
+    );
+    assert!(
+        !sink_impl.contains("pub(crate) fn cached_progress_snapshot(&self)"),
+        "workers/sink hard cut regressed; sink facade raw cached-progress wrapper should stay removed once callers use the typed helper directly",
+    );
+    assert!(
+        sink_impl.contains(
+            "self.status_cache\n            .lock()\n            .map(|guard| guard.clone())",
+        ),
+        "workers/sink hard cut regressed; sink worker typed cached status helper should read the cache directly",
+    );
+}
+
+#[test]
+fn sink_worker_cached_logical_roots_access_stays_on_typed_helper() {
+    let sink_impl = include_str!("../sink.rs");
+
+    assert!(
+        sink_impl.contains("fn cached_logical_roots_snapshot_with_failure("),
+        "workers/sink hard cut regressed; sink worker cached logical-roots access should keep a typed helper",
+    );
+    assert!(
+        !sink_impl.contains("self.cached_logical_roots().map_err(SinkFailure::from)"),
+        "workers/sink hard cut regressed; sink worker logical-roots fallback bounced back through a raw cached wrapper",
+    );
+    assert!(
+        sink_impl.contains(
+            "self.logical_roots_cache\n            .lock()\n            .map(|guard| guard.clone())",
+        ),
+        "workers/sink hard cut regressed; sink worker typed cached logical-roots helper should read the cache directly",
+    );
+    assert!(
+        !sink_impl.contains(
+            "fn cached_logical_roots(&self) -> Result<Vec<crate::source::config::RootSpec>> {"
+        ),
+        "workers/sink hard cut regressed; zero-call raw cached logical-roots worker wrapper should stay removed",
+    );
+}
+
+#[test]
+fn sink_worker_cached_scheduled_groups_access_stays_on_typed_helper() {
+    let sink_impl = include_str!("../sink.rs");
+
+    assert!(
+        sink_impl.contains("fn cached_scheduled_group_ids_with_failure("),
+        "workers/sink hard cut regressed; sink worker scheduled-groups cache access should keep a typed helper",
+    );
+    assert!(
+        !sink_impl.contains("self.cached_scheduled_group_ids().map_err(SinkFailure::from)"),
+        "workers/sink hard cut regressed; sink worker scheduled-groups fallback bounced back through a raw cached wrapper",
+    );
+    assert!(
+        sink_impl.contains(
+            "self.scheduled_groups_cache\n            .lock()\n            .map(|guard| guard.clone())",
+        ),
+        "workers/sink hard cut regressed; sink worker typed cached scheduled-groups helper should read the cache directly",
+    );
+}
+
+#[test]
+fn sink_facade_start_stream_endpoint_wrapper_is_removed() {
+    let sink_impl = include_str!("../sink.rs");
+
+    assert!(
+        !sink_impl.contains("pub fn start_stream_endpoint("),
+        "workers/sink hard cut regressed; dead sink facade start_stream_endpoint wrapper should stay removed",
+    );
+}
+
+#[test]
+fn sink_cached_status_wrappers_are_removed() {
+    let sink_impl = include_str!("../sink.rs");
+
+    for removed_surface in [
+        "pub(crate) fn cached_status_snapshot(&self) -> Result<SinkStatusSnapshot> {",
+        "pub fn cached_status_snapshot(&self) -> Result<SinkStatusSnapshot> {",
+    ] {
+        assert!(
+            !sink_impl.contains(removed_surface),
+            "workers/sink hard cut regressed; zero-call raw cached status wrappers should stay removed: {removed_surface}",
+        );
+    }
+
+    assert!(
+        sink_impl.contains("cached_status_snapshot_with_failure()\n                    .unwrap_or_else(|_| SinkStatusSnapshot::default())"),
+        "workers/sink hard cut regressed; status-route cached fallback should stay on the typed cached status helper",
+    );
 }
 
 fn external_sink_worker_binding(socket_dir: &Path) -> RuntimeWorkerBinding {
@@ -732,8 +1165,14 @@ async fn overlapping_external_sink_worker_handles_for_same_binding_keep_one_work
     .expect("second activation timed out")
     .expect("second activation should share the same worker lane");
 
-    let first_status = first.status_snapshot().await.expect("first status");
-    let second_status = second.status_snapshot().await.expect("second status");
+    let first_status = first
+        .status_snapshot_with_failure()
+        .await
+        .expect("first status");
+    let second_status = second
+        .status_snapshot_with_failure()
+        .await
+        .expect("second status");
     assert_eq!(
         first_status.scheduled_groups_by_node, second_status.scheduled_groups_by_node,
         "same-binding sink worker handles should observe one shared external worker state",
@@ -797,22 +1236,31 @@ async fn external_sink_worker_materializes_each_local_primary_root_from_source_b
     let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < initial_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply initial batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply initial batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let nfs1_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
-                .await
-                .expect("query nfs1"),
+            sink.materialized_query_with_failure(selected_group_request(
+                b"/force-find-stress",
+                "nfs1",
+            ))
+            .await
+            .expect("query nfs1"),
             b"/force-find-stress",
         )
         .expect("decode nfs1")
         .is_some();
         let nfs2_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
-                .await
-                .expect("query nfs2"),
+            sink.materialized_query_with_failure(selected_group_request(
+                b"/force-find-stress",
+                "nfs2",
+            ))
+            .await
+            .expect("query nfs2"),
             b"/force-find-stress",
         )
         .expect("decode nfs2")
@@ -824,9 +1272,12 @@ async fn external_sink_worker_materializes_each_local_primary_root_from_source_b
 
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
-                .await
-                .expect("query nfs1 after initial"),
+            sink.materialized_query_with_failure(selected_group_request(
+                b"/force-find-stress",
+                "nfs1"
+            ))
+            .await
+            .expect("query nfs1 after initial"),
             b"/force-find-stress",
         )
         .expect("decode nfs1 after initial")
@@ -835,9 +1286,12 @@ async fn external_sink_worker_materializes_each_local_primary_root_from_source_b
     );
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
-                .await
-                .expect("query nfs2 after initial"),
+            sink.materialized_query_with_failure(selected_group_request(
+                b"/force-find-stress",
+                "nfs2"
+            ))
+            .await
+            .expect("query nfs2 after initial"),
             b"/force-find-stress",
         )
         .expect("decode nfs2 after initial")
@@ -863,12 +1317,15 @@ async fn external_sink_worker_materializes_each_local_primary_root_from_source_b
     let rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < rescan_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply rescan batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply rescan batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let nfs1_done = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(
+            sink.materialized_query_with_failure(selected_group_request(
                 b"/force-find-stress/after-rescan.txt",
                 "nfs1",
             ))
@@ -879,7 +1336,7 @@ async fn external_sink_worker_materializes_each_local_primary_root_from_source_b
         .expect("decode nfs1 rescan")
         .is_some();
         let nfs2_done = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(
+            sink.materialized_query_with_failure(selected_group_request(
                 b"/force-find-stress/after-rescan.txt",
                 "nfs2",
             ))
@@ -896,7 +1353,7 @@ async fn external_sink_worker_materializes_each_local_primary_root_from_source_b
 
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(
+            sink.materialized_query_with_failure(selected_group_request(
                 b"/force-find-stress/after-rescan.txt",
                 "nfs1",
             ))
@@ -910,7 +1367,7 @@ async fn external_sink_worker_materializes_each_local_primary_root_from_source_b
     );
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(
+            sink.materialized_query_with_failure(selected_group_request(
                 b"/force-find-stress/after-rescan.txt",
                 "nfs2",
             ))
@@ -997,12 +1454,15 @@ async fn external_sink_worker_materializes_third_local_primary_root_non_root_sub
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let nfs1_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_dir, "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs1"))
                 .await
                 .expect("query nfs1"),
             selected_dir,
@@ -1010,7 +1470,7 @@ async fn external_sink_worker_materializes_third_local_primary_root_non_root_sub
         .expect("decode nfs1")
         .is_some();
         let nfs2_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_dir, "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs2"))
                 .await
                 .expect("query nfs2"),
             selected_dir,
@@ -1018,7 +1478,7 @@ async fn external_sink_worker_materializes_third_local_primary_root_non_root_sub
         .expect("decode nfs2")
         .is_some();
         let nfs3_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_dir, "nfs3"))
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs3"))
                 .await
                 .expect("query nfs3"),
             selected_dir,
@@ -1032,7 +1492,7 @@ async fn external_sink_worker_materializes_third_local_primary_root_non_root_sub
 
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_dir, "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs1"))
                 .await
                 .expect("query nfs1 final"),
             selected_dir,
@@ -1043,7 +1503,7 @@ async fn external_sink_worker_materializes_third_local_primary_root_non_root_sub
     );
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_dir, "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs2"))
                 .await
                 .expect("query nfs2 final"),
             selected_dir,
@@ -1054,7 +1514,7 @@ async fn external_sink_worker_materializes_third_local_primary_root_non_root_sub
     );
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_dir, "nfs3"))
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs3"))
                 .await
                 .expect("query nfs3 final"),
             selected_dir,
@@ -1278,7 +1738,7 @@ async fn external_sink_worker_stream_endpoint_materializes_split_primary_mixed_c
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let snapshot = sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect("sink worker status snapshot");
         let ready_groups = snapshot
@@ -1452,7 +1912,7 @@ async fn external_sink_worker_initial_split_primary_wave_arms_stream_before_loca
 
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     let mut saw_local_baseline_publication = false;
-    let mut last_wrapper_status = Err(CnxError::Timeout);
+    let mut last_wrapper_status = Err(SinkFailure::from(CnxError::Timeout));
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
             Ok(Some(batch)) => {
@@ -1478,7 +1938,7 @@ async fn external_sink_worker_initial_split_primary_wave_arms_stream_before_loca
             Err(_) => {}
         }
 
-        last_wrapper_status = sink.status_snapshot().await;
+        last_wrapper_status = sink.status_snapshot_with_failure().await;
         if let Ok(snapshot) = &last_wrapper_status {
             if snapshot.groups.iter().any(|group| {
                 group.group_id == "nfs3"
@@ -1628,13 +2088,15 @@ async fn external_sink_worker_third_group_non_root_subtree_recovers_after_first_
                     dropped_first_nfs3_batch = true;
                     continue;
                 }
-                sink.send(forward).await.expect("apply source batch");
+                sink.send_with_failure(forward)
+                    .await
+                    .expect("apply source batch");
             }
             Ok(None) => break,
             Err(_) => continue,
         }
         let nfs1_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_dir, "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs1"))
                 .await
                 .expect("query nfs1"),
             selected_dir,
@@ -1642,7 +2104,7 @@ async fn external_sink_worker_third_group_non_root_subtree_recovers_after_first_
         .expect("decode nfs1")
         .is_some();
         let nfs2_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_dir, "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs2"))
                 .await
                 .expect("query nfs2"),
             selected_dir,
@@ -1650,7 +2112,7 @@ async fn external_sink_worker_third_group_non_root_subtree_recovers_after_first_
         .expect("decode nfs2")
         .is_some();
         let nfs3_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_dir, "nfs3"))
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs3"))
                 .await
                 .expect("query nfs3"),
             selected_dir,
@@ -1668,7 +2130,7 @@ async fn external_sink_worker_third_group_non_root_subtree_recovers_after_first_
     );
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_dir, "nfs3"))
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs3"))
                 .await
                 .expect("query nfs3 final"),
             selected_dir,
@@ -1760,14 +2222,16 @@ async fn external_sink_worker_schedules_group_before_it_materializes_until_batch
                     deferred_nfs2_batches.push(nfs2_batch);
                 }
                 if !nfs1_batch.is_empty() {
-                    sink.send(nfs1_batch).await.expect("apply nfs1-only batch");
+                    sink.send_with_failure(nfs1_batch)
+                        .await
+                        .expect("apply nfs1-only batch");
                 }
             }
             Ok(None) => break,
             Err(_) => continue,
         }
         let nfs1_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_file, "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(selected_file, "nfs1"))
                 .await
                 .expect("query nfs1 while nfs2 withheld"),
             selected_file,
@@ -1780,7 +2244,7 @@ async fn external_sink_worker_schedules_group_before_it_materializes_until_batch
     }
 
     let status = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("status snapshot after nfs1-only send");
     assert_eq!(
@@ -1794,7 +2258,7 @@ async fn external_sink_worker_schedules_group_before_it_materializes_until_batch
     );
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_file, "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(selected_file, "nfs1"))
                 .await
                 .expect("query nfs1 after nfs1-only send"),
             selected_file,
@@ -1805,7 +2269,7 @@ async fn external_sink_worker_schedules_group_before_it_materializes_until_batch
     );
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_file, "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(selected_file, "nfs2"))
                 .await
                 .expect("query nfs2 before batches arrive"),
             selected_file,
@@ -1816,7 +2280,9 @@ async fn external_sink_worker_schedules_group_before_it_materializes_until_batch
     );
 
     for batch in deferred_nfs2_batches.drain(..) {
-        sink.send(batch).await.expect("apply deferred nfs2 batch");
+        sink.send_with_failure(batch)
+            .await
+            .expect("apply deferred nfs2 batch");
     }
     let nfs2_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < nfs2_deadline {
@@ -1827,7 +2293,7 @@ async fn external_sink_worker_schedules_group_before_it_materializes_until_batch
                     .filter(|event| event.metadata().origin_id.0 == "node-a::nfs2")
                     .collect::<Vec<_>>();
                 if !nfs2_batch.is_empty() {
-                    sink.send(nfs2_batch)
+                    sink.send_with_failure(nfs2_batch)
                         .await
                         .expect("apply remaining nfs2 batch");
                 }
@@ -1836,7 +2302,7 @@ async fn external_sink_worker_schedules_group_before_it_materializes_until_batch
             Err(_) => continue,
         }
         let nfs2_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_file, "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(selected_file, "nfs2"))
                 .await
                 .expect("query nfs2 after deferred batches"),
             selected_file,
@@ -1850,7 +2316,7 @@ async fn external_sink_worker_schedules_group_before_it_materializes_until_batch
 
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_file, "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(selected_file, "nfs2"))
                 .await
                 .expect("query nfs2 final"),
             selected_file,
@@ -1947,12 +2413,15 @@ async fn external_sink_worker_internal_materialized_route_delivers_sequential_sa
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let nfs1_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_dir, "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs1"))
                 .await
                 .expect("query nfs1"),
             selected_dir,
@@ -1960,7 +2429,7 @@ async fn external_sink_worker_internal_materialized_route_delivers_sequential_sa
         .expect("decode nfs1")
         .is_some();
         let nfs2_ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_dir, "nfs2"))
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs2"))
                 .await
                 .expect("query nfs2"),
             selected_dir,
@@ -2126,12 +2595,15 @@ async fn external_sink_worker_internal_materialized_route_serves_local_owner_pay
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(selected_dir, "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(selected_dir, "nfs1"))
                 .await
                 .expect("query nfs1"),
             selected_dir,
@@ -2593,7 +3065,7 @@ async fn materialized_query_nonblocking_does_not_dispatch_worker_rpc_while_contr
     let _inflight = sink.begin_control_op();
 
     let events = sink
-            .materialized_query_nonblocking(selected_group_request(b"/", "nfs1"))
+            .materialized_query_nonblocking_with_failure(selected_group_request(b"/", "nfs1"))
             .await
             .expect(
                 "materialized_query_nonblocking should fail closed from the local nonblocking path while sink worker control is already in flight",
@@ -2652,7 +3124,7 @@ async fn status_snapshot_nonblocking_does_not_return_stale_empty_cache_after_mat
         .expect("start sink worker");
 
     let primed = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("prime initial empty cached status snapshot");
     assert!(
@@ -2677,14 +3149,20 @@ async fn status_snapshot_nonblocking_does_not_return_stale_empty_cache_after_mat
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
-                .await
-                .expect("query nfs1"),
+            sink.materialized_query_with_failure(selected_group_request(
+                b"/force-find-stress",
+                "nfs1",
+            ))
+            .await
+            .expect("query nfs1"),
             b"/force-find-stress",
         )
         .expect("decode nfs1")
@@ -2696,9 +3174,12 @@ async fn status_snapshot_nonblocking_does_not_return_stale_empty_cache_after_mat
 
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
-                .await
-                .expect("query nfs1 after materialization"),
+            sink.materialized_query_with_failure(selected_group_request(
+                b"/force-find-stress",
+                "nfs1"
+            ))
+            .await
+            .expect("query nfs1 after materialization"),
             b"/force-find-stress",
         )
         .expect("decode nfs1 after materialization")
@@ -2794,13 +3275,16 @@ async fn status_snapshot_nonblocking_fails_closed_from_stale_empty_cache_when_co
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -2815,7 +3299,7 @@ async fn status_snapshot_nonblocking_fails_closed_from_stale_empty_cache_when_co
 
     let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     let live_snapshot = loop {
-        match sink.status_snapshot().await {
+        match sink.status_snapshot_with_failure().await {
             Ok(snapshot)
                 if snapshot
                     .groups
@@ -2825,7 +3309,8 @@ async fn status_snapshot_nonblocking_fails_closed_from_stale_empty_cache_when_co
             {
                 break snapshot;
             }
-            Ok(_) | Err(CnxError::Timeout) => {}
+            Ok(_) => {}
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => {}
             Err(err) => panic!("snapshot after materialization: {err:?}"),
         }
         assert!(
@@ -2951,13 +3436,16 @@ async fn status_snapshot_nonblocking_returns_cached_ready_snapshot_when_control_
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -2972,7 +3460,7 @@ async fn status_snapshot_nonblocking_returns_cached_ready_snapshot_when_control_
 
     let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     let live_snapshot = loop {
-        match sink.status_snapshot().await {
+        match sink.status_snapshot_with_failure().await {
             Ok(snapshot)
                 if snapshot
                     .groups
@@ -2982,7 +3470,8 @@ async fn status_snapshot_nonblocking_returns_cached_ready_snapshot_when_control_
             {
                 break snapshot;
             }
-            Ok(_) | Err(CnxError::Timeout) => {}
+            Ok(_) => {}
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => {}
             Err(err) => panic!("snapshot after materialization: {err:?}"),
         }
         assert!(
@@ -3097,13 +3586,16 @@ async fn status_snapshot_nonblocking_returns_cached_ready_selected_group_from_pa
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -3118,7 +3610,7 @@ async fn status_snapshot_nonblocking_returns_cached_ready_selected_group_from_pa
 
     let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     let live_snapshot = loop {
-        match sink.status_snapshot().await {
+        match sink.status_snapshot_with_failure().await {
             Ok(snapshot)
                 if snapshot
                     .groups
@@ -3128,7 +3620,8 @@ async fn status_snapshot_nonblocking_returns_cached_ready_selected_group_from_pa
             {
                 break snapshot;
             }
-            Ok(_) | Err(CnxError::Timeout) => {}
+            Ok(_) => {}
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => {}
             Err(err) => panic!("snapshot after materialization: {err:?}"),
         }
         assert!(
@@ -3243,13 +3736,16 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -3294,7 +3790,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
     );
 
     let cached_snapshot = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached status summary after control-inflight fail-closed nonblocking status");
     let cached_scheduled = cached_snapshot
         .scheduled_groups_by_node
@@ -3374,13 +3870,16 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_zero_row_
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -3395,7 +3894,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_zero_row_
 
     let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     let live_snapshot = loop {
-        match sink.status_snapshot().await {
+        match sink.status_snapshot_with_failure().await {
             Ok(snapshot)
                 if snapshot
                     .groups
@@ -3405,7 +3904,8 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_zero_row_
             {
                 break snapshot;
             }
-            Ok(_) | Err(CnxError::Timeout) => {}
+            Ok(_) => {}
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => {}
             Err(err) => panic!("snapshot after materialization: {err:?}"),
         }
         assert!(
@@ -3460,7 +3960,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_zero_row_
     );
 
     let cached_snapshot = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached status summary after control-inflight fail-closed nonblocking status");
     let cached_scheduled = cached_snapshot
         .scheduled_groups_by_node
@@ -3667,7 +4167,7 @@ async fn close_keeps_shared_sink_worker_client_alive_when_another_handle_still_e
     );
 
     let roots = successor
-        .logical_roots_snapshot()
+        .logical_roots_snapshot_with_failure()
         .await
         .expect("successor sink logical_roots_snapshot after predecessor close");
     assert_eq!(
@@ -3735,7 +4235,7 @@ async fn close_waits_for_inflight_update_logical_roots_control_op_before_shuttin
         let nfs2 = nfs2.clone();
         async move {
             client
-                .update_logical_roots(
+                .update_logical_roots_with_failure(
                     vec![
                         sink_worker_root("nfs1", &nfs1),
                         sink_worker_root("nfs2", &nfs2),
@@ -3859,7 +4359,7 @@ async fn distinct_runtime_factories_do_not_share_started_sink_worker_client_on_s
     );
     assert_eq!(
         predecessor
-            .logical_roots_snapshot()
+            .logical_roots_snapshot_with_failure()
             .await
             .expect("predecessor logical_roots_snapshot after successor start")
             .iter()
@@ -3870,7 +4370,7 @@ async fn distinct_runtime_factories_do_not_share_started_sink_worker_client_on_s
     );
     assert_eq!(
         successor
-            .logical_roots_snapshot()
+            .logical_roots_snapshot_with_failure()
             .await
             .expect("successor logical_roots_snapshot after successor start")
             .iter()

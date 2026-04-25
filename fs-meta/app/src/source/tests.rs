@@ -3014,7 +3014,10 @@ async fn manual_rescan_source_to_fresh_sink_replays_baseline_entries_for_each_pr
     let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < initial_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(&batch).await.expect("apply initial batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(&batch)
+                .await
+                .expect("apply initial batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
@@ -3045,7 +3048,10 @@ async fn manual_rescan_source_to_fresh_sink_replays_baseline_entries_for_each_pr
     let rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < rescan_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => fresh_sink.send(&batch).await.expect("apply rescan batch"),
+            Ok(Some(batch)) => fresh_sink
+                .send_with_failure(&batch)
+                .await
+                .expect("apply rescan batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
@@ -3111,7 +3117,10 @@ async fn manual_rescan_source_to_sink_materializes_new_entries_for_each_primary_
     let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < initial_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(&batch).await.expect("apply initial batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(&batch)
+                .await
+                .expect("apply initial batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
@@ -3141,7 +3150,10 @@ async fn manual_rescan_source_to_sink_materializes_new_entries_for_each_primary_
     let rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < rescan_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(&batch).await.expect("apply rescan batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(&batch)
+                .await
+                .expect("apply rescan batch"),
             Ok(None) => break,
             Err(_) => continue,
         }

@@ -1481,7 +1481,7 @@ async fn worker_backed_split_primary_initial_wave_arms_sink_before_source_public
         .await
         .expect("initial split-primary mixed wave should reach the sink-apply pause point");
 
-    let source_observability_while_paused = app.source.observability_snapshot_nonblocking().await;
+    let source_observability_while_paused = app.source.observability_snapshot_nonblocking_for_status_route().await.0;
     assert_eq!(
         source_apply_entries.load(AtomicOrdering::Acquire),
         0,
@@ -1531,7 +1531,7 @@ async fn worker_backed_split_primary_initial_wave_arms_sink_before_source_public
 
     let source_observability = app
         .source
-        .observability_snapshot()
+        .observability_snapshot_with_failure()
         .await
         .expect("source observability after initial split-primary mixed wave");
     assert!(

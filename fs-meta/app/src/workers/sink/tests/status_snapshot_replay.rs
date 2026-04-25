@@ -62,13 +62,13 @@ async fn status_snapshot_nonblocking_does_not_return_scheduled_zero_uninitialize
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -82,7 +82,7 @@ async fn status_snapshot_nonblocking_does_not_return_scheduled_zero_uninitialize
     }
 
     let live_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("snapshot after materialization");
     assert!(
@@ -209,7 +209,7 @@ async fn blocking_status_snapshot_test_hook_short_circuits_before_replay_and_fai
     );
 
     let snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect(
             "test-only blocking status_snapshot hook should bypass retained replay and fail-close so helper preconditions can poison cached sink status",
@@ -238,7 +238,7 @@ async fn blocking_status_snapshot_test_hook_short_circuits_before_replay_and_fai
         "test-only blocking status_snapshot hook should not consume retained replay before helper code decides whether to reenter replay"
     );
     let cached_snapshot = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached sink status after blocking hook short-circuit");
     assert_eq!(
         cached_snapshot.scheduled_groups_by_node, hooked_snapshot.scheduled_groups_by_node,
@@ -321,13 +321,13 @@ async fn status_snapshot_nonblocking_steady_probe_uses_local_probe_budget_when_l
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -341,7 +341,7 @@ async fn status_snapshot_nonblocking_steady_probe_uses_local_probe_budget_when_l
     }
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("snapshot after materialization");
     assert!(
@@ -466,7 +466,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_after_successf
     );
 
     let cached_snapshot = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached status summary after republished nonblocking status");
     let cached_scheduled = cached_snapshot
         .scheduled_groups_by_node
@@ -635,13 +635,13 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -655,7 +655,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
     }
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("snapshot after materialization");
     assert!(
@@ -707,7 +707,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
     );
 
     let cached_snapshot = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached status summary after republished nonblocking status");
     let cached_scheduled = cached_snapshot
         .scheduled_groups_by_node
@@ -855,7 +855,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
     );
 
     let cached_snapshot = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached sink status after degraded live snapshot");
     assert!(
         cached_snapshot.has_ready_scheduled_groups(),
@@ -1238,13 +1238,13 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -1258,7 +1258,7 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
     }
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before restart");
     assert!(
@@ -1348,7 +1348,7 @@ async fn status_snapshot_nonblocking_restores_persisted_root_id_ready_state_afte
     .await
     .expect("apply sink control before root-id materialization");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "nfs1",
             FileMetaRecord::scan_update(
@@ -1430,7 +1430,7 @@ async fn status_snapshot_nonblocking_restores_persisted_root_id_ready_state_afte
     .expect("apply root-id ready events");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before restart");
     assert!(
@@ -1525,7 +1525,7 @@ async fn status_snapshot_nonblocking_restores_persisted_root_id_ready_state_afte
     .await
     .expect("apply sink control before root-id materialization");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "nfs1",
             FileMetaRecord::scan_update(
@@ -1607,7 +1607,7 @@ async fn status_snapshot_nonblocking_restores_persisted_root_id_ready_state_afte
     .expect("apply root-id ready events");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before retry reset");
     assert!(
@@ -1709,7 +1709,7 @@ async fn status_snapshot_nonblocking_restores_persisted_root_id_ready_state_afte
     .await
     .expect("apply sink control before root-id materialization");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "nfs1",
             FileMetaRecord::scan_update(
@@ -1791,7 +1791,7 @@ async fn status_snapshot_nonblocking_restores_persisted_root_id_ready_state_afte
     .expect("apply root-id ready events");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before same-instance retained replay");
     assert!(
@@ -1879,7 +1879,7 @@ async fn status_snapshot_nonblocking_settles_within_runtime_app_probe_budget_aft
     .await
     .expect("apply sink control before root-id materialization");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "nfs1",
             FileMetaRecord::scan_update(
@@ -1961,7 +1961,7 @@ async fn status_snapshot_nonblocking_settles_within_runtime_app_probe_budget_aft
     .expect("apply root-id ready events");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before same-instance retained replay");
     assert!(
@@ -2057,7 +2057,7 @@ async fn status_snapshot_nonblocking_settles_within_runtime_app_probe_budget_aft
     .await
     .expect("apply sink control before root-id materialization");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "nfs1",
             FileMetaRecord::scan_update(
@@ -2139,7 +2139,7 @@ async fn status_snapshot_nonblocking_settles_within_runtime_app_probe_budget_aft
     .expect("apply root-id ready events");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before same-instance retained replay");
     assert!(
@@ -2238,7 +2238,7 @@ async fn status_snapshot_nonblocking_eventually_restores_ready_groups_after_seco
     .await
     .expect("apply sink control before root-id materialization");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "nfs1",
             FileMetaRecord::scan_update(
@@ -2320,7 +2320,7 @@ async fn status_snapshot_nonblocking_eventually_restores_ready_groups_after_seco
     .expect("apply root-id ready events");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before second same-instance retained replay");
     assert!(
@@ -2381,12 +2381,12 @@ async fn status_snapshot_nonblocking_eventually_restores_ready_groups_after_seco
 
         if tokio::time::Instant::now() >= deadline {
             let cached_snapshot = sink
-                .cached_status_snapshot()
+                .cached_status_snapshot_with_failure()
                 .expect("cached status after second same-instance retained replay");
             let blocking_sink_status =
-                match tokio::time::timeout(Duration::from_secs(2), sink.status_snapshot()).await {
+                match tokio::time::timeout(Duration::from_secs(2), sink.status_snapshot_with_failure()).await {
                     Ok(Ok(snapshot)) => format!("{snapshot:?}"),
-                    Ok(Err(err)) => format!("blocking_status_err={err}"),
+                    Ok(Err(err)) => format!("blocking_status_err={}", err.as_error()),
                     Err(_) => "blocking_status_timeout".to_string(),
                 };
             panic!(
@@ -2481,7 +2481,7 @@ async fn status_snapshot_nonblocking_restores_ready_groups_after_explicit_same_i
         .await
         .expect("apply initial sink control before root-id materialization");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "nfs1",
             FileMetaRecord::scan_update(
@@ -2563,7 +2563,7 @@ async fn status_snapshot_nonblocking_restores_ready_groups_after_explicit_same_i
     .expect("apply root-id ready events");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before explicit replay wave");
     assert!(
@@ -2617,12 +2617,12 @@ async fn status_snapshot_nonblocking_restores_ready_groups_after_explicit_same_i
 
         if tokio::time::Instant::now() >= deadline {
             let cached_snapshot = sink
-                .cached_status_snapshot()
+                .cached_status_snapshot_with_failure()
                 .expect("cached status after explicit same-instance replay wave");
             let blocking_sink_status =
-                match tokio::time::timeout(Duration::from_secs(2), sink.status_snapshot()).await {
+                match tokio::time::timeout(Duration::from_secs(2), sink.status_snapshot_with_failure()).await {
                     Ok(Ok(snapshot)) => format!("{snapshot:?}"),
-                    Ok(Err(err)) => format!("blocking_status_err={err}"),
+                    Ok(Err(err)) => format!("blocking_status_err={}", err.as_error()),
                     Err(_) => "blocking_status_timeout".to_string(),
                 };
             panic!(
@@ -2687,7 +2687,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
     .await
     .expect("apply sink control before root-id materialization");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "nfs1",
             FileMetaRecord::scan_update(
@@ -2769,7 +2769,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
     .expect("apply root-id ready events");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before runtime-app probe cancellation seam");
     assert!(
@@ -2808,7 +2808,7 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
     )
     .await;
     let cached_snapshot = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached status summary after bounded post-replay local status probe");
     let cached_scheduled = cached_snapshot
         .scheduled_groups_by_node
@@ -2876,7 +2876,7 @@ async fn status_snapshot_restores_persisted_root_id_ready_state_after_retry_rese
     .await
     .expect("apply sink control before root-id materialization");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "nfs1",
             FileMetaRecord::scan_update(
@@ -2958,7 +2958,7 @@ async fn status_snapshot_restores_persisted_root_id_ready_state_after_retry_rese
     .expect("apply root-id ready events");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before retry reset");
     assert!(
@@ -2986,7 +2986,7 @@ async fn status_snapshot_restores_persisted_root_id_ready_state_after_retry_rese
         .expect("clear cached status before retry-reset retained replay");
 
     let snapshot = sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect("blocking status_snapshot after retry reset retained replay should return a restored snapshot");
 
@@ -3129,7 +3129,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     sink.update_cached_status_snapshot(initial_ready_snapshot.clone())
         .expect("seed ready cached snapshot before retire");
 
-    sink.update_logical_roots(
+    sink.update_logical_roots_with_failure(
         vec![
             sink_worker_root("nfs2", &nfs2),
             sink_worker_root("nfs4", &nfs4),
@@ -3160,7 +3160,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     .expect("apply surviving sink control before replay-required probe");
 
     let ready_snapshot = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached status after logical-root retire");
     let expected_groups =
         std::collections::BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]);
@@ -3249,7 +3249,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     );
 
     let cached_after = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached status after replay-only not-ready live snapshot");
     let cached_ready_groups = cached_after
         .groups
@@ -3325,7 +3325,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     .await
     .expect("apply initial sink control before retire");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "node-d::nfs2",
             FileMetaRecord::scan_update(
@@ -3445,7 +3445,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     .expect("apply ready events before retire");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before logical-root retire");
     let ready_groups = ready_snapshot
@@ -3464,7 +3464,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
         "precondition: nfs2/nfs3/nfs4 must all be ready before retire: {ready_snapshot:?}"
     );
 
-    sink.update_logical_roots(
+    sink.update_logical_roots_with_failure(
         vec![
             sink_worker_root("nfs2", &nfs2),
             sink_worker_root("nfs4", &nfs4),
@@ -3589,7 +3589,7 @@ async fn status_snapshot_nonblocking_retries_single_control_inflight_retryable_s
     .await
     .expect("apply initial sink control before retire");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "node-d::nfs2",
             FileMetaRecord::scan_update(
@@ -3709,7 +3709,7 @@ async fn status_snapshot_nonblocking_retries_single_control_inflight_retryable_s
     .expect("apply ready events before retire");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before logical-root retire");
     assert_eq!(
@@ -3727,7 +3727,7 @@ async fn status_snapshot_nonblocking_retries_single_control_inflight_retryable_s
         "precondition: nfs2/nfs3/nfs4 must all be ready before retire: {ready_snapshot:?}"
     );
 
-    sink.update_logical_roots(
+    sink.update_logical_roots_with_failure(
         vec![
             sink_worker_root("nfs2", &nfs2),
             sink_worker_root("nfs4", &nfs4),
@@ -3883,7 +3883,7 @@ async fn status_snapshot_nonblocking_retries_single_noninflight_retryable_status
     .await
     .expect("apply initial sink control before retire");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "node-d::nfs2",
             FileMetaRecord::scan_update(
@@ -4003,7 +4003,7 @@ async fn status_snapshot_nonblocking_retries_single_noninflight_retryable_status
     .expect("apply ready events before retire");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before logical-root retire");
     assert_eq!(
@@ -4021,7 +4021,7 @@ async fn status_snapshot_nonblocking_retries_single_noninflight_retryable_status
         "precondition: nfs2/nfs3/nfs4 must all be ready before retire: {ready_snapshot:?}"
     );
 
-    sink.update_logical_roots(
+    sink.update_logical_roots_with_failure(
         vec![
             sink_worker_root("nfs2", &nfs2),
             sink_worker_root("nfs4", &nfs4),
@@ -4273,7 +4273,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     .await
     .expect("apply initial sink control before retire");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "node-d::nfs2",
             FileMetaRecord::scan_update(
@@ -4393,7 +4393,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     .expect("apply ready events before retire");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before logical-root retire");
     assert_eq!(
@@ -4411,7 +4411,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
         "precondition: nfs2/nfs3/nfs4 must all be ready before retire: {ready_snapshot:?}"
     );
 
-    sink.update_logical_roots(
+    sink.update_logical_roots_with_failure(
         vec![
             sink_worker_root("nfs2", &nfs2),
             sink_worker_root("nfs4", &nfs4),
@@ -4425,7 +4425,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     .expect("retire nfs3 from logical roots");
 
     let cached_after_retire = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached ready status after logical-root retire");
     assert_eq!(
         cached_after_retire
@@ -4609,7 +4609,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     .await
     .expect("apply initial sink control before retire");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "node-d::nfs2",
             FileMetaRecord::scan_update(
@@ -4729,7 +4729,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     .expect("apply ready events before retire");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before logical-root retire");
     assert_eq!(
@@ -4747,7 +4747,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
         "precondition: nfs2/nfs3/nfs4 must all be ready before retire: {ready_snapshot:?}"
     );
 
-    sink.update_logical_roots(
+    sink.update_logical_roots_with_failure(
         vec![
             sink_worker_root("nfs2", &nfs2),
             sink_worker_root("nfs4", &nfs4),
@@ -4761,7 +4761,7 @@ async fn status_snapshot_nonblocking_restores_surviving_ready_groups_after_logic
     .expect("retire nfs3 from logical roots");
 
     let cached_after_retire = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached ready status after logical-root retire");
     assert_eq!(
         cached_after_retire
@@ -4945,7 +4945,7 @@ async fn status_snapshot_nonblocking_fails_closed_after_logical_root_retire_when
     .await
     .expect("apply initial sink control before retire");
 
-    sink.send(vec![
+    sink.send_with_failure(vec![
         mk_worker_sink_source_event(
             "node-d::nfs2",
             FileMetaRecord::scan_update(
@@ -5065,7 +5065,7 @@ async fn status_snapshot_nonblocking_fails_closed_after_logical_root_retire_when
     .expect("apply ready events before retire");
 
     let ready_snapshot = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect("ready snapshot before logical-root retire");
     assert_eq!(
@@ -5083,7 +5083,7 @@ async fn status_snapshot_nonblocking_fails_closed_after_logical_root_retire_when
         "precondition: nfs2/nfs3/nfs4 must all be ready before retire: {ready_snapshot:?}"
     );
 
-    sink.update_logical_roots(
+    sink.update_logical_roots_with_failure(
         vec![
             sink_worker_root("nfs2", &nfs2),
             sink_worker_root("nfs4", &nfs4),
@@ -5097,7 +5097,7 @@ async fn status_snapshot_nonblocking_fails_closed_after_logical_root_retire_when
     .expect("retire nfs3 from logical roots");
 
     let cached_after_retire = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached ready status after logical-root retire");
     assert_eq!(
         cached_after_retire
@@ -5271,12 +5271,12 @@ async fn status_snapshot_does_not_report_replay_complete_when_live_snapshot_is_s
         .store(1, Ordering::Release);
 
     let err = sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect_err("status_snapshot must not report retained replay complete while the live sink status is still a scheduled zero/uninitialized snapshot");
 
     assert!(
-        matches!(err, CnxError::Timeout),
+        matches!(err.as_error(), CnxError::Timeout),
         "replay-required blocking status must fail close instead of reporting a scheduled zero/uninitialized snapshot as success: {err:?}"
     );
 
@@ -5339,12 +5339,12 @@ async fn status_snapshot_does_not_publish_scheduled_zero_uninitialized_snapshot_
         .store(0, Ordering::Release);
 
     let err = sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect_err("status_snapshot must fail close instead of publishing a scheduled zero/uninitialized snapshot after retained replay has already been cleared");
 
     assert!(
-        matches!(err, CnxError::Timeout),
+        matches!(err.as_error(), CnxError::Timeout),
         "blocking status_snapshot must fail close on scheduled zero/uninitialized groups even after retained replay was already cleared: {err:?}"
     );
 
@@ -5434,12 +5434,12 @@ async fn status_snapshot_rearms_replay_required_after_pending_materialization_wi
         ))]),
     });
 
-    let err = sink.status_snapshot().await.expect_err(
+    let err = sink.status_snapshot_with_failure().await.expect_err(
         "blocking status_snapshot must fail close on pending-materialization-without-stream-receipts",
     );
 
     assert!(
-        matches!(err, CnxError::Timeout),
+        matches!(err.as_error(), CnxError::Timeout),
         "blocking status_snapshot must fail close on a pending-materialization snapshot without stream receipts: {err:?}"
     );
     assert_eq!(
@@ -5515,13 +5515,13 @@ async fn status_snapshot_does_not_publish_unscheduled_zero_uninitialized_snapsho
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
-        let snapshot = match sink.status_snapshot().await {
+        let snapshot = match sink.status_snapshot_with_failure().await {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout) => continue,
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => continue,
             Err(err) => panic!("live sink snapshot: {err:?}"),
         };
         let both_ready = snapshot
@@ -5536,7 +5536,7 @@ async fn status_snapshot_does_not_publish_unscheduled_zero_uninitialized_snapsho
 
     let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     let live_snapshot = loop {
-        match sink.status_snapshot().await {
+        match sink.status_snapshot_with_failure().await {
             Ok(snapshot)
                 if snapshot
                     .groups
@@ -5546,7 +5546,8 @@ async fn status_snapshot_does_not_publish_unscheduled_zero_uninitialized_snapsho
             {
                 break snapshot;
             }
-            Ok(_) | Err(CnxError::Timeout) => {}
+            Ok(_) => {}
+            Err(err) if matches!(err.as_error(), CnxError::Timeout) => {}
             Err(err) => panic!("snapshot after materialization: {err:?}"),
         }
         assert!(
@@ -5602,14 +5603,14 @@ async fn status_snapshot_does_not_publish_unscheduled_zero_uninitialized_snapsho
     );
 
     let err = sink
-        .status_snapshot()
+        .status_snapshot_with_failure()
         .await
         .expect_err(
             "blocking status_snapshot must fail close instead of publishing an unscheduled zero-state snapshot after schedule convergence already cached the scheduled groups",
         );
 
     assert!(
-        matches!(err, CnxError::Timeout),
+        matches!(err.as_error(), CnxError::Timeout),
         "blocking status_snapshot must fail close on an unscheduled zero-state live snapshot after schedule cache convergence instead of returning ok empty groups: zero={zero_snapshot:?} err={err:?}"
     );
 
@@ -6052,12 +6053,12 @@ async fn status_snapshot_does_not_rearm_same_retained_replay_after_zero_uninitia
         .store(1, Ordering::Release);
 
     let first_err = sink
-            .status_snapshot()
+            .status_snapshot_with_failure()
             .await
             .expect_err("first blocking status_snapshot must fail close on a zero/uninitialized retained replay snapshot");
 
     assert!(
-        matches!(first_err, CnxError::Timeout),
+        matches!(first_err.as_error(), CnxError::Timeout),
         "first blocking status_snapshot must fail close on a zero/uninitialized retained replay snapshot: {first_err:?}"
     );
     assert_eq!(
@@ -6076,7 +6077,7 @@ async fn status_snapshot_does_not_rearm_same_retained_replay_after_zero_uninitia
 
     let second_status = tokio::spawn({
         let sink = sink.clone();
-        async move { sink.status_snapshot().await }
+        async move { sink.status_snapshot_with_failure().await }
     });
 
     let pause_entered = tokio::time::timeout(Duration::from_millis(600), entered.notified()).await;
@@ -6096,7 +6097,7 @@ async fn status_snapshot_does_not_rearm_same_retained_replay_after_zero_uninitia
                 "second blocking status_snapshot should still fail close on the zero/uninitialized snapshot",
             );
     assert!(
-        matches!(second_err, CnxError::Timeout),
+        matches!(second_err.as_error(), CnxError::Timeout),
         "second blocking status_snapshot should fail close without replaying retained control: {second_err:?}"
     );
 
@@ -6159,12 +6160,12 @@ async fn materialized_query_still_reads_local_payload_while_control_inflight() {
     let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < initial_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send(batch).await.expect("apply initial batch"),
+            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply initial batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let ready = decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1"),
             b"/force-find-stress",
@@ -6178,7 +6179,7 @@ async fn materialized_query_still_reads_local_payload_while_control_inflight() {
 
     assert!(
         decode_exact_query_node(
-            sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
                 .await
                 .expect("query nfs1 after initial"),
             b"/force-find-stress",
@@ -6229,7 +6230,7 @@ async fn materialized_query_still_reads_local_payload_while_control_inflight() {
 
     let query = tokio::time::timeout(
         Duration::from_millis(800),
-        sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1")),
+        sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1")),
     )
     .await;
 
@@ -6342,7 +6343,7 @@ async fn status_snapshot_uses_test_hook_before_replaying_retained_control_state(
         },
     );
 
-    let snapshot = tokio::time::timeout(Duration::from_millis(800), sink.status_snapshot())
+    let snapshot = tokio::time::timeout(Duration::from_millis(800), sink.status_snapshot_with_failure())
         .await
         .expect(
             "blocking status_snapshot should settle from the injected test hook instead of waiting for retained replay",
@@ -6364,7 +6365,7 @@ async fn status_snapshot_uses_test_hook_before_replaying_retained_control_state(
     );
 
     let cached_snapshot = sink
-        .cached_status_snapshot()
+        .cached_status_snapshot_with_failure()
         .expect("cached status after hooked blocking snapshot");
     assert!(
         cached_snapshot
