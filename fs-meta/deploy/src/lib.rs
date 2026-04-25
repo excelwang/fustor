@@ -620,11 +620,11 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SINK_STATUS_INTERNAL),
-        serde_json::json!([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
+        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SOURCE_STATUS_INTERNAL),
-        serde_json::json!([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
+        serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_FORCE_FIND),

@@ -4021,6 +4021,18 @@ fn internal_query_route_still_active(facade_gate: &RuntimeUnitGate, route_key: &
     query_active || query_peer_active
 }
 
+fn route_still_active_for_units(
+    facade_gate: &RuntimeUnitGate,
+    route_key: &str,
+    unit_ids: &[&'static str],
+) -> bool {
+    unit_ids.iter().any(|unit_id| {
+        facade_gate
+            .route_active(unit_id, route_key)
+            .unwrap_or(false)
+    })
+}
+
 fn is_internal_status_route(route_key: &str) -> bool {
     route_key == format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
         || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
@@ -6523,6 +6535,9 @@ impl FSMetaApp {
                     execution_units::FACADE_RUNTIME_UNIT_ID,
                     execution_units::QUERY_RUNTIME_UNIT_ID,
                     execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    execution_units::SINK_RUNTIME_UNIT_ID,
                 ],
             ),
             mirrored_query_peer_routes: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
@@ -7785,6 +7800,16 @@ impl FSMetaApp {
             .map(|(active, _)| active)
             .unwrap_or(false);
         let internal_query_active = query_active || query_peer_active;
+        let source_active = self
+            .facade_gate
+            .unit_state(execution_units::SOURCE_RUNTIME_UNIT_ID)?
+            .map(|(active, _)| active)
+            .unwrap_or(false);
+        let sink_active = self
+            .facade_gate
+            .unit_state(execution_units::SINK_RUNTIME_UNIT_ID)?
+            .map(|(active, _)| active)
+            .unwrap_or(false);
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_QUERY) {
             if !query_active || !spawned_routes.insert(route.0.clone()) {
                 // Not currently selected as query ingress owner, or already running.
@@ -7874,23 +7899,12 @@ impl FSMetaApp {
             }
         }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS) {
-            if !internal_query_active || !spawned_routes.insert(route.0.clone()) {
-                // Not currently selected as query/query-peer sink-status owner, or already running.
+            if !sink_active || !spawned_routes.insert(route.0.clone()) {
+                // Not currently selected as sink-status owner, or already running.
             } else {
-                let prefer_query_peer_first = self
-                    .mirrored_query_peer_routes
-                    .lock()
-                    .await
-                    .contains_key(&route.0);
-                let endpoint_unit_ids = preferred_internal_query_endpoint_units(
-                    query_active,
-                    query_peer_active,
-                    prefer_query_peer_first,
-                );
-                assert!(
-                    !endpoint_unit_ids.is_empty(),
-                    "internal query endpoint unit must exist when route is active"
-                );
+                let endpoint_unit_ids = vec![execution_units::SINK_RUNTIME_UNIT_ID];
+                let active_unit_ids: &'static [&'static str] =
+                    &[execution_units::SINK_RUNTIME_UNIT_ID];
                 let facade_service_state = self.facade_service_state.clone();
                 let facade_gate = self.facade_gate.clone();
                 let api_task = self.api_task.clone();
@@ -7939,7 +7953,11 @@ impl FSMetaApp {
                                 }
                                 #[cfg(test)]
                                 maybe_pause_runtime_proxy_request("sink_status").await;
-                                if !internal_query_route_still_active(&facade_gate, &route_key) {
+                                if !route_still_active_for_units(
+                                    &facade_gate,
+                                    &route_key,
+                                    &active_unit_ids,
+                                ) {
                                     eprintln!(
                                         "fs_meta_runtime_app: sink status endpoint unavailable reason=route_deactivated_after_pause route={}",
                                         route_key
@@ -7991,9 +8009,10 @@ impl FSMetaApp {
                                     }
                                     Err(err) => {
                                         let mut terminal_err = err.into_error();
-                                        if !internal_query_route_still_active(
+                                        if !route_still_active_for_units(
                                             &facade_gate,
                                             &route_key,
+                                            &active_unit_ids,
                                         ) {
                                             eprintln!(
                                                 "fs_meta_runtime_app: sink status endpoint fail-closed after route deactivate route={} err={}",
@@ -8047,9 +8066,10 @@ impl FSMetaApp {
                                             .await
                                             {
                                                 Ok(Ok(snapshot)) => {
-                                                    if !internal_query_route_still_active(
+                                                    if !route_still_active_for_units(
                                                         &facade_gate,
                                                         &route_key,
+                                                        &active_unit_ids,
                                                     ) {
                                                         eprintln!(
                                                             "fs_meta_runtime_app: sink status endpoint blocking fallback deactivated route={}",
@@ -8149,23 +8169,10 @@ impl FSMetaApp {
             }
         }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS) {
-            if !internal_query_active || !spawned_routes.insert(route.0.clone()) {
-                // Not currently selected as query/query-peer source-status owner, or already running.
+            if !source_active || !spawned_routes.insert(route.0.clone()) {
+                // Not currently selected as source-status owner, or already running.
             } else {
-                let prefer_query_peer_first = self
-                    .mirrored_query_peer_routes
-                    .lock()
-                    .await
-                    .contains_key(&route.0);
-                let endpoint_unit_ids = preferred_internal_query_endpoint_units(
-                    query_active,
-                    query_peer_active,
-                    prefer_query_peer_first,
-                );
-                assert!(
-                    !endpoint_unit_ids.is_empty(),
-                    "internal query endpoint unit must exist when route is active"
-                );
+                let endpoint_unit_ids = vec![execution_units::SOURCE_RUNTIME_UNIT_ID];
                 let facade_service_state = self.facade_service_state.clone();
                 let api_task = self.api_task.clone();
                 let source = self.source.clone();
@@ -10391,7 +10398,6 @@ impl FSMetaApp {
             if let Some(current) = api_task.as_mut()
                 && current.route_key == route_key
                 && current.resource_ids == candidate_resource_ids
-                && !runtime_managed
             {
                 current.generation = generation;
                 drop(api_task);
@@ -10818,6 +10824,8 @@ impl FSMetaApp {
                 }
                 return Ok(());
             }
+            self.record_shared_source_route_claims(&effective_source_signals)
+                .await;
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             #[cfg(test)]
             let source_apply_result = if let Some(err) = take_source_apply_error_queue_hook() {
@@ -11351,7 +11359,7 @@ impl FSMetaApp {
             self.api_control_gate.wait_for_facade_request_drain().await;
         }
         if query_lane && route_key == sink_query_proxy_route && !stale_sink_query_proxy_deactivate {
-            self.sink.wait_for_control_ops_to_drain_for_handoff().await;
+            self.wait_for_shared_worker_control_handoff().await;
         }
         if !self.control_initialized() && query_lane && route_key == sink_query_proxy_route {
             // Only clear per-peer sink-query shared claims as part of the uninitialized

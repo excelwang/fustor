@@ -374,13 +374,9 @@ struct ApiRequestRoutePolicy {
 }
 
 fn api_request_route_policy(method: &Method, path: &str) -> ApiRequestRoutePolicy {
-    let query_api_key_delete =
-        matches!(method, &Method::DELETE) && path.starts_with("/api/fs-meta/v1/query-api-keys/");
     let roots_put = matches!(method, &Method::PUT) && path == "/api/fs-meta/v1/monitoring/roots";
     let rescan = matches!(method, &Method::POST) && path == "/api/fs-meta/v1/index/rescan";
-    let query_api_key_create =
-        matches!(method, &Method::POST) && path == "/api/fs-meta/v1/query-api-keys";
-    let management_write = roots_put || rescan || query_api_key_create || query_api_key_delete;
+    let management_write = roots_put || rescan;
 
     ApiRequestRoutePolicy {
         requires_control_readiness: management_write,
@@ -400,7 +396,8 @@ fn api_request_route_policy(method: &Method, path: &str) -> ApiRequestRoutePolic
                 | (&Method::GET, "/api/fs-meta/v1/stats")
                 | (&Method::GET, "/api/fs-meta/v1/on-demand-force-find")
                 | (&Method::GET, "/api/fs-meta/v1/bound-route-metrics")
-        ) || query_api_key_delete,
+        ) || (matches!(method, &Method::DELETE)
+            && path.starts_with("/api/fs-meta/v1/query-api-keys/")),
     }
 }
 
@@ -638,8 +635,6 @@ mod tests {
         for (method, path) in [
             (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
             (Method::POST, "/api/fs-meta/v1/index/rescan"),
-            (Method::POST, "/api/fs-meta/v1/query-api-keys"),
-            (Method::DELETE, "/api/fs-meta/v1/query-api-keys/key-1"),
         ] {
             assert!(
                 api_request_route_policy(&method, path).counts_toward_control_drain,
@@ -686,6 +681,8 @@ mod tests {
             (Method::GET, "/api/fs-meta/v1/runtime/grants"),
             (Method::POST, "/api/fs-meta/v1/monitoring/roots/preview"),
             (Method::GET, "/api/fs-meta/v1/query-api-keys"),
+            (Method::POST, "/api/fs-meta/v1/query-api-keys"),
+            (Method::DELETE, "/api/fs-meta/v1/query-api-keys/key-1"),
             (Method::GET, "/api/fs-meta/v1/tree"),
         ] {
             assert!(
@@ -739,12 +736,10 @@ mod tests {
     }
 
     #[test]
-    fn api_request_route_policy_assigns_management_writes_to_all_three_gates() {
+    fn api_request_route_policy_assigns_control_writes_to_all_three_gates() {
         for (method, path) in [
             (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
             (Method::POST, "/api/fs-meta/v1/index/rescan"),
-            (Method::POST, "/api/fs-meta/v1/query-api-keys"),
-            (Method::DELETE, "/api/fs-meta/v1/query-api-keys/key-1"),
         ] {
             assert_eq!(
                 api_request_route_policy(&method, path),
@@ -753,7 +748,25 @@ mod tests {
                     counts_toward_control_drain: true,
                     counts_toward_facade_request_drain: true,
                 },
-                "{method} {path} should use all management-write gates"
+                "{method} {path} should use all control-write gates"
+            );
+        }
+    }
+
+    #[test]
+    fn api_request_route_policy_keeps_query_key_writes_on_facade_drain_only() {
+        for (method, path) in [
+            (Method::POST, "/api/fs-meta/v1/query-api-keys"),
+            (Method::DELETE, "/api/fs-meta/v1/query-api-keys/key-1"),
+        ] {
+            assert_eq!(
+                api_request_route_policy(&method, path),
+                ApiRequestRoutePolicy {
+                    requires_control_readiness: false,
+                    counts_toward_control_drain: false,
+                    counts_toward_facade_request_drain: true,
+                },
+                "{method} {path} updates local query-key authority and must not require runtime control write readiness"
             );
         }
     }

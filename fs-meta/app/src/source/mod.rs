@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_stream::stream;
+use bytes::Bytes;
 
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -54,8 +55,9 @@ use crate::runtime::orchestration::{
 };
 use crate::runtime::routes::{
     METHOD_SOURCE_RESCAN, METHOD_SOURCE_RESCAN_CONTROL, METHOD_SOURCE_ROOTS_CONTROL,
-    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, source_find_route_bindings_for,
-    source_rescan_route_key_for, source_roots_control_stream_route_for,
+    METHOD_SOURCE_STATUS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
+    source_find_route_bindings_for, source_rescan_route_key_for,
+    source_roots_control_stream_route_for,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
@@ -2781,6 +2783,77 @@ impl FSMetaSource {
         let rescan_fanout_health_scoped = rescan_fanout_health.clone();
         let rescan_manual_intents_scoped = rescan_manual_intents.clone();
         let routes = source_find_route_bindings_for(&self.node_id.0);
+
+        match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS) {
+            Ok(route)
+                if !self.endpoint_task_route_present(
+                    &route.0,
+                    "source.start_runtime_endpoints.route_present.status",
+                ) =>
+            {
+                let status_source = self.clone();
+                let status_node_id = self.node_id.clone();
+                let endpoint_task = ManagedEndpointTask::spawn_with_unit(
+                    boundary.clone(),
+                    route,
+                    format!(
+                        "source:{}:{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS
+                    ),
+                    SOURCE_RUNTIME_UNIT_ID,
+                    self.shutdown.clone(),
+                    move |requests| {
+                        let status_source = status_source.clone();
+                        let status_node_id = status_node_id.clone();
+                        async move {
+                            let (snapshot, used_cached_fallback) =
+                                status_source.observability_snapshot_nonblocking_for_status_route();
+                            if used_cached_fallback {
+                                eprintln!(
+                                    "fs_meta_source: source-status endpoint using cached/degraded snapshot node={}",
+                                    status_node_id.0
+                                );
+                            }
+                            let mut responses = Vec::with_capacity(requests.len());
+                            for req in requests {
+                                match rmp_serde::to_vec_named(&snapshot) {
+                                    Ok(payload) => responses.push(Event::new(
+                                        EventMetadata {
+                                            origin_id: status_node_id.clone(),
+                                            timestamp_us: now_us(),
+                                            logical_ts: None,
+                                            correlation_id: req.metadata().correlation_id,
+                                            ingress_auth: None,
+                                            trace: None,
+                                        },
+                                        Bytes::from(payload),
+                                    )),
+                                    Err(err) => eprintln!(
+                                        "fs_meta_source: source-status encode failed node={} err={}",
+                                        status_node_id.0, err
+                                    ),
+                                }
+                            }
+                            responses
+                        }
+                    },
+                );
+                lock_or_recover(
+                    &self.endpoint_tasks,
+                    "source.start_runtime_endpoints.status_tasks",
+                )
+                .push(endpoint_task);
+            }
+            Err(err) => {
+                log::error!(
+                    "failed to resolve source status route {}.{}: {:?}",
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SOURCE_STATUS,
+                    err
+                );
+            }
+            Ok(_) => {}
+        }
 
         match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN) {
             Ok(route)

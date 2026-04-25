@@ -1686,6 +1686,83 @@ async fn update_logical_roots_reacquires_worker_client_after_transport_closes_mi
     client.close().await.expect("close sink worker");
 }
 
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_logical_roots_restore_reopens_pending_groups_for_materialization() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs1", &nfs1)],
+        host_object_grants: vec![
+            sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = Arc::new(
+        SinkWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client"),
+    );
+
+    tokio::time::timeout(Duration::from_secs(8), client.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-d::nfs1"])],
+            }))
+            .expect("encode sink activate"),
+        ])
+        .await
+        .expect("apply initial sink control");
+
+    client
+        .update_logical_roots_with_failure(
+            vec![sink_worker_root("nfs1", &nfs1), sink_worker_root("nfs2", &nfs2)],
+            vec![
+                sink_worker_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                sink_worker_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+        )
+        .await
+        .expect("restore nfs2 logical root");
+
+    let scheduled = client
+        .scheduled_group_ids()
+        .await
+        .expect("scheduled groups")
+        .unwrap_or_default();
+    assert_eq!(
+        scheduled,
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        "restoring logical roots must reopen pending groups for materialization, not only previously ready groups"
+    );
+
+    client.close().await.expect("close sink worker");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn update_logical_roots_does_not_clear_cached_ready_status_for_surviving_groups() {
     let tmp = tempdir().expect("create temp dir");

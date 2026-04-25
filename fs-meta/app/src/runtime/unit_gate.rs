@@ -259,19 +259,30 @@ impl RuntimeUnitGate {
             .lock()
             .map_err(|_| CnxError::Internal("RuntimeUnitGate lock poisoned".into()))?;
         Ok(gate.units.get(unit_id).cloned().map(|row| {
-            let mut merged = BTreeMap::<String, BTreeSet<String>>::new();
+            let mut merged = BTreeMap::<String, (u64, BTreeSet<String>)>::new();
             for route in row.routes.values().filter(|route| route.active) {
                 for scope in &route.bound_scopes {
-                    let entry = merged.entry(scope.scope_id.clone()).or_default();
-                    for resource_id in &scope.resource_ids {
-                        entry.insert(resource_id.clone());
+                    let incoming = scope.resource_ids.iter().cloned().collect::<BTreeSet<_>>();
+                    match merged.entry(scope.scope_id.clone()) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert((route.generation, incoming));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            let (current_generation, current_resources) = entry.get_mut();
+                            if route.generation > *current_generation {
+                                *current_generation = route.generation;
+                                *current_resources = incoming;
+                            } else if route.generation == *current_generation {
+                                current_resources.extend(incoming);
+                            }
+                        }
                     }
                 }
             }
             let active = !merged.is_empty();
             let bound_scopes = merged
                 .into_iter()
-                .map(|(scope_id, resource_ids)| RuntimeBoundScope {
+                .map(|(scope_id, (_, resource_ids))| RuntimeBoundScope {
                     scope_id,
                     resource_ids: resource_ids.into_iter().collect(),
                 })

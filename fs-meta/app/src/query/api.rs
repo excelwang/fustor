@@ -51,8 +51,8 @@ use capanix_host_adapter_fs::HostAdapter;
 use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const QUERY_TIMEOUT_MS_DEFAULT: u64 = 60_000;
 const FORCE_FIND_TIMEOUT_MS_DEFAULT: u64 = 60_000;
@@ -84,6 +84,8 @@ const LATER_RANKED_TRUSTED_GROUP_STAGE_BUDGET: Duration = Duration::from_millis(
 // downgrade healthy groups into "initial audit incomplete". Give peer status
 // replies a little more time to settle before closing the collect window.
 const STATUS_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(2);
+const TRUSTED_MATERIALIZED_READINESS_SETTLE_BUDGET: Duration = Duration::from_secs(5);
+const TRUSTED_MATERIALIZED_READINESS_SETTLE_BACKOFF: Duration = Duration::from_millis(250);
 const LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE: Duration = Duration::from_millis(250);
 const STATUS_ROUTE_ATTEMPT_TIMEOUT_CAP: Duration = Duration::from_secs(5);
 const STATUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(30);
@@ -956,7 +958,7 @@ impl Default for MaterializedStatusLoadPlan {
             ),
             sink_route: StatusRoutePlan::new(
                 Duration::from_secs(30),
-                LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE,
+                STATUS_ROUTE_COLLECT_IDLE_GRACE,
             ),
             explicit_empty_sink_recollect: StatusRoutePlan::new(
                 EXPLICIT_EMPTY_SINK_STATUS_RECOLLECT_BUDGET,
@@ -1178,6 +1180,7 @@ async fn load_materialized_status_snapshots_with_failure(
         });
         preserved
     };
+    sink_status = apply_materialized_ready_sink_evidence_cache(sink_status, &source_status);
     if matches!(&state.backend, QueryBackend::Route { .. })
         && let Some(local_sink) = &state.readiness_sink
     {
@@ -1573,6 +1576,26 @@ fn materialized_observation_status(
     )
 }
 
+async fn load_trusted_materialized_status_snapshots_with_settle(
+    state: &ApiState,
+) -> Result<
+    (SourceStatusSnapshot, SinkStatusSnapshot, ObservationStatus),
+    QueryWorkerObservationFailure,
+> {
+    let deadline = Instant::now() + TRUSTED_MATERIALIZED_READINESS_SETTLE_BUDGET;
+    loop {
+        let (source_status, sink_status) =
+            load_materialized_status_snapshots_with_failure(state).await?;
+        let observation_status = materialized_observation_status(&source_status, &sink_status);
+        if observation_status.state == ObservationState::TrustedMaterialized
+            || Instant::now() >= deadline
+        {
+            return Ok((source_status, sink_status, observation_status));
+        }
+        tokio::time::sleep(TRUSTED_MATERIALIZED_READINESS_SETTLE_BACKOFF).await;
+    }
+}
+
 fn scan_enabled_readiness_groups(state: &ApiState) -> Result<BTreeSet<String>, CnxError> {
     state
         .readiness_source
@@ -1793,6 +1816,70 @@ fn preserve_cached_ready_groups_across_explicit_empty_root_transition(
             ..SinkStatusSnapshot::default()
         },
     ])
+}
+
+fn materialized_ready_sink_evidence_cache()
+-> &'static Mutex<BTreeMap<String, crate::sink::SinkGroupStatusSnapshot>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, crate::sink::SinkGroupStatusSnapshot>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn materialized_ready_sink_evidence_key(group: &crate::sink::SinkGroupStatusSnapshot) -> String {
+    format!("{}\0{}", group.group_id, group.primary_object_ref)
+}
+
+fn apply_materialized_ready_sink_evidence_cache(
+    snapshot: SinkStatusSnapshot,
+    source_status: &SourceStatusSnapshot,
+) -> SinkStatusSnapshot {
+    let mut cache = match materialized_ready_sink_evidence_cache().lock() {
+        Ok(cache) => cache,
+        Err(_) => return snapshot,
+    };
+    let mut merged = snapshot;
+    let mut replacements = BTreeMap::<String, crate::sink::SinkGroupStatusSnapshot>::new();
+    for group in &merged.groups {
+        let key = materialized_ready_sink_evidence_key(group);
+        if sink_group_readiness_reports_live_materialized_group(group) {
+            cache.insert(key, group.clone());
+        } else if source_status_group_still_active(source_status, &group.group_id)
+            && let Some(cached) = cache.get(&key)
+            && sink_group_readiness_reports_live_materialized_group(cached)
+            && sink_group_merge_score(cached) > sink_group_merge_score(group)
+        {
+            replacements.insert(group.group_id.clone(), cached.clone());
+        }
+    }
+    if replacements.is_empty() {
+        return merged;
+    }
+    for group in &mut merged.groups {
+        if let Some(cached) = replacements.get(&group.group_id) {
+            *group = cached.clone();
+        }
+    }
+    recompute_sink_status_totals(merged)
+}
+
+fn recompute_sink_status_totals(mut snapshot: SinkStatusSnapshot) -> SinkStatusSnapshot {
+    snapshot.live_nodes = 0;
+    snapshot.tombstoned_count = 0;
+    snapshot.attested_count = 0;
+    snapshot.suspect_count = 0;
+    snapshot.blind_spot_count = 0;
+    snapshot.estimated_heap_bytes = 0;
+    snapshot.shadow_time_us = 0;
+    for group in &snapshot.groups {
+        snapshot.live_nodes += group.live_nodes;
+        snapshot.tombstoned_count += group.tombstoned_count;
+        snapshot.attested_count += group.attested_count;
+        snapshot.suspect_count += group.suspect_count;
+        snapshot.blind_spot_count += group.blind_spot_count;
+        snapshot.estimated_heap_bytes += group.estimated_heap_bytes;
+        snapshot.shadow_time_us = snapshot.shadow_time_us.max(group.shadow_time_us);
+    }
+    snapshot
 }
 
 fn sink_status_snapshot_reports_explicit_empty_for_all_active_readiness_groups(
@@ -6385,19 +6472,19 @@ fn generic_force_find_route_uses_single_reply_call_when_selected_group_is_scoped
 fn force_find_runner_selection_uses_cached_root_and_grant_snapshots() {
     let source = include_str!("api.rs");
     let start = source
-        .find("\nasync fn force_find_candidate_object_refs_for_group(")
-        .expect("force_find_candidate_object_refs_for_group exists");
+        .find("\nasync fn force_find_candidate_object_refs_for_group_with_failure(")
+        .expect("force_find_candidate_object_refs_for_group_with_failure exists");
     let end = source[start..]
         .find("\nasync fn select_force_find_runner_node_for_group(")
         .map(|offset| start + offset)
         .unwrap_or(source.len());
     let body = &source[start..end];
     assert!(
-        body.contains("cached_logical_roots_snapshot()"),
+        body.contains("cached_logical_roots_snapshot_with_failure()"),
         "force-find runner selection must use cached logical roots so the freshness path is not blocked on source worker control RPCs",
     );
     assert!(
-        body.contains("cached_host_object_grants_snapshot()"),
+        body.contains("cached_host_object_grants_snapshot_with_failure()"),
         "force-find runner selection must use cached host-object grants so the freshness path stays available while source workers are still converging",
     );
     assert!(
@@ -8168,10 +8255,47 @@ fn node_id_from_object_ref(object_ref: &str) -> Option<NodeId> {
         .map(|(node_id, _)| NodeId(node_id.to_string()))
 }
 
+fn origin_count_entry_group_and_count(entry: &str) -> Option<(&str, u64)> {
+    let (origin, count) = entry.rsplit_once('=')?;
+    let group_id = origin
+        .rsplit_once("::")
+        .map(|(_, group_id)| group_id)
+        .unwrap_or(origin);
+    Some((group_id, count.parse::<u64>().unwrap_or(0)))
+}
+
+fn applied_sink_owner_node_for_group(
+    sink_status: &SinkStatusSnapshot,
+    group_id: &str,
+) -> Option<NodeId> {
+    sink_status
+        .stream_applied_origin_counts_by_node
+        .iter()
+        .filter_map(|(node_id, origin_counts)| {
+            let applied_count = origin_counts
+                .iter()
+                .filter_map(|entry| origin_count_entry_group_and_count(entry))
+                .filter(|(entry_group_id, _)| *entry_group_id == group_id)
+                .map(|(_, count)| count)
+                .sum::<u64>();
+            (applied_count > 0).then_some((applied_count, NodeId(node_id.clone())))
+        })
+        .max_by(|(left_count, left_node), (right_count, right_node)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| right_node.0.cmp(&left_node.0))
+        })
+        .map(|(_, node_id)| node_id)
+}
+
 fn scheduled_sink_owner_node_for_group(
     sink_status: &SinkStatusSnapshot,
     group_id: &str,
 ) -> Option<NodeId> {
+    if let Some(node_id) = applied_sink_owner_node_for_group(sink_status, group_id) {
+        return Some(node_id);
+    }
+
     let mut scheduled_nodes = sink_status
         .scheduled_groups_by_node
         .iter()
@@ -10671,14 +10795,29 @@ async fn get_stats(
     let observation_status = match read_class {
         ReadClass::Fresh => ObservationStatus::fresh_only(),
         ReadClass::Materialized | ReadClass::TrustedMaterialized => {
-            let (source_status, sink_status) =
-                match load_materialized_status_snapshots_with_failure(&state).await {
+            let (source_status, sink_status, status) = if read_class
+                == ReadClass::TrustedMaterialized
+            {
+                match load_trusted_materialized_status_snapshots_with_settle(&state).await {
                     Ok(statuses) => statuses,
                     Err(err) => {
                         return error_response_with_context(err.into_error(), Some(&params.path));
                     }
-                };
-            let status = materialized_observation_status(&source_status, &sink_status);
+                }
+            } else {
+                let (source_status, sink_status) =
+                    match load_materialized_status_snapshots_with_failure(&state).await {
+                        Ok(statuses) => statuses,
+                        Err(err) => {
+                            return error_response_with_context(
+                                err.into_error(),
+                                Some(&params.path),
+                            );
+                        }
+                    };
+                let status = materialized_observation_status(&source_status, &sink_status);
+                (source_status, sink_status, status)
+            };
             if read_class == ReadClass::TrustedMaterialized
                 && status.state != ObservationState::TrustedMaterialized
             {
@@ -10772,13 +10911,26 @@ async fn get_tree(
             Err(err) => error_response_with_context(err, Some(&path_for_error)),
         };
     }
-    let (source_status, sink_status) = match load_materialized_status_snapshots_with_failure(&state)
-        .await
+    let (_source_status, sink_status, observation_status) = if read_class
+        == ReadClass::TrustedMaterialized
     {
-        Ok(statuses) => statuses,
-        Err(err) => return error_response_with_context(err.into_error(), Some(&path_for_error)),
+        match load_trusted_materialized_status_snapshots_with_settle(&state).await {
+            Ok(statuses) => statuses,
+            Err(err) => {
+                return error_response_with_context(err.into_error(), Some(&path_for_error));
+            }
+        }
+    } else {
+        let (source_status, sink_status) =
+            match load_materialized_status_snapshots_with_failure(&state).await {
+                Ok(statuses) => statuses,
+                Err(err) => {
+                    return error_response_with_context(err.into_error(), Some(&path_for_error));
+                }
+            };
+        let observation_status = materialized_observation_status(&source_status, &sink_status);
+        (source_status, sink_status, observation_status)
     };
-    let observation_status = materialized_observation_status(&source_status, &sink_status);
     if read_class == ReadClass::TrustedMaterialized
         && observation_status.state != ObservationState::TrustedMaterialized
         && trusted_materialized_empty_group_root_requires_fail_closed(&params.path)

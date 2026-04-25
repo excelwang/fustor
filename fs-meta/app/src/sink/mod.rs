@@ -45,16 +45,19 @@ use crate::query::result_ops::{
 #[cfg(test)]
 use crate::query::tree::TreeGroupPayload;
 use crate::runtime::endpoint::ManagedEndpointTask;
-use crate::runtime::execution_units::{SINK_RUNTIME_UNIT_ID, SINK_RUNTIME_UNITS};
+use crate::runtime::execution_units::{
+    SINK_RUNTIME_UNIT_ID, SINK_RUNTIME_UNITS, SOURCE_RUNTIME_UNIT_ID,
+};
 use crate::runtime::orchestration::{
     SinkControlSignal, SinkRuntimeUnit, decode_logical_roots_control_payload,
     sink_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{
-    METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SOURCE_FIND,
-    METHOD_STREAM, ROUTE_KEY_EVENTS, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_EVENTS,
-    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, sink_query_request_route_for,
-    sink_query_route_bindings_for, sink_roots_control_stream_route_for,
+    METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SINK_STATUS,
+    METHOD_SOURCE_FIND, METHOD_STREAM, ROUTE_KEY_EVENTS, ROUTE_TOKEN_FS_META,
+    ROUTE_TOKEN_FS_META_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
+    sink_query_request_route_for, sink_query_route_bindings_for,
+    sink_roots_control_stream_route_for,
 };
 use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::unit_gate::RuntimeUnitGate;
@@ -64,7 +67,7 @@ use crate::sink::epoch::EpochManager;
 use crate::sink::query::query_node_from_node;
 use crate::sink::tree::MaterializedTree;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
-use crate::state::cell::AuthorityJournal;
+use crate::state::cell::{AuthorityJournal, LogicalRootsCell};
 use crate::state::commit_boundary::CommitBoundary;
 use crate::{ControlEvent, FileMetaRecord};
 
@@ -1553,6 +1556,7 @@ pub struct SinkFileMeta {
     node_id: NodeId,
     state: SinkStateCell,
     root_specs: Arc<RwLock<Vec<RootSpec>>>,
+    logical_roots_cell: LogicalRootsCell,
     host_object_grants: Arc<RwLock<Vec<GrantedMountRoot>>>,
     visibility_lag: Arc<Mutex<VisibilityLagTelemetry>>,
     stream_delivery_stats: Arc<Mutex<StreamDeliveryStats>>,
@@ -1719,6 +1723,14 @@ impl SinkFileMeta {
         .map_err(|err| {
             CnxError::InvalidInput(format!("sink statecell snapshot init failed: {err}"))
         })?;
+        let logical_roots_cell = LogicalRootsCell::from_state_boundary(
+            SOURCE_RUNTIME_UNIT_ID,
+            source_cfg.roots.clone(),
+            state_boundary.clone(),
+        )
+        .map_err(|err| {
+            CnxError::InvalidInput(format!("sink logical-roots state init failed: {err}"))
+        })?;
         let authority = if defer_authority_read {
             AuthorityJournal::deferred(SINK_RUNTIME_UNIT_ID, state_boundary.clone())
         } else {
@@ -1752,6 +1764,7 @@ impl SinkFileMeta {
             node_id: node_id.clone(),
             state: state.clone(),
             root_specs: root_specs.clone(),
+            logical_roots_cell: logical_roots_cell.clone(),
             host_object_grants: host_object_grants.clone(),
             visibility_lag: visibility_lag.clone(),
             stream_delivery_stats: stream_delivery_stats.clone(),
@@ -1778,6 +1791,7 @@ impl SinkFileMeta {
             let query_state = state.clone();
             let node_id_cloned = node_id.clone();
             let query_root_specs = root_specs.clone();
+            let query_logical_roots_cell = logical_roots_cell.clone();
             let query_host_object_grants = host_object_grants.clone();
             let query_visibility_lag = visibility_lag.clone();
             let query_stream_delivery_stats = stream_delivery_stats.clone();
@@ -1802,6 +1816,7 @@ impl SinkFileMeta {
                         move |requests| {
                             let query_state = query_state.clone();
                             let query_root_specs = query_root_specs.clone();
+                            let query_logical_roots_cell = query_logical_roots_cell.clone();
                             let query_host_object_grants = query_host_object_grants.clone();
                             let query_visibility_lag = query_visibility_lag.clone();
                             let query_stream_delivery_stats = query_stream_delivery_stats.clone();
@@ -1825,6 +1840,7 @@ impl SinkFileMeta {
                                             node_id: query_node_id.clone(),
                                             state: query_state.clone(),
                                             root_specs: query_root_specs.clone(),
+                                            logical_roots_cell: query_logical_roots_cell.clone(),
                                             host_object_grants: query_host_object_grants.clone(),
                                             visibility_lag: query_visibility_lag.clone(),
                                             stream_delivery_stats: query_stream_delivery_stats
@@ -1877,6 +1893,7 @@ impl SinkFileMeta {
 
             let internal_query_state = state.clone();
             let internal_query_root_specs = root_specs.clone();
+            let internal_query_logical_roots_cell = logical_roots_cell.clone();
             let internal_query_host_object_grants = host_object_grants.clone();
             let internal_query_visibility_lag = visibility_lag.clone();
             let internal_query_stream_delivery_stats = stream_delivery_stats.clone();
@@ -1897,6 +1914,8 @@ impl SinkFileMeta {
             for route in internal_query_routes {
                 let internal_query_state_for_route = internal_query_state.clone();
                 let internal_query_root_specs_for_route = internal_query_root_specs.clone();
+                let internal_query_logical_roots_cell_for_route =
+                    internal_query_logical_roots_cell.clone();
                 let internal_query_host_object_grants_for_route =
                     internal_query_host_object_grants.clone();
                 let internal_query_visibility_lag_for_route = internal_query_visibility_lag.clone();
@@ -1928,6 +1947,8 @@ impl SinkFileMeta {
                             let internal_query_state = internal_query_state_for_route.clone();
                             let internal_query_root_specs =
                                 internal_query_root_specs_for_route.clone();
+                            let internal_query_logical_roots_cell =
+                                internal_query_logical_roots_cell_for_route.clone();
                             let internal_query_host_object_grants =
                                 internal_query_host_object_grants_for_route.clone();
                             let internal_query_visibility_lag =
@@ -1968,6 +1989,8 @@ impl SinkFileMeta {
                                             node_id: internal_query_node_id.clone(),
                                             state: internal_query_state.clone(),
                                             root_specs: internal_query_root_specs.clone(),
+                                            logical_roots_cell: internal_query_logical_roots_cell
+                                                .clone(),
                                             host_object_grants: internal_query_host_object_grants
                                                 .clone(),
                                             visibility_lag: internal_query_visibility_lag.clone(),
@@ -2128,6 +2151,7 @@ impl SinkFileMeta {
 
             let stream_state = state.clone();
             let stream_root_specs = root_specs.clone();
+            let stream_logical_roots_cell = logical_roots_cell.clone();
             let stream_host_object_grants = host_object_grants.clone();
             let stream_visibility_lag = visibility_lag.clone();
             let stream_delivery_stats = stream_delivery_stats.clone();
@@ -2137,6 +2161,7 @@ impl SinkFileMeta {
                     node_id: node_id.clone(),
                     state: stream_state,
                     root_specs: stream_root_specs,
+                    logical_roots_cell: stream_logical_roots_cell.clone(),
                     host_object_grants: stream_host_object_grants,
                     visibility_lag: stream_visibility_lag,
                     stream_delivery_stats,
@@ -2244,6 +2269,7 @@ impl SinkFileMeta {
         let query_state = self.state.clone();
         let node_id_cloned = node_id.clone();
         let query_root_specs = self.root_specs.clone();
+        let query_logical_roots_cell = self.logical_roots_cell.clone();
         let query_host_object_grants = self.host_object_grants.clone();
         let query_visibility_lag = self.visibility_lag.clone();
         let query_stream_delivery_stats = self.stream_delivery_stats.clone();
@@ -2278,6 +2304,7 @@ impl SinkFileMeta {
                         move |requests| {
                             let query_state = query_state.clone();
                             let query_root_specs = query_root_specs.clone();
+                            let query_logical_roots_cell = query_logical_roots_cell.clone();
                             let query_host_object_grants = query_host_object_grants.clone();
                             let query_visibility_lag = query_visibility_lag.clone();
                             let query_stream_delivery_stats = query_stream_delivery_stats.clone();
@@ -2295,6 +2322,7 @@ impl SinkFileMeta {
                                             node_id: query_node_id.clone(),
                                             state: query_state.clone(),
                                             root_specs: query_root_specs.clone(),
+                                            logical_roots_cell: query_logical_roots_cell.clone(),
                                             host_object_grants: query_host_object_grants.clone(),
                                             visibility_lag: query_visibility_lag.clone(),
                                             stream_delivery_stats: query_stream_delivery_stats
@@ -2346,6 +2374,7 @@ impl SinkFileMeta {
 
         let internal_query_state = self.state.clone();
         let internal_query_root_specs = self.root_specs.clone();
+        let internal_query_logical_roots_cell = self.logical_roots_cell.clone();
         let internal_query_host_object_grants = self.host_object_grants.clone();
         let internal_query_visibility_lag = self.visibility_lag.clone();
         let internal_query_stream_delivery_stats = self.stream_delivery_stats.clone();
@@ -2366,6 +2395,8 @@ impl SinkFileMeta {
             }
             let internal_query_state_for_route = internal_query_state.clone();
             let internal_query_root_specs_for_route = internal_query_root_specs.clone();
+            let internal_query_logical_roots_cell_for_route =
+                internal_query_logical_roots_cell.clone();
             let internal_query_host_object_grants_for_route =
                 internal_query_host_object_grants.clone();
             let internal_query_visibility_lag_for_route = internal_query_visibility_lag.clone();
@@ -2402,6 +2433,8 @@ impl SinkFileMeta {
                     move |requests| {
                         let internal_query_state = internal_query_state_for_route.clone();
                         let internal_query_root_specs = internal_query_root_specs_for_route.clone();
+                        let internal_query_logical_roots_cell =
+                            internal_query_logical_roots_cell_for_route.clone();
                         let internal_query_host_object_grants =
                             internal_query_host_object_grants_for_route.clone();
                         let internal_query_visibility_lag =
@@ -2436,6 +2469,8 @@ impl SinkFileMeta {
                                         node_id: internal_query_node_id.clone(),
                                         state: internal_query_state.clone(),
                                         root_specs: internal_query_root_specs.clone(),
+                                        logical_roots_cell: internal_query_logical_roots_cell
+                                            .clone(),
                                         host_object_grants: internal_query_host_object_grants
                                             .clone(),
                                         visibility_lag: internal_query_visibility_lag.clone(),
@@ -2486,6 +2521,69 @@ impl SinkFileMeta {
             lock_or_recover(
                 &self.endpoint_tasks,
                 "sink.start_runtime_endpoints.internal_query_tasks",
+            )
+            .push(endpoint);
+        }
+
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            && !self.endpoint_task_route_present(
+                &route.0,
+                "sink.start_runtime_endpoints.route_present.status",
+            )
+        {
+            let status_sink = self.clone();
+            let status_node_id = node_id.clone();
+            let endpoint = ManagedEndpointTask::spawn_with_unit(
+                boundary.clone(),
+                route,
+                format!(
+                    "sink:{}:{}",
+                    ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS
+                ),
+                SINK_RUNTIME_UNIT_ID,
+                self.shutdown.clone(),
+                move |requests| {
+                    let status_sink = status_sink.clone();
+                    let status_node_id = status_node_id.clone();
+                    async move {
+                        let snapshot = match status_sink.status_snapshot_with_failure() {
+                            Ok(snapshot) => snapshot,
+                            Err(err) => {
+                                eprintln!(
+                                    "fs_meta_sink: sink-status endpoint snapshot failed node={} err={}",
+                                    status_node_id.0,
+                                    err.as_error()
+                                );
+                                SinkStatusSnapshot::default()
+                            }
+                        };
+                        let mut responses = Vec::with_capacity(requests.len());
+                        for req in requests {
+                            match rmp_serde::to_vec_named(&snapshot) {
+                                Ok(payload) => responses.push(Event::new(
+                                    EventMetadata {
+                                        origin_id: status_node_id.clone(),
+                                        timestamp_us: now_us(),
+                                        logical_ts: None,
+                                        correlation_id: req.metadata().correlation_id,
+                                        ingress_auth: None,
+                                        trace: None,
+                                    },
+                                    Bytes::from(payload),
+                                )),
+                                Err(err) => eprintln!(
+                                    "fs_meta_sink: sink-status endpoint encode failed node={} err={}",
+                                    status_node_id.0, err
+                                ),
+                            }
+                        }
+                        responses
+                    }
+                },
+            );
+            lock_or_recover(
+                &self.endpoint_tasks,
+                "sink.start_runtime_endpoints.status_tasks",
             )
             .push(endpoint);
         }
@@ -2596,6 +2694,7 @@ impl SinkFileMeta {
 
         let stream_state = self.state.clone();
         let stream_root_specs = self.root_specs.clone();
+        let stream_logical_roots_cell = self.logical_roots_cell.clone();
         let stream_host_object_grants = self.host_object_grants.clone();
         let stream_visibility_lag = self.visibility_lag.clone();
         let stream_delivery_stats = self.stream_delivery_stats.clone();
@@ -2616,6 +2715,7 @@ impl SinkFileMeta {
                     node_id: node_id.clone(),
                     state: stream_state,
                     root_specs: stream_root_specs,
+                    logical_roots_cell: stream_logical_roots_cell.clone(),
                     host_object_grants: stream_host_object_grants,
                     visibility_lag: stream_visibility_lag,
                     stream_delivery_stats,
@@ -2679,6 +2779,7 @@ impl SinkFileMeta {
                 node_id: self.node_id.clone(),
                 state: self.state.clone(),
                 root_specs: self.root_specs.clone(),
+                logical_roots_cell: self.logical_roots_cell.clone(),
                 host_object_grants: self.host_object_grants.clone(),
                 visibility_lag: self.visibility_lag.clone(),
                 stream_delivery_stats: self.stream_delivery_stats.clone(),
@@ -2809,6 +2910,7 @@ impl SinkFileMeta {
         let routes = sink_query_route_bindings_for(&self.node_id.0);
         let stream_state = self.state.clone();
         let stream_root_specs = self.root_specs.clone();
+        let stream_logical_roots_cell = self.logical_roots_cell.clone();
         let stream_host_object_grants = self.host_object_grants.clone();
         let stream_visibility_lag = self.visibility_lag.clone();
         let stream_delivery_stats = self.stream_delivery_stats.clone();
@@ -2828,6 +2930,7 @@ impl SinkFileMeta {
                 node_id: self.node_id.clone(),
                 state: stream_state,
                 root_specs: stream_root_specs,
+                logical_roots_cell: stream_logical_roots_cell.clone(),
                 host_object_grants: stream_host_object_grants,
                 visibility_lag: stream_visibility_lag,
                 stream_delivery_stats,
@@ -2893,13 +2996,6 @@ impl SinkFileMeta {
                 unit_id,
                 generation
             );
-        } else if unit == SinkRuntimeUnit::Sink && !bound_scopes.is_empty() {
-            // Sink holder routes should converge on one current scoped holder truth.
-            // When a successor runtime.exec.sink activate arrives for the same scopes,
-            // keep active routes aligned to the latest bound scope/resource mapping
-            // instead of merging stale dead-holder refs into the exported state.
-            self.unit_control
-                .sync_active_scopes(unit_id, bound_scopes)?;
         }
         Ok(())
     }
@@ -3226,10 +3322,62 @@ impl SinkFileMeta {
             .map_err(|_| CnxError::Internal("Sink host_object_grants lock poisoned".into()))
     }
 
+    fn root_specs_equivalent(a: &[RootSpec], b: &[RootSpec]) -> bool {
+        match (rmp_serde::to_vec_named(a), rmp_serde::to_vec_named(b)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    fn authoritative_logical_roots_if_changed(&self) -> Result<Option<Vec<RootSpec>>> {
+        let authoritative_roots = self.logical_roots_cell.refresh_from_boundary_blocking()?;
+        let current_roots = self
+            .root_specs
+            .read()
+            .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))?
+            .clone();
+        if Self::root_specs_equivalent(&authoritative_roots, &current_roots) {
+            return Ok(None);
+        }
+        Ok(Some(authoritative_roots))
+    }
+
+    pub(crate) fn sync_logical_roots_from_authoritative_cell_if_changed(&self) -> Result<bool> {
+        let Some(authoritative_roots) = self.authoritative_logical_roots_if_changed()? else {
+            return Ok(false);
+        };
+        eprintln!(
+            "fs_meta_sink: authoritative logical-roots sync begin node={} roots={}",
+            self.node_id.0,
+            authoritative_roots.len()
+        );
+        let grants = self.logical_grants_snapshot()?;
+        self.perform_update_logical_roots_with_scope_policy(
+            authoritative_roots.clone(),
+            &grants,
+            false,
+        )?;
+        eprintln!(
+            "fs_meta_sink: authoritative logical-roots sync ok node={} roots={}",
+            self.node_id.0,
+            authoritative_roots.len()
+        );
+        Ok(true)
+    }
+
     pub(crate) fn perform_update_logical_roots(
         &self,
         roots: Vec<RootSpec>,
         host_object_grants: &[GrantedMountRoot],
+    ) -> Result<()> {
+        self.perform_update_logical_roots_with_scope_policy(roots, host_object_grants, true)
+    }
+
+    fn perform_update_logical_roots_with_scope_policy(
+        &self,
+        roots: Vec<RootSpec>,
+        host_object_grants: &[GrantedMountRoot],
+        expand_runtime_scopes: bool,
     ) -> Result<()> {
         eprintln!(
             "fs_meta_sink: update_logical_roots begin roots={} grants={}",
@@ -3239,37 +3387,12 @@ impl SinkFileMeta {
         let root_count = roots.len();
         let grant_count = host_object_grants.len();
         let current_allowed_groups = self.scheduled_group_ids()?;
-        if let Some(current_allowed_groups) = current_allowed_groups.as_ref() {
+        if expand_runtime_scopes && current_allowed_groups.as_ref().is_some() {
             let root_ids = roots
                 .iter()
                 .map(|root| root.id.clone())
                 .collect::<BTreeSet<_>>();
-            let restorable_group_ids = self
-                .state
-                .read()?
-                .retained_groups
-                .iter()
-                .filter(|(_, group)| {
-                    group.preserves_materialized_state_for_omission_window()
-                        && !matches!(
-                            group.group_readiness_state(),
-                            GroupReadinessState::PendingMaterialization
-                        )
-                })
-                .map(|(group_id, _)| group_id.clone())
-                .collect::<BTreeSet<_>>();
-            let preserve_current_subset =
-                !current_allowed_groups.is_empty() && current_allowed_groups.is_subset(&root_ids);
-            let next_allowed_groups = if preserve_current_subset {
-                current_allowed_groups
-                    .iter()
-                    .chain(restorable_group_ids.iter())
-                    .filter(|group_id| root_ids.contains(*group_id))
-                    .cloned()
-                    .collect::<BTreeSet<_>>()
-            } else {
-                root_ids
-            };
+            let next_allowed_groups = root_ids;
             let bound_scopes = roots
                 .iter()
                 .filter(|root| next_allowed_groups.contains(&root.id))
@@ -3375,15 +3498,41 @@ impl SinkFileMeta {
                 estimated_heap_bytes,
             ));
         }
+        if let Some(scheduled_groups) = self.scheduled_group_ids()?
+            && !scheduled_groups.is_empty()
+        {
+            let present_groups = groups
+                .iter()
+                .map(|group| group.group_id.clone())
+                .collect::<BTreeSet<_>>();
+            for group_id in &scheduled_groups {
+                if present_groups.contains(group_id) {
+                    continue;
+                }
+                groups.push(SinkGroupStatusSnapshot::from_status_fields(
+                    group_id.clone(),
+                    group_id.clone(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    true,
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ));
+            }
+            snapshot.scheduled_groups_by_node.insert(
+                self.node_id.0.clone(),
+                scheduled_groups.into_iter().collect(),
+            );
+        }
         groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
         snapshot.groups = groups;
-        if let Some(groups) = self.scheduled_group_ids()?
-            && !groups.is_empty()
-        {
-            snapshot
-                .scheduled_groups_by_node
-                .insert(self.node_id.0.clone(), groups.into_iter().collect());
-        }
         snapshot.stream_path_capture_target = debug_stream_path_capture_target()
             .map(|target| String::from_utf8_lossy(&target).into_owned());
         if let Ok(stats) = self.stream_delivery_stats.lock() {
@@ -3479,6 +3628,7 @@ impl SinkFileMeta {
     }
 
     pub fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+        let _ = self.sync_logical_roots_from_authoritative_cell_if_changed();
         self.build_status_snapshot()
     }
 
@@ -4008,6 +4158,7 @@ impl SinkFileMeta {
         &self,
         request: &InternalQueryRequest,
     ) -> Result<Vec<Event>> {
+        let _ = self.sync_logical_roots_from_authoritative_cell_if_changed();
         if request.transport != crate::query::request::QueryTransport::Materialized {
             return Err(CnxError::InvalidInput(
                 "materialized_query requires materialized transport".into(),

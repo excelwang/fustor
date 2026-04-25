@@ -8051,7 +8051,9 @@ async fn pending_facade_exposure_confirmed_waits_for_inflight_rescan_before_shut
         }
     });
 
-    entered.notified().await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("public /tree should reach source status before later source/query activate wave");
     let control_task = tokio::spawn({
         let app = app.clone();
         async move {
@@ -8715,10 +8717,10 @@ async fn public_tree_request_settles_while_later_source_and_query_activate_wave_
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let _pause_reset = RuntimeProxyRequestPauseHookReset {
-        label: "sink_query_proxy",
+        label: "source_status",
     };
     install_runtime_proxy_request_pause_hook(
-        "sink_query_proxy",
+        "source_status",
         RuntimeProxyRequestPauseHook {
             entered: entered.clone(),
             release: release.clone(),
@@ -8747,7 +8749,6 @@ async fn public_tree_request_settles_while_later_source_and_query_activate_wave_
         let source_status_route = source_status_route.clone();
         async move {
             app.on_control_frame(&[
-                activate_envelope(execution_units::FACADE_RUNTIME_UNIT_ID),
                 activate_envelope_with_scope_rows(
                     execution_units::SOURCE_RUNTIME_UNIT_ID,
                     &[("test-root", &["single-app-node::root-1"])],

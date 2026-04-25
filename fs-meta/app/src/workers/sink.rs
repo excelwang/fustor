@@ -925,9 +925,7 @@ impl SinkStatusLiveScenario {
         match self {
             Self::Blocking | Self::ControlInflight => SinkStatusOutcomeKind::ReturnLive,
             Self::Steady | Self::SteadyAfterRetryReset => {
-                if facts.cached_preactivate_unscheduled {
-                    SinkStatusOutcomeKind::ReturnLive
-                } else if matches!(facts.cached_concern, Some(SinkStatusConcern::CoverageGap)) {
+                if matches!(facts.cached_concern, Some(SinkStatusConcern::CoverageGap)) {
                     SinkStatusOutcomeKind::ReturnCached
                 } else {
                     SinkStatusOutcomeKind::FailClosed

@@ -34,6 +34,7 @@ const SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT: Duration = Duration::fr
 const SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_START_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
+const SOURCE_WORKER_FORCE_FIND_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 const SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
 const SOURCE_WORKER_CLOSE_DRAIN_TIMEOUT: Duration = SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT;
@@ -72,7 +73,6 @@ enum SourceWaitFor {
     Observability,
     Started,
     LogicalRoots,
-    ForceFind,
 }
 
 impl SourceWaitFor {
@@ -98,13 +98,6 @@ impl SourceWaitFor {
             }
             Self::LogicalRoots => {
                 current.worker_client_replaced_epoch > after.worker_client_replaced_epoch
-                    || current.logical_roots_updated_epoch > after.logical_roots_updated_epoch
-            }
-            Self::ForceFind => {
-                current.worker_client_replaced_epoch > after.worker_client_replaced_epoch
-                    || current.control_signals_retained_epoch > after.control_signals_retained_epoch
-                    || current.scheduled_groups_updated_epoch > after.scheduled_groups_updated_epoch
-                    || current.started_epoch > after.started_epoch
                     || current.logical_roots_updated_epoch > after.logical_roots_updated_epoch
             }
         }
@@ -1768,7 +1761,7 @@ enum SourceScheduledGroupsRefreshEvent {
 
 enum SourceForceFindEffect {
     Attempt { timeout: Duration },
-    Wait { after: SourceProgressState },
+    RetryBackoff { delay: Duration },
     Complete(Vec<Event>),
     Fail(SourceFailure),
 }
@@ -1776,7 +1769,6 @@ enum SourceForceFindEffect {
 enum SourceForceFindEvent {
     AttemptCompleted {
         rpc_result: std::result::Result<Vec<Event>, CnxError>,
-        after: SourceProgressState,
     },
     WaitCompleted,
 }
@@ -1833,21 +1825,25 @@ impl SourceForceFindMachine {
             } => Ok(SourceForceFindEffect::Complete(events)),
             SourceForceFindEvent::AttemptCompleted {
                 rpc_result: Err(err),
-                after,
-            } => Ok(
-                match SourceRetryMachine::new(self.deadline).wait_after_retryable_gap(
-                    err,
-                    after,
-                    can_retry_force_find,
+                ..
+            } => {
+                if !can_retry_force_find(&err) {
+                    return Ok(SourceForceFindEffect::Fail(SourceFailure::from_cause(err)));
+                }
+                if matches!(
+                    SourceRetryMachine::new(self.deadline).budget(),
+                    SourceRetryBudgetDisposition::Exhausted
                 ) {
-                    SourceWaitRetryDisposition::WaitAfter(after) => {
-                        SourceForceFindEffect::Wait { after }
-                    }
-                    SourceWaitRetryDisposition::Fail(failure) => {
-                        SourceForceFindEffect::Fail(failure)
-                    }
-                },
-            ),
+                    return Ok(SourceForceFindEffect::Fail(
+                        SourceFailure::retry_budget_exhausted(
+                            SourceRetryBudgetExhaustionKind::OperationWait,
+                        ),
+                    ));
+                }
+                Ok(SourceForceFindEffect::RetryBackoff {
+                    delay: SOURCE_WORKER_FORCE_FIND_RETRY_BACKOFF,
+                })
+            }
             SourceForceFindEvent::WaitCompleted => self.start(),
         }
     }
@@ -6408,15 +6404,6 @@ impl SourceWorkerClientHandle {
         .map_err(SourceFailure::into_error)
     }
 
-    async fn execute_force_find_wait(
-        &self,
-        after: SourceProgressState,
-        deadline: std::time::Instant,
-    ) {
-        self.wait_for_source_progress_after(after, SourceWaitFor::ForceFind, deadline)
-            .await;
-    }
-
     async fn execute_scheduled_group_ids_attempt(
         &self,
         request: &SourceWorkerRequest,
@@ -6595,11 +6582,14 @@ impl SourceWorkerClientHandle {
                             rpc_result: self
                                 .execute_force_find_attempt(&params, &target_node, timeout)
                                 .await,
-                            after: self.current_source_progress_state(),
                         })
                     }
-                    SourceForceFindEffect::Wait { after } => {
-                        self.execute_force_find_wait(after, deadline).await;
+                    SourceForceFindEffect::RetryBackoff { delay } => {
+                        tokio::time::sleep(std::cmp::min(
+                            delay,
+                            deadline.saturating_duration_since(std::time::Instant::now()),
+                        ))
+                        .await;
                         SourceOperationLoopStep::Event(SourceForceFindEvent::WaitCompleted)
                     }
                     SourceForceFindEffect::Complete(events) => {

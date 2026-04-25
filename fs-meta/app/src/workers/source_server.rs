@@ -592,24 +592,32 @@ where
                     summarize_published_batch_path_counts(&batch, &target),
                 );
             }
-            let boundary = clone_pump_boundary_target(&boundary);
-            if let Err(err) = boundary
-                .channel_send(
-                    BoundaryContext::default(),
-                    ChannelSendRequest {
-                        channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
-                        events: batch,
-                        timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
-                    },
-                )
-                .await
-            {
-                log::error!(
-                    "source worker pump failed to publish source batch on stream route origin={}: {:?}",
-                    origin,
-                    err
-                );
-                break;
+            let mut publish_attempt = 0u64;
+            loop {
+                publish_attempt = publish_attempt.saturating_add(1);
+                let boundary = clone_pump_boundary_target(&boundary);
+                match boundary
+                    .channel_send(
+                        BoundaryContext::default(),
+                        ChannelSendRequest {
+                            channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
+                            events: batch.clone(),
+                            timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
+                        },
+                    )
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(err) => {
+                        log::warn!(
+                            "source worker pump retrying source batch publication origin={} attempt={} err={:?}",
+                            origin,
+                            publish_attempt,
+                            err
+                        );
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
             }
             record_summarized_path_stats(&published_stats, &publish_update);
             update_published_stats(&published_stats, &publish_update);

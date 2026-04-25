@@ -3,9 +3,9 @@ use std::future::Future;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
-use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Once, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -1193,13 +1193,62 @@ fn status_sink_live_nodes(live_source_nodes: u64, sink_status: &SinkStatusSnapsh
 }
 
 fn runtime_artifact_evidence() -> RuntimeArtifactEvidence {
-    match std::env::current_exe() {
-        Ok(path) => match file_sha256_hex(&path) {
+    static START: Once = Once::new();
+    static CACHE: OnceLock<StdMutex<RuntimeArtifactEvidence>> = OnceLock::new();
+
+    let cache = CACHE.get_or_init(|| StdMutex::new(runtime_artifact_pending_evidence()));
+    START.call_once(|| {
+        let cache = CACHE
+            .get()
+            .expect("runtime artifact evidence cache initialized before hash worker starts");
+        std::thread::spawn(move || {
+            let evidence = compute_runtime_artifact_evidence();
+            if let Ok(mut cached) = cache.lock() {
+                *cached = evidence;
+            }
+        });
+    });
+
+    cache
+        .lock()
+        .map(|cached| cached.clone())
+        .unwrap_or_else(|_| RuntimeArtifactEvidence {
+            available: false,
+            path: None,
+            sha256: None,
+            error: Some("runtime artifact evidence cache poisoned".to_string()),
+        })
+}
+
+fn runtime_artifact_pending_evidence() -> RuntimeArtifactEvidence {
+    match runtime_artifact_path() {
+        Ok((path, path_warning)) => RuntimeArtifactEvidence {
+            available: false,
+            path: Some(path.display().to_string()),
+            sha256: None,
+            error: Some(
+                path_warning
+                    .unwrap_or("runtime artifact hash pending")
+                    .to_string(),
+            ),
+        },
+        Err(err) => RuntimeArtifactEvidence {
+            available: false,
+            path: None,
+            sha256: None,
+            error: Some(err),
+        },
+    }
+}
+
+fn compute_runtime_artifact_evidence() -> RuntimeArtifactEvidence {
+    match runtime_artifact_path() {
+        Ok((path, path_warning)) => match file_sha256_hex(&path) {
             Ok(sha256) => RuntimeArtifactEvidence {
-                available: true,
+                available: path_warning.is_none(),
                 path: Some(path.display().to_string()),
                 sha256: Some(sha256),
-                error: None,
+                error: path_warning.map(ToString::to_string),
             },
             Err(err) => RuntimeArtifactEvidence {
                 available: false,
@@ -1212,9 +1261,31 @@ fn runtime_artifact_evidence() -> RuntimeArtifactEvidence {
             available: false,
             path: None,
             sha256: None,
-            error: Some(err.to_string()),
+            error: Some(err),
         },
     }
+}
+
+fn runtime_artifact_path() -> Result<(PathBuf, Option<&'static str>), String> {
+    for env_name in [
+        "CAPANIX_LOADED_APP_PATH",
+        "CAPANIX_FS_META_APP_BINARY",
+        "DATANIX_FS_META_APP_SO",
+    ] {
+        if let Some(path) = std::env::var_os(env_name).filter(|value| !value.is_empty()) {
+            return Ok((PathBuf::from(path), None));
+        }
+    }
+    std::env::current_exe()
+        .map(|path| {
+            (
+                path,
+                Some(
+                    "loaded app artifact path is not available; reporting host executable fallback",
+                ),
+            )
+        })
+        .map_err(|err| format!("resolve runtime artifact path failed: {err}"))
 }
 
 fn file_sha256_hex(path: &std::path::Path) -> Result<String, String> {
@@ -1523,9 +1594,9 @@ fn sink_status_snapshot_is_zeroish_for_active_source_groups(snapshot: &SinkStatu
         })
 }
 
-const STATUS_ROUTE_TIMEOUT: Duration = Duration::from_millis(350);
+const STATUS_ROUTE_TIMEOUT: Duration = Duration::from_secs(3);
 const STATUS_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(2);
-const STATUS_SINK_ROUTE_RECOLLECT_BUDGET: Duration = Duration::from_millis(250);
+const STATUS_SINK_ROUTE_RECOLLECT_BUDGET: Duration = Duration::from_secs(3);
 
 fn status_ready_sink_evidence_cache() -> &'static StdMutex<BTreeMap<String, SinkGroupStatusSnapshot>>
 {
@@ -2238,7 +2309,18 @@ pub async fn rescan(
             )
             .await
         {
-            Ok(()) => {}
+            Ok(()) => {
+                state
+                    .source
+                    .publish_manual_rescan_signal_with_failure()
+                    .await
+                    .map_err(|signal_err| {
+                        ApiError::internal(format!(
+                            "manual rescan cluster signal publish failed after control send: {}",
+                            signal_err.as_error()
+                        ))
+                    })?;
+            }
             Err(err) if is_stale_drained_pid_control_send_error(&err) => {
                 eprintln!(
                     "fs_meta_api: rescan control send tolerated stale drained pid route={} err={}",
@@ -6505,6 +6587,104 @@ mod tests {
         );
 
         assert_eq!(response.0.roots_count, 2);
+    }
+
+    #[tokio::test]
+    async fn rescan_with_runtime_boundary_publishes_cluster_manual_rescan_signal() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let root = RootSpec::new("nfs1", &nfs1);
+        let source_cfg = SourceConfig {
+            roots: vec![root],
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let state_boundary = in_memory_state_boundary();
+        let signal = SignalCell::from_state_boundary(
+            crate::runtime::execution_units::SOURCE_RUNTIME_UNIT_ID,
+            "manual_rescan",
+            state_boundary.clone(),
+        )
+        .expect("construct manual rescan signal cell");
+        let signal_offset = signal.current_seq();
+        let source_runtime = Arc::new(
+            FSMetaSource::with_boundaries_and_state(
+                source_cfg.clone(),
+                NodeId("node-a".into()),
+                None,
+                state_boundary,
+            )
+            .expect("source"),
+        );
+        let source = Arc::new(SourceFacade::local(source_runtime.clone()));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg.clone())
+                .expect("sink"),
+        )));
+        let sent_routes = Arc::new(StdMutex::new(Vec::new()));
+        let boundary = Arc::new(DeniedControlRouteBoundary {
+            sent_routes: sent_routes.clone(),
+            sent_unit_ids: Arc::new(StdMutex::new(Vec::new())),
+            denied_routes: BTreeSet::new(),
+        });
+        let headers = management_headers(auth.as_ref());
+        let facade_service_state = crate::api::facade_status::shared_facade_service_state_cell();
+        *facade_service_state
+            .write()
+            .expect("write facade service state") = FacadeServiceState::Serving;
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(boundary),
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source: source.clone(),
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                facade_service_state,
+                shared_facade_pending_status_cell(),
+            ),
+            published_rollout_status: test_published_rollout_status_reader(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
+        };
+
+        let response = rescan(State(state), headers)
+            .await
+            .expect("rescan should publish the cluster manual-rescan signal after runtime control send succeeds");
+        assert!(response.0.accepted);
+        let (_next_offset, updates) = signal
+            .watch_since(signal_offset)
+            .await
+            .expect("watch signal updates");
+        assert_eq!(
+            updates.len(),
+            1,
+            "runtime-boundary rescan must publish exactly one cluster manual-rescan signal"
+        );
+        assert_eq!(updates[0].requested_by, "node-a");
+
+        let sent_routes = match sent_routes.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        assert_eq!(
+            sent_routes,
+            vec![format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)]
+        );
     }
 
     #[tokio::test]

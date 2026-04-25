@@ -519,31 +519,29 @@ fn source_retry_budget_exhausted(
 }
 
 #[test]
-fn source_force_find_machine_owns_wait_retry_and_timeout_terminal_lanes() {
+fn source_force_find_machine_owns_backoff_retry_and_timeout_terminal_lanes() {
     let machine = SourceForceFindMachine::new(source_machine_test_future_deadline());
     let wait = machine
         .advance(SourceForceFindEvent::AttemptCompleted {
             rpc_result: Err(CnxError::ProtocolViolation(
                 "unexpected correlation_id in reply batch".into(),
             )),
-            after: SourceProgressState::default(),
         })
-        .expect("retryable force-find correlation mismatch should enter explicit wait lane");
+        .expect("retryable force-find correlation mismatch should enter explicit backoff lane");
     let retry = machine
         .advance(SourceForceFindEvent::WaitCompleted)
-        .expect("wait completion should resume the force-find attempt lane");
+        .expect("backoff completion should resume the force-find attempt lane");
     let expired_machine = SourceForceFindMachine::new(source_machine_test_expired_deadline());
     let terminal = expired_machine
         .advance(SourceForceFindEvent::AttemptCompleted {
             rpc_result: Err(CnxError::ProtocolViolation(
                 "unexpected correlation_id in reply batch".into(),
             )),
-            after: SourceProgressState::default(),
         })
         .expect("expired force-find deadline should produce a terminal timeout lane");
 
     assert!(
-        matches!(wait, SourceForceFindEffect::Wait { .. })
+        matches!(wait, SourceForceFindEffect::RetryBackoff { .. })
             && matches!(retry, SourceForceFindEffect::Attempt { .. })
             && matches!(
                 terminal,
@@ -553,7 +551,7 @@ fn source_force_find_machine_owns_wait_retry_and_timeout_terminal_lanes() {
                         SourceRetryBudgetExhaustionKind::OperationWait,
                     )
             ),
-        "source force-find machine should own explicit wait-retry and deadline-timeout lanes instead of drifting back to an ad hoc retry loop",
+        "source force-find machine should own explicit backoff-retry and deadline-timeout lanes instead of drifting back to an ad hoc retry loop",
     );
 }
 
@@ -1485,13 +1483,13 @@ fn source_control_frame_executor_shell_dispatches_handle_primitives_only() {
     }
 
     for required_dispatch in [
-        "apply_control_frame_retained_tick_fast_path(&signals)",
-        "replay_control_frame_retained_tick(deadline)",
-        "perform_control_frame_attempt(&envelopes, timeout).await",
-        "reconnect_for_control_frame().await?",
-        "wait_control_frame_retry_after(after, deadline)",
-        "apply_post_ack_cache_and_retain_signals(&signals, cache_priming)",
-        "arm_control_frame_replay().await",
+        "handle.apply_control_frame_retained_tick_fast_path(&self.signals)",
+        "replay_control_frame_retained_tick(self.deadline)",
+        "perform_control_frame_attempt(&self.envelopes, self.timeout)",
+        "handle.reconnect_for_control_frame().await?",
+        "wait_control_frame_retry_after(self.after, self.deadline)",
+        "apply_post_ack_cache_and_retain_signals(&self.signals, self.cache_priming)",
+        "handle.arm_control_frame_replay().await",
         "refresh_scheduled_groups_for_control_frame(",
     ] {
         assert!(

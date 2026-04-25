@@ -681,6 +681,67 @@ async fn sink_runtime_exec_failover_reactivate_replaces_scoped_holder_without_st
     );
 }
 
+#[tokio::test]
+async fn sink_runtime_exec_partial_route_activations_union_disjoint_groups() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs4", "/mnt/nfs4"),
+        RootSpec::new("nfs5", "/mnt/nfs5"),
+    ];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-a::nfs4", "node-a", "10.0.0.11", "/mnt/nfs4", true),
+        granted_mount_root("node-a::nfs5", "node-a", "10.0.0.11", "/mnt/nfs5", true),
+    ];
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("init sink");
+
+    let query_activation =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope("nfs1")],
+        }))
+        .expect("encode query activation");
+    let stream_activation =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 2,
+            bound_scopes: vec![bound_scope("nfs4"), bound_scope("nfs5")],
+        }))
+        .expect("encode stream activation");
+
+    sink.on_control_frame(&[query_activation])
+        .await
+        .expect("query activation should pass");
+    sink.on_control_frame(&[stream_activation])
+        .await
+        .expect("stream activation should pass");
+
+    let state = sink
+        .unit_control
+        .unit_state("runtime.exec.sink")
+        .expect("unit state after partial activations")
+        .expect("runtime.exec.sink unit state should exist");
+    let groups = state
+        .1
+        .into_iter()
+        .map(|scope| scope.scope_id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        groups,
+        BTreeSet::from(["nfs1".to_string(), "nfs4".to_string(), "nfs5".to_string()]),
+        "disjoint partial route activations are shards of the same sink schedule and must not erase each other",
+    );
+}
+
 #[test]
 fn stable_host_ref_treats_cluster_scoped_node_id_as_local_member() {
     let grants = vec![granted_mount_root(
