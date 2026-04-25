@@ -1477,11 +1477,13 @@ fn test_control_frame_signal_translation_contract() {
     assert!(runtime_app.contains("split_app_control_signals("));
 
     let source_mod = read_fs_meta_spec_file("fs-meta/app/src/source/mod.rs");
-    assert!(source_mod.contains("source_control_signals_from_envelopes("));
-    assert!(source_mod.contains("apply_orchestration_signals(&signals)"));
+    assert!(source_mod.contains("source_control_signals_from_envelopes(envelopes)?"));
+    assert!(source_mod.contains("apply_control_frame_signals(&signals)"));
+    assert!(source_mod.contains("fn apply_control_frame_signals("));
+    assert!(source_mod.contains("apply_orchestration_signals(signals)"));
 
     let sink_mod = read_fs_meta_spec_file("fs-meta/app/src/sink/mod.rs");
-    assert!(sink_mod.contains("sink_control_signals_from_envelopes("));
+    assert!(sink_mod.contains("sink_control_signals_from_envelopes(envelopes)?"));
     assert!(sink_mod.contains("apply_orchestration_signals(&signals)"));
 }
 

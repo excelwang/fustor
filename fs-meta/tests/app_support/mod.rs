@@ -3,13 +3,23 @@ use std::path::{Path, PathBuf};
 
 pub mod fixture_support;
 
+fn workspace_root() -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut current = manifest_dir.clone();
+    loop {
+        if current.join("fs-meta").is_dir() && current.join("Cargo.toml").is_file() {
+            return current;
+        }
+        if !current.pop() {
+            return manifest_dir;
+        }
+    }
+}
+
 pub fn combined_source_text() -> String {
     let mut buf = String::new();
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(PathBuf::from)
-        .expect("fs-meta container root");
-    visit(&manifest_dir.join("app/src"), &mut buf);
+    let fs_meta_root = workspace_root().join("fs-meta");
+    visit(&fs_meta_root.join("app/src"), &mut buf);
     buf
 }
 

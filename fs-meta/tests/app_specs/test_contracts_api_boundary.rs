@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::app_support::fixture_support::{FsMetaApiFixture, HttpResponse, http_json};
-use serde_json::{Value, json};
+use crate::app_support::fixture_support::{http_json, FsMetaApiFixture, HttpResponse};
+use serde_json::{json, Value};
 
 fn expect_error_field(resp: &HttpResponse) {
     let json = resp
@@ -813,14 +813,12 @@ fn blackbox_management_api_contract() {
     )
     .expect("roots preview");
     assert_eq!(preview.status, 200, "body={}", preview.body);
-    assert!(
-        preview
-            .json
-            .as_ref()
-            .and_then(|v| v.get("preview"))
-            .and_then(|v| v.as_array())
-            .is_some_and(|rows| rows.len() == 2)
-    );
+    assert!(preview
+        .json
+        .as_ref()
+        .and_then(|v| v.get("preview"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|rows| rows.len() == 2));
     assert_eq!(
         preview
             .json

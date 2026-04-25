@@ -5,18 +5,21 @@ use std::path::PathBuf;
 
 use crate::app_support::combined_source_text;
 
-fn fs_meta_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(PathBuf::from)
-        .expect("fs-meta container root")
+fn workspace_root() -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut current = manifest_dir.clone();
+    loop {
+        if current.join("fs-meta").is_dir() && current.join("Cargo.toml").is_file() {
+            return current;
+        }
+        if !current.pop() {
+            return manifest_dir;
+        }
+    }
 }
 
-fn workspace_root() -> PathBuf {
-    fs_meta_root()
-        .parent()
-        .map(PathBuf::from)
-        .expect("workspace root")
+fn fs_meta_root() -> PathBuf {
+    workspace_root().join("fs-meta")
 }
 
 fn read_app_spec(rel: &str) -> String {
@@ -248,16 +251,12 @@ fn app_sdk_authoring_path_is_primary() {
     assert!(!seam.contains("capanix_runtime_api::channel_boundary_into_kernel"));
     assert!(!seam.contains("capanix_kernel_api"));
     assert!(!combined_source_text().contains("capanix_runtime_entry_sdk::boundary::"));
-    assert!(
-        !combined_source_text().contains("capanix_runtime_entry_sdk::define_typed_worker_rpc!")
-    );
+    assert!(!combined_source_text().contains("capanix_runtime_entry_sdk::define_typed_worker_rpc!"));
     assert!(!combined_source_text().contains("capanix_app_sdk::route_proto::RuntimeUnitTick"));
     assert!(!combined_source_text().contains("capanix_route_proto::{"));
     assert!(!combined_source_text().contains("decode_exec_control_envelope("));
     assert!(!combined_source_text().contains("decode_unit_tick_envelope("));
-    assert!(
-        !combined_source_text().contains("decode_runtime_host_object_grants_changed_envelope(")
-    );
+    assert!(!combined_source_text().contains("decode_runtime_host_object_grants_changed_envelope("));
     assert!(runtime_app.contains("capanix_runtime_entry_sdk::advanced::boundary"));
     assert!(runtime_app.contains("boundary_handles(&bootstrap)"));
     assert!(source_mod.contains("capanix_runtime_entry_sdk::advanced::boundary"));
@@ -440,10 +439,8 @@ fn realization_bridge_confined_to_worker_module() {
     assert!(source_worker.contains("TypedRuntimeWorkerClient<SourceWorkerRpc"));
     assert!(source_worker.contains("TypedWorkerInit<SourceConfig>"));
     assert!(source_worker.contains("RuntimeWorkerClientFactory"));
-    assert!(
-        source_worker
-            .contains("capanix_runtime_entry_sdk::worker_runtime::define_typed_worker_rpc!")
-    );
+    assert!(source_worker
+        .contains("capanix_runtime_entry_sdk::worker_runtime::define_typed_worker_rpc!"));
     assert!(source_worker.contains(".shutdown(Duration::from_secs(2))"));
     assert!(!sink_worker.contains("BoundRouteClient"));
     assert!(!sink_worker.contains("::open("));
@@ -586,11 +583,8 @@ fn worker_mode_failure_boundary_is_explicit() {
     assert!(!l0.contains("facade-worker"));
     assert!(contracts.contains("`embedded` workers stay inside the shared host boundary"));
     assert!(contracts.contains("`external` workers run through isolated external worker hosting"));
-    assert!(
-        contracts.contains(
-            "bridge-realization seam remains below the business-module contract boundary"
-        )
-    );
+    assert!(contracts
+        .contains("bridge-realization seam remains below the business-module contract boundary"));
     assert!(contracts.contains(
         "worker bootstrap, retry clipping, lifecycle supervision, and canonical transport/error classification remain runtime-helper implementation"
     ));
@@ -759,25 +753,19 @@ fn app_authoring_crate_stays_product_specific() {
     let runtime_lib = read_app_spec("app/src/lib.rs");
     let runtime_config = read_app_spec("app/src/config.rs");
 
-    assert!(
-        l1.contains("developer-facing authoring surface stays bounded to fs-meta domain/types")
-    );
+    assert!(l1.contains("developer-facing authoring surface stays bounded to fs-meta domain/types"));
     assert!(l2.contains(
         "product boundary separates bounded authoring/domain, runtime artifact, deploy compilation, and operator tooling surfaces"
     ));
     assert!(l2.contains("runtime artifact surface owns worker entry"));
-    assert!(
-        governance
-            .contains("`fs-meta/lib/` 是唯一的开发者-facing fs-meta authoring/domain package")
-    );
+    assert!(governance
+        .contains("`fs-meta/lib/` 是唯一的开发者-facing fs-meta authoring/domain package"));
     assert!(governance.contains("`fs-meta/app/` 是内部 `fs-meta-runtime` package"));
     assert!(governance.contains("`fs-meta/deploy/` 是内部 `fs-meta-deploy` package"));
     assert!(authoring_manifest.contains("name = \"fs-meta\""));
     assert!(authoring_manifest.contains("publish = false"));
-    assert!(
-        authoring_manifest
-            .contains("description = \"fs-meta authoring and domain surface package\"")
-    );
+    assert!(authoring_manifest
+        .contains("description = \"fs-meta authoring and domain surface package\""));
     assert!(authoring_lib.contains("pub mod api;"));
     assert!(authoring_lib.contains("pub mod product_model;"));
     assert!(authoring_lib.contains("pub struct FSMetaConfig"));
@@ -898,10 +886,8 @@ fn status_paths_use_nonblocking_worker_observation_reads() {
         ".observability_snapshot()\n                .await\n                .unwrap_or_else"
     ));
     assert!(runtime_app.contains("let internal_query_active = query_active || query_peer_active;"));
-    assert!(
-        runtime_app
-            .contains("if !internal_query_active || !spawned_routes.insert(route.0.clone())")
-    );
+    assert!(runtime_app
+        .contains("if !internal_query_active || !spawned_routes.insert(route.0.clone())"));
     assert!(runtime_app.contains("route_key == source_status_route"));
     assert!(runtime_app.contains("route_key == source_find_route"));
     assert!(
@@ -992,23 +978,18 @@ fn crate_ownership_and_dependency_rules_are_explicit() {
 
 #[test]
 fn formal_specs_tree_is_single_and_non_spec_materials_live_outside_specs() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(PathBuf::from)
-        .expect("fs-meta container root");
+    let root = fs_meta_root();
     assert!(!root.join("specs/app").exists());
     assert!(!root.join("specs/cli").exists());
-    assert!(
-        root.join("specs/L3-RUNTIME/OBSERVATION_CUTOVER.md")
-            .exists()
-    );
+    assert!(root
+        .join("specs/L3-RUNTIME/OBSERVATION_CUTOVER.md")
+        .exists());
     assert!(root.join("docs/PRODUCT_DEPLOYMENT.md").exists());
     assert!(root.join("docs/ENGINEERING_GOVERNANCE.md").exists());
     assert!(!root.join("docs/UPSTREAM_SPEC_ALIGNMENT.md").exists());
     assert!(root.join("docs/examples/fs-meta.yaml").exists());
-    assert!(
-        root.join("testdata/specs/fs-meta-contract-tests.config.md")
-            .exists()
-    );
+    assert!(root
+        .join("testdata/specs/fs-meta-contract-tests.config.md")
+        .exists());
     assert!(root.join("scripts/validate_specs.sh").exists());
 }

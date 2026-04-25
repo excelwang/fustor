@@ -157,14 +157,21 @@ fn reserve_local_port() -> Result<u16, String> {
 }
 
 fn workspace_root() -> Result<PathBuf, String> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(PathBuf::from)
-        .expect("fs-meta container root");
-    manifest_dir
-        .join("..")
-        .canonicalize()
-        .map_err(|e| format!("resolve workspace root failed: {e}"))
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut current = manifest_dir.clone();
+    loop {
+        if current.join("fs-meta").is_dir() && current.join("Cargo.toml").is_file() {
+            return current
+                .canonicalize()
+                .map_err(|e| format!("resolve workspace root failed: {e}"));
+        }
+        if !current.pop() {
+            return Err(format!(
+                "resolve workspace root failed: no fs-meta workspace above {}",
+                manifest_dir.display()
+            ));
+        }
+    }
 }
 
 fn ensure_fixture_binary() -> Result<PathBuf, String> {

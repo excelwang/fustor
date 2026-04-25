@@ -107,6 +107,9 @@ PUT  /monitoring/roots         -> { roots_count: usize }
    3. validation: reject duplicated/empty `id`; reject legacy `path` and `source_locator`; allow empty `roots`; each non-empty root must provide at least one selector field and an absolute `subpath_scope`.
    4. write guard: server MUST revalidate each submitted root against the current runtime grants and reject the whole write when any submitted root has no current grant match; the error response MUST keep the unmatched root ids explicit.
    5. write readiness: server MUST require Management Write Ready before accepting roots apply. If the HTTP facade is reachable but the current-epoch control stream is not active, the server returns explicit `NOT_READY` instead of accepting the write.
+   6. materialization reopening: accepted roots apply MUST reopen each submitted root for sink materialization in the new roots epoch; restored roots cannot be filtered out only because their previous materialization evidence was pending rather than ready.
+   7. authoritative roots repair: accepted roots MUST be written as app-authoritative logical-root truth so a source or sink that misses a runtime roots-control route can repair its local root set from the authoritative cell before status/query work. This repair refreshes root configuration only; it MUST NOT expand a sink instance beyond the groups assigned by runtime scope evidence.
+   8. trusted observation fan-in: source-status and sink-status readiness evidence MUST be published from source/sink owner units for their assigned groups. Query/facade units aggregate this evidence for API reads, but do not own source/sink readiness for groups outside their runtime placement.
 
 ## [interface] IndexEndpoints
 
@@ -124,6 +127,8 @@ POST /index/rescan -> { accepted: true }
    1. response: `{ "accepted": true }`
    2. write access requires `admin`.
    3. write readiness: server MUST require Management Write Ready before accepting manual rescan. HTTP facade liveness alone is insufficient to enqueue source repair work.
+   4. cluster scope: in runtime-managed mode this operation MUST publish a cluster manual-rescan signal in addition to any runtime control route send, because source-primary roots may live on different nodes from the selected API/control route target.
+   5. repair semantics: accepted manual rescan is a materialization repair wave and MUST republish current root evidence for source-primary roots, not only newly changed filesystem entries.
 
 ## [interface] QueryApiKeyManagementEndpoints
 

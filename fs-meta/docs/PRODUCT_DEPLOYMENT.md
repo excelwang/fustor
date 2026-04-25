@@ -155,13 +155,13 @@ POST /api/fs-meta/v1/index/rescan
 
 - [examples/demo-aggregate-10e8.sh](./examples/demo-aggregate-10e8.sh)
 
-这个脚本只生成 `/stats` 展示口径，不代表 full-NFS 验收完成。full demo 验收必须同时检查 `/status` 中的 artifact evidence、roots/grants、source `coverage_mode`/`coverage_capabilities`、sink `materialization_readiness`。如果 metadata audit 被关闭或不可用，结果应标记为 metadata 降级，而不是完整通过。
+这个脚本只生成 `/stats` 展示口径，不代表 full-NFS 验收完成。脚本名中的 `10e8` 是历史命名，不作为当前数据规模承诺。full demo 验收必须同时检查 `/status` 中的 artifact evidence、roots/grants、source `coverage_mode`/`coverage_capabilities`、sink `materialization_readiness`。如果 metadata audit 被关闭或不可用，结果应标记为 metadata 降级，而不是完整通过。
 
 推荐对外表述：
 
 - fs-meta 把 5 个独立文件源纳入一个统一产品边界
 - `/stats` 按 group 给出稳定统计结果
-- 当前 5 个 groups 合计约 10 亿文件
+- 当前 5 个 groups 合计约 20 亿文件
 
 ## 业务参数分层
 

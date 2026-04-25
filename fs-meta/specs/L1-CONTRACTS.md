@@ -430,11 +430,17 @@ version: 3.0.0
    > Verification: API root/group update applies validation (including rejecting legacy `roots[].source_locator`), updates app-owned authoritative roots/group definitions against current host object grants, consumes current runtime-returned bound scopes only for resulting source/sink refresh and compensatory rescan, and does not promote API/app code into bind/run semantic ownership.
    > Verification: roots apply requires Management Write Ready; HTTP facade liveness alone is insufficient to accept the write.
    > Verification: after an app-defined group is added or removed, projection `tree` / `force-find` group result sets converge to the new defined groups without requiring host restart or runtime auto-discovery of groups.
+   > Verification: restoring a logical root MUST reopen that group for sink materialization even when the previous same-epoch state was still pending; roots apply MUST NOT limit restored groups to previously ready cached materialization evidence.
+   > Verification: accepted logical roots are app-authoritative configuration truth and MUST be recoverable from the authoritative logical-roots cell; source/sink runtime route payloads are propagation hints, not the only source of truth for later query/status repair.
+   > Verification: authoritative logical-root repair MUST NOT expand a sink instance's runtime placement. Placement remains owned by runtime scope evidence; roots repair may refresh the local root view and reconcile only the groups that the runtime already assigned to that sink.
+   > Verification: trusted observation status fan-in MUST be published by source and sink owners for their assigned groups. Query/facade units may consume and aggregate this evidence, but MUST NOT be the sole publisher of source/sink readiness for groups they do not own.
 
 7. **MANUAL_RESCAN_OPERATION**: **fs-meta System** MUST provide explicit manual rescan operation to repair index drift and watch-loss conditions.
    > Covers L0: VISION.API_BOUNDARY.ONLINE_SCOPE_MUTATION_AND_REPAIR
    > Responsibility: offer deterministic operator-triggered repair path independent of periodic audit cadence.
    > Verification: manual rescan API triggers source rescan on group-primary pipelines only and returns accepted operation response.
+   > Verification: in a runtime-managed deployment, manual rescan is a cluster-level repair wave: the API MUST publish a cluster manual-rescan signal so every node that owns a source-primary root can rescan, and MUST NOT rely only on one selected runtime control route.
+   > Verification: manual rescan republishes current root evidence for selected primary roots so newly reopened sink materialization paths can catch up even when file contents are unchanged.
    > Verification: manual rescan requires Management Write Ready; HTTP facade liveness alone is insufficient to enqueue repair work.
 
 8. **PRODUCT_API_NAMESPACE_STABILITY**: **fs-meta System** MUST expose a product-focused management namespace that is independent from legacy test/control helpers.
