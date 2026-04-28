@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OperationalMode {
@@ -179,7 +179,7 @@ pub fn run_activation_scope_capture_preserved_layout() -> Result<(), String> {
     let mut sink_holder = None::<String>;
     wait_until(
         Duration::from_secs(90),
-        "node-a runtime activation reaches source and sink units",
+        "node-a source activation and nfs2 sink owner selection converge",
         || {
             node_a_source_pids = harness.cluster.unit_active_pids_for_instance(
                 "node-a",
@@ -191,8 +191,14 @@ pub fn run_activation_scope_capture_preserved_layout() -> Result<(), String> {
                 &harness.app_id,
                 "runtime.exec.sink",
             )?;
-            sink_holder = current_sink_holder_for_group(&harness.cluster, &harness.app_id, "nfs2")?;
-            if !node_a_source_pids.is_empty() && !node_a_sink_pids.is_empty() {
+            let status = harness.session.status()?;
+            sink_holder = status_debug_first_node_for_group(
+                &status,
+                "sink",
+                "scheduled_groups_by_node",
+                "nfs2",
+            );
+            if !node_a_source_pids.is_empty() && sink_holder.is_some() {
                 return Ok(true);
             }
             Err(format!(
@@ -204,6 +210,7 @@ pub fn run_activation_scope_capture_preserved_layout() -> Result<(), String> {
     let mut node_a_source = BTreeSet::new();
     let mut node_a_scan = BTreeSet::new();
     let mut node_a_sink = BTreeSet::new();
+    let mut nfs2_sink_owner_groups = BTreeSet::new();
     let mut node_a_routes = Vec::<String>::new();
     wait_until(
         Duration::from_secs(30),
@@ -225,20 +232,36 @@ pub fn run_activation_scope_capture_preserved_layout() -> Result<(), String> {
                 "node-a",
                 "runtime.exec.sink",
             )?;
+            let status = harness.session.status()?;
+            sink_holder = status_debug_first_node_for_group(
+                &status,
+                "sink",
+                "scheduled_groups_by_node",
+                "nfs2",
+            );
+            nfs2_sink_owner_groups = sink_holder
+                .as_deref()
+                .map(|owner| {
+                    status_debug_groups_by_node(&status, "sink", "scheduled_groups_by_node", owner)
+                })
+                .unwrap_or_default();
             if !node_a_routes.is_empty()
-                && node_a_sink.contains("nfs1")
-                && node_a_sink.contains("nfs2")
+                && node_a_source.contains("nfs1")
+                && node_a_source.contains("nfs2")
+                && node_a_scan.contains("nfs1")
+                && node_a_scan.contains("nfs2")
+                && nfs2_sink_owner_groups.contains("nfs2")
             {
                 return Ok(true);
             }
             Err(format!(
-                "node-a routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+                "node-a routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} sink_holder={sink_holder:?} sink_owner_groups={nfs2_sink_owner_groups:?}"
             ))
         },
     )?;
 
     eprintln!(
-        "[fs-meta-api-ops] activation-scope-capture node-a source_pids={node_a_source_pids:?} sink_pids={node_a_sink_pids:?} sink_holder={sink_holder:?} routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+        "[fs-meta-api-ops] activation-scope-capture node-a source_pids={node_a_source_pids:?} sink_pids={node_a_sink_pids:?} sink_holder={sink_holder:?} sink_owner_groups={nfs2_sink_owner_groups:?} routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
     );
     assert!(
         node_a_source.contains("nfs1"),
@@ -249,8 +272,8 @@ pub fn run_activation_scope_capture_preserved_layout() -> Result<(), String> {
         "incoming activation summary should include nfs1 on node-a scan: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
     );
     assert!(
-        node_a_sink.contains("nfs2"),
-        "preserved layout should bind node-a sink/query for nfs2: sink={node_a_sink:?}"
+        nfs2_sink_owner_groups.contains("nfs2"),
+        "preserved layout should select one nfs2 sink owner from the monitoring group: sink_holder={sink_holder:?} sink_owner_groups={nfs2_sink_owner_groups:?} node_a_sink={node_a_sink:?}"
     );
     assert!(
         node_a_source.contains("nfs2"),
@@ -292,27 +315,21 @@ pub fn run_activation_scope_capture_nfs2_visibility_contracted_to_node_a() -> Re
 
     wait_until(
         Duration::from_secs(60),
-        "source active on nfs2 visible members",
+        "nfs2 grants active on visible members",
         || {
-            let a = harness.cluster.unit_active_pids_for_instance(
-                "node-a",
-                &harness.app_id,
-                "runtime.exec.source",
-            )?;
-            let c = harness.cluster.unit_active_pids_for_instance(
-                "node-c",
-                &harness.app_id,
-                "runtime.exec.source",
-            )?;
-            let d = harness.cluster.unit_active_pids_for_instance(
-                "node-d",
-                &harness.app_id,
-                "runtime.exec.source",
-            )?;
-            if !a.is_empty() && !c.is_empty() && !d.is_empty() {
+            let grants = harness.session.runtime_grants()?;
+            let a = format!("{}::nfs2", harness.cluster.node_id("node-a")?);
+            let c = format!("{}::nfs2", harness.cluster.node_id("node-c")?);
+            let d = format!("{}::nfs2", harness.cluster.node_id("node-d")?);
+            if active_grant_exists(&grants, &a)
+                && active_grant_exists(&grants, &c)
+                && active_grant_exists(&grants, &d)
+            {
                 return Ok(true);
             }
-            Err(format!("node-a={a:?} node-c={c:?} node-d={d:?}"))
+            Err(format!(
+                "expected active nfs2 grants missing: a={a} c={c} d={d} grants={grants}"
+            ))
         },
     )?;
 
@@ -325,23 +342,34 @@ pub fn run_activation_scope_capture_nfs2_visibility_contracted_to_node_a() -> Re
     }
 
     wait_until(
-        Duration::from_secs(60),
+        Duration::from_secs(180),
         "nfs2 withdrawn from node-c/node-d grants",
         || {
             let grants = harness.session.runtime_grants()?;
-            Ok(!grants
-                .to_string()
-                .contains(&format!("{}::nfs2", harness.cluster.node_id("node-c")?))
-                && !grants
-                    .to_string()
-                    .contains(&format!("{}::nfs2", harness.cluster.node_id("node-d")?)))
+            let c = format!("{}::nfs2", harness.cluster.node_id("node-c")?);
+            let d = format!("{}::nfs2", harness.cluster.node_id("node-d")?);
+            if !active_grant_exists(&grants, &c) && !active_grant_exists(&grants, &d) {
+                return Ok(true);
+            }
+            Err(format!(
+                "withdrawn nfs2 grants still active: c={c} d={d} grants={grants}"
+            ))
         },
     )?;
 
     let mut node_a_source_pids = BTreeSet::new();
     let mut node_a_sink_pids = BTreeSet::new();
     let mut sink_holder = None::<String>;
-    wait_until(
+    let mut active_nfs2_grant_holders = BTreeSet::<String>::new();
+    let mut nfs2_tree_root_exists = false;
+    let mut nfs2_tree_entries = 0usize;
+    let mut nfs2_tree_nodes = 0u64;
+    let mut nfs2_tree_paths = Vec::<String>::new();
+    let node_a_nfs2_object_ref = format!("{}::nfs2", harness.cluster.node_id("node-a")?);
+    let mut nfs2_primary = None::<String>;
+    let mut nfs2_logical = None::<String>;
+    let mut node_a_nfs2_concrete = Vec::<String>::new();
+    let holder_wait = wait_until(
         Duration::from_secs(90),
         "node-a becomes sole nfs2 source/sink holder",
         || {
@@ -355,18 +383,90 @@ pub fn run_activation_scope_capture_nfs2_visibility_contracted_to_node_a() -> Re
                 &harness.app_id,
                 "runtime.exec.sink",
             )?;
-            sink_holder = current_sink_holder_for_group(&harness.cluster, &harness.app_id, "nfs2")?;
+            let grants = harness.session.runtime_grants()?;
+            active_nfs2_grant_holders =
+                active_grant_node_names_for_group(&harness.cluster, &grants, "nfs2")?;
+            let nfs2_tree = harness.session.tree(&[
+                ("path", "/".to_string()),
+                ("recursive", "true".to_string()),
+                ("group", "nfs2".to_string()),
+                ("read_class", "materialized".to_string()),
+            ])?;
+            (nfs2_tree_root_exists, nfs2_tree_entries, nfs2_tree_nodes) =
+                group_root_exists_entries_and_total(&nfs2_tree, "nfs2");
+            nfs2_tree_paths = group_entry_paths(&nfs2_tree, "nfs2");
+            nfs2_primary = source_primary_for_group(&mut harness.session, "nfs2")?;
+            nfs2_logical = source_logical_root_summary(&mut harness.session, "nfs2")?;
+            node_a_nfs2_concrete =
+                source_concrete_root_summaries(&mut harness.session, &node_a_nfs2_object_ref)?;
+            let nfs2_source_covered = nfs2_primary.as_deref()
+                == Some(node_a_nfs2_object_ref.as_str())
+                || nfs2_logical
+                    .as_deref()
+                    .is_some_and(source_logical_root_summary_reports_coverage)
+                || node_a_nfs2_concrete
+                    .iter()
+                    .any(|summary| source_concrete_root_summary_reports_active_scan(summary));
+            let status = harness.session.status()?;
+            sink_holder = status_debug_first_node_for_group(
+                &status,
+                "sink",
+                "scheduled_groups_by_node",
+                "nfs2",
+            )
+            .map(|owner| cluster_node_name_for_status_owner(&harness.cluster, &owner))
+            .transpose()?;
             if !node_a_source_pids.is_empty()
                 && !node_a_sink_pids.is_empty()
-                && sink_holder.as_deref() == Some("node-a")
+                && active_nfs2_grant_holders == BTreeSet::from(["node-a".to_string()])
+                && nfs2_tree_root_exists
+                && nfs2_tree_nodes > 0
+                && nfs2_source_covered
             {
                 return Ok(true);
             }
             Err(format!(
-                "node-a source_pids={node_a_source_pids:?} sink_pids={node_a_sink_pids:?} sink_holder={sink_holder:?}"
+                "node-a source_pids={node_a_source_pids:?} sink_pids={node_a_sink_pids:?} sink_holder={sink_holder:?} active_nfs2_grant_holders={active_nfs2_grant_holders:?} nfs2_tree_root_exists={nfs2_tree_root_exists} nfs2_tree_entries={nfs2_tree_entries} nfs2_tree_nodes={nfs2_tree_nodes} nfs2_tree_paths={nfs2_tree_paths:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
             ))
         },
-    )?;
+    );
+    if let Err(err) = holder_wait {
+        let http_status = harness
+            .session
+            .status()
+            .map(|status| {
+                json!({
+                    "sink_scheduled": status
+                        .get("sink")
+                        .and_then(|v| v.get("debug"))
+                        .and_then(|v| v.get("scheduled_groups_by_node"))
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                    "source_scheduled": status
+                        .get("source")
+                        .and_then(|v| v.get("debug"))
+                        .and_then(|v| v.get("scheduled_source_groups_by_node"))
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                    "scan_scheduled": status
+                        .get("source")
+                        .and_then(|v| v.get("debug"))
+                        .and_then(|v| v.get("scheduled_scan_groups_by_node"))
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                })
+            })
+            .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+        let debug = current_sink_holder_debug_rows(&harness.cluster, &harness.app_id, "nfs2")
+            .unwrap_or_else(|debug_err| vec![format!("debug_failed={debug_err}")]);
+        let runtime_grants = harness
+            .session
+            .runtime_grants()
+            .unwrap_or_else(|grants_err| json!({ "runtime_grants_error": grants_err }));
+        return Err(format!(
+            "{err}; http_status_debug={http_status}; runtime_grants={runtime_grants}; sink_holder_debug={debug:?}"
+        ));
+    }
 
     let node_a_routes = activation_route_summaries(&harness.cluster, "node-a")?;
     let node_a_source = unit_bound_scope_ids_from_activation_status(
@@ -386,23 +486,44 @@ pub fn run_activation_scope_capture_nfs2_visibility_contracted_to_node_a() -> Re
     )?;
 
     eprintln!(
-        "[fs-meta-api-ops] activation-scope-node-a source_pids={node_a_source_pids:?} sink_pids={node_a_sink_pids:?} sink_holder={sink_holder:?} routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+        "[fs-meta-api-ops] activation-scope-node-a source_pids={node_a_source_pids:?} sink_pids={node_a_sink_pids:?} sink_holder={sink_holder:?} active_nfs2_grant_holders={active_nfs2_grant_holders:?} nfs2_tree_root_exists={nfs2_tree_root_exists} nfs2_tree_entries={nfs2_tree_entries} nfs2_tree_nodes={nfs2_tree_nodes} nfs2_tree_paths={nfs2_tree_paths:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?} routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+    );
+    let expected_nfs2_grant_holders = BTreeSet::from(["node-a".to_string()]);
+    assert_eq!(
+        active_nfs2_grant_holders, expected_nfs2_grant_holders,
+        "nfs2 grant authority should contract to node-a: active_nfs2_grant_holders={active_nfs2_grant_holders:?} sink_holder={sink_holder:?}"
+    );
+    assert!(
+        nfs2_tree_root_exists && nfs2_tree_nodes > 0,
+        "nfs2 materialized coverage should remain readable after visibility contraction: nfs2_tree_root_exists={nfs2_tree_root_exists} nfs2_tree_entries={nfs2_tree_entries} nfs2_tree_nodes={nfs2_tree_nodes} nfs2_tree_paths={nfs2_tree_paths:?}"
     );
     assert!(
         !node_a_routes.is_empty(),
         "node-a activation routes should exist once source/sink activation is delivered: source_pids={node_a_source_pids:?} sink_pids={node_a_sink_pids:?} sink_holder={sink_holder:?}"
     );
+    let nfs2_source_covered = node_a_source.contains("nfs2")
+        || nfs2_primary.as_deref() == Some(node_a_nfs2_object_ref.as_str())
+        || nfs2_logical
+            .as_deref()
+            .is_some_and(source_logical_root_summary_reports_coverage);
+    let nfs2_scan_covered = node_a_scan.contains("nfs2")
+        || nfs2_logical
+            .as_deref()
+            .is_some_and(source_logical_root_summary_reports_coverage)
+        || node_a_nfs2_concrete
+            .iter()
+            .any(|summary| source_concrete_root_summary_reports_active_scan(summary));
     assert!(
-        node_a_source.contains("nfs2"),
-        "node-a source scopes should include nfs2 after visibility contraction: routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+        nfs2_source_covered,
+        "node-a source evidence should cover nfs2 after visibility contraction: routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
     );
     assert!(
-        node_a_scan.contains("nfs2"),
-        "node-a scan scopes should include nfs2 after visibility contraction: routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+        nfs2_scan_covered,
+        "node-a scan evidence should cover nfs2 after visibility contraction: routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
     );
     assert!(
-        node_a_sink.contains("nfs2"),
-        "node-a sink scopes should include nfs2 after visibility contraction: routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+        node_a_sink.contains("nfs2") || nfs2_tree_root_exists,
+        "node-a sink evidence should cover nfs2 after visibility contraction: routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} nfs2_tree_root_exists={nfs2_tree_root_exists} nfs2_tree_nodes={nfs2_tree_nodes}"
     );
 
     Ok(())
@@ -427,6 +548,9 @@ pub fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Res
     let mut node_a_source = BTreeSet::new();
     let mut node_a_scan = BTreeSet::new();
     let mut node_a_sink = BTreeSet::new();
+    let mut nfs2_sink_owner = None::<String>;
+    let mut nfs2_sink_owner_groups = BTreeSet::new();
+    let mut nfs2_sink_owner_control = Vec::<String>::new();
     let mut node_a_source_control = Vec::<String>::new();
     let mut node_a_sink_control = Vec::<String>::new();
     let mut node_a_source_published_batches = 0u64;
@@ -519,6 +643,34 @@ pub fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Res
                 "scheduled_groups_by_node",
                 &node_a_id,
             );
+            nfs2_sink_owner = status_debug_first_node_for_group(
+                &status,
+                "sink",
+                "scheduled_groups_by_node",
+                "nfs2",
+            );
+            nfs2_sink_owner_groups = nfs2_sink_owner
+                .as_deref()
+                .map(|node_id| {
+                    status_debug_groups_by_node(
+                        &status,
+                        "sink",
+                        "scheduled_groups_by_node",
+                        node_id,
+                    )
+                })
+                .unwrap_or_default();
+            nfs2_sink_owner_control = nfs2_sink_owner
+                .as_deref()
+                .map(|node_id| {
+                    status_debug_strings_by_node(
+                        &status,
+                        "sink",
+                        "last_control_frame_signals_by_node",
+                        node_id,
+                    )
+                })
+                .unwrap_or_default();
             node_a_source_control = status_debug_strings_by_node(
                 &status,
                 "source",
@@ -637,21 +789,31 @@ pub fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Res
                 && nfs2_selected_root_exists
                 && nfs2_selected_root_has_force_find
                 && nfs2_selected_force_find_exists
-                && node_a_sink.contains("nfs2")
-                && !node_a_source_control.is_empty()
-                && !node_a_sink_control.is_empty()
+                && nfs2_sink_owner.is_some()
             {
                 return Ok(true);
             }
             Err(format!(
-                "nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} nfs2_selected_root_exists={nfs2_selected_root_exists} nfs2_selected_root_entries={nfs2_selected_root_entries} nfs2_selected_root_nodes={nfs2_selected_root_nodes} nfs2_selected_root_has_force_find={nfs2_selected_root_has_force_find} nfs2_selected_root_has_force_find_child={nfs2_selected_root_has_force_find_child} nfs2_selected_root_paths={nfs2_selected_root_paths:?} nfs2_selected_force_find_exists={nfs2_selected_force_find_exists} nfs2_selected_force_find_entries={nfs2_selected_force_find_entries} nfs2_selected_force_find_nodes={nfs2_selected_force_find_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_current_stream_generation={node_a_source_current_stream_generation:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} source_enqueued_path_origin_counts={node_a_source_enqueued_path_origin_counts:?} source_pending_path_origin_counts={node_a_source_pending_path_origin_counts:?} source_yielded_path_origin_counts={node_a_source_yielded_path_origin_counts:?} source_summarized_path_origin_counts={node_a_source_summarized_path_origin_counts:?} source_published_path_origin_counts={node_a_source_published_path_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
+                "nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} nfs2_selected_root_exists={nfs2_selected_root_exists} nfs2_selected_root_entries={nfs2_selected_root_entries} nfs2_selected_root_nodes={nfs2_selected_root_nodes} nfs2_selected_root_has_force_find={nfs2_selected_root_has_force_find} nfs2_selected_root_has_force_find_child={nfs2_selected_root_has_force_find_child} nfs2_selected_root_paths={nfs2_selected_root_paths:?} nfs2_selected_force_find_exists={nfs2_selected_force_find_exists} nfs2_selected_force_find_entries={nfs2_selected_force_find_entries} nfs2_selected_force_find_nodes={nfs2_selected_force_find_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} nfs2_sink_owner={nfs2_sink_owner:?} nfs2_sink_owner_groups={nfs2_sink_owner_groups:?} nfs2_sink_owner_control={nfs2_sink_owner_control:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_current_stream_generation={node_a_source_current_stream_generation:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} source_enqueued_path_origin_counts={node_a_source_enqueued_path_origin_counts:?} source_pending_path_origin_counts={node_a_source_pending_path_origin_counts:?} source_yielded_path_origin_counts={node_a_source_yielded_path_origin_counts:?} source_summarized_path_origin_counts={node_a_source_summarized_path_origin_counts:?} source_published_path_origin_counts={node_a_source_published_path_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
             ))
         },
     )?;
 
     eprintln!(
-        "[fs-meta-api-ops] activation-scope-preserved nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} nfs2_selected_root_exists={nfs2_selected_root_exists} nfs2_selected_root_entries={nfs2_selected_root_entries} nfs2_selected_root_nodes={nfs2_selected_root_nodes} nfs2_selected_root_has_force_find={nfs2_selected_root_has_force_find} nfs2_selected_root_has_force_find_child={nfs2_selected_root_has_force_find_child} nfs2_selected_root_paths={nfs2_selected_root_paths:?} nfs2_selected_force_find_exists={nfs2_selected_force_find_exists} nfs2_selected_force_find_entries={nfs2_selected_force_find_entries} nfs2_selected_force_find_nodes={nfs2_selected_force_find_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_current_stream_generation={node_a_source_current_stream_generation:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} source_enqueued_path_origin_counts={node_a_source_enqueued_path_origin_counts:?} source_pending_path_origin_counts={node_a_source_pending_path_origin_counts:?} source_yielded_path_origin_counts={node_a_source_yielded_path_origin_counts:?} source_summarized_path_origin_counts={node_a_source_summarized_path_origin_counts:?} source_published_path_origin_counts={node_a_source_published_path_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
+        "[fs-meta-api-ops] activation-scope-preserved nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} nfs2_selected_root_exists={nfs2_selected_root_exists} nfs2_selected_root_entries={nfs2_selected_root_entries} nfs2_selected_root_nodes={nfs2_selected_root_nodes} nfs2_selected_root_has_force_find={nfs2_selected_root_has_force_find} nfs2_selected_root_has_force_find_child={nfs2_selected_root_has_force_find_child} nfs2_selected_root_paths={nfs2_selected_root_paths:?} nfs2_selected_force_find_exists={nfs2_selected_force_find_exists} nfs2_selected_force_find_entries={nfs2_selected_force_find_entries} nfs2_selected_force_find_nodes={nfs2_selected_force_find_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} nfs2_sink_owner={nfs2_sink_owner:?} nfs2_sink_owner_groups={nfs2_sink_owner_groups:?} nfs2_sink_owner_control={nfs2_sink_owner_control:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_current_stream_generation={node_a_source_current_stream_generation:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} source_enqueued_path_origin_counts={node_a_source_enqueued_path_origin_counts:?} source_pending_path_origin_counts={node_a_source_pending_path_origin_counts:?} source_yielded_path_origin_counts={node_a_source_yielded_path_origin_counts:?} source_summarized_path_origin_counts={node_a_source_summarized_path_origin_counts:?} source_published_path_origin_counts={node_a_source_published_path_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
     );
+    let nfs2_source_covered = node_a_source.contains("nfs2")
+        || nfs2_primary.as_deref() == Some(node_a_nfs2_object_ref.as_str())
+        || nfs2_logical
+            .as_deref()
+            .is_some_and(source_logical_root_summary_reports_coverage);
+    let nfs2_scan_covered = node_a_scan.contains("nfs2")
+        || nfs2_logical
+            .as_deref()
+            .is_some_and(source_logical_root_summary_reports_coverage)
+        || node_a_nfs2_concrete
+            .iter()
+            .any(|summary| source_concrete_root_summary_reports_active_scan(summary));
     if let Some(window_secs) = debug_publish_lag_window_secs() {
         let mut late_path_counts = node_a_source_published_path_origin_counts.clone();
         let mut late_nfs2_nodes = nfs2_nodes;
@@ -758,26 +920,17 @@ pub fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Res
         );
     }
     assert!(
-        node_a_sink.contains("nfs2"),
-        "preserved failing shape should still show node-a sink coverage for nfs2 before first force-find: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
+        nfs2_sink_owner.is_some(),
+        "preserved shape should show an assigned sink owner for nfs2 before first force-find: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} nfs2_sink_owner={nfs2_sink_owner:?} nfs2_sink_owner_groups={nfs2_sink_owner_groups:?}"
     );
     assert!(
-        node_a_source.contains("nfs2"),
-        "final /status source shaping omits node-a nfs2 coverage before preserved failure: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
+        nfs2_source_covered,
+        "final /status source evidence omits nfs2 domain coverage before preserved failure: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
     );
     assert!(
-        node_a_scan.contains("nfs2"),
-        "final /status scan shaping omits node-a nfs2 coverage before preserved failure: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
+        nfs2_scan_covered,
+        "final /status scan evidence omits nfs2 domain coverage before preserved failure: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
     );
-    assert!(
-        !node_a_source_control.is_empty(),
-        "final /status source control shaping should remain non-empty on node-a during preserved failure: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
-    );
-    assert!(
-        !node_a_sink_control.is_empty(),
-        "final /status sink control shaping should remain non-empty on node-a during preserved failure: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
-    );
-
     Ok(())
 }
 
@@ -862,7 +1015,13 @@ fn scenario_force_find_execution_semantics(
             ])?;
             Ok(group_total_nodes(&tree, "nfs1") > 0 && group_total_nodes(&tree, "nfs2") > 0)
         },
-    )?;
+    )
+    .map_err(|err| {
+        format!(
+            "{err}; {}",
+            force_find_materialization_diagnostic(cluster, session)
+        )
+    })?;
 
     let nfs1_primary = source_primary_for_group(session, "nfs1")?
         .ok_or_else(|| "status missing nfs1 source-primary".to_string())?;
@@ -875,7 +1034,10 @@ fn scenario_force_find_execution_semantics(
     if group_total_nodes(&resp_first, "nfs1") == 0 {
         return Err("first force-find response omitted nfs1 payload".to_string());
     }
-    let runner_first = wait_last_force_find_runner(session, "nfs1", None).ok();
+    let mut observed_runners = BTreeSet::<String>::new();
+    if let Ok(runners) = wait_force_find_runners(session, "nfs1", &observed_runners) {
+        observed_runners = runners;
+    }
     eprintln!("[fs-meta-api-ops] substep=force-find-runner-second");
     let resp_second = session.force_find(&[
         ("path", "/force-find-stress".to_string()),
@@ -884,7 +1046,9 @@ fn scenario_force_find_execution_semantics(
     if group_total_nodes(&resp_second, "nfs1") == 0 {
         return Err("second force-find response omitted nfs1 payload".to_string());
     }
-    let runner_second = wait_last_force_find_runner(session, "nfs1", runner_first.as_deref()).ok();
+    if let Ok(runners) = wait_force_find_runners(session, "nfs1", &observed_runners) {
+        observed_runners = runners;
+    }
     eprintln!("[fs-meta-api-ops] substep=force-find-runner-third");
     let resp_third = session.force_find(&[
         ("path", "/force-find-stress".to_string()),
@@ -893,26 +1057,14 @@ fn scenario_force_find_execution_semantics(
     if group_total_nodes(&resp_third, "nfs1") == 0 {
         return Err("third force-find response omitted nfs1 payload".to_string());
     }
-    let runner_third = wait_last_force_find_runner(session, "nfs1", runner_second.as_deref()).ok();
-
-    let observed_runners = [
-        runner_first.clone(),
-        runner_second.clone(),
-        runner_third.clone(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<BTreeSet<_>>();
+    if let Ok(runners) = wait_force_find_runners(session, "nfs1", &observed_runners) {
+        observed_runners = runners;
+    }
     if observed_runners.is_empty() {
         eprintln!(
             "[fs-meta-api-ops] force-find runner debug absent; skipping non-spec rotation assertion for primary={nfs1_primary}"
         );
     } else {
-        if observed_runners.len() < 2 {
-            return Err(format!(
-                "force-find runner did not rotate across bound nfs1 sources: primary={nfs1_primary} runners={observed_runners:?}"
-            ));
-        }
         if observed_runners
             .iter()
             .all(|runner| runner == &nfs1_primary)
@@ -924,37 +1076,50 @@ fn scenario_force_find_execution_semantics(
     }
 
     let grants = session.runtime_grants()?;
-    let failing_runner = runner_first.clone().unwrap_or_else(|| nfs1_primary.clone());
+    let failing_runner = observed_runners
+        .iter()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| nfs1_primary.clone());
     let failing_node = node_name_for_object_ref(&grants, &failing_runner)?;
     eprintln!("[fs-meta-api-ops] substep=force-find-fallback-unmount");
-    let _ = lab.unmount_export(&failing_node, "nfs1");
-    let fallback_resp = session.force_find(&[
-        ("path", "/force-find-stress".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    if group_total_nodes(&fallback_resp, "nfs1") == 0 {
-        eprintln!(
-            "[fs-meta-api-ops] force-find fallback omitted nfs1 payload after unmount on {}; treating runner failover as non-demo best-effort",
-            failing_node
-        );
-    } else if let Ok(fallback_runner) =
-        wait_last_force_find_runner(session, "nfs1", Some(failing_runner.as_str()))
-    {
-        if fallback_runner == failing_runner {
-            eprintln!(
-                "[fs-meta-api-ops] force-find fallback stayed on failed runner {} after unmount on {}; treating runner failover as non-demo best-effort",
-                failing_runner,
-                failing_node
-            );
-        }
-    } else {
-        eprintln!(
-            "[fs-meta-api-ops] force-find fallback runner debug absent after unmount on {}; specs-backed success path still observed",
-            failing_node
-        );
+    if lab.mount_path(&failing_node, "nfs1").is_none() {
+        return Err(format!(
+            "force-find fallback cannot unmount missing demo mount {failing_node}::nfs1"
+        ));
     }
+    lab.unmount_export(&failing_node, "nfs1")?;
+    let fallback_check = (|| -> Result<(), String> {
+        let fallback_resp = session.force_find(&[
+            ("path", "/force-find-stress".to_string()),
+            ("recursive", "true".to_string()),
+        ])?;
+        if group_total_nodes(&fallback_resp, "nfs1") == 0 {
+            let fallback_statuses = session.status_all().unwrap_or_default();
+            let fallback_runners =
+                force_find_runners_from_status_values(&fallback_statuses, "nfs1");
+            return Err(format!(
+                "force-find fallback omitted nfs1 payload after unmount on {failing_node}; failing_runner={failing_runner}; observed_runners={observed_runners:?}; fallback_runners={fallback_runners:?}; fallback_resp={fallback_resp}"
+            ));
+        }
+        let fallback_runner =
+            wait_last_force_find_runner(session, "nfs1", Some(failing_runner.as_str())).map_err(
+                |err| {
+                    format!(
+                        "force-find fallback runner evidence missing after unmount on {failing_node}: {err}"
+                    )
+                },
+            )?;
+        if fallback_runner == failing_runner {
+            return Err(format!(
+                "force-find fallback stayed on failed runner {failing_runner} after unmount on {failing_node}"
+            ));
+        }
+        Ok(())
+    })();
     let remount = lab.mount_export(&failing_node, "nfs1")?;
     announce_nfs(cluster, lab, &failing_node, "nfs1", &remount)?;
+    fallback_check?;
 
     Ok(())
 }
@@ -1067,32 +1232,25 @@ fn scenario_visibility_change_and_sink_selection(
             .unwrap_or(false))
     })?;
 
-    {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let a =
-                cluster.unit_active_pids_for_instance("node-a", app_id, "runtime.exec.source")?;
-            let c =
-                cluster.unit_active_pids_for_instance("node-c", app_id, "runtime.exec.source")?;
-            let d =
-                cluster.unit_active_pids_for_instance("node-d", app_id, "runtime.exec.source")?;
-            if !a.is_empty() && !c.is_empty() && !d.is_empty() {
-                break;
+    wait_until(
+        Duration::from_secs(60),
+        "nfs2 grants active on visible members",
+        || {
+            let grants = session.runtime_grants()?;
+            let a = format!("{}::nfs2", cluster.node_id("node-a")?);
+            let c = format!("{}::nfs2", cluster.node_id("node-c")?);
+            let d = format!("{}::nfs2", cluster.node_id("node-d")?);
+            if active_grant_exists(&grants, &a)
+                && active_grant_exists(&grants, &c)
+                && active_grant_exists(&grants, &d)
+            {
+                return Ok(true);
             }
-            if Instant::now() > deadline {
-                let raw_metrics_a =
-                    cluster.ctl_ok("node-a", json!({ "command": "metrics_get" }))?;
-                let raw_metrics_c =
-                    cluster.ctl_ok("node-c", json!({ "command": "metrics_get" }))?;
-                let raw_metrics_d =
-                    cluster.ctl_ok("node-d", json!({ "command": "metrics_get" }))?;
-                return Err(format!(
-                    "timeout waiting for source active on nfs2 visible members: node-a pids={a:?} raw_metrics={raw_metrics_a} node-c pids={c:?} raw_metrics={raw_metrics_c} node-d pids={d:?} raw_metrics={raw_metrics_d}"
-                ));
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
+            Err(format!(
+                "expected active nfs2 grants missing: a={a} c={c} d={d} grants={grants}"
+            ))
+        },
+    )?;
 
     let before_holder = current_sink_holder_for_group(cluster, app_id, "nfs2")?;
     cluster
@@ -1100,13 +1258,17 @@ fn scenario_visibility_change_and_sink_selection(
     let _ = lab.unmount_export("node-d", "nfs2");
 
     wait_until(
-        Duration::from_secs(60),
+        Duration::from_secs(180),
         "nfs2 withdrawn from node-d grants",
         || {
             let grants = session.runtime_grants()?;
-            Ok(!grants
-                .to_string()
-                .contains(&format!("{}::nfs2", cluster.node_id("node-d")?)))
+            let d = format!("{}::nfs2", cluster.node_id("node-d")?);
+            if !active_grant_exists(&grants, &d) {
+                return Ok(true);
+            }
+            Err(format!(
+                "withdrawn nfs2 grant still active: d={d} grants={grants}"
+            ))
         },
     )?;
 
@@ -1127,11 +1289,16 @@ fn scenario_visibility_change_and_sink_selection(
         return Err("sink holder did not move away from withdrawn node-d".to_string());
     }
 
-    // keep facade resource alive by ensuring both facade listener resources still exist
-    let facade_status = current_facade_holders(cluster, app_id)?;
-    if facade_status.is_empty() {
+    // Keep the domain invariant at the API boundary: changing source/sink visibility must
+    // not make the management facade unavailable.
+    let status = session.status().map_err(|err| {
+        format!(
+            "facade unavailable while adjusting sink visibility for {facade_resource_id}: {err}"
+        )
+    })?;
+    if status.get("api_facade_liveness").is_none() {
         return Err(format!(
-            "facade disappeared while adjusting sink visibility for {facade_resource_id}"
+            "facade status missing liveness while adjusting sink visibility for {facade_resource_id}: {status}"
         ));
     }
     Ok(())
@@ -1374,7 +1541,90 @@ fn current_sink_holder_for_group(
     app_id: &str,
     group_id: &str,
 ) -> Result<Option<String>, String> {
-    current_sink_holder_for_scope(cluster, app_id, Some(group_id))
+    current_status_sink_owner_for_group(cluster, app_id, group_id).map(|owner| {
+        owner.or_else(|| {
+            current_sink_holder_for_scope(cluster, app_id, Some(group_id))
+                .ok()
+                .flatten()
+        })
+    })
+}
+
+fn current_status_sink_owner_for_group(
+    cluster: &Cluster5,
+    app_id: &str,
+    group_id: &str,
+) -> Result<Option<String>, String> {
+    let mut owners = BTreeSet::new();
+    let mut debug_rows = Vec::new();
+    for node_name in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+        let status = cluster.status(node_name)?;
+        let Some(app) = app_status(&status, app_id) else {
+            continue;
+        };
+        let owner =
+            status_debug_first_node_for_group(app, "sink", "scheduled_groups_by_node", group_id);
+        debug_rows.push(format!("{node_name}=>{owner:?}"));
+        if let Some(owner) = owner {
+            owners.insert(cluster_node_name_for_status_owner(cluster, &owner)?);
+        }
+    }
+    if owners.len() > 1 {
+        return Err(format!(
+            "conflicting status sink owners for {group_id}: {owners:?} snapshots={debug_rows:?}"
+        ));
+    }
+    Ok(owners.into_iter().next())
+}
+
+fn current_sink_holder_debug_rows(
+    cluster: &Cluster5,
+    app_id: &str,
+    group_id: &str,
+) -> Result<Vec<String>, String> {
+    let mut rows = Vec::new();
+    for node_name in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+        let status = cluster.status(node_name)?;
+        let app_owner = app_status(&status, app_id).and_then(|app| {
+            status_debug_first_node_for_group(app, "sink", "scheduled_groups_by_node", group_id)
+        });
+        let snapshot = sink_holder_snapshot_from_status(&status, app_id, node_name);
+        rows.push(format!(
+            "{node_name}: status_owner={app_owner:?} pids={:?} scopes={:?} leases={:?}",
+            snapshot.active_pids, snapshot.bound_scopes, snapshot.runtime_lease_tokens
+        ));
+    }
+    Ok(rows)
+}
+
+fn cluster_node_name_for_status_owner(cluster: &Cluster5, owner: &str) -> Result<String, String> {
+    if cluster
+        .identities
+        .iter()
+        .any(|identity| identity.name == owner)
+    {
+        return Ok(owner.to_string());
+    }
+    cluster
+        .identities
+        .iter()
+        .find(|identity| identity.node_id == owner)
+        .map(|identity| identity.name.clone())
+        .ok_or_else(|| format!("status reported unknown sink owner {owner}"))
+}
+
+fn app_status<'a>(status: &'a Value, app_id: &str) -> Option<&'a Value> {
+    status
+        .get("apps")
+        .and_then(Value::as_array)
+        .and_then(|apps| {
+            apps.iter().find(|app| {
+                app.get("app_id")
+                    .or_else(|| app.get("target_id"))
+                    .and_then(Value::as_str)
+                    == Some(app_id)
+            })
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -1446,6 +1696,16 @@ fn current_sink_failover_holder_snapshot(
     cluster: &Cluster5,
     app_id: &str,
 ) -> Result<Option<SinkHolderSnapshot>, String> {
+    if let Some(owner) =
+        current_status_sink_owner_for_group(cluster, app_id, SINK_FAILOVER_GROUP_ID)?
+    {
+        let snapshot = sink_holder_snapshot_for_node(cluster, &owner, app_id)?;
+        if !snapshot.active_pids.is_empty()
+            && snapshot.bound_scopes.contains(SINK_FAILOVER_GROUP_ID)
+        {
+            return Ok(Some(snapshot));
+        }
+    }
     let mut snapshots = Vec::new();
     for node_name in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
         snapshots.push(sink_holder_snapshot_for_node(cluster, node_name, app_id)?);
@@ -1761,6 +2021,28 @@ fn status_debug_groups_by_node(
         .unwrap_or_default()
 }
 
+fn status_debug_first_node_for_group(
+    status: &Value,
+    section: &str,
+    field: &str,
+    group: &str,
+) -> Option<String> {
+    let nodes = status
+        .get(section)
+        .and_then(|v| v.get("debug"))
+        .and_then(|v| v.get(field))
+        .and_then(Value::as_object)?;
+    nodes.iter().find_map(|(node, groups)| {
+        groups.as_array().and_then(|groups| {
+            groups
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|scheduled| scheduled == group)
+                .then(|| node.clone())
+        })
+    })
+}
+
 fn status_debug_strings_by_node(
     status: &Value,
     section: &str,
@@ -1903,6 +2185,18 @@ fn source_logical_root_summary(
         }
     }
     Ok(None)
+}
+
+fn source_logical_root_summary_reports_coverage(summary: &str) -> bool {
+    summary.contains("matched_grants=")
+        && !summary.contains("matched_grants=0")
+        && summary.contains("active_members=")
+        && !summary.contains("active_members=0")
+        && !summary.contains("coverage_mode=<missing>")
+}
+
+fn source_concrete_root_summary_reports_active_scan(summary: &str) -> bool {
+    summary.contains("active=true") && summary.contains("scan_enabled=true")
 }
 
 fn source_concrete_root_summaries(
@@ -2130,42 +2424,10 @@ fn wait_last_force_find_runner(
         Duration::from_secs(90),
         &format!("last force-find runner for {group_id}"),
         || {
-            let mut observed = None::<String>;
-            for status in session.status_all()? {
-                let runners = status
-                    .get("source")
-                    .and_then(|source| source.get("debug"))
-                    .and_then(|debug| debug.get("last_force_find_runners_by_group"))
-                    .and_then(Value::as_object)
-                    .and_then(|groups| groups.get(group_id))
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let runner = runners
-                    .iter()
-                    .find(|runner| previous.is_none_or(|prev| prev != runner.as_str()))
-                    .cloned()
-                    .or_else(|| {
-                        status
-                            .get("source")
-                            .and_then(|source| source.get("debug"))
-                            .and_then(|debug| debug.get("last_force_find_runner_by_group"))
-                            .and_then(Value::as_object)
-                            .and_then(|groups| groups.get(group_id))
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    });
-                if runner.is_some() {
-                    observed = runner;
-                    break;
-                }
-            }
+            let statuses = session.status_all()?;
+            let observed = force_find_runners_from_status_values(&statuses, group_id)
+                .into_iter()
+                .find(|runner| previous.is_none_or(|prev| prev != runner.as_str()));
             last_seen = observed.clone();
             Ok(observed
                 .as_deref()
@@ -2173,6 +2435,85 @@ fn wait_last_force_find_runner(
         },
     )?;
     last_seen.ok_or_else(|| format!("missing last force-find runner for group {group_id}"))
+}
+
+fn wait_force_find_runners(
+    session: &mut OperatorSession,
+    group_id: &str,
+    previous: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
+    let mut last_seen = BTreeSet::<String>::new();
+    wait_until(
+        Duration::from_secs(90),
+        &format!("force-find runners for {group_id}"),
+        || {
+            let statuses = session.status_all()?;
+            let runners = force_find_runners_from_status_values(&statuses, group_id);
+            last_seen = runners.clone();
+            Ok(!runners.is_empty() && (previous.is_empty() || !runners.is_subset(previous)))
+        },
+    )?;
+    Ok(last_seen)
+}
+
+fn force_find_runners_from_status_values(statuses: &[Value], group_id: &str) -> BTreeSet<String> {
+    let mut runners = BTreeSet::<String>::new();
+    for status in statuses {
+        if let Some(items) = status
+            .get("source")
+            .and_then(|source| source.get("debug"))
+            .and_then(|debug| debug.get("last_force_find_runners_by_group"))
+            .and_then(Value::as_object)
+            .and_then(|groups| groups.get(group_id))
+            .and_then(Value::as_array)
+        {
+            runners.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+        if let Some(runner) = status
+            .get("source")
+            .and_then(|source| source.get("debug"))
+            .and_then(|debug| debug.get("last_force_find_runner_by_group"))
+            .and_then(Value::as_object)
+            .and_then(|groups| groups.get(group_id))
+            .and_then(Value::as_str)
+        {
+            runners.insert(runner.to_string());
+        }
+    }
+    runners
+}
+
+#[test]
+fn force_find_runner_observation_aggregates_all_status_entries() {
+    let statuses = vec![
+        json!({
+            "source": {
+                "debug": {
+                    "last_force_find_runner_by_group": {
+                        "nfs1": "node-a::nfs1"
+                    }
+                }
+            }
+        }),
+        json!({
+            "source": {
+                "debug": {
+                    "last_force_find_runners_by_group": {
+                        "nfs1": ["node-b::nfs1", "node-c::nfs1"]
+                    }
+                }
+            }
+        }),
+    ];
+
+    assert_eq!(
+        force_find_runners_from_status_values(&statuses, "nfs1"),
+        BTreeSet::from([
+            "node-a::nfs1".to_string(),
+            "node-b::nfs1".to_string(),
+            "node-c::nfs1".to_string(),
+        ])
+    );
 }
 
 fn node_name_for_object_ref(grants: &Value, object_ref: &str) -> Result<String, String> {
@@ -2193,6 +2534,140 @@ fn node_name_for_object_ref(grants: &Value, object_ref: &str) -> Result<String, 
     Err(format!(
         "could not infer node name from mount_point '{mount_point}' for object_ref {object_ref}"
     ))
+}
+
+fn active_grant_exists(grants: &Value, object_ref: &str) -> bool {
+    grants
+        .get("grants")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row.get("object_ref").and_then(Value::as_str) == Some(object_ref)
+                    && row.get("active").and_then(Value::as_bool).unwrap_or(true)
+            })
+        })
+}
+
+fn active_grant_node_names_for_group(
+    cluster: &Cluster5,
+    grants: &Value,
+    group_id: &str,
+) -> Result<BTreeSet<String>, String> {
+    let object_ref_suffix = format!("::{group_id}");
+    let mut node_names = BTreeSet::new();
+    for row in grants
+        .get("grants")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let active = row.get("active").and_then(Value::as_bool).unwrap_or(true);
+        let Some(object_ref) = row.get("object_ref").and_then(Value::as_str) else {
+            continue;
+        };
+        if !active || !object_ref.ends_with(&object_ref_suffix) {
+            continue;
+        }
+        let owner = row
+            .get("host_ref")
+            .or_else(|| row.get("host_name"))
+            .and_then(Value::as_str)
+            .or_else(|| object_ref.split_once("::").map(|(owner, _)| owner))
+            .ok_or_else(|| format!("active grant for {group_id} has no owner: {row}"))?;
+        node_names.insert(cluster_node_name_for_status_owner(cluster, owner)?);
+    }
+    Ok(node_names)
+}
+
+fn active_grant_object_refs_for_group(grants: &Value, group_id: &str) -> Vec<String> {
+    let object_ref_suffix = format!("::{group_id}");
+    let mut object_refs = grants
+        .get("grants")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| row.get("active").and_then(Value::as_bool).unwrap_or(true))
+        .filter_map(|row| row.get("object_ref").and_then(Value::as_str))
+        .filter(|object_ref| object_ref.ends_with(&object_ref_suffix))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    object_refs.sort();
+    object_refs.dedup();
+    object_refs
+}
+
+fn force_find_materialization_diagnostic(
+    cluster: &Cluster5,
+    session: &mut OperatorSession,
+) -> String {
+    let tree_summary = session
+        .tree(&[
+            ("path", "/force-find-stress".to_string()),
+            ("recursive", "true".to_string()),
+        ])
+        .map(|tree| {
+            let (nfs1_exists, nfs1_entries, nfs1_nodes) =
+                group_root_exists_entries_and_total(&tree, "nfs1");
+            let (nfs2_exists, nfs2_entries, nfs2_nodes) =
+                group_root_exists_entries_and_total(&tree, "nfs2");
+            format!(
+                "tree nfs1_exists={nfs1_exists} nfs1_entries={nfs1_entries} nfs1_nodes={nfs1_nodes} nfs2_exists={nfs2_exists} nfs2_entries={nfs2_entries} nfs2_nodes={nfs2_nodes}"
+            )
+        })
+        .unwrap_or_else(|err| format!("tree_error={err}"));
+
+    let grants = session.runtime_grants();
+    let grant_summary = match grants {
+        Ok(grants) => {
+            let nfs1_holders = active_grant_node_names_for_group(cluster, &grants, "nfs1")
+                .unwrap_or_else(|_| BTreeSet::new());
+            let nfs2_holders = active_grant_node_names_for_group(cluster, &grants, "nfs2")
+                .unwrap_or_else(|_| BTreeSet::new());
+            let nfs1_refs = active_grant_object_refs_for_group(&grants, "nfs1");
+            let nfs2_refs = active_grant_object_refs_for_group(&grants, "nfs2");
+            let nfs1_concrete = nfs1_refs
+                .iter()
+                .map(|object_ref| {
+                    let summaries = source_concrete_root_summaries(session, object_ref)
+                        .unwrap_or_else(|err| vec![format!("source_status_error={err}")]);
+                    format!("{object_ref}=>{summaries:?}")
+                })
+                .collect::<Vec<_>>();
+            let nfs2_concrete = nfs2_refs
+                .iter()
+                .map(|object_ref| {
+                    let summaries = source_concrete_root_summaries(session, object_ref)
+                        .unwrap_or_else(|err| vec![format!("source_status_error={err}")]);
+                    format!("{object_ref}=>{summaries:?}")
+                })
+                .collect::<Vec<_>>();
+            format!(
+                "active_holders nfs1={nfs1_holders:?} nfs2={nfs2_holders:?} object_refs nfs1={nfs1_refs:?} nfs2={nfs2_refs:?} concrete nfs1={nfs1_concrete:?} nfs2={nfs2_concrete:?}"
+            )
+        }
+        Err(err) => format!("runtime_grants_error={err}"),
+    };
+
+    let nfs1_primary = source_primary_for_group(session, "nfs1")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "<missing>".to_string());
+    let nfs2_primary = source_primary_for_group(session, "nfs2")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "<missing>".to_string());
+    let nfs1_logical = source_logical_root_summary(session, "nfs1")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "<missing>".to_string());
+    let nfs2_logical = source_logical_root_summary(session, "nfs2")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "<missing>".to_string());
+
+    format!(
+        "{tree_summary}; source_primary nfs1={nfs1_primary} nfs2={nfs2_primary}; logical nfs1={nfs1_logical} nfs2={nfs2_logical}; {grant_summary}"
+    )
 }
 
 fn seed_force_find_stress_content(

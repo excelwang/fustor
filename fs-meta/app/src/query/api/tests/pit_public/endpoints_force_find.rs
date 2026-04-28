@@ -347,6 +347,7 @@ async fn concurrent_public_tree_requests_both_settle_under_multi_group_selected_
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let make_req = || {

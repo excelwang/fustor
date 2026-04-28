@@ -283,6 +283,151 @@ async fn collect_materialized_stats_groups_trusted_prefers_richer_proxy_stats_wh
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collect_materialized_stats_groups_trusted_reuses_same_authority_stats_snapshot_without_reroute(
+) {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a");
+    fs::create_dir_all(node_a_root.join("layout-a")).expect("create node-a dir");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-a::nfs2".to_string(),
+        host_ref: "node-a".to_string(),
+        host_ip: "10.0.0.1".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: node_a_root.clone(),
+        fs_source: "nfs".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let source = source_facade_with_group("nfs2", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let node_a_route = sink_query_request_route_for("node-a");
+    let mut owner_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_a_route.clone(),
+        "test-trusted-root-stats-steady-cache-owner-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            let mut responses = Vec::new();
+            for req in requests {
+                let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                    .expect("decode node-a stats request");
+                let group_id = params
+                    .scope
+                    .selected_group
+                    .clone()
+                    .expect("selected group for node-a stats request");
+                let payload =
+                    rmp_serde::to_vec_named(&MaterializedQueryPayload::Stats(SubtreeStats {
+                        total_nodes: 7,
+                        total_files: 5,
+                        total_dirs: 2,
+                        total_size: 41,
+                        latest_file_mtime_us: Some(1775804122265404),
+                        ..SubtreeStats::default()
+                    }))
+                    .expect("encode stats payload");
+                responses.push(mk_event_with_correlation(
+                    &group_id,
+                    req.metadata()
+                        .correlation_id
+                        .expect("node-a stats request correlation"),
+                    payload,
+                ));
+            }
+            responses
+        },
+    );
+
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+    );
+    let request_sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs2".to_string()],
+        )]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs2".to_string(),
+            primary_object_ref: "node-a::nfs2".to_string(),
+            total_nodes: 7,
+            live_nodes: 6,
+            tombstoned_count: 1,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 1,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+    let request_source_status = SourceStatusSnapshot {
+        current_stream_generation: Some(1),
+        ..SourceStatusSnapshot::default()
+    };
+    let params = NormalizedApiParams {
+        path: b"/".to_vec(),
+        group: None,
+        recursive: true,
+        max_depth: None,
+        pit_id: None,
+        group_order: GroupOrder::GroupKey,
+        group_page_size: None,
+        group_after: None,
+        entry_page_size: None,
+        entry_after: None,
+        read_class: Some(ReadClass::TrustedMaterialized),
+    };
+
+    let first = collect_materialized_stats_groups(
+        &state,
+        &ProjectionPolicy::default(),
+        &params,
+        ReadClass::TrustedMaterialized,
+        Some(&request_source_status),
+        Some(&request_sink_status),
+    )
+    .await
+    .expect("first trusted materialized stats groups");
+    let sends_after_first = boundary.send_batch_count(&node_a_route.0);
+    let second = collect_materialized_stats_groups(
+        &state,
+        &ProjectionPolicy::default(),
+        &params,
+        ReadClass::TrustedMaterialized,
+        Some(&request_source_status),
+        Some(&request_sink_status),
+    )
+    .await
+    .expect("second trusted materialized stats groups");
+
+    assert_eq!(first, second);
+    assert_eq!(
+        sends_after_first, 1,
+        "first steady stats read should route once to the selected owner"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&node_a_route.0),
+        sends_after_first,
+        "same-authority steady stats read must reuse the materialized stats snapshot instead of reopening selected-group route fanout"
+    );
+
+    owner_endpoint.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collect_materialized_stats_groups_trusted_fails_closed_when_ready_root_stats_remain_zeroish_below_sink_truth()
  {
     let tmp = tempfile::tempdir().expect("create tempdir");

@@ -503,7 +503,10 @@ impl OperatorSession {
                         saw_reauthable_error = true;
                         last_err = Some(format!("{base_url}: {err}"));
                     }
-                    Err(err) if is_transport_error(&err) => {
+                    Err(err)
+                        if is_transport_error(&err)
+                            || is_retryable_management_unavailable_error(&err) =>
+                    {
                         saw_reauthable_error = true;
                         last_err = Some(format!("{base_url}: {err}"));
                     }
@@ -701,6 +704,12 @@ pub fn is_retryable_query_unavailable_error(err: &str) -> bool {
             && err.contains("grant attachments"))
 }
 
+pub fn is_retryable_management_unavailable_error(err: &str) -> bool {
+    err.contains("http 503 failed")
+        && (err.contains("temporarily unavailable while runtime workers reconfigure")
+            || err.contains("runtime control initializes the app"))
+}
+
 pub fn extract_token(login: Value) -> Result<String, String> {
     login
         .get("token")
@@ -735,6 +744,10 @@ fn login_first_available(
             match client.login(username, password) {
                 Ok(login) => return Ok((client, extract_token(login)?)),
                 Err(err) if is_transport_error(&err) => {
+                    saw_transport_error = true;
+                    last_err = format!("{base}: {err}");
+                }
+                Err(err) if is_retryable_management_unavailable_error(&err) => {
                     saw_transport_error = true;
                     last_err = format!("{base}: {err}");
                 }
@@ -905,6 +918,77 @@ connection: close
         assert_eq!(session.client.base_url(), format!("http://{}", second_addr));
         first_server.join().expect("join first server");
         second_server.join().expect("join second server");
+    }
+
+    #[test]
+    fn management_request_failsover_when_runtime_control_is_initializing() {
+        let first = TcpListener::bind("127.0.0.1:0").expect("bind first facade listener");
+        let first_addr = first.local_addr().expect("first listener addr");
+        let second = TcpListener::bind("127.0.0.1:0").expect("bind second facade listener");
+        let second_addr = second.local_addr().expect("second listener addr");
+
+        let first_server = std::thread::spawn(move || {
+            let (mut stream, _) = first.accept().expect("accept first rescan request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"error":"fs-meta management request handling is unavailable until runtime control initializes the app"}"#;
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable
+content-type: application/json
+content-length: {}
+connection: close
+
+{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write first rescan response");
+            stream.flush().expect("flush first rescan response");
+        });
+
+        let second_server = std::thread::spawn(move || {
+            let (mut stream, _) = second.accept().expect("accept second rescan request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"status":"ok"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK
+content-type: application/json
+content-length: {}
+connection: close
+
+{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write second rescan response");
+            stream.flush().expect("flush second rescan response");
+        });
+
+        let mut session = OperatorSession {
+            client: FsMetaApiClient::new(format!("http://{}", first_addr)).expect("client"),
+            candidate_base_urls: vec![
+                format!("http://{}", first_addr),
+                format!("http://{}", second_addr),
+            ],
+            username: "operator".to_string(),
+            password: "operator123".to_string(),
+            management_token: "ignored".to_string(),
+            query_api_key: "ignored".to_string(),
+        };
+
+        let response = session
+            .with_management_reauth(|client, token| client.rescan(token))
+            .expect("management request should fail over while one facade initializes control");
+
+        assert_eq!(response.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(session.client.base_url(), format!("http://{}", second_addr));
+        first_server.join().expect("join first facade server");
+        second_server.join().expect("join second facade server");
     }
 
     #[test]

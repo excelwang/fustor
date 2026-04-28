@@ -1,3 +1,4 @@
+use crate::api::state::ForceFindRunnerEvidence;
 use crate::domain_state::QueryObservationState;
 use crate::query::models::SubtreeStats;
 use crate::query::observation::{
@@ -77,6 +78,7 @@ const TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET: Duration = Duration::fro
 const UNREADY_SELECTED_GROUP_ROUTE_BUDGET: Duration = Duration::from_millis(1200);
 const EXPLICIT_EMPTY_SINK_STATUS_RECOLLECT_BUDGET: Duration = Duration::from_millis(250);
 const REQUEST_SCOPED_SINK_STATUS_LOAD_BUDGET: Duration = Duration::from_millis(500);
+const REQUEST_SCOPED_READY_SINK_STATUS_LOAD_GRACE: Duration = Duration::from_millis(100);
 const FIRST_RANKED_TRUSTED_READY_GROUP_STAGE_BUDGET: Duration = Duration::from_millis(2500);
 const LATER_RANKED_TRUSTED_GROUP_STAGE_BUDGET: Duration = Duration::from_millis(1500);
 // Source/sink status fanout drives the trusted-materialized readiness gate.
@@ -84,6 +86,10 @@ const LATER_RANKED_TRUSTED_GROUP_STAGE_BUDGET: Duration = Duration::from_millis(
 // downgrade healthy groups into "initial audit incomplete". Give peer status
 // replies a little more time to settle before closing the collect window.
 const STATUS_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(2);
+const FORCE_FIND_RUNNER_BINDING_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const FORCE_FIND_RUNNER_BINDING_STATUS_IDLE_GRACE_MIN: Duration = Duration::from_millis(100);
+const FORCE_FIND_RUNNER_BINDING_STATUS_IDLE_GRACE_MAX: Duration = Duration::from_secs(1);
+const FORCE_FIND_RUNNER_BINDING_NOT_READY_PREFIX: &str = "runner_binding_not_ready:";
 const TRUSTED_MATERIALIZED_READINESS_SETTLE_BUDGET: Duration = Duration::from_secs(5);
 const TRUSTED_MATERIALIZED_READINESS_SETTLE_BACKOFF: Duration = Duration::from_millis(250);
 const LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE: Duration = Duration::from_millis(250);
@@ -346,22 +352,383 @@ struct ApiState {
     policy: Arc<RwLock<ProjectionPolicy>>,
     pit_store: Arc<Mutex<QueryPitStore>>,
     force_find_inflight: Arc<Mutex<BTreeSet<String>>>,
+    force_find_runner_evidence: ForceFindRunnerEvidence,
     force_find_route_rr: Arc<Mutex<BTreeMap<String, usize>>>,
     readiness_source: Option<Arc<SourceFacade>>,
     readiness_sink: Option<Arc<SinkFacade>>,
     materialized_source_status_cache: Arc<Mutex<Option<CachedSourceStatusSnapshot>>>,
     materialized_sink_status_cache: Arc<Mutex<Option<CachedSinkStatusSnapshot>>>,
+    materialized_stats_cache: Arc<Mutex<Option<CachedMaterializedStatsGroups>>>,
+    materialized_tree_cache: Arc<Mutex<Option<CachedMaterializedTreeSession>>>,
     tree_query_serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone, Debug)]
 struct CachedSourceStatusSnapshot {
     snapshot: SourceStatusSnapshot,
+    signature: MaterializedReadinessCacheSignature,
 }
 
 #[derive(Clone, Debug)]
 struct CachedSinkStatusSnapshot {
     snapshot: SinkStatusSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MaterializedStatsCacheKey {
+    path: Vec<u8>,
+    recursive: bool,
+    group: Option<String>,
+    read_class: ReadClass,
+    source_signature: MaterializedReadinessCacheSignature,
+    sink_signature: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MaterializedTreeCacheKey {
+    path: Vec<u8>,
+    recursive: bool,
+    max_depth: Option<usize>,
+    group: Option<String>,
+    group_order: GroupOrder,
+    read_class: ReadClass,
+    source_signature: MaterializedReadinessCacheSignature,
+    sink_signature: String,
+}
+
+#[derive(Clone, Debug)]
+struct CachedMaterializedStatsGroups {
+    key: MaterializedStatsCacheKey,
+    groups: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedMaterializedTreeSession {
+    key: MaterializedTreeCacheKey,
+    pit_id: String,
+    session: Arc<PitSession>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MaterializedReadinessCacheSignature {
+    roots: String,
+    grants: String,
+    read_epoch: u64,
+}
+
+#[derive(Serialize)]
+struct MaterializedReadSnapshotEvidenceSignature {
+    source: MaterializedSourceStatusEvidenceSignature,
+    sink: MaterializedSinkStatusEvidenceSignature,
+}
+
+#[derive(Serialize)]
+struct MaterializedSourceStatusEvidenceSignature {
+    current_stream_generation: Option<u64>,
+    logical_roots: Vec<MaterializedSourceLogicalRootEvidenceSignature>,
+    concrete_roots: Vec<MaterializedSourceConcreteRootEvidenceSignature>,
+    degraded_roots: Vec<(String, String)>,
+}
+
+#[derive(Serialize)]
+struct MaterializedSourceLogicalRootEvidenceSignature {
+    root_id: String,
+    status: String,
+    matched_grants: usize,
+    active_members: usize,
+    coverage_mode: String,
+}
+
+#[derive(Serialize)]
+struct MaterializedSourceConcreteRootEvidenceSignature {
+    root_key: String,
+    logical_root_id: String,
+    object_ref: String,
+    status: String,
+    coverage_mode: String,
+    watch_enabled: bool,
+    scan_enabled: bool,
+    is_group_primary: bool,
+    active: bool,
+    overflow_pending: bool,
+    rescan_pending: bool,
+    current_revision: Option<u64>,
+    current_stream_generation: Option<u64>,
+    candidate_revision: Option<u64>,
+    candidate_stream_generation: Option<u64>,
+    candidate_status: Option<String>,
+    draining_revision: Option<u64>,
+    draining_stream_generation: Option<u64>,
+    draining_status: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MaterializedSinkStatusEvidenceSignature {
+    groups: Vec<MaterializedSinkGroupEvidenceSignature>,
+    scheduled_groups_by_node: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct MaterializedSinkGroupEvidenceSignature {
+    group_id: String,
+    primary_object_ref: String,
+    total_nodes: u64,
+    live_nodes: u64,
+    overflow_pending_materialization: bool,
+    readiness: String,
+    materialized_revision: u64,
+}
+
+fn materialized_readiness_signature_part<T: Serialize>(
+    label: &str,
+    value: &T,
+) -> Result<String, CnxError> {
+    serde_json::to_string(value)
+        .map_err(|err| CnxError::Internal(format!("encode {label} readiness signature: {err}")))
+}
+
+fn materialized_read_snapshot_evidence_signature(
+    source_status: &SourceStatusSnapshot,
+    sink_status: &SinkStatusSnapshot,
+) -> Result<String, CnxError> {
+    let mut logical_roots = source_status
+        .logical_roots
+        .iter()
+        .map(|root| MaterializedSourceLogicalRootEvidenceSignature {
+            root_id: root.root_id.clone(),
+            status: root.status.clone(),
+            matched_grants: root.matched_grants,
+            active_members: root.active_members,
+            coverage_mode: root.coverage_mode.clone(),
+        })
+        .collect::<Vec<_>>();
+    logical_roots.sort_by(|left, right| left.root_id.cmp(&right.root_id));
+
+    let mut concrete_roots = source_status
+        .concrete_roots
+        .iter()
+        .map(|root| MaterializedSourceConcreteRootEvidenceSignature {
+            root_key: root.root_key.clone(),
+            logical_root_id: root.logical_root_id.clone(),
+            object_ref: root.object_ref.clone(),
+            status: root.status.clone(),
+            coverage_mode: root.coverage_mode.clone(),
+            watch_enabled: root.watch_enabled,
+            scan_enabled: root.scan_enabled,
+            is_group_primary: root.is_group_primary,
+            active: root.active,
+            overflow_pending: root.overflow_pending,
+            rescan_pending: root.rescan_pending,
+            current_revision: root.current_revision,
+            current_stream_generation: root.current_stream_generation,
+            candidate_revision: root.candidate_revision,
+            candidate_stream_generation: root.candidate_stream_generation,
+            candidate_status: root.candidate_status.clone(),
+            draining_revision: root.draining_revision,
+            draining_stream_generation: root.draining_stream_generation,
+            draining_status: root.draining_status.clone(),
+        })
+        .collect::<Vec<_>>();
+    concrete_roots.sort_by(|left, right| {
+        left.logical_root_id
+            .cmp(&right.logical_root_id)
+            .then_with(|| left.object_ref.cmp(&right.object_ref))
+            .then_with(|| left.root_key.cmp(&right.root_key))
+    });
+
+    let mut degraded_roots = source_status.degraded_roots.clone();
+    degraded_roots.sort();
+
+    let mut scheduled_groups_by_node = sink_status.scheduled_groups_by_node.clone();
+    for groups in scheduled_groups_by_node.values_mut() {
+        groups.sort();
+        groups.dedup();
+    }
+
+    let mut groups = sink_status
+        .groups
+        .iter()
+        .map(|group| MaterializedSinkGroupEvidenceSignature {
+            group_id: group.group_id.clone(),
+            primary_object_ref: group.primary_object_ref.clone(),
+            total_nodes: group.total_nodes,
+            live_nodes: group.live_nodes,
+            overflow_pending_materialization: group.overflow_pending_materialization,
+            readiness: format!("{:?}", group.normalized_readiness()),
+            materialized_revision: group.materialized_revision,
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| left.group_id.cmp(&right.group_id));
+
+    materialized_readiness_signature_part(
+        "materialized read snapshot evidence",
+        &MaterializedReadSnapshotEvidenceSignature {
+            source: MaterializedSourceStatusEvidenceSignature {
+                current_stream_generation: source_status.current_stream_generation,
+                logical_roots,
+                concrete_roots,
+                degraded_roots,
+            },
+            sink: MaterializedSinkStatusEvidenceSignature {
+                groups,
+                scheduled_groups_by_node,
+            },
+        },
+    )
+}
+
+fn materialized_readiness_cache_signature(
+    source: &SourceFacade,
+) -> std::result::Result<MaterializedReadinessCacheSignature, SourceFailure> {
+    let roots = source.cached_logical_roots_snapshot_with_failure()?;
+    let grants = source.cached_host_object_grants_snapshot_with_failure()?;
+    let read_epoch = source.materialized_read_cache_epoch_with_failure()?;
+    Ok(MaterializedReadinessCacheSignature {
+        roots: materialized_readiness_signature_part("logical roots", &roots)
+            .map_err(SourceFailure::from)?,
+        grants: materialized_readiness_signature_part("host grants", &grants)
+            .map_err(SourceFailure::from)?,
+        read_epoch,
+    })
+}
+
+fn materialized_read_source(state: &ApiState) -> &SourceFacade {
+    match &state.backend {
+        QueryBackend::Local { source, .. } | QueryBackend::Route { source, .. } => source.as_ref(),
+    }
+}
+
+fn materialized_stats_cache_key(
+    state: &ApiState,
+    params: &NormalizedApiParams,
+    read_class: ReadClass,
+    request_source_status: Option<&SourceStatusSnapshot>,
+    request_sink_status: Option<&SinkStatusSnapshot>,
+) -> Option<MaterializedStatsCacheKey> {
+    if read_class != ReadClass::TrustedMaterialized {
+        return None;
+    }
+    let source_status = request_source_status?;
+    let sink_status = request_sink_status?;
+    let source_signature =
+        materialized_readiness_cache_signature(materialized_read_source(state)).ok()?;
+    let sink_signature =
+        materialized_read_snapshot_evidence_signature(source_status, sink_status).ok()?;
+    Some(MaterializedStatsCacheKey {
+        path: params.path.clone(),
+        recursive: params.recursive,
+        group: params.group.clone(),
+        read_class,
+        source_signature,
+        sink_signature,
+    })
+}
+
+fn materialized_tree_cache_key(
+    state: &ApiState,
+    params: &NormalizedApiParams,
+    read_class: ReadClass,
+    request_source_status: Option<&SourceStatusSnapshot>,
+    request_sink_status: Option<&SinkStatusSnapshot>,
+) -> Option<MaterializedTreeCacheKey> {
+    if read_class != ReadClass::TrustedMaterialized {
+        return None;
+    }
+    if params.pit_id.is_some() || params.group_after.is_some() || params.entry_after.is_some() {
+        return None;
+    }
+    let source_status = request_source_status?;
+    let sink_status = request_sink_status?;
+    let source_signature =
+        materialized_readiness_cache_signature(materialized_read_source(state)).ok()?;
+    let sink_signature =
+        materialized_read_snapshot_evidence_signature(source_status, sink_status).ok()?;
+    Some(MaterializedTreeCacheKey {
+        path: params.path.clone(),
+        recursive: params.recursive,
+        max_depth: params.max_depth,
+        group: params.group.clone(),
+        group_order: params.group_order,
+        read_class,
+        source_signature,
+        sink_signature,
+    })
+}
+
+fn cached_materialized_stats_groups(
+    state: &ApiState,
+    key: &MaterializedStatsCacheKey,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, CnxError> {
+    let cached = state
+        .materialized_stats_cache
+        .lock()
+        .map_err(|_| CnxError::Internal("materialized stats cache lock poisoned".into()))?
+        .clone();
+    Ok(cached
+        .filter(|cached| &cached.key == key)
+        .map(|cached| cached.groups))
+}
+
+fn store_materialized_stats_groups(
+    state: &ApiState,
+    key: MaterializedStatsCacheKey,
+    groups: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), CnxError> {
+    let mut cache = state
+        .materialized_stats_cache
+        .lock()
+        .map_err(|_| CnxError::Internal("materialized stats cache lock poisoned".into()))?;
+    *cache = Some(CachedMaterializedStatsGroups {
+        key,
+        groups: groups.clone(),
+    });
+    Ok(())
+}
+
+fn cached_materialized_tree_session(
+    state: &ApiState,
+    key: &MaterializedTreeCacheKey,
+) -> Result<Option<(String, Arc<PitSession>)>, CnxError> {
+    let cached = state
+        .materialized_tree_cache
+        .lock()
+        .map_err(|_| CnxError::Internal("materialized tree cache lock poisoned".into()))?
+        .clone();
+    let Some(cached) = cached.filter(|cached| &cached.key == key) else {
+        return Ok(None);
+    };
+    if cached.session.expires_at_ms <= unix_now_ms() {
+        return Ok(None);
+    }
+    Ok(Some((cached.pit_id, cached.session)))
+}
+
+fn store_materialized_tree_session(
+    state: &ApiState,
+    key: MaterializedTreeCacheKey,
+    pit_id: &str,
+    session: &Arc<PitSession>,
+) -> Result<(), CnxError> {
+    let mut cache = state
+        .materialized_tree_cache
+        .lock()
+        .map_err(|_| CnxError::Internal("materialized tree cache lock poisoned".into()))?;
+    *cache = Some(CachedMaterializedTreeSession {
+        key,
+        pit_id: pit_id.to_string(),
+        session: session.clone(),
+    });
+    Ok(())
+}
+
+fn pit_session_has_cacheable_materialized_content(session: &PitSession) -> bool {
+    !session.groups.is_empty()
+        && session.groups.iter().all(|group| {
+            group
+                .root
+                .as_ref()
+                .is_some_and(|root| root.exists && (root.has_children || !group.entries.is_empty()))
+        })
 }
 
 struct ForceFindInflightGuard {
@@ -958,7 +1325,7 @@ impl Default for MaterializedStatusLoadPlan {
             ),
             sink_route: StatusRoutePlan::new(
                 Duration::from_secs(30),
-                STATUS_ROUTE_COLLECT_IDLE_GRACE,
+                LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE,
             ),
             explicit_empty_sink_recollect: StatusRoutePlan::new(
                 EXPLICIT_EMPTY_SINK_STATUS_RECOLLECT_BUDGET,
@@ -977,11 +1344,11 @@ impl MaterializedStatusLoadPlan {
     }
 }
 
-async fn route_source_status_snapshot(
+async fn route_source_observability_snapshots(
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
     plan: StatusRoutePlan,
-) -> Result<SourceStatusSnapshot, CnxError> {
+) -> Result<Vec<SourceObservabilitySnapshot>, CnxError> {
     let events = plan
         .machine()
         .collect_status_events(
@@ -994,20 +1361,32 @@ async fn route_source_status_snapshot(
     let snapshots = events
         .into_iter()
         .map(|event| {
-            rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes())
-                .map(|snapshot| snapshot.status)
-                .map_err(|err| {
-                    CnxError::Internal(format!("decode source status snapshot failed: {err}"))
-                })
+            rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes()).map_err(
+                |err| CnxError::Internal(format!("decode source status snapshot failed: {err}")),
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(merge_source_status_snapshots(snapshots))
+    Ok(snapshots)
+}
+
+async fn route_source_status_snapshot(
+    boundary: Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    plan: StatusRoutePlan,
+) -> Result<SourceStatusSnapshot, CnxError> {
+    let snapshots = route_source_observability_snapshots(boundary, origin_id, plan).await?;
+    Ok(merge_source_status_snapshots(
+        snapshots
+            .into_iter()
+            .map(|snapshot| snapshot.status)
+            .collect(),
+    ))
 }
 
 fn is_retryable_source_status_continuity_gap(err: &CnxError) -> bool {
     matches!(
         err,
-        CnxError::Timeout | CnxError::TransportClosed(_) | CnxError::ProtocolViolation(_)
+        CnxError::TransportClosed(_) | CnxError::ProtocolViolation(_)
     ) || matches!(
         err,
         CnxError::Internal(message)
@@ -1056,13 +1435,87 @@ pub(crate) async fn route_sink_status_snapshot(
     Ok(merge_sink_status_snapshots(snapshots))
 }
 
+fn source_status_covers_readiness_groups(
+    source_status: &SourceStatusSnapshot,
+    readiness_groups: &BTreeSet<String>,
+) -> bool {
+    let mut source_groups = source_status
+        .logical_roots
+        .iter()
+        .map(|root| root.root_id.clone())
+        .collect::<BTreeSet<_>>();
+    source_groups.extend(
+        source_status
+            .concrete_roots
+            .iter()
+            .map(|root| root.logical_root_id.clone()),
+    );
+    readiness_groups.is_subset(&source_groups)
+}
+
+fn sink_status_covers_ready_readiness_groups(
+    sink_status: &SinkStatusSnapshot,
+    readiness_groups: &BTreeSet<String>,
+) -> bool {
+    let scheduled_groups = materialized_scheduled_group_ids(sink_status);
+    if !readiness_groups.is_subset(&scheduled_groups) {
+        return false;
+    }
+    let ready_groups = sink_status
+        .groups
+        .iter()
+        .filter(|group| sink_group_readiness_reports_live_materialized_group(group))
+        .map(|group| group.group_id.clone())
+        .collect::<BTreeSet<_>>();
+    readiness_groups.is_subset(&ready_groups)
+}
+
+fn materialized_status_cache_is_ready(
+    source_status: &SourceStatusSnapshot,
+    sink_status: &SinkStatusSnapshot,
+    readiness_groups: &BTreeSet<String>,
+) -> bool {
+    !readiness_groups.is_empty()
+        && source_status_covers_readiness_groups(source_status, readiness_groups)
+        && sink_status_covers_ready_readiness_groups(sink_status, readiness_groups)
+        && materialized_observation_status(source_status, sink_status).state
+            == ObservationState::TrustedMaterialized
+}
+
+fn cached_materialized_status_snapshots(
+    state: &ApiState,
+    readiness_groups: &BTreeSet<String>,
+    signature: &MaterializedReadinessCacheSignature,
+) -> Result<Option<(SourceStatusSnapshot, SinkStatusSnapshot)>, CnxError> {
+    let cached_source = state
+        .materialized_source_status_cache
+        .lock()
+        .map_err(|_| CnxError::Internal("materialized source status cache lock poisoned".into()))?
+        .clone();
+    let cached_sink = state
+        .materialized_sink_status_cache
+        .lock()
+        .map_err(|_| CnxError::Internal("materialized sink status cache lock poisoned".into()))?
+        .clone();
+    let (Some(cached_source), Some(cached_sink)) = (cached_source, cached_sink) else {
+        return Ok(None);
+    };
+    if &cached_source.signature != signature {
+        return Ok(None);
+    }
+    let source_status = filter_source_status_snapshot(cached_source.snapshot, readiness_groups);
+    let sink_status = filter_sink_status_snapshot(cached_sink.snapshot, readiness_groups);
+    if materialized_status_cache_is_ready(&source_status, &sink_status, readiness_groups) {
+        Ok(Some((source_status, sink_status)))
+    } else {
+        Ok(None)
+    }
+}
+
 fn is_retryable_sink_status_continuity_gap(err: &CnxError) -> bool {
     matches!(
         err,
-        CnxError::Timeout
-            | CnxError::TransportClosed(_)
-            | CnxError::ProtocolViolation(_)
-            | CnxError::Internal(_)
+        CnxError::TransportClosed(_) | CnxError::ProtocolViolation(_) | CnxError::Internal(_)
     )
 }
 
@@ -1076,28 +1529,60 @@ async fn load_materialized_status_snapshots_with_failure(
             SinkStatusSnapshot::default(),
         ));
     };
-    let source_status = match &state.backend {
+    let readiness_groups = scan_enabled_readiness_groups(state)?;
+    let cache_signature = materialized_readiness_cache_signature(source)?;
+    if let Some(cached) =
+        cached_materialized_status_snapshots(state, &readiness_groups, &cache_signature)?
+    {
+        return Ok(cached);
+    }
+    let (source_status, mut sink_status) = match &state.backend {
         QueryBackend::Route {
             boundary,
             origin_id,
             ..
-        } => match route_source_status_snapshot(
-            boundary.clone(),
-            origin_id.clone(),
-            status_load_plan.source_route,
-        )
-        .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(err) if is_retryable_source_status_continuity_gap(&err) => source
-                .status_snapshot_with_failure()
-                .await
-                .map_err(|_| QueryWorkerObservationFailure::from(err))?,
-            Err(err) => return Err(err.into()),
-        },
-        QueryBackend::Local { .. } => source.status_snapshot_with_failure().await?,
+        } => {
+            let source_status_load = route_source_status_snapshot(
+                boundary.clone(),
+                origin_id.clone(),
+                status_load_plan.source_route,
+            );
+            let sink_status_load = route_sink_status_snapshot(
+                boundary.clone(),
+                origin_id.clone(),
+                status_load_plan.sink_route,
+            );
+            let (source_status_result, sink_status_result) =
+                tokio::join!(source_status_load, sink_status_load);
+            let source_status = match source_status_result {
+                Ok(snapshot) => snapshot,
+                Err(err @ CnxError::Timeout) => source
+                    .status_snapshot_with_failure()
+                    .await
+                    .map_err(|_| QueryWorkerObservationFailure::from(err))?,
+                Err(err) if is_retryable_source_status_continuity_gap(&err) => source
+                    .status_snapshot_with_failure()
+                    .await
+                    .map_err(|_| QueryWorkerObservationFailure::from(err))?,
+                Err(err) => return Err(err.into()),
+            };
+            let sink_status = match sink_status_result {
+                Ok(snapshot) => snapshot,
+                Err(err @ CnxError::Timeout)
+                | Err(err @ CnxError::TransportClosed(_))
+                | Err(err @ CnxError::ProtocolViolation(_)) => sink
+                    .status_snapshot_with_failure()
+                    .await
+                    .map_err(|_| QueryWorkerObservationFailure::from(err))?,
+                Err(err) => return Err(err.into()),
+            };
+            (source_status, sink_status)
+        }
+        QueryBackend::Local { .. } => (
+            source.status_snapshot_with_failure().await?,
+            sink.status_snapshot_with_failure().await?,
+        ),
     };
-    let readiness_groups = scan_enabled_readiness_groups(state)?;
     let source_status = {
         let fresh = filter_source_status_snapshot(source_status, &readiness_groups);
         let mut cache = state.materialized_source_status_cache.lock().map_err(|_| {
@@ -1112,50 +1597,29 @@ async fn load_materialized_status_snapshots_with_failure(
         };
         *cache = Some(CachedSourceStatusSnapshot {
             snapshot: merged.clone(),
+            signature: cache_signature.clone(),
         });
         merged
     };
-    let sink_status = match &state.backend {
-        QueryBackend::Route {
-            boundary,
-            origin_id,
-            ..
-        } => {
-            let mut snapshot = match route_sink_status_snapshot(
-                boundary.clone(),
-                origin_id.clone(),
-                status_load_plan.sink_route,
-            )
-            .await
-            {
-                Ok(snapshot) => snapshot,
-                Err(err @ CnxError::Timeout)
-                | Err(err @ CnxError::TransportClosed(_))
-                | Err(err @ CnxError::ProtocolViolation(_)) => sink
-                    .status_snapshot_with_failure()
-                    .await
-                    .map_err(|_| QueryWorkerObservationFailure::from(err))?,
-                Err(err) => return Err(err.into()),
-            };
-            if sink_status_snapshot_reports_explicit_empty_for_all_active_readiness_groups(
-                &source_status,
-                &snapshot,
-                &readiness_groups,
-            ) {
-                if let Ok(retry_snapshot) = route_sink_status_snapshot(
-                    boundary.clone(),
-                    origin_id.clone(),
-                    status_load_plan.explicit_empty_sink_recollect,
-                )
-                .await
-                {
-                    snapshot = retry_snapshot;
-                }
-            }
-            snapshot
-        }
-        QueryBackend::Local { .. } => sink.status_snapshot_with_failure().await?,
-    };
+    if let QueryBackend::Route {
+        boundary,
+        origin_id,
+        ..
+    } = &state.backend
+        && sink_status_snapshot_reports_explicit_empty_for_all_active_readiness_groups(
+            &source_status,
+            &sink_status,
+            &readiness_groups,
+        )
+        && let Ok(retry_snapshot) = route_sink_status_snapshot(
+            boundary.clone(),
+            origin_id.clone(),
+            status_load_plan.explicit_empty_sink_recollect,
+        )
+        .await
+    {
+        sink_status = retry_snapshot;
+    }
     let route_explicit_empty_groups = sink_status
         .groups
         .iter()
@@ -1227,25 +1691,53 @@ async fn load_request_scoped_materialized_sink_status_snapshot(
     plan: TreePitRequestScopedSinkStatusPlan,
 ) -> Option<SinkStatusSnapshot> {
     let readiness_groups = scan_enabled_readiness_groups(state).ok()?;
+    let cached_ready =
+        cached_request_scoped_sink_status_when_readiness_complete(state, &readiness_groups);
     match &state.backend {
         QueryBackend::Route {
             boundary,
             origin_id,
             ..
-        } => route_sink_status_snapshot(
-            boundary.clone(),
-            origin_id.clone(),
-            StatusRoutePlan::new(plan.route_timeout(), STATUS_ROUTE_COLLECT_IDLE_GRACE),
-        )
-        .await
-        .ok()
-        .map(|snapshot| filter_sink_status_snapshot(snapshot, &readiness_groups)),
+        } => {
+            let route_timeout = if cached_ready.is_some() {
+                std::cmp::min(
+                    plan.route_timeout(),
+                    REQUEST_SCOPED_READY_SINK_STATUS_LOAD_GRACE,
+                )
+            } else {
+                plan.route_timeout()
+            };
+            route_sink_status_snapshot(
+                boundary.clone(),
+                origin_id.clone(),
+                StatusRoutePlan::new(
+                    route_timeout,
+                    std::cmp::min(STATUS_ROUTE_COLLECT_IDLE_GRACE, route_timeout),
+                ),
+            )
+            .await
+            .ok()
+            .map(|snapshot| filter_sink_status_snapshot(snapshot, &readiness_groups))
+            .or(cached_ready)
+        }
         QueryBackend::Local { sink, .. } => sink
             .status_snapshot_with_failure()
             .await
             .ok()
             .map(|snapshot| filter_sink_status_snapshot(snapshot, &readiness_groups)),
     }
+}
+
+fn cached_request_scoped_sink_status_when_readiness_complete(
+    state: &ApiState,
+    readiness_groups: &BTreeSet<String>,
+) -> Option<SinkStatusSnapshot> {
+    let source = state.readiness_source.as_ref()?;
+    let signature = materialized_readiness_cache_signature(source).ok()?;
+    cached_materialized_status_snapshots(state, readiness_groups, &signature)
+        .ok()
+        .flatten()
+        .map(|(_, sink_status)| sink_status)
 }
 
 fn merge_request_scoped_materialized_sink_status_snapshot(
@@ -1334,6 +1826,7 @@ enum RequestScopedLoadedReadyGroupPreservationLane {
     ExplicitEmptyDrift,
     MissingReadyGroupRow,
     PartialScheduleOmission,
+    AllScheduleOmission,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1365,6 +1858,15 @@ fn request_scoped_loaded_ready_group_preservation_decision(
     if input.request_scoped_explicit_empty {
         return RequestScopedLoadedReadyGroupPreservationDecision {
             lane: RequestScopedLoadedReadyGroupPreservationLane::ExplicitEmptyDrift,
+            should_restore_loaded_group: true,
+        };
+    }
+    if input.request_scoped_omits_all_groups_from_schedule
+        && !input.request_scoped_mentions_group
+        && !input.request_scoped_schedules_group
+    {
+        return RequestScopedLoadedReadyGroupPreservationDecision {
+            lane: RequestScopedLoadedReadyGroupPreservationLane::AllScheduleOmission,
             should_restore_loaded_group: true,
         };
     }
@@ -1481,7 +1983,8 @@ fn preserve_request_loaded_ready_groups_across_partial_request_scoped_schedule_o
         materialized_scheduled_group_ids(request_scoped_sink_status);
     let request_scoped_omits_all_groups_from_schedule =
         sink_status_snapshot_omits_all_groups_from_schedule(request_scoped_sink_status);
-    if request_scoped_scheduled_groups.is_empty() {
+    if request_scoped_scheduled_groups.is_empty() && !request_scoped_omits_all_groups_from_schedule
+    {
         return current;
     }
     let current_by_group = current
@@ -2485,6 +2988,7 @@ pub fn create_local_router(
     origin_id: NodeId,
     policy: Arc<RwLock<ProjectionPolicy>>,
     force_find_inflight: Arc<Mutex<BTreeSet<String>>>,
+    force_find_runner_evidence: ForceFindRunnerEvidence,
 ) -> Router {
     eprintln!(
         "fs_meta_query_api: create router backend={}",
@@ -2510,11 +3014,14 @@ pub fn create_local_router(
         policy,
         pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
         force_find_inflight,
+        force_find_runner_evidence,
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
         materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
     base_router(state)
@@ -2826,6 +3333,53 @@ fn request_scoped_omitted_ready_root_group_should_settle_empty_tree(
 
 fn sink_status_snapshot_omits_all_groups_from_schedule(snapshot: &SinkStatusSnapshot) -> bool {
     snapshot.groups.is_empty() && snapshot.scheduled_groups_by_node.is_empty()
+}
+
+fn sink_status_snapshot_has_materialized_schedule(snapshot: &SinkStatusSnapshot) -> bool {
+    !sink_status_snapshot_omits_all_groups_from_schedule(snapshot)
+}
+
+fn trusted_materialized_root_tree_should_fail_closed_without_sink_schedule(
+    path: &[u8],
+    request_sink_status: &SinkStatusSnapshot,
+    cached_sink_status: Option<&CachedSinkStatusSnapshot>,
+) -> bool {
+    trusted_materialized_empty_group_root_requires_fail_closed(path)
+        && sink_status_snapshot_omits_all_groups_from_schedule(request_sink_status)
+        && !cached_sink_status
+            .map(|cached| sink_status_snapshot_has_materialized_schedule(&cached.snapshot))
+            .unwrap_or(false)
+}
+
+fn trusted_materialized_root_tree_should_fail_closed_before_status_fanout(
+    state: &ApiState,
+    path: &[u8],
+) -> Result<bool, CnxError> {
+    if !trusted_materialized_empty_group_root_requires_fail_closed(path) {
+        return Ok(false);
+    }
+    if matches!(state.backend, QueryBackend::Route { .. }) {
+        return Ok(false);
+    }
+    let cached_sink_status = state
+        .materialized_sink_status_cache
+        .lock()
+        .map_err(|_| CnxError::Internal("materialized sink status cache lock poisoned".into()))?;
+    if cached_sink_status
+        .as_ref()
+        .is_some_and(|cached| sink_status_snapshot_has_materialized_schedule(&cached.snapshot))
+    {
+        return Ok(false);
+    }
+    let Some(sink) = &state.readiness_sink else {
+        return Ok(true);
+    };
+    match sink.cached_status_snapshot_with_failure() {
+        Ok(snapshot) => Ok(sink_status_snapshot_omits_all_groups_from_schedule(
+            &snapshot,
+        )),
+        Err(_) => Ok(false),
+    }
 }
 
 fn selected_group_materialized_tree_payload_is_empty(
@@ -3226,7 +3780,7 @@ impl SelectedGroupTreePitPlan {
             && trusted_materialized_ready_group
             && !input.prior_materialized_group_decoded
         {
-            !input.empty_root_requires_fail_closed
+            true
         } else {
             !(input.read_class != ReadClass::TrustedMaterialized
                 && input.is_last_ranked_group
@@ -3870,8 +4424,8 @@ impl ForceFindRoutePlan {
         if remaining.is_zero() {
             return ForceFindTreeRouteErrorLane::Fail;
         }
-        let retryable =
-            is_retryable_force_find_route_error(err) || is_retryable_force_find_runner_gap(err);
+        let retryable = is_retryable_force_find_route_error(err)
+            || is_force_find_selected_group_missing_gap(err);
         if !retryable {
             return ForceFindTreeRouteErrorLane::Fail;
         }
@@ -3889,13 +4443,40 @@ impl ForceFindRouteMachine {
         state: &ApiState,
         source: &SourceFacade,
         group_id: &str,
+        excluded_runner_nodes: &BTreeSet<String>,
     ) -> Result<ForceFindRouteMachinePhase, CnxError> {
-        Ok(self.phase_for_selected_runner_at(
-            tokio::time::Instant::now(),
-            select_force_find_runner_node_for_group_with_failure(state, source, group_id)
-                .await
-                .map_err(QueryWorkerObservationFailure::into_error)?,
-        ))
+        let Some(attempt_runtime) = self.attempt_at(tokio::time::Instant::now()) else {
+            return Ok(ForceFindRouteMachinePhase::Failed(
+                RouteTerminalError::Timeout,
+            ));
+        };
+        let selected_runner = match select_force_find_runner_node_for_group_with_failure(
+            state,
+            source,
+            group_id,
+            attempt_runtime.remaining,
+            excluded_runner_nodes,
+        )
+        .await
+        {
+            Ok(selected_runner) => selected_runner,
+            Err(err) => {
+                let err = err.into_error();
+                let now = tokio::time::Instant::now();
+                if is_retryable_force_find_runner_binding_gap(&err) {
+                    if let Some(attempt_runtime) = self.attempt_at(now) {
+                        return Ok(ForceFindRouteMachinePhase::WaitForForceFindReadiness(
+                            now + attempt_runtime.route_plan().retry_backoff(),
+                        ));
+                    }
+                    return Ok(ForceFindRouteMachinePhase::Failed(
+                        RouteTerminalError::Timeout,
+                    ));
+                }
+                return Err(err);
+            }
+        };
+        Ok(self.phase_for_selected_runner_at(tokio::time::Instant::now(), selected_runner))
     }
 
     fn tree_entry_action_at(
@@ -4622,7 +5203,7 @@ async fn resolve_tree_pit_stage_execution_action(
                         empty_response_plan,
                         group_key: input.group_key,
                         query_path: input.query_path,
-                        session_deadline: input.stage_timing.session_deadline,
+                        session_deadline: input.stage_timing.stage_deadline,
                     },
                     &mut response,
                 )
@@ -5909,25 +6490,27 @@ fn status_route_machine_owns_attempt_budget_and_retry_followup() {
             CnxError::Timeout,
             is_retryable_source_status_continuity_gap
         ),
-        StatusRouteMachinePhase::WaitUntil(now + STATUS_ROUTE_RETRY_BACKOFF),
-        "routed status machine should own the retry wait followup instead of leaving helper loops to hot-spin on retryable continuity gaps",
+        StatusRouteMachinePhase::Failed(RouteTerminalError::Timeout),
+        "routed status timeout is observation evidence and must not be amplified by same-request retry loops",
     );
     assert_eq!(
         machine.followup_phase_at(
-            now + Duration::from_secs(29) + Duration::from_millis(995),
-            CnxError::Timeout,
+            now,
+            CnxError::TransportClosed("return lane closed".into()),
             is_retryable_source_status_continuity_gap,
         ),
-        StatusRouteMachinePhase::WaitUntil(now + Duration::from_secs(30)),
-        "routed status machine should cap the retry wait followup to the remaining route budget instead of letting helpers sleep past the deadline",
+        StatusRouteMachinePhase::WaitUntil(now + STATUS_ROUTE_RETRY_BACKOFF),
+        "routed status machine should own the retry wait followup for true route continuity gaps instead of leaving helper loops to hot-spin",
     );
     assert_eq!(
         machine.followup_phase_at(
             now + Duration::from_secs(30),
-            CnxError::Timeout,
+            CnxError::TransportClosed("return lane closed".into()),
             is_retryable_source_status_continuity_gap,
         ),
-        StatusRouteMachinePhase::Failed(RouteTerminalError::Timeout),
+        StatusRouteMachinePhase::Failed(RouteTerminalError::TransportClosed(
+            "return lane closed".into()
+        )),
         "routed status machine should also own the retry followup timeout cut-off instead of leaving helper loops to branch on remaining.is_zero() after each retryable continuity gap",
     );
 }
@@ -6117,7 +6700,7 @@ fn tree_pit_group_plan_owner_attempt_timeout_preserves_small_fail_closed_budget(
     assert_eq!(
         plan.owner_attempt_timeout(Duration::from_millis(250)),
         Duration::from_millis(250),
-        "fail-closed ready-root lanes must keep the full remaining owner budget instead of reserving proxy time that cannot be spent",
+        "fail-closed ready-root lanes should spend a tiny remaining budget on the owner when no meaningful proxy reserve fits",
     );
 }
 
@@ -6350,6 +6933,21 @@ fn force_find_route_machine_routes_selected_runner_gap_to_generic_fallback() {
 }
 
 #[test]
+fn force_find_route_machine_fails_host_fs_unavailable_if_executor_did_not_replan_runner() {
+    let now = tokio::time::Instant::now();
+    let machine = ForceFindSessionPlan::new(Duration::from_secs(3))
+        .route_plan()
+        .machine_from_now(now);
+    let message = "force-find failed on all targeted roots (1): node-a::nfs1: HOST_FS_UNAVAILABLE";
+
+    assert_eq!(
+        machine.followup_phase_at(now, CnxError::PeerError(message.into()), true,),
+        ForceFindRouteMachinePhase::Failed(RouteTerminalError::PeerError(message.into())),
+        "HOST_FS_UNAVAILABLE same-group replanning is owned by the force-find executor; the generic fallback machine must not omit the requested group",
+    );
+}
+
+#[test]
 fn force_find_route_machine_removes_external_selected_runner_planner_symbol() {
     let source = include_str!("api.rs");
     assert!(
@@ -6444,7 +7042,7 @@ fn selected_runner_force_find_route_uses_single_reply_call_for_scoped_source_fin
 }
 
 #[test]
-fn generic_force_find_route_uses_single_reply_call_when_selected_group_is_scoped() {
+fn generic_force_find_route_uses_collect_for_scoped_selected_group_fallback() {
     let source = include_str!("api.rs");
     let start = source
         .find("\nasync fn query_force_find_events(")
@@ -6455,21 +7053,21 @@ fn generic_force_find_route_uses_single_reply_call_when_selected_group_is_scoped
         .unwrap_or(source.len());
     let body = &source[start..end];
     assert!(
-        body.contains("params.scope.selected_group.is_some()"),
-        "generic force-find route should branch on selected_group so scoped freshness reads avoid collect idle-grace",
+        !body.contains("params.scope.selected_group.is_some()"),
+        "generic force-find route must not branch scoped selected-group fallback back to single-reply routing",
     );
     assert!(
-        body.contains(".call(") && body.contains("METHOD_SOURCE_FIND,"),
-        "scoped generic source.find should use single-reply call semantics instead of collect idle-grace",
+        !body.contains(".call("),
+        "generic source.find fallback should use fan-in collect semantics; selected-runner single-reply routing is owned by route_force_find_events_via_node",
     );
     assert!(
         body.contains(".call_collect("),
-        "ungrouped generic source.find should keep collect semantics for multi-origin freshness reads",
+        "generic source.find fallback should collect replies so selected groups do not settle on unrelated or stale single replies",
     );
 }
 
 #[test]
-fn force_find_runner_selection_uses_cached_root_and_grant_snapshots() {
+fn force_find_runner_selection_uses_binding_evidence_with_local_snapshot_fallback() {
     let source = include_str!("api.rs");
     let start = source
         .find("\nasync fn force_find_candidate_object_refs_for_group_with_failure(")
@@ -6480,12 +7078,20 @@ fn force_find_runner_selection_uses_cached_root_and_grant_snapshots() {
         .unwrap_or(source.len());
     let body = &source[start..end];
     assert!(
+        body.contains("route_source_observability_snapshots("),
+        "runtime-managed force-find runner selection must use current runner binding evidence from source observability",
+    );
+    assert!(
+        body.contains("scheduled_source_groups_by_node"),
+        "runner binding evidence must come from scheduled source groups by node",
+    );
+    assert!(
         body.contains("cached_logical_roots_snapshot_with_failure()"),
-        "force-find runner selection must use cached logical roots so the freshness path is not blocked on source worker control RPCs",
+        "local force-find fallback may still use cached logical roots",
     );
     assert!(
         body.contains("cached_host_object_grants_snapshot_with_failure()"),
-        "force-find runner selection must use cached host-object grants so the freshness path stays available while source workers are still converging",
+        "local force-find fallback may still use cached host-object grants",
     );
     assert!(
         !body.contains("logical_roots_snapshot().await"),
@@ -6523,6 +7129,15 @@ fn force_find_route_plan_tree_error_lane_routes_runner_gaps_through_canonical_fa
         ),
         ForceFindTreeRouteErrorLane::Fail,
         "non-retryable force-find tree route errors must fail directly instead of reopening fallback or retry lanes",
+    );
+    assert_eq!(
+        plan.tree_route_error_lane(
+            &CnxError::PeerError("HOST_FS_UNAVAILABLE".into()),
+            true,
+            Duration::from_secs(2),
+        ),
+        ForceFindTreeRouteErrorLane::Fail,
+        "HOST_FS_UNAVAILABLE must not be delegated to generic fallback because same-group runner replanning owns that recovery",
     );
 }
 
@@ -7623,12 +8238,14 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                             let remaining = deadline
                                 .checked_duration_since(tokio::time::Instant::now())
                                 .unwrap_or_default();
-                            if !remaining.is_zero() {
+                            let primary_reroute_timeout =
+                                group_plan.owner_empty_tree_retry_timeout(remaining);
+                            if !primary_reroute_timeout.is_zero() {
                                 let primary_events = route_materialized_events_via_node(
                                     boundary.clone(),
                                     primary_node_id,
                                     params.clone(),
-                                    SelectedGroupOwnerRoutePlan::new(remaining),
+                                    SelectedGroupOwnerRoutePlan::new(primary_reroute_timeout),
                                 )
                                 .await?;
                                 if !selected_group_materialized_tree_payload_is_empty(
@@ -7794,60 +8411,32 @@ async fn query_force_find_events(
             let payload = rmp_serde::to_vec_named(&params).map_err(|err| {
                 CnxError::Internal(format!("encode force-find query failed: {err}"))
             })?;
-            if params.scope.selected_group.is_some() {
-                eprintln!("fs_meta_query_api: query_force_find_events route call begin");
-                let events = adapter
-                    .call(
-                        ROUTE_TOKEN_FS_META_INTERNAL,
-                        METHOD_SOURCE_FIND,
-                        Bytes::from(payload),
-                        route_plan.route_timeout(),
-                    )
-                    .await
-                    .map_err(|err| {
-                        eprintln!(
-                            "fs_meta_query_api: query_force_find_events route call failed err={}",
-                            err
-                        );
+            eprintln!("fs_meta_query_api: query_force_find_events route call_collect begin");
+            let events = adapter
+                .call_collect(
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SOURCE_FIND,
+                    Bytes::from(payload),
+                    route_plan.route_timeout(),
+                    route_plan.collect_idle_grace(),
+                )
+                .await
+                .map_err(|err| {
+                    eprintln!(
+                        "fs_meta_query_api: query_force_find_events route call_collect failed err={}",
                         err
-                    })?;
-                eprintln!(
-                    "fs_meta_query_api: query_force_find_events route call done events={} origins={:?}",
-                    events.len(),
-                    events
-                        .iter()
-                        .map(|event| event.metadata().origin_id.0.clone())
-                        .collect::<Vec<_>>()
-                );
-                Ok(events)
-            } else {
-                eprintln!("fs_meta_query_api: query_force_find_events route call_collect begin");
-                let events = adapter
-                    .call_collect(
-                        ROUTE_TOKEN_FS_META_INTERNAL,
-                        METHOD_SOURCE_FIND,
-                        Bytes::from(payload),
-                        route_plan.route_timeout(),
-                        route_plan.collect_idle_grace(),
-                    )
-                    .await
-                    .map_err(|err| {
-                        eprintln!(
-                            "fs_meta_query_api: query_force_find_events route call_collect failed err={}",
-                            err
-                        );
-                        err
-                    })?;
-                eprintln!(
-                    "fs_meta_query_api: query_force_find_events route call_collect done events={} origins={:?}",
-                    events.len(),
-                    events
-                        .iter()
-                        .map(|event| event.metadata().origin_id.0.clone())
-                        .collect::<Vec<_>>()
-                );
-                Ok(events)
-            }
+                    );
+                    err
+                })?;
+            eprintln!(
+                "fs_meta_query_api: query_force_find_events route call_collect done events={} origins={:?}",
+                events.len(),
+                events
+                    .iter()
+                    .map(|event| event.metadata().origin_id.0.clone())
+                    .collect::<Vec<_>>()
+            );
+            Ok(events)
         }
     }
 }
@@ -7858,6 +8447,7 @@ async fn route_force_find_events_via_node(
     params: InternalQueryRequest,
     route_plan: ForceFindRoutePlan,
 ) -> Result<Vec<Event>, CnxError> {
+    let selected_group = params.scope.selected_group.clone();
     let adapter = exchange_host_adapter(
         boundary,
         node_id.clone(),
@@ -7868,14 +8458,40 @@ async fn route_force_find_events_via_node(
     // Per-node selected-runner source.find is single-owner/single-reply. Waiting on a
     // collect idle-grace here stretches each group query by the full grace window and can
     // exceed caller-facing HTTP budgets before generic fallback is even needed.
-    adapter
+    let events = adapter
         .call(
             ROUTE_TOKEN_FS_META_INTERNAL,
             METHOD_SOURCE_FIND,
             Bytes::from(payload),
             route_plan.route_timeout(),
         )
-        .await
+        .await?;
+    if let Some(err) = selected_group_force_find_route_error(&events, selected_group.as_deref()) {
+        return Err(err);
+    }
+    Ok(events)
+}
+
+fn selected_group_force_find_route_error(
+    events: &[Event],
+    selected_group: Option<&str>,
+) -> Option<CnxError> {
+    let selected_group = selected_group?;
+    for event in events {
+        if event.metadata().origin_id.0 != selected_group {
+            continue;
+        }
+        let Ok(message) = std::str::from_utf8(event.payload_bytes()) else {
+            continue;
+        };
+        let message = message.trim();
+        if message.contains("selected_group matched no group")
+            || message.contains("HOST_FS_UNAVAILABLE")
+        {
+            return Some(CnxError::PeerError(message.to_string()));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -7944,6 +8560,7 @@ async fn collect_group_rankings(
     group_order: GroupOrder,
     target_groups: &[String],
     explicit_group: Option<&str>,
+    force_find_session_guard_active: bool,
 ) -> Result<(Vec<GroupRank>, bool), CnxError> {
     let mut ordered_groups = target_groups.to_vec();
     ordered_groups.sort();
@@ -8014,6 +8631,7 @@ async fn collect_group_rankings(
                         ForceFindSessionPlan::new(query_timeout).route_plan(),
                         &group_key,
                         explicit_group == Some(group_key.as_str()),
+                        force_find_session_guard_active,
                     )
                     .await?
                 }
@@ -8407,21 +9025,176 @@ async fn force_find_candidate_object_refs_for_group_with_failure(
     Ok(candidates)
 }
 
-async fn select_force_find_runner_node_for_group_with_failure(
-    state: &ApiState,
-    source: &SourceFacade,
+fn force_find_candidate_nodes_from_runner_binding_evidence(
+    snapshots: &[SourceObservabilitySnapshot],
     group_id: &str,
-) -> std::result::Result<Option<NodeId>, QueryWorkerObservationFailure> {
-    let candidates =
-        force_find_candidate_object_refs_for_group_with_failure(source, group_id).await?;
-    if candidates.is_empty() {
-        return materialized_owner_node_for_group_with_failure(
-            source,
-            None,
+) -> Vec<NodeId> {
+    let mut candidates = Vec::<String>::new();
+    let mut seen = BTreeSet::<String>::new();
+    for snapshot in snapshots {
+        let mut scheduled_nodes = BTreeSet::<String>::new();
+        for (node_id, groups) in &snapshot.scheduled_source_groups_by_node {
+            if groups.iter().any(|group| group == group_id) {
+                scheduled_nodes.insert(node_id.clone());
+            }
+        }
+        for node_id in &scheduled_nodes {
+            if seen.insert(node_id.clone()) {
+                candidates.push(node_id.clone());
+            }
+        }
+        for node_id in force_find_candidate_nodes_from_current_root_grants(
+            snapshot,
             group_id,
-            MaterializedOwnerOmissionPolicy::Authoritative,
-        )
-        .await;
+            &scheduled_nodes,
+        ) {
+            if seen.insert(node_id.0.clone()) {
+                candidates.push(node_id.0);
+            }
+        }
+    }
+    candidates.into_iter().map(NodeId).collect()
+}
+
+fn force_find_candidate_nodes_from_current_root_grants(
+    snapshot: &SourceObservabilitySnapshot,
+    group_id: &str,
+    scheduled_nodes: &BTreeSet<String>,
+) -> Vec<NodeId> {
+    let root = snapshot
+        .logical_roots
+        .iter()
+        .find(|root| root.id == group_id);
+    let health_has_members = snapshot
+        .status
+        .logical_roots
+        .iter()
+        .find(|logical_root| logical_root.root_id == group_id)
+        .is_some_and(|logical_root| {
+            logical_root.matched_grants > 0 || logical_root.active_members > 0
+        });
+
+    let mut candidates = BTreeSet::<String>::new();
+    if let Some(root) = root {
+        candidates.extend(
+            snapshot
+                .grants
+                .iter()
+                .filter(|grant| grant.active && root.selector.matches(grant))
+                .filter_map(force_find_candidate_node_from_grant)
+                .map(|node| node.0),
+        );
+    }
+    if candidates.is_empty() && health_has_members {
+        candidates.extend(
+            snapshot
+                .grants
+                .iter()
+                .filter(|grant| {
+                    grant.active && grant_object_ref_matches_group(&grant.object_ref, group_id)
+                })
+                .filter_map(force_find_candidate_node_from_grant)
+                .map(|node| node.0),
+        );
+    }
+    candidates
+        .into_iter()
+        .filter(|node_id| !scheduled_nodes.contains(node_id))
+        .map(NodeId)
+        .collect()
+}
+
+fn grant_object_ref_matches_group(object_ref: &str, group_id: &str) -> bool {
+    object_ref
+        .rsplit_once("::")
+        .map(|(_, object_group)| object_group == group_id)
+        .unwrap_or(object_ref == group_id)
+}
+
+fn record_force_find_runner_response_evidence(
+    state: &ApiState,
+    group_id: &str,
+    selected_node: Option<&NodeId>,
+    events: &[Event],
+) {
+    let mut runners = events
+        .iter()
+        .map(|event| event.metadata().origin_id.0.trim().to_string())
+        .filter(|origin| origin.contains("::") && grant_object_ref_matches_group(origin, group_id))
+        .collect::<BTreeSet<_>>();
+    if runners.is_empty()
+        && let Some(node) = selected_node
+    {
+        runners.insert(format!("{}::{}", node.0, group_id));
+    }
+    for runner in runners {
+        state.force_find_runner_evidence.record(group_id, runner);
+    }
+}
+
+fn force_find_candidate_node_from_grant(grant: &GrantedMountRoot) -> Option<NodeId> {
+    node_id_from_object_ref(&grant.object_ref)
+        .or_else(|| (!grant.host_ref.trim().is_empty()).then(|| NodeId(grant.host_ref.clone())))
+}
+
+async fn route_force_find_candidate_nodes_for_group_with_failure(
+    state: &ApiState,
+    group_id: &str,
+    route_timeout: Duration,
+) -> std::result::Result<Option<Vec<NodeId>>, QueryWorkerObservationFailure> {
+    let QueryBackend::Route {
+        boundary,
+        origin_id,
+        ..
+    } = &state.backend
+    else {
+        return Ok(None);
+    };
+    let status_timeout = std::cmp::min(route_timeout, FORCE_FIND_RUNNER_BINDING_STATUS_TIMEOUT);
+    if status_timeout.is_zero() {
+        return Err(QueryWorkerObservationFailure::Other(CnxError::Timeout));
+    }
+    let idle_grace = force_find_runner_binding_status_idle_grace(status_timeout);
+    let snapshots = route_source_observability_snapshots(
+        boundary.clone(),
+        origin_id.clone(),
+        StatusRoutePlan::caller_capped(status_timeout, idle_grace),
+    )
+    .await
+    .map_err(QueryWorkerObservationFailure::from)?;
+    Ok(Some(
+        force_find_candidate_nodes_from_runner_binding_evidence(&snapshots, group_id),
+    ))
+}
+
+fn force_find_runner_binding_status_idle_grace(status_timeout: Duration) -> Duration {
+    if status_timeout <= FORCE_FIND_RUNNER_BINDING_STATUS_IDLE_GRACE_MIN {
+        return status_timeout;
+    }
+    let quarter_millis = status_timeout.as_millis() / 4;
+    let quarter = Duration::from_millis(quarter_millis.min(u128::from(u64::MAX)) as u64);
+    std::cmp::min(
+        status_timeout,
+        std::cmp::min(
+            FORCE_FIND_RUNNER_BINDING_STATUS_IDLE_GRACE_MAX,
+            std::cmp::max(FORCE_FIND_RUNNER_BINDING_STATUS_IDLE_GRACE_MIN, quarter),
+        ),
+    )
+}
+
+fn select_force_find_runner_node_from_candidates(
+    state: &ApiState,
+    group_id: &str,
+    candidates: &[NodeId],
+    excluded_runner_nodes: &BTreeSet<String>,
+) -> std::result::Result<Option<NodeId>, QueryWorkerObservationFailure> {
+    let candidates = candidates
+        .iter()
+        .filter(|candidate| !excluded_runner_nodes.contains(&candidate.0))
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(None);
     }
     let len = candidates.len();
     let idx = {
@@ -8434,7 +9207,62 @@ async fn select_force_find_runner_node_for_group_with_failure(
         rr.insert(group_id.to_string(), (idx + 1) % len);
         idx
     };
-    Ok(node_id_from_object_ref(&candidates[idx]))
+    if debug_force_find_route_capture_enabled() {
+        eprintln!(
+            "fs_meta_query_api: force-find runner_selection group={} candidates={:?} excluded={:?} selected={} next_index={}",
+            group_id,
+            candidates
+                .iter()
+                .map(|node| node.0.clone())
+                .collect::<Vec<_>>(),
+            excluded_runner_nodes,
+            candidates[idx].0,
+            (idx + 1) % len
+        );
+    }
+    Ok(Some(candidates[idx].clone()))
+}
+
+async fn select_force_find_runner_node_for_group_with_failure(
+    state: &ApiState,
+    source: &SourceFacade,
+    group_id: &str,
+    route_timeout: Duration,
+    excluded_runner_nodes: &BTreeSet<String>,
+) -> std::result::Result<Option<NodeId>, QueryWorkerObservationFailure> {
+    if let Some(candidates) =
+        route_force_find_candidate_nodes_for_group_with_failure(state, group_id, route_timeout)
+            .await?
+    {
+        if candidates.is_empty() {
+            return Err(QueryWorkerObservationFailure::Other(CnxError::NotReady(
+                format!("{FORCE_FIND_RUNNER_BINDING_NOT_READY_PREFIX} group {group_id}"),
+            )));
+        }
+        return select_force_find_runner_node_from_candidates(
+            state,
+            group_id,
+            &candidates,
+            excluded_runner_nodes,
+        );
+    }
+
+    let candidates =
+        force_find_candidate_object_refs_for_group_with_failure(source, group_id).await?;
+    if candidates.is_empty() {
+        return materialized_owner_node_for_group_with_failure(
+            source,
+            None,
+            group_id,
+            MaterializedOwnerOmissionPolicy::Authoritative,
+        )
+        .await;
+    }
+    let nodes = candidates
+        .into_iter()
+        .filter_map(|object_ref| node_id_from_object_ref(&object_ref))
+        .collect::<Vec<_>>();
+    select_force_find_runner_node_from_candidates(state, group_id, &nodes, excluded_runner_nodes)
 }
 
 #[cfg(test)]
@@ -8443,9 +9271,15 @@ async fn select_force_find_runner_node_for_group(
     source: &SourceFacade,
     group_id: &str,
 ) -> Result<Option<NodeId>, CnxError> {
-    select_force_find_runner_node_for_group_with_failure(state, source, group_id)
-        .await
-        .map_err(QueryWorkerObservationFailure::into_error)
+    select_force_find_runner_node_for_group_with_failure(
+        state,
+        source,
+        group_id,
+        FORCE_FIND_RUNNER_BINDING_STATUS_TIMEOUT,
+        &BTreeSet::new(),
+    )
+    .await
+    .map_err(QueryWorkerObservationFailure::into_error)
 }
 
 fn acquire_force_find_group(
@@ -8462,17 +9296,28 @@ async fn query_force_find_group_stats(
     route_plan: ForceFindRoutePlan,
     group_id: &str,
     strict_conflict: bool,
+    session_guard_active: bool,
 ) -> Result<Vec<Event>, CnxError> {
-    let _guard = match acquire_force_find_group(state, group_id) {
-        Ok(guard) => guard,
-        Err(_err) if !strict_conflict => return Ok(Vec::new()),
-        Err(err) => return Err(err),
+    let _guard = if session_guard_active {
+        None
+    } else {
+        match acquire_force_find_group(state, group_id) {
+            Ok(guard) => Some(guard),
+            Err(_err) if !strict_conflict => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        }
     };
     let request = build_force_find_stats_request(path, recursive, Some(group_id.to_string()));
     let events =
         execute_force_find_group_stats_collect(state, request, route_plan, group_id, recursive)
             .await?;
-    apply_force_find_inflight_hold(route_plan, !_guard.groups.is_empty()).await;
+    apply_force_find_inflight_hold(
+        route_plan,
+        _guard
+            .as_ref()
+            .is_some_and(|guard| !guard.groups.is_empty()),
+    )
+    .await;
     Ok(events)
 }
 
@@ -8552,7 +9397,27 @@ fn is_retryable_force_find_route_error(err: &CnxError) -> bool {
 }
 
 fn is_retryable_force_find_runner_gap(err: &CnxError) -> bool {
-    matches!(err, CnxError::PeerError(message) if message.contains("selected_group matched no group"))
+    is_force_find_selected_group_missing_gap(err) || is_force_find_host_fs_unavailable_gap(err)
+}
+
+fn is_force_find_selected_group_missing_gap(err: &CnxError) -> bool {
+    matches!(
+        err,
+        CnxError::PeerError(message) | CnxError::Internal(message)
+            if message.contains("selected_group matched no group")
+    )
+}
+
+fn is_force_find_host_fs_unavailable_gap(err: &CnxError) -> bool {
+    matches!(
+        err,
+        CnxError::PeerError(message) | CnxError::Internal(message)
+            if message.contains("HOST_FS_UNAVAILABLE")
+    )
+}
+
+fn is_retryable_force_find_runner_binding_gap(err: &CnxError) -> bool {
+    matches!(err, CnxError::NotReady(message) if message.starts_with(FORCE_FIND_RUNNER_BINDING_NOT_READY_PREFIX))
 }
 
 async fn query_force_find_group_tree_on_route(
@@ -8636,12 +9501,29 @@ async fn execute_force_find_group_route_collect(
     kind: ForceFindRouteCollectKind,
 ) -> Result<Vec<Event>, CnxError> {
     let mut phase = machine.entry_phase();
+    let mut excluded_runner_nodes = BTreeSet::<String>::new();
+    let mut last_same_group_runner_gap = None::<String>;
     loop {
         match phase {
             ForceFindRouteMachinePhase::PlanSelectedRunner => {
-                phase = machine
-                    .phase_for_selected_runner(state, source, group_id)
+                let next_phase = machine
+                    .phase_for_selected_runner(state, source, group_id, &excluded_runner_nodes)
                     .await?;
+                if !excluded_runner_nodes.is_empty()
+                    && matches!(
+                        next_phase,
+                        ForceFindRouteMachinePhase::FallbackToGeneric { .. }
+                    )
+                {
+                    return Err(CnxError::PeerError(last_same_group_runner_gap.unwrap_or_else(
+                        || {
+                            format!(
+                                "force-find no alternate runner remained for group {group_id} after runner gap"
+                            )
+                        },
+                    )));
+                }
+                phase = next_phase;
             }
             ForceFindRouteMachinePhase::AttemptSelectedRunner {
                 node_id,
@@ -8689,6 +9571,12 @@ async fn execute_force_find_group_route_collect(
                 };
                 match attempt {
                     Ok(events) => {
+                        record_force_find_runner_response_evidence(
+                            state,
+                            group_id,
+                            Some(&node_id),
+                            &events,
+                        );
                         if debug_force_find_route_capture_enabled() {
                             eprintln!(
                                 "fs_meta_query_api: force-find {} via_node done group={} node={} events={} origins={:?}",
@@ -8703,7 +9591,23 @@ async fn execute_force_find_group_route_collect(
                     }
                     Err(err) => {
                         let runner_gap = is_retryable_force_find_runner_gap(&err);
+                        let host_fs_unavailable = is_force_find_host_fs_unavailable_gap(&err);
                         let err_text = err.to_string();
+                        if host_fs_unavailable {
+                            if debug_force_find_route_capture_enabled() {
+                                eprintln!(
+                                    "fs_meta_query_api: force-find {} via_node same_group_reroute group={} node={} err={}",
+                                    kind.label(),
+                                    group_id,
+                                    node_id.0,
+                                    err_text
+                                );
+                            }
+                            excluded_runner_nodes.insert(node_id.0);
+                            last_same_group_runner_gap = Some(err_text);
+                            phase = ForceFindRouteMachinePhase::PlanSelectedRunner;
+                            continue;
+                        }
                         let next_phase =
                             machine.followup_phase_at(tokio::time::Instant::now(), err, true);
                         if debug_force_find_route_capture_enabled() {
@@ -8773,6 +9677,7 @@ async fn execute_force_find_group_route_collect(
                     .await
                 {
                     Ok(events) => {
+                        record_force_find_runner_response_evidence(state, group_id, None, &events);
                         if debug_force_find_route_capture_enabled() {
                             eprintln!(
                                 "fs_meta_query_api: force-find {} route_fallback done group={} events={} origins={:?} after_runner_gap={}",
@@ -8840,11 +9745,16 @@ async fn query_force_find_group_tree(
     route_plan: ForceFindRoutePlan,
     group_id: &str,
     strict_conflict: bool,
+    session_guard_active: bool,
 ) -> Result<Vec<Event>, CnxError> {
-    let _guard = match acquire_force_find_group(state, group_id) {
-        Ok(guard) => guard,
-        Err(_err) if !strict_conflict => return Ok(Vec::new()),
-        Err(err) => return Err(err),
+    let _guard = if session_guard_active {
+        None
+    } else {
+        match acquire_force_find_group(state, group_id) {
+            Ok(guard) => Some(guard),
+            Err(_err) if !strict_conflict => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        }
     };
     let request =
         build_force_find_tree_request(path, recursive, max_depth, Some(group_id.to_string()));
@@ -8891,7 +9801,13 @@ async fn query_force_find_group_tree(
             }
         }
     };
-    apply_force_find_inflight_hold(route_plan, !_guard.groups.is_empty()).await;
+    apply_force_find_inflight_hold(
+        route_plan,
+        _guard
+            .as_ref()
+            .is_some_and(|guard| !guard.groups.is_empty()),
+    )
+    .await;
     Ok(events)
 }
 
@@ -8927,6 +9843,7 @@ struct ForceFindRankedGroupExecutionInput<'a> {
     policy: &'a ProjectionPolicy,
     params: &'a NormalizedApiParams,
     route_plan: ForceFindRoutePlan,
+    session_guard_active: bool,
 }
 
 fn decode_materialized_selected_group_response(
@@ -9183,6 +10100,37 @@ fn push_materialized_tree_group_error_snapshot(
 
 fn trusted_materialized_empty_group_root_requires_fail_closed(path: &[u8]) -> bool {
     path.is_empty() || path == b"/"
+}
+
+#[test]
+fn trusted_materialized_root_tree_fail_closes_when_sink_schedule_and_cache_are_empty() {
+    let empty_sink = SinkStatusSnapshot::default();
+    assert!(
+        trusted_materialized_root_tree_should_fail_closed_without_sink_schedule(
+            b"/",
+            &empty_sink,
+            None,
+        ),
+        "trusted root tree should fail closed instead of entering PIT routes when no sink schedule or cached schedule exists"
+    );
+
+    let cached_ready = CachedSinkStatusSnapshot {
+        snapshot: SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..SinkStatusSnapshot::default()
+        },
+    };
+    assert!(
+        !trusted_materialized_root_tree_should_fail_closed_without_sink_schedule(
+            b"/",
+            &empty_sink,
+            Some(&cached_ready),
+        ),
+        "request-scoped empty sink status must not erase an existing cached materialized schedule"
+    );
 }
 
 fn tree_root_json(root: &TreePageRoot) -> serde_json::Value {
@@ -9790,6 +10738,7 @@ async fn prepare_tree_pit_session_machine<'a>(
         params.group_order,
         &target_groups,
         None,
+        false,
     )
     .await?;
     let read_class = tree_read_class(params);
@@ -9829,6 +10778,7 @@ async fn build_force_find_pit_session(
 struct ForceFindPitSessionMachine<'a> {
     input: ForceFindRankedGroupExecutionInput<'a>,
     rankings: Vec<GroupRank>,
+    _session_guard: ForceFindInflightGuard,
 }
 
 struct ForceFindPitGroupMachine<'a, 'b> {
@@ -9849,6 +10799,7 @@ impl ForceFindPitGroupMachine<'_, '_> {
             input.route_plan,
             &group_key,
             strict_conflict,
+            input.session_guard_active,
         )
         .await
         {
@@ -9971,6 +10922,8 @@ async fn prepare_force_find_pit_session_machine<'a>(
     timeout: Duration,
 ) -> Result<ForceFindPitSessionMachine<'a>, CnxError> {
     let target_groups = resolve_force_find_groups(state, params).await?;
+    let session_guard = acquire_force_find_groups(state, target_groups.clone())?;
+    let session_guard_active = !session_guard.groups.is_empty();
     let rankings = if params.group_order == GroupOrder::GroupKey {
         let mut ordered = target_groups.clone();
         ordered.sort();
@@ -9994,6 +10947,7 @@ async fn prepare_force_find_pit_session_machine<'a>(
             params.group_order,
             &target_groups,
             params.group.as_deref(),
+            session_guard_active,
         )
         .await?
         .0
@@ -10004,8 +10958,10 @@ async fn prepare_force_find_pit_session_machine<'a>(
             policy,
             params,
             route_plan: ForceFindSessionPlan::new(timeout).route_plan(),
+            session_guard_active,
         },
         rankings,
+        _session_guard: session_guard,
     })
 }
 
@@ -10059,6 +11015,7 @@ async fn query_tree_page_response(
     params: &NormalizedApiParams,
     timeout: Duration,
     observation_status: ObservationStatus,
+    request_source_status: Option<SourceStatusSnapshot>,
     request_sink_status: Option<SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<BTreeSet<String>>,
 ) -> Result<serde_json::Value, CnxError> {
@@ -10113,7 +11070,40 @@ async fn query_tree_page_response(
         );
     }
 
+    let tree_cache_key = materialized_tree_cache_key(
+        state,
+        params,
+        tree_read_class(params),
+        request_source_status.as_ref(),
+        request_sink_status.as_ref(),
+    );
+    if let Some(key) = tree_cache_key.as_ref()
+        && let Some((pit_id, session)) = cached_materialized_tree_session(state, key)?
+    {
+        return render_pit_response(
+            &session,
+            &pit_id,
+            group_page_size,
+            0,
+            &entry_offsets,
+            entry_page_size,
+        );
+    }
+
     let _tree_query_serial = state.tree_query_serial.lock().await;
+    if let Some(key) = tree_cache_key.as_ref()
+        && let Some((pit_id, session)) = cached_materialized_tree_session(state, key)?
+    {
+        return render_pit_response(
+            &session,
+            &pit_id,
+            group_page_size,
+            0,
+            &entry_offsets,
+            entry_page_size,
+        );
+    }
+
     let session = Arc::new(
         build_tree_pit_session_with_request_scoped_schedule_omitted_ready_groups(
             state,
@@ -10133,6 +11123,11 @@ async fn query_tree_page_response(
             .lock()
             .map_err(|_| CnxError::Internal("pit store lock poisoned".into()))?;
         guard.insert(pit_id.clone(), session.clone())?;
+    }
+    if let Some(key) = tree_cache_key
+        && pit_session_has_cacheable_materialized_content(&session)
+    {
+        store_materialized_tree_session(state, key, &pit_id, &session)?;
     }
     render_pit_response(
         &session,
@@ -10173,14 +11168,51 @@ fn decode_force_find_selected_group_response(
     selected_group: &str,
     query_path: &[u8],
 ) -> Result<TreeGroupPayload, CnxError> {
-    let mut successes = Vec::<TreeGroupPayload>::new();
+    fn payload_score(payload: &TreeGroupPayload) -> (u8, usize, u8, u64, u8) {
+        (
+            u8::from(payload.root.exists),
+            payload.entries.len(),
+            u8::from(payload.root.has_children),
+            payload.root.modified_time_us,
+            u8::from(payload.reliability.reliable),
+        )
+    }
+
+    fn payload_precedence(
+        event: &Event,
+        payload: &TreeGroupPayload,
+    ) -> (u8, usize, u8, u64, u8, u64) {
+        let score = payload_score(payload);
+        (
+            score.0,
+            score.1,
+            score.2,
+            score.3,
+            score.4,
+            event.metadata().timestamp_us,
+        )
+    }
+
+    let mut best = None::<TreeGroupPayload>;
+    let mut best_precedence = None::<(u8, usize, u8, u64, u8, u64)>;
+    let mut saw_selected_group_payload = false;
     let mut errors = Vec::<String>::new();
     for event in events {
         if event_group_key(policy, event) != selected_group {
             continue;
         }
         match rmp_serde::from_slice::<ForceFindQueryPayload>(event.payload_bytes()) {
-            Ok(ForceFindQueryPayload::Tree(response)) => successes.push(response),
+            Ok(ForceFindQueryPayload::Tree(response)) => {
+                saw_selected_group_payload = true;
+                let precedence = payload_precedence(event, &response);
+                let replace = best_precedence
+                    .as_ref()
+                    .is_none_or(|current| precedence > *current);
+                if replace {
+                    best_precedence = Some(precedence);
+                    best = Some(response);
+                }
+            }
             Ok(ForceFindQueryPayload::Stats(_)) => {
                 errors.push("unexpected stats payload for force-find tree query".into());
             }
@@ -10193,21 +11225,12 @@ fn decode_force_find_selected_group_response(
             }
         }
     }
-    if successes.is_empty() {
+    if !saw_selected_group_payload {
         if errors.is_empty() {
-            return Ok(TreeGroupPayload {
-                reliability: GroupReliability::from_reason(None),
-                stability: TreeStability::not_evaluated(),
-                root: TreePageRoot {
-                    path: query_path.to_vec(),
-                    size: 0,
-                    modified_time_us: 0,
-                    is_dir: true,
-                    exists: false,
-                    has_children: false,
-                },
-                entries: Vec::new(),
-            });
+            return Err(CnxError::Internal(format!(
+                "force-find returned no selected group payload: {selected_group} path={}",
+                String::from_utf8_lossy(query_path)
+            )));
         }
         let detail = errors
             .first()
@@ -10215,10 +11238,7 @@ fn decode_force_find_selected_group_response(
             .unwrap_or_else(|| "force-find returned no payload for requested group".to_string());
         return Err(CnxError::Internal(detail));
     }
-    Ok(successes
-        .into_iter()
-        .next()
-        .expect("successes must contain one payload when non-empty"))
+    Ok(best.expect("best payload must exist after selected-group tree payload was seen"))
 }
 
 async fn query_force_find_page_response(
@@ -10559,6 +11579,7 @@ impl StatsGroupMachine<'_, '_> {
                     ForceFindSessionPlan::new(self.query.policy.force_find_timeout()).route_plan(),
                     group_id,
                     strict_conflict,
+                    false,
                 )
                 .await?
             }
@@ -10768,7 +11789,20 @@ async fn collect_materialized_stats_groups(
     request_source_status: Option<&SourceStatusSnapshot>,
     request_sink_status: Option<&SinkStatusSnapshot>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, CnxError> {
-    StatsQueryMachine {
+    let cache_key = materialized_stats_cache_key(
+        state,
+        params,
+        read_class,
+        request_source_status,
+        request_sink_status,
+    );
+    if let Some(key) = cache_key.as_ref()
+        && let Some(groups) = cached_materialized_stats_groups(state, key)?
+    {
+        return Ok(groups);
+    }
+
+    let groups = StatsQueryMachine {
         state,
         policy,
         params,
@@ -10777,7 +11811,11 @@ async fn collect_materialized_stats_groups(
         request_sink_status,
     }
     .run()
-    .await
+    .await?;
+    if let Some(key) = cache_key {
+        store_materialized_stats_groups(state, key, &groups)?;
+    }
+    Ok(groups)
 }
 
 async fn get_stats(
@@ -10911,7 +11949,25 @@ async fn get_tree(
             Err(err) => error_response_with_context(err, Some(&path_for_error)),
         };
     }
-    let (_source_status, sink_status, observation_status) = if read_class
+    if read_class == ReadClass::TrustedMaterialized {
+        match trusted_materialized_root_tree_should_fail_closed_before_status_fanout(
+            &state,
+            &params.path,
+        ) {
+            Ok(true) => {
+                return error_response_with_context(
+                    CnxError::NotReady(
+                        "trusted-materialized reads remain unavailable: sink has no scheduled materialized groups for root tree"
+                            .into(),
+                    ),
+                    Some(&path_for_error),
+                );
+            }
+            Ok(false) => {}
+            Err(err) => return error_response_with_context(err, Some(&path_for_error)),
+        }
+    }
+    let (source_status, sink_status, observation_status) = if read_class
         == ReadClass::TrustedMaterialized
     {
         match load_trusted_materialized_status_snapshots_with_settle(&state).await {
@@ -10976,28 +12032,44 @@ async fn get_tree(
                     &sink_status,
                     &request_scoped,
                 );
-            if trusted_materialized_empty_group_root_requires_fail_closed(&params.path)
-                && sink_status_snapshot_omits_all_groups_from_schedule(&request_scoped)
-            {
-                (
-                    request_scoped,
-                    Some(request_scoped_schedule_omitted_ready_groups),
-                )
-            } else {
-                (
-                    preserved,
-                    Some(request_scoped_schedule_omitted_ready_groups),
-                )
-            }
+            (
+                preserved,
+                Some(request_scoped_schedule_omitted_ready_groups),
+            )
         } else {
             (sink_status.clone(), None)
         };
+    if read_class == ReadClass::TrustedMaterialized {
+        let cached_sink_status = match state.materialized_sink_status_cache.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                return error_response_with_context(
+                    CnxError::Internal("materialized sink status cache lock poisoned".into()),
+                    Some(&path_for_error),
+                );
+            }
+        };
+        if trusted_materialized_root_tree_should_fail_closed_without_sink_schedule(
+            &params.path,
+            &request_sink_status,
+            cached_sink_status.as_ref(),
+        ) {
+            return error_response_with_context(
+                CnxError::NotReady(
+                    "trusted-materialized reads remain unavailable: sink has no scheduled materialized groups for root tree"
+                        .into(),
+                ),
+                Some(&path_for_error),
+            );
+        }
+    }
     match query_tree_page_response(
         &state,
         &policy,
         &params,
         policy.query_timeout(),
         observation_status,
+        Some(source_status),
         Some(request_sink_status),
         request_scoped_schedule_omitted_ready_groups,
     )

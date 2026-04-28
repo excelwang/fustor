@@ -1688,7 +1688,7 @@ async fn update_logical_roots_reacquires_worker_client_after_transport_closes_mi
 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn update_logical_roots_restore_reopens_pending_groups_for_materialization() {
+async fn update_logical_roots_restore_preserves_pending_groups_until_runtime_reassigns_scope() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -1756,8 +1756,37 @@ async fn update_logical_roots_restore_reopens_pending_groups_for_materialization
         .unwrap_or_default();
     assert_eq!(
         scheduled,
+        std::collections::BTreeSet::from(["nfs1".to_string()]),
+        "restoring logical roots must not widen sink placement before runtime reassigns nfs2"
+    );
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 3,
+                expires_at_ms: 2,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                ],
+            }))
+            .expect("encode sink reactivate with nfs2"),
+        ])
+        .await
+        .expect("apply runtime reassignment");
+
+    let scheduled_after_reassign = client
+        .scheduled_group_ids()
+        .await
+        .expect("scheduled groups after runtime reassignment")
+        .unwrap_or_default();
+    assert_eq!(
+        scheduled_after_reassign,
         std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
-        "restoring logical roots must reopen pending groups for materialization, not only previously ready groups"
+        "runtime reassignment must reopen restored pending groups for materialization"
     );
 
     client.close().await.expect("close sink worker");

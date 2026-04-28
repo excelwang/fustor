@@ -77,6 +77,8 @@ async fn close_clears_process_wide_fixed_bind_owner_and_pending_handoff_state() 
             api_task: app.api_task.clone(),
             api_request_tracker: app.api_request_tracker.clone(),
             api_control_gate: app.api_control_gate.clone(),
+            control_failure_uninitialized: app.control_failure_uninitialized.clone(),
+            retained_active_facade_continuity: app.retained_active_facade_continuity.clone(),
         },
     );
     let active_owner_present = {
@@ -103,12 +105,14 @@ async fn close_clears_process_wide_fixed_bind_owner_and_pending_handoff_state() 
             pending_fixed_bind_has_suppressed_dependent_routes: app
                 .pending_fixed_bind_has_suppressed_dependent_routes
                 .clone(),
+            retained_active_facade_continuity: app.retained_active_facade_continuity.clone(),
             facade_spawn_in_progress: app.facade_spawn_in_progress.clone(),
             facade_pending_status: app.facade_pending_status.clone(),
             facade_service_state: app.facade_service_state.clone(),
             rollout_status: app.rollout_status.clone(),
             api_request_tracker: app.api_request_tracker.clone(),
             api_control_gate: app.api_control_gate.clone(),
+            control_failure_uninitialized: app.control_failure_uninitialized.clone(),
             runtime_gate_state: app.runtime_gate_state.clone(),
             runtime_state_changed: app.runtime_state_changed.clone(),
             node_id: app.node_id.clone(),
@@ -311,6 +315,7 @@ async fn pending_facade_exposure_confirmed_waits_for_inflight_roots_put_after_si
     let _shutdown_reset = FacadeShutdownStartHookReset;
     install_facade_shutdown_start_hook(FacadeShutdownStartHook {
         entered: shutdown_started.clone(),
+        release: None,
     });
 
     let roots_body = json!({

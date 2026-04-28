@@ -38,7 +38,8 @@ const SOURCE_WORKER_FORCE_FIND_RETRY_BACKOFF: Duration = Duration::from_millis(2
 const SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
 const SOURCE_WORKER_CLOSE_DRAIN_TIMEOUT: Duration = SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT;
-const SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
+const SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT: Duration = Duration::from_secs(4);
+const SOURCE_WORKER_SCHEDULE_REFRESH_RPC_TIMEOUT: Duration = Duration::from_secs(1);
 const SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_WORKER_NONBLOCKING_OBSERVABILITY_CACHE_TTL: Duration = Duration::from_secs(1);
 const SOURCE_WORKER_DEGRADED_STATE: &str = "degraded_worker_unreachable";
@@ -139,6 +140,7 @@ enum SourceControlFrameLaneInspect {
     RetainedTickReplay,
     Attempt,
     Reconnect,
+    FailClosedReconnect,
     Wait {
         after: SourceProgressState,
         deadline: std::time::Instant,
@@ -241,6 +243,25 @@ impl SourceControlFrameLane for ReconnectLane {
         handle: &SourceWorkerClientHandle,
     ) -> std::result::Result<SourceControlFrameEvent, SourceFailure> {
         handle.reconnect_for_control_frame().await?;
+        Ok(SourceControlFrameEvent::ReconnectCompleted)
+    }
+}
+
+struct FailClosedReconnectLane;
+
+#[async_trait]
+impl SourceControlFrameLane for FailClosedReconnectLane {
+    fn inspect(&self) -> SourceControlFrameLaneInspect {
+        SourceControlFrameLaneInspect::FailClosedReconnect
+    }
+
+    async fn execute(
+        self: Box<Self>,
+        handle: &SourceWorkerClientHandle,
+    ) -> std::result::Result<SourceControlFrameEvent, SourceFailure> {
+        handle
+            .replace_worker_client_for_fail_closed_control_frame()
+            .await?;
         Ok(SourceControlFrameEvent::ReconnectCompleted)
     }
 }
@@ -398,7 +419,6 @@ impl SourceControlFrameStep {
 
 enum SourceControlFrameInitialStep {
     Run(SourceControlFrameRun),
-    Reconnect(SourceControlFrameReconnectResume),
 }
 
 impl SourceControlFrameInitialStep {
@@ -414,7 +434,6 @@ impl SourceControlFrameInitialStep {
 enum SourceControlFrameTickOnlyDisposition {
     RetainedTickFastPath { signals: Vec<SourceControlSignal> },
     RetainedTickReplay,
-    Reconnect,
 }
 
 #[derive(Clone, Debug)]
@@ -736,10 +755,9 @@ impl SourceControlFrameMachine {
             timeout_reset_policy,
             attempt_timeout_policy,
         } = facts;
-        let (pending_reconnect_resume, initial_step) = match initial_step {
-            Some(SourceControlFrameInitialStep::Run(lane)) => (None, Some(lane)),
-            Some(SourceControlFrameInitialStep::Reconnect(resume)) => (Some(resume), None),
-            None => (None, None),
+        let initial_step = match initial_step {
+            Some(SourceControlFrameInitialStep::Run(lane)) => Some(lane),
+            None => None,
         };
         let machine = Self {
             envelopes,
@@ -753,7 +771,7 @@ impl SourceControlFrameMachine {
             timeout_reset_policy,
             attempt_timeout_policy,
             timeout_reset_observation: SourceControlFrameTimeoutResetObservation::Clear,
-            pending_reconnect_resume,
+            pending_reconnect_resume: None,
             pending_refresh: None,
         };
         let initial_effect = if let Some(initial_step) = initial_step {
@@ -929,12 +947,15 @@ impl SourceControlFrameMachine {
             },
             None => SourceFailure::non_retryable(err),
         };
-        if retryable_control_error_kind.is_some_and(|kind| kind.is_bridge_reset_like()) {
-            match self.bridge_reset_policy_after_timeout_reset() {
+        let bridge_reset_policy = self.bridge_reset_policy_after_timeout_reset();
+        if retryable_control_error_kind
+            .is_some_and(|kind| kind.should_follow_fail_closed_bridge_policy(bridge_reset_policy))
+        {
+            match bridge_reset_policy {
                 SourceControlFrameBridgeResetPolicy::ReconnectThenFail => {
                     self.pending_reconnect_resume =
                         Some(SourceControlFrameReconnectResume::Fail(failure));
-                    return SourceControlFrameStep::run(ReconnectLane);
+                    return SourceControlFrameStep::run(FailClosedReconnectLane);
                 }
                 SourceControlFrameBridgeResetPolicy::FailImmediately => {
                     self.pending_reconnect_resume = None;
@@ -1221,6 +1242,18 @@ impl SourceWorkerControlResetKind {
 
     const fn is_timeout_like_reset(self) -> bool {
         matches!(self, Self::Timeout | Self::TimeoutLikePeerOrInternal)
+    }
+
+    const fn should_follow_fail_closed_bridge_policy(
+        self,
+        policy: SourceControlFrameBridgeResetPolicy,
+    ) -> bool {
+        self.is_bridge_reset_like()
+            || (self.is_timeout_like_reset()
+                && !matches!(
+                    policy,
+                    SourceControlFrameBridgeResetPolicy::RetryAfterReconnect
+                ))
     }
 }
 
@@ -1670,7 +1703,7 @@ enum SourceStartEffect {
 
 enum SourceObservabilitySnapshotEffect {
     Attempt { timeout: Duration },
-    Wait { after: SourceProgressState },
+    Reconnect,
     Complete(SourceWorkerResponse),
     Fail(SourceFailure),
 }
@@ -1704,7 +1737,7 @@ enum SourceObservabilitySnapshotEvent {
         rpc_result: std::result::Result<SourceWorkerResponse, CnxError>,
         after: SourceProgressState,
     },
-    WaitCompleted,
+    ReconnectCompleted,
 }
 
 enum SourceStartEvent {
@@ -1987,20 +2020,18 @@ impl SourceObservabilitySnapshotMachine {
                 rpc_result: Err(err),
                 after,
             } => Ok(
-                match SourceRetryMachine::new(self.deadline).wait_after_retryable_gap(
-                    err,
-                    after,
-                    can_retry_update_logical_roots,
-                ) {
-                    SourceWaitRetryDisposition::WaitAfter(after) => {
-                        SourceObservabilitySnapshotEffect::Wait { after }
+                match SourceRetryMachine::new(self.deadline)
+                    .reconnect_after_update_roots_gap(err, after)
+                {
+                    SourceReconnectRetryDisposition::ReconnectAfter(_) => {
+                        SourceObservabilitySnapshotEffect::Reconnect
                     }
-                    SourceWaitRetryDisposition::Fail(failure) => {
+                    SourceReconnectRetryDisposition::Fail(failure) => {
                         SourceObservabilitySnapshotEffect::Fail(failure)
                     }
                 },
             ),
-            SourceObservabilitySnapshotEvent::WaitCompleted => self.start(),
+            SourceObservabilitySnapshotEvent::ReconnectCompleted => self.start(),
         }
     }
 }
@@ -2067,7 +2098,10 @@ impl SourceReplayRetainedControlStateMachine {
     }
 
     fn start(&self) -> SourceReplayRetainedControlStateEffect {
-        match source_operation_attempt_timeout(self.deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT) {
+        match source_operation_attempt_timeout(
+            self.deadline,
+            SOURCE_WORKER_SCHEDULE_REFRESH_RPC_TIMEOUT,
+        ) {
             Ok(timeout) => SourceReplayRetainedControlStateEffect::Attempt { timeout },
             Err(failure) => SourceReplayRetainedControlStateEffect::Fail(failure),
         }
@@ -2441,6 +2475,7 @@ fn normalize_observability_snapshot_scheduled_group_keys(
     snapshot: &mut SourceObservabilitySnapshot,
     node_id: &NodeId,
     cached_grants: Option<&Vec<GrantedMountRoot>>,
+    cached_schedule_stable_host_ref: Option<&str>,
 ) {
     let mut stable_host_ref = stable_host_ref_for_node_id(node_id, &snapshot.grants);
     if stable_host_ref == node_id.0
@@ -2450,6 +2485,11 @@ fn normalize_observability_snapshot_scheduled_group_keys(
         if cached_host_ref != node_id.0 {
             stable_host_ref = cached_host_ref;
         }
+    }
+    if stable_host_ref == node_id.0
+        && let Some(cached_schedule_stable_host_ref) = cached_schedule_stable_host_ref
+    {
+        stable_host_ref = cached_schedule_stable_host_ref.to_string();
     }
     normalize_node_groups_key(
         &mut snapshot.scheduled_source_groups_by_node,
@@ -2631,6 +2671,7 @@ fn prime_cached_schedule_from_control_signals(
         _ => None,
     });
     if let Some((version, grants)) = changed_grants {
+        cache.last_live_observability_snapshot_at = None;
         cache.host_object_grants_version = Some(version);
         cache.grants = Some(grants);
     }
@@ -3097,6 +3138,65 @@ fn source_observability_snapshot_debug_maps_absent(snapshot: &SourceObservabilit
         && snapshot.yielded_path_origin_counts_by_node.is_empty()
         && snapshot.summarized_path_origin_counts_by_node.is_empty()
         && snapshot.published_path_origin_counts_by_node.is_empty()
+}
+
+fn source_logical_root_counts_as_status_readiness(
+    root: &crate::source::SourceLogicalRootHealthSnapshot,
+) -> bool {
+    root.matched_grants > 0
+        && root.active_members > 0
+        && !root.status.starts_with("waiting_for_root:")
+}
+
+fn source_concrete_root_counts_as_status_readiness(
+    root: &crate::source::SourceConcreteRootHealthSnapshot,
+) -> bool {
+    root.active
+        && root.scan_enabled
+        && root.last_error.is_none()
+        && !root.status.starts_with("waiting_for_root:")
+}
+
+fn source_status_readiness_groups(
+    status: &SourceStatusSnapshot,
+) -> std::collections::BTreeSet<String> {
+    let degraded_groups = status
+        .degraded_roots
+        .iter()
+        .map(|(group, _)| group.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut groups = status
+        .logical_roots
+        .iter()
+        .filter(|root| source_logical_root_counts_as_status_readiness(root))
+        .map(|root| root.root_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    groups.extend(
+        status
+            .concrete_roots
+            .iter()
+            .filter(|root| source_concrete_root_counts_as_status_readiness(root))
+            .map(|root| root.logical_root_id.clone()),
+    );
+    for group in degraded_groups {
+        groups.remove(&group);
+    }
+    groups
+}
+
+fn source_observability_snapshot_has_configured_status_root_health(
+    snapshot: &SourceObservabilitySnapshot,
+) -> bool {
+    let configured_groups = snapshot
+        .logical_roots
+        .iter()
+        .filter(|root| root.watch || root.scan)
+        .map(|root| root.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if configured_groups.is_empty() {
+        return false;
+    }
+    configured_groups.is_subset(&source_status_readiness_groups(&snapshot.status))
 }
 
 pub(crate) fn source_status_has_active_observability_truth(status: &SourceStatusSnapshot) -> bool {
@@ -3690,6 +3790,7 @@ pub struct SourceWorkerClientHandle {
     source_progress_state_tx: tokio::sync::watch::Sender<SourceProgressState>,
     source_progress_state: tokio::sync::watch::Receiver<SourceProgressState>,
     control_ops_serial: Arc<tokio::sync::Mutex<()>>,
+    observability_read_serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct InflightControlOpGuard {
@@ -3717,6 +3818,7 @@ struct SharedSourceWorkerHandleState {
     source_progress_state_current: Arc<Mutex<SourceProgressState>>,
     source_progress_state: tokio::sync::watch::Sender<SourceProgressState>,
     control_ops_serial: Arc<tokio::sync::Mutex<()>>,
+    observability_read_serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3853,7 +3955,7 @@ impl SourceControlState {
         if self.active_by_route.is_empty() {
             return None;
         }
-        let mut saw_generation_mismatch = false;
+        let mut current_or_forward_ticks = Vec::new();
         for signal in signals {
             let SourceControlSignal::Tick {
                 unit,
@@ -3877,18 +3979,23 @@ impl SourceControlState {
             else {
                 return None;
             };
-            if retained_generation != generation {
-                saw_generation_mismatch = true;
+            if generation >= retained_generation {
+                current_or_forward_ticks.push(signal.clone());
             }
         }
-        if saw_generation_mismatch {
-            Some(SourceControlFrameTickOnlyDisposition::Reconnect)
-        } else if matches!(self.replay_state(), SourceControlReplayState::Required) {
+        if current_or_forward_ticks.is_empty() {
+            return Some(
+                SourceControlFrameTickOnlyDisposition::RetainedTickFastPath {
+                    signals: Vec::new(),
+                },
+            );
+        }
+        if matches!(self.replay_state(), SourceControlReplayState::Required) {
             Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay)
         } else {
             Some(
                 SourceControlFrameTickOnlyDisposition::RetainedTickFastPath {
-                    signals: signals.to_vec(),
+                    signals: current_or_forward_ticks,
                 },
             )
         }
@@ -3904,6 +4011,18 @@ impl SourceControlState {
                 .values()
                 .map(SourceControlSignal::envelope),
         );
+        envelopes
+    }
+
+    fn merge_replay_envelopes_for_next_wave(
+        &self,
+        incoming: &[ControlEnvelope],
+    ) -> Vec<ControlEnvelope> {
+        if !matches!(self.replay_state, SourceControlReplayState::Required) {
+            return incoming.to_vec();
+        }
+        let mut envelopes = self.replay_envelopes();
+        envelopes.extend(incoming.iter().cloned());
         envelopes
     }
 
@@ -4020,6 +4139,11 @@ pub(crate) struct SourceWorkerObservabilityErrorHook {
 }
 
 #[cfg(test)]
+pub(crate) struct SourceWorkerObservabilityDelayHook {
+    pub delay: Duration,
+}
+
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct SourceWorkerObservabilityCallCountHook {
     pub count: Arc<AtomicUsize>,
@@ -4074,6 +4198,12 @@ pub(crate) struct SourceWorkerScheduledGroupsRefreshErrorQueueHook {
     pub errs: std::collections::VecDeque<CnxError>,
     pub sticky_worker_instance_id: Option<u64>,
     pub sticky_peer_err: Option<String>,
+}
+
+#[cfg(test)]
+pub(crate) struct SourceWorkerScheduledGroupsRefreshDelayHook {
+    pub delays: std::collections::VecDeque<Duration>,
+    pub sticky_worker_instance_id: Option<u64>,
 }
 
 #[cfg(test)]
@@ -4160,6 +4290,14 @@ fn source_worker_observability_error_hook_cell()
 }
 
 #[cfg(test)]
+fn source_worker_observability_delay_hook_cell()
+-> &'static Mutex<Option<SourceWorkerObservabilityDelayHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerObservabilityDelayHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
 fn source_worker_observability_call_count_hook_cell()
 -> &'static Mutex<Option<SourceWorkerObservabilityCallCountHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerObservabilityCallCountHook>>> =
@@ -4220,6 +4358,14 @@ fn source_worker_scheduled_groups_refresh_error_queue_hook_cell()
     static CELL: std::sync::OnceLock<
         Mutex<Option<SourceWorkerScheduledGroupsRefreshErrorQueueHook>>,
     > = std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn source_worker_scheduled_groups_refresh_delay_hook_cell()
+-> &'static Mutex<Option<SourceWorkerScheduledGroupsRefreshDelayHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerScheduledGroupsRefreshDelayHook>>> =
+        std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
 
@@ -4301,6 +4447,17 @@ pub(crate) fn install_source_worker_scheduled_groups_refresh_error_queue_hook(
 }
 
 #[cfg(test)]
+pub(crate) fn install_source_worker_scheduled_groups_refresh_delay_hook(
+    hook: SourceWorkerScheduledGroupsRefreshDelayHook,
+) {
+    let mut guard = match source_worker_scheduled_groups_refresh_delay_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn install_source_worker_force_find_error_queue_hook(
     hook: SourceWorkerForceFindErrorQueueHook,
 ) {
@@ -4368,6 +4525,15 @@ pub(crate) fn clear_source_worker_scheduled_groups_refresh_queue_hook() {
 #[cfg(test)]
 pub(crate) fn clear_source_worker_scheduled_groups_refresh_error_queue_hook() {
     let mut guard = match source_worker_scheduled_groups_refresh_error_queue_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_source_worker_scheduled_groups_refresh_delay_hook() {
+    let mut guard = match source_worker_scheduled_groups_refresh_delay_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -4486,6 +4652,17 @@ pub(crate) fn install_source_worker_observability_call_count_hook(
 }
 
 #[cfg(test)]
+pub(crate) fn install_source_worker_observability_delay_hook(
+    hook: SourceWorkerObservabilityDelayHook,
+) {
+    let mut guard = match source_worker_observability_delay_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn install_source_worker_trigger_rescan_when_ready_call_count_hook(
     hook: SourceWorkerTriggerRescanWhenReadyCallCountHook,
 ) {
@@ -4577,6 +4754,15 @@ pub(crate) fn clear_source_worker_observability_call_count_hook() {
 }
 
 #[cfg(test)]
+pub(crate) fn clear_source_worker_observability_delay_hook() {
+    let mut guard = match source_worker_observability_delay_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
 pub(crate) fn clear_source_worker_trigger_rescan_when_ready_call_count_hook() {
     let mut guard = match source_worker_trigger_rescan_when_ready_call_count_hook_cell().lock() {
         Ok(guard) => guard,
@@ -4640,6 +4826,15 @@ fn take_source_worker_observability_error_hook() -> Option<CnxError> {
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.take().map(|hook| hook.err)
+}
+
+#[cfg(test)]
+fn source_worker_observability_delay_hook() -> Option<Duration> {
+    let guard = match source_worker_observability_delay_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.as_ref().map(|hook| hook.delay)
 }
 
 #[cfg(test)]
@@ -4745,6 +4940,27 @@ fn take_source_worker_scheduled_groups_refresh_error_queue_hook(
         *guard = None;
     }
     err
+}
+
+#[cfg(test)]
+fn take_source_worker_scheduled_groups_refresh_delay_hook(
+    current_worker_instance_id: u64,
+) -> Option<Duration> {
+    let mut guard = match source_worker_scheduled_groups_refresh_delay_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let hook = guard.as_mut()?;
+    if let Some(sticky_worker_instance_id) = hook.sticky_worker_instance_id
+        && sticky_worker_instance_id != current_worker_instance_id
+    {
+        return None;
+    }
+    let delay = hook.delays.pop_front();
+    if hook.delays.is_empty() {
+        *guard = None;
+    }
+    delay
 }
 
 #[cfg(test)]
@@ -4940,6 +5156,7 @@ impl SourceWorkerClientHandle {
                     source_progress_state_current: Arc::new(Mutex::new(initial_progress_state)),
                     source_progress_state,
                     control_ops_serial: Arc::new(tokio::sync::Mutex::new(())),
+                    observability_read_serial: Arc::new(tokio::sync::Mutex::new(())),
                 });
                 registry.insert(key, Arc::downgrade(&shared));
                 shared
@@ -4969,6 +5186,7 @@ impl SourceWorkerClientHandle {
             source_progress_state_tx: shared.source_progress_state.clone(),
             source_progress_state: shared.source_progress_state.subscribe(),
             control_ops_serial: shared.control_ops_serial.clone(),
+            observability_read_serial: shared.observability_read_serial.clone(),
             config,
         })
     }
@@ -5019,6 +5237,16 @@ impl SourceWorkerClientHandle {
     ) -> std::result::Result<(), SourceFailure> {
         let stale_client = self.replace_shared_worker_client().await?;
         let _ = stale_client.shutdown(Duration::from_millis(250)).await;
+        Ok(())
+    }
+
+    async fn replace_worker_client_for_fail_closed_control_frame(
+        &self,
+    ) -> std::result::Result<(), SourceFailure> {
+        let stale_client = self.replace_shared_worker_client().await?;
+        tokio::spawn(async move {
+            let _ = stale_client.shutdown(Duration::from_millis(250)).await;
+        });
         Ok(())
     }
 
@@ -5189,6 +5417,35 @@ impl SourceWorkerClientHandle {
         replay_result
     }
 
+    async fn replay_retained_control_state_before_observability_read_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<(), SourceFailure> {
+        let replay_required = matches!(
+            self.control_state.lock().await.replay_state(),
+            SourceControlReplayState::Required
+        );
+        if !replay_required {
+            return Ok(());
+        }
+
+        let _inflight = self.begin_control_op();
+        let _serial = self.control_ops_serial.lock().await;
+        eprintln!(
+            "fs_meta_source_worker_client: observability retained replay begin node={}",
+            self.node_id.0
+        );
+        let result = self
+            .replay_retained_control_state_if_needed_for_refresh_until(deadline)
+            .await;
+        eprintln!(
+            "fs_meta_source_worker_client: observability retained replay done node={} ok={}",
+            self.node_id.0,
+            result.is_ok()
+        );
+        result
+    }
+
     fn begin_control_op(&self) -> InflightControlOpGuard {
         let next = self.control_ops_inflight.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = self.control_ops_state_tx.send_replace(next);
@@ -5247,6 +5504,21 @@ impl SourceWorkerClientHandle {
 
     fn cached_rescan_observed_epoch(&self) -> u64 {
         self.with_cache_mut(|cache| cache.rescan_observed_epoch)
+    }
+
+    fn cached_materialized_read_cache_epoch(&self) -> u64 {
+        self.with_cache_mut(|cache| cache.rescan_request_epoch.max(cache.rescan_observed_epoch))
+    }
+
+    fn bump_cached_materialized_read_cache_epoch(&self) {
+        self.with_cache_mut(|cache| {
+            let next = cache
+                .rescan_request_epoch
+                .max(cache.rescan_observed_epoch)
+                .saturating_add(1);
+            cache.rescan_request_epoch = cache.rescan_request_epoch.max(next);
+            cache.last_live_observability_snapshot_at = None;
+        });
     }
 
     async fn wait_for_source_progress_after(
@@ -5330,9 +5602,11 @@ impl SourceWorkerClientHandle {
             scheduled_groups_expectation,
             refresh_disposition,
         );
-        let recovery_observation =
-            std::sync::atomic::AtomicU8::new(machine.recovery_observation.as_atomic_u8());
-        drive_source_machine_loop(
+        let recovery_observation = Arc::new(std::sync::atomic::AtomicU8::new(
+            machine.recovery_observation.as_atomic_u8(),
+        ));
+        let recovery_observation_for_deadline = recovery_observation.clone();
+        let drive_refresh = drive_source_machine_loop(
             machine.start(),
             |effect| async {
                 match effect {
@@ -5452,8 +5726,17 @@ impl SourceWorkerClientHandle {
                 );
                 Ok(effect)
             },
-        )
-        .await
+        );
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), drive_refresh).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(source_scheduled_groups_refresh_deadline_failure(
+                refresh_disposition,
+                SourceScheduledGroupsRefreshRecoveryObservation::from_atomic_u8(
+                    recovery_observation_for_deadline.load(Ordering::Relaxed),
+                ),
+            )),
+        }
     }
 
     async fn execute_scheduled_groups_refresh_ensure_started(
@@ -5462,7 +5745,7 @@ impl SourceWorkerClientHandle {
     ) -> std::result::Result<(), SourceFailure> {
         let worker = self.worker_client().await;
         let ensure_started_timeout =
-            source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)?;
+            source_operation_attempt_timeout(deadline, SOURCE_WORKER_SCHEDULE_REFRESH_RPC_TIMEOUT)?;
         map_source_timeout_result_with_failure(
             tokio::time::timeout(ensure_started_timeout, worker.ensure_started()).await,
         )
@@ -5493,7 +5776,7 @@ impl SourceWorkerClientHandle {
         Self::call_worker_with_failure(
             client,
             SourceWorkerRequest::HostObjectGrantsSnapshot,
-            source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)?,
+            source_operation_attempt_timeout(deadline, SOURCE_WORKER_SCHEDULE_REFRESH_RPC_TIMEOUT)?,
         )
         .await
     }
@@ -5533,9 +5816,14 @@ impl SourceWorkerClientHandle {
     ) -> std::result::Result<SourceScheduledGroupsRefreshFetchedGroups, SourceFailure> {
         #[cfg(test)]
         let refresh_attempt = {
-            let injected = take_source_worker_scheduled_groups_refresh_error_queue_hook(
-                self.worker_instance_id_for_tests().await,
-            );
+            let worker_instance_id = self.worker_instance_id_for_tests().await;
+            if let Some(delay) =
+                take_source_worker_scheduled_groups_refresh_delay_hook(worker_instance_id)
+            {
+                tokio::time::sleep(delay).await;
+            }
+            let injected =
+                take_source_worker_scheduled_groups_refresh_error_queue_hook(worker_instance_id);
             if let Some(err) = injected {
                 Err(err.into())
             } else {
@@ -5615,7 +5903,7 @@ impl SourceWorkerClientHandle {
         let scheduled_source = match Self::call_worker_with_failure(
             client,
             SourceWorkerRequest::ScheduledSourceGroupIds,
-            source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)?,
+            source_operation_attempt_timeout(deadline, SOURCE_WORKER_SCHEDULE_REFRESH_RPC_TIMEOUT)?,
         )
         .await?
         {
@@ -5637,7 +5925,7 @@ impl SourceWorkerClientHandle {
         let scheduled_scan = match Self::call_worker_with_failure(
             client,
             SourceWorkerRequest::ScheduledScanGroupIds,
-            source_operation_attempt_timeout(deadline, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)?,
+            source_operation_attempt_timeout(deadline, SOURCE_WORKER_SCHEDULE_REFRESH_RPC_TIMEOUT)?,
         )
         .await?
         {
@@ -5693,6 +5981,20 @@ impl SourceWorkerClientHandle {
             .await
     }
 
+    async fn with_started_once_with_failure<T, F, Fut>(
+        &self,
+        op: F,
+    ) -> std::result::Result<T, SourceFailure>
+    where
+        F: FnOnce(TypedWorkerClient<SourceWorkerRpc>) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, SourceFailure>>,
+    {
+        self.worker_client()
+            .await
+            .with_started_once_mapped(op, SourceFailure::into_error)
+            .await
+    }
+
     #[cfg(test)]
     async fn client(&self) -> Result<TypedWorkerClient<SourceWorkerRpc>> {
         self.worker_client().await.client().await
@@ -5739,6 +6041,8 @@ impl SourceWorkerClientHandle {
         timeout: Duration,
     ) -> std::result::Result<SourceObservabilitySnapshot, SourceFailure> {
         let deadline = clip_retry_deadline(std::time::Instant::now() + timeout, timeout);
+        self.replay_retained_control_state_before_observability_read_until(deadline)
+            .await?;
         let machine = SourceObservabilitySnapshotMachine::new(deadline, timeout);
         let response = drive_source_machine_loop(
             machine.start()?,
@@ -5754,12 +6058,13 @@ impl SourceWorkerClientHandle {
                             },
                         )
                     }
-                    SourceObservabilitySnapshotEffect::Wait { after } => {
-                        self.execute_observability_snapshot_wait(after, deadline)
-                            .await;
-                        SourceOperationLoopStep::Event(
-                            SourceObservabilitySnapshotEvent::WaitCompleted,
-                        )
+                    SourceObservabilitySnapshotEffect::Reconnect => {
+                        match self.reconnect_shared_worker_client_with_failure().await {
+                            Ok(()) => SourceOperationLoopStep::Event(
+                                SourceObservabilitySnapshotEvent::ReconnectCompleted,
+                            ),
+                            Err(err) => SourceOperationLoopStep::Fail(err),
+                        }
                     }
                     SourceObservabilitySnapshotEffect::Complete(response) => {
                         SourceOperationLoopStep::Complete(response)
@@ -5775,10 +6080,13 @@ impl SourceWorkerClientHandle {
         match response {
             SourceWorkerResponse::ObservabilitySnapshot(mut snapshot) => {
                 snapshot = self.with_cache_mut(|cache| {
+                    let cached_schedule_stable_host_ref =
+                        stable_host_ref_from_cached_scheduled_groups(&self.node_id, cache);
                     normalize_observability_snapshot_scheduled_group_keys(
                         &mut snapshot,
                         &self.node_id,
                         cache.grants.as_ref(),
+                        cached_schedule_stable_host_ref.as_deref(),
                     );
                     merge_non_empty_cached_groups(
                         &mut snapshot.scheduled_source_groups_by_node,
@@ -6431,6 +6739,10 @@ impl SourceWorkerClientHandle {
             #[cfg(test)]
             record_source_worker_observability_rpc_attempt();
             #[cfg(test)]
+            if let Some(delay) = source_worker_observability_delay_hook() {
+                tokio::time::sleep(delay).await;
+            }
+            #[cfg(test)]
             if let Some(err) = take_source_worker_observability_error_hook() {
                 return Err(SourceFailure::from(err));
             }
@@ -6443,15 +6755,6 @@ impl SourceWorkerClientHandle {
         })
         .await
         .map_err(SourceFailure::into_error)
-    }
-
-    async fn execute_observability_snapshot_wait(
-        &self,
-        after: SourceProgressState,
-        deadline: std::time::Instant,
-    ) {
-        self.wait_for_source_progress_after(after, SourceWaitFor::Observability, deadline)
-            .await;
     }
 
     async fn execute_start_attempt(&self, timeout: Duration) -> std::result::Result<(), CnxError> {
@@ -6612,7 +6915,9 @@ impl SourceWorkerClientHandle {
         self.manual_rescan_signal
             .emit(&self.node_id.0)
             .await
-            .map(|_| ())
+            .map(|_| {
+                self.bump_cached_materialized_read_cache_epoch();
+            })
             .map_err(|err| {
                 SourceFailure::from(CnxError::Internal(format!(
                     "publish manual rescan signal failed: {err}"
@@ -6637,10 +6942,13 @@ impl SourceWorkerClientHandle {
         total_timeout: Duration,
         rpc_timeout: Duration,
     ) -> Result<SourceControlFrameFacts> {
-        let control_envelopes = Arc::<[ControlEnvelope]>::from(envelopes.to_vec());
+        let control_envelopes = Arc::<[ControlEnvelope]>::from({
+            let control_state = self.control_state.lock().await;
+            control_state.merge_replay_envelopes_for_next_wave(envelopes)
+        });
         let operation_deadline =
             clip_retry_deadline(std::time::Instant::now() + total_timeout, total_timeout);
-        let decoded_signals = source_control_signals_from_envelopes(envelopes)
+        let decoded_signals = source_control_signals_from_envelopes(&control_envelopes)
             .map(SourceControlFrameDecodedSignals::Decoded)
             .unwrap_or(SourceControlFrameDecodedSignals::DecodeFailed);
         let (fail_fast_generation_one_activate_replay, initial_step) = match &decoded_signals {
@@ -6656,11 +6964,6 @@ impl SourceWorkerClientHandle {
                         Some(SourceControlFrameInitialStep::run(RetainedTickReplayLane {
                             deadline: operation_deadline,
                         }))
-                    }
-                    Some(SourceControlFrameTickOnlyDisposition::Reconnect) => {
-                        Some(SourceControlFrameInitialStep::Reconnect(
-                            SourceControlFrameReconnectResume::RetainedTickReplay,
-                        ))
                     }
                     None => None,
                 };
@@ -6705,16 +7008,15 @@ impl SourceWorkerClientHandle {
         } else {
             false
         };
-        let bridge_reset_policy =
-            if total_timeout <= SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT {
-                SourceControlFrameBridgeResetPolicy::FailImmediately
-            } else if fail_fast_generation_one_activate_replay
-                || is_restart_deferred_retire_pending_deactivate_batch(envelopes)
-            {
-                SourceControlFrameBridgeResetPolicy::ReconnectThenFail
-            } else {
-                SourceControlFrameBridgeResetPolicy::RetryAfterReconnect
-            };
+        let bridge_reset_policy = if fail_fast_generation_one_activate_replay
+            || is_restart_deferred_retire_pending_deactivate_batch(&control_envelopes)
+        {
+            SourceControlFrameBridgeResetPolicy::ReconnectThenFail
+        } else if total_timeout <= SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT {
+            SourceControlFrameBridgeResetPolicy::FailImmediately
+        } else {
+            SourceControlFrameBridgeResetPolicy::RetryAfterReconnect
+        };
         Ok(SourceControlFrameFacts {
             envelopes: control_envelopes,
             decoded_signals,
@@ -6810,6 +7112,43 @@ impl SourceWorkerClientHandle {
         Ok(epoch)
     }
 
+    async fn submit_rescan_when_ready_epoch_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SourceFailure> {
+        let response = self
+            .with_started_once_with_failure(|client| async move {
+                Self::call_worker_with_failure(
+                    &client,
+                    SourceWorkerRequest::TriggerRescanWhenReadyEpoch,
+                    SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
+                )
+                .await
+            })
+            .await?;
+        let epoch = match response {
+            SourceWorkerResponse::RescanRequestEpoch(epoch) => epoch,
+            other => {
+                return Err(unexpected_source_worker_response_failure(
+                    "for submit_rescan_when_ready_epoch",
+                    other,
+                ));
+            }
+        };
+        self.with_cache_mut(|cache| {
+            let last_audit_completed_at_us = cache
+                .status
+                .as_ref()
+                .map(source_status_rescan_completion_marker)
+                .unwrap_or_default();
+            let (published_batches, last_published_at_us) = cached_source_publication_marker(cache);
+            cache.rescan_request_published_batches = published_batches;
+            cache.rescan_request_last_published_at_us = last_published_at_us;
+            cache.rescan_request_last_audit_completed_at_us = last_audit_completed_at_us;
+            cache.rescan_request_epoch = cache.rescan_request_epoch.max(epoch);
+        });
+        Ok(epoch)
+    }
+
     async fn progress_snapshot_with_timeout_with_failure(
         &self,
         timeout: Duration,
@@ -6835,9 +7174,13 @@ impl SourceWorkerClientHandle {
                     );
                 }
                 self.with_cache_mut(|cache| {
+                    let previous_rescan_observed_epoch = cache.rescan_observed_epoch;
                     cache.rescan_observed_epoch = cache
                         .rescan_observed_epoch
                         .max(snapshot.rescan_observed_epoch);
+                    if cache.rescan_observed_epoch > previous_rescan_observed_epoch {
+                        cache.last_live_observability_snapshot_at = None;
+                    }
                 });
                 Ok(snapshot)
             }
@@ -6876,7 +7219,13 @@ impl SourceWorkerClientHandle {
         self.worker_client()
             .await
             .shutdown(Duration::from_secs(2))
-            .await
+            .await?;
+        self.with_cache_mut(|cache| {
+            cache.lifecycle_state = Some("closed".to_string());
+        });
+        self.control_state.lock().await.arm_replay();
+        self.bump_source_progress(SourceProgressReason::WorkerClientReplaced);
+        Ok(())
     }
 
     async fn observability_snapshot_nonblocking_with_access_path(
@@ -6894,6 +7243,9 @@ impl SourceWorkerClientHandle {
             }
             return Ok((snapshot, true));
         }
+        let read_deadline = std::time::Instant::now() + SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT;
+        self.replay_retained_control_state_before_observability_read_until(read_deadline)
+            .await?;
         let Some(_client) = self.existing_client_with_failure().await? else {
             let snapshot =
                 self.degraded_observability_snapshot_from_cache("source worker status not started");
@@ -6906,22 +7258,34 @@ impl SourceWorkerClientHandle {
             }
             return Ok((snapshot, true));
         };
-        if let Some(snapshot) = self.with_cache_mut(|cache| {
-            cache
-                .last_live_observability_snapshot_at
-                .filter(|last| last.elapsed() < SOURCE_WORKER_NONBLOCKING_OBSERVABILITY_CACHE_TTL)
-                .and_then(|_| build_cached_worker_observability_snapshot(cache))
-        }) {
-            if !recent_cached_source_observability_snapshot_is_incomplete(&snapshot) {
-                if debug_control_scope_capture_enabled() {
-                    eprintln!(
-                        "fs_meta_source_worker_client: observability_snapshot cache_fallback node={} reason=recent_live_cache {}",
-                        self.node_id.0,
-                        summarize_source_observability_snapshot(&snapshot)
-                    );
-                }
-                return Ok((snapshot, true));
+        if let Some(snapshot) = self.recent_nonblocking_observability_cache_snapshot() {
+            self.log_observability_cache_fallback("recent_live_cache", &snapshot);
+            return Ok((snapshot, true));
+        }
+        if let Some(snapshot) = self.stable_status_root_health_observability_cache_snapshot() {
+            self.log_observability_cache_fallback("stable_status_root_health_cache", &snapshot);
+            return Ok((snapshot, true));
+        }
+        let _read_serial = self.observability_read_serial.lock().await;
+        if self.control_op_inflight() {
+            let snapshot =
+                self.degraded_observability_snapshot_from_cache("source worker control in flight");
+            if debug_control_scope_capture_enabled() {
+                eprintln!(
+                    "fs_meta_source_worker_client: observability_snapshot cache_fallback node={} reason=control_inflight {}",
+                    self.node_id.0,
+                    summarize_source_observability_snapshot(&snapshot)
+                );
             }
+            return Ok((snapshot, true));
+        }
+        if let Some(snapshot) = self.recent_nonblocking_observability_cache_snapshot() {
+            self.log_observability_cache_fallback("recent_live_cache", &snapshot);
+            return Ok((snapshot, true));
+        }
+        if let Some(snapshot) = self.stable_status_root_health_observability_cache_snapshot() {
+            self.log_observability_cache_fallback("stable_status_root_health_cache", &snapshot);
+            return Ok((snapshot, true));
         }
         let trace_id = next_source_status_trace_id();
         let mut trace_guard =
@@ -6932,10 +7296,18 @@ impl SourceWorkerClientHandle {
             SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT.as_millis(),
             trace_id
         );
+        let snapshot_timeout = match classify_source_retry_budget(read_deadline) {
+            SourceRetryBudgetDisposition::Exhausted => {
+                return Err(SourceFailure::retry_budget_exhausted(
+                    SourceRetryBudgetExhaustionKind::OperationAttempt,
+                ));
+            }
+            SourceRetryBudgetDisposition::Remaining(remaining) => {
+                remaining.min(SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT)
+            }
+        };
         let result = self
-            .observability_snapshot_with_timeout_with_failure(
-                SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
-            )
+            .observability_snapshot_with_timeout_with_failure(snapshot_timeout)
             .await;
         trace_guard.phase("after_rpc_await");
         eprintln!(
@@ -6946,6 +7318,47 @@ impl SourceWorkerClientHandle {
         );
         trace_guard.complete();
         result.map(|snapshot| (snapshot, false))
+    }
+
+    fn recent_nonblocking_observability_cache_snapshot(
+        &self,
+    ) -> Option<SourceObservabilitySnapshot> {
+        let snapshot = self.with_cache_mut(|cache| {
+            cache
+                .last_live_observability_snapshot_at
+                .filter(|last| last.elapsed() < SOURCE_WORKER_NONBLOCKING_OBSERVABILITY_CACHE_TTL)
+                .and_then(|_| build_cached_worker_observability_snapshot(cache))
+        })?;
+        (!recent_cached_source_observability_snapshot_is_incomplete(&snapshot)).then_some(snapshot)
+    }
+
+    fn stable_status_root_health_observability_cache_snapshot(
+        &self,
+    ) -> Option<SourceObservabilitySnapshot> {
+        let snapshot = self.with_cache_mut(|cache| {
+            let last_live = cache.last_live_observability_snapshot_at?;
+            if last_live.elapsed() < SOURCE_WORKER_NONBLOCKING_OBSERVABILITY_CACHE_TTL {
+                return None;
+            }
+            build_cached_worker_observability_snapshot(cache)
+        })?;
+        source_observability_snapshot_has_configured_status_root_health(&snapshot)
+            .then_some(snapshot)
+    }
+
+    fn log_observability_cache_fallback(
+        &self,
+        reason: &str,
+        snapshot: &SourceObservabilitySnapshot,
+    ) {
+        if debug_control_scope_capture_enabled() {
+            eprintln!(
+                "fs_meta_source_worker_client: observability_snapshot cache_fallback node={} reason={} {}",
+                self.node_id.0,
+                reason,
+                summarize_source_observability_snapshot(snapshot)
+            );
+        }
     }
 
     async fn observability_snapshot_nonblocking_for_status_route(
@@ -7730,6 +8143,12 @@ impl FSMetaSource {
         Ok(self.build_progress_snapshot())
     }
 
+    pub(crate) fn materialized_read_cache_epoch_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SourceFailure> {
+        Ok(self.materialized_read_cache_epoch())
+    }
+
     fn local_observability_snapshot(&self) -> SourceObservabilitySnapshot {
         let snapshot = build_local_source_observability_snapshot(self);
         let last_audit_completed_at_us = source_status_rescan_completion_marker(&snapshot.status);
@@ -7949,6 +8368,16 @@ impl SourceFacade {
         match self {
             Self::Local(source) => source.retained_control_state_for_tests().await,
             Self::Worker(client) => client.control_state.lock().await.clone(),
+        }
+    }
+
+    pub(crate) async fn retained_replay_required(&self) -> bool {
+        match self {
+            Self::Local(_) => false,
+            Self::Worker(client) => matches!(
+                client.control_state.lock().await.replay_state(),
+                SourceControlReplayState::Required
+            ),
         }
     }
 
@@ -8180,6 +8609,17 @@ impl SourceFacade {
         }
     }
 
+    pub(crate) async fn submit_rescan_when_ready_epoch_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SourceFailure> {
+        #[cfg(test)]
+        record_source_worker_trigger_rescan_when_ready_attempt();
+        match self {
+            Self::Local(source) => source.trigger_rescan_when_ready_epoch_with_failure().await,
+            Self::Worker(client) => client.submit_rescan_when_ready_epoch_with_failure().await,
+        }
+    }
+
     pub(crate) async fn reconnect_shared_worker_client_with_failure(
         &self,
     ) -> std::result::Result<(), SourceFailure> {
@@ -8259,6 +8699,15 @@ impl SourceFacade {
                     .progress_snapshot_with_timeout_with_failure(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
                     .await
             }
+        }
+    }
+
+    pub(crate) fn materialized_read_cache_epoch_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SourceFailure> {
+        match self {
+            Self::Local(source) => source.materialized_read_cache_epoch_with_failure(),
+            Self::Worker(client) => Ok(client.cached_materialized_read_cache_epoch()),
         }
     }
 }

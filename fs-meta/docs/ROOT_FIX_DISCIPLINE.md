@@ -44,14 +44,13 @@ Run from cheapest proof to most realistic proof:
 
 | Rung | Command suite | Meaning |
 | --- | --- | --- |
-| L0 | contract-fast | Specs, API names, CLI scope, and module boundaries agree. |
-| L1 | core-unit-fast | Query, management write, and worker domain state machines pass locally. |
-| L2 | runtime-scope-gate | Runtime-scope behavior works across the worker-host boundary. |
-| L3 | mini-real-nfs-smoke | The 5-node/5-NFS topology converges on separate mini exports with 10 files each. |
-| L4 | real-nfs-api-core | Full real-NFS P0 API and management behavior pass on real data. |
-| L5 | real-nfs-ops, real-nfs-component, real-nfs-upgrade | Operational churn, component diagnostics, and release continuity pass. |
+| L1 | business-fast | Local contracts, API/query behavior, force-find, status, and management roots pass. |
+| L2 | business-mini-nfs | The 5-node mini NFS topology converges on separate mini exports with about 10 files each. |
+| L3 | environment-full-nfs | Full 5-node / 5-NFS demo topology, grants, bounded readiness, coverage, and degraded evidence pass. |
+| L4 | operations-local | Local worker/runtime restart, replay, handoff, and generation-skew style behavior passes. |
+| L5 | operations-real-nfs | Full demo real-NFS failover, resource switch, retire, activation-scope, release upgrade, and CPU budget behavior pass. |
 
-If L4 or L5 finishes suspiciously fast, verify that the test was not skipped,
+If L3 or L5 finishes suspiciously fast, verify that the test was not skipped,
 `--ignored` was used intentionally, the filter matched real tests,
 `CAPANIX_REAL_NFS_E2E=1` was set, and the mounted paths are the intended real
 NFS exports.

@@ -53,6 +53,7 @@ const FULL_NODE_DELEGATION_SCOPES: &[&str] = &[
     "boundary_read_self",
 ];
 const NODE_NAMES: &[&str] = &["node-a", "node-b", "node-c", "node-d", "node-e"];
+const FULL_REAL_NFS_MAX_CHANNELS: u32 = 1024;
 
 fn configure_test_child_runtime(cmd: &mut Command) {
     unsafe {
@@ -146,8 +147,6 @@ where
 fn classify_apply_release_retry(err: &str) -> Option<&'static str> {
     if err.contains("tx busy") {
         Some("tx_busy")
-    } else if err.contains("relation-target replication quorum not reached") {
-        Some("quorum")
     } else {
         None
     }
@@ -155,6 +154,10 @@ fn classify_apply_release_retry(err: &str) -> Option<&'static str> {
 
 fn is_generation_conflict_apply_error(err: &str) -> bool {
     err.contains("generation conflict") && err.contains("bump target generation to override")
+}
+
+fn is_retryable_runtime_admin_write_conflict(err: &str) -> bool {
+    err.contains("tx busy")
 }
 
 fn release_target_id(release: &Value) -> String {
@@ -362,7 +365,7 @@ impl Cluster5 {
         let mut last_err = String::new();
         let command_name = trace_command_name(&command);
         let command_summary = trace_exports_summary(&command);
-        for attempt in 0..3 {
+        for attempt in 0..6 {
             let seq = next_auth_seq_global();
             let nonce = format!("{}-{node_name}", unique_suffix());
             let auth = signed_auth_for_runtime_admin_command(
@@ -409,6 +412,11 @@ impl Cluster5 {
                     if is_retryable_runtime_admin_connect_gap(&e) && attempt + 1 < 3 {
                         last_err = e;
                         thread::sleep(Duration::from_millis(25));
+                        continue;
+                    }
+                    if is_retryable_runtime_admin_write_conflict(&e) && attempt + 1 < 6 {
+                        last_err = e;
+                        thread::sleep(Duration::from_millis(100 * (attempt + 1) as u64));
                         continue;
                     }
                     return Err(e);
@@ -1342,6 +1350,7 @@ fn resolve_fs_meta_app_cdylib() -> Option<PathBuf> {
         }
     }
     let root = repo_root();
+    let capanix_root = capanix_repo_root();
     let lib_name = fs_meta_app_lib_filename();
     let candidates = [
         root.join("target/debug").join(lib_name),
@@ -1354,6 +1363,8 @@ fn resolve_fs_meta_app_cdylib() -> Option<PathBuf> {
         root.join("fs-meta/app/Cargo.toml"),
         root.join("fs-meta/tests"),
         root.join("src"),
+        capanix_root.join("Cargo.lock"),
+        capanix_root.join("crates"),
     ];
     if let Some(found) = candidates.iter().find(|p| p.exists()).cloned() {
         if !should_rebuild_binary(&found, &watch_paths) {
@@ -1564,7 +1575,7 @@ fn build_cluster_config(
     out.push_str("    nonce: n1\n");
     out.push_str(&format!("    signature_b64: \"{delegation_sig}\"\n"));
     out.push_str("resource_limits:\n");
-    out.push_str("  max_channels: 64\n");
+    out.push_str(&format!("  max_channels: {FULL_REAL_NFS_MAX_CHANNELS}\n"));
     out.push_str("  max_processes: 64\n");
     out.push_str("  channel_buffer_size: 128\n");
     out.push_str("  max_audit_entries: 512\n");
@@ -2331,6 +2342,16 @@ mod tests {
         .expect("encode runtime-admin response")
     }
 
+    fn runtime_admin_error_response_bytes(
+        code: capanix_kernel_api::control::CtlErrorCode,
+        message: &str,
+    ) -> Vec<u8> {
+        rmp_serde::to_vec_named(&RuntimeAdminEnvelope::AdminResult(
+            RuntimeAdminResponse::err_code(code, message),
+        ))
+        .expect("encode runtime-admin error response")
+    }
+
     fn spawn_runtime_admin_responder_after_delay(
         socket_path: PathBuf,
         bind_delay: Duration,
@@ -2370,6 +2391,50 @@ mod tests {
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(err) => panic!("accept runtime-admin responder: {err}"),
+                }
+            }
+        })
+    }
+
+    fn spawn_runtime_admin_error_responder(
+        socket_path: PathBuf,
+        code: capanix_kernel_api::control::CtlErrorCode,
+        message: &'static str,
+        accept_window: Duration,
+    ) -> thread::JoinHandle<usize> {
+        thread::spawn(move || {
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+                .expect("bind runtime-admin error responder socket");
+            listener
+                .set_nonblocking(true)
+                .expect("set error responder nonblocking");
+            let body = runtime_admin_error_response_bytes(code, message);
+            let deadline = Instant::now() + accept_window;
+            let mut accepted = 0usize;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        accepted += 1;
+                        let mut len_buf = [0u8; 4];
+                        stream
+                            .read_exact(&mut len_buf)
+                            .expect("read request length");
+                        let req_len = u32::from_le_bytes(len_buf) as usize;
+                        let mut req = vec![0u8; req_len];
+                        stream.read_exact(&mut req).expect("read request body");
+                        stream
+                            .write_all(&(body.len() as u32).to_le_bytes())
+                            .expect("write error response length");
+                        stream.write_all(&body).expect("write error response body");
+                        stream.flush().expect("flush error response body");
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return accepted;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("accept runtime-admin error responder: {err}"),
                 }
             }
         })
@@ -2424,6 +2489,39 @@ mod tests {
         assert_eq!(
             result.expect("runtime_admin_ok should retry a transient ENOENT gap"),
             json!({"accepted": true})
+        );
+    }
+
+    #[test]
+    fn runtime_admin_ok_does_not_retry_startup_apply_timeout() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let cluster = test_cluster_with_single_node(&temp);
+        let socket_path = cluster.nodes[0].socket_path.clone();
+        let responder = spawn_runtime_admin_error_responder(
+            socket_path,
+            capanix_kernel_api::control::CtlErrorCode::Timeout,
+            "config commit failed: startup apply timed out",
+            Duration::from_millis(250),
+        );
+
+        let result = cluster.runtime_admin_ok(
+            "node-a",
+            json!({
+                "command": "resource_export_withdraw",
+                "node_id": "node-a-id",
+                "resource_ids": ["facade-listener"]
+            }),
+        );
+
+        let err = result.expect_err("startup apply timeout must fail without retry masking");
+        assert!(
+            err.contains("startup apply timed out"),
+            "error must preserve startup apply timeout evidence: {err}"
+        );
+        let accepted = responder.join().expect("join runtime-admin responder");
+        assert_eq!(
+            accepted, 1,
+            "startup apply timeout is an owning failure signal and must not be retried by the fustor harness"
         );
     }
 
@@ -3018,6 +3116,32 @@ mod tests {
         assert!(
             rust_log.is_none(),
             "real-NFS harness must not force capanixd into RUST_LOG=debug during cpu_budget steady sampling"
+        );
+    }
+
+    #[test]
+    fn full_real_nfs_cluster_config_uses_full_demo_channel_budget() {
+        let identities = NODE_NAMES
+            .iter()
+            .map(|name| generate_node_identity(name, 1))
+            .collect::<Vec<_>>();
+        let all_refs = identities.iter().collect::<Vec<_>>();
+        let cfg = build_cluster_config(
+            &identities[0],
+            &all_refs,
+            &[],
+            &[],
+            &admin_public_key_b64(),
+            FULL_NODE_DELEGATION_SCOPES,
+        );
+
+        assert!(
+            cfg.contains("  max_channels: 1024\n"),
+            "full real-NFS operations must provision the full demo route set and one release-upgrade generation overlap"
+        );
+        assert!(
+            !cfg.contains("  max_channels: 64\n"),
+            "full real-NFS operations must not reuse the mini/debug channel cap"
         );
     }
 }

@@ -444,6 +444,40 @@ fn plan_worker_request(
                 false,
             ),
         },
+        SinkWorkerRequest::UpdateLogicalRootsFromManagementApply {
+            roots,
+            host_object_grants,
+        } => match state.sink.as_ref() {
+            Some(sink) => {
+                eprintln!(
+                    "fs_meta_sink_worker_server: update_logical_roots_from_management_apply begin roots={} grants={}",
+                    roots.len(),
+                    host_object_grants.len()
+                );
+                match sink.update_logical_roots_from_management_apply_with_failure(
+                    roots,
+                    &host_object_grants,
+                ) {
+                    Ok(_) => {
+                        eprintln!(
+                            "fs_meta_sink_worker_server: update_logical_roots_from_management_apply ok"
+                        );
+                        SinkWorkerAction::Immediate(SinkWorkerResponse::Ack, false)
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "fs_meta_sink_worker_server: update_logical_roots_from_management_apply err={}",
+                            err.as_error()
+                        );
+                        SinkWorkerAction::Immediate(classify_sink_worker_failure(err), false)
+                    }
+                }
+            }
+            None => SinkWorkerAction::Immediate(
+                SinkWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
         SinkWorkerRequest::LogicalRootsSnapshot => match state.sink.as_ref() {
             Some(sink) => match sink.logical_roots_snapshot_with_failure() {
                 Ok(roots) => {

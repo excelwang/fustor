@@ -565,6 +565,7 @@ async fn public_trusted_file_path_stats_preserves_request_source_roots_when_loca
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let response = app

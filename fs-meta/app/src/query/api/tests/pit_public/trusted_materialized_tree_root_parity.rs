@@ -296,6 +296,7 @@ async fn public_trusted_tree_preserves_request_ready_sink_truth_when_later_pit_s
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()
@@ -326,7 +327,7 @@ async fn public_trusted_tree_preserves_request_ready_sink_truth_when_later_pit_s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn public_trusted_tree_does_not_preserve_cached_ready_groups_when_later_sink_status_omits_all_groups_from_schedule(
+async fn public_trusted_tree_preserves_loaded_ready_groups_when_later_request_scoped_sink_status_omits_all_groups_from_schedule(
 ) {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let root_a = tmp.path().join("node-a-nfs1");
@@ -578,7 +579,10 @@ async fn public_trusted_tree_does_not_preserve_cached_ready_groups_when_later_si
                 responses.push(mk_event_with_correlation(
                     &group_id,
                     req.metadata().correlation_id.expect("owner-a correlation"),
-                    real_materialized_tree_payload_for_test(&params.scope.path),
+                    real_materialized_tree_payload_with_entries_for_test(
+                        &params.scope.path,
+                        &[b"/materialized-a.txt"],
+                    ),
                 ));
             }
             responses
@@ -602,7 +606,10 @@ async fn public_trusted_tree_does_not_preserve_cached_ready_groups_when_later_si
                 responses.push(mk_event_with_correlation(
                     &group_id,
                     req.metadata().correlation_id.expect("owner-b correlation"),
-                    real_materialized_tree_payload_for_test(&params.scope.path),
+                    real_materialized_tree_payload_with_entries_for_test(
+                        &params.scope.path,
+                        &[b"/materialized-b.txt"],
+                    ),
                 ));
             }
             responses
@@ -626,7 +633,10 @@ async fn public_trusted_tree_does_not_preserve_cached_ready_groups_when_later_si
                 responses.push(mk_event_with_correlation(
                     &group_id,
                     req.metadata().correlation_id.expect("proxy correlation"),
-                    real_materialized_tree_payload_for_test(&params.scope.path),
+                    real_materialized_tree_payload_with_entries_for_test(
+                        &params.scope.path,
+                        &[b"/materialized-proxy.txt"],
+                    ),
                 ));
             }
             responses
@@ -643,6 +653,7 @@ async fn public_trusted_tree_does_not_preserve_cached_ready_groups_when_later_si
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let first_req = Request::builder()
@@ -700,14 +711,32 @@ async fn public_trusted_tree_does_not_preserve_cached_ready_groups_when_later_si
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        second_group_roots,
-        vec![
-            ("nfs1".to_string(), false, "/".to_string(), 0),
-            ("nfs2".to_string(), false, "/".to_string(), 0),
-            ("nfs3".to_string(), false, "/".to_string(), 0),
-        ],
-        "trusted public / tree must not preserve cached ready groups when later sink status omits all groups from schedule: {second_payload}"
+        second_group_roots.len(),
+        3,
+        "trusted public / tree must keep all loaded ready groups after a request-scoped all-schedule omission: {second_payload}"
     );
+    assert_eq!(
+        second_group_roots
+            .iter()
+            .map(|(group, _, _, _)| group.as_str())
+            .collect::<Vec<_>>(),
+        vec!["nfs1", "nfs2", "nfs3"],
+        "trusted public / tree must retain group-key order after preserving loaded ready groups: {second_payload}"
+    );
+    for (group, root_exists, path, entries) in &second_group_roots {
+        assert!(
+            *root_exists,
+            "trusted public / tree must query the loaded ready owner for {group} instead of synthesizing an empty root: {second_payload}"
+        );
+        assert_eq!(
+            path, "/",
+            "trusted public / tree must keep the requested root path for {group}: {second_payload}"
+        );
+        assert!(
+            *entries > 0,
+            "trusted public / tree must expose owner materialized entries for {group} instead of an empty trusted placeholder: {second_payload}"
+        );
+    }
 
     source_status_endpoint
         .shutdown(Duration::from_secs(2))
@@ -1081,6 +1110,7 @@ async fn public_trusted_tree_preserves_request_ready_sink_truth_when_later_reque
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()
@@ -1453,6 +1483,7 @@ async fn public_trusted_tree_force_find_stress_path_ignores_unrelated_pending_gr
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()
@@ -1870,6 +1901,7 @@ async fn public_trusted_tree_fails_closed_when_later_pit_sink_status_regresses_f
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()
@@ -2218,6 +2250,7 @@ async fn public_trusted_tree_uses_later_request_scoped_ready_owner_for_first_ran
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()
@@ -2655,6 +2688,7 @@ async fn public_trusted_non_recursive_tree_preserves_request_ready_sink_truth_wh
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()
@@ -3032,6 +3066,7 @@ async fn public_trusted_non_recursive_tree_preserves_request_ready_sink_truth_wh
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()
@@ -3417,6 +3452,7 @@ async fn public_trusted_non_recursive_tree_preserves_request_ready_sink_truth_wh
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()
@@ -3848,6 +3884,7 @@ async fn public_trusted_non_recursive_tree_preserves_request_ready_sink_truth_wh
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()
@@ -4286,6 +4323,7 @@ async fn public_trusted_max_depth_tree_preserves_request_ready_sink_truth_when_l
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()
@@ -4703,6 +4741,7 @@ async fn public_trusted_max_depth_tree_preserves_request_ready_sink_truth_when_l
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()
@@ -5123,6 +5162,7 @@ async fn public_trusted_max_depth_tree_preserves_request_ready_sink_truth_when_l
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()
@@ -5561,6 +5601,7 @@ async fn public_trusted_max_depth_tree_preserves_request_ready_sink_truth_when_l
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()
@@ -5981,6 +6022,7 @@ async fn public_trusted_tree_fails_closed_when_later_pit_sink_status_regresses_m
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
 
     let req = Request::builder()

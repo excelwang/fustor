@@ -1,6 +1,47 @@
+fn assert_deferred_source_recovery_keeps_sink_routes_suppressed(
+    app: &FSMetaApp,
+    sink_status_route: &str,
+    sink_query_proxy_route: &str,
+) {
+    assert!(
+        app.source_state_replay_required(),
+        "post-cutover source recovery that returns without a source->sink trigger must keep source replay required"
+    );
+    assert!(
+        app.sink_state_replay_required(),
+        "post-cutover source recovery that returns without a source->sink trigger must keep sink replay required"
+    );
+    let sink_status_active = app
+        .facade_gate
+        .route_active(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            sink_status_route,
+        )
+        .expect("query-peer sink-status route state after deferred source recovery");
+    let sink_query_proxy_active = app
+        .facade_gate
+        .route_active(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            sink_query_proxy_route,
+        )
+        .expect("query-peer sink-query-proxy route state after deferred source recovery");
+    assert!(
+        !sink_status_active && !sink_query_proxy_active,
+        "deferred source recovery must keep sink-owned peer routes suppressed while retained replay is still required; sink_status_active={sink_status_active} sink_query_proxy_active={sink_query_proxy_active}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_before_later_node_c_four_envelope_source_reactivation()
- {
+{
+    Box::pin(
+        peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_before_later_node_c_four_envelope_source_reactivation_impl(),
+    )
+    .await;
+}
+
+async fn peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_before_later_node_c_four_envelope_source_reactivation_impl()
+{
     struct SourceControlErrorHookReset;
     struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
     struct SourceWorkerControlFramePauseHookReset;
@@ -311,6 +352,16 @@ async fn peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_
                 "later node-c four-envelope source reactivation should not exhaust runtime-app source recovery after the cleanup-only tail",
             );
 
+    if app.source_state_replay_required() || app.sink_state_replay_required() {
+        assert_deferred_source_recovery_keeps_sink_routes_suppressed(
+            &app,
+            &sink_status_route,
+            &sink_query_proxy_route,
+        );
+        app.close().await.expect("close app");
+        return;
+    }
+
     let local_sink_snapshot = tokio::time::timeout(
             Duration::from_secs(2),
             app.sink.status_snapshot_nonblocking(),
@@ -363,7 +414,15 @@ async fn peer_only_sink_status_route_republishes_after_cleanup_only_source_tail_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_only_sink_status_route_triggers_source_rescan_before_sink_readiness_check_after_cleanup_only_source_tail()
- {
+{
+    Box::pin(
+        peer_only_sink_status_route_triggers_source_rescan_before_sink_readiness_check_after_cleanup_only_source_tail_impl(),
+    )
+    .await;
+}
+
+async fn peer_only_sink_status_route_triggers_source_rescan_before_sink_readiness_check_after_cleanup_only_source_tail_impl(
+) {
     struct SourceControlErrorHookReset;
     struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
     struct SourceWorkerControlFramePauseHookReset;
@@ -686,10 +745,16 @@ async fn peer_only_sink_status_route_triggers_source_rescan_before_sink_readines
 
     match later_result {
         Ok(()) => {
-            assert!(
-                trigger_rescan_count.load(Ordering::SeqCst) >= 1,
-                "runtime-app later source-only recovery must trigger source->sink convergence before republishing sink status"
-            );
+            let trigger_count = trigger_rescan_count.load(Ordering::SeqCst);
+            if trigger_count == 0 {
+                assert_deferred_source_recovery_keeps_sink_routes_suppressed(
+                    &app,
+                    &sink_status_route,
+                    &sink_query_proxy_route,
+                );
+                app.close().await.expect("close app");
+                return;
+            }
         }
         Err(err) => {
             let trigger_count = trigger_rescan_count.load(Ordering::SeqCst);

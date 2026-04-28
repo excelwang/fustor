@@ -110,6 +110,7 @@ async fn load_materialized_status_snapshots_preserves_cached_ready_groups_when_r
         policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
         pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
         force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
@@ -117,6 +118,8 @@ async fn load_materialized_status_snapshots_preserves_cached_ready_groups_when_r
         materialized_sink_status_cache: Arc::new(Mutex::new(Some(CachedSinkStatusSnapshot {
             snapshot: cached_snapshot,
         }))),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
 

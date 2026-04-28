@@ -1,4 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -16,6 +18,41 @@ use crate::workers::source::SourceFacade;
 
 use super::auth::AuthService;
 
+pub type ManagementWriteRecoveryFuture =
+    Pin<Box<dyn Future<Output = Result<(), capanix_app_sdk::CnxError>> + Send>>;
+pub type ManagementWriteRecovery =
+    Arc<dyn Fn() -> ManagementWriteRecoveryFuture + Send + Sync + 'static>;
+
+#[derive(Clone, Default)]
+pub struct ForceFindRunnerEvidence {
+    runners_by_group: Arc<Mutex<BTreeMap<String, BTreeSet<String>>>>,
+}
+
+impl ForceFindRunnerEvidence {
+    pub fn record(&self, group_id: impl Into<String>, runner: impl Into<String>) {
+        if let Ok(mut guard) = self.runners_by_group.lock() {
+            guard
+                .entry(group_id.into())
+                .or_default()
+                .insert(runner.into());
+        }
+    }
+
+    pub fn snapshot(&self) -> BTreeMap<String, Vec<String>> {
+        self.runners_by_group
+            .lock()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .map(|(group, runners)| {
+                        (group.clone(), runners.iter().cloned().collect::<Vec<_>>())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Default)]
 pub struct ApiRequestTracker {
     inflight: AtomicUsize,
@@ -28,6 +65,7 @@ pub struct ApiControlGate {
     epoch: AtomicU64,
     changed: Notify,
     facade_request_tracker: Arc<ApiRequestTracker>,
+    management_write_recovery: RwLock<Option<ManagementWriteRecovery>>,
 }
 
 pub struct ApiRequestGuard {
@@ -64,6 +102,7 @@ impl ApiControlGate {
             epoch: AtomicU64::new(0),
             changed: Notify::new(),
             facade_request_tracker: Arc::new(ApiRequestTracker::default()),
+            management_write_recovery: RwLock::new(None),
         }
     }
 
@@ -127,6 +166,19 @@ impl ApiControlGate {
         }
     }
 
+    pub fn set_management_write_recovery(&self, recovery: Option<ManagementWriteRecovery>) {
+        if let Ok(mut guard) = self.management_write_recovery.write() {
+            *guard = recovery;
+        }
+    }
+
+    pub fn management_write_recovery(&self) -> Option<ManagementWriteRecovery> {
+        self.management_write_recovery
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
     pub fn begin_facade_request(self: &Arc<Self>) -> ApiRequestGuard {
         self.facade_request_tracker.begin()
     }
@@ -149,6 +201,7 @@ pub struct ApiState {
     pub runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     pub query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     pub force_find_inflight: Arc<Mutex<BTreeSet<String>>>,
+    pub force_find_runner_evidence: ForceFindRunnerEvidence,
     pub source: Arc<SourceFacade>,
     pub sink: Arc<SinkFacade>,
     pub query_sink: Arc<SinkFacade>,

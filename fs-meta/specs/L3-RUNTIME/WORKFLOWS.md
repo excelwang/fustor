@@ -77,7 +77,8 @@ User-visible and operator-visible state names consumed by these workflows are ow
 3. app 仅使用 descriptors + 管理配置形成 groups，不依赖 runtime 解释路径或节点含义。
 4. app 可使用 host descriptor selectors（例如 `host_ip`、`host_name`、`site/zone`）与 object descriptors（例如 `mount_point`、`fs_source`、`fs_type`）决定分组。
 5. on runtime grants-changed control event，source 按版本号执行在线增量重收敛（新增 object 启动新的本地执行分区，移除 object 有界回收旧分区），并触发定向重扫。
-6. mount-root object 生命周期独立，单 object 失败不阻塞同组其他 objects；禁止“仅更新内存映射但不生效任务变更”。
+6. 若 grant 的 `fs_source` 表示远端挂载源（例如 `host:/export`），app 必须使用 mount-root guarded host-fs facade；该失败闭合边界由远端源形态决定，不依赖 `fs_type` 标签是否写成 `nfs`。
+7. mount-root object 生命周期独立，单 object 失败不阻塞同组其他 objects；禁止“仅更新内存映射但不生效任务变更”。
 
 ## [workflow] SourcePrimaryExecutorSelectionWorkflow
 
@@ -248,6 +249,7 @@ User-visible and operator-visible state names consumed by these workflows are ow
 5. `trusted-materialized` consumes the same package-local observation evidence as cutover `observation_eligible`; until that evidence is trusted enough, the request fails closed with explicit `NOT_READY`.
 6. `group_page_size/group_after` paginate bucket selection inside one PIT and `entry_page_size/entry_after` paginate per-group metadata only; `read_class` does not change PIT ownership or cursor meaning.
 7. `/on-demand-force-find` stays a freshness path; it is the dedicated force-find alias for `read_class=fresh` rather than a second free-form stability model.
+8. For a trusted-materialized root `/tree`, a selected sink owner route gap may be rescued only by bounded generic query-proxy evidence for the same selected group and same path; the result still fails closed if that proxy evidence is missing, empty, or from another group/path.
 
 ## [workflow] DescriptorDrivenGroupingPolicy
 
@@ -262,10 +264,11 @@ User-visible and operator-visible state names consumed by these workflows are ow
 **Steps**
 
 1. sink 分发主路径采用“单 fs-meta app package boundary + runtime group-aware sink bind/run realization”，而不是 whole-app single-instance sharding。
-2. app 为每个 group 声明 sink 执行形状；这些声明细节仅用于内部 bind/run realization，而不是产品层术语。
+2. app 为每个 group 声明一个 sink 物化负责人；负责人必须从该监控 group 的成员节点中选择一个，而不是从无关的资源可见节点中选择。
 3. runtime 返回每个 sink instance 的 `bound_scopes[]`，sink 仅处理自己当前 bound_scopes 中的 groups。
-4. worker 进程只承载本机 sink-side execution partitions；group 查询 fanout 单位为 logical group 及其状态分区，不以 app 实例或 worker 进程为 fanout 单位。
-5. source/sink unit gate 对未知 `unit_id` 与 stale generation 进行 fail-closed/fencing，确保 unit 合约前置收敛。
+4. “已分配物化负责人”只表示运行放置已就绪；只有对应 group 已产出同 epoch 的 sink 物化证据并达到 ready，才可以把 trusted observation readiness 判定为 ready。
+5. worker 进程只承载本机 sink-side execution partitions；group 查询 fanout 单位为 logical group 及其状态分区，不以 app 实例或 worker 进程为 fanout 单位。
+6. source/sink unit gate 对未知 `unit_id` 与 stale generation 进行 fail-closed/fencing，确保 unit 合约前置收敛。
 
 ## [workflow] UnitControlFenceWorkflow
 
@@ -273,9 +276,70 @@ User-visible and operator-visible state names consumed by these workflows are ow
 
 1. runtime 通过 `ExecControl(activate/deactivate)` 与 `UnitTick` 下发执行门控信号，信号必须携带 `unit_id + generation`。
 2. source/sink 按域内 unit 合约校验 `unit_id`；未知 unit 视为非法控制帧并拒绝。
-3. source/sink 对同一 unit 维护代际高水位；`generation` 回退的控制帧被判定为 stale 并忽略。
+3. source/sink 对同一 unit 维护代际高水位；`generation` 回退的控制帧被判定为 stale 并忽略，前进的 `UnitTick` 只表示当前 keepalive/control evidence，不能单独触发 worker reconnect 或 retained-state replay。
 4. unit 控制帧仅更新执行门控状态，不改写 query/find 或业务 payload 语义。
 5. sink/source 仅接受显式域内 unit（source: `runtime.exec.source`/`runtime.exec.scan`; sink: `runtime.exec.sink`）。
+
+## [workflow] RuntimeWorkerControlResetRecovery
+
+**Steps**
+
+1. source/sink control frame observes retryable worker-control reset evidence such as channel close, timeout-like stale bridge, or retryable bridge peer failure.
+2. app marks runtime control uninitialized, republishes facade unavailable, and retains the last accepted control state for replay.
+3. recovery restarts or reacquires the affected worker path without waiting for the same in-flight worker control handoff that reported the reset.
+4. retained source/sink control state is replayed after the worker path is live; steady ticks do not reopen worker initialization when no replay is required, and a forward-moving source tick after replay is accepted locally instead of being treated as generation skew.
+5. source post-ack scheduled-group refresh uses one bounded total recovery window plus a shorter per-RPC attempt cap; worker start, retained-control replay, client acquisition, grant refresh, and group refresh are all inside that total deadline, so no stale bridge lane can keep source control in flight after the refresh budget expires.
+6. post-initial source activation waves produced by release cutover are accepted into retained source state and fail-closed at the app boundary before source-worker replay; this applies whether they arrive as source-only, source+facade, or mixed source/sink companion frames, so the process-level apply/quorum path is never blocked on inline source replay.
+7. later tick, cleanup, or empty replay wakeups that find retained generation-cutover source replay still pending follow the same fail-closed rule on retryable source worker reset; they do not spend the process-level apply/quorum budget on inline replay retries. Later non-empty source recovery waves may perform one bounded apply of the current desired state and still fail closed at the app boundary if the worker path is not ready.
+8. mixed cleanup followups such as source `restart_deferred_retire_pending` plus sink tick/cleanup are cleanup waves, not new business apply waves; retryable source or sink worker reset preserves retained replay and returns at the app boundary without inline replay retries.
+9. after that fail-closed release cutover, assigned source/sink owners keep bounded internal status recovery lanes live while materialized/query exposure stays closed, so a source primary can repair retained replay without waiting for a later control tick or for an external facade request to hit that same node.
+10. while runtime control is already fail-closed, cleanup-only query and per-peer sink logical-roots deactivates are absorbed into retained route state locally; they do not re-enter the sink worker bridge and do not keep management writes unavailable behind retired worker RPCs.
+11. when source/sink worker-control recovery exhausts its bounded retry budget, the app keeps the process boundary alive, marks runtime control uninitialized, retains replay state, and reports degraded/unavailable evidence through app status/query gates instead of returning a process-level `Timeout`, `ChannelClosed`, or `TransportClosed` from `on_control_frame`.
+12. source status/observability access paths and management-write readiness waits are also recovery entrypoints: if retained source/sink replay is pending and no control op is already in flight, the access path performs one bounded retained-state replay repair before returning `not started` or management-write `not ready`; source/sink recovery does not rely on a later runtime tick after a generation cutover.
+13. source-to-sink convergence pretrigger runs only for the first mixed source/sink boot wave with no retained replay pending; recovery waves do not submit that synchronous pretrigger before retained replay has reopened the control gate.
+14. after source control fail-closes inside a mixed source/sink generation-cutover frame, the app returns from the current control frame with retained source/sink replay armed; it must not continue into same-frame sink replay or sink cleanup RPCs behind the failed source lane.
+15. after that fail-closed cutover, later tick, cleanup, or empty process wakeups that still carry retained post-initial source replay must keep the latest desired state and return without inline source replay RPCs; retained source replay includes both active and deactivating route state. A later non-empty source recovery wave may run one bounded source apply, and retained sink replay may run inline only after source replay is clear; otherwise source/sink repair is driven by bounded recovery/status entrypoints.
+16. if that fail-closed app owns a fixed-bind HTTP facade, it records the failed-owner state with the active bind owner; when a successor later registers a pending claim for the same bind address, the successor releases that stale owner through the bounded fixed-bind handoff path instead of leaving a not-ready facade bound forever.
+17. if the fail-closed app is the pending successor and the predecessor is already only continuity-retaining a runtime-deactivated fixed listener, the successor releases the retained predecessor through the same bounded handoff path and exposes its own fail-closed app boundary, so new API requests do not continue through a drained/fenced predecessor PID.
+18. after a successor fixed-bind HTTP facade is actively serving, cleanup-only query/facade tails from the failed cutover may withdraw stale auxiliary source-status/source-find lanes, but they must not withdraw the active facade's core business read lanes (`find`, materialized query proxy, sink-status) while runtime control is still fail-closed; those lanes belong to the serving facade and must survive until retained replay either recovers them or a later initialized business route change supersedes them.
+19. steady-state control, status, and endpoint request diagnostics are opt-in or bounded summaries by default; full signal payloads and per-batch normal-path logs are debug evidence, not part of the operations workload being measured by CPU gates.
+20. while retained source or sink replay is pending, tick/cleanup wakeups must not reopen normal runtime initialization before the retained replay recovery lane clears the app gate; otherwise a fail-closed owner can rebuild endpoints on every steady tick and turn recovery bookkeeping into steady CPU workload.
+21. once runtime control is already initialized, steady tick/keepalive waves must not re-enter the runtime initialization path; initialization is reserved for first activation or bounded recovery, not normal keepalive processing.
+22. after a post-reset recovery, current retained-generation source ticks may drive one bounded retained-state repair and must keep the tick evidence; this is distinct from steady keepalive processing and from older retained generation-cutover wakeups.
+23. if runtime control remains fail-closed only because sink replay is still pending, source current-generation keepalive ticks are retained gate evidence only; they must not re-enter source-worker control while source replay is already clear.
+24. status-route fan-in may reach the same source worker through multiple active route units; same-node nonblocking source observability reads that overlap in one status cycle share one live worker read and use the resulting fresh cache for followers, instead of multiplying source-worker RPCs per status request.
+25. when a retained source or sink replay is deliberately deferred at the app boundary, the app marks only that lane as still needing replay; deferring sink replay must not re-arm already-cleared source replay, and deferring source replay must not re-arm already-cleared sink replay.
+26. management status, write-readiness, and runtime control-readiness probes are bounded recovery entrypoints: if retained source or sink replay is pending, the app must run one bounded replay repair before returning `NotReady` and clear the app-level replay flag once the worker no longer needs retained replay; cleanup and tick frames remain evidence and do not own this repair.
+27. recovery progress waits use source/sink snapshots as evidence probes inside a bounded observation window; a probe that returns quickly without a runtime-change notification is not progress and must not turn retained replay recovery into a tight poll loop.
+
+## [workflow] RuntimeEndpointReplyPressureLiveness
+
+**Steps**
+
+1. internal query/status endpoints receive request batches and send replies over route reply channels.
+2. reply send `Timeout`, `Backpressure`, not-ready, channel-close, and retryable link errors are transient endpoint pressure signals.
+3. endpoint loops retry those transient reply send failures within bounded sleeps and continue serving later batches.
+4. non-transient send failures preserve terminal reason evidence before runtime app prunes or respawns the route.
+5. endpoint cancellation or generation cutover stops the app receive loop without permanently closing the reusable request route or derived reply route; the same runtime route key must remain usable by the replacement endpoint in the same control-frame recovery turn.
+6. request/reply endpoint startup readiness means the endpoint has entered its first request receive poll for the owned route; a spawned thread that has not armed receive interest is not delivery-ready evidence for management writes.
+7. consecutive worker-bridge transport-close evidence while receiving request batches marks the endpoint boundary stale. The endpoint records terminal reason evidence and exits so the next runtime endpoint reconciliation can prune the old task and rearm the same product route on the current worker boundary. This stale-endpoint exit does not apply to bounded reply backpressure/timeouts, which remain liveness-preserving retry signals.
+
+## [workflow] TrustedMaterializedReadinessFanIn
+
+**Steps**
+
+1. trusted-materialized `/tree` and `/stats` first check whether root-level sink schedule or cached sink status evidence exists for the current authority epoch. In a routed facade, local sink schedule absence is not authoritative because the current materialized owner may be a peer sink; the routed path must perform peer sink-status fan-in before deciding that no current schedule exists.
+2. if neither local authoritative evidence nor routed peer fan-in evidence exists, the read returns explicit not-ready/degraded evidence without entering expensive materialized PIT work.
+3. when readiness fan-in is needed, source-status and sink-status route reads run independently and are combined after both bounded attempts finish.
+4. one slow or missing status route may contribute degraded evidence, but it must not serialize the other route or consume the full query budget before the other readiness plane is observed.
+5. once source-status has identified the active readiness groups and same-node sink evidence already covers those groups as ready/live, a missing sink-status route is supplementary degraded evidence; the request must return after a bounded local completion grace instead of waiting for the full sink route timeout.
+6. steady request-scoped sink-status refresh for trusted-materialized `/tree`/`/stats` must not re-run a missing sink-status route when same-epoch loaded readiness evidence and same-node sink evidence already prove all active groups ready/live; it may reuse that evidence until an authority-epoch change or contradictory failure evidence invalidates it.
+7. management `/status` may use source logical-root/concrete-root health as status-readiness group evidence when route-level source schedule maps are absent during a generation cutover; if same-node sink evidence covers those groups as ready/live, a missing status route is a degraded diagnostic and must use bounded local completion instead of steady full-route waits.
+8. once a source worker has returned complete same-authority root-health evidence for the configured roots, steady management `/status` does not need to re-enter the source-worker observability RPC on every poll only to restore optional route-schedule debug maps; it may reuse that cached root-health evidence for status readiness until control/grant/root authority changes or contradictory health evidence arrives.
+9. when same-node source root-health evidence identifies the active status groups and same-node sink evidence already proves those groups ready/live, steady management `/status` may complete from local domain evidence and mark remote status fan-in as skipped; route-schedule maps remain diagnostics, not mandatory work for every poll.
+10. steady trusted-materialized `/tree` first-page PIT/session reads and `/stats` reads may reuse the latest successful same-parameter materialized read snapshot when the source root/grant authority signature, source rescan/read epoch, request source evidence, and sink status/materialized-revision evidence are unchanged; repeated observation reads consume the same materialized snapshot and must not reopen selected-group route/proxy fanout until that authority or materialized evidence changes. Empty, non-content, or partially materialized `/tree` PIT/session snapshots are materialization catch-up evidence, not steady reusable snapshots, and must not mask later post-rescan content for any returned group.
+11. operations validation that checks source/scan coverage must prefer domain source logical-root health, concrete-root health, runner binding evidence, and materialized/query evidence over route-schedule debug maps; route-schedule maps are diagnostics and may be absent or delayed during generation cutover without closing the source/scan coverage plane when domain evidence is complete.
+12. operations validation that checks post-grant-contraction sink coverage must prefer active runtime grant authority plus materialized/query evidence over status sink schedule maps or activation route scope debug; route and schedule maps are diagnostics and may retain broad process-continuity detail or be absent during cutover even when grant authority and materialized coverage have converged.
 
 ## [workflow] LinuxOnlyRealtimeEnforcement
 
@@ -321,7 +385,8 @@ fn delete_aware_aggregate(records: &[FileMetaRecord]) -> Vec<FsMetaQueryNode>
 2. runtime/app startup records the actually loaded artifact path and content hash as RuntimeArtifactEvidence.
 3. status or deployment diagnostics expose expected-vs-actual artifact evidence without making it business observation truth.
 4. deploy validation compares expected and actual hashes across all nodes before treating the environment as artifact-consistent.
-5. demo/test harness fails closed when the run/bin artifact and actually loaded runtime artifact differ.
+5. demo/test harness stale-artifact checks cover both fs-meta workspace inputs and upstream capanix path dependencies linked into the runtime/app artifact before reusing an existing cdylib.
+6. demo/test harness fails closed when the run/bin artifact and actually loaded runtime artifact differ.
 
 ## [workflow] DemoEvidenceDiscipline
 
@@ -332,6 +397,8 @@ fn delete_aware_aggregate(records: &[FileMetaRecord]) -> Vec<FsMetaQueryNode>
 3. `/stats` aggregation output is display evidence only unless `/status` also proves artifact consistency, roots/grants activation, source coverage, and sink materialization readiness.
 4. disabled metadata audit is not an allowed full-demo acceleration path; metadata coverage loss may be reported only as degraded evidence.
 5. full demo acceptance fails when artifact mismatch, host-fs timeout/backpressure, missing metadata coverage, or materialization unreadiness remains.
+6. full real-NFS operations use a runtime channel budget sized for the full five-node route set plus one release-upgrade generation overlap; mini/debug channel caps must not be reused for full operations gates.
+7. release-upgrade operations gates that trigger manual rescan or steady CPU sampling must wait for app-visible source runtime-scope evidence or accepted manual-rescan delivery evidence for the current roots; source/scan process liveness alone is not convergence evidence.
 
 ## [workflow] BinaryUpgradeContinuity
 
@@ -343,6 +410,19 @@ fn delete_aware_aggregate(records: &[FileMetaRecord]) -> Vec<FsMetaQueryNode>
 4. app rebuilds in-memory observation state through scan/audit/rescan and tracks whether the active scan-enabled primary groups have completed their required first-audit/materialized catch-up against current authoritative truth inputs.
 5. only after `observation_eligible` is reached may runtime cut trusted external materialized `/tree` and `/stats` exposure on the resource-scoped one-cardinality facade over to the new generation.
 6. after cutover, runtime sends drain/deactivate/retire intent to the old generation through the thin runtime control path; old-generation instances fence stale observation or writer paths during retirement.
+
+## [workflow] FixedBindFacadeHandoff
+
+**Steps**
+
+1. a successor generation that cannot bind the fixed HTTP facade records a pending fixed-bind handoff and keeps facade-dependent routes suppressed.
+2. during normal handoff, the predecessor keeps serving until successor runtime exposure is confirmed, then drains requests and releases the bind address through the fixed-bind handoff path.
+3. if the predecessor has already failed closed, its active fixed-bind owner record carries a failed-owner marker; when a pending successor exists, the successor releases the bind address even if successor exposure confirmation has not arrived yet.
+4. if the predecessor has accepted runtime deactivate and is only retained for continuity, and the pending successor later fail-closes after accepting desired state, the successor releases the retained predecessor and binds a fail-closed successor facade rather than leaving the old runtime PID to handle new requests.
+5. after release, the successor refreshes fixed-bind lifecycle facts before evaluating facade-dependent query publication; stale pre-release claim snapshots cannot continue suppressing current-generation routes.
+6. if the bind blocker is outside the current process, the successor still treats its unconfirmed fixed-bind facade publication as incomplete and keeps facade-dependent query routes suppressed until the bind is actually acquired.
+7. when fixed-bind facade publication becomes complete, previously suppressed sink-owned facade-dependent materialized/query route activates are replayed from retained sink desired state; a source-only recovery follow-up must not leave trusted-materialized routes unpublished behind a completed facade.
+7. a fresh request that is already accepted by the predecessor before shutdown must settle with an HTTP response; a new connection during the unavoidable no-listener bind gap is not treated as proof of app-level query correctness.
 
 ## [workflow] ObservationEligibilityCutover
 
@@ -416,10 +496,13 @@ fn delete_aware_aggregate(records: &[FileMetaRecord]) -> Vec<FsMetaQueryNode>
 
 1. caller sends `POST /api/fs-meta/v1/index/rescan`.
 2. api authorizes admin role.
-3. api checks Management Write Ready for the current Authority Epoch; if the HTTP facade is reachable but the active control stream is not ready, api rejects the write with explicit `NOT_READY`.
-4. api forwards trigger to source-primary executor rescan path.
-5. source sends manual rescan signal only to each group source-primary executor pipeline.
-6. api returns accepted response.
+3. api checks Management Write Ready for the current Authority Epoch; if the HTTP facade is reachable but the active control stream is not ready, api rejects the write with explicit `NOT_READY`. If an earlier online roots apply returned before peer runtime-scope followup finished, api performs a bounded current-roots source runtime-scope readiness fan-in before scoped manual-rescan delivery; it must not turn a not-yet-activated source route into an accepted rescan. Source-status readiness evidence is served by active `runtime.exec.source` owners for their runtime-scope groups; query/facade lanes aggregate that evidence but are not a prerequisite for the source-owned status endpoint. Because runtime remote fanout is peer delivery, the API aggregation combines routed peer source-status evidence with the same-node source owner observation before judging source runtime-scope readiness. Sink materialization readiness is not part of this precondition because manual rescan delivery targets source request routes, so this source-only gate must not wait on sink-status route replies.
+4. api publishes the cluster manual-rescan stream notification and performs bounded `source.rescan` request/reply collects against the current source-primary runner node-scoped routes for the current authoritative logical roots, where each scoped route is addressed by the source-primary runner identity proven by current source runtime-scope observation, not by every active host grant that matches the logical root. The scoped collect uses the standard fs-meta route exchange and arms the reply lane before sending the request; direct one-off reply-channel polling is not scoped delivery evidence. For a current root, a single node observed in the current source/scan runtime-scope schedule is authoritative source-primary runner route evidence; source-primary object refs and concrete-root primary flags are supplementary disambiguation when more than one runtime-scope node is observed. If explicit primary evidence points outside the current source/scan runtime-scope, that evidence is stale for scoped delivery and the app applies the same stable source-primary ordering over the current runtime-scope nodes. Active grants that no longer match the current authoritative logical roots, matching grants that are not the observed source-primary runner for that root, or source-primary refs outside current runtime-scope are stale or standby runtime evidence and must not become required manual-rescan delivery targets. If no active source scoped target exists for the current roots, the generic `source.rescan` route is the fallback delivery probe.
+5. source request/reply endpoint records the manual rescan intent and replies with explicit delivery evidence before rescan execution completes; execution is still owned by each group source-primary executor pipeline and waits for root readiness internally. A node-scoped source-rescan request route is accepted only by the source node named by that route. App source workers MUST NOT intentionally attach peer-scoped manual-rescan consumers, because a node-scoped route is domain ownership evidence, not a best-effort fanout drain lane. If stale or transport-level non-target evidence is observed, it is supplementary only and never proves execution ownership.
+6. scoped manual-rescan collection treats any non-target drain evidence as supplementary only; it must keep waiting within the existing route timeout for the target source node's explicit delivery evidence, and short idle grace after non-target replies must not complete the target delivery decision. If a fanout send only reaches non-target evidence while the target endpoint is still becoming receive-armed, api reissues the same scoped delivery probe within the original route timeout instead of accepting non-target evidence or extending the operation budget. If a short bounded receive window returns no evidence for the scoped probe, api applies the same rule: reissue the same scoped delivery probe only while the original route timeout still has budget, and fail closed when target evidence never appears.
+7. after a source control wave activates source-owned manual-rescan routes, the source runtime reconciles request endpoints again in the same control-frame turn so newly active local target routes can serve the first management request after activation.
+8. if any required active source scoped route cannot be reached, or if the generic fallback cannot be reached when there are no scoped targets, api fails closed instead of accepting a rescan that only reached the facade-local source.
+9. api returns accepted response after the cluster route delivery and local source signal are published.
 
 ## [workflow] QueryApiKeyLifecycle
 
@@ -442,11 +525,16 @@ fn delete_aware_aggregate(records: &[FileMetaRecord]) -> Vec<FsMetaQueryNode>
 3. if monitoring roots are empty, api returns explicit `NOT_READY` with `monitoring_roots_empty`.
 4. if runtime grants are unavailable for the current Authority Epoch, api returns explicit `NOT_READY` with `runtime_grants_unavailable`.
 5. api resolves Runner Binding Evidence for each requested group inside the current Authority Epoch; cached evidence may be used only when it belongs to that same Authority Epoch.
-6. if runner binding has not yet been built for the current Authority Epoch, api returns explicit `NOT_READY` with `runner_binding_not_ready` instead of using older evidence.
-7. if a requested group has no runner candidate in the current Authority Epoch, the group returns explicit `GROUP_UNBOUND` while other groups continue independently.
-8. if a requested group already has an in-flight fresh scan, fs-meta applies the group-local exclusivity policy and either joins that in-flight work within the request budget or returns an explicit group-local conflict/unavailable result.
-9. once a group is Force-Find Ready, fs-meta selects one runner bound to that group and dispatches fresh execution to that selected runner; it does not wait for source initial audit completion, sink materialization readiness, or trusted materialized observation eligibility.
-10. the group enters Selected-Runner Fresh Execution: the group result is decided by the selected runner's success, explicit failure, or timeout, and fs-meta does not keep that group open to wait for unrelated runners.
-11. for multi-group force-find, fs-meta repeats the same selected-runner decision per group and assembles independent group buckets; one group's wait or failure does not redefine another group's result.
-12. successful results return `read_class=fresh` and `observation_status.state=fresh-only`; they do not promote `/tree` or `/stats` materialized observation to trusted state.
-13. fresh execution failures remain explicit group-level errors such as `RUNNER_UNAVAILABLE` or `HOST_FS_UNAVAILABLE`; fs-meta does not silently substitute materialized results for failed fresh execution.
+6. when route-schedule debug maps, configured-root snapshots, or per-snapshot active-member counters are absent/partial during cutover but same-epoch logical-root health and active grants prove group membership, Runner Binding Evidence derives candidates from those active group grants; debug underreporting must not collapse force-find onto source-primary only.
+7. status fan-in must preserve selected-runner evidence produced by fresh execution even when route-schedule debug maps are absent; missing debug maps may fail-close incomplete root/debug fields, but they must not discard same-epoch runner evidence that proves force-find execution and fallback behavior.
+8. successful force-find response origin evidence is authoritative runner evidence for management status; source-status route debug maps are supplementary diagnostics, and a bounded source-status timeout must not erase runner evidence already proven by the fresh execution response.
+9. if runner binding has not yet been built for the current Authority Epoch, api returns explicit `NOT_READY` with `runner_binding_not_ready` instead of using older evidence.
+10. if a requested group has no runner candidate in the current Authority Epoch, the group returns explicit `GROUP_UNBOUND` while other groups continue independently.
+11. if a requested group already has an in-flight fresh scan, fs-meta applies the group-local exclusivity policy and either joins that in-flight work within the request budget or returns an explicit group-local conflict/unavailable result.
+12. once a group is Force-Find Ready, fs-meta selects one runner bound to that group and dispatches fresh execution to that selected runner; it does not wait for source initial audit completion, sink materialization readiness, or trusted materialized observation eligibility.
+13. the group enters Selected-Runner Fresh Execution: the group result is decided by the selected runner's success, explicit failure, or timeout, and fs-meta does not keep that group open to wait for unrelated runners.
+14. for multi-group force-find, fs-meta repeats the same selected-runner decision per group and assembles independent group buckets; one group's wait or failure does not redefine another group's result.
+15. successful results return `read_class=fresh` and `observation_status.state=fresh-only`; they do not promote `/tree` or `/stats` materialized observation to trusted state.
+16. fresh execution failures remain explicit group-level errors such as `RUNNER_UNAVAILABLE` or `HOST_FS_UNAVAILABLE`; fs-meta does not silently substitute materialized results for failed fresh execution.
+17. if a selected runner's remote mount-root is no longer mounted, the host-fs facade must fail closed with `HOST_FS_UNAVAILABLE`; when another current-epoch bound runner exists for the same logical group, fs-meta retries that group's fresh execution on the next bound runner before rendering unavailable evidence.
+18. a same-group runner retry is still one group-level fresh execution decision; it must not use materialized data, unrelated group replies, or a generic fallback that can omit the requested group.

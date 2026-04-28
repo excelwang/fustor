@@ -1,16 +1,20 @@
 use super::*;
 use crate::ControlEvent;
 use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
-use crate::runtime::execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID;
+use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID};
 use crate::runtime::orchestration::encode_logical_roots_control_payload;
 use crate::runtime::routes::{
-    ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
-    ROUTE_KEY_SOURCE_ROOTS_CONTROL,
+    METHOD_SOURCE_RESCAN, ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
+    ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_TOKEN_FS_META_INTERNAL, source_rescan_route_bindings_for,
 };
 use crate::sink::SinkFileMeta;
 use crate::state::cell::LogicalRootsCell;
+use bytes::Bytes;
 use capanix_app_sdk::runtime::ControlEnvelope;
-use capanix_runtime_entry_sdk::advanced::boundary::BoundaryContext;
+use capanix_app_sdk::runtime::RouteKey;
+use capanix_runtime_entry_sdk::advanced::boundary::{
+    BoundaryContext, ChannelRecvRequest, ChannelSendRequest,
+};
 use capanix_runtime_entry_sdk::control::{
     RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate,
     RuntimeHostDescriptor, RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState,
@@ -19,6 +23,7 @@ use capanix_runtime_entry_sdk::control::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
 struct NoopBoundary;
 
@@ -63,6 +68,77 @@ impl ChannelIoSubset for RouteCountingTimeoutBoundary {
             .entry(route_key)
             .or_default() += 1;
         Err(CnxError::Timeout)
+    }
+}
+
+#[derive(Default)]
+struct RetryableClosedBoundary {
+    recv_count: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ChannelIoSubset for RetryableClosedBoundary {
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        _request: ChannelRecvRequest,
+    ) -> Result<Vec<Event>> {
+        self.recv_count.fetch_add(1, Ordering::SeqCst);
+        Err(CnxError::Internal(
+            "transport closed: sidecar data bridge closed: internal error: ipc read len: early eof"
+                .to_string(),
+        ))
+    }
+}
+
+#[derive(Default)]
+struct SourceLoopbackBoundary {
+    channels: std::sync::Mutex<std::collections::BTreeMap<String, Vec<Event>>>,
+    changed: Notify,
+}
+
+#[async_trait::async_trait]
+impl ChannelIoSubset for SourceLoopbackBoundary {
+    async fn channel_send(&self, _ctx: BoundaryContext, request: ChannelSendRequest) -> Result<()> {
+        {
+            let mut channels = self.channels.lock().expect("source loopback channels lock");
+            channels
+                .entry(request.channel_key.0)
+                .or_default()
+                .extend(request.events);
+        }
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelRecvRequest,
+    ) -> Result<Vec<Event>> {
+        let route_key = request.channel_key.0;
+        let deadline = request
+            .timeout_ms
+            .map(Duration::from_millis)
+            .map(|timeout| tokio::time::Instant::now() + timeout);
+        loop {
+            {
+                let mut channels = self.channels.lock().expect("source loopback channels lock");
+                if let Some(events) = channels.remove(&route_key)
+                    && !events.is_empty()
+                {
+                    return Ok(events);
+                }
+            }
+            if let Some(deadline) = deadline {
+                match tokio::time::timeout_at(deadline, self.changed.notified()).await {
+                    Ok(()) => {}
+                    Err(_) => return Err(CnxError::Timeout),
+                }
+            } else {
+                self.changed.notified().await;
+            }
+        }
     }
 }
 
@@ -264,6 +340,32 @@ fn local_source_progress_snapshot_reads_machine_owned_published_group_epoch_from
         snapshot
             .published_expected_groups_since(request_epoch, &BTreeSet::from(["nfs1".to_string()]),),
         "local source progress should satisfy request-scoped publication once SourceStateCell records the group epoch",
+    );
+}
+
+#[test]
+fn local_source_materialized_read_cache_epoch_tracks_pending_rescan_request() {
+    let source = build_source(Vec::new());
+    assert_eq!(
+        source.materialized_read_cache_epoch(),
+        0,
+        "fresh source should start without a materialized-read cache epoch"
+    );
+
+    let request_epoch = source.state_cell.begin_rescan_request_epoch(0, 0, 0);
+
+    assert_eq!(
+        source.materialized_read_cache_epoch(),
+        request_epoch,
+        "materialized reads must see a pending manual-rescan epoch before publication catches up"
+    );
+
+    source.state_cell.mark_group_published("nfs1");
+
+    assert_eq!(
+        source.materialized_read_cache_epoch(),
+        request_epoch,
+        "publication catch-up should preserve the same request epoch instead of hiding it"
     );
 }
 
@@ -583,6 +685,347 @@ async fn owner_scoped_roots_control_stream_stays_gated_until_route_activation() 
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+
+    source.close().await.expect("close source");
+}
+
+#[tokio::test]
+async fn owner_scoped_source_rescan_endpoint_listens_on_request_route_after_activation() {
+    let source = build_source(vec![test_export(
+        "node-a",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )]);
+    let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("start runtime endpoints");
+
+    let rescan_route = crate::runtime::routes::source_rescan_request_route_for("node-a").0;
+    source
+        .on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+            RuntimeExecActivate {
+                route_key: rescan_route.clone(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            },
+        ))
+        .expect("encode scoped source rescan activate")])
+        .await
+        .expect("activate owner-scoped source rescan route");
+
+    let activated_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let rescan_recv = boundary.recv_count(&rescan_route);
+        if rescan_recv > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < activated_deadline,
+            "source owner-scoped rescan endpoint must listen on the request route after activation; recv_counts={:?}",
+            boundary.recv_counts_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    source.close().await.expect("close source");
+}
+
+#[tokio::test]
+async fn source_rescan_endpoint_does_not_serve_peer_scoped_route_after_activation() {
+    let source = build_source(vec![test_export(
+        "node-a",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )]);
+    let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("start runtime endpoints");
+
+    let local_rescan_route = crate::runtime::routes::source_rescan_request_route_for("node-a").0;
+    let peer_rescan_route = crate::runtime::routes::source_rescan_request_route_for("node-b").0;
+    source
+        .on_control_frame(&[
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: local_rescan_route.clone(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode local scoped source rescan activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: peer_rescan_route.clone(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode peer scoped source rescan activate"),
+        ])
+        .await
+        .expect("activate scoped source rescan routes");
+
+    let local_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let local_recv = boundary.recv_count(&local_rescan_route);
+        if local_recv > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < local_deadline,
+            "local source scoped rescan endpoint must listen on its own request route; recv_counts={:?}",
+            boundary.recv_counts_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        boundary.recv_count(&peer_rescan_route),
+        0,
+        "source node must not attach a drain endpoint to another node's scoped rescan route; recv_counts={:?}",
+        boundary.recv_counts_snapshot()
+    );
+
+    source.close().await.expect("close source");
+}
+
+#[tokio::test]
+async fn source_rescan_endpoint_does_not_start_peer_scoped_route_during_control_reconcile() {
+    let source = build_source(vec![test_export(
+        "node-a",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )]);
+    let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("start runtime endpoints");
+
+    let local_rescan_route = crate::runtime::routes::source_rescan_request_route_for("node-a").0;
+    let peer_rescan_route = crate::runtime::routes::source_rescan_request_route_for("node-b").0;
+    source
+        .on_control_frame(&[
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: local_rescan_route.clone(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode local scoped source rescan activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: peer_rescan_route.clone(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode peer scoped source rescan activate"),
+        ])
+        .await
+        .expect("activate scoped source rescan routes");
+
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("reconcile runtime endpoints after control");
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        boundary.recv_count(&peer_rescan_route),
+        0,
+        "source node must not start a receive endpoint for another node's scoped manual-rescan route during post-control reconcile; recv_counts={:?}",
+        boundary.recv_counts_snapshot()
+    );
+
+    source.close().await.expect("close source");
+}
+
+#[tokio::test]
+async fn owner_scoped_source_rescan_endpoint_acknowledges_before_root_running() {
+    let source = build_source(vec![test_export(
+        "node-a",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )]);
+    let boundary = Arc::new(SourceLoopbackBoundary::default());
+
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("start runtime endpoints");
+
+    let rescan_route = crate::runtime::routes::source_rescan_request_route_for("node-a").0;
+    source
+        .on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+            RuntimeExecActivate {
+                route_key: rescan_route.clone(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            },
+        ))
+        .expect("encode scoped source rescan activate")])
+        .await
+        .expect("activate owner-scoped source rescan route");
+
+    let adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary,
+        NodeId("node-d".to_string()),
+        source_rescan_route_bindings_for("node-a"),
+    );
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_RESCAN,
+        Bytes::from_static(b"manual-rescan"),
+        Duration::from_millis(750),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("scoped source rescan route must acknowledge delivery before root running health");
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.metadata().origin_id == NodeId("node-a".to_string())),
+        "scoped source rescan route must reply from the source node: {events:?}"
+    );
+
+    source.close().await.expect("close source");
+}
+
+#[tokio::test]
+async fn scoped_source_rescan_endpoint_rearms_after_retryable_bridge_close() {
+    let source = build_source(vec![test_export(
+        "node-a",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )]);
+    let rescan_route = crate::runtime::routes::source_rescan_request_route_for("node-a").0;
+    let stale_endpoint = ManagedEndpointTask::spawn_with_unit(
+        Arc::new(RetryableClosedBoundary::default()),
+        RouteKey(rescan_route.clone()),
+        "test-stale-scoped-source-rescan",
+        SOURCE_RUNTIME_UNIT_ID,
+        source.shutdown.clone(),
+        |_requests| async { Vec::<Event>::new() },
+    );
+    lock_or_recover(
+        &source.endpoint_tasks,
+        "test.source.scoped_rescan_rearm.seed",
+    )
+    .push(stale_endpoint);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let stale_finished = lock_or_recover(
+            &source.endpoint_tasks,
+            "test.source.scoped_rescan_rearm.finished",
+        )
+        .iter()
+        .any(|task| task.route_key() == rescan_route && task.is_finished());
+        if stale_finished {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "retryable bridge-close request endpoint must finish so runtime endpoint rearm can attach the current boundary"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let boundary = Arc::new(SourceLoopbackBoundary::default());
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("rearm source runtime endpoints after stale scoped rescan endpoint exits");
+    source
+        .on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+            RuntimeExecActivate {
+                route_key: rescan_route.clone(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            },
+        ))
+        .expect("encode scoped source rescan activate")])
+        .await
+        .expect("activate owner-scoped source rescan route");
+
+    let adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary,
+        NodeId("node-d".to_string()),
+        source_rescan_route_bindings_for("node-a"),
+    );
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_RESCAN,
+        Bytes::from_static(b"manual-rescan"),
+        Duration::from_millis(750),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("rearmed scoped source rescan route must acknowledge delivery");
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.metadata().origin_id == NodeId("node-a".to_string())),
+        "rearmed scoped source rescan route must reply from the source node: {events:?}"
+    );
 
     source.close().await.expect("close source");
 }
@@ -3054,7 +3497,7 @@ async fn trigger_rescan_when_ready_waits_for_primary_root_running() {
 }
 
 #[tokio::test]
-async fn trigger_rescan_when_ready_does_not_fire_before_primary_root_running() {
+async fn trigger_rescan_when_ready_records_deferred_intent_before_primary_root_running() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
     cfg.host_object_grants = vec![test_export(
@@ -3082,12 +3525,21 @@ async fn trigger_rescan_when_ready_does_not_fire_before_primary_root_running() {
             "trigger_rescan_when_ready should settle even if primary root never becomes running",
         );
 
+    let reason = rx
+        .try_recv()
+        .expect("manual rescan intent should be recorded before primary root is running");
+    assert!(matches!(reason, RescanReason::Manual));
+    let root_key = FSMetaSource::root_runtime_key(&primary_root);
+    let health = lock_or_recover(
+        &source.state_cell.fanout_health,
+        "test.trigger_rescan_when_ready_timeout.health",
+    );
     assert!(
-        matches!(
-            rx.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ),
-        "trigger_rescan_when_ready must not fire a manual rescan before the primary scan root is running"
+        health
+            .object_ref_detail
+            .get(&root_key)
+            .is_some_and(|detail| detail.rescan_pending),
+        "trigger_rescan_when_ready must record pending manual rescan intent before execution"
     );
 }
 
@@ -4306,6 +4758,72 @@ fn force_find_round_robins_across_group_sources() {
     drop(last_runner);
     let rr = lock_or_recover(&source.force_find_rr, "test.force_find.rr.round_robin");
     assert_eq!(rr.get("nfs1").copied(), Some(1));
+}
+
+#[test]
+fn selected_group_force_find_prefers_local_source_runner_object_on_first_request() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_micros();
+    let root_dir = std::env::temp_dir().join(format!("fs-meta-force-find-local-{unique}"));
+    std::fs::create_dir_all(&root_dir).expect("create root dir");
+    std::fs::write(root_dir.join("file.txt"), b"ok").expect("seed file");
+
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", root_dir.clone())];
+    cfg.host_object_grants = vec![
+        test_export(
+            "node-a::nfs1",
+            "node-a",
+            "10.0.0.11",
+            root_dir.clone(),
+            true,
+        ),
+        test_export(
+            "node-b::nfs1",
+            "node-b",
+            "10.0.0.12",
+            root_dir.clone(),
+            true,
+        ),
+        test_export(
+            "node-c::nfs1",
+            "node-c",
+            "10.0.0.13",
+            root_dir.clone(),
+            true,
+        ),
+    ];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-b-123".to_string()), None)
+        .expect("init source");
+    let params = crate::query::request::InternalQueryRequest::force_find(
+        crate::query::request::QueryOp::Tree,
+        crate::query::request::QueryScope {
+            path: b"/".to_vec(),
+            recursive: true,
+            max_depth: None,
+            selected_group: Some("nfs1".to_string()),
+        },
+    );
+
+    let events = source
+        .force_find(&params)
+        .expect("selected group force-find");
+
+    assert_eq!(
+        event_origin_ids(&events),
+        BTreeSet::from(["nfs1".to_string()])
+    );
+    let last_runner = lock_or_recover(
+        &source.force_find_last_runner,
+        "test.force_find.last_runner.local_preference",
+    );
+    assert_eq!(
+        last_runner.get("nfs1").map(String::as_str),
+        Some("node-b::nfs1"),
+        "selected source runner requests should execute the local runner object first instead of every source process starting at the source-primary object"
+    );
 }
 
 #[test]

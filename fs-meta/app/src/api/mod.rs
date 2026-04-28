@@ -5,7 +5,7 @@ pub(crate) mod facade_status;
 mod handlers;
 pub(crate) mod rollout_status;
 mod server;
-mod state;
+pub(crate) mod state;
 pub mod types;
 
 pub use config::{ApiAuthConfig, ApiConfig, BootstrapAdminConfig, BootstrapManagementConfig};
@@ -19,4 +19,4 @@ pub(crate) use handlers::{
 };
 pub use server::ApiServerHandle;
 pub(crate) use server::{spawn, spawn_with_rollout_status};
-pub(crate) use state::{ApiControlGate, ApiRequestTracker};
+pub(crate) use state::{ApiControlGate, ApiRequestTracker, ManagementWriteRecovery};

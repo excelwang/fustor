@@ -2756,24 +2756,28 @@ impl SinkWorkerClientHandle {
             roots.len(),
             host_object_grants.len()
         );
-        let response = self
-            .with_started_retry_with_failure(|client| {
-                let roots = roots.clone();
-                let host_object_grants = host_object_grants.clone();
-                async move {
-                    #[cfg(test)]
-                    maybe_pause_before_update_logical_roots_rpc().await;
-                    Self::call_worker_with_failure(
-                        &client,
-                        SinkWorkerRequest::UpdateLogicalRoots {
-                            roots: roots.clone(),
-                            host_object_grants: host_object_grants.clone(),
-                        },
-                        SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
-                    )
-                    .await
-                }
-            })
+        let worker = self.worker_client().await;
+        let response = worker
+            .with_started_once_mapped(
+                |client| {
+                    let roots = roots.clone();
+                    let host_object_grants = host_object_grants.clone();
+                    async move {
+                        #[cfg(test)]
+                        maybe_pause_before_update_logical_roots_rpc().await;
+                        Self::call_worker_with_failure(
+                            &client,
+                            SinkWorkerRequest::UpdateLogicalRoots {
+                                roots: roots.clone(),
+                                host_object_grants: host_object_grants.clone(),
+                            },
+                            SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
+                        )
+                        .await
+                    }
+                },
+                SinkFailure::into_error,
+            )
             .await?;
         match response {
             SinkWorkerResponse::Ack => {
@@ -2956,6 +2960,58 @@ impl SinkWorkerClientHandle {
                 unreachable!("live access path passed to cached reason formatter")
             }
         }
+    }
+
+    async fn update_logical_roots_from_management_apply_with_failure(
+        &self,
+        roots: Vec<crate::source::config::RootSpec>,
+        host_object_grants: Vec<GrantedMountRoot>,
+    ) -> std::result::Result<(), SinkFailure> {
+        let _inflight = self.begin_control_op();
+        eprintln!(
+            "fs_meta_sink_worker_client: update_logical_roots_from_management_apply begin node={} roots={} grants={}",
+            self.node_id.0,
+            roots.len(),
+            host_object_grants.len()
+        );
+        let response = self
+            .with_started_retry_with_failure(|client| {
+                let roots = roots.clone();
+                let host_object_grants = host_object_grants.clone();
+                async move {
+                    #[cfg(test)]
+                    maybe_pause_before_update_logical_roots_rpc().await;
+                    Self::call_worker_with_failure(
+                        &client,
+                        SinkWorkerRequest::UpdateLogicalRootsFromManagementApply {
+                            roots: roots.clone(),
+                            host_object_grants: host_object_grants.clone(),
+                        },
+                        SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
+                    )
+                    .await
+                }
+            })
+            .await?;
+        match response {
+            SinkWorkerResponse::Ack => {
+                eprintln!(
+                    "fs_meta_sink_worker_client: update_logical_roots_from_management_apply ok node={} roots={}",
+                    self.node_id.0,
+                    roots.len()
+                );
+            }
+            other => Err(unexpected_sink_worker_response_failure(
+                "for update roots from management apply",
+                other,
+            ))?,
+        }
+        self.update_cached_logical_roots(roots.clone())
+            .map_err(SinkFailure::from)?;
+        self.update_cached_runtime_config(&roots, &host_object_grants)
+            .map_err(SinkFailure::from)?;
+        self.retain_cached_status_for_surviving_roots(&roots)
+            .map_err(SinkFailure::from)
     }
 
     async fn nonblocking_status_entry_action(
@@ -3363,6 +3419,27 @@ impl SinkWorkerClientHandle {
     pub(crate) async fn status_snapshot_nonblocking_for_status_route(
         &self,
     ) -> (SinkStatusSnapshot, bool) {
+        let replay_required = self.control_state_replay_required.load(Ordering::Acquire) > 0;
+        let control_inflight = self.control_op_inflight();
+        if replay_required || control_inflight {
+            let snapshot = self
+                .cached_status_snapshot_with_failure()
+                .unwrap_or_else(|_| SinkStatusSnapshot::default());
+            if debug_control_scope_capture_enabled() {
+                let reason = if replay_required {
+                    "status_route_retained_replay_pending"
+                } else {
+                    "status_route_control_inflight"
+                };
+                eprintln!(
+                    "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason={} {}",
+                    self.node_id.0,
+                    reason,
+                    summarize_sink_status_snapshot(&snapshot)
+                );
+            }
+            return (snapshot, true);
+        }
         match self.status_snapshot_nonblocking_with_access_path().await {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -4082,6 +4159,15 @@ impl SinkFileMeta {
             .map_err(SinkFailure::from)
     }
 
+    pub(crate) fn update_logical_roots_from_management_apply_with_failure(
+        &self,
+        roots: Vec<crate::source::config::RootSpec>,
+        host_object_grants: &[GrantedMountRoot],
+    ) -> std::result::Result<(), SinkFailure> {
+        self.perform_update_logical_roots_from_management_apply(roots, host_object_grants)
+            .map_err(SinkFailure::from)
+    }
+
     pub(crate) fn logical_roots_snapshot_with_failure(
         &self,
     ) -> std::result::Result<Vec<crate::source::config::RootSpec>, SinkFailure> {
@@ -4259,6 +4345,25 @@ impl SinkFacade {
         }
     }
 
+    pub(crate) async fn update_logical_roots_from_management_apply_with_failure(
+        &self,
+        roots: Vec<crate::source::config::RootSpec>,
+        host_object_grants: &[GrantedMountRoot],
+    ) -> std::result::Result<(), SinkFailure> {
+        match self {
+            Self::Local(sink) => sink
+                .update_logical_roots_from_management_apply_with_failure(roots, host_object_grants),
+            Self::Worker(client) => {
+                client
+                    .update_logical_roots_from_management_apply_with_failure(
+                        roots,
+                        host_object_grants.to_vec(),
+                    )
+                    .await
+            }
+        }
+    }
+
     pub(crate) fn cached_logical_roots_snapshot_with_failure(
         &self,
     ) -> std::result::Result<Vec<crate::source::config::RootSpec>, SinkFailure> {
@@ -4359,6 +4464,15 @@ impl SinkFacade {
         match self {
             Self::Local(_) => false,
             Self::Worker(client) => client.control_op_inflight_for_internal_status(),
+        }
+    }
+
+    pub(crate) fn retained_replay_required(&self) -> bool {
+        match self {
+            Self::Local(_) => false,
+            Self::Worker(client) => {
+                client.control_state_replay_required.load(Ordering::Acquire) > 0
+            }
         }
     }
 

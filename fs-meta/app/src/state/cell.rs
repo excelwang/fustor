@@ -572,7 +572,22 @@ impl HostObjectGrantsCell {
                             ),
                         ));
                     }
-                    decoded
+                    if decoded.grants != initial_grants {
+                        let snapshot = HostObjectGrantsSnapshot {
+                            scope: scope.to_string(),
+                            version: decoded.version.saturating_add(1),
+                            grants: initial_grants,
+                        };
+                        write_host_object_grants_snapshot_blocking(
+                            &state_boundary,
+                            scope,
+                            &handle,
+                            &snapshot,
+                        )?;
+                        snapshot
+                    } else {
+                        decoded
+                    }
                 }
             }
             Err(err) if is_statecell_not_found(&err) => {
@@ -958,6 +973,28 @@ mod tests {
         authority_handle(scope)
     }
 
+    fn granted_root(object_ref: &str, mount_point: &str) -> GrantedMountRoot {
+        GrantedMountRoot {
+            object_ref: object_ref.to_string(),
+            host_ref: object_ref
+                .split_once("::")
+                .map(|(host, _)| host)
+                .unwrap_or(object_ref)
+                .to_string(),
+            host_ip: "127.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: Default::default(),
+            mount_point: mount_point.into(),
+            fs_source: format!("nfs://{object_ref}"),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: vec!["host-object-access".to_string()],
+            active: true,
+        }
+    }
+
     #[test]
     fn authority_journal_roundtrip_on_local_state_boundary() {
         let boundary = in_memory_state_boundary();
@@ -973,6 +1010,31 @@ mod tests {
         let reopened =
             AuthorityJournal::from_state_boundary("runtime.exec.source", boundary).expect("reopen");
         assert_eq!(reopened.len(), 2);
+    }
+
+    #[test]
+    fn host_object_grants_statecell_refreshes_when_config_authority_changes() {
+        let boundary = in_memory_state_boundary();
+        let old_grants = vec![granted_root("node-d::nfs2", "/mnt/node-d/nfs2")];
+        let cell = HostObjectGrantsCell::from_state_boundary(
+            "runtime.exec.source",
+            old_grants,
+            boundary.clone(),
+        )
+        .expect("seed old grants");
+        assert_eq!(cell.snapshot().0, 0);
+
+        let new_grants = vec![granted_root("node-c::nfs2", "/mnt/node-c/nfs2")];
+        let reopened = HostObjectGrantsCell::from_state_boundary(
+            "runtime.exec.source",
+            new_grants.clone(),
+            boundary,
+        )
+        .expect("reload refreshed grants");
+
+        let (version, grants) = reopened.snapshot();
+        assert_eq!(version, 1);
+        assert_eq!(grants, new_grants);
     }
 
     #[test]

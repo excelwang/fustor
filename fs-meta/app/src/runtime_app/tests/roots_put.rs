@@ -58,6 +58,11 @@
         "/src/runtime_app/tests/roots_put/successor_live_sink_schedule.rs"
     ));
 
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/runtime_app/tests/roots_put/source_release_cutover_fail_closed.rs"
+    ));
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn live_successor_sink_only_mid_handoff_close_falls_into_cleanup_only_facade_then_one_uninitialized_sink_retry()
      {
@@ -1504,6 +1509,39 @@
             .await
             .expect("join node-a deactivate")
             .expect("node-a deactivate should complete as cleanup-only without sink worker entry");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let node_a_roots_control_deactivate = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                successor
+                    .on_control_frame(&[deactivate_envelope_with_route_key(
+                        execution_units::SINK_RUNTIME_UNIT_ID,
+                        crate::runtime::routes::sink_roots_control_stream_route_for("node-a").0,
+                        3,
+                    )])
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_millis(600), entered.notified())
+            .await
+            .expect_err(
+                "uninitialized per-peer sink logical-roots cleanup must update retained state locally and must not re-enter sink worker",
+            );
+        release.notify_waiters();
+        node_a_roots_control_deactivate
+            .await
+            .expect("join node-a sink logical-roots deactivate")
+            .expect("sink logical-roots deactivate should complete as local cleanup");
 
         successor.close().await.expect("close successor app");
         predecessor.close().await.expect("close predecessor app");

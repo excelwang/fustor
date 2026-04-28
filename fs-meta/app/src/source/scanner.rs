@@ -36,6 +36,110 @@ fn lock_or_recover<'a, T>(m: &'a Mutex<T>, context: &str) -> MutexGuard<'a, T> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct MetadataErrorHostFs {
+        kind: io::ErrorKind,
+        message: &'static str,
+    }
+
+    impl HostFs for MetadataErrorHostFs {
+        fn metadata(&self, _path: &Path) -> io::Result<HostFsMetadata> {
+            Err(io::Error::new(self.kind, self.message))
+        }
+
+        fn symlink_metadata(&self, path: &Path) -> io::Result<HostFsMetadata> {
+            self.metadata(path)
+        }
+
+        fn read_dir(&self, _path: &Path) -> io::Result<Vec<HostFsDirEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn scanner_with(host_fs: impl HostFs + 'static) -> ParallelScanner {
+        ParallelScanner::new(
+            PathBuf::from("/root"),
+            PathBuf::new(),
+            1,
+            16,
+            1024,
+            NodeId("node-a::nfs1".to_string()),
+            Arc::new(host_fs),
+        )
+    }
+
+    fn drift_estimator() -> Arc<Mutex<DriftEstimator>> {
+        Arc::new(Mutex::new(DriftEstimator::new(32, 10, 1_000_000)))
+    }
+
+    #[test]
+    fn targeted_scan_preserves_host_fs_unavailable_even_when_reported_as_not_found() {
+        let scanner = scanner_with(MetadataErrorHostFs {
+            kind: io::ErrorKind::NotFound,
+            message: "HOST_FS_UNAVAILABLE: bound root is not a mounted root",
+        });
+
+        let err = scanner
+            .scan_targeted(
+                b"/force-find-stress",
+                true,
+                None,
+                &drift_estimator(),
+                &Arc::new(LogicalClock::new()),
+            )
+            .expect_err("root unavailable must not be treated as a missing child path");
+
+        assert!(
+            err.to_string().contains("HOST_FS_UNAVAILABLE"),
+            "error should preserve unavailable evidence: {err:?}"
+        );
+    }
+
+    #[test]
+    fn targeted_scan_keeps_plain_not_found_as_missing_child_path() {
+        let scanner = scanner_with(MetadataErrorHostFs {
+            kind: io::ErrorKind::NotFound,
+            message: "No such file or directory",
+        });
+
+        let events = scanner
+            .scan_targeted(
+                b"/missing",
+                true,
+                None,
+                &drift_estimator(),
+                &Arc::new(LogicalClock::new()),
+            )
+            .expect("plain missing child should remain an empty targeted scan");
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn targeted_scan_root_not_found_still_fails() {
+        let scanner = scanner_with(MetadataErrorHostFs {
+            kind: io::ErrorKind::NotFound,
+            message: "root missing",
+        });
+
+        let err = scanner
+            .scan_targeted(
+                b"/",
+                true,
+                None,
+                &drift_estimator(),
+                &Arc::new(LogicalClock::new()),
+            )
+            .expect_err("root path itself missing is not a missing child result");
+
+        assert!(err.to_string().contains("root missing"));
+    }
+}
+
 fn derived_ino_for_path(path: &Path) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);
@@ -122,6 +226,17 @@ fn should_retry_host_fs_error(kind: io::ErrorKind) -> bool {
             | io::ErrorKind::WouldBlock
             | io::ErrorKind::Other
     )
+}
+
+fn host_fs_error_indicates_unavailable(err: &io::Error) -> bool {
+    err.to_string().contains("HOST_FS_UNAVAILABLE")
+        || matches!(
+            err.kind(),
+            io::ErrorKind::NotConnected
+                | io::ErrorKind::HostUnreachable
+                | io::ErrorKind::NetworkUnreachable
+                | io::ErrorKind::StaleNetworkFileHandle
+        )
 }
 
 fn host_fs_op_timeout() -> Duration {
@@ -316,7 +431,11 @@ impl ParallelScanner {
 
         let meta = match metadata_with_retry(Arc::clone(&self.host_fs), &target) {
             Ok(meta) => meta,
-            Err(err) if err.kind() == io::ErrorKind::NotFound && target != self.root_path => {
+            Err(err)
+                if err.kind() == io::ErrorKind::NotFound
+                    && target != self.root_path
+                    && !host_fs_error_indicates_unavailable(&err) =>
+            {
                 return Ok(Vec::new());
             }
             Err(err) => {

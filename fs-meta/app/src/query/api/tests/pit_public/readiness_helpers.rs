@@ -644,7 +644,7 @@ fn request_scoped_loaded_ready_group_preservation_decision_restores_loaded_group
 }
 
 #[test]
-fn request_scoped_loaded_ready_group_preservation_decision_does_not_restore_when_request_scope_omits_all_groups()
+fn request_scoped_loaded_ready_group_preservation_decision_restores_loaded_group_when_request_scope_omits_all_groups()
  {
     let decision = request_scoped_loaded_ready_group_preservation_decision(
         RequestScopedLoadedReadyGroupPreservationDecisionInput {
@@ -660,10 +660,10 @@ fn request_scoped_loaded_ready_group_preservation_decision_does_not_restore_when
     assert_eq!(
         decision,
         RequestScopedLoadedReadyGroupPreservationDecision {
-            lane: RequestScopedLoadedReadyGroupPreservationLane::KeepCurrent,
-            should_restore_loaded_group: false,
+            lane: RequestScopedLoadedReadyGroupPreservationLane::AllScheduleOmission,
+            should_restore_loaded_group: true,
         },
-        "request-scoped snapshots that omit every scheduled group must not reopen partial-omission preservation"
+        "request-scoped snapshots that omit every scheduled group are a collection gap and must preserve loaded ready groups instead of allowing a trusted empty root tree"
     );
 }
 
@@ -723,7 +723,7 @@ fn request_scoped_schedule_omitted_ready_groups_keeps_loaded_ready_groups_when_r
     assert_eq!(
         omitted,
         BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
-        "omit-all request-scoped sink snapshots must still preserve which loaded ready groups disappeared from schedule, so root trusted tree can settle them as empty instead of group-payload-missing"
+        "omit-all request-scoped sink snapshots must still preserve which loaded ready groups disappeared from schedule for diagnostics while loaded ready evidence remains the query-owner source"
     );
 }
 
@@ -1048,15 +1048,15 @@ fn selected_group_owner_attempt_timeout_splits_sub_proxy_min_budget_evenly_for_l
 }
 
 #[test]
-fn selected_group_owner_attempt_timeout_preserves_full_fail_closed_root_budget()
+fn selected_group_owner_attempt_timeout_reserves_proxy_for_fail_closed_root_budget()
 {
     let timeout = trusted_materialized_tree_group_plan_for_test(true, false, true)
         .owner_attempt_timeout(Duration::from_millis(1200));
 
     assert_eq!(
         timeout,
-        Duration::from_millis(1200),
-        "fail-closed ready-root selected-group owner attempts should keep the full remaining PIT budget instead of reserving proxy time that cannot be spent"
+        Duration::from_millis(600),
+        "fail-closed ready-root selected-group owner attempts should reserve bounded proxy rescue time while preserving the final non-empty root requirement"
     );
 }
 
@@ -1069,11 +1069,11 @@ fn selected_group_tree_pit_plan_reserves_proxy_budget_for_first_ranked_trusted_r
 }
 
 #[test]
-fn selected_group_tree_pit_plan_does_not_reserve_proxy_budget_for_first_ranked_trusted_ready_root()
+fn selected_group_tree_pit_plan_reserves_proxy_budget_for_first_ranked_trusted_ready_root()
 {
     assert!(
-        !trusted_materialized_tree_pit_plan_for_test(true, false, true).reserve_proxy_budget,
-        "first-ranked trusted-ready root queries should still spend the full owner stage instead of pre-reserving a proxy lane"
+        trusted_materialized_tree_pit_plan_for_test(true, false, true).reserve_proxy_budget,
+        "trusted-materialized ready-root selected-owner gaps must preserve bounded generic proxy rescue budget before failing closed"
     );
 }
 

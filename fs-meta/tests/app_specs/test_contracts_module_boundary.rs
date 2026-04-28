@@ -37,6 +37,20 @@ fn read_workspace_manifest() -> String {
     fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read workspace manifest")
 }
 
+fn read_workspace_file(rel: &str) -> String {
+    fs::read_to_string(workspace_root().join(rel)).expect("read workspace file")
+}
+
+fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
+    let start = source.find(name).expect("function start");
+    let rest = &source[start..];
+    let end = rest
+        .find("\nfn ")
+        .or_else(|| rest.find("\n#["))
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
 fn collect_rust_files(dir: &PathBuf, base: &PathBuf, out: &mut Vec<(String, String)>) {
     let mut entries = fs::read_dir(dir)
         .expect("read source directory")
@@ -728,6 +742,30 @@ fn e2e_apply_release_harness_does_not_retry_transport_failures() {
 }
 
 #[test]
+fn release_upgrade_harness_relogin_waits_for_http_readiness() {
+    let release_upgrade = read_app_spec("tests/e2e/test_release_upgrade.rs");
+    let start = release_upgrade
+        .find("fn upgrade_to_generation_two(")
+        .expect("upgrade_to_generation_two helper");
+    let end = release_upgrade[start..]
+        .find("fn wait_for_primary_tree_materialization(")
+        .map(|offset| start + offset)
+        .expect("wait_for_primary_tree_materialization after upgrade helper");
+    let helper = &release_upgrade[start..end];
+
+    let readiness = helper
+        .find("wait_http_login_ready(")
+        .expect("release-upgrade relogin must wait for HTTP login readiness");
+    let login = helper
+        .find("OperatorSession::login_many(")
+        .expect("release-upgrade relogin");
+    assert!(
+        readiness < login,
+        "release-upgrade relogin must use bounded readiness before creating the new session"
+    );
+}
+
+#[test]
 fn worker_servers_do_not_hold_state_mutex_across_async_control_or_rpc_calls() {
     let source_server = read_app_spec("app/src/workers/source_server.rs");
     let sink_server = read_app_spec("app/src/workers/sink_server.rs");
@@ -974,6 +1012,26 @@ fn crate_ownership_and_dependency_rules_are_explicit() {
     assert!(!app_manifest.contains("capanix-worker-runtime-support"));
     assert!(!app_manifest.contains("capanix-unit-entry-macros"));
     assert!(!tooling_manifest.contains("capanix-worker-runtime-support"));
+}
+
+#[test]
+fn demo_runtime_cdylib_rebuild_tracks_capanix_path_dependencies() {
+    for rel in [
+        "fs-meta/tests/e2e/support/cluster5.rs",
+        "fs-meta/tests/common/harness.rs",
+    ] {
+        let source = read_workspace_file(rel);
+        let body = function_body(&source, "fn resolve_fs_meta_app_cdylib");
+        assert!(
+            body.contains("let capanix_root = capanix_repo_root();"),
+            "{rel} must include capanix repo inputs when deciding whether the fs-meta runtime cdylib is stale"
+        );
+        assert!(
+            body.contains("capanix_root.join(\"Cargo.lock\")")
+                && body.contains("capanix_root.join(\"crates\")"),
+            "{rel} must rebuild the demo runtime cdylib after upstream capanix path dependency changes"
+        );
+    }
 }
 
 #[test]

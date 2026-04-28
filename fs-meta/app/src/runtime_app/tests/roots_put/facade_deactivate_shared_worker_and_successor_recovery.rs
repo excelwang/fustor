@@ -130,6 +130,7 @@
         let _shutdown_reset = FacadeShutdownStartHookReset;
         install_facade_shutdown_start_hook(FacadeShutdownStartHook {
             entered: shutdown_started.clone(),
+        release: None,
         });
 
         let successor_control = tokio::spawn({
@@ -313,6 +314,7 @@
         let _shutdown_reset = FacadeShutdownStartHookReset;
         install_facade_shutdown_start_hook(FacadeShutdownStartHook {
             entered: shutdown_started.clone(),
+        release: None,
         });
 
         let successor_control = tokio::spawn({

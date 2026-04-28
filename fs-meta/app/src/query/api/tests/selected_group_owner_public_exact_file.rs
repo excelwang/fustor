@@ -392,6 +392,7 @@ async fn public_trusted_exact_file_path_b64_keeps_first_request_materialized_own
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
     let path = "/nested/child/deep.txt";
 
@@ -841,6 +842,7 @@ async fn public_trusted_exact_file_path_b64_preserves_first_request_owner_when_l
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
     let path = "/nested/child/deep.txt";
 
@@ -1281,6 +1283,7 @@ async fn public_trusted_exact_file_path_b64_keeps_first_request_owner_when_later
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
     let path = "/nested/child/deep.txt";
 
@@ -1716,6 +1719,7 @@ async fn public_trusted_exact_file_path_b64_retries_transient_omitted_schedule_s
             ..ProjectionPolicy::default()
         })),
         Arc::new(Mutex::new(BTreeSet::new())),
+        crate::api::state::ForceFindRunnerEvidence::default(),
     );
     let path = "/nested/child/deep.txt";
 

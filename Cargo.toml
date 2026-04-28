@@ -119,6 +119,7 @@ capanix-host-fs-types = { path = "../capanix/crates/host-fs-types" }
 capanix-kernel = { path = "../capanix/crates/kernel" }
 capanix-kernel-api = { path = "../capanix/crates/kernel-api" }
 capanix-route-proto = { path = "../capanix/crates/route-proto" }
+capanix-runtime = { path = "../capanix/crates/runtime" }
 capanix-runtime-api = { path = "../capanix/crates/runtime-api" }
 capanix-unit-entry-macros = { path = "../capanix/crates/unit-entry-macros" }
 capanix-unit-sidecar = { path = "../capanix/crates/unit-sidecar" }

@@ -398,10 +398,10 @@
 
 | 职责簇 | 数量 | 对应测试 | 主要在验什么 |
 | --- | --- | --- | --- |
-| API 契约与查询矩阵 | 3 | `fs_meta_http_api_matrix_real_nfs`、`fs_meta_http_api_matrix_query_baseline_real_nfs`、`fs_meta_http_api_matrix_live_only_rescan_real_nfs` | 登录、状态、runtime grants、roots preview/apply、rescan、`/tree` `/stats` `/on-demand-force-find`、PIT、分页、`bound-route-metrics` |
+| API 契约与查询矩阵 | 3 | `fs_meta_environment_full_real_nfs`、`fs_meta_business_query_real_nfs`、`fs_meta_environment_live_only_rescan_real_nfs` | 登录、状态、runtime grants、roots preview/apply、rescan、`/tree` `/stats` `/on-demand-force-find`、PIT、分页、`bound-route-metrics` |
 | Activation Scope Capture | 3 | `activation_scope_capture_preserved_layout_distributed`、`activation_scope_capture_nfs2_visibility_contracted_to_node_a`、`activation_scope_capture_force_find_preserved_pre_force_find` | runtime 激活后 source/scan/sink scope 是否落在正确节点，visibility 收缩后 scope 是否正确收敛，force-find 前后 scope capture 是否保持稳定 |
-| 在线运维与资源变更 | 8 | `fs_meta_operational_scenarios_real_nfs`、`fs_meta_operational_force_find_execution_semantics_real_nfs`、`fs_meta_operational_new_nfs_join_real_nfs`、`fs_meta_operational_root_path_modify_real_nfs`、`fs_meta_operational_visibility_change_and_sink_selection_real_nfs`、`fs_meta_operational_sink_failover_real_nfs`、`fs_meta_operational_facade_failover_and_resource_switch_real_nfs`、`fs_meta_operational_nfs_retire_real_nfs` | 新 NFS 上线、根路径修改、可见性收缩、sink/facade 故障切换、NFS 退役、在线 force-find 执行语义 |
-| Release-Generation 升级与连续性 | 10 | `fs_meta_release_upgrade_real_nfs`、`fs_meta_release_upgrade_peer_source_control_completion_real_nfs`、`fs_meta_release_upgrade_facade_claim_continuity_real_nfs`、`fs_meta_release_upgrade_roots_persist_real_nfs`、`fs_meta_release_upgrade_tree_stats_stable_real_nfs`、`fs_meta_release_upgrade_tree_materialization_real_nfs`、`fs_meta_release_upgrade_sink_control_roles_real_nfs`、`fs_meta_release_upgrade_source_control_roles_real_nfs`、`fs_meta_release_upgrade_window_join_real_nfs`、`fs_meta_release_upgrade_cpu_budget_real_nfs` | generation cutover、source/sink/facade continuity、roots 持久、树与 stats 稳定性、升级窗口并发、CPU 预算、升级后 materialization 完整性 |
+| 在线运维与资源变更 | 8 | `fs_meta_operations_scenarios_real_nfs`、`fs_meta_operations_force_find_execution_semantics_real_nfs`、`fs_meta_operations_new_nfs_join_real_nfs`、`fs_meta_operations_root_path_modify_real_nfs`、`fs_meta_operations_visibility_change_and_sink_selection_real_nfs`、`fs_meta_operations_sink_failover_real_nfs`、`fs_meta_operations_facade_failover_and_resource_switch_real_nfs`、`fs_meta_operations_nfs_retire_real_nfs` | 新 NFS 上线、根路径修改、可见性收缩、sink/facade 故障切换、NFS 退役、在线 force-find 执行语义 |
+| Release-Generation 升级与连续性 | 10 | `fs_meta_operations_release_upgrade_real_nfs`、`fs_meta_operations_release_upgrade_peer_source_control_completion_real_nfs`、`fs_meta_operations_release_upgrade_facade_claim_continuity_real_nfs`、`fs_meta_operations_release_upgrade_roots_persist_real_nfs`、`fs_meta_operations_release_upgrade_tree_stats_stable_real_nfs`、`fs_meta_operations_release_upgrade_tree_materialization_real_nfs`、`fs_meta_operations_release_upgrade_sink_control_roles_real_nfs`、`fs_meta_operations_release_upgrade_source_control_roles_real_nfs`、`fs_meta_operations_release_upgrade_window_join_real_nfs`、`fs_meta_operations_release_upgrade_cpu_budget_real_nfs` | generation cutover、source/sink/facade continuity、roots 持久、树与 stats 稳定性、升级窗口并发、CPU 预算、升级后 materialization 完整性 |
 
 这 24 条的意义不是“回归测试数量很多”，而是它们几乎把当前 `fs-meta + capanix` 重构最重要的 4 个目标面都钉住了：
 
@@ -424,11 +424,11 @@
 
 根据你提供的联调快照，本地已明确打绿的 exact 有 5 条：
 
-- `fs_meta_http_api_matrix_query_baseline_real_nfs`
-- `fs_meta_http_api_matrix_real_nfs`
-- `fs_meta_operational_nfs_retire_real_nfs`
-- `fs_meta_release_upgrade_cpu_budget_real_nfs`
-- `fs_meta_release_upgrade_facade_claim_continuity_real_nfs`
+- `fs_meta_business_query_real_nfs`
+- `fs_meta_environment_full_real_nfs`
+- `fs_meta_operations_nfs_retire_real_nfs`
+- `fs_meta_operations_release_upgrade_cpu_budget_real_nfs`
+- `fs_meta_operations_release_upgrade_facade_claim_continuity_real_nfs`
 
 这 5 条横跨了 3 个最关键职责簇：
 

@@ -889,6 +889,7 @@
         let _shutdown_reset = FacadeShutdownStartHookReset;
         install_facade_shutdown_start_hook(FacadeShutdownStartHook {
             entered: shutdown_started.clone(),
+        release: None,
         });
 
         let roots_body = json!({

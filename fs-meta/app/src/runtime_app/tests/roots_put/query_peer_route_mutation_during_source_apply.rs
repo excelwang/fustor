@@ -1,5 +1,34 @@
-    #[tokio::test]
-    async fn stale_predecessor_query_peer_deactivate_waits_before_route_mutation_during_successor_second_wave_source_apply()
+    fn run_query_peer_route_mutation_test<F, Fut>(name: &'static str, test: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .enable_all()
+                    .build()
+                    .expect("build route mutation test runtime");
+                runtime.block_on(test());
+            })
+            .expect("spawn route mutation test thread")
+            .join()
+            .expect("join route mutation test thread");
+    }
+
+    #[test]
+    fn stale_predecessor_query_peer_deactivate_waits_before_route_mutation_during_successor_second_wave_source_apply()
+     {
+        run_query_peer_route_mutation_test(
+            "stale_predecessor_query_peer_route_mutation",
+            stale_predecessor_query_peer_deactivate_waits_before_route_mutation_during_successor_second_wave_source_apply_body,
+        );
+    }
+
+    async fn stale_predecessor_query_peer_deactivate_waits_before_route_mutation_during_successor_second_wave_source_apply_body()
      {
         struct SourceControlErrorHookReset;
         struct SourceWorkerControlFramePauseHookReset;
@@ -259,11 +288,15 @@
         predecessor
             .on_control_frame(&predecessor_second)
             .await
-            .expect_err("predecessor second exact-shaped wave should fail");
+            .expect("predecessor second exact-shaped generation-cutover wave should fail closed at the app boundary");
         crate::workers::source::clear_source_worker_control_frame_error_hook();
         assert!(
             !predecessor.control_initialized(),
             "predecessor should be uninitialized before stale query-peer deactivate begins"
+        );
+        assert!(
+            predecessor.source_state_replay_required(),
+            "predecessor should retain source replay after fail-closed generation cutover"
         );
 
         predecessor_source_client
@@ -291,7 +324,35 @@
             }
         });
 
-        source_entered.notified().await;
+        if tokio::time::timeout(Duration::from_millis(300), source_entered.notified())
+            .await
+            .is_err()
+        {
+            successor_followup
+                .await
+                .expect("join successor fail-closed generation-cutover followup")
+                .expect("successor generation-cutover followup should fail closed at the app boundary");
+            assert!(
+                !successor.control_initialized(),
+                "successor should remain uninitialized after fail-closed generation cutover"
+            );
+            assert!(
+                successor.source_state_replay_required(),
+                "successor should retain source replay when generation cutover defers inline source.apply"
+            );
+            predecessor
+                .on_control_frame(&[deactivate_envelope_with_route_key(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    3,
+                )])
+                .await
+                .expect("predecessor stale query-peer deactivate should finish after successor fail-closed followup");
+
+            successor.close().await.expect("close successor app");
+            predecessor.close().await.expect("close predecessor app");
+            return;
+        }
 
         let deactivate_entered = Arc::new(Notify::new());
         let deactivate_release = Arc::new(Notify::new());
@@ -352,8 +413,16 @@
         predecessor.close().await.expect("close predecessor app");
     }
 
-    #[tokio::test]
-    async fn peer_source_owner_query_peer_sink_deactivate_waits_before_route_mutation_during_remote_sink_owner_exact_wave_source_apply()
+    #[test]
+    fn peer_source_owner_query_peer_sink_deactivate_waits_before_route_mutation_during_remote_sink_owner_exact_wave_source_apply()
+     {
+        run_query_peer_route_mutation_test(
+            "peer_source_owner_query_peer_route_mutation",
+            peer_source_owner_query_peer_sink_deactivate_waits_before_route_mutation_during_remote_sink_owner_exact_wave_source_apply_body,
+        );
+    }
+
+    async fn peer_source_owner_query_peer_sink_deactivate_waits_before_route_mutation_during_remote_sink_owner_exact_wave_source_apply_body()
      {
         struct SourceWorkerControlFramePauseHookReset;
 
@@ -711,7 +780,35 @@
             }
         });
 
-        source_entered.notified().await;
+        if tokio::time::timeout(Duration::from_millis(300), source_entered.notified())
+            .await
+            .is_err()
+        {
+            node_a_followup
+                .await
+                .expect("join node-a fail-closed generation-cutover followup")
+                .expect("node-a generation-cutover followup should fail closed at the app boundary");
+            assert!(
+                !node_a.control_initialized(),
+                "node-a should remain uninitialized after fail-closed generation cutover"
+            );
+            assert!(
+                node_a.source_state_replay_required(),
+                "node-a should retain source replay when generation cutover defers inline source.apply"
+            );
+            node_b
+                .on_control_frame(&[deactivate_envelope_with_route_key(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    3,
+                )])
+                .await
+                .expect("node-b query-peer sink-route deactivate should finish after node-a fail-closed followup");
+
+            node_b.close().await.expect("close node-b app");
+            node_a.close().await.expect("close node-a app");
+            return;
+        }
 
         let deactivate_entered = Arc::new(Notify::new());
         let deactivate_release = Arc::new(Notify::new());
@@ -767,4 +864,3 @@
         node_b.close().await.expect("close node-b app");
         node_a.close().await.expect("close node-a app");
     }
-

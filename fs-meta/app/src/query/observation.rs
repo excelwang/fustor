@@ -62,8 +62,7 @@ pub fn materialized_query_observation_evidence(
     for root in &source_status.logical_roots {
         if root.matched_grants > 0
             && root.active_members > 0
-            && ((concrete_candidate_groups.is_empty() && scheduled_groups.contains(&root.root_id))
-                || concrete_candidate_groups.contains(&root.root_id))
+            && group_has_local_sink_presence(&root.root_id, &sink_groups, &scheduled_groups)
         {
             candidate_groups.insert(root.root_id.clone());
         }
@@ -307,6 +306,51 @@ mod tests {
             evidence.initial_audit_groups,
             BTreeSet::from(["nfs1".to_string()]),
             "scheduled logical-only groups must still block on initial audit until materialized: {evidence:?}"
+        );
+    }
+
+    #[test]
+    fn materialized_query_observation_evidence_keeps_every_scheduled_logical_group_even_when_some_groups_have_primary_scan_evidence()
+     {
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![
+                SourceLogicalRootHealthSnapshot {
+                    root_id: "nfs1".to_string(),
+                    status: "ready".to_string(),
+                    active_members: 3,
+                    matched_grants: 3,
+                    coverage_mode: "realtime_hotset_plus_audit".to_string(),
+                },
+                SourceLogicalRootHealthSnapshot {
+                    root_id: "nfs2".to_string(),
+                    status: "ready".to_string(),
+                    active_members: 3,
+                    matched_grants: 3,
+                    coverage_mode: "realtime_hotset_plus_audit".to_string(),
+                },
+            ],
+            concrete_roots: vec![concrete_root("nfs2", true)],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![sink_group("nfs1"), sink_group("nfs2")],
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-d".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            ..SinkStatusSnapshot::default()
+        };
+
+        let evidence = materialized_query_observation_evidence(&source_status, &sink_status);
+        assert_eq!(
+            evidence.candidate_groups,
+            BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+            "trusted observation must include every scheduled logical root, not only roots with concrete primary scan evidence: {evidence:?}"
+        );
+        assert_eq!(
+            evidence.initial_audit_groups,
+            BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+            "every scheduled non-ready materialized root must block trusted-materialized reads: {evidence:?}"
         );
     }
 

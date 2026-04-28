@@ -33,6 +33,6 @@ for bin in rpcbind rpc.nfsd rpc.mountd exportfs mount umount pgrep pkill; do
   fi
 done
 
-CARGO_BIN="${CARGO:-cargo}"
-echo "[fs-meta-api-e2e-real-nfs] running ignored real-NFS suite"
-"$CARGO_BIN" test --manifest-path "$ROOT_DIR/Cargo.toml" -q --test fs_meta_api_e2e -- --ignored --nocapture --test-threads=1
+SUITE="${FSMETA_REAL_NFS_SUITE:-progressive-operations}"
+echo "[fs-meta-api-e2e-real-nfs] running matrix suite: $SUITE"
+fs-meta/docs/examples/test-matrix-commands.sh "$SUITE"

@@ -1208,7 +1208,7 @@ async fn events_stream_materializes_split_primary_mixed_cluster_publications_on_
         granted_mount_root("node-b::nfs3", "node-b", "10.0.0.13", "/mnt/nfs3", true),
     ];
     let sink =
-        SinkFileMeta::with_boundaries(NodeId("node-d".to_string()), None, cfg).expect("init sink");
+        SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("init sink");
 
     sink.enable_stream_receive();
     sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
@@ -1396,7 +1396,7 @@ async fn update_logical_roots_preserves_pending_materialization_scheduled_group_
     ];
     cfg.host_object_grants = host_object_grants.clone();
     let sink =
-        SinkFileMeta::with_boundaries(NodeId("node-d".to_string()), None, cfg).expect("init sink");
+        SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("init sink");
 
     sink.enable_stream_receive();
     sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
@@ -1874,6 +1874,215 @@ async fn activate_limits_sink_state_to_bound_scopes_only() {
     assert_eq!(
         origins,
         std::collections::BTreeSet::from(["root-a".to_string()])
+    );
+}
+
+#[tokio::test]
+async fn sink_status_stops_publishing_scheduled_group_when_local_active_grant_is_withdrawn() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs2", "/mnt/nfs2")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-d::nfs2",
+        "node-d",
+        "10.0.0.14",
+        "/mnt/nfs2",
+        true,
+    )];
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-d".to_string()), None, cfg).expect("init sink");
+
+    let activate =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs2", &["nfs2"])],
+        }))
+        .expect("encode activate");
+    sink.on_control_frame(&[activate])
+        .await
+        .expect("activate nfs2 should pass");
+
+    let before = sink.status_snapshot().expect("status before withdraw");
+    assert_eq!(
+        before.scheduled_groups_by_node.get("node-d"),
+        Some(&vec!["nfs2".to_string()]),
+        "precondition: active local grant should publish node-d as nfs2 sink holder: {before:?}"
+    );
+
+    let withdrawn = host_object_grants_changed_envelope(
+        2,
+        &[granted_mount_root(
+            "node-d::nfs2",
+            "node-d",
+            "10.0.0.14",
+            "/mnt/nfs2",
+            false,
+        )],
+    );
+    sink.on_control_frame(&[withdrawn])
+        .await
+        .expect("withdraw nfs2 grant should pass");
+
+    let after = sink.status_snapshot().expect("status after withdraw");
+    assert!(
+        after
+            .scheduled_groups_by_node
+            .get("node-d")
+            .is_none_or(|groups| !groups.iter().any(|group| group == "nfs2")),
+        "withdrawn local grant must remove nfs2 from scheduled_groups_by_node instead of reporting node-d as a stale sink holder: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn sink_status_stops_publishing_explicit_local_resource_when_local_grant_is_withdrawn() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs2", "/mnt/nfs2")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-d::nfs2",
+        "node-d",
+        "10.0.0.14",
+        "/mnt/nfs2",
+        true,
+    )];
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-d".to_string()), None, cfg).expect("init sink");
+
+    let activate =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs2", &["node-d::nfs2"])],
+        }))
+        .expect("encode activate");
+    sink.on_control_frame(&[activate])
+        .await
+        .expect("activate nfs2 should pass");
+
+    let before = sink.status_snapshot().expect("status before withdraw");
+    assert_eq!(
+        before.scheduled_groups_by_node.get("node-d"),
+        Some(&vec!["nfs2".to_string()]),
+        "precondition: explicit active local resource should publish node-d as nfs2 sink holder: {before:?}"
+    );
+
+    let withdrawn = host_object_grants_changed_envelope(
+        2,
+        &[granted_mount_root(
+            "node-d::nfs2",
+            "node-d",
+            "10.0.0.14",
+            "/mnt/nfs2",
+            false,
+        )],
+    );
+    sink.on_control_frame(&[withdrawn])
+        .await
+        .expect("withdraw nfs2 grant should pass");
+
+    let after = sink.status_snapshot().expect("status after withdraw");
+    assert!(
+        after
+            .scheduled_groups_by_node
+            .get("node-d")
+            .is_none_or(|groups| !groups.iter().any(|group| group == "nfs2")),
+        "withdrawn local grant must suppress an explicit local resource scope instead of reporting node-d as a stale sink holder: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn sink_status_uses_management_apply_grants_when_filtering_scheduled_groups() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs2", "/mnt/nfs2")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-d::nfs2",
+        "node-d",
+        "10.0.0.14",
+        "/mnt/nfs2",
+        true,
+    )];
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-d".to_string()), None, cfg).expect("init sink");
+
+    let activate =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs2", &["nfs2"])],
+        }))
+        .expect("encode activate");
+    sink.on_control_frame(&[activate])
+        .await
+        .expect("activate nfs2 should pass");
+
+    let before = sink
+        .status_snapshot()
+        .expect("status before management apply");
+    assert_eq!(
+        before.scheduled_groups_by_node.get("node-d"),
+        Some(&vec!["nfs2".to_string()]),
+        "precondition: active local grant should publish nfs2 before management apply changes grants: {before:?}"
+    );
+
+    sink.update_logical_roots_from_management_apply(
+        vec![RootSpec::new("nfs2", "/mnt/nfs2")],
+        &[granted_mount_root(
+            "node-d::nfs2",
+            "node-d",
+            "10.0.0.14",
+            "/mnt/nfs2",
+            false,
+        )],
+    )
+    .expect("management apply should update sink grants");
+
+    let after = sink
+        .status_snapshot()
+        .expect("status after management apply");
+    assert!(
+        after
+            .scheduled_groups_by_node
+            .get("node-d")
+            .is_none_or(|groups| !groups.iter().any(|group| group == "nfs2")),
+        "sink status must filter scheduled groups with management-applied current grants, not stale bootstrap grants: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn sink_status_publishes_runtime_managed_bare_scope_when_no_matching_grants_exist() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs2", "/mnt/nfs2")];
+    cfg.host_object_grants = Vec::new();
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("init sink");
+
+    let activate =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs2", &["nfs2"])],
+        }))
+        .expect("encode activate");
+    sink.on_control_frame(&[activate])
+        .await
+        .expect("activate nfs2 should pass");
+
+    let snapshot = sink.status_snapshot().expect("sink status");
+    assert_eq!(
+        snapshot.scheduled_groups_by_node.get("node-a"),
+        Some(&vec!["nfs2".to_string()]),
+        "runtime-managed bare sink scope should publish the local holder when matching grant rows are not yet available: {snapshot:?}"
     );
 }
 
@@ -3081,7 +3290,7 @@ async fn retained_root_id_ready_state_persists_control_only_scope_wobble_before_
 }
 
 #[tokio::test]
-async fn retained_root_id_ready_state_restores_when_logical_roots_sync_readds_scheduled_scope_after_control_only_wobble_without_new_stream_events()
+async fn retained_root_id_ready_state_restores_after_runtime_reassigns_scope_following_logical_roots_sync()
  {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![
@@ -3263,32 +3472,79 @@ async fn retained_root_id_ready_state_restores_when_logical_roots_sync_readds_sc
         ],
         &[],
     )
-    .expect("later logical-roots sync should restore runtime scope without new stream events");
+    .expect(
+        "later logical-roots sync should preserve retained state without widening runtime scope",
+    );
+
+    let snapshot_after_roots_sync = sink
+        .status_snapshot()
+        .expect("status after logical-roots sync preserves runtime scope");
+    assert!(
+        snapshot_after_roots_sync
+            .groups
+            .iter()
+            .all(|group| group.group_id != "nfs2"),
+        "logical-roots sync must not reopen nfs2 before runtime reassigns the scope: {snapshot_after_roots_sync:?}"
+    );
+    {
+        let state = sink
+            .state
+            .read()
+            .expect("state lock after logical-roots sync without runtime reassignment");
+        let retained_nfs2 = state
+            .retained_groups
+            .get("nfs2")
+            .expect("nfs2 must remain retained until runtime reassigns it");
+        assert!(
+            matches!(
+                retained_nfs2.group_readiness_state(),
+                GroupReadinessState::Ready
+            ),
+            "logical-roots sync must keep retained nfs2 ready state while placement remains contracted"
+        );
+    }
+
+    let reactivate_both =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 3,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["nfs1"]),
+                bound_scope_with_resources("nfs2", &["nfs2"]),
+            ],
+        }))
+        .expect("encode reactivate both");
+    sink.on_control_frame(&[reactivate_both])
+        .await
+        .expect("runtime reassignment should pass");
 
     let snapshot_after = sink
         .status_snapshot()
-        .expect("status after logical-roots sync restores runtime scope");
+        .expect("status after runtime reassignment restores retained scope");
     let nfs2_after = snapshot_after
         .groups
         .iter()
         .find(|group| group.group_id == "nfs2")
-        .expect("nfs2 after logical-roots sync restores runtime scope");
+        .expect("nfs2 after runtime reassignment restores retained scope");
     assert!(
         nfs2_after.is_ready(),
-        "later logical-roots sync must restore retained nfs2 ready state instead of regressing to init=false: {snapshot_after:?}"
+        "runtime reassignment must restore retained nfs2 ready state instead of regressing to init=false: {snapshot_after:?}"
     );
     assert!(
         nfs2_after.live_nodes > 0,
-        "later logical-roots sync must restore retained nfs2 live nodes instead of regressing to live_nodes=0: {snapshot_after:?}"
+        "runtime reassignment must restore retained nfs2 live nodes instead of regressing to live_nodes=0: {snapshot_after:?}"
     );
     assert_eq!(
         nfs2_after.materialized_revision, nfs2_before.materialized_revision,
-        "later logical-roots sync must preserve retained nfs2 materialized revision instead of resetting to revision 1"
+        "runtime reassignment must preserve retained nfs2 materialized revision instead of resetting to revision 1"
     );
 
     let query_events = sink
         .materialized_query(&default_materialized_request())
-        .expect("query after logical-roots sync restores runtime scope");
+        .expect("query after runtime reassignment restores retained scope");
     let responses = query_events
         .iter()
         .map(|event| {
@@ -3300,15 +3556,15 @@ async fn retained_root_id_ready_state_restores_when_logical_roots_sync_readds_sc
         .collect::<std::collections::BTreeMap<_, _>>();
     let nfs2_response = responses
         .get("nfs2")
-        .expect("nfs2 response after logical-roots sync restores runtime scope");
+        .expect("nfs2 response after runtime reassignment restores retained scope");
     assert!(
         payload_contains_path(nfs2_response, b"/ready-b.txt"),
-        "later logical-roots sync must restore retained nfs2 tree payload instead of recreating it from scratch"
+        "runtime reassignment must restore retained nfs2 tree payload instead of recreating it from scratch"
     );
 
     let nested_query_events = sink
         .materialized_query(&materialized_tree_request(b"/nested", true, Some(1)))
-        .expect("nested query after logical-roots sync restores runtime scope");
+        .expect("nested query after runtime reassignment restores retained scope");
     let nested_responses = nested_query_events
         .iter()
         .map(|event| {
@@ -3320,14 +3576,14 @@ async fn retained_root_id_ready_state_restores_when_logical_roots_sync_readds_sc
         .collect::<std::collections::BTreeMap<_, _>>();
     let nfs2_nested_response = nested_responses
         .get("nfs2")
-        .expect("nfs2 nested response after logical-roots sync restores runtime scope");
+        .expect("nfs2 nested response after runtime reassignment restores retained scope");
     assert!(
         nfs2_nested_response.root.exists && nfs2_nested_response.root.path == b"/nested",
-        "later logical-roots sync must restore retained nfs2 nested root instead of collapsing it to an empty subtree: {nfs2_nested_response:?}"
+        "runtime reassignment must restore retained nfs2 nested root instead of collapsing it to an empty subtree: {nfs2_nested_response:?}"
     );
     assert!(
         payload_contains_path(nfs2_nested_response, b"/nested/peer.txt"),
-        "later logical-roots sync must restore retained nfs2 nested max-depth payload instead of dropping peer.txt after scope wobble"
+        "runtime reassignment must restore retained nfs2 nested max-depth payload instead of dropping peer.txt after scope wobble"
     );
 
     sink.close().await.expect("close sink");
@@ -3440,7 +3696,7 @@ async fn update_logical_roots_drops_unrelated_pending_materialization_group_from
     ];
     cfg.host_object_grants = host_object_grants.clone();
     let sink =
-        SinkFileMeta::with_boundaries(NodeId("node-d".to_string()), None, cfg).expect("init sink");
+        SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("init sink");
 
     let activate_force_find_subset =
         encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {

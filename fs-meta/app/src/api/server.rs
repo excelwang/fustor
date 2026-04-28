@@ -40,7 +40,9 @@ use super::handlers;
 use super::rollout_status::{
     PublishedRolloutStatusReader, SharedRolloutStatusCell, shared_rollout_status_cell,
 };
-use super::state::{ApiControlGate, ApiRequestGuard, ApiRequestTracker, ApiState};
+use super::state::{
+    ApiControlGate, ApiRequestGuard, ApiRequestTracker, ApiState, ForceFindRunnerEvidence,
+};
 
 enum ApiServerJoin {
     Thread(std::thread::JoinHandle<()>),
@@ -170,11 +172,13 @@ pub(crate) async fn spawn_with_rollout_status(
     );
     let projection_policy = Arc::new(RwLock::new(initial_policy));
     let force_find_inflight = Arc::new(Mutex::new(BTreeSet::new()));
+    let force_find_runner_evidence = ForceFindRunnerEvidence::default();
     let state = ApiState {
         node_id,
         runtime_boundary,
         query_runtime_boundary,
         force_find_inflight: force_find_inflight.clone(),
+        force_find_runner_evidence: force_find_runner_evidence.clone(),
         source,
         sink,
         query_sink,
@@ -313,6 +317,7 @@ fn router(state: ApiState, control_gate: Arc<ApiControlGate>) -> Result<Router> 
         state.node_id.clone(),
         state.projection_policy.clone(),
         state.force_find_inflight.clone(),
+        state.force_find_runner_evidence.clone(),
     )
     .layer(middleware::from_fn_with_state(
         state.auth.clone(),
@@ -428,12 +433,31 @@ async fn request_control_readiness_guard(
     if control_gate.is_management_write_ready() {
         return response_with_owned_guards(next.run(request).await, None, facade_request_guard);
     }
-    if tokio::time::timeout(
-        Duration::from_secs(15),
-        control_gate.wait_management_write_ready(),
-    )
-    .await
-    .is_err()
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    if let Some(recovery) = control_gate.management_write_recovery() {
+        let recovery_budget = ready_deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(Duration::from_secs(10));
+        if !recovery_budget.is_zero() {
+            match tokio::time::timeout(recovery_budget, recovery()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    eprintln!(
+                        "fs_meta_api_server: management write readiness recovery failed err={err}"
+                    );
+                }
+                Err(_) => {
+                    eprintln!("fs_meta_api_server: management write readiness recovery timed out");
+                }
+            }
+        }
+    }
+    let remaining = ready_deadline.saturating_duration_since(tokio::time::Instant::now());
+    if !control_gate.is_management_write_ready()
+        && (remaining.is_zero()
+            || tokio::time::timeout(remaining, control_gate.wait_management_write_ready())
+                .await
+                .is_err())
     {
         return response_with_owned_guards(
             ApiError::service_unavailable(
@@ -614,6 +638,7 @@ mod tests {
             runtime_boundary: None,
             query_runtime_boundary: None,
             force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+            force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
             source,
             sink: sink.clone(),
             query_sink: sink,
@@ -1013,6 +1038,71 @@ mod tests {
         )
         .await
         .expect("facade drain should clear after roots_put settles");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rescan_control_readiness_guard_runs_recovery_before_waiting_not_ready() {
+        let control_gate = Arc::new(ApiControlGate::new(false));
+        let recovery_calls = Arc::new(AtomicUsize::new(0));
+        control_gate.set_management_write_recovery(Some(Arc::new({
+            let control_gate = control_gate.clone();
+            let recovery_calls = recovery_calls.clone();
+            move || {
+                let control_gate = control_gate.clone();
+                let recovery_calls = recovery_calls.clone();
+                Box::pin(async move {
+                    recovery_calls.fetch_add(1, Ordering::SeqCst);
+                    control_gate.set_ready_state(true, true);
+                    Ok(())
+                })
+            }
+        })));
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/fs-meta/v1/index/rescan",
+                post({
+                    let handler_calls = handler_calls.clone();
+                    move || {
+                        let handler_calls = handler_calls.clone();
+                        async move {
+                            handler_calls.fetch_add(1, Ordering::SeqCst);
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .with_state(control_gate.clone())
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                request_control_readiness_guard,
+            ));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/fs-meta/v1/index/rescan")
+                    .body(Body::empty())
+                    .expect("build rescan request"),
+            ),
+        )
+        .await
+        .expect("rescan should run bounded management-write recovery before timing out")
+        .expect("route rescan request");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            recovery_calls.load(Ordering::SeqCst),
+            1,
+            "rescan readiness guard must drive exactly one bounded recovery before allowing the handler"
+        );
+        assert_eq!(
+            handler_calls.load(Ordering::SeqCst),
+            1,
+            "rescan handler must run after management-write recovery reopens the gate"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

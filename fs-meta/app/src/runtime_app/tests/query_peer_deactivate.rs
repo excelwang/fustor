@@ -204,6 +204,16 @@ async fn query_peer_deactivate_does_not_wait_for_inflight_internal_sink_status_r
         .expect("join sink-status deactivate task")
         .expect("deactivate query-peer sink-status after request drain");
 
+    app.ensure_runtime_proxy_endpoints_started()
+        .await
+        .expect("runtime endpoint reconciliation after sink-status deactivate");
+    let sink_status_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
+    let endpoint_routes = app.runtime_endpoint_routes.lock().await.clone();
+    assert!(
+        !endpoint_routes.contains(&sink_status_route),
+        "runtime endpoint reconciliation must not respawn a route after the route-level query-peer deactivate; endpoint_routes={endpoint_routes:?}"
+    );
+
     app.close().await.expect("close app");
 }
 

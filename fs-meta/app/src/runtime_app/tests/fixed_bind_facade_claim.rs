@@ -1,5 +1,6 @@
 #[tokio::test]
 async fn facade_spawn_dedupes_across_distinct_app_instances_with_same_fixed_bind() {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
     clear_process_facade_claim_for_tests();
     let tmp = tempdir().expect("create temp dir");
     let bind_addr = reserve_bind_addr();
@@ -90,7 +91,7 @@ async fn facade_spawn_dedupes_across_distinct_app_instances_with_same_fixed_bind
         }],
         group_ids: Vec::new(),
         runtime_managed: true,
-        runtime_exposure_confirmed: true,
+        runtime_exposure_confirmed: false,
         resolved: app_2
             .config
             .api
@@ -103,7 +104,7 @@ async fn facade_spawn_dedupes_across_distinct_app_instances_with_same_fixed_bind
         .expect("second app facade spawn should not error");
     assert!(
         !second_spawn,
-        "distinct app instance must not start a duplicate fixed-bind facade"
+        "distinct app instance must not start a duplicate fixed-bind facade before runtime exposure is confirmed"
     );
     assert!(
         app_2.api_task.lock().await.is_none(),
@@ -350,5 +351,187 @@ async fn retry_pending_facade_does_not_wait_for_runtime_exposure_behind_dead_act
         .await
         .expect("close app should not hang after explicit facade teardown")
         .expect("close app");
+    clear_process_facade_claim_for_tests();
+}
+
+#[tokio::test]
+async fn pending_successor_fail_closed_releases_continuity_retained_fixed_bind_predecessor() {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+    clear_process_facade_claim_for_tests();
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let listener_resource = api::config::ApiListenerResource {
+        resource_id: "retained-predecessor-listener".to_string(),
+        bind_addr: bind_addr.clone(),
+    };
+    let predecessor_root = tmp.path().join("predecessor-root");
+    let successor_root = tmp.path().join("successor-root");
+    fs::create_dir_all(&predecessor_root).expect("create predecessor root");
+    fs::create_dir_all(&successor_root).expect("create successor root");
+
+    let (predecessor_passwd, predecessor_shadow) = write_auth_files(&tmp);
+    let predecessor = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new(
+                    "predecessor-root",
+                    &predecessor_root,
+                )],
+                host_object_grants: vec![granted_mount_root(
+                    "node-a::predecessor-root",
+                    &predecessor_root,
+                )],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: listener_resource.resource_id.clone(),
+                local_listener_resources: vec![listener_resource.clone()],
+                auth: api::ApiAuthConfig {
+                    passwd_path: predecessor_passwd,
+                    shadow_path: predecessor_shadow,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        },
+        NodeId("fixed-bind-predecessor".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init predecessor app");
+    *predecessor.pending_facade.lock().await = Some(PendingFacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 1,
+        resource_ids: vec![listener_resource.resource_id.clone()],
+        bound_scopes: vec![RuntimeBoundScope {
+            scope_id: listener_resource.resource_id.clone(),
+            resource_ids: vec![listener_resource.resource_id.clone()],
+        }],
+        group_ids: Vec::new(),
+        runtime_managed: true,
+        runtime_exposure_confirmed: true,
+        resolved: predecessor
+            .config
+            .api
+            .resolve_for_candidate_ids(std::slice::from_ref(&listener_resource.resource_id))
+            .expect("resolve predecessor facade config"),
+    });
+    match predecessor.try_spawn_pending_facade().await {
+        Ok(true) => {}
+        Err(CnxError::InvalidInput(msg))
+            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+        {
+            clear_process_facade_claim_for_tests();
+            return;
+        }
+        Ok(false) => panic!("predecessor should claim the fixed-bind facade"),
+        Err(err) => panic!("spawn predecessor facade: {err}"),
+    }
+
+    let (successor_passwd, successor_shadow) = write_auth_files(&tmp);
+    let successor = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("successor-root", &successor_root)],
+                host_object_grants: vec![granted_mount_root(
+                    "node-b::successor-root",
+                    &successor_root,
+                )],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: listener_resource.resource_id.clone(),
+                local_listener_resources: vec![listener_resource.clone()],
+                auth: api::ApiAuthConfig {
+                    passwd_path: successor_passwd,
+                    shadow_path: successor_shadow,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        },
+        NodeId("fixed-bind-successor".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init successor app");
+
+    successor
+        .apply_facade_activate(
+            FacadeRuntimeUnit::Facade,
+            &facade_control_stream_route(),
+            2,
+            &[RuntimeBoundScope {
+                scope_id: listener_resource.resource_id.clone(),
+                resource_ids: vec![listener_resource.resource_id.clone()],
+            }],
+        )
+        .await
+        .expect("successor should record pending fixed-bind facade");
+    successor
+        .apply_facade_activate(
+            FacadeRuntimeUnit::Query,
+            &format!("{}.req", ROUTE_KEY_QUERY),
+            2,
+            &[RuntimeBoundScope {
+                scope_id: listener_resource.resource_id.clone(),
+                resource_ids: vec![listener_resource.resource_id.clone()],
+            }],
+        )
+        .await
+        .expect("successor should retain suppressed public query route");
+    let stale_claim_session = successor.begin_fixed_bind_lifecycle_session().await;
+
+    predecessor
+        .apply_facade_deactivate(
+            FacadeRuntimeUnit::Facade,
+            &facade_control_stream_route(),
+            2,
+            false,
+        )
+        .await
+        .expect("predecessor should retain active facade for continuity");
+    assert!(
+        predecessor
+            .retained_active_facade_continuity
+            .load(AtomicOrdering::Acquire),
+        "test precondition: predecessor must be retained only for fixed-bind continuity"
+    );
+
+    successor.mark_control_uninitialized_after_failure().await;
+
+    assert!(
+        predecessor.api_task.lock().await.is_none(),
+        "pending successor fail-closed after accepting desired state must release a continuity-retained fixed-bind predecessor instead of leaving old runtime PID serving the listener"
+    );
+    let active = successor.api_task.lock().await;
+    assert!(
+        active.as_ref().is_some_and(|active| active.generation == 2),
+        "successor should bind its fail-closed app boundary after releasing the retained predecessor"
+    );
+
+    drop(active);
+    let query_route = format!("{}.req", ROUTE_KEY_QUERY);
+    successor
+        .apply_facade_activate_with_session(
+            stale_claim_session,
+            FacadeRuntimeUnit::Query,
+            &query_route,
+            2,
+            &[RuntimeBoundScope {
+                scope_id: listener_resource.resource_id.clone(),
+                resource_ids: vec![listener_resource.resource_id.clone()],
+            }],
+        )
+        .await
+        .expect("stale fixed-bind session should refresh after predecessor release");
+    assert!(
+        successor
+            .facade_gate
+            .route_active(execution_units::QUERY_RUNTIME_UNIT_ID, &query_route)
+            .expect("query route state after fixed-bind predecessor release"),
+        "released fixed-bind predecessor claim must not keep suppressing facade-dependent query routes through a stale lifecycle session"
+    );
+
+    successor.close().await.expect("close successor app");
+    predecessor.close().await.expect("close predecessor app");
     clear_process_facade_claim_for_tests();
 }

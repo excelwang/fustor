@@ -1,6 +1,7 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::Duration;
 
@@ -20,8 +21,10 @@ use crate::runtime::routes::ROUTE_KEY_SINK_QUERY_INTERNAL;
 #[cfg(test)]
 use crate::runtime::routes::sink_query_request_route_for;
 
+#[cfg(test)]
 const ENDPOINT_READY_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 const ENDPOINT_RETRY_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const REQUEST_RETRYABLE_RECV_GAP_RETRY_LIMIT: usize = 12;
 const STREAM_STALE_RECV_GAP_RETRY_LIMIT: usize = 12;
 
 struct RecvEntryObservedBoundary<H> {
@@ -92,6 +95,15 @@ fn debug_materialized_route_lifecycle_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("FSMETA_DEBUG_MATERIALIZED_ROUTE_LIFECYCLE")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
+fn debug_endpoint_request_lifecycle_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_ENDPOINT_REQUEST_LIFECYCLE")
             .ok()
             .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
     })
@@ -226,6 +238,7 @@ impl EndpointJoin {
 pub(crate) struct ManagedEndpointTask {
     name: String,
     route_key: String,
+    unit_ids: Vec<String>,
     shutdown: CancellationToken,
     terminal_reason: Arc<StdMutex<Option<String>>>,
     join: Option<EndpointJoin>,
@@ -269,11 +282,9 @@ impl ManagedEndpointTask {
     }
 
     fn wait_until_ready(name: &str, ready_rx: Receiver<()>) {
-        match ready_rx.recv_timeout(ENDPOINT_READY_WAIT_TIMEOUT) {
-            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                log::debug!("endpoint task {} ready wait deferred", name);
-            }
+        match ready_rx.recv() {
+            Ok(()) => {}
+            Err(err) => log::warn!("endpoint task {} ready wait failed: {}", name, err),
         }
     }
 
@@ -374,12 +385,29 @@ impl ManagedEndpointTask {
     {
         let name_owned = name.into();
         let route_key = route.0.clone();
+        let unit_ids = contexts
+            .iter()
+            .filter_map(|ctx| ctx.unit_id.clone())
+            .collect::<Vec<_>>();
         let join_name = name_owned.clone();
         let route_key_for_runner = route_key.clone();
         let shutdown_for_task = shutdown.clone();
         let terminal_reason = Arc::new(StdMutex::new(None));
         let terminal_reason_for_runner = terminal_reason.clone();
         let (ready_tx, ready_rx) = sync_channel(1);
+        let ready_tx = Arc::new(StdMutex::new(Some(ready_tx)));
+        let boundary: Arc<dyn ChannelIoSubset> = Arc::new(RecvEntryObservedBoundary {
+            inner: boundary,
+            before_recv: Arc::new(move || {
+                if let Some(tx) = ready_tx
+                    .lock()
+                    .expect("endpoint request ready tx lock")
+                    .take()
+                {
+                    let _ = tx.send(());
+                }
+            }),
+        });
         let handler = Arc::new(handler);
         let runner = run_endpoint_loop_with_contexts(
             boundary,
@@ -388,7 +416,6 @@ impl ManagedEndpointTask {
             contexts,
             shutdown_for_task,
             handler,
-            Some(ready_tx),
             terminal_reason_for_runner.clone(),
         );
         let runner = async move {
@@ -418,6 +445,7 @@ impl ManagedEndpointTask {
         Self {
             name: name_owned,
             route_key,
+            unit_ids,
             shutdown,
             terminal_reason,
             join: Some(join),
@@ -529,7 +557,7 @@ impl ManagedEndpointTask {
             boundary,
             route,
             join_name,
-            unit_id,
+            unit_id.clone(),
             shutdown_for_task,
             should_recv,
             wait_until_receivable,
@@ -564,6 +592,7 @@ impl ManagedEndpointTask {
         Self {
             name: name_owned,
             route_key,
+            unit_ids: vec![unit_id],
             shutdown,
             terminal_reason,
             join: Some(join),
@@ -572,6 +601,10 @@ impl ManagedEndpointTask {
 
     pub(crate) fn route_key(&self) -> &str {
         &self.route_key
+    }
+
+    pub(crate) fn unit_ids(&self) -> &[String] {
+        &self.unit_ids
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -583,6 +616,10 @@ impl ManagedEndpointTask {
             .lock()
             .expect("terminal_reason lock")
             .clone()
+    }
+
+    pub(crate) fn request_shutdown(&self) {
+        self.shutdown.cancel();
     }
 
     pub(crate) async fn shutdown(&mut self, wait_timeout: Duration) {
@@ -635,7 +672,6 @@ async fn run_endpoint_loop<F, Fut>(
         vec![ctx],
         shutdown_for_task,
         handler,
-        None,
         terminal_reason,
     )
     .await
@@ -648,7 +684,6 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
     contexts: Vec<BoundaryContext>,
     shutdown_for_task: CancellationToken,
     handler: Arc<F>,
-    ready_tx: Option<std::sync::mpsc::SyncSender<()>>,
     terminal_reason: Arc<StdMutex<Option<String>>>,
 ) where
     F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
@@ -656,8 +691,11 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
 {
     let debug_materialized_route = debug_materialized_route_lifecycle_enabled()
         && is_materialized_internal_query_route(&route);
+    let debug_endpoint_requests = debug_endpoint_request_lifecycle_enabled()
+        || debug_source_status_lifecycle_enabled()
+        || debug_materialized_route;
     #[cfg(test)]
-    if let Some(delay) = take_endpoint_loop_start_delay_hook() {
+    if let Some(delay) = take_endpoint_loop_start_delay_hook(&route, &join_name) {
         std::thread::sleep(delay);
     }
     if debug_source_status_lifecycle_enabled() || debug_materialized_route {
@@ -668,12 +706,10 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
             std::thread::current().name()
         );
     }
-    if let Some(ready_tx) = ready_tx {
-        let _ = ready_tx.send(());
-    }
     let request_channel = ChannelKey(route.0.clone());
     let reply_channel = ChannelKey(format!("{}:reply", route.0));
     let mut exit_reason = None::<String>;
+    let mut retryable_recv_gap_count = 0usize;
 
     loop {
         if shutdown_for_task.is_cancelled() {
@@ -684,6 +720,8 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
         let mut fatal_err = None::<CnxError>;
         let mut saw_retryable_gap = false;
         let recv_timeout_ms = Duration::from_millis(250).as_millis() as u64;
+        #[cfg(test)]
+        maybe_run_endpoint_before_first_recv_poll_hook(&route, &join_name);
         let mut pending = contexts
             .iter()
             .cloned()
@@ -719,9 +757,19 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
                     continue;
                 }
                 Ok(result) => match result {
-                    Ok(events) => events,
+                    Ok(events) => {
+                        retryable_recv_gap_count = 0;
+                        events
+                    }
                     Err(CnxError::Timeout) => continue,
                     Err(err) if is_retryable_worker_bridge_peer_error(&err) => {
+                        retryable_recv_gap_count = retryable_recv_gap_count.saturating_add(1);
+                        if retryable_recv_gap_count >= REQUEST_RETRYABLE_RECV_GAP_RETRY_LIMIT {
+                            if fatal_err.is_none() {
+                                fatal_err = Some(err);
+                            }
+                            continue;
+                        }
                         if debug_materialized_route {
                             eprintln!(
                                 "fs_meta_runtime_endpoint: materialized_route recv_retry route={} task={} err={}",
@@ -811,12 +859,14 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
         if requests.is_empty() {
             continue;
         }
-        eprintln!(
-            "fs_meta_runtime_endpoint: request batch recv route={} task={} events={}",
-            request_channel.0,
-            join_name,
-            requests.len()
-        );
+        if debug_endpoint_requests {
+            eprintln!(
+                "fs_meta_runtime_endpoint: request batch recv route={} task={} events={}",
+                request_channel.0,
+                join_name,
+                requests.len()
+            );
+        }
 
         let correlation_id = shared_correlation_id(&requests);
         let mut responses = handler(requests).await;
@@ -834,10 +884,12 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
         }
 
         if responses.is_empty() {
-            eprintln!(
-                "fs_meta_runtime_endpoint: request batch handled with no replies route={} task={}",
-                request_channel.0, join_name
-            );
+            if debug_endpoint_requests {
+                eprintln!(
+                    "fs_meta_runtime_endpoint: request batch handled with no replies route={} task={}",
+                    request_channel.0, join_name
+                );
+            }
             continue;
         }
         let response_count = responses.len();
@@ -854,6 +906,7 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
         {
             match err {
                 err @ CnxError::Timeout
+                | err @ CnxError::Backpressure
                 | err @ CnxError::NotSupported(_)
                 | err @ CnxError::NotReady(_)
                 | err @ CnxError::TransportClosed(_)
@@ -886,10 +939,12 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
                 }
             }
         }
-        eprintln!(
-            "fs_meta_runtime_endpoint: request batch replies sent route={} task={} events={}",
-            reply_channel.0, join_name, response_count
-        );
+        if debug_endpoint_requests {
+            eprintln!(
+                "fs_meta_runtime_endpoint: request batch replies sent route={} task={} events={}",
+                reply_channel.0, join_name, response_count
+            );
+        }
     }
 
     let final_reason = exit_reason.unwrap_or_else(|| "loop_returned".into());
@@ -1122,25 +1177,82 @@ async fn run_stream_loop_with_wait<F, Fut, G, W, H>(
 }
 
 #[cfg(test)]
-fn endpoint_loop_start_delay_hook_cell() -> &'static StdMutex<Option<Duration>> {
-    static CELL: std::sync::OnceLock<StdMutex<Option<Duration>>> = std::sync::OnceLock::new();
+fn endpoint_loop_start_delay_hook_cell() -> &'static StdMutex<Option<(String, String, Duration)>> {
+    static CELL: std::sync::OnceLock<StdMutex<Option<(String, String, Duration)>>> =
+        std::sync::OnceLock::new();
     CELL.get_or_init(|| StdMutex::new(None))
 }
 
 #[cfg(test)]
-fn install_endpoint_loop_start_delay_hook(delay: Duration) {
+fn install_endpoint_loop_start_delay_hook(route_key: &str, join_name: &str, delay: Duration) {
     let mut guard = endpoint_loop_start_delay_hook_cell()
         .lock()
         .expect("endpoint_loop_start_delay_hook lock");
-    *guard = Some(delay);
+    *guard = Some((route_key.to_string(), join_name.to_string(), delay));
 }
 
 #[cfg(test)]
-fn take_endpoint_loop_start_delay_hook() -> Option<Duration> {
+fn take_endpoint_loop_start_delay_hook(route: &RouteKey, join_name: &str) -> Option<Duration> {
     let mut guard = endpoint_loop_start_delay_hook_cell()
         .lock()
         .expect("endpoint_loop_start_delay_hook lock");
-    guard.take()
+    let Some((hook_route, hook_name, _)) = guard.as_ref() else {
+        return None;
+    };
+    if hook_route == &route.0 && hook_name == join_name {
+        let (_, _, delay) = guard
+            .take()
+            .expect("endpoint_loop_start_delay_hook present");
+        Some(delay)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+type EndpointBeforeFirstRecvPollHook = Arc<dyn Fn() + Send + Sync + 'static>;
+
+#[cfg(test)]
+fn endpoint_before_first_recv_poll_hook_cell()
+-> &'static StdMutex<Option<(String, String, EndpointBeforeFirstRecvPollHook)>> {
+    static CELL: std::sync::OnceLock<
+        StdMutex<Option<(String, String, EndpointBeforeFirstRecvPollHook)>>,
+    > = std::sync::OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn install_endpoint_before_first_recv_poll_hook<F>(route_key: &str, join_name: &str, hook: F)
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    let mut guard = endpoint_before_first_recv_poll_hook_cell()
+        .lock()
+        .expect("endpoint_before_first_recv_poll_hook lock");
+    *guard = Some((route_key.to_string(), join_name.to_string(), Arc::new(hook)));
+}
+
+#[cfg(test)]
+fn maybe_run_endpoint_before_first_recv_poll_hook(route: &RouteKey, join_name: &str) {
+    let hook = {
+        let mut guard = endpoint_before_first_recv_poll_hook_cell()
+            .lock()
+            .expect("endpoint_before_first_recv_poll_hook lock");
+        let Some((hook_route, hook_name, _)) = guard.as_ref() else {
+            return;
+        };
+        if hook_route == &route.0 && hook_name == join_name {
+            let (_, _, hook) = guard
+                .take()
+                .expect("endpoint_before_first_recv_poll_hook present");
+            Some(hook)
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 #[cfg(test)]
@@ -1207,6 +1319,7 @@ mod tests {
 
     enum SendStep {
         Timeout,
+        Backpressure,
         Ok,
     }
 
@@ -1249,6 +1362,14 @@ mod tests {
 
     impl ReplyTimeoutThenRecoverBoundary {
         fn new(first: Vec<Event>, second: Vec<Event>) -> Self {
+            Self::new_with_first_send_step(first, second, SendStep::Timeout)
+        }
+
+        fn new_with_first_send_step(
+            first: Vec<Event>,
+            second: Vec<Event>,
+            first_send_step: SendStep,
+        ) -> Self {
             Self {
                 recv_keys: Mutex::new(Vec::new()),
                 send_keys: Mutex::new(Vec::new()),
@@ -1257,7 +1378,7 @@ mod tests {
                     RecvStep::Events(second),
                     RecvStep::InternalStop,
                 ])),
-                send_steps: Mutex::new(VecDeque::from([SendStep::Timeout, SendStep::Ok])),
+                send_steps: Mutex::new(VecDeque::from([first_send_step, SendStep::Ok])),
             }
         }
     }
@@ -1389,6 +1510,7 @@ mod tests {
                 .unwrap_or(SendStep::Ok)
             {
                 SendStep::Timeout => Err(CnxError::Timeout),
+                SendStep::Backpressure => Err(CnxError::Backpressure),
                 SendStep::Ok => Ok(()),
             }
         }
@@ -1606,13 +1728,17 @@ mod tests {
 
     #[test]
     fn spawned_endpoint_waits_briefly_for_loop_start_before_returning() {
-        install_endpoint_loop_start_delay_hook(Duration::from_millis(40));
+        install_endpoint_loop_start_delay_hook(
+            "source-status.loop-start-delay-test:v1.req",
+            "loop-start-delay-test-endpoint",
+            Duration::from_millis(40),
+        );
         let boundary = Arc::new(RecordingBoundary::new());
         let started = std::time::Instant::now();
         let mut endpoint = ManagedEndpointTask::spawn(
             boundary,
-            RouteKey("source-status:v1.req".into()),
-            "test-endpoint",
+            RouteKey("source-status.loop-start-delay-test:v1.req".into()),
+            "loop-start-delay-test-endpoint",
             CancellationToken::new(),
             |_events: Vec<Event>| std::future::ready(Vec::new()),
         );
@@ -1625,6 +1751,102 @@ mod tests {
             elapsed >= Duration::from_millis(30),
             "endpoint spawn must wait for the recv loop to enter loop_start before returning; elapsed={elapsed:?}"
         );
+    }
+
+    #[test]
+    fn spawned_endpoint_waits_for_first_request_recv_poll_before_returning() {
+        let route_key = "source-manual-rescan.node-b:v1.req";
+        let join_name = "first-recv-poll-test-endpoint";
+        let (hook_entered_tx, hook_entered_rx) = sync_channel(1);
+        let (hook_release_tx, hook_release_rx) = sync_channel(1);
+        let (spawn_returned_tx, spawn_returned_rx) = sync_channel(1);
+        let hook_release_rx = Arc::new(Mutex::new(hook_release_rx));
+        install_endpoint_before_first_recv_poll_hook(route_key, join_name, move || {
+            let _ = hook_entered_tx.send(());
+            let _ = hook_release_rx
+                .lock()
+                .expect("hook_release_rx lock")
+                .recv_timeout(Duration::from_secs(1));
+        });
+
+        let route_key_owned = route_key.to_string();
+        let join_name_owned = join_name.to_string();
+        let handle = std::thread::spawn(move || {
+            let boundary = Arc::new(RecordingBoundary::new());
+            let mut endpoint = ManagedEndpointTask::spawn(
+                boundary,
+                RouteKey(route_key_owned),
+                join_name_owned,
+                CancellationToken::new(),
+                |_events: Vec<Event>| std::future::ready(Vec::new()),
+            );
+            let _ = spawn_returned_tx.send(());
+            crate::runtime_app::shared_tokio_runtime()
+                .block_on(endpoint.shutdown(Duration::from_secs(1)));
+        });
+
+        hook_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("endpoint loop should pause before first recv poll");
+        assert!(
+            spawn_returned_rx
+                .recv_timeout(Duration::from_millis(30))
+                .is_err(),
+            "endpoint spawn returned before the request recv interest could be armed"
+        );
+        let _ = hook_release_tx.send(());
+        spawn_returned_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("endpoint spawn should return after first recv poll is allowed");
+        handle.join().expect("endpoint spawn thread should join");
+    }
+
+    #[test]
+    fn spawned_endpoint_does_not_return_after_ready_wait_timeout_before_first_recv_poll() {
+        let route_key = "source-manual-rescan.node-c:v1.req";
+        let join_name = "first-recv-poll-timeout-test-endpoint";
+        let (hook_entered_tx, hook_entered_rx) = sync_channel(1);
+        let (hook_release_tx, hook_release_rx) = sync_channel(1);
+        let (spawn_returned_tx, spawn_returned_rx) = sync_channel(1);
+        let hook_release_rx = Arc::new(Mutex::new(hook_release_rx));
+        install_endpoint_before_first_recv_poll_hook(route_key, join_name, move || {
+            let _ = hook_entered_tx.send(());
+            let _ = hook_release_rx
+                .lock()
+                .expect("hook_release_rx lock")
+                .recv_timeout(Duration::from_secs(1));
+        });
+
+        let route_key_owned = route_key.to_string();
+        let join_name_owned = join_name.to_string();
+        let handle = std::thread::spawn(move || {
+            let boundary = Arc::new(RecordingBoundary::new());
+            let mut endpoint = ManagedEndpointTask::spawn(
+                boundary,
+                RouteKey(route_key_owned),
+                join_name_owned,
+                CancellationToken::new(),
+                |_events: Vec<Event>| std::future::ready(Vec::new()),
+            );
+            let _ = spawn_returned_tx.send(());
+            crate::runtime_app::shared_tokio_runtime()
+                .block_on(endpoint.shutdown(Duration::from_secs(1)));
+        });
+
+        hook_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("endpoint loop should pause before first recv poll");
+        assert!(
+            spawn_returned_rx
+                .recv_timeout(ENDPOINT_READY_WAIT_TIMEOUT + Duration::from_millis(80))
+                .is_err(),
+            "endpoint spawn must not return after the old bounded ready wait while request recv interest is still unarmed"
+        );
+        let _ = hook_release_tx.send(());
+        spawn_returned_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("endpoint spawn should return after first recv poll is allowed");
+        handle.join().expect("endpoint spawn thread should join");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1640,6 +1862,7 @@ mod tests {
         let mut endpoint = ManagedEndpointTask {
             name: "test-endpoint".to_string(),
             route_key: "sink-status:v1.req".to_string(),
+            unit_ids: Vec::new(),
             shutdown: CancellationToken::new(),
             terminal_reason: Arc::new(StdMutex::new(None)),
             join: Some(EndpointJoin::Thread(join)),
@@ -1836,7 +2059,15 @@ mod tests {
             ]
         );
         let close_keys = boundary.close_keys.lock().expect("close_keys lock").clone();
-        assert_eq!(close_keys, vec!["sink-status:v1.req".to_string()]);
+        assert_eq!(
+            close_keys.first().map(String::as_str),
+            Some("sink-status:v1.req"),
+            "stale grant retry must still close the stale request route before retry; close_keys={close_keys:?}"
+        );
+        assert!(
+            !close_keys.contains(&"sink-status:v1.req:reply".to_string()),
+            "terminal endpoint cleanup must not permanently close reusable reply route after stale request-route reset; close_keys={close_keys:?}"
+        );
     }
 
     #[test]
@@ -1868,9 +2099,13 @@ mod tests {
         );
         let close_keys = boundary.close_keys.lock().expect("close_keys lock").clone();
         assert_eq!(
-            close_keys,
-            vec!["source-status:v1.req".to_string()],
-            "revoked grant attachment recv gaps should close the stale channel before retry"
+            close_keys.first().map(String::as_str),
+            Some("source-status:v1.req"),
+            "revoked grant attachment recv gaps should close the stale channel before retry; close_keys={close_keys:?}"
+        );
+        assert!(
+            !close_keys.contains(&"source-status:v1.req:reply".to_string()),
+            "terminal endpoint cleanup must not permanently close reusable reply route after stale request-route reset; close_keys={close_keys:?}"
         );
     }
 
@@ -2073,6 +2308,27 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_loop_keeps_reusable_request_and_reply_routes_open_on_terminal_exit() {
+        let boundary = Arc::new(RecordingBoundary::new());
+        crate::runtime_app::shared_tokio_runtime().block_on(run_endpoint_loop(
+            boundary.clone(),
+            RouteKey("source-status:v1.req".into()),
+            "test-endpoint".into(),
+            BoundaryContext::for_unit("runtime.exec.query"),
+            CancellationToken::new(),
+            Arc::new(|_events: Vec<Event>| std::future::ready(Vec::new())),
+            test_terminal_reason(),
+        ));
+
+        let close_keys = boundary.close_keys.lock().expect("close_keys lock").clone();
+        assert!(
+            !close_keys.contains(&"source-status:v1.req".to_string())
+                && !close_keys.contains(&"source-status:v1.req:reply".to_string()),
+            "endpoint exit must not permanently close reusable request/reply routes before respawn; close_keys={close_keys:?}"
+        );
+    }
+
+    #[test]
     fn endpoint_loop_retries_transient_reply_send_timeout_and_handles_later_batches() {
         let boundary = Arc::new(ReplyTimeoutThenRecoverBoundary::new(
             vec![test_event(1, b"first")],
@@ -2096,6 +2352,34 @@ mod tests {
                 "materialized-find:v1.req:reply".to_string()
             ],
             "endpoint loop should keep serving later materialized batches after a transient reply send timeout"
+        );
+    }
+
+    #[test]
+    fn endpoint_loop_retries_transient_reply_send_backpressure_and_handles_later_batches() {
+        let boundary = Arc::new(ReplyTimeoutThenRecoverBoundary::new_with_first_send_step(
+            vec![test_event(1, b"first")],
+            vec![test_event(2, b"second")],
+            SendStep::Backpressure,
+        ));
+        crate::runtime_app::shared_tokio_runtime().block_on(run_endpoint_loop(
+            boundary.clone(),
+            RouteKey("materialized-find:v1.req".into()),
+            "sink:fs-meta.internal:sink.query".into(),
+            BoundaryContext::for_unit("runtime.exec.sink"),
+            CancellationToken::new(),
+            Arc::new(|events: Vec<Event>| std::future::ready(events)),
+            test_terminal_reason(),
+        ));
+
+        let send_keys = boundary.send_keys.lock().expect("send_keys lock").clone();
+        assert_eq!(
+            send_keys,
+            vec![
+                "materialized-find:v1.req:reply".to_string(),
+                "materialized-find:v1.req:reply".to_string()
+            ],
+            "endpoint loop should keep serving later materialized batches after transient reply send backpressure"
         );
     }
 
@@ -2210,15 +2494,22 @@ mod tests {
     }
 
     #[test]
-    fn wait_until_ready_does_not_block_inside_runtime() {
-        let (_tx, rx) = sync_channel::<()>(1);
+    fn wait_until_ready_waits_for_receive_arm_signal_inside_runtime() {
+        let (tx, rx) = sync_channel::<()>(1);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            let _ = tx.send(());
+        });
         let started = std::time::Instant::now();
         crate::runtime_app::shared_tokio_runtime().block_on(async {
             ManagedEndpointTask::wait_until_ready("test-endpoint", rx);
         });
+        sender
+            .join()
+            .expect("ready signal sender should join cleanly");
         assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "ready wait should not block tokio runtime threads"
+            started.elapsed() >= Duration::from_millis(60),
+            "ready wait must not return before endpoint receive interest is armed"
         );
     }
 }

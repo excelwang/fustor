@@ -53,11 +53,10 @@ use crate::runtime::orchestration::{
     sink_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{
-    METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SINK_STATUS,
-    METHOD_SOURCE_FIND, METHOD_STREAM, ROUTE_KEY_EVENTS, ROUTE_TOKEN_FS_META,
-    ROUTE_TOKEN_FS_META_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
-    sink_query_request_route_for, sink_query_route_bindings_for,
-    sink_roots_control_stream_route_for,
+    METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SOURCE_FIND,
+    METHOD_STREAM, ROUTE_KEY_EVENTS, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_EVENTS,
+    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, sink_query_request_route_for,
+    sink_query_route_bindings_for, sink_roots_control_stream_route_for,
 };
 use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::unit_gate::RuntimeUnitGate;
@@ -2525,69 +2524,6 @@ impl SinkFileMeta {
             .push(endpoint);
         }
 
-        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
-            && !self.endpoint_task_route_present(
-                &route.0,
-                "sink.start_runtime_endpoints.route_present.status",
-            )
-        {
-            let status_sink = self.clone();
-            let status_node_id = node_id.clone();
-            let endpoint = ManagedEndpointTask::spawn_with_unit(
-                boundary.clone(),
-                route,
-                format!(
-                    "sink:{}:{}",
-                    ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS
-                ),
-                SINK_RUNTIME_UNIT_ID,
-                self.shutdown.clone(),
-                move |requests| {
-                    let status_sink = status_sink.clone();
-                    let status_node_id = status_node_id.clone();
-                    async move {
-                        let snapshot = match status_sink.status_snapshot_with_failure() {
-                            Ok(snapshot) => snapshot,
-                            Err(err) => {
-                                eprintln!(
-                                    "fs_meta_sink: sink-status endpoint snapshot failed node={} err={}",
-                                    status_node_id.0,
-                                    err.as_error()
-                                );
-                                SinkStatusSnapshot::default()
-                            }
-                        };
-                        let mut responses = Vec::with_capacity(requests.len());
-                        for req in requests {
-                            match rmp_serde::to_vec_named(&snapshot) {
-                                Ok(payload) => responses.push(Event::new(
-                                    EventMetadata {
-                                        origin_id: status_node_id.clone(),
-                                        timestamp_us: now_us(),
-                                        logical_ts: None,
-                                        correlation_id: req.metadata().correlation_id,
-                                        ingress_auth: None,
-                                        trace: None,
-                                    },
-                                    Bytes::from(payload),
-                                )),
-                                Err(err) => eprintln!(
-                                    "fs_meta_sink: sink-status endpoint encode failed node={} err={}",
-                                    status_node_id.0, err
-                                ),
-                            }
-                        }
-                        responses
-                    }
-                },
-            );
-            lock_or_recover(
-                &self.endpoint_tasks,
-                "sink.start_runtime_endpoints.status_tasks",
-            )
-            .push(endpoint);
-        }
-
         const FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS: u64 = 750;
         let node_id_proxy = node_id.clone();
         let node_id_proxy_log = node_id_proxy.clone();
@@ -3025,6 +2961,139 @@ impl SinkFileMeta {
         ))
     }
 
+    fn host_ref_matches_local_node(&self, host_ref: &str) -> bool {
+        host_ref == self.node_id.0
+            || self
+                .node_id
+                .0
+                .strip_prefix(host_ref)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+            || self
+                .node_id
+                .0
+                .strip_prefix("cluster-")
+                .is_some_and(|scoped| {
+                    scoped == host_ref
+                        || scoped
+                            .strip_prefix(host_ref)
+                            .is_some_and(|suffix| suffix.starts_with('-'))
+                })
+    }
+
+    fn root_has_local_active_grant(&self, root: &RootSpec, grants: &[GrantedMountRoot]) -> bool {
+        grants.iter().any(|grant| {
+            grant.active
+                && self.host_ref_matches_local_node(&grant.host_ref)
+                && root.selector.matches(grant)
+        })
+    }
+
+    fn root_has_any_matching_grant(root: &RootSpec, grants: &[GrantedMountRoot]) -> bool {
+        grants.iter().any(|grant| root.selector.matches(grant))
+    }
+
+    fn runtime_scope_resource_matches_logical_root(
+        resource_id: &str,
+        logical_root_id: &str,
+    ) -> bool {
+        resource_id == logical_root_id
+            || resource_id
+                .rsplit_once("::")
+                .is_some_and(|(_, tail)| tail == logical_root_id)
+    }
+
+    fn runtime_scope_row_matches_logical_root(
+        row: &RuntimeBoundScope,
+        logical_root_id: &str,
+    ) -> bool {
+        row.scope_id == logical_root_id
+            || row.resource_ids.iter().any(|resource_id| {
+                Self::runtime_scope_resource_matches_logical_root(resource_id, logical_root_id)
+            })
+    }
+
+    fn runtime_scope_row_has_explicit_local_resource_id(
+        &self,
+        row: &RuntimeBoundScope,
+        logical_root_id: &str,
+    ) -> bool {
+        row.resource_ids.iter().any(|resource_id| {
+            Self::runtime_scope_resource_matches_logical_root(resource_id, logical_root_id)
+                && resource_id
+                    .rsplit_once("::")
+                    .is_some_and(|(host_ref, _)| self.host_ref_matches_local_node(host_ref))
+        })
+    }
+
+    fn runtime_scope_row_has_bare_logical_root_id(
+        row: &RuntimeBoundScope,
+        logical_root_id: &str,
+    ) -> bool {
+        row.scope_id == logical_root_id
+            || row
+                .resource_ids
+                .iter()
+                .any(|resource_id| resource_id == logical_root_id)
+    }
+
+    fn root_is_reportable_for_local_sink_status(
+        &self,
+        root: &RootSpec,
+        grants: &[GrantedMountRoot],
+        active_rows: &[RuntimeBoundScope],
+    ) -> bool {
+        if self.root_has_local_active_grant(root, grants) {
+            return true;
+        }
+
+        let has_any_matching_grant = Self::root_has_any_matching_grant(root, grants);
+        let mut saw_bare_logical_root_id = false;
+        for row in active_rows {
+            if !Self::runtime_scope_row_matches_logical_root(row, &root.id) {
+                continue;
+            }
+            if self.runtime_scope_row_has_explicit_local_resource_id(row, &root.id)
+                && !has_any_matching_grant
+            {
+                return true;
+            }
+            if Self::runtime_scope_row_has_bare_logical_root_id(row, &root.id) {
+                saw_bare_logical_root_id = true;
+            }
+        }
+
+        saw_bare_logical_root_id && !has_any_matching_grant
+    }
+
+    fn status_scheduled_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
+        let Some(active_rows) = self.scheduled_bound_scopes()? else {
+            return Ok(None);
+        };
+        if active_rows.is_empty() {
+            return Ok(Some(BTreeSet::new()));
+        }
+        let roots = self
+            .root_specs
+            .read()
+            .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))?
+            .clone();
+        let grants = self.logical_grants_snapshot()?;
+        Ok(Some(
+            roots
+                .iter()
+                .filter(|root| {
+                    active_rows
+                        .iter()
+                        .any(|row| Self::runtime_scope_row_matches_logical_root(row, &root.id))
+                })
+                .filter(|root| {
+                    self.root_is_reportable_for_local_sink_status(root, &grants, &active_rows)
+                })
+                .map(|root| root.id.clone())
+                .collect(),
+        ))
+    }
+
     pub(crate) fn snapshot_scheduled_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
         self.scheduled_group_ids()
     }
@@ -3370,6 +3439,14 @@ impl SinkFileMeta {
         roots: Vec<RootSpec>,
         host_object_grants: &[GrantedMountRoot],
     ) -> Result<()> {
+        self.perform_update_logical_roots_with_scope_policy(roots, host_object_grants, false)
+    }
+
+    pub(crate) fn perform_update_logical_roots_from_management_apply(
+        &self,
+        roots: Vec<RootSpec>,
+        host_object_grants: &[GrantedMountRoot],
+    ) -> Result<()> {
         self.perform_update_logical_roots_with_scope_policy(roots, host_object_grants, true)
     }
 
@@ -3386,16 +3463,9 @@ impl SinkFileMeta {
         );
         let root_count = roots.len();
         let grant_count = host_object_grants.len();
-        let current_allowed_groups = self.scheduled_group_ids()?;
-        if expand_runtime_scopes && current_allowed_groups.as_ref().is_some() {
-            let root_ids = roots
-                .iter()
-                .map(|root| root.id.clone())
-                .collect::<BTreeSet<_>>();
-            let next_allowed_groups = root_ids;
+        if expand_runtime_scopes {
             let bound_scopes = roots
                 .iter()
-                .filter(|root| next_allowed_groups.contains(&root.id))
                 .map(|root| RuntimeBoundScope {
                     scope_id: root.id.clone(),
                     resource_ids: Vec::new(),
@@ -3408,6 +3478,13 @@ impl SinkFileMeta {
             .root_specs
             .write()
             .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))?;
+        {
+            let mut grants = self
+                .host_object_grants
+                .write()
+                .map_err(|_| CnxError::Internal("Sink host_object_grants lock poisoned".into()))?;
+            *grants = host_object_grants.to_vec();
+        }
         let allowed_groups = self.scheduled_group_ids()?;
         let mut state = self.state.write()?;
         state.reconcile_host_object_grants(&roots, host_object_grants, allowed_groups.as_ref());
@@ -3432,6 +3509,14 @@ impl SinkFileMeta {
         host_object_grants: &[GrantedMountRoot],
     ) -> Result<()> {
         self.perform_update_logical_roots(roots, host_object_grants)
+    }
+
+    pub(crate) fn update_logical_roots_from_management_apply(
+        &self,
+        roots: Vec<RootSpec>,
+        host_object_grants: &[GrantedMountRoot],
+    ) -> Result<()> {
+        self.perform_update_logical_roots_from_management_apply(roots, host_object_grants)
     }
 
     pub(crate) fn snapshot_logical_roots(&self) -> Result<Vec<RootSpec>> {
@@ -3498,7 +3583,7 @@ impl SinkFileMeta {
                 estimated_heap_bytes,
             ));
         }
-        if let Some(scheduled_groups) = self.scheduled_group_ids()?
+        if let Some(scheduled_groups) = self.status_scheduled_group_ids()?
             && !scheduled_groups.is_empty()
         {
             let present_groups = groups

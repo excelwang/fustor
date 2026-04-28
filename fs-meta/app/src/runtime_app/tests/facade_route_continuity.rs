@@ -81,6 +81,7 @@ async fn query_peer_deactivate_does_not_shutdown_active_facade_listener() {
     let _shutdown_reset = FacadeShutdownStartHookReset;
     install_facade_shutdown_start_hook(FacadeShutdownStartHook {
         entered: shutdown_started.clone(),
+        release: None,
     });
     let shutdown_wait = shutdown_started.notified();
 
@@ -269,6 +270,151 @@ async fn mark_control_uninitialized_clears_retained_active_facade_continuity_bef
 }
 
 #[tokio::test]
+async fn cleanup_only_query_tail_keeps_serving_facade_business_read_routes_live_after_successor_activation()
+ {
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let root = tmp.path().join("root-a");
+    fs::create_dir_all(&root).expect("create root");
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let cfg = FSMetaConfig {
+        source: SourceConfig {
+            roots: vec![source::config::RootSpec::new("root-a", &root)],
+            host_object_grants: vec![granted_mount_root("single-app-node::root-a-1", &root)],
+            ..local_source_config()
+        },
+        api: api::ApiConfig {
+            enabled: true,
+            facade_resource_id: "listener-a".to_string(),
+            local_listener_resources: vec![api::config::ApiListenerResource {
+                resource_id: "listener-a".to_string(),
+                bind_addr: bind_addr.clone(),
+            }],
+            auth: api::ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                ..api::ApiAuthConfig::default()
+            },
+        },
+    };
+    let app = FSMetaApp::with_boundaries(
+        cfg,
+        NodeId("single-app-node".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init app");
+    let active_facade = match api::spawn(
+        app.config
+            .api
+            .resolve_for_candidate_ids(&["listener-a".to_string()])
+            .expect("resolve facade config"),
+        app.node_id.clone(),
+        app.runtime_boundary.clone(),
+        app.source.clone(),
+        app.sink.clone(),
+        app.query_sink.clone(),
+        app.runtime_boundary.clone(),
+        app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
+        app.api_request_tracker.clone(),
+        app.api_control_gate.clone(),
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(CnxError::InvalidInput(msg))
+            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+        {
+            return;
+        }
+        Err(err) => panic!("spawn active facade: {err}"),
+    };
+    *app.api_task.lock().await = Some(FacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 10,
+        resource_ids: vec!["listener-a".to_string()],
+        handle: active_facade,
+    });
+
+    let route_scopes = [RuntimeBoundScope {
+        scope_id: "root-a".to_string(),
+        resource_ids: vec!["listener-a".to_string()],
+    }];
+    app.apply_facade_activate(
+        FacadeRuntimeUnit::Facade,
+        &facade_control_stream_route(),
+        20,
+        &route_scopes,
+    )
+    .await
+    .expect("successor facade activation should publish");
+
+    let find_route = format!("{}.req", ROUTE_KEY_QUERY);
+    let materialized_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
+    let sink_status_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
+    for (unit, route_key) in [
+        (FacadeRuntimeUnit::Query, find_route.as_str()),
+        (FacadeRuntimeUnit::Query, materialized_proxy_route.as_str()),
+        (FacadeRuntimeUnit::QueryPeer, materialized_proxy_route.as_str()),
+        (FacadeRuntimeUnit::Query, sink_status_route.as_str()),
+        (FacadeRuntimeUnit::QueryPeer, sink_status_route.as_str()),
+    ] {
+        app.apply_facade_activate(unit, route_key, 20, &route_scopes)
+            .await
+            .expect("activate serving facade business read route");
+    }
+    assert!(
+        !app.retained_active_facade_continuity
+            .load(Ordering::Acquire),
+        "successor facade activation clears predecessor continuity retention; business read route continuity is owned by the serving facade"
+    );
+
+    set_control_initialized_for_tests(&app, false);
+    app.api_control_gate.set_ready(false);
+
+    for (unit, route_key) in [
+        (FacadeRuntimeUnit::Query, find_route.as_str()),
+        (FacadeRuntimeUnit::Query, materialized_proxy_route.as_str()),
+        (FacadeRuntimeUnit::QueryPeer, materialized_proxy_route.as_str()),
+        (FacadeRuntimeUnit::Query, sink_status_route.as_str()),
+        (FacadeRuntimeUnit::QueryPeer, sink_status_route.as_str()),
+    ] {
+        app.apply_facade_deactivate(unit, route_key, 30, false)
+            .await
+            .expect("cleanup-only query tail should not withdraw serving business route");
+    }
+
+    for (unit_id, route_key) in [
+        (execution_units::QUERY_RUNTIME_UNIT_ID, find_route.as_str()),
+        (
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+            materialized_proxy_route.as_str(),
+        ),
+        (
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            materialized_proxy_route.as_str(),
+        ),
+        (
+            execution_units::QUERY_RUNTIME_UNIT_ID,
+            sink_status_route.as_str(),
+        ),
+        (
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            sink_status_route.as_str(),
+        ),
+    ] {
+        assert!(
+            app.facade_gate
+                .route_active(unit_id, route_key)
+                .expect("route state after cleanup tail"),
+            "cleanup-only query tail must preserve active serving facade business read route {unit_id}:{route_key}"
+        );
+    }
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test]
 async fn future_generation_facade_deactivate_without_successor_activate_keeps_active_listener_available()
  {
     let tmp = tempdir().expect("create temp dir");
@@ -351,6 +497,7 @@ async fn future_generation_facade_deactivate_without_successor_activate_keeps_ac
     let _shutdown_reset = FacadeShutdownStartHookReset;
     install_facade_shutdown_start_hook(FacadeShutdownStartHook {
         entered: shutdown_started.clone(),
+        release: None,
     });
     let shutdown_wait = shutdown_started.notified();
 
@@ -467,6 +614,7 @@ async fn future_generation_facade_deactivate_without_successor_activate_keeps_qu
     let _shutdown_reset = FacadeShutdownStartHookReset;
     install_facade_shutdown_start_hook(FacadeShutdownStartHook {
         entered: shutdown_started.clone(),
+        release: None,
     });
     let shutdown_wait = shutdown_started.notified();
 
@@ -591,6 +739,7 @@ async fn uninitialized_same_generation_facade_deactivate_keeps_listener_availabl
     let _shutdown_reset = FacadeShutdownStartHookReset;
     install_facade_shutdown_start_hook(FacadeShutdownStartHook {
         entered: shutdown_started.clone(),
+        release: None,
     });
     let shutdown_wait = shutdown_started.notified();
 
@@ -698,6 +847,7 @@ async fn initialized_same_generation_facade_deactivate_without_successor_keeps_l
     let _shutdown_reset = FacadeShutdownStartHookReset;
     install_facade_shutdown_start_hook(FacadeShutdownStartHook {
         entered: shutdown_started.clone(),
+        release: None,
     });
     let shutdown_wait = shutdown_started.notified();
 

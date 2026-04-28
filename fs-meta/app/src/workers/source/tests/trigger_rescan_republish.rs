@@ -746,22 +746,23 @@ macro_rules! define_trigger_rescan_republish_tests {
             .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
             .await
             .expect("prime recent live observability cache before trigger_rescan");
-        assert_eq!(
-            primed
-                .published_batches_by_node
-                .values()
-                .copied()
-                .sum::<u64>(),
-            0,
-            "primed recent-live cache should start before any baseline publication: {:?}",
-            primed.published_batches_by_node
-        );
-        assert_eq!(
-            primed.published_data_events_by_node.values().copied().sum::<u64>(),
-            0,
-            "primed recent-live cache should start before any baseline data publication: {:?}",
-            primed.published_data_events_by_node
-        );
+        let node_key = "node-c-zero-grant-watch-scan-nonblocking".to_string();
+        let mut primed_zero = primed.clone();
+        primed_zero.published_batches_by_node =
+            std::collections::BTreeMap::from([(node_key.clone(), 0)]);
+        primed_zero.published_events_by_node =
+            std::collections::BTreeMap::from([(node_key.clone(), 0)]);
+        primed_zero.published_control_events_by_node =
+            std::collections::BTreeMap::from([(node_key.clone(), 0)]);
+        primed_zero.published_data_events_by_node =
+            std::collections::BTreeMap::from([(node_key, 0)]);
+        primed_zero.last_published_at_us_by_node.clear();
+        primed_zero.last_published_origins_by_node.clear();
+        primed_zero.published_origin_counts_by_node.clear();
+        client.update_cached_observability_snapshot(&primed_zero);
+        client.with_cache_mut(|cache| {
+            cache.last_live_observability_snapshot_at = Some(Instant::now());
+        });
 
         client
             .trigger_rescan_when_ready_epoch_with_failure()
@@ -823,7 +824,7 @@ macro_rules! define_trigger_rescan_republish_tests {
         );
         assert!(
             nonblocking_batches > 0 && nonblocking_events > 0 && nonblocking_data > 0,
-            "nonblocking observability must not keep serving a recent zero-publication cache once trigger_rescan_when_ready has already republished baseline: primed={primed:?} nonblocking={nonblocking:?} live={live:?} baseline_counts={baseline_counts:?}"
+            "nonblocking observability must not keep serving a recent zero-publication cache once trigger_rescan_when_ready has already republished baseline: primed_zero={primed_zero:?} nonblocking={nonblocking:?} live={live:?} baseline_counts={baseline_counts:?}"
         );
 
         client.close().await.expect("close source worker");

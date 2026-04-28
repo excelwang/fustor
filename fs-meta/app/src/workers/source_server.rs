@@ -1287,10 +1287,11 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
     async fn handle_request(
         &mut self,
         request: SourceWorkerRequest,
-        _context: &WorkerSessionContext,
+        context: &WorkerSessionContext,
     ) -> capanix_app_sdk::Result<WorkerLoopControl<SourceWorkerResponse>> {
         let request_seq = next_source_worker_request_seq();
         let request_label = source_worker_request_label(&request);
+        let request_is_control = matches!(request, SourceWorkerRequest::OnControlFrame { .. });
         eprintln!(
             "fs_meta_source_worker_server: handle_request begin seq={} request={}",
             request_seq, request_label
@@ -1308,7 +1309,20 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
                 plan_worker_request(request, &mut guard)
             }
         };
-        let (response, stop) = execute_worker_action(action).await;
+        let (mut response, stop) = execute_worker_action(action).await;
+        if request_is_control && matches!(response, SourceWorkerResponse::Ack) {
+            let source = {
+                let guard = self.state.lock().await;
+                guard.source.clone()
+            };
+            if let Some(source) = source
+                && let Err(err) = source
+                    .start_runtime_endpoints_with_failure(context.io_boundary())
+                    .await
+            {
+                response = classify_source_worker_failure(err);
+            }
+        }
         eprintln!(
             "fs_meta_source_worker_server: handle_request done seq={} request={} stop={}",
             request_seq, request_label, stop
@@ -1323,7 +1337,7 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
     async fn on_runtime_control(
         &mut self,
         envelopes: &[ControlEnvelope],
-        _context: &WorkerSessionContext,
+        context: &WorkerSessionContext,
     ) -> capanix_app_sdk::Result<()> {
         eprintln!(
             "fs_meta_source_worker_server: on_runtime_control begin envelopes={}",
@@ -1346,9 +1360,17 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
                 "worker runtime not initialized for runtime control frames".into(),
             ));
         };
-        let result = source
+        let result = match source
             .on_control_frame_with_failure(envelopes.to_vec())
-            .await;
+            .await
+        {
+            Ok(()) => {
+                source
+                    .start_runtime_endpoints_with_failure(context.io_boundary())
+                    .await
+            }
+            Err(err) => Err(err),
+        };
         if result.is_ok() {
             let mut guard = self.state.lock().await;
             guard.last_control_frame_signals = summary.clone();
@@ -1436,7 +1458,7 @@ mod tests {
     use super::*;
     use capanix_app_sdk::raw::ChannelBoundary;
     use capanix_app_sdk::runtime::{
-        KernelResultEnvelope, LogLevel, StateCellReadRequest, StateCellWatchRequest,
+        EventMetadata, KernelResultEnvelope, LogLevel, StateCellReadRequest, StateCellWatchRequest,
         StateCellWriteRequest, in_memory_state_boundary,
     };
     use capanix_runtime_entry_sdk::control::{
@@ -1451,7 +1473,7 @@ mod tests {
     use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID};
     use crate::runtime::routes::{
         ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
-        ROUTE_KEY_SOURCE_ROOTS_CONTROL,
+        ROUTE_KEY_SOURCE_ROOTS_CONTROL, source_rescan_request_route_for,
     };
     use crate::source::config::GrantedMountRoot;
     use crate::source::config::RootSpec;
@@ -2622,6 +2644,122 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+
+        session
+            .on_close(&context)
+            .await
+            .expect("close source worker session");
+    }
+
+    #[tokio::test]
+    async fn worker_source_control_spawns_non_target_scoped_rescan_drain_after_broad_activation() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_watch_scan_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![test_export("node-a::nfs1", nfs1)],
+            ..SourceConfig::default()
+        };
+
+        let boundary = Arc::new(LoopbackPublishBoundary::default());
+        let context = WorkerSessionContext::new(
+            boundary.clone(),
+            boundary.clone(),
+            in_memory_state_boundary(),
+        );
+        let state = Arc::new(Mutex::new(SourceWorkerState {
+            source: None,
+            pending_init: None,
+            pump_task: None,
+            pump_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        }));
+        let mut session = SourceWorkerSession { state };
+
+        session
+            .on_init(NodeId("node-a-123".to_string()), cfg, &context)
+            .await
+            .expect("init source worker session");
+        session
+            .on_start(&context)
+            .await
+            .expect("start source worker session");
+
+        let local_route = source_rescan_request_route_for("node-a-123").0;
+        let non_target_route = source_rescan_request_route_for("node-b-456").0;
+        let scoped_wave = [
+            local_route.clone(),
+            non_target_route.clone(),
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+        ]
+        .into_iter()
+        .map(|route_key| {
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key,
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source scoped route activate")
+        })
+        .collect::<Vec<_>>();
+
+        let response = session
+            .handle_request(
+                SourceWorkerRequest::OnControlFrame {
+                    envelopes: scoped_wave,
+                },
+                &context,
+            )
+            .await
+            .expect("handle source scoped route control frame");
+        assert!(matches!(
+            response,
+            WorkerLoopControl::Continue(SourceWorkerResponse::Ack)
+        ));
+
+        boundary
+            .channel_send(
+                BoundaryContext::default(),
+                ChannelSendRequest {
+                    channel_key: ChannelKey(non_target_route.clone()),
+                    events: vec![Event::new(
+                        EventMetadata {
+                            origin_id: NodeId("api-node".to_string()),
+                            timestamp_us: 0,
+                            logical_ts: None,
+                            correlation_id: Some(77),
+                            ingress_auth: None,
+                            trace: None,
+                        },
+                        bytes::Bytes::from_static(b"manual-rescan"),
+                    )],
+                    timeout_ms: Some(100),
+                },
+            )
+            .await
+            .expect("send non-target scoped source rescan request");
+
+        let replies = boundary
+            .recv_route(&format!("{non_target_route}:reply"), 1000)
+            .await
+            .expect("non-target scoped source rescan route must drain with explicit reply");
+        assert!(
+            replies.iter().any(|event| {
+                event.metadata().origin_id == NodeId("node-a-123".to_string())
+                    && event.metadata().correlation_id == Some(77)
+                    && event.payload_bytes() == b"not-target"
+            }),
+            "non-target scoped source rescan drain must reply from the local source lane without recording another node's rescan intent: {replies:?}"
+        );
 
         session
             .on_close(&context)

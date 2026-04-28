@@ -140,6 +140,8 @@ version: 3.0.0
 12. **FORCE_FIND_EXPLICIT_UNAVAILABLE**: **fs-meta System** MUST represent unavailable `force-find` execution as explicit not-ready or group-level error evidence.
    > Responsibility: avoid silently dropping groups, returning empty success for unscanned groups, or substituting materialized results for failed fresh execution.
    > Verification: empty monitoring roots returns explicit `NOT_READY`; unavailable runtime grants or not-yet-built runner binding returns explicit `NOT_READY`; group-specific missing or unreachable runners return explicit per-group error.
+   > Verification: when a bound remote mount-root is no longer a mounted root, fresh execution fails closed as `HOST_FS_UNAVAILABLE`; fs-meta MUST NOT scan the empty underlying host directory and report it as a fresh success.
+   > Verification: when another current-epoch bound runner exists for the same logical group, fs-meta MUST route that same fresh group execution to the next bound runner before rendering the group as unavailable.
    > Covers L0: VISION.QUERY_OUTCOME.PARTIAL_FAILURE_ISOLATION
 
 13. **NO_CROSS_GROUP_ENTRY_MERGE**: **fs-meta System** MUST keep multi-group query payloads as independent group buckets and MUST NOT merge metadata from multiple groups into one synthetic tree page.
@@ -289,6 +291,7 @@ version: 3.0.0
    > Verification: if a group has completed materialized readiness evidence for the current Authority Epoch, a short-lived fan-in miss or delayed status refresh does not by itself downgrade that group from ready to not-ready.
    > Verification: materialized readiness evidence may still move to degraded when same-epoch evidence explicitly reports overflow, audit invalidation, stale-writer fencing, sink loss, or another domain failure; monotonicity protects against missing status, not against contradictory failure evidence.
    > Verification: any Authority Epoch change, including roots signature, grants signature, source stream generation, sink materialization generation, or facade/runtime generation changes, invalidates the cached materialized readiness evidence and requires fresh evidence for the new epoch.
+   > Verification: steady `/tree` and `/stats` reads MAY reuse cached same-epoch materialized readiness evidence instead of re-running full source/sink fan-in on every request, as long as the cache still matches the current Authority Epoch and no contradictory failure evidence has appeared.
    > Verification: cached materialized readiness evidence remains observation evidence only; it does not become authoritative truth and does not bypass trusted observation gates after an epoch change.
    > Covers L0: VISION.OBSERVATION_CONVERGENCE.OBSERVATION_IS_NOT_TRUTH, VISION.OBSERVATION_CONVERGENCE.OBSERVATION_ELIGIBILITY_BEFORE_EXPOSURE
 
@@ -338,6 +341,7 @@ version: 3.0.0
    > Verification: runtime/app startup logs or status evidence include the loaded artifact path and content hash.
    > Verification: deploy validation can compare the expected artifact hash with the actual loaded hash on every participating node.
    > Verification: demo/test harness fails closed when the run/bin artifact and the actually loaded runtime artifact differ.
+   > Verification: demo/test harness stale-artifact detection includes the fs-meta workspace and upstream capanix path dependencies that are linked into the runtime/app artifact, so cross-repo runtime, app SDK, or worker bridge changes cannot silently reuse an older cdylib.
    > Verification: path/hash evidence is sufficient for this baseline; specs do not require SBOM, signing, or supply-chain attestation for the current demo contract.
    > Covers L0: VISION.EVOLUTION_AND_OPERATIONS.RELEASE_GENERATION_UPGRADE
 
@@ -347,6 +351,11 @@ version: 3.0.0
    > Covers L0: VISION.QUERY_OUTCOME.RESOURCE_SCOPED_DOMAIN_HTTP_FACADE
    > Responsibility: preserve one stable external URL through ingress-resource selection without introducing a separate roaming API boundary.
    > Verification: fs-meta generation-control document binds the HTTP facade through `api.facade_resource_id`, declares `runtime.exec.facade` as `resource_visible_nodes + one`, and does not define a standalone roaming HTTP execution role outside the app package boundary.
+   > Verification: a normal fixed-bind facade handoff keeps the predecessor listener until the successor has runtime exposure proof; if the predecessor has already failed closed, the fixed-bind owner records that failure and the first pending successor for the same bind address MUST release the stale owner claim/listener instead of leaving a 503-only facade that blocks takeover.
+   > Verification: if runtime has already deactivated the predecessor and the predecessor is only continuity-retaining the fixed listener, a successor that has accepted desired control state but then fail-closes before exposure MUST release the continuity-retained predecessor through the bounded handoff path and expose its own fail-closed app boundary; it must not leave the predecessor serving requests from a drained/fenced runtime PID.
+   > Verification: after a bounded fixed-bind handoff releases a predecessor claim, facade/query publication decisions MUST refresh fixed-bind claim facts before suppressing dependent routes; a stale lifecycle snapshot MUST NOT keep treating the released predecessor as the current bind owner.
+   > Verification: a fixed-bind successor with an unconfirmed local facade publication MUST keep facade-dependent query routes suppressed even when the bind blocker is an external listener and therefore no in-process predecessor claim exists; bind completion is part of facade publication.
+   > Verification: once fixed-bind facade publication completes, retained facade-dependent sink-owned query/materialized route activates that were suppressed by the publication barrier MUST replay from retained desired state even if the follow-up control wave is source-only.
 8. **API_FAILOVER_RESCAN_REBUILD**: **fs-meta System** MUST rebuild materialized sink/query state on newly bound instances after unit failover via baseline scan/audit/rescan path.
    > Covers L0: VISION.OBSERVATION_CONVERGENCE.OBSERVATION_ELIGIBILITY_BEFORE_EXPOSURE
    > Responsibility: keep failover semantics explicit under in-memory observation ownership instead of implying durable truth transfer.
@@ -375,6 +384,7 @@ version: 3.0.0
    > Responsibility: keep unit dispatch deterministic and reject unknown/invalid execution units.
    > Verification: source/sink reject `ExecControl` or `UnitTick` envelopes with unknown `unit_id`.
    > Verification: source/sink ignore stale generation envelopes (`generation` regression) instead of rolling back newer unit state.
+   > Verification: source/sink treat forward-moving `UnitTick` generations as current keepalive/control evidence for already-active routes; a tick whose generation is greater than the retained activation generation MUST NOT force worker reconnect or retained-state replay by itself.
    > Verification: accepted unit ids stay domain-bounded (`runtime.exec.source` / `runtime.exec.scan` / `runtime.exec.sink`).
    > Verification: source/sink share one gate implementation (`RuntimeUnitGate`) to enforce identical allowlist/fencing semantics.
    > Verification: source/sink consume one centralized fs-meta execution-unit registry instead of duplicating raw unit-id string literals.
@@ -384,6 +394,27 @@ version: 3.0.0
    > Covers L0: VISION.APP_SCOPE.DOMAIN_CONTRACT_CONSUMPTION_ONLY
    > Responsibility: separate orchestration parsing from source/sink business logic and keep control ingestion deterministic.
    > Verification: top-level app and module-local control handlers call shared orchestration adapter translation first; business handlers consume typed signal enums instead of decoding control envelopes inline.
+   > Verification: same-worker source/sink control calls are serialized per handle; ticks and replay must not race retained-state replay on the same worker bridge, and transient tick followups are applied only after retained-state replay has had the first chance to recover.
+   > Verification: after retained source replay succeeds, a forward-moving tick followup is handled as local current tick evidence instead of reopening the source worker path; generation-regressed ticks are ignored.
+   > Verification: retryable source/sink control-reset recovery restarts or reacquires the affected worker path without waiting for the same in-flight control handoff that reported the reset.
+   > Verification: source post-ack scheduled-group refresh separates total recovery budget from per-RPC attempt budget, and the total deadline covers every refresh lane including worker start, retained replay, client acquisition, grant refresh, and group fetch so one slow or dead worker bridge cannot consume all retry/reacquire time.
+   > Verification: release cutover source waves that have already retained desired source state, including post-initial source activation waves split by runtime unit dispatch as source-only, source+facade, or mixed source/sink companion frames, MUST fail closed inside the app boundary on retryable source worker reset instead of blocking the process-level apply/quorum path on inline source replay.
+   > Verification: a later tick, cleanup, or empty replay control frame that wakes retained generation-cutover source replay MUST use the same fail-closed process-boundary rule on retryable source worker reset; it MUST preserve retained replay for the recovery lane rather than spend the process-level apply/quorum budget on inline retries. A later non-empty source recovery wave MAY perform one bounded apply of current desired state, and MUST still fail closed at the app boundary if the worker path is not ready.
+   > Verification: mixed cleanup followups such as source `restart_deferred_retire_pending` plus sink tick/cleanup are cleanup waves, not new business apply waves; retryable source or sink worker reset MUST fail closed at the app boundary and MUST NOT inline retained replay in the process-level apply/quorum path.
+   > Verification: after that fail-closed release cutover, source/sink owners MUST keep or immediately republish bounded internal status recovery lanes for their assigned groups while materialized/query exposure remains closed; recovery MUST NOT depend on a later control tick or an external facade request landing on the same non-public owner.
+   > Verification: while runtime control is already fail-closed, cleanup-only query and per-peer sink logical-roots deactivates MUST update retained route state locally and MUST NOT re-enter the sink worker bridge; cleanup cannot keep management writes unavailable behind retired worker RPCs.
+   > Verification: once a successor fixed-bind HTTP facade is actively serving, cleanup-only query/facade tails from the failed cutover MUST NOT withdraw the serving facade's core business read lanes (`find`, materialized query proxy, sink-status) while runtime control is still fail-closed; stale auxiliary source-status/source-find lanes may still be withdrawn.
+   > Verification: exhausted source/sink worker-control recovery fails closed inside the fs-meta app boundary and preserves retained replay state; worker-path timeout/channel-close/reset evidence MUST NOT be returned as a process-boundary `Timeout`/`ChannelClosed`/`TransportClosed` from `on_control_frame`.
+   > Verification: source status/observability reads that find retained source replay pending MUST perform a bounded retained-state replay repair before reporting `not started` when no newer source control frame has arrived; recovery MUST NOT depend on a future runtime tick to reopen the source worker path.
+   > Verification: source-status route ownership MUST follow active `runtime.exec.source` runtime-scope ownership. Query/facade lanes may aggregate source-status evidence, but a source-status endpoint MUST NOT require a query or query-peer facade route before serving source-owned runtime-scope readiness evidence.
+   > Verification: manual-rescan current-roots readiness MUST aggregate routed peer source-status evidence together with same-node source owner observation before deciding source runtime-scope readiness; peer fanout alone is not authoritative for the sender-local source owner.
+   > Verification: recovery progress waits are satisfied only by runtime-change evidence or by a bounded observation window completing; a fast source/sink snapshot read without new progress evidence MUST NOT immediately complete the wait loop.
+   > Verification: source-to-sink convergence pretrigger is an initial-boot assist only; replay-required recovery waves must let retained source/sink replay clear before follow-up rescan work is submitted.
+   > Verification: internal query/status endpoint reply `Backpressure` is bounded transient pressure; endpoint loops preserve liveness instead of relying on route respawn churn.
+   > Verification: consecutive worker-bridge transport-close evidence while receiving on an app-owned request endpoint is stale endpoint evidence, not reply pressure; the endpoint MUST exit with terminal reason evidence so the next runtime endpoint reconciliation can prune and rearm the same product route on the current boundary.
+   > Verification: when an app-owned internal endpoint is cancelled or pruned for generation cutover, it MUST stop its receive loop without permanently closing the reusable request route or derived reply route; the replacement endpoint for the same route key MUST be able to serve the first management/API request in the same recovery turn.
+   > Verification: app close MUST stop app-owned internal endpoint loops before deciding source/sink worker handles are still shared; endpoint-held worker references MUST NOT suppress external-worker shutdown during release retire.
+   > Verification: steady control-frame, status-endpoint, and endpoint request lifecycle diagnostics MUST be opt-in or bounded state-change summaries by default; full control payloads and per-batch normal-path logs MUST NOT become steady CPU/IO workload during operations gates.
 14. **ORCHESTRATION_TOKEN_PARSING_BOUNDARY**: **fs-meta System** MUST keep raw `unit_id/runtime.exec.*` parsing in orchestration adapter boundary modules only.
    > Covers L0: VISION.APP_SCOPE.DOMAIN_CONTRACT_CONSUMPTION_ONLY
    > Responsibility: avoid orchestration token leakage into pure source/sink compute paths.
@@ -421,6 +452,9 @@ version: 3.0.0
    > Verification: API facade liveness means the product HTTP namespace can accept and authenticate requests; it does not by itself authorize roots apply, rescan, query-api-key mutation, or trusted-materialized query success.
    > Verification: management write readiness requires an active current-epoch control stream capable of safely submitting management writes; `PUT /monitoring/roots`, `POST /index/rescan`, and query-api-key management writes MUST fail closed with explicit not-ready semantics when this plane is closed.
    > Verification: trusted observation readiness is governed by materialized readiness evidence and observation eligibility; it is not opened by management write readiness alone.
+   > Verification: trusted-materialized root `/tree` fails closed with explicit not-ready evidence when no current sink schedule or cached sink status exists; on a routed facade, "no current sink schedule" is determined after peer sink-status fan-in, not from the local facade process alone. Source/sink status fan-in is collected independently so one slow status route does not serialize the other.
+   > Verification: trusted-materialized root `/tree` may rescue a selected owner route gap through bounded generic query-proxy evidence only when that evidence returns a non-empty same-group same-path materialized payload; proxy timeout, empty payload, or mismatched group/path remains fail-closed.
+   > Verification: steady management `/status` may skip remote status fan-in when same-node source root-health and same-node sink readiness already prove the active status groups; route-schedule maps are diagnostics and must not become mandatory work for every poll.
    > Verification: `/status` and read-only diagnostics MAY remain available when management write readiness or trusted observation readiness is closed, as long as they report the closed plane explicitly.
    > Covers L0: VISION.API_BOUNDARY.BOUNDED_PRODUCT_MANAGEMENT_NAMESPACE, VISION.OBSERVATION_CONVERGENCE.OBSERVATION_ELIGIBILITY_BEFORE_EXPOSURE
 
@@ -438,7 +472,9 @@ version: 3.0.0
 7. **MANUAL_RESCAN_OPERATION**: **fs-meta System** MUST provide explicit manual rescan operation to repair index drift and watch-loss conditions.
    > Covers L0: VISION.API_BOUNDARY.ONLINE_SCOPE_MUTATION_AND_REPAIR
    > Responsibility: offer deterministic operator-triggered repair path independent of periodic audit cadence.
-   > Verification: manual rescan API triggers source rescan on group-primary pipelines only and returns accepted operation response.
+   > Verification: manual rescan API triggers source rescan on group-primary pipelines only and returns accepted operation response; scoped runtime delivery evidence targets source-primary runner nodes proven by current source runtime-scope observation, not every host grant that matches the logical root. If prior source-primary refs point outside the current runtime-scope, scoped delivery uses the stable current runtime-scope source-primary choice instead of the stale ref.
+   > Verification: node-scoped manual-rescan delivery is owned by the source node named by the scoped route. Non-target evidence may appear only as stale or transport-level supplementary evidence; app source workers MUST NOT intentionally attach peer-scoped manual-rescan consumers, and accepted delivery still requires explicit evidence from the target source-primary runner.
+   > Verification: node-scoped manual-rescan delivery MUST use the standard fs-meta scoped route exchange, with the reply lane armed before sending the request. A direct one-off reply-channel poll is not sufficient delivery evidence for an accepted scoped rescan.
    > Verification: in a runtime-managed deployment, manual rescan is a cluster-level repair wave: the API MUST publish a cluster manual-rescan signal so every node that owns a source-primary root can rescan, and MUST NOT rely only on one selected runtime control route.
    > Verification: manual rescan republishes current root evidence for selected primary roots so newly reopened sink materialization paths can catch up even when file contents are unchanged.
    > Verification: manual rescan requires Management Write Ready; HTTP facade liveness alone is insufficient to enqueue repair work.

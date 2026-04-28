@@ -119,6 +119,10 @@
                 api_task: app_1.api_task.clone(),
                 api_request_tracker: app_1.api_request_tracker.clone(),
                 api_control_gate: app_1.api_control_gate.clone(),
+                control_failure_uninitialized: app_1.control_failure_uninitialized.clone(),
+                retained_active_facade_continuity: app_1
+                    .retained_active_facade_continuity
+                    .clone(),
             },
         );
 
@@ -335,6 +339,10 @@
                 api_task: app_1.api_task.clone(),
                 api_request_tracker: app_1.api_request_tracker.clone(),
                 api_control_gate: app_1.api_control_gate.clone(),
+                control_failure_uninitialized: app_1.control_failure_uninitialized.clone(),
+                retained_active_facade_continuity: app_1
+                    .retained_active_facade_continuity
+                    .clone(),
             },
         );
 

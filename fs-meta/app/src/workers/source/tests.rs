@@ -37,8 +37,9 @@ use crate::runtime::execution_units::{
     SINK_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
 };
 use crate::runtime::routes::{
-    ROUTE_KEY_QUERY, ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
-    ROUTE_KEY_SOURCE_ROOTS_CONTROL,
+    METHOD_SOURCE_RESCAN, ROUTE_KEY_QUERY, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
+    ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_TOKEN_FS_META_INTERNAL,
+    source_rescan_request_route_for, source_rescan_route_bindings_for,
 };
 use crate::sink::SinkFileMeta;
 use crate::workers::sink::SinkWorkerClientHandle;
@@ -54,7 +55,29 @@ mod real_nfs_lab {
 struct LoopbackWorkerBoundary {
     channels: AsyncMutex<HashMap<String, Vec<Event>>>,
     closed: StdMutex<HashSet<String>>,
+    close_history: StdMutex<Vec<String>>,
     changed: Notify,
+}
+
+impl LoopbackWorkerBoundary {
+    fn closed_channels_snapshot(&self) -> Vec<String> {
+        let mut channels = self
+            .closed
+            .lock()
+            .expect("loopback closed lock")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        channels.sort();
+        channels
+    }
+
+    fn close_history_snapshot(&self) -> Vec<String> {
+        self.close_history
+            .lock()
+            .expect("loopback close history lock")
+            .clone()
+    }
 }
 
 struct SourceWorkerUpdateRootsHookReset;
@@ -213,7 +236,7 @@ fn source_control_frame_machine_owns_generation_one_timeout_reset_retry_lane() {
             Some(SourceControlFrameLaneInspect::Attempt)
         ) && matches!(
             terminal_reconnect.inspect(),
-            Some(SourceControlFrameLaneInspect::Reconnect)
+            Some(SourceControlFrameLaneInspect::FailClosedReconnect)
         ) && matches!(
             terminal_action.terminal_error(),
             Some(CnxError::ChannelClosed)
@@ -247,6 +270,31 @@ fn source_control_frame_machine_owns_retry_resume_followup_lane() {
                 Some(SourceControlFrameLaneInspect::Attempt)
             ),
         "source control-frame machine should resume reconnect retry into wait and attempt lanes through machine-held reconnect state instead of composite reconnect effect variants",
+    );
+}
+
+#[test]
+fn source_control_frame_machine_fails_fast_restart_deferred_timeout_like_reset() {
+    let mut machine = source_control_frame_test_machine();
+    machine.bridge_reset_policy = SourceControlFrameBridgeResetPolicy::ReconnectThenFail;
+
+    let reconnect = machine.action_after_error(
+        CnxError::Internal("operation timed out".to_string()),
+        SourceProgressState::default(),
+    );
+    let terminal = machine
+        .advance(SourceControlFrameEvent::ReconnectCompleted)
+        .expect("cleanup timeout-like reset should reconnect once before surfacing fail-closed");
+
+    assert!(
+        matches!(
+            reconnect.inspect(),
+            Some(SourceControlFrameLaneInspect::FailClosedReconnect)
+        ) && matches!(
+            terminal.terminal_error(),
+            Some(CnxError::Internal(message)) if message.contains("operation timed out")
+        ),
+        "restart-deferred cleanup timeout-like stale bridge evidence must fail closed after one reconnect instead of spending the whole source control retry budget",
     );
 }
 
@@ -712,20 +760,20 @@ fn source_update_logical_roots_machine_owns_wait_retry_and_timeout_terminal_lane
 }
 
 #[test]
-fn source_observability_snapshot_machine_owns_wait_retry_and_timeout_terminal_lanes() {
+fn source_observability_snapshot_machine_owns_reconnect_retry_and_timeout_terminal_lanes() {
     let machine = SourceObservabilitySnapshotMachine::new(
         source_machine_test_future_deadline(),
         Duration::from_millis(250),
     );
-    let wait = machine
+    let reconnect = machine
         .advance(SourceObservabilitySnapshotEvent::AttemptCompleted {
             rpc_result: Err(CnxError::Timeout),
             after: SourceProgressState::default(),
         })
-        .expect("retryable observability timeout should enter explicit wait lane");
+        .expect("retryable observability timeout should enter explicit reconnect lane");
     let retry = machine
-        .advance(SourceObservabilitySnapshotEvent::WaitCompleted)
-        .expect("wait completion should resume observability attempt lane");
+        .advance(SourceObservabilitySnapshotEvent::ReconnectCompleted)
+        .expect("reconnect completion should resume observability attempt lane");
     let expired_machine = SourceObservabilitySnapshotMachine::new(
         source_machine_test_expired_deadline(),
         Duration::from_millis(250),
@@ -738,7 +786,7 @@ fn source_observability_snapshot_machine_owns_wait_retry_and_timeout_terminal_la
         .expect("expired observability deadline should produce a terminal timeout lane");
 
     assert!(
-        matches!(wait, SourceObservabilitySnapshotEffect::Wait { .. })
+        matches!(reconnect, SourceObservabilitySnapshotEffect::Reconnect)
             && matches!(retry, SourceObservabilitySnapshotEffect::Attempt { .. })
             && matches!(
                 terminal,
@@ -748,7 +796,7 @@ fn source_observability_snapshot_machine_owns_wait_retry_and_timeout_terminal_la
                         SourceRetryBudgetExhaustionKind::OperationWait,
                     )
             ),
-        "source observability machine should own explicit wait-retry and deadline-timeout lanes instead of helper-owned retry state",
+        "source observability machine should own explicit reconnect-retry and deadline-timeout lanes instead of helper-owned retry state",
     );
 }
 
@@ -787,6 +835,98 @@ fn source_replay_retained_control_state_machine_owns_reconnect_retry_and_timeout
             ),
         "source retained-control replay machine should own explicit reconnect and wait retry lanes instead of drifting back to composite reconnect helpers",
     );
+}
+
+#[test]
+fn source_replay_retained_control_state_attempt_timeout_keeps_refresh_recovery_margin() {
+    assert!(
+        SOURCE_WORKER_SCHEDULE_REFRESH_RPC_TIMEOUT < SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT,
+        "post-ack scheduled-group refresh needs retry margin beyond any single retained-control replay attempt"
+    );
+
+    let machine = SourceReplayRetainedControlStateMachine::new(
+        std::time::Instant::now() + SOURCE_WORKER_SCHEDULE_REFRESH_TOTAL_TIMEOUT,
+    );
+    let SourceReplayRetainedControlStateEffect::Attempt { timeout } = machine.start() else {
+        panic!("fresh retained-control replay should start with an attempt");
+    };
+
+    assert!(
+        timeout <= SOURCE_WORKER_SCHEDULE_REFRESH_RPC_TIMEOUT,
+        "retained-control replay inside post-ack schedule refresh must use the short per-RPC cap, got {timeout:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_scheduled_groups_refresh_total_deadline_bounds_delayed_fetch_lane() {
+    struct SourceWorkerScheduledGroupsRefreshDelayHookReset;
+
+    impl Drop for SourceWorkerScheduledGroupsRefreshDelayHookReset {
+        fn drop(&mut self) {
+            clear_source_worker_scheduled_groups_refresh_delay_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![worker_source_root("nfs1", &nfs1)],
+        host_object_grants: vec![worker_source_export(
+            "node-a::nfs1",
+            "node-a",
+            "10.0.0.11",
+            nfs1.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+    let worker_instance_id = client.worker_instance_id_for_tests().await;
+
+    let _delay_reset = SourceWorkerScheduledGroupsRefreshDelayHookReset;
+    install_source_worker_scheduled_groups_refresh_delay_hook(
+        SourceWorkerScheduledGroupsRefreshDelayHook {
+            delays: std::collections::VecDeque::from([Duration::from_millis(500)]),
+            sticky_worker_instance_id: Some(worker_instance_id),
+        },
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(250),
+        client.refresh_cached_scheduled_groups_from_live_worker_until(
+            std::time::Instant::now() + Duration::from_millis(50),
+            SourceScheduledGroupsExpectation::ExpectLocalRunnableGroups,
+        ),
+    )
+    .await
+    .expect("scheduled-groups refresh must honor its own total deadline");
+    let err = result.expect_err("delayed fetch lane should exhaust the refresh deadline");
+    let CnxError::Internal(message) = err.into_error() else {
+        panic!("deadline exhaustion should surface as a sharp refresh exhaustion error");
+    };
+    assert!(
+        message.contains("post-ack scheduled-groups refresh exhausted before scheduled groups converged (timeout)"),
+        "delayed fetch lane should be classified as refresh timeout, got: {message}"
+    );
+
+    client.close().await.expect("close source worker");
 }
 
 #[test]
@@ -841,6 +981,8 @@ fn source_operations_hard_cut_removed_generic_operation_machine_family() {
         "enum SourceUpdateLogicalRootsEvent {",
         "enum SourceObservabilitySnapshotEffect {",
         "enum SourceObservabilitySnapshotEvent {",
+        "SourceObservabilitySnapshotEffect::Reconnect",
+        "SourceObservabilitySnapshotEvent::ReconnectCompleted",
         "enum SourceStartEffect {",
         "enum SourceStartEvent {",
         "enum SourceReplayRetainedControlStateEffect {",
@@ -876,7 +1018,6 @@ fn source_operations_hard_cut_removed_generic_operation_machine_family() {
         "async fn execute_update_logical_roots_attempt(",
         "async fn execute_update_logical_roots_wait(",
         "async fn execute_observability_snapshot_attempt(",
-        "async fn execute_observability_snapshot_wait(",
         "async fn execute_start_attempt(",
         "async fn execute_scheduled_groups_refresh_ensure_started(",
         "async fn execute_scheduled_groups_refresh_acquire_client(",
@@ -2470,6 +2611,42 @@ impl Drop for SourceWorkerObservabilityCallCountHookReset {
     }
 }
 
+struct SourceWorkerObservabilityDelayHookReset;
+
+impl Drop for SourceWorkerObservabilityDelayHookReset {
+    fn drop(&mut self) {
+        clear_source_worker_observability_delay_hook();
+    }
+}
+
+async fn source_worker_observability_hook_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| AsyncMutex::new(())).lock().await
+}
+
+fn clear_cached_worker_observability_debug_maps_for_test(client: &SourceWorkerClientHandle) {
+    client.with_cache_mut(|cache| {
+        cache.last_force_find_runner_by_group = Some(std::collections::BTreeMap::new());
+        cache.force_find_inflight_groups = Some(Vec::new());
+        cache.scheduled_source_groups_by_node = Some(std::collections::BTreeMap::new());
+        cache.scheduled_scan_groups_by_node = Some(std::collections::BTreeMap::new());
+        cache.last_control_frame_signals_by_node = Some(std::collections::BTreeMap::new());
+        cache.published_batches_by_node = Some(std::collections::BTreeMap::new());
+        cache.published_events_by_node = Some(std::collections::BTreeMap::new());
+        cache.published_control_events_by_node = Some(std::collections::BTreeMap::new());
+        cache.published_data_events_by_node = Some(std::collections::BTreeMap::new());
+        cache.last_published_at_us_by_node = Some(std::collections::BTreeMap::new());
+        cache.last_published_origins_by_node = Some(std::collections::BTreeMap::new());
+        cache.published_origin_counts_by_node = Some(std::collections::BTreeMap::new());
+        cache.published_path_capture_target = None;
+        cache.enqueued_path_origin_counts_by_node = Some(std::collections::BTreeMap::new());
+        cache.pending_path_origin_counts_by_node = Some(std::collections::BTreeMap::new());
+        cache.yielded_path_origin_counts_by_node = Some(std::collections::BTreeMap::new());
+        cache.summarized_path_origin_counts_by_node = Some(std::collections::BTreeMap::new());
+        cache.published_path_origin_counts_by_node = Some(std::collections::BTreeMap::new());
+    });
+}
+
 struct SourceWorkerScheduledGroupsErrorHookReset;
 
 impl Drop for SourceWorkerScheduledGroupsErrorHookReset {
@@ -2561,6 +2738,10 @@ impl ChannelIoSubset for LoopbackWorkerBoundary {
     }
 
     fn channel_close(&self, _ctx: BoundaryContext, channel: ChannelKey) -> Result<()> {
+        self.close_history
+            .lock()
+            .expect("loopback close history lock")
+            .push(channel.0.clone());
         self.closed
             .lock()
             .expect("loopback closed lock")
@@ -3601,6 +3782,7 @@ fn normalize_observability_snapshot_scheduled_group_keys_preserves_explicit_empt
         &mut snapshot,
         &node_id,
         Some(&cached_grants),
+        None,
     );
 
     assert_eq!(
@@ -3919,8 +4101,10 @@ fn source_control_state_classifies_tick_only_replay_paths_from_canonical_state()
     );
     let matching_tick =
         source_control_state_test_tick_signal(SourceRuntimeUnit::Source, "query.stream", 2);
-    let mismatched_tick =
+    let advanced_tick =
         source_control_state_test_tick_signal(SourceRuntimeUnit::Source, "query.stream", 3);
+    let stale_tick =
+        source_control_state_test_tick_signal(SourceRuntimeUnit::Source, "query.stream", 1);
 
     let mut state = SourceControlState::default();
     state.retain_signals(&[activate.clone()]);
@@ -3943,10 +4127,50 @@ fn source_control_state_classifies_tick_only_replay_paths_from_canonical_state()
     );
     assert!(
         matches!(
-            state.classify_tick_only_wave(&[mismatched_tick]),
-            Some(SourceControlFrameTickOnlyDisposition::Reconnect)
+            state.classify_tick_only_wave(&[advanced_tick.clone()]),
+            Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay)
         ),
-        "generation-mismatched tick-only followups must reconnect and replay from canonical state",
+        "generation-advanced tick-only followups must replay retained control state when replay remains armed",
+    );
+    state.take_replay_state();
+    match state.classify_tick_only_wave(&[advanced_tick.clone()]) {
+        Some(SourceControlFrameTickOnlyDisposition::RetainedTickFastPath { signals }) => {
+            assert_eq!(signals.len(), 1);
+            match &signals[0] {
+                SourceControlSignal::Tick {
+                    unit,
+                    route_key,
+                    generation,
+                    ..
+                } => {
+                    assert_eq!(*unit, SourceRuntimeUnit::Source);
+                    assert_eq!(route_key, "query.stream");
+                    assert_eq!(*generation, 3);
+                }
+                other => panic!("expected retained generation-advanced tick, got {other:?}"),
+            }
+        }
+        other => panic!("expected generation-advanced source tick fast path, got {other:?}"),
+    }
+    match state.classify_tick_only_wave(&[stale_tick]) {
+        Some(SourceControlFrameTickOnlyDisposition::RetainedTickFastPath { signals }) => {
+            assert!(
+                signals.is_empty(),
+                "generation-regressed source tick must be ignored without reopening the worker path"
+            );
+        }
+        other => panic!("expected stale source tick no-op fast path, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            state.classify_tick_only_wave(&[source_control_state_test_tick_signal(
+                SourceRuntimeUnit::Scan,
+                "missing.stream",
+                3,
+            )]),
+            None
+        ),
+        "tick-only followups for unknown routes must not be fast-pathed",
     );
     assert!(
         matches!(state.classify_tick_only_wave(&[activate]), None),
@@ -4089,11 +4313,16 @@ async fn publish_manual_rescan_signal_succeeds_without_started_worker_and_update
     )
     .expect("construct manual rescan signal cell");
     let offset = signal.current_seq();
+    let cache_epoch_before = client.cached_materialized_read_cache_epoch();
 
     client
         .publish_manual_rescan_signal_with_failure()
         .await
         .expect("publish manual rescan signal without started worker");
+    assert!(
+        client.cached_materialized_read_cache_epoch() > cache_epoch_before,
+        "manual rescan publication must invalidate same-authority materialized read caches before the worker starts"
+    );
 
     let (_next, updates) = signal
         .watch_since(offset)
@@ -4823,6 +5052,7 @@ async fn status_snapshot_retries_stale_drained_fenced_pid_errors() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn observability_snapshot_nonblocking_retries_stale_drained_fenced_pid_errors() {
+    let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -4955,6 +5185,7 @@ async fn observability_snapshot_nonblocking_retries_stale_drained_fenced_pid_err
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn observability_snapshot_nonblocking_retries_bound_route_unexpected_correlation_protocol_violation()
  {
+    let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -5086,6 +5317,7 @@ async fn observability_snapshot_nonblocking_retries_bound_route_unexpected_corre
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn observability_snapshot_nonblocking_retries_peer_bridge_stopped_errors_after_begin() {
+    let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -5207,6 +5439,220 @@ async fn observability_snapshot_nonblocking_retries_peer_bridge_stopped_errors_a
         snapshot.status.degraded_roots.is_empty(),
         "live observability snapshot after bridge-stopped retry should not degrade: {:?}",
         snapshot.status.degraded_roots
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observability_snapshot_nonblocking_replays_retained_source_control_after_worker_rebind_without_new_control_wave()
+ {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: vec![
+            worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+            worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = Arc::new(
+        SourceWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client"),
+    );
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                ],
+            }))
+            .expect("encode source-scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    client
+        .reconnect_shared_worker_client_with_failure()
+        .await
+        .expect("rebind source worker client and arm retained replay");
+
+    let snapshot = tokio::time::timeout(
+        Duration::from_secs(7),
+        SourceFacade::Worker(client.clone().into())
+            .observability_snapshot_nonblocking_for_status_route(),
+    )
+    .await
+    .expect("observability replay repair should stay bounded")
+    .0;
+
+    let expected = vec!["nfs1".to_string(), "nfs2".to_string()];
+    assert_ne!(
+        snapshot.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
+        "source observability should replay retained source control instead of returning not-started after a worker rebind with no new control wave: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.scheduled_source_groups_by_node.get("node-d"),
+        Some(&expected),
+        "source observability replay repair should restore source scheduled groups: {:?}",
+        snapshot.scheduled_source_groups_by_node
+    );
+    assert_eq!(
+        snapshot.scheduled_scan_groups_by_node.get("node-d"),
+        Some(&expected),
+        "source observability replay repair should restore scan scheduled groups: {:?}",
+        snapshot.scheduled_scan_groups_by_node
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn observability_snapshot_with_failure_replays_retained_source_control_after_worker_rebind_without_new_control_wave()
+ {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: vec![
+            worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+            worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = Arc::new(
+        SourceWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client"),
+    );
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                ],
+            }))
+            .expect("encode source-scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    client
+        .reconnect_shared_worker_client_with_failure()
+        .await
+        .expect("rebind source worker client and arm retained replay");
+
+    let facade = SourceFacade::Worker(client.clone().into());
+    let snapshot = tokio::time::timeout(
+        Duration::from_secs(7),
+        facade.observability_snapshot_with_failure(),
+    )
+    .await
+    .expect("blocking observability replay repair should stay bounded")
+    .expect("blocking observability should repair retained replay");
+
+    let expected = vec!["nfs1".to_string(), "nfs2".to_string()];
+    assert_ne!(
+        snapshot.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
+        "blocking source observability should replay retained source control instead of reporting a not-started worker after a rebind: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.scheduled_source_groups_by_node.get("node-d"),
+        Some(&expected),
+        "blocking source observability replay repair should restore source scheduled groups: {:?}",
+        snapshot.scheduled_source_groups_by_node
+    );
+    assert_eq!(
+        snapshot.scheduled_scan_groups_by_node.get("node-d"),
+        Some(&expected),
+        "blocking source observability replay repair should restore scan scheduled groups: {:?}",
+        snapshot.scheduled_scan_groups_by_node
+    );
+    assert!(
+        !facade.retained_replay_required().await,
+        "blocking source observability should clear the retained replay flag after successful repair"
     );
 
     client.close().await.expect("close source worker");
@@ -7795,6 +8241,151 @@ async fn generation_two_fs_source_selected_wave_reacquires_worker_client_after_c
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generation_two_channel_closed_recovery_rearms_scoped_manual_rescan_endpoint() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let node_id = NodeId("node-c-29775497172756365788053506".to_string());
+    let cfg = SourceConfig {
+        roots: vec![worker_watch_scan_root("nfs1", &nfs1)],
+        host_object_grants: Vec::new(),
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = Arc::new(
+        SourceWorkerClientHandle::new(
+            node_id.clone(),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client"),
+    );
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    let local_rescan_route = source_rescan_request_route_for(&node_id.0).0;
+    let source_wave = |generation| {
+        vec![
+            encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+                version: generation,
+                grants: vec![worker_route_export(
+                    "node-c::nfs1",
+                    "node-c",
+                    "10.0.0.23",
+                    &nfs1,
+                )],
+            })
+            .expect("encode runtime host grants changed"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-c::nfs1"])],
+            }))
+            .expect("encode source roots activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-c::nfs1"])],
+            }))
+            .expect("encode source rescan-control activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: local_rescan_route.clone(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-c::nfs1"])],
+            }))
+            .expect("encode scoped source rescan activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: local_rescan_route.clone(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-c::nfs1"])],
+            }))
+            .expect("encode scoped scan rescan activate"),
+        ]
+    };
+
+    client
+        .on_control_frame(source_wave(1))
+        .await
+        .expect("initial scoped source-rescan control wave should succeed");
+
+    let previous_instance_id = client.worker_instance_id_for_tests().await;
+    let _reset = SourceWorkerControlFrameErrorHookReset;
+    install_source_worker_control_frame_error_hook(SourceWorkerControlFrameErrorHook {
+        err: CnxError::ChannelClosed,
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(4),
+        client.on_control_frame(source_wave(2)),
+    )
+    .await
+    .expect("generation-two scoped rescan replay should reacquire a fresh worker client")
+    .expect("generation-two scoped rescan replay should recover after channel-closed reset");
+
+    let next_instance_id = client.worker_instance_id_for_tests().await;
+    assert_ne!(
+        next_instance_id, previous_instance_id,
+        "generation-two channel-closed recovery must reacquire a fresh shared source worker client instance"
+    );
+
+    let adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+        source_rescan_route_bindings_for(&node_id.0),
+    );
+    assert!(
+        !boundary
+            .closed_channels_snapshot()
+            .iter()
+            .any(|channel| channel == &local_rescan_route
+                || channel == &format!("{local_rescan_route}:reply")),
+        "generation-two recovery must not leave the scoped manual-rescan request/reply lanes closed before the first API rescan: closed={:?} history={:?}",
+        boundary.closed_channels_snapshot(),
+        boundary.close_history_snapshot()
+    );
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_RESCAN,
+        bytes::Bytes::from_static(b"manual-rescan"),
+        Duration::from_secs(2),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("scoped manual-rescan endpoint must be receive-armed after channel-closed replay");
+
+    assert!(
+        events.iter().any(|event| {
+            event.metadata().origin_id == node_id && event.payload_bytes() == b"accepted"
+        }),
+        "generation-two replay must rearm the source-owned scoped manual-rescan endpoint before the first management rescan: {events:?}"
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn generation_two_fs_source_selected_wave_reacquires_worker_client_after_sticky_stale_drained_fenced_pid_error_during_post_ack_schedule_refresh()
  {
     struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
@@ -9727,10 +10318,17 @@ async fn generation_two_real_source_route_post_ack_schedule_refresh_schedule_rpc
 async fn generation_two_real_source_route_replay_required_post_ack_schedule_refresh_reacquires_live_worker_after_repeated_timeouts()
  {
     struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+    struct SourceWorkerScheduledGroupsRefreshDelayHookReset;
 
     impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
         fn drop(&mut self) {
             clear_source_worker_scheduled_groups_refresh_error_queue_hook();
+        }
+    }
+
+    impl Drop for SourceWorkerScheduledGroupsRefreshDelayHookReset {
+        fn drop(&mut self) {
+            clear_source_worker_scheduled_groups_refresh_delay_hook();
         }
     }
 
@@ -9845,6 +10443,13 @@ async fn generation_two_real_source_route_replay_required_post_ack_schedule_refr
     let replay_required_instance_id = client.worker_instance_id_for_tests().await;
 
     let _reset = SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
+    let _delay_reset = SourceWorkerScheduledGroupsRefreshDelayHookReset;
+    install_source_worker_scheduled_groups_refresh_delay_hook(
+        SourceWorkerScheduledGroupsRefreshDelayHook {
+            delays: std::collections::VecDeque::from([Duration::from_millis(2100)]),
+            sticky_worker_instance_id: Some(replay_required_instance_id),
+        },
+    );
     install_source_worker_scheduled_groups_refresh_error_queue_hook(
         SourceWorkerScheduledGroupsRefreshErrorQueueHook {
             errs: std::iter::repeat_with(|| CnxError::Timeout)
@@ -11365,12 +11970,9 @@ async fn external_source_worker_stream_batches_reach_sink_worker_for_each_schedu
             .expect("scan groups")
             .unwrap_or_default();
         let sink_groups = sink
-            .status_snapshot_with_failure()
+            .scheduled_group_ids()
             .await
             .expect("sink status")
-            .scheduled_groups_by_node
-            .get("node-a")
-            .cloned()
             .unwrap_or_default()
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
@@ -11828,12 +12430,17 @@ async fn external_source_worker_nonblocking_observability_preserves_scheduled_gr
         .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
         .await
         .expect("prime cached observability snapshot");
-    assert!(
-        primed.scheduled_source_groups_by_node.is_empty()
-            && primed.scheduled_scan_groups_by_node.is_empty(),
-        "baseline cached observability should start empty: source={:?} scan={:?}",
-        primed.scheduled_source_groups_by_node,
-        primed.scheduled_scan_groups_by_node
+    let expected = std::collections::BTreeMap::from([(
+        "node-a".to_string(),
+        vec!["nfs1".to_string(), "nfs2".to_string()],
+    )]);
+    assert_eq!(
+        primed.scheduled_source_groups_by_node, expected,
+        "baseline cached observability should expose configured source groups"
+    );
+    assert_eq!(
+        primed.scheduled_scan_groups_by_node, expected,
+        "baseline cached observability should expose configured scan groups"
     );
 
     client
@@ -11866,10 +12473,6 @@ async fn external_source_worker_nonblocking_observability_preserves_scheduled_gr
         .await
         .expect("apply source+scan control");
 
-    let expected = std::collections::BTreeMap::from([(
-        "node-a".to_string(),
-        vec!["nfs1".to_string(), "nfs2".to_string()],
-    )]);
     let local_source_groups = client
         .scheduled_source_group_ids()
         .await
@@ -11913,6 +12516,7 @@ async fn external_source_worker_nonblocking_observability_preserves_scheduled_gr
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nonblocking_observability_reissues_live_rpc_when_recent_cache_is_active_but_debug_empty() {
+    let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
     let _hook_reset = SourceWorkerObservabilityCallCountHookReset;
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
@@ -12012,10 +12616,14 @@ async fn nonblocking_observability_reissues_live_rpc_when_recent_cache_is_active
     incomplete.summarized_path_origin_counts_by_node.clear();
     incomplete.published_path_origin_counts_by_node.clear();
     client.update_cached_observability_snapshot(&incomplete);
+    clear_cached_worker_observability_debug_maps_for_test(&client);
 
     let observability_rpc_count = Arc::new(AtomicUsize::new(0));
     install_source_worker_observability_call_count_hook(SourceWorkerObservabilityCallCountHook {
         count: observability_rpc_count.clone(),
+    });
+    client.with_cache_mut(|cache| {
+        cache.last_live_observability_snapshot_at = Some(Instant::now());
     });
 
     let nonblocking = client
@@ -12051,8 +12659,252 @@ async fn nonblocking_observability_reissues_live_rpc_when_recent_cache_is_active
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_nonblocking_observability_reads_share_one_live_worker_rpc() {
+    let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
+    let _count_hook_reset = SourceWorkerObservabilityCallCountHookReset;
+    let _delay_hook_reset = SourceWorkerObservabilityDelayHookReset;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: vec![
+            worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+            worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    let live = client
+        .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+        .await
+        .expect("prime complete live observability snapshot");
+    let mut incomplete = live.clone();
+    incomplete.scheduled_source_groups_by_node.clear();
+    incomplete.scheduled_scan_groups_by_node.clear();
+    incomplete.last_control_frame_signals_by_node.clear();
+    incomplete.published_batches_by_node.clear();
+    incomplete.published_events_by_node.clear();
+    incomplete.published_control_events_by_node.clear();
+    incomplete.published_data_events_by_node.clear();
+    incomplete.last_published_at_us_by_node.clear();
+    incomplete.last_published_origins_by_node.clear();
+    incomplete.published_origin_counts_by_node.clear();
+    incomplete.enqueued_path_origin_counts_by_node.clear();
+    incomplete.pending_path_origin_counts_by_node.clear();
+    incomplete.yielded_path_origin_counts_by_node.clear();
+    incomplete.summarized_path_origin_counts_by_node.clear();
+    incomplete.published_path_origin_counts_by_node.clear();
+    client.update_cached_observability_snapshot(&incomplete);
+    clear_cached_worker_observability_debug_maps_for_test(&client);
+
+    let observability_rpc_count = Arc::new(AtomicUsize::new(0));
+    install_source_worker_observability_call_count_hook(SourceWorkerObservabilityCallCountHook {
+        count: observability_rpc_count.clone(),
+    });
+    install_source_worker_observability_delay_hook(SourceWorkerObservabilityDelayHook {
+        delay: Duration::from_millis(200),
+    });
+    client.with_cache_mut(|cache| {
+        cache.last_live_observability_snapshot_at = Some(Instant::now());
+    });
+
+    let first = client.observability_snapshot_nonblocking_for_status_route();
+    let second = client.observability_snapshot_nonblocking_for_status_route();
+    let ((first_snapshot, _), (second_snapshot, _)) = tokio::join!(first, second);
+
+    assert_eq!(
+        observability_rpc_count.load(Ordering::Relaxed),
+        1,
+        "overlapping status-route source observability reads for the same node should share one live worker RPC"
+    );
+    assert_eq!(
+        first_snapshot.scheduled_source_groups_by_node.get("node-a"),
+        Some(&vec!["nfs1".to_string(), "nfs2".to_string()])
+    );
+    assert_eq!(
+        second_snapshot
+            .scheduled_source_groups_by_node
+            .get("node-a"),
+        Some(&vec!["nfs1".to_string(), "nfs2".to_string()])
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nonblocking_status_observability_reuses_stable_root_health_cache_after_recent_window_without_live_rpc()
+ {
+    let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
+    let _count_hook_reset = SourceWorkerObservabilityCallCountHookReset;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: vec![
+            worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+            worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    let live = client
+        .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+        .await
+        .expect("prime complete live observability snapshot");
+    let mut route_debug_omitted = live.clone();
+    route_debug_omitted.scheduled_source_groups_by_node.clear();
+    route_debug_omitted.scheduled_scan_groups_by_node.clear();
+    route_debug_omitted
+        .last_control_frame_signals_by_node
+        .clear();
+    client.update_cached_observability_snapshot(&route_debug_omitted);
+    client.with_cache_mut(|cache| {
+        cache.last_live_observability_snapshot_at = Some(
+            Instant::now()
+                - SOURCE_WORKER_NONBLOCKING_OBSERVABILITY_CACHE_TTL
+                - Duration::from_millis(50),
+        );
+    });
+
+    let observability_rpc_count = Arc::new(AtomicUsize::new(0));
+    install_source_worker_observability_call_count_hook(SourceWorkerObservabilityCallCountHook {
+        count: observability_rpc_count.clone(),
+    });
+
+    let (nonblocking, used_cached_fallback) = client
+        .observability_snapshot_nonblocking_for_status_route()
+        .await;
+
+    assert!(
+        used_cached_fallback,
+        "stable status root-health evidence should be reported as a cached status fallback"
+    );
+    assert_eq!(
+        observability_rpc_count.load(Ordering::Relaxed),
+        0,
+        "steady /status should not re-enter source-worker observability only to restore optional route-schedule debug maps"
+    );
+    assert_eq!(
+        nonblocking.status.logical_roots.len(),
+        2,
+        "cached source root health remains the status readiness evidence"
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nonblocking_observability_accepts_recent_active_cache_when_only_force_find_observability_remains()
  {
+    let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
     let _hook_reset = SourceWorkerObservabilityCallCountHookReset;
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
@@ -12155,6 +13007,9 @@ async fn nonblocking_observability_accepts_recent_active_cache_when_only_force_f
     let observability_rpc_count = Arc::new(AtomicUsize::new(0));
     install_source_worker_observability_call_count_hook(SourceWorkerObservabilityCallCountHook {
         count: observability_rpc_count.clone(),
+    });
+    client.with_cache_mut(|cache| {
+        cache.last_live_observability_snapshot_at = Some(Instant::now());
     });
 
     let nonblocking = client
@@ -13473,6 +14328,7 @@ async fn recent_live_cache_clears_published_path_observability_when_later_active
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn observability_snapshot_nonblocking_fail_closes_incomplete_active_cache_when_worker_unavailable()
  {
+    let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -14836,6 +15692,7 @@ fn observability_snapshot_normalization_uses_cached_grants_when_live_reply_grant
         &mut snapshot,
         &node_id,
         Some(&cached_grants),
+        None,
     );
 
     assert_eq!(

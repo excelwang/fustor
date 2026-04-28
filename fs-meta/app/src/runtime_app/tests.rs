@@ -3,10 +3,11 @@ use crate::api::facade_status::{FacadePendingReason, SharedFacadePendingStatus};
 use crate::api::rollout_status::read_published_rollout_status;
 use crate::domain_state::{FacadeServiceState, RolloutGenerationState};
 use crate::runtime::routes::{
-    METHOD_SINK_QUERY, ROUTE_KEY_EVENTS, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_SINK_QUERY_INTERNAL,
-    ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
+    METHOD_SINK_QUERY, METHOD_SOURCE_RESCAN, ROUTE_KEY_EVENTS, ROUTE_KEY_FORCE_FIND,
+    ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
     ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_TOKEN_FS_META_INTERNAL,
     sink_query_request_route_for, source_find_request_route_for, source_find_route_bindings_for,
+    source_rescan_request_route_for, source_rescan_route_bindings_for,
 };
 use crate::{ControlEvent, FileMetaRecord};
 use crate::{FSMetaConfig, FSMetaProductConfig, api, query, source};
@@ -123,6 +124,39 @@ fn worker_stderr_excerpt(socket_dir: &Path) -> String {
     } else {
         excerpts.join("\n---\n")
     }
+}
+
+#[tokio::test]
+async fn runtime_progress_wait_keeps_observation_window_when_snapshot_returns_immediately() {
+    let runtime_state_changed = Arc::new(Notify::new());
+    let observed = Arc::new(AtomicUsize::new(0));
+    let observed_for_probe = observed.clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(120);
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(25),
+        FSMetaApp::wait_for_runtime_progress_observation_window_until(
+            &runtime_state_changed,
+            deadline,
+            move |_wait_budget| {
+                let observed = observed_for_probe.clone();
+                async move {
+                    observed.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+            },
+        ),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "fast source/sink snapshot probes must not satisfy progress wait immediately"
+    );
+    assert_eq!(
+        observed.load(AtomicOrdering::SeqCst),
+        1,
+        "the progress probe should run once inside the bounded wait window"
+    );
 }
 
 fn fixed_bind_handoff_test_serial() -> &'static tokio::sync::Mutex<()> {
@@ -863,6 +897,15 @@ struct LoopbackWorkerBoundary {
     changed: Notify,
 }
 
+fn reopen_loopback_route_epoch(closed: &mut std::collections::HashSet<String>, route_key: &str) {
+    closed.remove(route_key);
+    if let Some(request_route) = route_key.strip_suffix(":reply") {
+        closed.remove(request_route);
+    } else {
+        closed.remove(&format!("{route_key}:reply"));
+    }
+}
+
 struct SourceStatusUnitAwareBoundary {
     inner: LoopbackWorkerBoundary,
     required_unit_id: &'static str,
@@ -877,6 +920,7 @@ struct RuntimeProxyUnitAwareBoundary {
     required_sink_status_unit_id: Option<&'static str>,
     source_status_recv_unit_ids: StdMutex<Vec<Option<String>>>,
     source_find_recv_unit_ids: StdMutex<Vec<Option<String>>>,
+    source_rescan_recv_unit_ids: StdMutex<Vec<Option<String>>>,
     sink_query_proxy_recv_unit_ids: StdMutex<Vec<Option<String>>>,
     sink_status_recv_unit_ids: StdMutex<Vec<Option<String>>>,
 }
@@ -914,6 +958,7 @@ impl RuntimeProxyUnitAwareBoundary {
             required_sink_status_unit_id,
             source_status_recv_unit_ids: StdMutex::new(Vec::new()),
             source_find_recv_unit_ids: StdMutex::new(Vec::new()),
+            source_rescan_recv_unit_ids: StdMutex::new(Vec::new()),
             sink_query_proxy_recv_unit_ids: StdMutex::new(Vec::new()),
             sink_status_recv_unit_ids: StdMutex::new(Vec::new()),
         }
@@ -929,6 +974,22 @@ fn is_source_find_request_route(route_key: &str) -> bool {
     };
     let Some((stem, version)) = ROUTE_KEY_SOURCE_FIND_INTERNAL.rsplit_once(':') else {
         return request_route.starts_with(&format!("{ROUTE_KEY_SOURCE_FIND_INTERNAL}."));
+    };
+    let Some(route_stem) = request_route.strip_suffix(&format!(":{version}")) else {
+        return false;
+    };
+    route_stem.starts_with(&format!("{stem}."))
+}
+
+fn is_source_rescan_request_route(route_key: &str) -> bool {
+    if route_key == format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL) {
+        return true;
+    }
+    let Some(request_route) = route_key.strip_suffix(".req") else {
+        return false;
+    };
+    let Some((stem, version)) = ROUTE_KEY_SOURCE_RESCAN_INTERNAL.rsplit_once(':') else {
+        return request_route.starts_with(&format!("{ROUTE_KEY_SOURCE_RESCAN_INTERNAL}."));
     };
     let Some(route_stem) = request_route.strip_suffix(&format!(":{version}")) else {
         return false;
@@ -956,6 +1017,10 @@ impl ChannelIoSubset for LoopbackWorkerBoundary {
     async fn channel_send(&self, _ctx: BoundaryContext, request: ChannelSendRequest) -> Result<()> {
         {
             let route_key = request.channel_key.0.clone();
+            reopen_loopback_route_epoch(
+                &mut self.closed.lock().expect("loopback closed lock"),
+                &route_key,
+            );
             let mut channels = self.channels.lock().expect("loopback channels lock");
             channels
                 .entry(route_key)
@@ -1087,6 +1152,12 @@ impl ChannelIoSubset for RuntimeProxyUnitAwareBoundary {
                     required_unit_id
                 )));
             }
+        }
+        if is_source_rescan_request_route(&request.channel_key.0) {
+            self.source_rescan_recv_unit_ids
+                .lock()
+                .expect("source_rescan_recv_unit_ids lock")
+                .push(ctx.unit_id.clone());
         }
         if request.channel_key.0 == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY) {
             self.sink_query_proxy_recv_unit_ids
@@ -1622,6 +1693,76 @@ fn selected_group_tree_nonempty_local_payload_skips_sink_query_bridge() {
         &[local_event],
         true,
     ));
+}
+
+#[test]
+fn selected_group_tree_nonempty_local_payload_resolves_bridge_without_sink_status() {
+    let request = query::InternalQueryRequest::materialized(
+        query::QueryOp::Tree,
+        query::QueryScope {
+            path: b"/force-find-stress".to_vec(),
+            recursive: true,
+            max_depth: None,
+            selected_group: Some("nfs2".to_string()),
+        },
+        Some(query::TreeQueryOptions::default()),
+    );
+    let payload = rmp_serde::to_vec_named(&query::MaterializedQueryPayload::Tree(
+        query::TreeGroupPayload {
+            reliability: query::GroupReliability {
+                reliable: true,
+                unreliable_reason: None,
+            },
+            stability: query::TreeStability::not_evaluated(),
+            root: query::TreePageRoot {
+                path: b"/force-find-stress".to_vec(),
+                size: 0,
+                modified_time_us: 1,
+                is_dir: true,
+                exists: true,
+                has_children: true,
+            },
+            entries: Vec::new(),
+        },
+    ))
+    .expect("encode non-empty tree payload");
+    let local_event = Event::new(
+        EventMetadata {
+            origin_id: NodeId("nfs2".to_string()),
+            timestamp_us: 1,
+            logical_ts: None,
+            correlation_id: Some(11),
+            ingress_auth: None,
+            trace: None,
+        },
+        Bytes::from(payload),
+    );
+
+    assert_eq!(
+        selected_group_sink_query_bridge_decision_without_status(&request, &[local_event]),
+        Some(false),
+        "a selected-group query that already returned materialized data must not require a sink-status probe before deciding not to bridge"
+    );
+}
+
+#[test]
+fn selected_group_stats_payload_resolves_bridge_without_sink_status() {
+    let request = query::InternalQueryRequest::materialized(
+        query::QueryOp::Stats,
+        query::QueryScope {
+            path: b"/".to_vec(),
+            recursive: true,
+            max_depth: None,
+            selected_group: Some("nfs2".to_string()),
+        },
+        None,
+    );
+
+    assert_eq!(
+        selected_group_sink_query_bridge_decision_without_status(&request, &[]),
+        Some(false),
+        "stats requests never enter selected-group tree bridging and must not probe sink status"
+    );
 }
 
 #[test]
@@ -2600,6 +2741,59 @@ fn runtime_control_state_control_gate_ready_requires_initialized_or_facade_only_
 }
 
 #[test]
+fn runtime_control_state_initial_mixed_source_to_sink_pretrigger_is_initial_boot_only() {
+    assert!(
+        runtime_control_state_for_tests(false, false, false)
+            .initial_mixed_source_to_sink_pretrigger_eligible(
+                false,
+                runtime_control_state_for_tests(true, false, false),
+                true,
+            ),
+        "first mixed source/sink activation should be allowed to kick source-to-sink convergence"
+    );
+    assert!(
+        !runtime_control_state_for_tests(false, true, true)
+            .initial_mixed_source_to_sink_pretrigger_eligible(
+                false,
+                runtime_control_state_for_tests(true, false, true),
+                true,
+            ),
+        "recovery mixed waves with retained replay must not synchronously pretrigger source-to-sink convergence before sink replay clears"
+    );
+    assert!(
+        !runtime_control_state_for_tests(false, false, false)
+            .initial_mixed_source_to_sink_pretrigger_eligible(
+                false,
+                runtime_control_state_for_tests(false, true, true),
+                true,
+            ),
+        "fail-closed source apply must not continue into the initial pretrigger path"
+    );
+}
+
+#[test]
+fn post_recovery_raw_timeout_defers_scheduled_only_sink_status_republish() {
+    let snapshot = crate::sink::SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]),
+        ..Default::default()
+    };
+
+    assert!(
+        !snapshot.progress_snapshot().empty_summary,
+        "scheduled-only status is not empty; it represents retained replay catch-up evidence"
+    );
+    assert!(
+        FSMetaApp::sink_status_snapshot_should_defer_republish_after_retained_replay_timeout(
+            &snapshot
+        ),
+        "scheduled-only status after raw timeout must defer local sink-status republish instead of re-entering retained replay on every sink tick"
+    );
+}
+
+#[test]
 fn facade_publication_machine_keeps_active_facade_withheld_until_runtime_gate_is_ready() {
     let snapshot = FixedBindLifecycleMachine {
         observation: FacadeGateObservation {
@@ -2863,12 +3057,14 @@ async fn pending_fixed_bind_handoff_release_registrant_for_tests(
         pending_fixed_bind_has_suppressed_dependent_routes: app
             .pending_fixed_bind_has_suppressed_dependent_routes
             .clone(),
+        retained_active_facade_continuity: app.retained_active_facade_continuity.clone(),
         facade_spawn_in_progress: app.facade_spawn_in_progress.clone(),
         facade_pending_status: app.facade_pending_status.clone(),
         facade_service_state: app.facade_service_state.clone(),
         rollout_status: app.rollout_status.clone(),
         api_request_tracker: app.api_request_tracker.clone(),
         api_control_gate: app.api_control_gate.clone(),
+        control_failure_uninitialized: app.control_failure_uninitialized.clone(),
         runtime_gate_state: app.runtime_gate_state.clone(),
         runtime_state_changed: app.runtime_state_changed.clone(),
         node_id: app.node_id.clone(),
@@ -2956,6 +3152,7 @@ fn pending_fixed_bind_handoff_attempt_disposition_releases_active_owner_when_cla
                 claim_conflict: true,
                 pending_runtime_exposure_confirmed: true,
                 active_owner_present: true,
+                active_owner_failed_control_uninitialized: false,
                 conflicting_process_claim_owner_instance_id: Some(7),
             },
         ),
@@ -2972,6 +3169,7 @@ fn pending_fixed_bind_handoff_attempt_disposition_releases_conflicting_process_c
                 claim_conflict: true,
                 pending_runtime_exposure_confirmed: true,
                 active_owner_present: false,
+                active_owner_failed_control_uninitialized: false,
                 conflicting_process_claim_owner_instance_id: Some(11),
             },
         ),
@@ -2989,10 +3187,28 @@ fn pending_fixed_bind_handoff_attempt_disposition_blocks_without_runtime_exposur
                 claim_conflict: true,
                 pending_runtime_exposure_confirmed: false,
                 active_owner_present: true,
+                active_owner_failed_control_uninitialized: false,
                 conflicting_process_claim_owner_instance_id: Some(7),
             },
         ),
         PendingFixedBindHandoffAttemptDisposition::NoAttempt
+    );
+}
+
+#[test]
+fn pending_fixed_bind_handoff_attempt_disposition_releases_failed_owner_without_exposure_confirmation()
+ {
+    assert_eq!(
+        FSMetaApp::pending_fixed_bind_handoff_attempt_disposition(
+            PendingFixedBindHandoffAttemptDecisionInput {
+                claim_conflict: true,
+                pending_runtime_exposure_confirmed: false,
+                active_owner_present: true,
+                active_owner_failed_control_uninitialized: true,
+                conflicting_process_claim_owner_instance_id: Some(7),
+            },
+        ),
+        PendingFixedBindHandoffAttemptDisposition::ReleaseActiveOwner
     );
 }
 
@@ -3019,12 +3235,14 @@ async fn pending_fixed_bind_handoff_continuation_for_tests(
             pending_fixed_bind_has_suppressed_dependent_routes: app
                 .pending_fixed_bind_has_suppressed_dependent_routes
                 .clone(),
+            retained_active_facade_continuity: app.retained_active_facade_continuity.clone(),
             facade_spawn_in_progress: app.facade_spawn_in_progress.clone(),
             facade_pending_status: app.facade_pending_status.clone(),
             facade_service_state: app.facade_service_state.clone(),
             rollout_status: app.rollout_status.clone(),
             api_request_tracker: app.api_request_tracker.clone(),
             api_control_gate: app.api_control_gate.clone(),
+            control_failure_uninitialized: app.control_failure_uninitialized.clone(),
             runtime_gate_state: app.runtime_gate_state.clone(),
             runtime_state_changed: app.runtime_state_changed.clone(),
             node_id: app.node_id.clone(),
@@ -3255,6 +3473,9 @@ fn runtime_app_fixed_bind_projection_symbols_are_removed() {
             )
             && source.contains(
                 "pub async fn start(&self) -> Result<()> {\n        let fixed_bind_session = self\n            .begin_fixed_bind_lifecycle_root_session(FixedBindLifecycleRootReason::PublicStart)\n            .await;",
+            )
+            && source.contains(
+                "self.initialize_from_control_with_deadline_and_session(\n            false,\n            false,\n            None,\n            &fixed_bind_session,\n        )",
             )
             && source.contains(
                 "pub async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {\n        let fixed_bind_session = self\n            .begin_fixed_bind_lifecycle_root_session(\n                FixedBindLifecycleRootReason::PublicOnControlFrame,\n            )\n            .await;\n        self.service_on_control_frame_with_failure_and_session(envelopes, fixed_bind_session)\n            .await\n            .map_err(RuntimeControlFrameFailure::into_error)\n    }",
@@ -3674,7 +3895,7 @@ fn runtime_app_fixed_bind_session_rebuild_preserves_lineage() {
             && source.contains(
                 "#[cfg(test)]\n    async fn begin_fixed_bind_lifecycle_session(&self) -> FixedBindLifecycleSession {",
             )
-            && source.matches(".begin_fixed_bind_lifecycle_session().await").count() == 13
+            && source.matches(".begin_fixed_bind_lifecycle_session().await").count() == 9
             && source
                 .matches("FixedBindLifecycleRootReason::Public")
                 .count()
@@ -3683,8 +3904,8 @@ fn runtime_app_fixed_bind_session_rebuild_preserves_lineage() {
                 .matches("FixedBindLifecycleRootReason::TestFixedBindSession")
                 .count()
                 == 1
-            && source.matches("FixedBindLifecycleRebuildReason::").count() == 10,
-        "fixed-bind session construction should stay centralized: exactly one constructor site, one test-only session helper, bounded test-only helper callsites, three public transaction roots, and a bounded typed rebuild-reason surface",
+            && source.matches("FixedBindLifecycleRebuildReason::").count() == 11,
+        "fixed-bind session construction should stay centralized: exactly one constructor site, one test-only session helper, bounded test-only helper callsites, three public transaction roots, and a bounded typed rebuild-reason surface including the stale-claim refresh path",
     );
 }
 
@@ -3957,6 +4178,7 @@ fn classify_source_control_wave_disposition_detects_cleanup_only_uninitialized_f
                 cleanup_disposition: UninitializedCleanupDisposition::SourceOnly,
                 facade_claim_signals_present: false,
                 facade_publication_signals_present: false,
+                source_tick_gate_only_while_sink_replay_pending: false,
                 source_signals_present: !source_signals.is_empty(),
                 sink_signals_present: false,
             },
@@ -4081,6 +4303,42 @@ fn classify_source_generation_cutover_disposition_detects_restart_deferred_retir
 }
 
 #[test]
+fn classify_source_generation_cutover_disposition_detects_source_facade_post_initial_activate() {
+    let (source_signals, sink_signals, facade_signals) = split_app_control_signals(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::FACADE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+    ])
+    .expect("split source+facade post-initial activate signals");
+
+    assert!(sink_signals.is_empty(), "test must model no sink companion");
+    assert!(
+        !facade_signals.is_empty(),
+        "test must model facade companion"
+    );
+    assert_eq!(
+        FSMetaApp::classify_source_generation_cutover_disposition(
+            SourceGenerationCutoverDecisionInput {
+                control_initialized_at_entry: true,
+                source_signals: &source_signals,
+                sink_signals: &sink_signals,
+                facade_signals: &facade_signals,
+            },
+        ),
+        SourceGenerationCutoverDisposition::FailClosedRetainedReplayOnRetryableReset
+    );
+}
+
+#[test]
 fn classify_sink_generation_cutover_disposition_detects_shared_generation_cutover_lane() {
     let (_, sink_signals, _) =
         split_app_control_signals(&[deactivate_envelope_with_route_key_reason_and_lease(
@@ -4129,6 +4387,7 @@ fn classify_source_control_wave_disposition_detects_steady_tick_noop() {
                 cleanup_disposition: UninitializedCleanupDisposition::None,
                 facade_claim_signals_present: false,
                 facade_publication_signals_present: false,
+                source_tick_gate_only_while_sink_replay_pending: false,
                 source_signals_present: !source_signals.is_empty(),
                 sink_signals_present: false,
             },
@@ -4152,12 +4411,70 @@ fn classify_source_control_wave_disposition_detects_replay_retained() {
                 cleanup_disposition: UninitializedCleanupDisposition::None,
                 facade_claim_signals_present: false,
                 facade_publication_signals_present: false,
+                source_tick_gate_only_while_sink_replay_pending: false,
                 source_signals_present: false,
                 sink_signals_present: false,
             },
             &[]
         ),
         SourceControlWaveDisposition::ReplayRetained
+    );
+}
+
+#[test]
+fn source_worker_recovery_exhaustion_fail_closes_inside_app_boundary() {
+    assert!(
+        should_fail_closed_source_control_recovery_exhaustion(&CnxError::Timeout),
+        "worker control timeouts are worker-path degradation, not process-boundary timeouts"
+    );
+    assert!(
+        should_fail_closed_source_control_recovery_exhaustion(&CnxError::ChannelClosed),
+        "source worker channel closure is worker-path degradation, not a process-boundary failure"
+    );
+    assert!(
+        should_fail_closed_source_control_recovery_exhaustion(&CnxError::Internal(
+            "source worker post-ack scheduled-groups refresh exhausted before scheduled groups converged (timeout)"
+                .to_string(),
+        )),
+        "post-ack scheduled-group refresh exhaustion must stay app-owned and retryable by later control waves"
+    );
+    assert!(
+        should_fail_closed_source_control_recovery_exhaustion(&CnxError::Internal(
+            "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                .to_string(),
+        )),
+        "source worker bridge resets must stay app-owned and retryable by later control waves"
+    );
+    assert!(
+        !should_fail_closed_source_control_recovery_exhaustion(&CnxError::ProtocolViolation(
+            "malformed source control payload".to_string(),
+        )),
+        "protocol violations remain terminal control-frame failures"
+    );
+}
+
+#[test]
+fn sink_worker_recovery_exhaustion_fail_closes_inside_app_boundary() {
+    assert!(
+        should_fail_closed_sink_control_recovery_exhaustion(&CnxError::Timeout),
+        "sink worker control timeouts are worker-path degradation, not process-boundary timeouts"
+    );
+    assert!(
+        should_fail_closed_sink_control_recovery_exhaustion(&CnxError::ChannelClosed),
+        "sink worker channel closure is worker-path degradation, not a process-boundary failure"
+    );
+    assert!(
+        should_fail_closed_sink_control_recovery_exhaustion(&CnxError::Internal(
+            "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof"
+                .to_string(),
+        )),
+        "sink worker bridge resets must stay app-owned and retryable by later control waves"
+    );
+    assert!(
+        !should_fail_closed_sink_control_recovery_exhaustion(&CnxError::ProtocolViolation(
+            "malformed sink control payload".to_string(),
+        )),
+        "protocol violations remain terminal control-frame failures"
     );
 }
 
@@ -4182,6 +4499,7 @@ fn classify_sink_control_wave_disposition_detects_initial_mixed_wave_before_sour
                 source_signals_present: true,
                 facade_claim_signals_present: false,
                 facade_publication_signals_present: false,
+                source_tick_gate_only_while_sink_replay_pending: false,
                 sink_signals_present: !sink_signals.is_empty(),
             },
             SourceControlWaveDisposition::ApplySignals,
@@ -4213,6 +4531,7 @@ fn classify_sink_control_wave_disposition_marks_tick_recovery_apply_waiting_for_
                 source_signals_present: false,
                 facade_claim_signals_present: false,
                 facade_publication_signals_present: false,
+                source_tick_gate_only_while_sink_replay_pending: false,
                 sink_signals_present: !sink_signals.is_empty(),
             },
             SourceControlWaveDisposition::Idle,
@@ -4459,6 +4778,199 @@ async fn reinitialize_after_control_reset_with_deadline_republishes_unavailable_
         FacadeServiceState::Unavailable,
         "closing the control gate for deadline-bounded reinitialize must republish unavailable facade state immediately"
     );
+}
+
+#[tokio::test]
+async fn control_reset_reinitialize_does_not_wait_for_inflight_source_control_handoff_before_source_start()
+ {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct SourceWorkerControlFramePauseHookReset;
+    struct SourceWorkerStartPauseHookReset;
+
+    impl Drop for SourceWorkerControlFramePauseHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_control_frame_pause_hook();
+        }
+    }
+
+    impl Drop for SourceWorkerStartPauseHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_start_pause_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let fs_source = tmp.path().display().to_string();
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "single-app-node::root-1",
+                        "single-app-node",
+                        "127.0.0.1",
+                        &fs_source,
+                        tmp.path().to_path_buf(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: "listener-a".to_string(),
+                    local_listener_resources: vec![api::config::ApiListenerResource {
+                        resource_id: "listener-a".to_string(),
+                        bind_addr: bind_addr.clone(),
+                    }],
+                    auth: api::ApiAuthConfig {
+                        passwd_path,
+                        shadow_path,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("single-app-node".into()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    if cfg!(target_os = "linux") {
+        match app.start().await {
+            Ok(()) => {}
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Err(err) => panic!("start app: {err}"),
+        }
+    } else {
+        let err = app.start().await.expect_err("non-linux should fail fast");
+        assert!(matches!(err, CnxError::NotSupported(_)));
+        return;
+    }
+
+    app.on_control_frame(&[
+        activate_envelope_with_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("initial source control wave should succeed");
+
+    let source_signals = crate::runtime::orchestration::source_control_signals_from_envelopes(&[
+        activate_envelope_with_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            &[("test-root", &["single-app-node::root-1"])],
+            3,
+        ),
+    ])
+    .expect("source signals");
+    let source_entered = Arc::new(Notify::new());
+    let source_release = Arc::new(Notify::new());
+    let _source_pause_reset = SourceWorkerControlFramePauseHookReset;
+    crate::workers::source::install_source_worker_control_frame_pause_hook(
+        crate::workers::source::SourceWorkerControlFramePauseHook {
+            entered: source_entered.clone(),
+            release: source_release.clone(),
+        },
+    );
+    let source_inflight = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.source
+                .apply_orchestration_signals_with_total_timeout_with_failure(
+                    &source_signals,
+                    Duration::from_secs(10),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), source_entered.notified())
+        .await
+        .expect("in-flight source control op should reach source worker pause point");
+
+    let start_entered = Arc::new(Notify::new());
+    let start_entered_flag = Arc::new(AtomicBool::new(false));
+    let start_release = Arc::new(Notify::new());
+    let _start_pause_reset = SourceWorkerStartPauseHookReset;
+    crate::workers::source::install_source_worker_start_pause_hook(
+        crate::workers::source::SourceWorkerStartPauseHook {
+            entered: start_entered.clone(),
+            release: start_release.clone(),
+        },
+    );
+    let start_entered_waiter = tokio::spawn({
+        let start_entered = start_entered.clone();
+        let start_entered_flag = start_entered_flag.clone();
+        async move {
+            start_entered.notified().await;
+            start_entered_flag.store(true, Ordering::Release);
+        }
+    });
+
+    let reinitialize = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.reinitialize_after_control_reset_with_deadline(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_millis(600), async {
+        loop {
+            if start_entered_flag.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(
+        "control-reset reinitialize should begin source.start without waiting for the same in-flight source control handoff",
+    );
+    start_entered_waiter
+        .await
+        .expect("join source-start entered waiter");
+
+    start_release.notify_waiters();
+    source_release.notify_waiters();
+
+    reinitialize
+        .await
+        .expect("join control-reset reinitialize")
+        .expect("control-reset reinitialize should settle after source.start release");
+    source_inflight
+        .await
+        .expect("join in-flight source control op")
+        .expect("in-flight source control op should settle after pause release");
+
+    app.close().await.expect("close app");
 }
 
 #[tokio::test]
@@ -6501,6 +7013,7 @@ async fn same_resource_facade_generation_refresh_does_not_restart_active_listene
     let _shutdown_reset = FacadeShutdownStartHookReset;
     install_facade_shutdown_start_hook(FacadeShutdownStartHook {
         entered: shutdown_started.clone(),
+        release: None,
     });
     let shutdown_wait = shutdown_started.notified();
 
@@ -7795,11 +8308,35 @@ impl Drop for SourceApplyPauseHookReset {
     }
 }
 
+struct SourceApplyEntryCountHookReset;
+
+impl Drop for SourceApplyEntryCountHookReset {
+    fn drop(&mut self) {
+        clear_source_apply_entry_count_hook();
+    }
+}
+
+struct RuntimeInitializeEntryCountHookReset;
+
+impl Drop for RuntimeInitializeEntryCountHookReset {
+    fn drop(&mut self) {
+        clear_runtime_initialize_entry_count_hook();
+    }
+}
+
 struct SourceApplyErrorQueueHookReset;
 
 impl Drop for SourceApplyErrorQueueHookReset {
     fn drop(&mut self) {
         clear_source_apply_error_queue_hook();
+    }
+}
+
+struct SinkApplyEntryCountHookReset;
+
+impl Drop for SinkApplyEntryCountHookReset {
+    fn drop(&mut self) {
+        clear_sink_apply_entry_count_hook();
     }
 }
 
@@ -8035,6 +8572,7 @@ async fn pending_facade_exposure_confirmed_waits_for_inflight_rescan_before_shut
     let _shutdown_reset = FacadeShutdownStartHookReset;
     install_facade_shutdown_start_hook(FacadeShutdownStartHook {
         entered: shutdown_started.clone(),
+        release: None,
     });
 
     let request = tokio::spawn({
@@ -8406,10 +8944,10 @@ async fn query_peer_deactivate_does_not_wait_for_inflight_internal_sink_query_pr
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let _pause_reset = RuntimeProxyRequestPauseHookReset {
-        label: "source_status",
+        label: "sink_query_proxy",
     };
     install_runtime_proxy_request_pause_hook(
-        "source_status",
+        "sink_query_proxy",
         RuntimeProxyRequestPauseHook {
             entered: entered.clone(),
             release: release.clone(),
@@ -8490,6 +9028,173 @@ async fn query_peer_deactivate_does_not_wait_for_inflight_internal_sink_query_pr
         .expect("deactivate query-peer sink query proxy after request drain");
 
     app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_close_stops_internal_proxy_endpoints_before_worker_shutdown_decision() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let fs_source = tmp.path().display().to_string();
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "single-app-node::root-1",
+                        "single-app-node",
+                        "127.0.0.1",
+                        &fs_source,
+                        tmp.path().to_path_buf(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: "listener-a".to_string(),
+                    local_listener_resources: vec![api::config::ApiListenerResource {
+                        resource_id: "listener-a".to_string(),
+                        bind_addr,
+                    }],
+                    auth: api::ApiAuthConfig {
+                        passwd_path,
+                        shadow_path,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("single-app-node".into()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    match app.start().await {
+        Ok(()) => {}
+        Err(CnxError::InvalidInput(msg))
+            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+        {
+            return;
+        }
+        Err(err) => panic!("start app: {err}"),
+    }
+
+    app.on_control_frame(&[
+        activate_envelope_with_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+            &[("test-root", &["listener-a"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("activate source/sink + query-peer sink query proxy");
+
+    let proxy_entered = Arc::new(Notify::new());
+    let proxy_release = Arc::new(Notify::new());
+    let _proxy_pause_reset = RuntimeProxyRequestPauseHookReset {
+        label: "sink_query_proxy",
+    };
+    install_runtime_proxy_request_pause_hook(
+        "sink_query_proxy",
+        RuntimeProxyRequestPauseHook {
+            entered: proxy_entered.clone(),
+            release: proxy_release.clone(),
+        },
+    );
+
+    let source_close_entered = Arc::new(Notify::new());
+    let sink_close_entered = Arc::new(Notify::new());
+    let _source_close_reset = SourceWorkerCloseHookReset;
+    let _sink_close_reset = SinkWorkerCloseHookReset;
+    crate::workers::source::install_source_worker_close_hook(
+        crate::workers::source::SourceWorkerCloseHook {
+            entered: source_close_entered.clone(),
+        },
+    );
+    crate::workers::sink::install_sink_worker_close_hook(
+        crate::workers::sink::SinkWorkerCloseHook {
+            entered: sink_close_entered.clone(),
+        },
+    );
+
+    let request_task = tokio::spawn({
+        let boundary = boundary.clone();
+        async move {
+            selected_group_proxy_tree(
+                boundary,
+                NodeId("single-app-node".into()),
+                &selected_group_dir_request(b"/", "test-root"),
+            )
+            .await
+        }
+    });
+
+    proxy_entered.notified().await;
+
+    let mut close_task = tokio::spawn({
+        let app = app.clone();
+        async move { app.close().await }
+    });
+
+    let source_close_before_endpoint_release =
+        tokio::time::timeout(Duration::from_millis(250), source_close_entered.notified()).await;
+    let sink_close_before_endpoint_release =
+        tokio::time::timeout(Duration::from_millis(250), sink_close_entered.notified()).await;
+
+    assert!(
+        source_close_before_endpoint_release.is_err(),
+        "source worker close started while an app-owned internal proxy endpoint still held the source handle"
+    );
+    assert!(
+        sink_close_before_endpoint_release.is_err(),
+        "sink worker close started while an app-owned internal proxy endpoint still held the sink handle"
+    );
+
+    let source_close_after_endpoint_release = source_close_entered.notified();
+    let sink_close_after_endpoint_release = sink_close_entered.notified();
+    proxy_release.notify_waiters();
+    let close_result = tokio::time::timeout(Duration::from_secs(8), &mut close_task)
+        .await
+        .expect("app close should finish after proxy endpoint is released")
+        .expect("join app close task");
+    close_result.expect("app close should succeed");
+
+    tokio::time::timeout(Duration::from_secs(2), source_close_after_endpoint_release)
+        .await
+        .expect("source worker close should run after endpoint shutdown");
+    tokio::time::timeout(Duration::from_secs(2), sink_close_after_endpoint_release)
+        .await
+        .expect("sink worker close should run after endpoint shutdown");
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), request_task).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11038,6 +11743,8 @@ async fn mixed_source_and_query_wave_does_not_publish_routes_before_source_apply
 #[tokio::test]
 async fn pending_fixed_bind_facade_claim_keeps_successor_not_ready_until_publication_can_complete()
 {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -11285,6 +11992,8 @@ async fn pending_fixed_bind_facade_claim_survives_later_facade_deactivate_follow
 #[tokio::test]
 async fn route_peer_turnover_does_not_publish_query_routes_while_fixed_bind_facade_claim_is_owned_by_predecessor()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -11666,6 +12375,8 @@ async fn route_peer_turnover_does_not_publish_query_routes_while_fixed_bind_faca
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_worker_mixed_wave_completes_fixed_bind_publication_without_later_followup_after_predecessor_release()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -11924,6 +12635,8 @@ async fn external_worker_mixed_wave_completes_fixed_bind_publication_without_lat
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_worker_mixed_wave_completes_fixed_bind_publication_after_retryable_source_bridge_close()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     use std::collections::VecDeque;
 
     struct ProcessFacadeClaimReset;
@@ -12208,6 +12921,8 @@ async fn external_worker_mixed_wave_completes_fixed_bind_publication_after_retry
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_worker_mixed_wave_retryable_source_bridge_close_keeps_control_initialized_while_predecessor_still_owns_fixed_bind()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     use std::collections::VecDeque;
 
     struct ProcessFacadeClaimReset;
@@ -12463,6 +13178,8 @@ async fn external_worker_mixed_wave_retryable_source_bridge_close_keeps_control_
 
 #[tokio::test]
 async fn pending_fixed_bind_conflict_marks_handoff_ready_while_active_facade_exists() {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -12668,12 +13385,14 @@ async fn pending_fixed_bind_publication_release_uses_local_registrant_when_ready
         pending_fixed_bind_has_suppressed_dependent_routes: app
             .pending_fixed_bind_has_suppressed_dependent_routes
             .clone(),
+        retained_active_facade_continuity: app.retained_active_facade_continuity.clone(),
         facade_spawn_in_progress: app.facade_spawn_in_progress.clone(),
         facade_pending_status: app.facade_pending_status.clone(),
         facade_service_state: app.facade_service_state.clone(),
         rollout_status: app.rollout_status.clone(),
         api_request_tracker: app.api_request_tracker.clone(),
         api_control_gate: app.api_control_gate.clone(),
+        control_failure_uninitialized: app.control_failure_uninitialized.clone(),
         runtime_gate_state: app.runtime_gate_state.clone(),
         runtime_state_changed: app.runtime_state_changed.clone(),
         node_id: app.node_id.clone(),
@@ -13831,6 +14550,8 @@ async fn pending_fixed_bind_release_remains_blocked_without_runtime_exposure_con
 
 #[tokio::test]
 async fn fixed_bind_handoff_release_waits_for_live_suppressed_route_state() {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -13965,6 +14686,8 @@ async fn fixed_bind_handoff_release_waits_for_live_suppressed_route_state() {
 
 #[tokio::test]
 async fn fixed_bind_handoff_release_ignores_non_control_pending_ready_entry() {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -14093,12 +14816,14 @@ async fn fixed_bind_handoff_release_ignores_non_control_pending_ready_entry() {
             pending_fixed_bind_has_suppressed_dependent_routes: successor
                 .pending_fixed_bind_has_suppressed_dependent_routes
                 .clone(),
+            retained_active_facade_continuity: successor.retained_active_facade_continuity.clone(),
             facade_spawn_in_progress: successor.facade_spawn_in_progress.clone(),
             facade_pending_status: successor.facade_pending_status.clone(),
             facade_service_state: successor.facade_service_state.clone(),
             rollout_status: successor.rollout_status.clone(),
             api_request_tracker: successor.api_request_tracker.clone(),
             api_control_gate: successor.api_control_gate.clone(),
+            control_failure_uninitialized: successor.control_failure_uninitialized.clone(),
             runtime_gate_state: successor.runtime_gate_state.clone(),
             runtime_state_changed: successor.runtime_state_changed.clone(),
             node_id: successor.node_id.clone(),
@@ -14122,6 +14847,8 @@ async fn fixed_bind_handoff_release_ignores_non_control_pending_ready_entry() {
 #[tokio::test]
 async fn pending_fixed_bind_claim_suppresses_all_facade_dependent_query_routes_regardless_of_generation_order()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -14259,6 +14986,8 @@ async fn pending_fixed_bind_claim_suppresses_all_facade_dependent_query_routes_r
 #[tokio::test]
 async fn pending_fixed_bind_claim_suppresses_sink_owned_facade_dependent_query_routes_until_publication_completes()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -14610,6 +15339,8 @@ async fn retained_predecessor_fixed_bind_facade_deactivate_keeps_source_status_r
 #[tokio::test]
 async fn released_predecessor_fixed_bind_claim_requires_later_followup_to_complete_successor_facade_publication()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -14798,6 +15529,8 @@ async fn released_predecessor_fixed_bind_claim_requires_later_followup_to_comple
 #[tokio::test]
 async fn released_predecessor_fixed_bind_claim_source_followup_completes_successor_facade_publication_without_query_republication()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -14986,6 +15719,8 @@ async fn released_predecessor_fixed_bind_claim_source_followup_completes_success
 #[tokio::test]
 async fn released_predecessor_fixed_bind_claim_source_followup_completes_successor_facade_publication_after_retryable_source_bridge_close()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     use std::collections::VecDeque;
 
     struct ProcessFacadeClaimReset;
@@ -15167,6 +15902,8 @@ async fn released_predecessor_fixed_bind_claim_source_followup_completes_success
 #[tokio::test]
 async fn released_predecessor_fixed_bind_claim_source_followup_completes_successor_facade_publication_after_retryable_source_timeout()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     use std::collections::VecDeque;
 
     struct ProcessFacadeClaimReset;
@@ -15340,6 +16077,8 @@ async fn released_predecessor_fixed_bind_claim_source_followup_completes_success
 #[tokio::test]
 async fn released_predecessor_fixed_bind_claim_source_followup_keeps_all_query_peer_routes_unpublished_without_query_followup()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -15440,6 +16179,11 @@ async fn released_predecessor_fixed_bind_claim_source_followup_keeps_all_query_p
         format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
         format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
     ];
+    let sink_owned_routes = [
+        format!("{}.req", ROUTE_KEY_FORCE_FIND),
+        format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL),
+        sink_query_request_route_for("node-a").0,
+    ];
 
     let mut initial_wave = vec![activate_envelope_with_route_key_and_scope_rows(
         execution_units::FACADE_RUNTIME_UNIT_ID,
@@ -15452,6 +16196,14 @@ async fn released_predecessor_fixed_bind_claim_source_followup_keeps_all_query_p
             execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
             route_key.clone(),
             &[("listener-a", &["listener-a"])],
+            2,
+        ));
+    }
+    for route_key in &sink_owned_routes {
+        initial_wave.push(activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            route_key.clone(),
+            &[("root-a", &["node-d-successor::root-a"])],
             2,
         ));
     }
@@ -15500,6 +16252,17 @@ async fn released_predecessor_fixed_bind_claim_source_followup_keeps_all_query_p
             "source-only followup must not republish facade-dependent query-peer route {route_key} without a matching query followup"
         );
     }
+    let claims = successor.shared_sink_route_claims.lock().await;
+    for route_key in &sink_owned_routes {
+        assert!(
+            claims.contains_key(&(
+                execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                route_key.clone()
+            )),
+            "source-only fixed-bind publication followup must replay retained sink-owned facade-dependent route {route_key}"
+        );
+    }
+    drop(claims);
 
     successor.close().await.expect("close successor app");
 }
@@ -15507,6 +16270,8 @@ async fn released_predecessor_fixed_bind_claim_source_followup_keeps_all_query_p
 #[tokio::test]
 async fn released_predecessor_fixed_bind_claim_mixed_followup_replays_suppressed_public_query_route_after_publication()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -15706,6 +16471,8 @@ async fn released_predecessor_fixed_bind_claim_mixed_followup_replays_suppressed
 #[tokio::test]
 async fn released_predecessor_fixed_bind_claim_mixed_followup_replays_suppressed_source_find_routes_after_publication()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -15917,6 +16684,8 @@ async fn released_predecessor_fixed_bind_claim_mixed_followup_replays_suppressed
 
 #[tokio::test]
 async fn fixed_bind_handoff_releases_predecessor_once_successor_facade_exposure_is_confirmed() {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -16068,8 +16837,322 @@ async fn fixed_bind_handoff_releases_predecessor_once_successor_facade_exposure_
 }
 
 #[tokio::test]
+async fn failed_predecessor_fixed_bind_owner_releases_pending_successor_without_exposure_confirmation()
+ {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+    struct ProcessFacadeClaimReset;
+
+    impl Drop for ProcessFacadeClaimReset {
+        fn drop(&mut self) {
+            clear_process_facade_claim_for_tests();
+        }
+    }
+
+    clear_process_facade_claim_for_tests();
+    let _claim_reset = ProcessFacadeClaimReset;
+
+    let tmp = tempdir().expect("create temp dir");
+    let root = tmp.path().join("root-a");
+    fs::create_dir_all(&root).expect("create root-a");
+    let bind_addr = reserve_bind_addr();
+    let listener_resource = api::config::ApiListenerResource {
+        resource_id: "listener-a".to_string(),
+        bind_addr: bind_addr.clone(),
+    };
+
+    let (passwd_path_1, shadow_path_1) = write_auth_files(&tmp);
+    let predecessor = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("root-a", &root)],
+                host_object_grants: vec![granted_mount_root("node-d-predecessor::root-a", &root)],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: listener_resource.resource_id.clone(),
+                local_listener_resources: vec![listener_resource.clone()],
+                auth: api::ApiAuthConfig {
+                    passwd_path: passwd_path_1,
+                    shadow_path: shadow_path_1,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        },
+        NodeId("node-d-fixed-bind-predecessor".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init predecessor app");
+    *predecessor.pending_facade.lock().await = Some(PendingFacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 1,
+        resource_ids: vec![listener_resource.resource_id.clone()],
+        bound_scopes: vec![RuntimeBoundScope {
+            scope_id: listener_resource.resource_id.clone(),
+            resource_ids: vec![listener_resource.resource_id.clone()],
+        }],
+        group_ids: Vec::new(),
+        runtime_managed: true,
+        runtime_exposure_confirmed: true,
+        resolved: predecessor
+            .config
+            .api
+            .resolve_for_candidate_ids(std::slice::from_ref(&listener_resource.resource_id))
+            .expect("resolve predecessor facade config"),
+    });
+    match predecessor.try_spawn_pending_facade().await {
+        Ok(true) => {}
+        Err(CnxError::InvalidInput(msg))
+            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+        {
+            return;
+        }
+        Ok(false) => panic!("predecessor fixed-bind facade should claim the listener"),
+        Err(err) => panic!("spawn predecessor facade: {err}"),
+    }
+
+    let (passwd_path_2, shadow_path_2) = write_auth_files(&tmp);
+    let successor = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("root-a", &root)],
+                host_object_grants: vec![granted_mount_root("node-d-successor::root-a", &root)],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: listener_resource.resource_id.clone(),
+                local_listener_resources: vec![listener_resource.clone()],
+                auth: api::ApiAuthConfig {
+                    passwd_path: passwd_path_2,
+                    shadow_path: shadow_path_2,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        },
+        NodeId("node-d-fixed-bind-successor".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init successor app");
+
+    successor
+        .on_control_frame(&[
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                &[("listener-a", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("root-a", &["node-d-successor::root-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("successor facade/source wave should park behind predecessor claim");
+
+    assert!(
+        successor.pending_facade.lock().await.is_some(),
+        "successor facade should remain pending before predecessor failure releases the fixed bind"
+    );
+    let claim_before = {
+        let guard = match process_facade_claim_cell().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard
+            .get(&bind_addr)
+            .cloned()
+            .expect("predecessor should own claim before failure")
+    };
+    assert_eq!(claim_before.owner_instance_id, predecessor.instance_id);
+
+    predecessor.mark_control_uninitialized_after_failure().await;
+
+    let claim_after = {
+        let guard = match process_facade_claim_cell().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard
+            .get(&bind_addr)
+            .cloned()
+            .expect("successor should claim after failed predecessor release")
+    };
+    assert_eq!(
+        claim_after.owner_instance_id, successor.instance_id,
+        "a fail-closed fixed-bind owner must not keep a 503-only facade bound while a pending successor is ready to take over"
+    );
+    assert!(
+        successor.api_task.lock().await.is_some(),
+        "successor should install the fixed-bind facade after failed predecessor release"
+    );
+
+    successor.close().await.expect("close successor app");
+    predecessor.close().await.expect("close predecessor app");
+}
+
+#[tokio::test]
+async fn successor_releases_fixed_bind_owner_that_failed_before_pending_claim_was_registered() {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+    struct ProcessFacadeClaimReset;
+
+    impl Drop for ProcessFacadeClaimReset {
+        fn drop(&mut self) {
+            clear_process_facade_claim_for_tests();
+        }
+    }
+
+    clear_process_facade_claim_for_tests();
+    let _claim_reset = ProcessFacadeClaimReset;
+
+    let tmp = tempdir().expect("create temp dir");
+    let root = tmp.path().join("root-a");
+    fs::create_dir_all(&root).expect("create root-a");
+    let bind_addr = reserve_bind_addr();
+    let listener_resource = api::config::ApiListenerResource {
+        resource_id: "listener-a".to_string(),
+        bind_addr: bind_addr.clone(),
+    };
+
+    let (passwd_path_1, shadow_path_1) = write_auth_files(&tmp);
+    let predecessor = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("root-a", &root)],
+                host_object_grants: vec![granted_mount_root("node-d-predecessor::root-a", &root)],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: listener_resource.resource_id.clone(),
+                local_listener_resources: vec![listener_resource.clone()],
+                auth: api::ApiAuthConfig {
+                    passwd_path: passwd_path_1,
+                    shadow_path: shadow_path_1,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        },
+        NodeId("node-d-fixed-bind-predecessor".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init predecessor app");
+    *predecessor.pending_facade.lock().await = Some(PendingFacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 1,
+        resource_ids: vec![listener_resource.resource_id.clone()],
+        bound_scopes: vec![RuntimeBoundScope {
+            scope_id: listener_resource.resource_id.clone(),
+            resource_ids: vec![listener_resource.resource_id.clone()],
+        }],
+        group_ids: Vec::new(),
+        runtime_managed: true,
+        runtime_exposure_confirmed: true,
+        resolved: predecessor
+            .config
+            .api
+            .resolve_for_candidate_ids(std::slice::from_ref(&listener_resource.resource_id))
+            .expect("resolve predecessor facade config"),
+    });
+    match predecessor.try_spawn_pending_facade().await {
+        Ok(true) => {}
+        Err(CnxError::InvalidInput(msg))
+            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+        {
+            return;
+        }
+        Ok(false) => panic!("predecessor fixed-bind facade should claim the listener"),
+        Err(err) => panic!("spawn predecessor facade: {err}"),
+    }
+
+    predecessor.mark_control_uninitialized_after_failure().await;
+
+    let claim_after_predecessor_failure = {
+        let guard = match process_facade_claim_cell().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard
+            .get(&bind_addr)
+            .cloned()
+            .expect("predecessor should still own claim until a successor is registered")
+    };
+    assert_eq!(
+        claim_after_predecessor_failure.owner_instance_id,
+        predecessor.instance_id
+    );
+
+    let (passwd_path_2, shadow_path_2) = write_auth_files(&tmp);
+    let successor = FSMetaApp::with_boundaries(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("root-a", &root)],
+                host_object_grants: vec![granted_mount_root("node-d-successor::root-a", &root)],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: listener_resource.resource_id.clone(),
+                local_listener_resources: vec![listener_resource.clone()],
+                auth: api::ApiAuthConfig {
+                    passwd_path: passwd_path_2,
+                    shadow_path: shadow_path_2,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        },
+        NodeId("node-d-fixed-bind-successor".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init successor app");
+
+    successor
+        .on_control_frame(&[
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                &[("listener-a", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("root-a", &["node-d-successor::root-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("successor should take over after observing a fail-closed predecessor");
+
+    let claim_after_successor = {
+        let guard = match process_facade_claim_cell().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard
+            .get(&bind_addr)
+            .cloned()
+            .expect("successor should claim after observing failed predecessor")
+    };
+    assert_eq!(
+        claim_after_successor.owner_instance_id, successor.instance_id,
+        "a successor must not wait for exposure confirmation when the fixed-bind owner had already failed closed"
+    );
+    assert!(successor.api_task.lock().await.is_some());
+    assert!(successor.api_control_gate.is_ready());
+
+    successor.close().await.expect("close successor app");
+    predecessor.close().await.expect("close predecessor app");
+}
+
+#[tokio::test]
 async fn released_externally_occupied_fixed_bind_requires_later_source_followup_to_complete_successor_facade_publication()
  {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -16240,6 +17323,8 @@ async fn released_externally_occupied_fixed_bind_requires_later_source_followup_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fixed_bind_handoff_shutdown_window_tree_request_settles_with_http_response() {
+    let _serial = fixed_bind_handoff_test_serial().lock().await;
+
     struct ProcessFacadeClaimReset;
 
     impl Drop for ProcessFacadeClaimReset {
@@ -16394,9 +17479,11 @@ async fn fixed_bind_handoff_shutdown_window_tree_request_settles_with_http_respo
     );
 
     let shutdown_started = Arc::new(Notify::new());
+    let shutdown_release = Arc::new(Notify::new());
     let _shutdown_reset = FacadeShutdownStartHookReset;
     install_facade_shutdown_start_hook(FacadeShutdownStartHook {
         entered: shutdown_started.clone(),
+        release: Some(shutdown_release.clone()),
     });
 
     let premature_shutdown = shutdown_started.notified();
@@ -16453,16 +17540,20 @@ async fn fixed_bind_handoff_shutdown_window_tree_request_settles_with_http_respo
         .send()
         .await
         .expect("public /tree request should not lose transport during fixed-bind handoff");
+    let response_status = response.status();
+    drop(response);
+    shutdown_release.notify_waiters();
     assert!(
-        response.status().is_success() || response.status().is_server_error(),
+        response_status.is_success() || response_status.is_server_error(),
         "public /tree should settle with HTTP response during fixed-bind handoff shutdown/restart window: {}",
-        response.status()
+        response_status
     );
 
     control_task
         .await
         .expect("join successor exposure confirmation task")
         .expect("successor facade exposure confirmation should settle");
+    clear_facade_shutdown_start_hook();
 
     successor.close().await.expect("close successor app");
     predecessor.close().await.expect("close predecessor app");
@@ -18844,6 +19935,98 @@ async fn sink_status_route_serves_peer_only_requests_under_query_peer_runtime_un
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_owned_source_status_route_serves_without_query_facade_lane() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    let boundary = Arc::new(SourceStatusUnitAwareBoundary::new(
+        execution_units::SOURCE_RUNTIME_UNIT_ID,
+    ));
+    let app = Arc::new(
+        FSMetaApp::with_boundaries(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("nfs1", &nfs1)],
+                    host_object_grants: vec![granted_mount_root("single-app-node::nfs1", &nfs1)],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            NodeId("single-app-node".into()),
+            Some(boundary.clone()),
+        )
+        .expect("init app"),
+    );
+    let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            &[("nfs1", &["single-app-node::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            &[("nfs1", &["single-app-node::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["single-app-node::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["single-app-node::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_status_route.clone(),
+            &[("nfs1", &["single-app-node::nfs1"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("source-owned source-status wave should succeed");
+
+    let endpoint_units = app
+        .runtime_endpoint_tasks
+        .lock()
+        .await
+        .iter()
+        .find(|task| task.route_key() == source_status_route)
+        .map(|task| task.unit_ids().to_vec())
+        .expect("source-owned source-status endpoint should start without query facade lane");
+    assert_eq!(
+        endpoint_units,
+        vec![execution_units::SOURCE_RUNTIME_UNIT_ID.to_string()],
+        "source-owned source-status endpoint must receive under runtime.exec.source"
+    );
+
+    let snapshots = internal_source_status_snapshots_with_timeout(
+        boundary.clone(),
+        NodeId("node-a".to_string()),
+        Duration::from_secs(1),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("source-owned source-status route should serve without query facade lane");
+    assert!(
+        snapshots
+            .iter()
+            .any(|snapshot| snapshot.logical_roots.iter().any(|root| root.id == "nfs1")),
+        "source-owned source-status route must publish current source roots: {snapshots:?}"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn source_status_route_serves_peer_only_requests_under_query_peer_runtime_unit_after_turnover()
  {
     let tmp = tempdir().expect("create temp dir");
@@ -19427,6 +20610,258 @@ async fn sink_query_proxy_route_serves_peer_only_requests_under_query_peer_runti
             .iter()
             .any(|unit_id| unit_id.as_deref() == Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)),
         "peer-only sink query proxy requests must recv under runtime.exec.query-peer: {recv_unit_ids:?}"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_rescan_routes_serve_worker_source_under_source_runtime_unit() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(nfs1.join("rescan")).expect("create nfs1 rescan dir");
+    fs::write(nfs1.join("rescan").join("seed.txt"), b"a").expect("seed nfs1");
+    let nfs1_source = nfs1.display().to_string();
+    let boundary = Arc::new(RuntimeProxyUnitAwareBoundary::new(None, None, None, None));
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+    let node_id = NodeId("node-a-source-rescan-worker".into());
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_watch_scan_root("nfs1", &nfs1_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "node-a::nfs1",
+                        "node-a",
+                        "10.0.0.11",
+                        &nfs1_source,
+                        nfs1.clone(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            node_id.clone(),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_rescan_request_route_for(&node_id.0).0,
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            source_rescan_request_route_for(&node_id.0).0,
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("source manual-rescan route wave should succeed");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let source_groups = app
+            .source
+            .scheduled_source_group_ids()
+            .await
+            .expect("source groups")
+            .unwrap_or_default();
+        let scan_groups = app
+            .source
+            .scheduled_scan_group_ids()
+            .await
+            .expect("scan groups")
+            .unwrap_or_default();
+        if source_groups == std::collections::BTreeSet::from(["nfs1".to_string()])
+            && scan_groups == std::collections::BTreeSet::from(["nfs1".to_string()])
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for source rescan worker route convergence: source={source_groups:?} scan={scan_groups:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let generic_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+        crate::runtime::routes::default_route_bindings(),
+    );
+    let generic_events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &generic_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_RESCAN,
+        Bytes::from_static(b"manual-rescan"),
+        Duration::from_secs(2),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("worker-backed generic source-rescan route should reply");
+    assert!(
+        !generic_events.is_empty(),
+        "worker-backed generic source-rescan route must return explicit delivery evidence"
+    );
+
+    let scoped_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+        source_rescan_route_bindings_for(&node_id.0),
+    );
+    let scoped_events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &scoped_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_RESCAN,
+        Bytes::from_static(b"manual-rescan"),
+        Duration::from_secs(2),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("worker-backed scoped source-rescan route should reply");
+    assert!(
+        scoped_events
+            .iter()
+            .any(|event| event.metadata().origin_id == node_id),
+        "worker-backed scoped source-rescan route must reply from the target source node"
+    );
+
+    let recv_unit_ids = boundary
+        .source_rescan_recv_unit_ids
+        .lock()
+        .expect("source_rescan_recv_unit_ids lock")
+        .clone();
+    assert!(
+        recv_unit_ids
+            .iter()
+            .any(|unit_id| unit_id.as_deref() == Some(execution_units::SOURCE_RUNTIME_UNIT_ID)),
+        "worker-backed source-rescan requests must recv under runtime.exec.source: {recv_unit_ids:?}"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_rescan_peer_scoped_route_drains_non_target_after_source_control_apply() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(nfs1.join("rescan")).expect("create nfs1 rescan dir");
+    fs::write(nfs1.join("rescan").join("seed.txt"), b"a").expect("seed nfs1");
+    let nfs1_source = nfs1.display().to_string();
+    let boundary = Arc::new(RuntimeProxyUnitAwareBoundary::new(None, None, None, None));
+    let node_id = NodeId("node-a-source-rescan-drain".into());
+    let peer_node_id = "node-b-source-rescan-drain";
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_watch_scan_root("nfs1", &nfs1_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "node-a::nfs1",
+                        "node-a",
+                        "10.0.0.11",
+                        &nfs1_source,
+                        nfs1.clone(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            local_runtime_worker_binding("source"),
+            local_runtime_worker_binding("sink"),
+            node_id.clone(),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            in_memory_state_boundary(),
+        )
+        .expect("init app"),
+    );
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_rescan_request_route_for(peer_node_id).0,
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("source manual-rescan peer route wave should succeed");
+
+    let scoped_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+        source_rescan_route_bindings_for(peer_node_id),
+    );
+    let scoped_events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &scoped_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_RESCAN,
+        Bytes::from_static(b"manual-rescan"),
+        Duration::from_millis(250),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("non-target scoped source-rescan route should drain explicitly");
+    assert!(
+        scoped_events.iter().any(|event| {
+            event.metadata().origin_id == node_id && event.payload_bytes() == b"not-target"
+        }),
+        "source node must drain another node's scoped source-rescan route with explicit non-target evidence; got {scoped_events:?}"
+    );
+    let target_evidence = scoped_events.iter().any(|event| {
+        event.metadata().origin_id.0 == peer_node_id && event.payload_bytes() == b"accepted"
+    });
+    assert!(
+        !target_evidence,
+        "non-target source node must not emit accepted target delivery evidence for another node's scoped route; got {scoped_events:?}"
     );
 
     app.close().await.expect("close app");
@@ -21847,7 +23282,7 @@ async fn cleanup_only_sink_query_tail_preserves_retained_sink_activate_before_la
     followup.extend(sink_wave(3));
     app.on_control_frame(&followup)
         .await
-        .expect_err("follow-up full wave should fail in source.apply before sink replay");
+        .expect("follow-up full wave should fail closed at the app boundary before sink replay");
     crate::workers::source::clear_source_worker_control_frame_error_hook();
     assert!(!app.control_initialized());
     match app
@@ -22133,7 +23568,7 @@ async fn cleanup_only_sink_query_tail_later_node_a_mixed_recovery_settles_after_
     followup.extend(sink_wave(3));
     app.on_control_frame(&followup)
         .await
-        .expect_err("follow-up full wave should fail in source.apply before sink replay");
+        .expect("follow-up full wave should fail closed at the app boundary before sink replay");
     crate::workers::source::clear_source_worker_control_frame_error_hook();
     assert!(!app.control_initialized());
     match app
@@ -22786,7 +24221,7 @@ async fn source_cleanup_only_followup_does_not_replay_retained_sink_state_while_
     followup.extend(sink_wave(3));
     app.on_control_frame(&followup)
         .await
-        .expect_err("follow-up full wave should fail in source.apply before sink replay");
+        .expect("follow-up full wave should fail closed at the app boundary before sink replay");
     crate::workers::source::clear_source_worker_control_frame_error_hook();
     assert!(!app.control_initialized());
     match app
@@ -23030,7 +24465,7 @@ async fn source_cleanup_only_and_query_peer_cleanup_tails_preserve_sink_converge
     followup.extend(query_peer_wave(3));
     app.on_control_frame(&followup)
         .await
-        .expect_err("follow-up mixed wave should fail in source.apply before sink replay");
+        .expect("follow-up mixed wave should fail closed at the app boundary before sink replay");
     crate::workers::source::clear_source_worker_control_frame_error_hook();
     assert!(!app.control_initialized());
     match app
@@ -23176,7 +24611,7 @@ async fn source_cleanup_only_and_query_peer_cleanup_tails_preserve_sink_converge
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn peer_only_source_status_initial_scope_only_wave_settles_after_repeated_post_ack_refresh_timeouts()
+async fn peer_only_source_status_initial_scope_only_wave_fail_closes_after_repeated_post_ack_refresh_timeouts()
  {
     struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
 
@@ -23296,10 +24731,10 @@ async fn peer_only_source_status_initial_scope_only_wave_settles_after_repeated_
     tokio::time::timeout(Duration::from_secs(5), app.on_control_frame(&initial))
             .await
             .expect(
-                "peer-only scope-only initial source wave should settle even when post-ack scheduled-groups refresh keeps timing out on successive retries",
+                "peer-only scope-only initial source wave should fail closed within the source refresh budget when post-ack scheduled-groups refresh keeps timing out on successive retries",
             )
             .expect(
-                "peer-only scope-only initial source wave should not exhaust runtime-app source recovery on repeated post-ack scheduled-groups refresh timeouts",
+                "peer-only scope-only initial source wave should keep the app process boundary alive after repeated post-ack scheduled-groups refresh timeouts",
             );
 
     let expected_groups =
@@ -23318,7 +24753,14 @@ async fn peer_only_source_status_initial_scope_only_wave_settles_after_repeated_
         .unwrap_or_default();
     assert_eq!(source_groups, expected_groups);
     assert_eq!(scan_groups, expected_groups);
-    assert!(app.control_initialized());
+    assert!(
+        !app.control_initialized(),
+        "persistent post-ack scheduled-group refresh timeouts must keep runtime control closed"
+    );
+    assert!(
+        app.source_state_replay_required(),
+        "persistent post-ack scheduled-group refresh timeouts must retain source replay for the next recovery wave"
+    );
 
     app.close().await.expect("close app");
 }
@@ -27690,13 +29132,8 @@ async fn failed_second_full_wave_preserves_incoming_sink_routes_for_later_replay
     let mut followup = source_wave(3);
     followup.extend(sink_wave(3));
     followup.extend(facade_wave(3));
-    let err = app.on_control_frame(&followup).await.expect_err(
-        "follow-up exact-shaped full wave should fail in source.apply before sink replay",
-    );
-    assert!(
-        err.to_string()
-            .contains("simulated source apply failure before sink replay"),
-        "unexpected follow-up full-wave failure: {err}"
+    app.on_control_frame(&followup).await.expect(
+        "follow-up exact-shaped full wave should fail closed at the app boundary before sink replay",
     );
     assert!(
         !app.control_initialized(),
@@ -27813,7 +29250,7 @@ async fn filtered_stale_shared_source_deactivate_does_not_clear_desired_source_s
         &fixed_bind_session,
         &stale_source_deactivate,
         true,
-        false,
+        SourceGenerationCutoverDisposition::None,
     )
     .await
     .expect("stale source deactivate should be filtered");
@@ -28009,7 +29446,7 @@ async fn generation_cutover_restart_deferred_cleanup_tail_fail_closes_before_rep
             &fixed_bind_session,
             &cleanup_source_signals,
             true,
-            true,
+            SourceGenerationCutoverDisposition::FailClosedRestartDeferredRetirePending,
         ),
     )
     .await
@@ -28023,6 +29460,537 @@ async fn generation_cutover_restart_deferred_cleanup_tail_fail_closes_before_rep
     assert!(
         !app.control_initialized(),
         "fail-closed cleanup-tail replay should leave runtime uninitialized for follow-up recovery"
+    );
+}
+
+#[tokio::test]
+async fn mixed_generation_cutover_source_retryable_reset_returns_before_same_frame_sink_replay() {
+    use std::collections::VecDeque;
+
+    let tmp = tempdir().expect("create temp dir");
+    let fs_source = tmp.path().display().to_string();
+    let app = FSMetaApp::new(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                host_object_grants: vec![worker_export_with_fs_source(
+                    "single-app-node::root-1",
+                    "single-app-node",
+                    "127.0.0.1",
+                    &fs_source,
+                    tmp.path().to_path_buf(),
+                )],
+                ..SourceConfig::default()
+            },
+            ..FSMetaConfig::default()
+        },
+        NodeId("single-app-node".into()),
+    )
+    .expect("init app");
+
+    let source_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let sink_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+    let root_scopes = &[("test-root", &["single-app-node::root-1"][..])];
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_route.clone(),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_route.clone(),
+            root_scopes,
+            2,
+        ),
+    ])
+    .await
+    .expect("initial mixed source/sink wave should succeed");
+
+    let _source_apply_error_reset = SourceApplyErrorQueueHookReset;
+    install_source_apply_error_queue_hook(SourceApplyErrorQueueHook {
+        errs: VecDeque::from([CnxError::Timeout]),
+    });
+    let sink_apply_entries = Arc::new(AtomicUsize::new(0));
+    let _sink_entry_reset = SinkApplyEntryCountHookReset;
+    install_sink_apply_entry_count_hook(sink_apply_entries.clone());
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_route,
+            root_scopes,
+            3,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_route,
+            root_scopes,
+            3,
+        ),
+    ])
+    .await
+    .expect("mixed generation-cutover wave should fail-close source reset at the app boundary");
+
+    assert_eq!(
+        sink_apply_entries.load(AtomicOrdering::Acquire),
+        0,
+        "once source control fail-closes a mixed generation-cutover frame, same-frame sink replay must be deferred instead of entering sink.apply",
+    );
+    assert!(
+        !app.control_initialized(),
+        "source fail-closed mixed cutover should leave runtime uninitialized for retained replay"
+    );
+    assert!(
+        app.source_state_replay_required(),
+        "source retained replay must remain armed after source fail-closed mixed cutover"
+    );
+    assert!(
+        app.sink_state_replay_required(),
+        "sink retained replay must remain armed instead of being replayed in the failed source frame"
+    );
+}
+
+#[tokio::test]
+async fn post_initial_source_activation_cutover_defers_inline_worker_rpc_on_process_apply_frame() {
+    let tmp = tempdir().expect("create temp dir");
+    let fs_source = tmp.path().display().to_string();
+    let app = FSMetaApp::new(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                host_object_grants: vec![worker_export_with_fs_source(
+                    "single-app-node::root-1",
+                    "single-app-node",
+                    "127.0.0.1",
+                    &fs_source,
+                    tmp.path().to_path_buf(),
+                )],
+                ..SourceConfig::default()
+            },
+            ..FSMetaConfig::default()
+        },
+        NodeId("single-app-node".into()),
+    )
+    .expect("init app");
+
+    let source_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let sink_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+    let root_scopes = &[("test-root", &["single-app-node::root-1"][..])];
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_route.clone(),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_route.clone(),
+            root_scopes,
+            2,
+        ),
+    ])
+    .await
+    .expect("initial mixed source/sink wave should succeed");
+
+    let source_apply_entries = Arc::new(AtomicUsize::new(0));
+    let _source_entry_reset = SourceApplyEntryCountHookReset;
+    install_source_apply_entry_count_hook(source_apply_entries.clone());
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_route,
+            root_scopes,
+            3,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_route,
+            root_scopes,
+            3,
+        ),
+    ])
+    .await
+    .expect(
+        "release cutover process apply should fail-close source replay without inline worker RPC",
+    );
+
+    assert_eq!(
+        source_apply_entries.load(AtomicOrdering::Acquire),
+        0,
+        "post-initial source activation cutover must not enter source.apply on the process apply/quorum frame",
+    );
+    assert!(
+        !app.control_initialized(),
+        "deferred post-initial source activation should keep runtime uninitialized until a recovery entrypoint repairs it"
+    );
+    assert!(
+        app.source_state_replay_required(),
+        "deferred post-initial source activation must remain armed for recovery entrypoints"
+    );
+}
+
+#[tokio::test]
+async fn retained_generation_cutover_source_replay_defers_inline_worker_rpc_on_process_apply_frame()
+{
+    use std::collections::VecDeque;
+
+    let tmp = tempdir().expect("create temp dir");
+    let fs_source = tmp.path().display().to_string();
+    let app = FSMetaApp::new(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                host_object_grants: vec![worker_export_with_fs_source(
+                    "single-app-node::root-1",
+                    "single-app-node",
+                    "127.0.0.1",
+                    &fs_source,
+                    tmp.path().to_path_buf(),
+                )],
+                ..SourceConfig::default()
+            },
+            ..FSMetaConfig::default()
+        },
+        NodeId("single-app-node".into()),
+    )
+    .expect("init app");
+
+    let source_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let sink_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+    let root_scopes = &[("test-root", &["single-app-node::root-1"][..])];
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_route.clone(),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_route.clone(),
+            root_scopes,
+            2,
+        ),
+    ])
+    .await
+    .expect("initial mixed source/sink wave should succeed");
+
+    app.mark_control_uninitialized_after_failure().await;
+    assert!(
+        app.source_state_replay_required(),
+        "forced fail-closed state should arm retained source replay"
+    );
+
+    let _source_apply_error_reset = SourceApplyErrorQueueHookReset;
+    install_source_apply_error_queue_hook(SourceApplyErrorQueueHook {
+        errs: VecDeque::from([CnxError::Timeout]),
+    });
+    let source_apply_entries = Arc::new(AtomicUsize::new(0));
+    let _source_entry_reset = SourceApplyEntryCountHookReset;
+    install_source_apply_entry_count_hook(source_apply_entries.clone());
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_route,
+            root_scopes,
+            3,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_route,
+            root_scopes,
+            3,
+        ),
+    ])
+    .await
+    .expect(
+        "process apply frame with retained post-initial source replay should ack without inline source RPC",
+    );
+
+    assert_eq!(
+        source_apply_entries.load(AtomicOrdering::Acquire),
+        0,
+        "retained post-initial source replay must not enter source.apply on the process apply/quorum frame",
+    );
+    assert!(
+        !app.control_initialized(),
+        "deferred retained source replay should keep runtime uninitialized until a recovery entrypoint repairs it"
+    );
+    assert!(
+        app.source_state_replay_required(),
+        "deferred retained source replay must remain armed for recovery entrypoints"
+    );
+}
+
+#[tokio::test]
+async fn retained_generation_cutover_source_deactivate_replay_defers_inline_worker_rpc_on_process_apply_frame()
+ {
+    use std::collections::VecDeque;
+
+    let tmp = tempdir().expect("create temp dir");
+    let fs_source = tmp.path().display().to_string();
+    let app = FSMetaApp::new(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                host_object_grants: vec![worker_export_with_fs_source(
+                    "single-app-node::root-1",
+                    "single-app-node",
+                    "127.0.0.1",
+                    &fs_source,
+                    tmp.path().to_path_buf(),
+                )],
+                ..SourceConfig::default()
+            },
+            ..FSMetaConfig::default()
+        },
+        NodeId("single-app-node".into()),
+    )
+    .expect("init app");
+
+    let source_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let sink_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+    let root_scopes = &[("test-root", &["single-app-node::root-1"][..])];
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_route.clone(),
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_route.clone(),
+            root_scopes,
+            2,
+        ),
+    ])
+    .await
+    .expect("initial mixed source/sink wave should succeed");
+
+    let _source_apply_error_reset = SourceApplyErrorQueueHookReset;
+    install_source_apply_error_queue_hook(SourceApplyErrorQueueHook {
+        errs: VecDeque::from([CnxError::Timeout]),
+    });
+    app.on_control_frame(&[deactivate_envelope_with_route_key_reason_and_lease(
+        execution_units::SOURCE_RUNTIME_UNIT_ID,
+        source_route,
+        3,
+        "restart_deferred_retire_pending",
+        7,
+        11,
+        22,
+    )])
+    .await
+    .expect("source restart-deferred retire should fail-close and retain source replay");
+    assert!(
+        app.source_state_replay_required(),
+        "source restart-deferred retire failure should leave retained source replay armed"
+    );
+
+    let source_apply_entries = Arc::new(AtomicUsize::new(0));
+    let _source_entry_reset = SourceApplyEntryCountHookReset;
+    install_source_apply_entry_count_hook(source_apply_entries.clone());
+
+    app.on_control_frame(&[activate_envelope_with_route_key_and_scope_rows(
+        execution_units::SINK_RUNTIME_UNIT_ID,
+        sink_route,
+        root_scopes,
+        3,
+    )])
+    .await
+    .expect("process apply frame with retained source deactivate replay should ack without inline source RPC");
+
+    assert_eq!(
+        source_apply_entries.load(AtomicOrdering::Acquire),
+        0,
+        "retained source deactivate replay must not enter source.apply on the process apply/quorum frame",
+    );
+    assert!(
+        !app.control_initialized(),
+        "deferred retained source deactivate replay should keep runtime uninitialized until a recovery entrypoint repairs it"
+    );
+    assert!(
+        app.source_state_replay_required(),
+        "deferred retained source deactivate replay must remain armed for recovery entrypoints"
+    );
+}
+
+#[tokio::test]
+async fn retained_generation_cutover_sink_replay_defers_inline_worker_rpc_on_process_apply_frame() {
+    let tmp = tempdir().expect("create temp dir");
+    let fs_source = tmp.path().display().to_string();
+    let app = FSMetaApp::new(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                host_object_grants: vec![worker_export_with_fs_source(
+                    "single-app-node::root-1",
+                    "single-app-node",
+                    "127.0.0.1",
+                    &fs_source,
+                    tmp.path().to_path_buf(),
+                )],
+                ..SourceConfig::default()
+            },
+            ..FSMetaConfig::default()
+        },
+        NodeId("single-app-node".into()),
+    )
+    .expect("init app");
+
+    let source_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let sink_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+    let root_scopes = &[("test-root", &["single-app-node::root-1"][..])];
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_route,
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_route,
+            root_scopes,
+            2,
+        ),
+    ])
+    .await
+    .expect("initial mixed source/sink wave should succeed");
+
+    set_control_initialized_for_tests(&app, false);
+    set_source_replay_required_for_tests(&app, false);
+    set_sink_replay_required_for_tests(&app, true);
+
+    let source_apply_entries = Arc::new(AtomicUsize::new(0));
+    let _source_entry_reset = SourceApplyEntryCountHookReset;
+    install_source_apply_entry_count_hook(source_apply_entries.clone());
+    let sink_apply_entries = Arc::new(AtomicUsize::new(0));
+    let _sink_entry_reset = SinkApplyEntryCountHookReset;
+    install_sink_apply_entry_count_hook(sink_apply_entries.clone());
+
+    app.on_control_frame(&[tick_envelope_with_route_key(
+        execution_units::SOURCE_RUNTIME_UNIT_ID,
+        format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+        3,
+    )])
+    .await
+    .expect("process apply frame with retained sink replay should ack without inline sink RPC");
+
+    assert_eq!(
+        source_apply_entries.load(AtomicOrdering::Acquire),
+        0,
+        "source current-generation keepalive ticks must not enter source.apply while runtime stays fail-closed only for retained sink replay",
+    );
+    assert_eq!(
+        sink_apply_entries.load(AtomicOrdering::Acquire),
+        0,
+        "retained sink replay must not enter sink.apply on the process apply/quorum frame",
+    );
+    assert!(
+        !app.control_initialized(),
+        "deferred retained sink replay should keep runtime uninitialized until a recovery entrypoint repairs it"
+    );
+    assert!(
+        app.sink_state_replay_required(),
+        "deferred retained sink replay must remain armed for recovery entrypoints"
+    );
+}
+
+#[tokio::test]
+async fn retained_replay_wakeup_tick_does_not_reopen_runtime_initialization_before_recovery() {
+    let app = FSMetaApp::new(FSMetaConfig::default(), NodeId("single-app-node".into()))
+        .expect("init app");
+    set_control_initialized_for_tests(&app, false);
+    set_source_replay_required_for_tests(&app, true);
+    app.api_control_gate.set_ready_state(false, false);
+
+    let initialize_entries = Arc::new(AtomicUsize::new(0));
+    let _initialize_reset = RuntimeInitializeEntryCountHookReset;
+    install_runtime_initialize_entry_count_hook(initialize_entries.clone());
+
+    app.on_control_frame(&[tick_envelope_with_route_key(
+        execution_units::SOURCE_RUNTIME_UNIT_ID,
+        format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+        3,
+    )])
+    .await
+    .expect("retained replay wakeup tick should stay inside fail-closed recovery bookkeeping");
+
+    assert_eq!(
+        initialize_entries.load(AtomicOrdering::Acquire),
+        0,
+        "retained replay wakeup ticks must not reopen normal runtime initialization before recovery clears retained replay"
+    );
+    assert!(
+        !app.control_initialized(),
+        "retained replay wakeup tick should leave the runtime fail-closed until recovery repairs retained source state"
+    );
+    assert!(
+        app.source_state_replay_required(),
+        "retained replay wakeup tick should preserve source replay for the bounded recovery entrypoint"
+    );
+}
+
+#[tokio::test]
+async fn initialized_steady_source_tick_does_not_reenter_runtime_initialization_path() {
+    let app = FSMetaApp::new(FSMetaConfig::default(), NodeId("single-app-node".into()))
+        .expect("init app");
+    set_control_initialized_for_tests(&app, true);
+    set_source_replay_required_for_tests(&app, false);
+    set_sink_replay_required_for_tests(&app, false);
+    app.api_control_gate.set_ready_state(true, true);
+
+    let initialize_entries = Arc::new(AtomicUsize::new(0));
+    let _initialize_reset = RuntimeInitializeEntryCountHookReset;
+    install_runtime_initialize_entry_count_hook(initialize_entries.clone());
+
+    app.on_control_frame(&[tick_envelope_with_route_key(
+        execution_units::SOURCE_RUNTIME_UNIT_ID,
+        format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+        3,
+    )])
+    .await
+    .expect("initialized steady source tick should remain a keepalive");
+
+    assert_eq!(
+        initialize_entries.load(AtomicOrdering::Acquire),
+        0,
+        "already-initialized keepalive ticks must not re-enter runtime initialization"
+    );
+}
+
+#[tokio::test]
+async fn management_write_recovery_clears_retained_replay_before_write_ready_wait() {
+    let app = FSMetaApp::new(FSMetaConfig::default(), NodeId("single-app-node".into()))
+        .expect("init app");
+    set_control_initialized_for_tests(&app, false);
+    set_source_replay_required_for_tests(&app, true);
+    set_sink_replay_required_for_tests(&app, true);
+    app.api_control_gate.set_ready_state(false, false);
+
+    let recovery = app.management_write_recovery_for_tests();
+    recovery()
+        .await
+        .expect("management write recovery should repair retained local source/sink replay");
+
+    assert!(
+        app.control_initialized(),
+        "management-write recovery should mark runtime initialized after retained source/sink replay clears"
+    );
+    assert!(
+        !app.source_state_replay_required(),
+        "management-write recovery should clear retained source replay before the write-ready wait returns"
+    );
+    assert!(
+        !app.sink_state_replay_required(),
+        "management-write recovery should clear retained sink replay before the write-ready wait returns"
     );
 }
 

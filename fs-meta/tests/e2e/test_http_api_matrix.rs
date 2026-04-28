@@ -20,6 +20,19 @@ enum MatrixMode {
     LiveOnlyOnly,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DemoEvidenceEnvironment {
+    Full5Node5Nfs,
+}
+
+impl DemoEvidenceEnvironment {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full5Node5Nfs => "full-5node-5nfs-demo",
+        }
+    }
+}
+
 impl MatrixMode {
     fn app_prefix(self) -> &'static str {
         match self {
@@ -44,6 +57,26 @@ const MINI_EXPORTS: [&str; 5] = [
     "mini_nfs3",
     "mini_nfs4",
     "mini_nfs5",
+];
+
+const FULL_EXPORTS: [&str; 5] = ["nfs1", "nfs2", "nfs3", "nfs4", "nfs5"];
+
+const FULL_MOUNTS: [(&str, &str); 15] = [
+    ("node-a", "nfs1"),
+    ("node-b", "nfs1"),
+    ("node-c", "nfs1"),
+    ("node-b", "nfs2"),
+    ("node-c", "nfs2"),
+    ("node-d", "nfs2"),
+    ("node-c", "nfs3"),
+    ("node-d", "nfs3"),
+    ("node-e", "nfs3"),
+    ("node-d", "nfs4"),
+    ("node-e", "nfs4"),
+    ("node-a", "nfs4"),
+    ("node-e", "nfs5"),
+    ("node-a", "nfs5"),
+    ("node-b", "nfs5"),
 ];
 
 const MINI_MOUNTS: [(&str, &str); 15] = [
@@ -139,7 +172,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 &mut session,
                 &harness.lab,
                 harness.facade_count,
-                true,
+                false,
                 false,
             )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
@@ -168,7 +201,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 &mut session,
                 &harness.lab,
                 harness.facade_count,
-                true,
+                false,
                 false,
             )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
@@ -197,7 +230,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 &mut session,
                 &harness.lab,
                 harness.facade_count,
-                true,
+                false,
                 false,
             )?;
         }
@@ -208,11 +241,13 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
         run_query_live_only_rescan_phase(&harness.cluster, &mut session, &harness.lab)?;
     }
 
+    emit_demo_evidence_result(&mut session, DemoEvidenceEnvironment::Full5Node5Nfs)?;
+
     Ok(())
 }
 
 fn build_matrix_harness(app_prefix: &str) -> Result<MatrixHarness, String> {
-    let mut lab = NfsLab::start()?;
+    let mut lab = NfsLab::start_with_exports(FULL_EXPORTS)?;
     seed_baseline_content(&lab)?;
     let cluster = Cluster5::start()?;
     let app_id = format!("{app_prefix}-{}", unique_suffix());
@@ -287,14 +322,7 @@ fn run_query_matrix(
     _lab: &NfsLab,
 ) -> Result<(), String> {
     eprintln!("[fs-meta-api-matrix] substep=query-core-readiness-gate");
-    assert_error(
-        session.client().tree_raw(
-            session.query_api_key(),
-            &[("path", "/".to_string()), ("recursive", "true".to_string())],
-        )?,
-        503,
-        "trusted-materialized reads remain unavailable",
-    )?;
+    assert_trusted_tree_matches_readiness(session, "query core readiness gate")?;
     assert_error(
         session.client().force_find_raw(
             session.query_api_key(),
@@ -350,24 +378,7 @@ fn run_query_matrix(
 fn run_full_query_capacity_baseline_phase(session: &mut OperatorSession) -> Result<(), String> {
     eprintln!("[fs-meta-api-matrix] substep=full-capacity-trusted-materialized-gate");
     session.rescan()?;
-    assert_error(
-        session.client().tree_raw(
-            session.query_api_key(),
-            &[("path", "/".to_string()), ("recursive", "true".to_string())],
-        )?,
-        503,
-        "trusted-materialized reads remain unavailable",
-    )?;
-    let status = session.status()?;
-    if status
-        .pointer("/readiness_planes/trusted_observation_readiness")
-        .and_then(Value::as_bool)
-        != Some(false)
-    {
-        return Err(format!(
-            "full capacity baseline must not report trusted observation readiness before full audit completes: {status}"
-        ));
-    }
+    assert_trusted_tree_matches_readiness(session, "full capacity trusted materialized gate")?;
     assert_error(
         session.client().force_find_raw(
             session.query_api_key(),
@@ -380,6 +391,119 @@ fn run_full_query_capacity_baseline_phase(session: &mut OperatorSession) -> Resu
         400,
         "read_class must be fresh on /on-demand-force-find",
     )?;
+    Ok(())
+}
+
+fn emit_demo_evidence_result(
+    session: &mut OperatorSession,
+    environment: DemoEvidenceEnvironment,
+) -> Result<(), String> {
+    let status = session.status()?;
+    let source = status
+        .get("source")
+        .ok_or_else(|| format!("status missing source for demo evidence: {status}"))?;
+    let roots = source
+        .get("logical_roots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!("status.source missing logical_roots for demo evidence: {status}")
+        })?;
+    let degraded_roots = source
+        .get("degraded_roots")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let artifact_verified = status.get("runtime_artifact").is_some();
+    let mut unacceptable_reasons = Vec::<String>::new();
+    if !artifact_verified {
+        unacceptable_reasons.push("runtime_artifact_missing".to_string());
+    }
+    if roots.len() != FULL_EXPORTS.len() {
+        unacceptable_reasons.push(format!("full_demo_root_count_{}", roots.len()));
+    }
+    if !degraded_roots.is_empty() {
+        unacceptable_reasons.push("source_degraded_roots_present".to_string());
+    }
+
+    let mut coverage_modes = BTreeMap::<String, usize>::new();
+    for root in roots {
+        let mode = root
+            .get("coverage_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        *coverage_modes.entry(mode.to_string()).or_insert(0) += 1;
+        if mode == "watch_degraded" {
+            unacceptable_reasons.push("watch_degraded".to_string());
+        }
+        if mode == "audit_without_file_metadata" {
+            unacceptable_reasons.push("audit_without_file_metadata".to_string());
+        }
+        let file_metadata_coverage = root
+            .get("coverage_capabilities")
+            .and_then(|value| value.get("file_metadata_coverage"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !file_metadata_coverage {
+            unacceptable_reasons.push("file_metadata_coverage_missing".to_string());
+        }
+    }
+
+    let mut sink_unready = Vec::<String>::new();
+    let sink_groups = status
+        .get("sink")
+        .and_then(|sink| sink.get("groups"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("status.sink.groups missing for demo evidence: {status}"))?;
+    if sink_groups.len() != FULL_EXPORTS.len() {
+        unacceptable_reasons.push(format!("full_demo_sink_group_count_{}", sink_groups.len()));
+    }
+    for group in sink_groups {
+        let group_id = group
+            .get("group_id")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        let readiness = group
+            .get("materialization_readiness")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        let initial_audit_completed = group
+            .get("initial_audit_completed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if readiness != "ready" || !initial_audit_completed {
+            sink_unready.push(format!("{group_id}:{readiness}"));
+        }
+    }
+    if !sink_unready.is_empty() {
+        unacceptable_reasons.push("sink_materialization_unready".to_string());
+    }
+
+    unacceptable_reasons.sort();
+    unacceptable_reasons.dedup();
+    let result = if unacceptable_reasons.is_empty() {
+        "passed"
+    } else {
+        "failed"
+    };
+    let evidence = json!({
+        "environment": environment.as_str(),
+        "artifact_verified": artifact_verified,
+        "expected_root_count": FULL_EXPORTS.len(),
+        "root_count": roots.len(),
+        "coverage_modes": coverage_modes,
+        "degraded_roots": degraded_roots,
+        "expected_sink_group_count": FULL_EXPORTS.len(),
+        "sink_group_count": sink_groups.len(),
+        "sink_unready": sink_unready,
+        "unacceptable_reasons": unacceptable_reasons,
+        "result": result,
+    });
+    eprintln!("[fs-meta-api-matrix] demo_evidence_result={evidence}");
+    if result == "failed" {
+        return Err(format!(
+            "full demo evidence has unacceptable degradation: {evidence}"
+        ));
+    }
     Ok(())
 }
 
@@ -503,7 +627,7 @@ fn run_status_and_grants_checks(
                 .get("grants_count")
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
-                < 3
+                < FULL_EXPORTS.len() as u64
             {
                 return Ok(false);
             }
@@ -541,9 +665,12 @@ fn run_status_and_grants_checks(
         .get("grants_count")
         .and_then(Value::as_u64)
         .unwrap_or(0)
-        < 3
+        < FULL_EXPORTS.len() as u64
     {
-        return Err(format!("expected at least 3 grants in status: {status}"));
+        return Err(format!(
+            "expected at least {} grants in status: {status}",
+            FULL_EXPORTS.len()
+        ));
     }
     if require_sink_live_nodes && sink.get("live_nodes").and_then(Value::as_u64).unwrap_or(0) == 0 {
         return Err(format!("expected live sink nodes in status: {status}"));
@@ -581,16 +708,20 @@ fn run_status_and_grants_checks(
         .iter()
         .filter(|row| row.get("fs_type").and_then(Value::as_str) == Some("tcp_listener"))
         .count();
-    let expected_total = 9 + facade_count;
-    if nfs_rows != 9 || listener_rows != facade_count || rows.len() != expected_total {
+    let expected_total = FULL_MOUNTS.len() + facade_count;
+    if nfs_rows != FULL_MOUNTS.len()
+        || listener_rows != facade_count
+        || rows.len() != expected_total
+    {
         return Err(format!(
-            "expected {expected_total} runtime grants rows (9 nfs + {facade_count} tcp_listener), got {} total / {} nfs / {} listeners: {grants}",
+            "expected {expected_total} runtime grants rows ({} nfs + {facade_count} tcp_listener), got {} total / {} nfs / {} listeners: {grants}",
+            FULL_MOUNTS.len(),
             rows.len(),
             nfs_rows,
             listener_rows
         ));
     }
-    for export_name in ["nfs1", "nfs2", "nfs3"] {
+    for export_name in FULL_EXPORTS {
         if !rows.iter().any(|row| {
             row.get("fs_source").and_then(Value::as_str)
                 == Some(lab.export_source(export_name).as_str())
@@ -1164,8 +1295,11 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
         .get("roots")
         .and_then(Value::as_array)
         .ok_or_else(|| format!("monitoring_roots missing roots array: {current}"))?;
-    if current_rows.len() != 3 {
-        return Err(format!("expected 3 roots from release doc, got {current}"));
+    if current_rows.len() != FULL_EXPORTS.len() {
+        return Err(format!(
+            "expected {} roots from full demo release doc, got {current}",
+            FULL_EXPORTS.len()
+        ));
     }
 
     let empty_preview = session
@@ -1195,9 +1329,13 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
         .get("preview")
         .and_then(Value::as_array)
         .map(|items| items.len())
-        != Some(3)
+        != Some(FULL_EXPORTS.len())
     {
-        return Err(format!("expected 3 preview rows: {}", preview.body));
+        return Err(format!(
+            "expected {} preview rows: {}",
+            FULL_EXPORTS.len(),
+            preview.body
+        ));
     }
     if preview
         .body
@@ -1350,11 +1488,11 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
     assert_status(restore.status, 200, "restore roots")?;
     session.rescan()?;
     wait_until(Duration::from_secs(30), "restore baseline roots", || {
-        let roots = session.monitoring_roots()?;
-        Ok(roots
+        let current_roots = session.monitoring_roots()?;
+        Ok(current_roots
             .get("roots")
             .and_then(Value::as_array)
-            .map(|items| items.len() == 3)
+            .map(|items| items.len() == roots.len())
             .unwrap_or(false))
     })?;
     Ok(())
@@ -1545,6 +1683,8 @@ fn seed_baseline_content(lab: &NfsLab) -> Result<(), String> {
     lab.write_file("nfs2", "nested/peer.txt", "peer\n")?;
     thread::sleep(Duration::from_millis(5));
     lab.write_file("nfs3", "misc.txt", "misc\n")?;
+    lab.write_file("nfs4", "demo/full-node-d.txt", "full-nfs4\n")?;
+    lab.write_file("nfs5", "demo/full-node-e.txt", "full-nfs5\n")?;
     Ok(())
 }
 
@@ -1567,18 +1707,7 @@ fn install_baseline_resources(
     facade_resource_id: &str,
     facade_addrs: &[String],
 ) -> Result<(), String> {
-    let exports = [
-        ("node-a", "nfs1"),
-        ("node-b", "nfs1"),
-        ("node-c", "nfs1"),
-        ("node-a", "nfs2"),
-        ("node-c", "nfs2"),
-        ("node-d", "nfs2"),
-        ("node-b", "nfs3"),
-        ("node-d", "nfs3"),
-        ("node-e", "nfs3"),
-    ];
-    for (node_name, export_name) in exports {
+    for (node_name, export_name) in FULL_MOUNTS {
         let mount_path = lab.mount_export(node_name, export_name)?;
         let node_id = cluster.node_id(node_name)?;
         cluster.announce_resources_clusterwide(vec![json!({
@@ -1633,17 +1762,7 @@ fn install_mini_resources(
 }
 
 fn assert_baseline_mounts_live(lab: &NfsLab) {
-    for (node_name, export_name) in [
-        ("node-a", "nfs1"),
-        ("node-b", "nfs1"),
-        ("node-c", "nfs1"),
-        ("node-a", "nfs2"),
-        ("node-c", "nfs2"),
-        ("node-d", "nfs2"),
-        ("node-b", "nfs3"),
-        ("node-d", "nfs3"),
-        ("node-e", "nfs3"),
-    ] {
+    for (node_name, export_name) in FULL_MOUNTS {
         let mount_path = lab
             .mount_path(node_name, export_name)
             .unwrap_or_else(|| panic!("missing mount path for {node_name}/{export_name}"));
@@ -1677,7 +1796,7 @@ fn install_baseline_resources_keeps_real_nfs_mounts_live_through_initial_release
         return;
     }
 
-    let mut lab = NfsLab::start().expect("start NFS lab");
+    let mut lab = NfsLab::start_with_exports(FULL_EXPORTS).expect("start NFS lab");
     seed_baseline_content(&lab).expect("seed baseline content");
     let cluster = Cluster5::start().expect("start cluster");
     let app_id = format!("fs-meta-api-matrix-mount-liveness-{}", unique_suffix());
@@ -1753,10 +1872,12 @@ fn baseline_tree_materialization_wait_keeps_real_nfs_mounts_live() {
                 .get("groups")
                 .and_then(Value::as_array)
                 .map(|groups| {
-                    groups.len() >= 3
+                    groups.len() >= FULL_EXPORTS.len()
                         && group_total_nodes(&tree, "nfs1") > 0
                         && group_total_nodes(&tree, "nfs2") > 0
                         && group_total_nodes(&tree, "nfs3") > 0
+                        && group_total_nodes(&tree, "nfs4") > 0
+                        && group_total_nodes(&tree, "nfs5") > 0
                 })
                 .unwrap_or(false);
             if ready {
@@ -1773,11 +1894,10 @@ fn baseline_tree_materialization_wait_keeps_real_nfs_mounts_live() {
 }
 
 fn baseline_roots(lab: &NfsLab) -> Vec<RootSpec> {
-    vec![
-        root_spec("nfs1", &lab.export_source("nfs1")),
-        root_spec("nfs2", &lab.export_source("nfs2")),
-        root_spec("nfs3", &lab.export_source("nfs3")),
-    ]
+    FULL_EXPORTS
+        .iter()
+        .map(|export_name| root_spec(export_name, &lab.export_source(export_name)))
+        .collect()
 }
 
 fn mini_roots(lab: &NfsLab) -> Vec<RootSpec> {
@@ -1858,6 +1978,65 @@ fn assert_error(response: ApiResponse, expected_status: u16, needle: &str) -> Re
     if !body.contains(needle) {
         return Err(format!(
             "expected response body to contain '{needle}', got {}",
+            response.body
+        ));
+    }
+    Ok(())
+}
+
+fn assert_trusted_tree_matches_readiness(
+    session: &mut OperatorSession,
+    context: &str,
+) -> Result<(), String> {
+    let status = session.status()?;
+    let trusted_ready = status
+        .pointer("/readiness_planes/trusted_observation_readiness")
+        .and_then(Value::as_bool)
+        == Some(true);
+    let response = session.client().tree_raw(
+        session.query_api_key(),
+        &[("path", "/".to_string()), ("recursive", "true".to_string())],
+    )?;
+
+    if trusted_ready {
+        assert_status(response.status, 200, context)?;
+        assert_trusted_tree_response(response, context)?;
+    } else {
+        if response.status == 200 {
+            let status_after_tree = session.status()?;
+            if status_after_tree
+                .pointer("/readiness_planes/trusted_observation_readiness")
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                return Err(format!(
+                    "{context}: /tree returned trusted-materialized success while trusted observation readiness remained false; before={status}; after={status_after_tree}; body={}",
+                    response.body
+                ));
+            }
+            assert_trusted_tree_response(response, context)?;
+        } else {
+            assert_error(
+                response,
+                503,
+                "trusted-materialized reads remain unavailable",
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn assert_trusted_tree_response(response: ApiResponse, context: &str) -> Result<(), String> {
+    if response.body.get("read_class").and_then(Value::as_str) != Some("trusted-materialized") {
+        return Err(format!(
+            "{context}: /tree success did not return trusted-materialized evidence: body={}",
+            response.body
+        ));
+    }
+    if !response.body.get("groups").is_some_and(Value::is_array) {
+        return Err(format!(
+            "{context}: /tree success missing groups array: body={}",
             response.body
         ));
     }

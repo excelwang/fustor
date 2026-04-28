@@ -62,7 +62,10 @@ async fn status_snapshot_nonblocking_does_not_return_scheduled_zero_uninitialize
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
@@ -321,7 +324,10 @@ async fn status_snapshot_nonblocking_steady_probe_uses_local_probe_budget_when_l
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
@@ -483,6 +489,87 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_after_successf
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn management_apply_updates_external_sink_worker_client_runtime_cache_for_status_scope() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    let nfs3 = tmp.path().join("nfs3");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    std::fs::create_dir_all(&nfs3).expect("create nfs3 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            sink_worker_root("nfs1", &nfs1),
+            sink_worker_root("nfs2", &nfs2),
+            sink_worker_root("nfs3", &nfs3),
+        ],
+        host_object_grants: vec![
+            sink_worker_export("node-a::nfs1", "node-a", "10.0.0.41", nfs1.clone()),
+            sink_worker_export("node-a::nfs2", "node-a", "10.0.0.42", nfs2.clone()),
+            sink_worker_export("node-c::nfs2", "node-c", "10.0.0.43", nfs2.clone()),
+            sink_worker_export("node-d::nfs2", "node-d", "10.0.0.44", nfs2.clone()),
+            sink_worker_export("node-a::nfs3", "node-a", "10.0.0.45", nfs3.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    let mut node_c_revoked =
+        sink_worker_export("node-c::nfs2", "node-c", "10.0.0.43", nfs2.clone());
+    node_c_revoked.active = false;
+    let mut node_d_revoked =
+        sink_worker_export("node-d::nfs2", "node-d", "10.0.0.44", nfs2.clone());
+    node_d_revoked.active = false;
+    let current_grants = vec![
+        sink_worker_export("node-a::nfs2", "node-a", "10.0.0.42", nfs2.clone()),
+        node_c_revoked,
+        node_d_revoked,
+    ];
+    sink.update_logical_roots_from_management_apply_with_failure(
+        vec![sink_worker_root("nfs2", &nfs2)],
+        current_grants.clone(),
+    )
+    .await
+    .expect("management apply should reach sink worker");
+
+    let cached = sink.current_config().expect("cached sink worker config");
+    let cached_roots = cached
+        .roots
+        .iter()
+        .map(|root| root.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        cached_roots,
+        std::collections::BTreeSet::from(["nfs2"]),
+        "external sink worker client status cache must track management-applied roots instead of retaining the previous all-root bootstrap scope"
+    );
+    assert_eq!(
+        cached.host_object_grants, current_grants,
+        "external sink worker client status cache must track current grant activity after management apply"
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn status_snapshot_nonblocking_does_not_publish_unscheduled_zero_uninitialized_live_snapshot_before_any_schedule_converges()
  {
     let tmp = tempdir().expect("create temp dir");
@@ -635,7 +722,10 @@ async fn status_snapshot_nonblocking_republishes_scheduled_groups_into_cached_su
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
@@ -1238,7 +1328,10 @@ async fn status_snapshot_nonblocking_does_not_regress_ready_cached_groups_to_liv
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
@@ -2383,12 +2476,16 @@ async fn status_snapshot_nonblocking_eventually_restores_ready_groups_after_seco
             let cached_snapshot = sink
                 .cached_status_snapshot_with_failure()
                 .expect("cached status after second same-instance retained replay");
-            let blocking_sink_status =
-                match tokio::time::timeout(Duration::from_secs(2), sink.status_snapshot_with_failure()).await {
-                    Ok(Ok(snapshot)) => format!("{snapshot:?}"),
-                    Ok(Err(err)) => format!("blocking_status_err={}", err.as_error()),
-                    Err(_) => "blocking_status_timeout".to_string(),
-                };
+            let blocking_sink_status = match tokio::time::timeout(
+                Duration::from_secs(2),
+                sink.status_snapshot_with_failure(),
+            )
+            .await
+            {
+                Ok(Ok(snapshot)) => format!("{snapshot:?}"),
+                Ok(Err(err)) => format!("blocking_status_err={}", err.as_error()),
+                Err(_) => "blocking_status_timeout".to_string(),
+            };
             panic!(
                 "second same-instance retained replay should eventually restore ready groups without new source events instead of leaving local sink-status stuck empty: cached={cached_snapshot:?} blocking={blocking_sink_status}"
             );
@@ -2619,12 +2716,16 @@ async fn status_snapshot_nonblocking_restores_ready_groups_after_explicit_same_i
             let cached_snapshot = sink
                 .cached_status_snapshot_with_failure()
                 .expect("cached status after explicit same-instance replay wave");
-            let blocking_sink_status =
-                match tokio::time::timeout(Duration::from_secs(2), sink.status_snapshot_with_failure()).await {
-                    Ok(Ok(snapshot)) => format!("{snapshot:?}"),
-                    Ok(Err(err)) => format!("blocking_status_err={}", err.as_error()),
-                    Err(_) => "blocking_status_timeout".to_string(),
-                };
+            let blocking_sink_status = match tokio::time::timeout(
+                Duration::from_secs(2),
+                sink.status_snapshot_with_failure(),
+            )
+            .await
+            {
+                Ok(Ok(snapshot)) => format!("{snapshot:?}"),
+                Ok(Err(err)) => format!("blocking_status_err={}", err.as_error()),
+                Err(_) => "blocking_status_timeout".to_string(),
+            };
             panic!(
                 "explicit same-instance retained sink replay wave should eventually restore ready groups without new source events instead of leaving local sink-status stuck empty: cached={cached_snapshot:?} blocking={blocking_sink_status}"
             );
@@ -5515,7 +5616,10 @@ async fn status_snapshot_does_not_publish_unscheduled_zero_uninitialized_snapsho
     let materialized_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     while tokio::time::Instant::now() < materialized_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply source batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply source batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
@@ -6105,6 +6209,111 @@ async fn status_snapshot_does_not_rearm_same_retained_replay_after_zero_uninitia
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_route_snapshot_does_not_execute_retained_replay_recovery() {
+    struct SinkWorkerControlFramePauseHookReset;
+
+    impl Drop for SinkWorkerControlFramePauseHookReset {
+        fn drop(&mut self) {
+            clear_sink_worker_control_frame_pause_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            sink_worker_root("nfs1", &nfs1),
+            sink_worker_root("nfs2", &nfs2),
+        ],
+        host_object_grants: Vec::new(),
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = Arc::new(
+        SinkWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client"),
+    );
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    sink.on_control_frame(vec![encode_runtime_exec_control(
+        &RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["nfs1"]),
+                bound_scope_with_resources("nfs2", &["nfs2"]),
+            ],
+        }),
+    )
+    .expect("encode sink activate")])
+    .await
+    .expect("apply retained replay control wave before status-route probe");
+
+    sink.control_state_replay_required
+        .store(1, Ordering::Release);
+    sink.update_cached_status_snapshot(SinkStatusSnapshot::default())
+        .expect("seed cached status for status-route fallback");
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let _pause_reset = SinkWorkerControlFramePauseHookReset;
+    install_sink_worker_control_frame_pause_hook(SinkWorkerControlFramePauseHook {
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+
+    let status_route = tokio::spawn({
+        let sink = sink.clone();
+        async move { sink.status_snapshot_nonblocking_for_status_route().await }
+    });
+
+    let pause_entered = tokio::time::timeout(Duration::from_millis(300), entered.notified()).await;
+    if pause_entered.is_ok() {
+        release.notify_waiters();
+        let _ = status_route.await;
+        panic!(
+            "status-route snapshot must observe cached sink status while retained replay is pending instead of executing recovery replay"
+        );
+    }
+
+    let (_snapshot, used_cached_fallback) = tokio::time::timeout(Duration::from_secs(2), status_route)
+        .await
+        .expect("status-route snapshot should settle without retained replay")
+        .expect("join status-route snapshot task");
+    assert!(
+        used_cached_fallback,
+        "status-route snapshot should report cached fallback while retained replay recovery is pending"
+    );
+    assert_eq!(
+        sink.control_state_replay_required.load(Ordering::Acquire),
+        1,
+        "status-route observation must leave retained replay ownership to the recovery path"
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn materialized_query_still_reads_local_payload_while_control_inflight() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
@@ -6160,14 +6369,20 @@ async fn materialized_query_still_reads_local_payload_while_control_inflight() {
     let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < initial_deadline {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Some(batch)) => sink.send_with_failure(batch).await.expect("apply initial batch"),
+            Ok(Some(batch)) => sink
+                .send_with_failure(batch)
+                .await
+                .expect("apply initial batch"),
             Ok(None) => break,
             Err(_) => continue,
         }
         let ready = decode_exact_query_node(
-            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
-                .await
-                .expect("query nfs1"),
+            sink.materialized_query_with_failure(selected_group_request(
+                b"/force-find-stress",
+                "nfs1",
+            ))
+            .await
+            .expect("query nfs1"),
             b"/force-find-stress",
         )
         .expect("decode nfs1")
@@ -6179,9 +6394,12 @@ async fn materialized_query_still_reads_local_payload_while_control_inflight() {
 
     assert!(
         decode_exact_query_node(
-            sink.materialized_query_with_failure(selected_group_request(b"/force-find-stress", "nfs1"))
-                .await
-                .expect("query nfs1 after initial"),
+            sink.materialized_query_with_failure(selected_group_request(
+                b"/force-find-stress",
+                "nfs1"
+            ))
+            .await
+            .expect("query nfs1 after initial"),
             b"/force-find-stress",
         )
         .expect("decode nfs1 after initial")

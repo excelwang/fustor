@@ -1,8 +1,8 @@
 use super::*;
 use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::routes::{
-    METHOD_SINK_QUERY, METHOD_SOURCE_FIND, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
-    sink_query_request_route_for, source_find_request_route_for,
+    METHOD_SINK_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SOURCE_FIND, ROUTE_TOKEN_FS_META_INTERNAL,
+    default_route_bindings, sink_query_request_route_for, source_find_request_route_for,
 };
 use crate::sink::SinkFileMeta;
 use crate::source::FSMetaSource;
@@ -140,9 +140,18 @@ struct ForceFindFixture {
 }
 
 #[derive(Default)]
+struct TestSourceStatusResponder {
+    payload: Option<Vec<u8>>,
+    send_count: std::sync::atomic::AtomicUsize,
+    delivered_send_count: std::sync::atomic::AtomicUsize,
+    correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+#[derive(Default)]
 struct LoopbackRouteBoundary {
     channels: AsyncMutex<HashMap<String, Vec<Event>>>,
     closed: std::sync::Mutex<std::collections::HashSet<String>>,
+    source_status: TestSourceStatusResponder,
     changed: Notify,
 }
 
@@ -170,6 +179,15 @@ struct SourceStatusTimeoutSinkStatusOkBoundary {
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
     sink_reply_sent: std::sync::atomic::AtomicBool,
+}
+
+struct SourceStatusOkSinkStatusTimeoutBoundary {
+    source_reply_channel: String,
+    source_status_payload: Vec<u8>,
+    send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    source_reply_sent: std::sync::atomic::AtomicBool,
 }
 
 struct SourceStatusSendMissingRouteStateSinkStatusOkBoundary {
@@ -246,6 +264,7 @@ struct SinkStatusPeerTransportRetryThenReplyBoundary {
 struct ForceFindProtocolRetryThenReplyBoundary {
     source_reply_channel: String,
     payload: Vec<u8>,
+    source_status: TestSourceStatusResponder,
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
@@ -255,21 +274,65 @@ struct ForceFindProtocolRetryThenReplyBoundary {
 struct ForceFindGroupMissingThenReplyBoundary {
     source_reply_channel: String,
     payload: Vec<u8>,
+    source_status: TestSourceStatusResponder,
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
     source_reply_sent: std::sync::atomic::AtomicBool,
 }
 
+struct ForceFindHostUnavailableThenNextRunnerBoundary {
+    node_a_reply_channel: String,
+    node_b_reply_channel: String,
+    generic_request_channel: String,
+    payload: Vec<u8>,
+    source_status: TestSourceStatusResponder,
+    send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    node_b_reply_sent: std::sync::atomic::AtomicBool,
+}
+
 struct ForceFindSingleCandidateGroupMissingThenFallbackBoundary {
     source_reply_channel: String,
     payload: Vec<u8>,
+    source_status: TestSourceStatusResponder,
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
     first_retryable_gap_at: std::sync::Mutex<Option<std::time::Instant>>,
     second_send_at: std::sync::Mutex<Option<std::time::Instant>>,
     source_reply_sent: std::sync::atomic::AtomicBool,
+}
+
+struct ForceFindSelectedGroupFallbackCollectBoundary {
+    selected_reply_channel: String,
+    generic_reply_channel: String,
+    selected_group_payload: Vec<u8>,
+    source_status: TestSourceStatusResponder,
+    send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    generic_reply_count: std::sync::atomic::AtomicUsize,
+}
+
+struct ForceFindRunnerBindingStatusBoundary {
+    source_reply_channel: String,
+    source_status_payload: Vec<u8>,
+    send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    delivered_send_count: std::sync::atomic::AtomicUsize,
+}
+
+struct ForceFindDelayedRunnerBindingBoundary {
+    source_status_reply_channel: String,
+    source_status_payloads: std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
+    send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    delivered_source_status_send_count: std::sync::atomic::AtomicUsize,
+    source_find_reply_sent: std::sync::atomic::AtomicBool,
 }
 
 struct MaterializedRouteAccessDeniedThenProxyBoundary {
@@ -337,6 +400,9 @@ impl ChannelIoSubset for LoopbackRouteBoundary {
         _ctx: BoundaryContext,
         request: ChannelSendRequest,
     ) -> capanix_app_sdk::Result<()> {
+        if self.source_status.on_send(&request) {
+            return Ok(());
+        }
         {
             let mut channels = self.channels.lock().await;
             channels
@@ -353,6 +419,9 @@ impl ChannelIoSubset for LoopbackRouteBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
+        if let Some(result) = self.source_status.try_recv(&request) {
+            return result;
+        }
         let deadline = request
             .timeout_ms
             .map(Duration::from_millis)
@@ -423,6 +492,88 @@ impl MaterializedRouteRaceBoundary {
     }
 }
 
+impl TestSourceStatusResponder {
+    fn with_payload(payload: Vec<u8>) -> Self {
+        Self {
+            payload: Some(payload),
+            send_count: std::sync::atomic::AtomicUsize::new(0),
+            delivered_send_count: std::sync::atomic::AtomicUsize::new(0),
+            correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn request_channel() -> String {
+        default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+            .expect("resolve source-status route")
+            .0
+    }
+
+    fn reply_channel() -> String {
+        format!("{}:reply", Self::request_channel())
+    }
+
+    fn on_send(&self, request: &ChannelSendRequest) -> bool {
+        if self.payload.is_none() || request.channel_key.0 != Self::request_channel() {
+            return false;
+        }
+        if let Some(correlation) = request
+            .events
+            .first()
+            .and_then(|event| event.metadata().correlation_id)
+        {
+            self.correlations_by_channel
+                .lock()
+                .expect("test source-status correlations lock")
+                .insert(request.channel_key.0.clone(), correlation);
+        }
+        self.send_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    fn try_recv(
+        &self,
+        request: &ChannelRecvRequest,
+    ) -> Option<capanix_app_sdk::Result<Vec<Event>>> {
+        let payload = self.payload.as_ref()?;
+        if request.channel_key.0 != Self::reply_channel() {
+            return None;
+        }
+        let send_count = self.send_count.load(std::sync::atomic::Ordering::SeqCst);
+        let delivered = self
+            .delivered_send_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if send_count == 0 || delivered >= send_count {
+            return Some(Err(CnxError::Timeout));
+        }
+        self.delivered_send_count
+            .store(send_count, std::sync::atomic::Ordering::SeqCst);
+        let request_channel = Self::request_channel();
+        let correlation = self
+            .correlations_by_channel
+            .lock()
+            .expect("test source-status correlations lock")
+            .get(&request_channel)
+            .copied()
+            .unwrap_or(1);
+        Some(Ok(vec![mk_event_with_correlation(
+            "source-status",
+            correlation,
+            payload.clone(),
+        )]))
+    }
+}
+
+impl LoopbackRouteBoundary {
+    fn with_source_status_payload(payload: Vec<u8>) -> Self {
+        Self {
+            source_status: TestSourceStatusResponder::with_payload(payload),
+            ..Self::default()
+        }
+    }
+}
+
 impl ReusableObservedRouteBoundary {
     fn send_batch_count(&self, channel: &str) -> usize {
         *self
@@ -472,6 +623,31 @@ impl SourceStatusTimeoutSinkStatusOkBoundary {
             .recv_batches_by_channel
             .lock()
             .expect("source/sink selective boundary recv batches lock")
+            .get(channel)
+            .unwrap_or(&0)
+    }
+}
+
+impl SourceStatusOkSinkStatusTimeoutBoundary {
+    fn new(source_status_payload: Vec<u8>) -> Self {
+        let source_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+            .expect("resolve source-status route");
+        Self {
+            source_reply_channel: format!("{}:reply", source_route.0),
+            source_status_payload,
+            send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
+            recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
+            correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            source_reply_sent: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn send_batch_count(&self, channel: &str) -> usize {
+        *self
+            .send_batches_by_channel
+            .lock()
+            .expect("source ok sink timeout boundary send batches lock")
             .get(channel)
             .unwrap_or(&0)
     }
@@ -620,6 +796,59 @@ impl SourceStatusMissingRouteStateThenReplyBoundary {
     }
 }
 
+impl ForceFindRunnerBindingStatusBoundary {
+    fn new(source_status_payload: Vec<u8>) -> Self {
+        let source_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+            .expect("resolve source-status route");
+        Self {
+            source_reply_channel: format!("{}:reply", source_route.0),
+            source_status_payload,
+            send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
+            recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
+            correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            delivered_send_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn send_batch_count(&self, channel: &str) -> usize {
+        *self
+            .send_batches_by_channel
+            .lock()
+            .expect("force-find runner binding boundary send batches lock")
+            .get(channel)
+            .unwrap_or(&0)
+    }
+}
+
+impl ForceFindDelayedRunnerBindingBoundary {
+    fn new(source_status_payloads: Vec<Vec<u8>>) -> Self {
+        let source_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+            .expect("resolve source-status route");
+        Self {
+            source_status_reply_channel: format!("{}:reply", source_route.0),
+            source_status_payloads: std::sync::Mutex::new(
+                source_status_payloads.into_iter().collect(),
+            ),
+            send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
+            recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
+            correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            delivered_source_status_send_count: std::sync::atomic::AtomicUsize::new(0),
+            source_find_reply_sent: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn total_send_batch_count(&self) -> usize {
+        self.send_batches_by_channel
+            .lock()
+            .expect("delayed runner binding boundary send batches lock")
+            .values()
+            .copied()
+            .sum()
+    }
+}
+
 impl SourceStatusOkSinkStatusExplicitEmptyThenReadyBoundary {
     fn new(source_status_payload: Vec<u8>, sink_status_payloads: Vec<Vec<u8>>) -> Self {
         let source_route = default_route_bindings()
@@ -729,13 +958,14 @@ impl SinkStatusPeerTransportRetryThenReplyBoundary {
 }
 
 impl ForceFindProtocolRetryThenReplyBoundary {
-    fn new(payload: Vec<u8>) -> Self {
+    fn new(payload: Vec<u8>, source_status_payload: Vec<u8>) -> Self {
         let source_route = default_route_bindings()
             .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
             .expect("resolve source-find route");
         Self {
             source_reply_channel: format!("{}:reply", source_route.0),
             payload,
+            source_status: TestSourceStatusResponder::with_payload(source_status_payload),
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
@@ -781,13 +1011,14 @@ impl ForceFindProtocolRetryThenReplyBoundary {
 }
 
 impl ForceFindGroupMissingThenReplyBoundary {
-    fn new(payload: Vec<u8>) -> Self {
+    fn new(payload: Vec<u8>, source_status_payload: Vec<u8>) -> Self {
         let source_route = default_route_bindings()
             .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
             .expect("resolve source-find route");
         Self {
             source_reply_channel: format!("{}:reply", source_route.0),
             payload,
+            source_status: TestSourceStatusResponder::with_payload(source_status_payload),
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
@@ -832,14 +1063,43 @@ impl ForceFindGroupMissingThenReplyBoundary {
     }
 }
 
+impl ForceFindHostUnavailableThenNextRunnerBoundary {
+    fn new(payload: Vec<u8>, source_status_payload: Vec<u8>) -> Self {
+        let generic_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
+            .expect("resolve generic source-find route");
+        Self {
+            node_a_reply_channel: format!("{}:reply", source_find_request_route_for("node-a").0),
+            node_b_reply_channel: format!("{}:reply", source_find_request_route_for("node-b").0),
+            generic_request_channel: generic_route.0,
+            payload,
+            source_status: TestSourceStatusResponder::with_payload(source_status_payload),
+            send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
+            recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
+            correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            node_b_reply_sent: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn send_batch_count(&self, channel: &str) -> usize {
+        *self
+            .send_batches_by_channel
+            .lock()
+            .expect("force-find host-unavailable boundary send batches lock")
+            .get(channel)
+            .unwrap_or(&0)
+    }
+}
+
 impl ForceFindSingleCandidateGroupMissingThenFallbackBoundary {
-    fn new(payload: Vec<u8>) -> Self {
+    fn new(payload: Vec<u8>, source_status_payload: Vec<u8>) -> Self {
         let source_route = default_route_bindings()
             .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
             .expect("resolve source-find route");
         Self {
             source_reply_channel: format!("{}:reply", source_route.0),
             payload,
+            source_status: TestSourceStatusResponder::with_payload(source_status_payload),
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
@@ -879,6 +1139,33 @@ impl ForceFindSingleCandidateGroupMissingThenFallbackBoundary {
         self.send_batches_by_channel
             .lock()
             .expect("force-find single-candidate boundary send batches lock")
+            .values()
+            .copied()
+            .sum()
+    }
+}
+
+impl ForceFindSelectedGroupFallbackCollectBoundary {
+    fn new(selected_group_payload: Vec<u8>, source_status_payload: Vec<u8>) -> Self {
+        let generic_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
+            .expect("resolve generic source-find route");
+        Self {
+            selected_reply_channel: format!("{}:reply", source_find_request_route_for("node-a").0),
+            generic_reply_channel: format!("{}:reply", generic_route.0),
+            selected_group_payload,
+            source_status: TestSourceStatusResponder::with_payload(source_status_payload),
+            send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
+            recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
+            correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            generic_reply_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn total_recv_batch_count(&self) -> usize {
+        self.recv_batches_by_channel
+            .lock()
+            .expect("force-find selected-group fallback collect recv batches lock")
             .values()
             .copied()
             .sum()
@@ -1344,6 +1631,67 @@ impl ChannelIoSubset for SourceStatusTimeoutSinkStatusOkBoundary {
                 "node-a",
                 correlation,
                 self.sink_status_payload.clone(),
+            )]);
+        }
+        Err(CnxError::Timeout)
+    }
+}
+
+#[async_trait]
+impl ChannelIoSubset for SourceStatusOkSinkStatusTimeoutBoundary {
+    async fn channel_send(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelSendRequest,
+    ) -> capanix_app_sdk::Result<()> {
+        if let Some(correlation) = request
+            .events
+            .first()
+            .and_then(|event| event.metadata().correlation_id)
+        {
+            self.correlations_by_channel
+                .lock()
+                .expect("source ok sink timeout boundary correlations lock")
+                .insert(request.channel_key.0.clone(), correlation);
+        }
+        let mut send_batches = self
+            .send_batches_by_channel
+            .lock()
+            .expect("source ok sink timeout boundary send batches lock");
+        *send_batches.entry(request.channel_key.0).or_default() += 1;
+        Ok(())
+    }
+
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelRecvRequest,
+    ) -> capanix_app_sdk::Result<Vec<Event>> {
+        let mut recv_batches = self
+            .recv_batches_by_channel
+            .lock()
+            .expect("source ok sink timeout boundary recv batches lock");
+        *recv_batches
+            .entry(request.channel_key.0.clone())
+            .or_default() += 1;
+        drop(recv_batches);
+        if request.channel_key.0 == self.source_reply_channel
+            && !self
+                .source_reply_sent
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let request_channel = self.source_reply_channel.trim_end_matches(":reply");
+            let correlation = self
+                .correlations_by_channel
+                .lock()
+                .expect("source ok sink timeout boundary correlations lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or(1);
+            return Ok(vec![mk_event_with_correlation(
+                "node-b",
+                correlation,
+                self.source_status_payload.clone(),
             )]);
         }
         Err(CnxError::Timeout)
@@ -2153,6 +2501,9 @@ impl ChannelIoSubset for ForceFindProtocolRetryThenReplyBoundary {
         _ctx: BoundaryContext,
         request: ChannelSendRequest,
     ) -> capanix_app_sdk::Result<()> {
+        if self.source_status.on_send(&request) {
+            return Ok(());
+        }
         if let Some(correlation) = request
             .events
             .first()
@@ -2176,6 +2527,9 @@ impl ChannelIoSubset for ForceFindProtocolRetryThenReplyBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
+        if let Some(result) = self.source_status.try_recv(&request) {
+            return result;
+        }
         let mut recv_batches = self
             .recv_batches_by_channel
             .lock()
@@ -2191,10 +2545,18 @@ impl ChannelIoSubset for ForceFindProtocolRetryThenReplyBoundary {
         let request_channel = request.channel_key.0.trim_end_matches(":reply");
         let send_count = self.total_send_batch_count();
         if send_count < 2 {
-            return Err(CnxError::ProtocolViolation(
-                "bound route protocol violation: unexpected correlation_id in reply batch (11)"
-                    .to_string(),
-            ));
+            let correlation = self
+                .correlations_by_channel
+                .lock()
+                .expect("force-find retry boundary correlations lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or(1);
+            return Ok(vec![mk_event_with_correlation(
+                "node-a::routed",
+                correlation + 100,
+                self.payload.clone(),
+            )]);
         }
         if self
             .source_reply_sent
@@ -2224,6 +2586,9 @@ impl ChannelIoSubset for ForceFindGroupMissingThenReplyBoundary {
         _ctx: BoundaryContext,
         request: ChannelSendRequest,
     ) -> capanix_app_sdk::Result<()> {
+        if self.source_status.on_send(&request) {
+            return Ok(());
+        }
         if let Some(correlation) = request
             .events
             .first()
@@ -2247,6 +2612,9 @@ impl ChannelIoSubset for ForceFindGroupMissingThenReplyBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
+        if let Some(result) = self.source_status.try_recv(&request) {
+            return result;
+        }
         let mut recv_batches = self
             .recv_batches_by_channel
             .lock()
@@ -2262,9 +2630,18 @@ impl ChannelIoSubset for ForceFindGroupMissingThenReplyBoundary {
         let request_channel = request.channel_key.0.trim_end_matches(":reply");
         let send_count = self.total_send_batch_count();
         if send_count < 2 {
-            return Err(CnxError::PeerError(
-                "force-find selected_group matched no group: nfs1".to_string(),
-            ));
+            let correlation = self
+                .correlations_by_channel
+                .lock()
+                .expect("force-find group-missing boundary correlations lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or(1);
+            return Ok(vec![mk_event_with_correlation(
+                "nfs1",
+                correlation,
+                b"force-find selected_group matched no group: nfs1".to_vec(),
+            )]);
         }
         if self
             .source_reply_sent
@@ -2288,12 +2665,100 @@ impl ChannelIoSubset for ForceFindGroupMissingThenReplyBoundary {
 }
 
 #[async_trait]
+impl ChannelIoSubset for ForceFindHostUnavailableThenNextRunnerBoundary {
+    async fn channel_send(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelSendRequest,
+    ) -> capanix_app_sdk::Result<()> {
+        if self.source_status.on_send(&request) {
+            return Ok(());
+        }
+        let correlation = request
+            .events
+            .first()
+            .and_then(|event| event.metadata().correlation_id)
+            .unwrap_or(1);
+        self.correlations_by_channel
+            .lock()
+            .expect("force-find host-unavailable boundary correlations lock")
+            .insert(request.channel_key.0.clone(), correlation);
+        let mut send_batches = self
+            .send_batches_by_channel
+            .lock()
+            .expect("force-find host-unavailable boundary send batches lock");
+        *send_batches.entry(request.channel_key.0).or_default() += 1;
+        Ok(())
+    }
+
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelRecvRequest,
+    ) -> capanix_app_sdk::Result<Vec<Event>> {
+        if let Some(result) = self.source_status.try_recv(&request) {
+            return result;
+        }
+        let mut recv_batches = self
+            .recv_batches_by_channel
+            .lock()
+            .expect("force-find host-unavailable boundary recv batches lock");
+        *recv_batches
+            .entry(request.channel_key.0.clone())
+            .or_default() += 1;
+        drop(recv_batches);
+
+        if !request.channel_key.0.ends_with(":reply") {
+            return Err(CnxError::Timeout);
+        }
+        let request_channel = request.channel_key.0.trim_end_matches(":reply");
+        let correlation = self
+            .correlations_by_channel
+            .lock()
+            .expect("force-find host-unavailable boundary correlations lock")
+            .get(request_channel)
+            .copied()
+            .unwrap_or(1);
+
+        if request.channel_key.0 == self.node_a_reply_channel {
+            return Ok(vec![mk_event_with_correlation(
+                "nfs1",
+                correlation,
+                b"force-find failed on all targeted roots (1): node-a::nfs1: HOST_FS_UNAVAILABLE"
+                    .to_vec(),
+            )]);
+        }
+        if request.channel_key.0 == self.node_b_reply_channel {
+            if self
+                .node_b_reply_sent
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CnxError::Timeout);
+            }
+            return Ok(vec![mk_event_with_correlation(
+                "node-b::nfs1",
+                correlation,
+                self.payload.clone(),
+            )]);
+        }
+
+        Err(CnxError::PeerError(
+            "generic force-find fallback must not decide same-group HOST_FS_UNAVAILABLE reroute"
+                .into(),
+        ))
+    }
+}
+
+#[async_trait]
 impl ChannelIoSubset for ForceFindSingleCandidateGroupMissingThenFallbackBoundary {
     async fn channel_send(
         &self,
         _ctx: BoundaryContext,
         request: ChannelSendRequest,
     ) -> capanix_app_sdk::Result<()> {
+        if self.source_status.on_send(&request) {
+            return Ok(());
+        }
         let correlation = request
             .events
             .first()
@@ -2326,6 +2791,9 @@ impl ChannelIoSubset for ForceFindSingleCandidateGroupMissingThenFallbackBoundar
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
+        if let Some(result) = self.source_status.try_recv(&request) {
+            return result;
+        }
         let mut recv_batches = self
             .recv_batches_by_channel
             .lock()
@@ -2346,9 +2814,18 @@ impl ChannelIoSubset for ForceFindSingleCandidateGroupMissingThenFallbackBoundar
                 .lock()
                 .expect("force-find single-candidate boundary first gap lock") =
                 Some(std::time::Instant::now());
-            return Err(CnxError::PeerError(
-                "force-find selected_group matched no group: nfs2".to_string(),
-            ));
+            let correlation = self
+                .correlations_by_channel
+                .lock()
+                .expect("force-find single-candidate boundary correlations lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or(1);
+            return Ok(vec![mk_event_with_correlation(
+                "nfs2",
+                correlation,
+                b"force-find selected_group matched no group: nfs2".to_vec(),
+            )]);
         }
         let retry_reissue_delay = self.retry_reissue_delay().unwrap_or(Duration::from_secs(1));
         if retry_reissue_delay >= FORCE_FIND_ROUTE_RETRY_BACKOFF {
@@ -2373,6 +2850,272 @@ impl ChannelIoSubset for ForceFindSingleCandidateGroupMissingThenFallbackBoundar
             "node-d::fallback",
             correlation,
             self.payload.clone(),
+        )])
+    }
+}
+
+#[async_trait]
+impl ChannelIoSubset for ForceFindSelectedGroupFallbackCollectBoundary {
+    async fn channel_send(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelSendRequest,
+    ) -> capanix_app_sdk::Result<()> {
+        if self.source_status.on_send(&request) {
+            return Ok(());
+        }
+        let correlation = request
+            .events
+            .first()
+            .and_then(|event| event.metadata().correlation_id)
+            .unwrap_or(1);
+        self.correlations_by_channel
+            .lock()
+            .expect("force-find selected-group fallback collect correlations lock")
+            .insert(request.channel_key.0.clone(), correlation);
+        let mut send_batches = self
+            .send_batches_by_channel
+            .lock()
+            .expect("force-find selected-group fallback collect send batches lock");
+        *send_batches.entry(request.channel_key.0).or_default() += 1;
+        Ok(())
+    }
+
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelRecvRequest,
+    ) -> capanix_app_sdk::Result<Vec<Event>> {
+        if let Some(result) = self.source_status.try_recv(&request) {
+            return result;
+        }
+        let mut recv_batches = self
+            .recv_batches_by_channel
+            .lock()
+            .expect("force-find selected-group fallback collect recv batches lock");
+        *recv_batches
+            .entry(request.channel_key.0.clone())
+            .or_default() += 1;
+        drop(recv_batches);
+
+        if request.channel_key.0 == self.selected_reply_channel {
+            let request_channel = request.channel_key.0.trim_end_matches(":reply");
+            let correlation = self
+                .correlations_by_channel
+                .lock()
+                .expect("force-find selected-group fallback collect correlations lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or(1);
+            return Ok(vec![mk_event_with_correlation(
+                "nfs1",
+                correlation,
+                b"force-find selected_group matched no group: nfs1".to_vec(),
+            )]);
+        }
+
+        if request.channel_key.0 == self.generic_reply_channel {
+            let request_channel = request.channel_key.0.trim_end_matches(":reply");
+            let correlation = self
+                .correlations_by_channel
+                .lock()
+                .expect("force-find selected-group fallback collect correlations lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or(1);
+            let count = self
+                .generic_reply_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if count == 0 {
+                return Ok(vec![mk_event_with_correlation(
+                    "nfs2",
+                    correlation,
+                    b"unrelated fresh group".to_vec(),
+                )]);
+            }
+            if count == 1 {
+                return Ok(vec![mk_event_with_correlation(
+                    "node-b::nfs1",
+                    correlation,
+                    self.selected_group_payload.clone(),
+                )]);
+            }
+        }
+
+        Err(CnxError::Timeout)
+    }
+}
+
+#[async_trait]
+impl ChannelIoSubset for ForceFindRunnerBindingStatusBoundary {
+    async fn channel_send(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelSendRequest,
+    ) -> capanix_app_sdk::Result<()> {
+        if let Some(correlation) = request
+            .events
+            .first()
+            .and_then(|event| event.metadata().correlation_id)
+        {
+            self.correlations_by_channel
+                .lock()
+                .expect("force-find runner binding boundary correlations lock")
+                .insert(request.channel_key.0.clone(), correlation);
+        }
+        let mut send_batches = self
+            .send_batches_by_channel
+            .lock()
+            .expect("force-find runner binding boundary send batches lock");
+        *send_batches.entry(request.channel_key.0).or_default() += 1;
+        Ok(())
+    }
+
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelRecvRequest,
+    ) -> capanix_app_sdk::Result<Vec<Event>> {
+        let mut recv_batches = self
+            .recv_batches_by_channel
+            .lock()
+            .expect("force-find runner binding boundary recv batches lock");
+        *recv_batches
+            .entry(request.channel_key.0.clone())
+            .or_default() += 1;
+        drop(recv_batches);
+
+        if request.channel_key.0 != self.source_reply_channel {
+            return Err(CnxError::Timeout);
+        }
+        let request_channel = self.source_reply_channel.trim_end_matches(":reply");
+        let send_count = self
+            .send_batches_by_channel
+            .lock()
+            .expect("force-find runner binding boundary send batches lock")
+            .get(request_channel)
+            .copied()
+            .unwrap_or_default();
+        let delivered = self
+            .delivered_send_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if send_count == 0 || delivered >= send_count {
+            return Err(CnxError::Timeout);
+        }
+        self.delivered_send_count
+            .store(send_count, std::sync::atomic::Ordering::SeqCst);
+        let correlation = self
+            .correlations_by_channel
+            .lock()
+            .expect("force-find runner binding boundary correlations lock")
+            .get(request_channel)
+            .copied()
+            .unwrap_or(1);
+        Ok(vec![mk_event_with_correlation(
+            "source-status",
+            correlation,
+            self.source_status_payload.clone(),
+        )])
+    }
+}
+
+#[async_trait]
+impl ChannelIoSubset for ForceFindDelayedRunnerBindingBoundary {
+    async fn channel_send(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelSendRequest,
+    ) -> capanix_app_sdk::Result<()> {
+        if let Some(correlation) = request
+            .events
+            .first()
+            .and_then(|event| event.metadata().correlation_id)
+        {
+            self.correlations_by_channel
+                .lock()
+                .expect("delayed runner binding boundary correlations lock")
+                .insert(request.channel_key.0.clone(), correlation);
+        }
+        let mut send_batches = self
+            .send_batches_by_channel
+            .lock()
+            .expect("delayed runner binding boundary send batches lock");
+        *send_batches.entry(request.channel_key.0).or_default() += 1;
+        Ok(())
+    }
+
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: ChannelRecvRequest,
+    ) -> capanix_app_sdk::Result<Vec<Event>> {
+        let mut recv_batches = self
+            .recv_batches_by_channel
+            .lock()
+            .expect("delayed runner binding boundary recv batches lock");
+        *recv_batches
+            .entry(request.channel_key.0.clone())
+            .or_default() += 1;
+        drop(recv_batches);
+
+        if request.channel_key.0 == self.source_status_reply_channel {
+            let request_channel = self.source_status_reply_channel.trim_end_matches(":reply");
+            let send_count = self
+                .send_batches_by_channel
+                .lock()
+                .expect("delayed runner binding boundary send batches lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or_default();
+            let delivered = self
+                .delivered_source_status_send_count
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if send_count == 0 || delivered >= send_count {
+                return Err(CnxError::Timeout);
+            }
+            self.delivered_source_status_send_count
+                .store(send_count, std::sync::atomic::Ordering::SeqCst);
+            let payload = self
+                .source_status_payloads
+                .lock()
+                .expect("delayed runner binding boundary payload lock")
+                .pop_front()
+                .ok_or_else(|| CnxError::Timeout)?;
+            let correlation = self
+                .correlations_by_channel
+                .lock()
+                .expect("delayed runner binding boundary correlations lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or(1);
+            return Ok(vec![mk_event_with_correlation(
+                "source-status",
+                correlation,
+                payload,
+            )]);
+        }
+
+        if !request.channel_key.0.ends_with(":reply") {
+            return Err(CnxError::Timeout);
+        }
+        if self
+            .source_find_reply_sent
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(CnxError::Timeout);
+        }
+        let request_channel = request.channel_key.0.trim_end_matches(":reply");
+        let correlation = self
+            .correlations_by_channel
+            .lock()
+            .expect("delayed runner binding boundary correlations lock")
+            .get(request_channel)
+            .copied()
+            .unwrap_or(1);
+        Ok(vec![mk_event_with_correlation(
+            "node-a::routed",
+            correlation,
+            vec![1, 2, 3],
         )])
     }
 }
@@ -2643,6 +3386,7 @@ impl ForceFindFixture {
                 NodeId("test-node".into()),
                 policy,
                 Arc::new(Mutex::new(BTreeSet::new())),
+                crate::api::state::ForceFindRunnerEvidence::default(),
             ),
         }
     }
@@ -2936,6 +3680,64 @@ fn source_facade_with_group(group_id: &str, grants: &[GrantedMountRoot]) -> Arc<
     )))
 }
 
+fn source_observability_payload_for_runner_nodes(
+    group_id: &str,
+    grants: &[GrantedMountRoot],
+    runner_nodes: &[&str],
+) -> Vec<u8> {
+    let primary = grants
+        .iter()
+        .find(|grant| {
+            grant
+                .object_ref
+                .rsplit_once("::")
+                .map(|(_, group)| group == group_id)
+                .unwrap_or(false)
+        })
+        .map(|grant| grant.object_ref.clone())
+        .unwrap_or_else(|| format!("{}::{group_id}", runner_nodes.first().unwrap_or(&"node-a")));
+    rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+        lifecycle_state: "running".into(),
+        host_object_grants_version: 1,
+        grants: grants.to_vec(),
+        logical_roots: Vec::new(),
+        status: SourceStatusSnapshot {
+            current_stream_generation: Some(1),
+            logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: group_id.to_string(),
+                status: "ok".into(),
+                matched_grants: runner_nodes.len(),
+                active_members: runner_nodes.len(),
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            }],
+            ..SourceStatusSnapshot::default()
+        },
+        source_primary_by_group: BTreeMap::from([(group_id.to_string(), primary)]),
+        last_force_find_runner_by_group: BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: runner_nodes
+            .iter()
+            .map(|node| (node.to_string(), vec![group_id.to_string()]))
+            .collect(),
+        scheduled_scan_groups_by_node: BTreeMap::new(),
+        last_control_frame_signals_by_node: BTreeMap::new(),
+        published_batches_by_node: BTreeMap::new(),
+        published_events_by_node: BTreeMap::new(),
+        published_control_events_by_node: BTreeMap::new(),
+        published_data_events_by_node: BTreeMap::new(),
+        last_published_at_us_by_node: BTreeMap::new(),
+        last_published_origins_by_node: BTreeMap::new(),
+        published_origin_counts_by_node: BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: BTreeMap::new(),
+        pending_path_origin_counts_by_node: BTreeMap::new(),
+        yielded_path_origin_counts_by_node: BTreeMap::new(),
+        summarized_path_origin_counts_by_node: BTreeMap::new(),
+        published_path_origin_counts_by_node: BTreeMap::new(),
+    })
+    .expect("encode source observability")
+}
+
 fn source_facade_with_roots(
     roots: Vec<RootSpec>,
     grants: &[GrantedMountRoot],
@@ -2975,11 +3777,14 @@ fn test_api_state_for_source(source: Arc<SourceFacade>, sink: Arc<SinkFacade>) -
         policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
         pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
         force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: None,
         readiness_sink: None,
         materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     }
 }
@@ -3000,13 +3805,34 @@ fn test_api_state_for_route_source(
         policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
         pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
         force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: None,
         readiness_sink: None,
         materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     }
+}
+
+#[test]
+fn trusted_materialized_root_tree_route_backend_does_not_fail_before_peer_status_fanout() {
+    let source = source_facade_with_group("nfs1", &[]);
+    let sink = sink_facade_with_group(&[]);
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        Arc::new(LoopbackRouteBoundary::default()),
+        NodeId("api-node".into()),
+    );
+
+    assert!(
+        !trusted_materialized_root_tree_should_fail_closed_before_status_fanout(&state, b"/")
+            .expect("pre-fanout trusted root tree check"),
+        "routed facade must let peer sink-status fan-in decide global schedule absence instead of treating local empty sink schedule as authoritative"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3466,6 +4292,455 @@ fn force_find_runner_node_selection_rotates_across_group_members() {
     assert_eq!(third.0, "node-a");
 }
 
+#[test]
+fn route_force_find_runner_selection_uses_current_runner_binding_evidence() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root_a = tmp.path().join("node-a");
+    fs::create_dir_all(&root_a).expect("create node-a dir");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-a::nfs1".to_string(),
+        host_ref: "node-a".to_string(),
+        host_ip: "10.0.0.1".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: root_a,
+        fs_source: "nfs".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let source = source_facade_with_group("nfs1", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let source_status_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+        lifecycle_state: "running".into(),
+        host_object_grants_version: 1,
+        grants: grants.clone(),
+        logical_roots: Vec::new(),
+        status: SourceStatusSnapshot {
+            current_stream_generation: Some(1),
+            logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".into(),
+                status: "ok".into(),
+                matched_grants: 2,
+                active_members: 2,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            }],
+            ..SourceStatusSnapshot::default()
+        },
+        source_primary_by_group: BTreeMap::from([("nfs1".to_string(), "node-a::nfs1".to_string())]),
+        last_force_find_runner_by_group: BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: BTreeMap::from([
+            ("node-b".to_string(), vec!["nfs1".to_string()]),
+            ("node-c".to_string(), vec!["nfs1".to_string()]),
+        ]),
+        scheduled_scan_groups_by_node: BTreeMap::new(),
+        last_control_frame_signals_by_node: BTreeMap::new(),
+        published_batches_by_node: BTreeMap::new(),
+        published_events_by_node: BTreeMap::new(),
+        published_control_events_by_node: BTreeMap::new(),
+        published_data_events_by_node: BTreeMap::new(),
+        last_published_at_us_by_node: BTreeMap::new(),
+        last_published_origins_by_node: BTreeMap::new(),
+        published_origin_counts_by_node: BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: BTreeMap::new(),
+        pending_path_origin_counts_by_node: BTreeMap::new(),
+        yielded_path_origin_counts_by_node: BTreeMap::new(),
+        summarized_path_origin_counts_by_node: BTreeMap::new(),
+        published_path_origin_counts_by_node: BTreeMap::new(),
+    })
+    .expect("encode source observability");
+    let boundary = Arc::new(ForceFindRunnerBindingStatusBoundary::new(
+        source_status_payload,
+    ));
+    let state = test_api_state_for_route_source(
+        source.clone(),
+        sink,
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+    );
+
+    let first = crate::runtime_app::shared_tokio_runtime()
+        .block_on(select_force_find_runner_node_for_group(
+            &state,
+            source.as_ref(),
+            "nfs1",
+        ))
+        .expect("first selection")
+        .expect("first node");
+    let second = crate::runtime_app::shared_tokio_runtime()
+        .block_on(select_force_find_runner_node_for_group(
+            &state,
+            source.as_ref(),
+            "nfs1",
+        ))
+        .expect("second selection")
+        .expect("second node");
+
+    assert_eq!(first.0, "node-b");
+    assert_eq!(second.0, "node-c");
+    let source_status_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+        .expect("resolve source-status route");
+    assert_eq!(boundary.send_batch_count(&source_status_route.0), 2);
+}
+
+#[test]
+fn route_force_find_runner_selection_expands_partial_schedule_from_current_root_grants() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a");
+    let node_b_root = tmp.path().join("node-b");
+    let node_c_root = tmp.path().join("node-c");
+    fs::create_dir_all(&node_a_root).expect("create node-a dir");
+    fs::create_dir_all(&node_b_root).expect("create node-b dir");
+    fs::create_dir_all(&node_c_root).expect("create node-c dir");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_a_root,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-b::nfs1".to_string(),
+            host_ref: "node-b".to_string(),
+            host_ip: "10.0.0.2".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_b_root,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-c::nfs1".to_string(),
+            host_ref: "node-c".to_string(),
+            host_ip: "10.0.0.3".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_c_root,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let mut root = RootSpec::new("nfs1", "/unused");
+    root.selector = crate::source::config::RootSelector {
+        fs_type: Some("nfs".to_string()),
+        ..crate::source::config::RootSelector::default()
+    };
+    let source = source_facade_with_roots(vec![root.clone()], &grants);
+    let sink = sink_facade_with_group(&grants);
+    let source_status_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+        lifecycle_state: "running".into(),
+        host_object_grants_version: 1,
+        grants: grants.clone(),
+        logical_roots: vec![root],
+        status: SourceStatusSnapshot {
+            current_stream_generation: Some(1),
+            logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".into(),
+                status: "ok".into(),
+                matched_grants: 3,
+                active_members: 3,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            }],
+            ..SourceStatusSnapshot::default()
+        },
+        source_primary_by_group: BTreeMap::from([("nfs1".to_string(), "node-a::nfs1".to_string())]),
+        last_force_find_runner_by_group: BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        scheduled_scan_groups_by_node: BTreeMap::new(),
+        last_control_frame_signals_by_node: BTreeMap::new(),
+        published_batches_by_node: BTreeMap::new(),
+        published_events_by_node: BTreeMap::new(),
+        published_control_events_by_node: BTreeMap::new(),
+        published_data_events_by_node: BTreeMap::new(),
+        last_published_at_us_by_node: BTreeMap::new(),
+        last_published_origins_by_node: BTreeMap::new(),
+        published_origin_counts_by_node: BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: BTreeMap::new(),
+        pending_path_origin_counts_by_node: BTreeMap::new(),
+        yielded_path_origin_counts_by_node: BTreeMap::new(),
+        summarized_path_origin_counts_by_node: BTreeMap::new(),
+        published_path_origin_counts_by_node: BTreeMap::new(),
+    })
+    .expect("encode source observability");
+    let boundary = Arc::new(ForceFindRunnerBindingStatusBoundary::new(
+        source_status_payload,
+    ));
+    let state = test_api_state_for_route_source(
+        source.clone(),
+        sink,
+        boundary,
+        NodeId("node-d".to_string()),
+    );
+
+    let first = crate::runtime_app::shared_tokio_runtime()
+        .block_on(select_force_find_runner_node_for_group(
+            &state,
+            source.as_ref(),
+            "nfs1",
+        ))
+        .expect("first selection")
+        .expect("first node");
+    let second = crate::runtime_app::shared_tokio_runtime()
+        .block_on(select_force_find_runner_node_for_group(
+            &state,
+            source.as_ref(),
+            "nfs1",
+        ))
+        .expect("second selection")
+        .expect("second node");
+    let third = crate::runtime_app::shared_tokio_runtime()
+        .block_on(select_force_find_runner_node_for_group(
+            &state,
+            source.as_ref(),
+            "nfs1",
+        ))
+        .expect("third selection")
+        .expect("third node");
+
+    assert_eq!(first.0, "node-a");
+    assert_eq!(second.0, "node-b");
+    assert_eq!(third.0, "node-c");
+}
+
+#[test]
+fn route_force_find_runner_selection_expands_active_grants_from_root_health_when_root_snapshot_missing()
+ {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a");
+    let node_b_root = tmp.path().join("node-b");
+    let node_c_root = tmp.path().join("node-c");
+    fs::create_dir_all(&node_a_root).expect("create node-a dir");
+    fs::create_dir_all(&node_b_root).expect("create node-b dir");
+    fs::create_dir_all(&node_c_root).expect("create node-c dir");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_a_root,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-b::nfs1".to_string(),
+            host_ref: "node-b".to_string(),
+            host_ip: "10.0.0.2".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_b_root,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-c::nfs1".to_string(),
+            host_ref: "node-c".to_string(),
+            host_ip: "10.0.0.3".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_c_root,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let source = source_facade_with_group("nfs1", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let source_status_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+        lifecycle_state: "running".into(),
+        host_object_grants_version: 1,
+        grants: grants.clone(),
+        logical_roots: Vec::new(),
+        status: SourceStatusSnapshot {
+            current_stream_generation: Some(1),
+            logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".into(),
+                status: "ok".into(),
+                matched_grants: 3,
+                active_members: 3,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            }],
+            ..SourceStatusSnapshot::default()
+        },
+        source_primary_by_group: BTreeMap::from([("nfs1".to_string(), "node-a::nfs1".to_string())]),
+        last_force_find_runner_by_group: BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        scheduled_scan_groups_by_node: BTreeMap::new(),
+        last_control_frame_signals_by_node: BTreeMap::new(),
+        published_batches_by_node: BTreeMap::new(),
+        published_events_by_node: BTreeMap::new(),
+        published_control_events_by_node: BTreeMap::new(),
+        published_data_events_by_node: BTreeMap::new(),
+        last_published_at_us_by_node: BTreeMap::new(),
+        last_published_origins_by_node: BTreeMap::new(),
+        published_origin_counts_by_node: BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: BTreeMap::new(),
+        pending_path_origin_counts_by_node: BTreeMap::new(),
+        yielded_path_origin_counts_by_node: BTreeMap::new(),
+        summarized_path_origin_counts_by_node: BTreeMap::new(),
+        published_path_origin_counts_by_node: BTreeMap::new(),
+    })
+    .expect("encode source observability");
+    let boundary = Arc::new(ForceFindRunnerBindingStatusBoundary::new(
+        source_status_payload,
+    ));
+    let state = test_api_state_for_route_source(
+        source.clone(),
+        sink,
+        boundary,
+        NodeId("node-d".to_string()),
+    );
+
+    let first = crate::runtime_app::shared_tokio_runtime()
+        .block_on(select_force_find_runner_node_for_group(
+            &state,
+            source.as_ref(),
+            "nfs1",
+        ))
+        .expect("first selection")
+        .expect("first node");
+    let second = crate::runtime_app::shared_tokio_runtime()
+        .block_on(select_force_find_runner_node_for_group(
+            &state,
+            source.as_ref(),
+            "nfs1",
+        ))
+        .expect("second selection")
+        .expect("second node");
+    let third = crate::runtime_app::shared_tokio_runtime()
+        .block_on(select_force_find_runner_node_for_group(
+            &state,
+            source.as_ref(),
+            "nfs1",
+        ))
+        .expect("third selection")
+        .expect("third node");
+
+    assert_eq!(first.0, "node-a");
+    assert_eq!(second.0, "node-b");
+    assert_eq!(third.0, "node-c");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_group_force_find_waits_for_current_runner_binding_evidence() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path().join("node-a");
+    fs::create_dir_all(root.join("force-find-stress")).expect("create node-a dir");
+    fs::write(root.join("force-find-stress").join("seed.txt"), b"a").expect("seed node-a file");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-a::nfs1".to_string(),
+        host_ref: "node-a".to_string(),
+        host_ip: "10.0.0.1".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: root,
+        fs_source: "nfs".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let source = source_facade_with_group("nfs1", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let not_ready_source_status =
+        source_observability_payload_for_runner_nodes("nfs1", &grants, &[]);
+    let ready_source_status =
+        source_observability_payload_for_runner_nodes("nfs1", &grants, &["node-a"]);
+    let boundary = Arc::new(ForceFindDelayedRunnerBindingBoundary::new(vec![
+        not_ready_source_status,
+        ready_source_status,
+    ]));
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+    );
+
+    let result = query_force_find_group_tree(
+        &state,
+        b"/force-find-stress",
+        true,
+        None,
+        ForceFindSessionPlan::new(Duration::from_secs(2)).route_plan(),
+        "nfs1",
+        true,
+        false,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "force-find should wait for current runner binding evidence before emitting group-unavailable; sends={} err={:?}",
+        boundary.total_send_batch_count(),
+        result.as_ref().err(),
+    );
+    assert!(
+        boundary.total_send_batch_count() >= 3,
+        "force-find should re-read runner binding evidence and then dispatch source-find"
+    );
+    assert_eq!(
+        result
+            .expect("force-find result")
+            .iter()
+            .map(|event| event.metadata().origin_id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["node-a::routed"]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_group_force_find_route_uses_source_find_endpoint_for_chosen_node() {
     let tmp = tempfile::tempdir().expect("create tempdir");
@@ -3489,7 +4764,11 @@ async fn selected_group_force_find_route_uses_source_find_endpoint_for_chosen_no
     }];
     let source = source_facade_with_group("nfs1", &grants);
     let sink = sink_facade_with_group(&grants);
-    let boundary = Arc::new(LoopbackRouteBoundary::default());
+    let source_status_payload =
+        source_observability_payload_for_runner_nodes("nfs1", &grants, &["node-a"]);
+    let boundary = Arc::new(LoopbackRouteBoundary::with_source_status_payload(
+        source_status_payload,
+    ));
     let route = source_find_request_route_for("node-a");
     let routed_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let routed_calls_for_handler = routed_calls.clone();
@@ -3528,6 +4807,7 @@ async fn selected_group_force_find_route_uses_source_find_endpoint_for_chosen_no
         ForceFindSessionPlan::new(Duration::from_secs(2)).route_plan(),
         "nfs1",
         true,
+        false,
     )
     .await
     .expect("selected-group force-find route query");
@@ -3546,6 +4826,78 @@ async fn selected_group_force_find_route_uses_source_find_endpoint_for_chosen_no
     );
 
     endpoint.shutdown(Duration::from_secs(2)).await;
+}
+
+#[test]
+fn force_find_runner_candidates_expand_from_active_grants_when_schedule_health_reports_only_primary()
+ {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: tmp.path().join("node-a"),
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-b::nfs1".to_string(),
+            host_ref: "node-b".to_string(),
+            host_ip: "10.0.0.2".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: tmp.path().join("node-b"),
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-c::nfs1".to_string(),
+            host_ref: "node-c".to_string(),
+            host_ip: "10.0.0.3".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: tmp.path().join("node-c"),
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let snapshot: SourceObservabilitySnapshot = rmp_serde::from_slice(
+        &source_observability_payload_for_runner_nodes("nfs1", &grants, &["node-a"]),
+    )
+    .expect("decode source observability");
+
+    let candidates = force_find_candidate_nodes_from_runner_binding_evidence(&[snapshot], "nfs1")
+        .into_iter()
+        .map(|node| node.0)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        candidates,
+        vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string()
+        ],
+        "active same-epoch grants must expand force-find runner candidates even when schedule/active-member debug evidence only reports the current primary"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3571,8 +4923,12 @@ async fn selected_group_force_find_route_retries_protocol_violation_and_reaches_
     }];
     let source = source_facade_with_group("nfs1", &grants);
     let sink = sink_facade_with_group(&grants);
-    let boundary = Arc::new(ForceFindProtocolRetryThenReplyBoundary::new(vec![1, 2, 3]));
-    let route = source_find_request_route_for("node-a");
+    let source_status_payload =
+        source_observability_payload_for_runner_nodes("nfs1", &grants, &["node-a"]);
+    let boundary = Arc::new(ForceFindProtocolRetryThenReplyBoundary::new(
+        vec![1, 2, 3],
+        source_status_payload,
+    ));
     let state = test_api_state_for_route_source(
         source,
         sink,
@@ -3588,6 +4944,7 @@ async fn selected_group_force_find_route_retries_protocol_violation_and_reaches_
         ForceFindSessionPlan::new(Duration::from_secs(2)).route_plan(),
         "nfs1",
         true,
+        false,
     )
     .await;
 
@@ -3660,8 +5017,12 @@ async fn selected_group_force_find_route_reroutes_when_chosen_runner_reports_sel
     ];
     let source = source_facade_with_group("nfs1", &grants);
     let sink = sink_facade_with_group(&grants);
-    let boundary = Arc::new(ForceFindGroupMissingThenReplyBoundary::new(vec![7, 8, 9]));
-    let route = source_find_request_route_for("node-a");
+    let source_status_payload =
+        source_observability_payload_for_runner_nodes("nfs1", &grants, &["node-a", "node-b"]);
+    let boundary = Arc::new(ForceFindGroupMissingThenReplyBoundary::new(
+        vec![7, 8, 9],
+        source_status_payload,
+    ));
     let state = test_api_state_for_route_source(
         source,
         sink,
@@ -3677,6 +5038,7 @@ async fn selected_group_force_find_route_reroutes_when_chosen_runner_reports_sel
         ForceFindSessionPlan::new(Duration::from_secs(2)).route_plan(),
         "nfs1",
         true,
+        false,
     )
     .await;
 
@@ -3706,6 +5068,109 @@ async fn selected_group_force_find_route_reroutes_when_chosen_runner_reports_sel
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_group_force_find_route_replans_same_group_runner_when_host_fs_unavailable() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root_a = tmp.path().join("node-a");
+    let root_b = tmp.path().join("node-b");
+    fs::create_dir_all(root_a.join("force-find-stress")).expect("create node-a dir");
+    fs::create_dir_all(root_b.join("force-find-stress")).expect("create node-b dir");
+    fs::write(root_a.join("force-find-stress").join("seed.txt"), b"a").expect("seed node-a file");
+    fs::write(root_b.join("force-find-stress").join("seed.txt"), b"b").expect("seed node-b file");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: root_a,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-b::nfs1".to_string(),
+            host_ref: "node-b".to_string(),
+            host_ip: "10.0.0.2".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: root_b,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let source = source_facade_with_group("nfs1", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let source_status_payload =
+        source_observability_payload_for_runner_nodes("nfs1", &grants, &["node-a", "node-b"]);
+    let boundary = Arc::new(ForceFindHostUnavailableThenNextRunnerBoundary::new(
+        vec![7, 8, 9],
+        source_status_payload,
+    ));
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+    );
+
+    let result = query_force_find_group_tree(
+        &state,
+        b"/force-find-stress",
+        true,
+        None,
+        ForceFindSessionPlan::new(Duration::from_secs(2)).route_plan(),
+        "nfs1",
+        true,
+        false,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "selected-group force-find should route HOST_FS_UNAVAILABLE to another current same-group runner instead of generic fallback; err={:?}",
+        result.as_ref().err(),
+    );
+    assert_eq!(
+        result
+            .expect("force-find route result")
+            .iter()
+            .map(|event| event.metadata().origin_id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["node-b::nfs1"]
+    );
+    assert_eq!(
+        boundary.send_batch_count(&boundary.generic_request_channel),
+        0,
+        "same-group HOST_FS_UNAVAILABLE reroute must not use generic fallback that can omit the requested group"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&source_find_request_route_for("node-a").0),
+        1
+    );
+    assert_eq!(
+        boundary.send_batch_count(&source_find_request_route_for("node-b").0),
+        1
+    );
+    let runner_evidence = state.force_find_runner_evidence.snapshot();
+    assert!(
+        runner_evidence
+            .get("nfs1")
+            .is_some_and(|runners| runners.iter().any(|runner| runner == "node-b::nfs1")),
+        "successful selected-runner force-find response must update API runner evidence; evidence={runner_evidence:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_group_force_find_route_falls_back_when_single_candidate_runner_keeps_reporting_selected_group_missing()
  {
     let tmp = tempfile::tempdir().expect("create tempdir");
@@ -3729,9 +5194,14 @@ async fn selected_group_force_find_route_falls_back_when_single_candidate_runner
     }];
     let source = source_facade_with_group("nfs2", &grants);
     let sink = sink_facade_with_group(&grants);
-    let boundary =
-        Arc::new(ForceFindSingleCandidateGroupMissingThenFallbackBoundary::new(vec![4, 5, 6]));
-    let route = source_find_request_route_for("node-b");
+    let source_status_payload =
+        source_observability_payload_for_runner_nodes("nfs2", &grants, &["node-b"]);
+    let boundary = Arc::new(
+        ForceFindSingleCandidateGroupMissingThenFallbackBoundary::new(
+            vec![4, 5, 6],
+            source_status_payload,
+        ),
+    );
     let state = test_api_state_for_route_source(
         source,
         sink,
@@ -3747,6 +5217,7 @@ async fn selected_group_force_find_route_falls_back_when_single_candidate_runner
         ForceFindSessionPlan::new(Duration::from_millis(450)).route_plan(),
         "nfs2",
         true,
+        false,
     )
     .await;
 
@@ -3775,6 +5246,91 @@ async fn selected_group_force_find_route_falls_back_when_single_candidate_runner
             .map(|event| event.metadata().origin_id.0.as_str())
             .collect::<Vec<_>>(),
         vec!["node-d::fallback"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_group_force_find_fallback_collects_until_selected_group_payload_arrives() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root_a = tmp.path().join("node-a");
+    let root_b = tmp.path().join("node-b");
+    fs::create_dir_all(root_a.join("force-find-stress")).expect("create node-a dir");
+    fs::create_dir_all(root_b.join("force-find-stress")).expect("create node-b dir");
+    fs::write(root_a.join("force-find-stress").join("seed.txt"), b"a").expect("seed node-a file");
+    fs::write(root_b.join("force-find-stress").join("seed.txt"), b"b").expect("seed node-b file");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: root_a,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-b::nfs1".to_string(),
+            host_ref: "node-b".to_string(),
+            host_ip: "10.0.0.2".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: root_b,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let source = source_facade_with_group("nfs1", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let source_status_payload =
+        source_observability_payload_for_runner_nodes("nfs1", &grants, &["node-a"]);
+    let boundary = Arc::new(ForceFindSelectedGroupFallbackCollectBoundary::new(
+        b"selected nfs1 payload".to_vec(),
+        source_status_payload,
+    ));
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+    );
+
+    let result = query_force_find_group_tree(
+        &state,
+        b"/force-find-stress",
+        true,
+        None,
+        ForceFindSessionPlan::new(Duration::from_secs(2)).route_plan(),
+        "nfs1",
+        true,
+        false,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "selected-group force-find fallback must collect until the selected group payload arrives; recv_batches={} err={:?}",
+        boundary.total_recv_batch_count(),
+        result.as_ref().err(),
+    );
+    assert_eq!(
+        result
+            .expect("force-find fallback result")
+            .iter()
+            .map(|event| event.metadata().origin_id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["nfs2", "node-b::nfs1"],
+        "fallback must not settle on an unrelated group-only reply"
     );
 }
 
@@ -4105,6 +5661,105 @@ fn decode_materialized_selected_group_response_prefers_newer_empty_same_path_pay
         payload.entries.is_empty(),
         "newer empty same-path payload should clear stale entries from older duplicate responses"
     );
+}
+
+#[test]
+fn decode_force_find_selected_group_response_fails_without_selected_group_payload() {
+    let payload = rmp_serde::to_vec_named(&ForceFindQueryPayload::Tree(TreeGroupPayload {
+        reliability: GroupReliability {
+            reliable: true,
+            unreliable_reason: None,
+        },
+        stability: TreeStability::not_evaluated(),
+        root: TreePageRoot {
+            path: b"/force-find-stress".to_vec(),
+            size: 0,
+            modified_time_us: 1,
+            is_dir: true,
+            exists: true,
+            has_children: true,
+        },
+        entries: Vec::new(),
+    }))
+    .expect("encode force-find payload");
+    let events = vec![mk_event("nfs2", payload)];
+
+    let err = decode_force_find_selected_group_response(
+        &events,
+        &ProjectionPolicy::default(),
+        "nfs1",
+        b"/force-find-stress",
+    )
+    .expect_err("missing selected-group payload must fail closed");
+
+    assert!(
+        err.to_string()
+            .contains("force-find returned no selected group payload: nfs1"),
+        "missing selected-group payload must not be rendered as an empty successful group: {err}"
+    );
+}
+
+#[test]
+fn decode_force_find_selected_group_response_prefers_non_empty_runner_payload() {
+    let empty_payload = rmp_serde::to_vec_named(&ForceFindQueryPayload::Tree(TreeGroupPayload {
+        reliability: GroupReliability {
+            reliable: true,
+            unreliable_reason: None,
+        },
+        stability: TreeStability::not_evaluated(),
+        root: TreePageRoot {
+            path: b"/force-find-stress".to_vec(),
+            size: 0,
+            modified_time_us: 0,
+            is_dir: true,
+            exists: false,
+            has_children: false,
+        },
+        entries: Vec::new(),
+    }))
+    .expect("encode empty force-find payload");
+    let rich_payload = rmp_serde::to_vec_named(&ForceFindQueryPayload::Tree(TreeGroupPayload {
+        reliability: GroupReliability {
+            reliable: true,
+            unreliable_reason: None,
+        },
+        stability: TreeStability::not_evaluated(),
+        root: TreePageRoot {
+            path: b"/force-find-stress".to_vec(),
+            size: 0,
+            modified_time_us: 7,
+            is_dir: true,
+            exists: true,
+            has_children: true,
+        },
+        entries: vec![TreePageEntry {
+            path: b"/force-find-stress/file.txt".to_vec(),
+            size: 4,
+            modified_time_us: 9,
+            is_dir: false,
+            has_children: false,
+            depth: 1,
+        }],
+    }))
+    .expect("encode rich force-find payload");
+    let events = vec![
+        mk_event("nfs1", empty_payload),
+        mk_event("nfs1", rich_payload),
+    ];
+
+    let payload = decode_force_find_selected_group_response(
+        &events,
+        &ProjectionPolicy::default(),
+        "nfs1",
+        b"/force-find-stress",
+    )
+    .expect("decode selected-group force-find response");
+
+    assert!(
+        payload.root.exists,
+        "force-find fallback collect must not let an empty runner payload hide richer fresh evidence from another runner"
+    );
+    assert_eq!(payload.entries.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4639,11 +6294,14 @@ async fn load_request_scoped_materialized_sink_status_snapshot_accepts_immediate
         policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
         pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
         force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink),
         materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
 

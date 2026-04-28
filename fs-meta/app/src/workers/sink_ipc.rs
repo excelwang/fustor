@@ -21,6 +21,10 @@ pub enum SinkWorkerRequest {
         roots: Vec<RootSpec>,
         host_object_grants: Vec<GrantedMountRoot>,
     },
+    UpdateLogicalRootsFromManagementApply {
+        roots: Vec<RootSpec>,
+        host_object_grants: Vec<GrantedMountRoot>,
+    },
     LogicalRootsSnapshot,
     ScheduledGroupIds,
     Health,

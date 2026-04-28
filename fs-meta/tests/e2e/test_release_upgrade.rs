@@ -303,6 +303,12 @@ fn apply_generation_two_release_only(harness: &mut UpgradeHarness) -> Result<(),
 fn upgrade_to_generation_two(harness: &mut UpgradeHarness) -> Result<(), String> {
     apply_generation_two_release_only(harness)?;
     wait_for_generation(&harness.cluster, 2)?;
+    let _ = harness.cluster.wait_http_login_ready(
+        &harness.candidate_base_urls,
+        "operator",
+        "operator123",
+        Duration::from_secs(120),
+    )?;
     harness.session = OperatorSession::login_many(
         harness.candidate_base_urls.clone(),
         "operator",
@@ -333,6 +339,25 @@ fn wait_for_primary_tree_materialization(
                 .status()
                 .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
             Err(format!("tree={tree}; status={status}"))
+        }
+    })
+}
+
+fn wait_for_manual_rescan_acceptance(
+    session: &mut OperatorSession,
+    reason: &str,
+) -> Result<(), String> {
+    wait_until(Duration::from_secs(120), reason, || {
+        match session.rescan() {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                let status = session
+                    .status()
+                    .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+                Err(format!(
+                    "manual rescan not accepted yet: {err}; status={status}"
+                ))
+            }
         }
     })
 }
@@ -420,7 +445,10 @@ fn scenario_tree_materialization_after_upgrade(harness: &mut UpgradeHarness) -> 
         "operator",
         "operator123",
     )?;
-    harness.session.rescan()?;
+    wait_for_manual_rescan_acceptance(
+        &mut harness.session,
+        "manual rescan accepted after release-upgrade source scope convergence",
+    )?;
     wait_for_primary_tree_materialization(
         &mut harness.session,
         "tree materializes after generation-two upgrade",
@@ -528,7 +556,10 @@ fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
         "operator",
         "operator123",
     )?;
-    harness.session.rescan()?;
+    wait_for_manual_rescan_acceptance(
+        &mut harness.session,
+        "manual rescan accepted before cpu-budget tree materialization",
+    )?;
     wait_for_primary_tree_materialization(&mut harness.session, "cpu-budget tree materializes")?;
 
     let (stop, worker) = spawn_light_polling(

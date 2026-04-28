@@ -392,6 +392,7 @@ fn resolve_fs_meta_app_cdylib() -> Option<PathBuf> {
     }
 
     let root = repo_root();
+    let capanix_root = capanix_repo_root();
     let lib_name = fs_meta_app_lib_filename();
     let candidates = [
         root.join("target/debug").join(lib_name),
@@ -410,6 +411,8 @@ fn resolve_fs_meta_app_cdylib() -> Option<PathBuf> {
         root.join("fs-meta/app/Cargo.toml"),
         root.join("fs-meta/tests"),
         root.join("src"),
+        capanix_root.join("Cargo.lock"),
+        capanix_root.join("crates"),
     ];
 
     if let Some(found) = candidates.iter().find(|p| p.exists()).cloned() {

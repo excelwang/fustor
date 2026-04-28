@@ -49,11 +49,14 @@ async fn load_materialized_status_snapshots_falls_back_to_local_source_when_rout
         policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
         pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
         force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink_facade_with_group(&grants)),
         materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
 
@@ -90,7 +93,8 @@ async fn load_materialized_status_snapshots_falls_back_to_local_source_when_rout
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn load_materialized_status_snapshots_retries_routed_source_status_before_local_fallback() {
+async fn load_materialized_status_snapshots_falls_back_to_local_source_after_routed_source_status_timeout_without_route_retry()
+{
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_a_root = tmp.path().join("node-a");
     let node_b_root = tmp.path().join("node-b");
@@ -196,27 +200,34 @@ async fn load_materialized_status_snapshots_retries_routed_source_status_before_
         policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
         pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
         force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink_facade_with_group(&grants)),
         materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     let (source_status, _sink_status) = load_materialized_status_snapshots(&state)
         .await
-        .expect("materialized status snapshots after routed source-status retry");
+        .expect("materialized status snapshots after routed source-status timeout fallback");
 
     assert_eq!(
         boundary.send_batch_count(&source_status_route.0),
-        2,
-        "source-status caller chain must reissue routed status collection after a transient first-attempt timeout instead of collapsing immediately to local fallback",
+        1,
+        "routed source-status timeout is bounded observation evidence; the query must not amplify it with same-request route retries",
     );
     assert_eq!(
-        source_status.current_stream_generation,
-        Some(9),
-        "successful routed retry should preserve the peer source-status snapshot instead of falling back to local-only status",
+        source_status
+            .logical_roots
+            .iter()
+            .map(|root| root.root_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["nfs1"],
+        "routed source-status timeout should fall back to package-local source readiness evidence for the same authority inputs",
     );
 }
 
@@ -461,11 +472,14 @@ async fn load_materialized_status_snapshots_retries_routed_source_status_after_m
         policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
         pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
         force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink_facade_with_group(&grants)),
         materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
 
@@ -544,9 +558,8 @@ async fn load_materialized_status_snapshots_falls_back_to_local_sink_when_route_
         published_path_origin_counts_by_node: BTreeMap::new(),
     })
     .expect("encode source-status payload");
-    let boundary = Arc::new(SourceStatusRetryThenReplyBoundary::new(
+    let boundary = Arc::new(SourceStatusOkSinkStatusTimeoutBoundary::new(
         source_status_payload,
-        Vec::new(),
     ));
     let source_status_route = default_route_bindings()
         .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
@@ -564,11 +577,14 @@ async fn load_materialized_status_snapshots_falls_back_to_local_sink_when_route_
         policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
         pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
         force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink_facade_with_group(&grants)),
         materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
 
@@ -642,11 +658,14 @@ async fn load_materialized_status_snapshots_falls_back_to_local_source_when_rout
         policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
         pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
         force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
         force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
         readiness_source: Some(source),
         readiness_sink: Some(sink_facade_with_group(&grants)),
         materialized_source_status_cache: Arc::new(Mutex::new(None)),
         materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
         tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
     };
 
