@@ -611,6 +611,162 @@ async fn load_materialized_status_snapshots_falls_back_to_local_sink_when_route_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn load_materialized_status_snapshots_uses_nonblocking_sink_evidence_when_route_sink_status_times_out()
+ {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a");
+    fs::create_dir_all(&node_a_root).expect("create node-a dir");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-a::nfs1".to_string(),
+        host_ref: "node-a".to_string(),
+        host_ip: "10.0.0.1".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: node_a_root.clone(),
+        fs_source: "nfs".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let source = source_facade_with_group("nfs1", &grants);
+    let source_status_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+        lifecycle_state: "running".into(),
+        host_object_grants_version: 1,
+        grants: grants.clone(),
+        logical_roots: Vec::new(),
+        status: SourceStatusSnapshot {
+            current_stream_generation: Some(9),
+            logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".into(),
+                status: "ok".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            }],
+            ..SourceStatusSnapshot::default()
+        },
+        source_primary_by_group: BTreeMap::new(),
+        last_force_find_runner_by_group: BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: BTreeMap::new(),
+        scheduled_scan_groups_by_node: BTreeMap::new(),
+        last_control_frame_signals_by_node: BTreeMap::new(),
+        published_batches_by_node: BTreeMap::new(),
+        published_events_by_node: BTreeMap::new(),
+        published_control_events_by_node: BTreeMap::new(),
+        published_data_events_by_node: BTreeMap::new(),
+        last_published_at_us_by_node: BTreeMap::new(),
+        last_published_origins_by_node: BTreeMap::new(),
+        published_origin_counts_by_node: BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: BTreeMap::new(),
+        pending_path_origin_counts_by_node: BTreeMap::new(),
+        yielded_path_origin_counts_by_node: BTreeMap::new(),
+        summarized_path_origin_counts_by_node: BTreeMap::new(),
+        published_path_origin_counts_by_node: BTreeMap::new(),
+    })
+    .expect("encode source-status payload");
+    let route_boundary = Arc::new(SourceStatusOkSinkStatusTimeoutBoundary::new(
+        source_status_payload,
+    ));
+    let worker_boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let worker_socket_dir = tmp.path().join("worker-sockets");
+    fs::create_dir_all(&worker_socket_dir).expect("create worker socket dir");
+    let worker_binding = RuntimeWorkerBinding {
+        role_id: "sink".to_string(),
+        mode: WorkerMode::External,
+        launcher_kind: RuntimeWorkerLauncherKind::WorkerHost,
+        module_path: Some(tmp.path().join("missing-worker-module.so")),
+        socket_dir: Some(worker_socket_dir),
+    };
+    let worker_factory = RuntimeWorkerClientFactory::new(
+        worker_boundary.clone(),
+        worker_boundary,
+        in_memory_state_boundary(),
+    );
+    let worker_config = SourceConfig {
+        roots: vec![external_worker_root("nfs1", &node_a_root)],
+        host_object_grants: grants.clone(),
+        ..SourceConfig::default()
+    };
+    let worker_client = Arc::new(
+        SinkWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            worker_config,
+            worker_binding,
+            worker_factory,
+        )
+        .expect("construct sink worker client"),
+    );
+    assert!(
+        worker_client
+            .shared_worker_existing_client_for_tests()
+            .await
+            .expect("read initial sink worker client")
+            .is_none(),
+        "test setup should start with no live sink worker client"
+    );
+    let sink = Arc::new(SinkFacade::worker(worker_client.clone()));
+    let source_status_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+        .expect("resolve source-status route");
+    let sink_status_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+        .expect("resolve sink-status route");
+    let state = ApiState {
+        backend: QueryBackend::Route {
+            sink: sink.clone(),
+            boundary: route_boundary.clone(),
+            origin_id: NodeId("node-d".to_string()),
+            source: source.clone(),
+        },
+        policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+        pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
+        force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+        force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
+        readiness_source: Some(source),
+        readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
+        materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
+        tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
+    };
+
+    let (source_status, sink_status) = load_materialized_status_snapshots(&state)
+        .await
+        .expect("route sink-status timeout should degrade to nonblocking sink evidence");
+
+    assert_eq!(source_status.current_stream_generation, Some(9));
+    assert!(
+        sink_status.groups.is_empty(),
+        "not-started worker fallback should provide cached degraded sink evidence instead of live materialization"
+    );
+    assert_eq!(
+        route_boundary.send_batch_count(&source_status_route.0),
+        1,
+        "source status should still be collected independently"
+    );
+    assert_eq!(
+        route_boundary.send_batch_count(&sink_status_route.0),
+        1,
+        "sink status should make one routed attempt before degrading"
+    );
+    assert!(
+        worker_client
+            .shared_worker_existing_client_for_tests()
+            .await
+            .expect("read final sink worker client")
+            .is_none(),
+        "trusted-materialized readiness fan-in must not start the local sink worker after routed sink-status timeout"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn load_materialized_status_snapshots_falls_back_to_local_source_when_route_source_status_send_hits_missing_channel_buffer_state()
  {
     let tmp = tempfile::tempdir().expect("create tempdir");

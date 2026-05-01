@@ -7,7 +7,8 @@ use std::time::Duration;
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
 use capanix_app_sdk::{CnxError, Event, Result};
 use capanix_runtime_entry_sdk::advanced::boundary::{
-    BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest, StateBoundary,
+    BoundaryContext, ChannelIoSubset, ChannelKey, ChannelRecvRequest, ChannelSendRequest,
+    StateBoundary,
 };
 use capanix_runtime_entry_sdk::worker_runtime::{
     TypedWorkerBootstrapSession, TypedWorkerSession, WorkerLoopControl, WorkerSessionContext,
@@ -27,6 +28,7 @@ use crate::workers::source::SourceObservabilitySnapshot;
 use crate::workers::source::SourceWorkerRpc;
 use crate::workers::source::{
     SourceObservabilityPublicationView, build_live_source_observability_snapshot,
+    source_observability_signal_preserves_scoped_manual_rescan_route_evidence,
 };
 use crate::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
 
@@ -42,8 +44,42 @@ struct SourceWorkerState {
     pending_init: Option<(NodeId, SourceConfig)>,
     pump_task: Option<JoinHandle<()>>,
     pump_boundary: Option<Arc<StdMutex<Arc<dyn ChannelIoSubset>>>>,
+    runtime_endpoint_boundary: Option<Arc<dyn ChannelIoSubset>>,
     last_control_frame_signals: Vec<String>,
     published_stats: Arc<StdMutex<PublishedBatchStats>>,
+}
+
+struct SharedSourceWorkerRuntimeBoundary {
+    target: Arc<StdMutex<Arc<dyn ChannelIoSubset>>>,
+}
+
+impl SharedSourceWorkerRuntimeBoundary {
+    fn new(target: Arc<StdMutex<Arc<dyn ChannelIoSubset>>>) -> Self {
+        Self { target }
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelIoSubset for SharedSourceWorkerRuntimeBoundary {
+    async fn channel_send(&self, ctx: BoundaryContext, request: ChannelSendRequest) -> Result<()> {
+        clone_pump_boundary_target(&self.target)
+            .channel_send(ctx, request)
+            .await
+    }
+
+    async fn channel_recv(
+        &self,
+        ctx: BoundaryContext,
+        request: ChannelRecvRequest,
+    ) -> Result<Vec<Event>> {
+        clone_pump_boundary_target(&self.target)
+            .channel_recv(ctx, request)
+            .await
+    }
+
+    fn channel_close(&self, ctx: BoundaryContext, channel: ChannelKey) -> Result<()> {
+        clone_pump_boundary_target(&self.target).channel_close(ctx, channel)
+    }
 }
 
 #[derive(Default)]
@@ -88,7 +124,13 @@ enum SourceWorkerAction {
     PublishManualRescanSignal {
         source: Arc<FSMetaSource>,
     },
+    SubmitRescanRequestEpoch {
+        source: Arc<FSMetaSource>,
+    },
     TriggerRescanWhenReadyEpoch {
+        source: Arc<FSMetaSource>,
+    },
+    TriggerTargetedRescanWhenReadyEpoch {
         source: Arc<FSMetaSource>,
     },
     OnControlFrame {
@@ -134,10 +176,16 @@ fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
             "LastForceFindRunnerByGroupSnapshot"
         }
         SourceWorkerRequest::ForceFindInflightGroupsSnapshot => "ForceFindInflightGroupsSnapshot",
+        SourceWorkerRequest::StartRuntimeEndpoints => "StartRuntimeEndpoints",
+        SourceWorkerRequest::RearmSourceRescanEndpoints => "RearmSourceRescanEndpoints",
         SourceWorkerRequest::ForceFind { .. } => "ForceFind",
         SourceWorkerRequest::ResolveGroupIdForObjectRef { .. } => "ResolveGroupIdForObjectRef",
         SourceWorkerRequest::PublishManualRescanSignal => "PublishManualRescanSignal",
+        SourceWorkerRequest::SubmitRescanRequestEpoch => "SubmitRescanRequestEpoch",
         SourceWorkerRequest::TriggerRescanWhenReadyEpoch => "TriggerRescanWhenReadyEpoch",
+        SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch => {
+            "TriggerTargetedRescanWhenReadyEpoch"
+        }
         SourceWorkerRequest::OnControlFrame { .. } => "OnControlFrame",
     }
 }
@@ -414,6 +462,32 @@ fn clone_pump_boundary_target(
     }
 }
 
+fn source_worker_runtime_boundary_target(
+    state: &mut SourceWorkerState,
+    boundary: Arc<dyn ChannelIoSubset>,
+) -> Arc<StdMutex<Arc<dyn ChannelIoSubset>>> {
+    let target = state
+        .pump_boundary
+        .get_or_insert_with(|| Arc::new(StdMutex::new(boundary.clone())))
+        .clone();
+    replace_pump_boundary_target(&target, boundary);
+    target
+}
+
+fn source_worker_runtime_endpoint_boundary(
+    state: &mut SourceWorkerState,
+    boundary: Arc<dyn ChannelIoSubset>,
+) -> Arc<dyn ChannelIoSubset> {
+    let target = source_worker_runtime_boundary_target(state, boundary);
+    if let Some(endpoint_boundary) = &state.runtime_endpoint_boundary {
+        return endpoint_boundary.clone();
+    }
+    let endpoint_boundary: Arc<dyn ChannelIoSubset> =
+        Arc::new(SharedSourceWorkerRuntimeBoundary::new(target));
+    state.runtime_endpoint_boundary = Some(endpoint_boundary.clone());
+    endpoint_boundary
+}
+
 fn published_path_origin_counts_for_target(
     batch: &[Event],
     path_capture_target: Option<&[u8]>,
@@ -648,9 +722,13 @@ fn request_requires_live_publish_pump(request: &SourceWorkerRequest) -> bool {
         request,
         SourceWorkerRequest::UpdateLogicalRoots { .. }
             | SourceWorkerRequest::PublishManualRescanSignal
+            | SourceWorkerRequest::SubmitRescanRequestEpoch
             | SourceWorkerRequest::TriggerRescanWhenReadyEpoch
+            | SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch
             | SourceWorkerRequest::ProgressSnapshot
             | SourceWorkerRequest::ObservabilitySnapshot
+            | SourceWorkerRequest::StartRuntimeEndpoints
+            | SourceWorkerRequest::RearmSourceRescanEndpoints
             | SourceWorkerRequest::OnControlFrame { .. }
     )
 }
@@ -682,7 +760,10 @@ fn source_observability_snapshot_with_failure(
     Ok(build_live_source_observability_snapshot(
         source,
         SourceObservabilityPublicationView {
-            last_control_frame_signals: last_control_frame_signals.to_vec(),
+            last_control_frame_signals: source_observability_control_signals_for_publication(
+                source,
+                last_control_frame_signals,
+            ),
             keep_zero_publication_counters: true,
             published_batch_count: published.batch_count,
             published_event_count: published.event_count,
@@ -700,6 +781,25 @@ fn source_observability_snapshot_with_failure(
             published_path_origin_counts: published.published_path_origin_counts.clone(),
         },
     ))
+}
+
+fn source_observability_control_signals_for_publication(
+    source: &FSMetaSource,
+    last_control_frame_signals: &[String],
+) -> Vec<String> {
+    let source_owned_signals = source.snapshot_last_control_frame_signals();
+    if last_control_frame_signals.is_empty() {
+        return source_owned_signals;
+    }
+    let mut merged = last_control_frame_signals.to_vec();
+    for signal in source_owned_signals.into_iter().filter(|signal| {
+        source_observability_signal_preserves_scoped_manual_rescan_route_evidence(signal)
+    }) {
+        if !merged.iter().any(|existing| existing == &signal) {
+            merged.push(signal);
+        }
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -787,21 +887,18 @@ async fn bootstrap_start_source_runtime_with_failure(
             }
         }
     }
-    let Some(source) = state.source.as_ref() else {
+    let Some(source) = state.source.clone() else {
         return Err(SourceFailure::from(CnxError::Internal(
             "source worker runtime missing during start".into(),
         )));
     };
+    let runtime_boundary = source_worker_runtime_boundary_target(state, boundary.clone());
+    let endpoint_boundary = source_worker_runtime_endpoint_boundary(state, boundary);
     eprintln!("fs_meta_source_worker_server: bootstrap_start endpoints begin");
     source
-        .start_runtime_endpoints_with_failure(boundary.clone())
+        .start_runtime_endpoints_with_failure(endpoint_boundary)
         .await?;
     eprintln!("fs_meta_source_worker_server: bootstrap_start endpoints ok");
-    let pump_boundary = state
-        .pump_boundary
-        .get_or_insert_with(|| Arc::new(StdMutex::new(boundary.clone())))
-        .clone();
-    replace_pump_boundary_target(&pump_boundary, boundary);
     if state.pump_task.is_none() {
         let source = source.clone();
         eprintln!("fs_meta_source_worker_server: bootstrap_start pub begin");
@@ -809,7 +906,7 @@ async fn bootstrap_start_source_runtime_with_failure(
         eprintln!("fs_meta_source_worker_server: bootstrap_start pub ok");
         state.pump_task = Some(start_source_pump_with_stream(
             stream,
-            pump_boundary,
+            runtime_boundary,
             state.published_stats.clone(),
         ));
         eprintln!("fs_meta_source_worker_server: bootstrap_start pump ok");
@@ -1053,6 +1150,14 @@ fn plan_worker_request(
                 false,
             ),
         },
+        SourceWorkerRequest::StartRuntimeEndpoints
+        | SourceWorkerRequest::RearmSourceRescanEndpoints => match state.source.as_ref() {
+            Some(_) => SourceWorkerAction::Immediate(SourceWorkerResponse::Ack, false),
+            None => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
         SourceWorkerRequest::ForceFind { request } => match state.source.as_ref() {
             Some(source) => {
                 if debug_force_find_route_capture_enabled() {
@@ -1128,8 +1233,22 @@ fn plan_worker_request(
                 false,
             ),
         },
+        SourceWorkerRequest::SubmitRescanRequestEpoch => match state.source.clone() {
+            Some(source) => SourceWorkerAction::SubmitRescanRequestEpoch { source },
+            None => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
         SourceWorkerRequest::TriggerRescanWhenReadyEpoch => match state.source.clone() {
             Some(source) => SourceWorkerAction::TriggerRescanWhenReadyEpoch { source },
+            None => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
+        SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch => match state.source.clone() {
+            Some(source) => SourceWorkerAction::TriggerTargetedRescanWhenReadyEpoch { source },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
@@ -1244,8 +1363,20 @@ async fn execute_worker_action(action: SourceWorkerAction) -> (SourceWorkerRespo
                 Err(err) => (classify_source_worker_failure(err), false),
             }
         }
+        SourceWorkerAction::SubmitRescanRequestEpoch { source } => {
+            match source.submit_rescan_request_epoch_with_failure() {
+                Ok(epoch) => (SourceWorkerResponse::RescanRequestEpoch(epoch), false),
+                Err(err) => (classify_source_worker_failure(err), false),
+            }
+        }
         SourceWorkerAction::TriggerRescanWhenReadyEpoch { source } => {
             match source.trigger_rescan_when_ready_epoch_with_failure().await {
+                Ok(epoch) => (SourceWorkerResponse::RescanRequestEpoch(epoch), false),
+                Err(err) => (classify_source_worker_failure(err), false),
+            }
+        }
+        SourceWorkerAction::TriggerTargetedRescanWhenReadyEpoch { source } => {
+            match source.targeted_rescan_when_ready_epoch_with_failure().await {
                 Ok(epoch) => (SourceWorkerResponse::RescanRequestEpoch(epoch), false),
                 Err(err) => (classify_source_worker_failure(err), false),
             }
@@ -1268,6 +1399,7 @@ pub fn run_source_worker_server(
         pending_init: None,
         pump_task: None,
         pump_boundary: None,
+        runtime_endpoint_boundary: None,
         last_control_frame_signals: Vec::new(),
         published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
     }));
@@ -1292,6 +1424,10 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
         let request_seq = next_source_worker_request_seq();
         let request_label = source_worker_request_label(&request);
         let request_is_control = matches!(request, SourceWorkerRequest::OnControlFrame { .. });
+        let request_starts_runtime_endpoints =
+            matches!(request, SourceWorkerRequest::StartRuntimeEndpoints);
+        let request_rearms_source_rescan_endpoints =
+            matches!(request, SourceWorkerRequest::RearmSourceRescanEndpoints);
         eprintln!(
             "fs_meta_source_worker_server: handle_request begin seq={} request={}",
             request_seq, request_label
@@ -1310,17 +1446,30 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
             }
         };
         let (mut response, stop) = execute_worker_action(action).await;
-        if request_is_control && matches!(response, SourceWorkerResponse::Ack) {
-            let source = {
-                let guard = self.state.lock().await;
-                guard.source.clone()
+        if (request_is_control
+            || request_starts_runtime_endpoints
+            || request_rearms_source_rescan_endpoints)
+            && matches!(response, SourceWorkerResponse::Ack)
+        {
+            let (source, endpoint_boundary) = {
+                let mut guard = self.state.lock().await;
+                let endpoint_boundary =
+                    source_worker_runtime_endpoint_boundary(&mut guard, context.io_boundary());
+                (guard.source.clone(), endpoint_boundary)
             };
-            if let Some(source) = source
-                && let Err(err) = source
-                    .start_runtime_endpoints_with_failure(context.io_boundary())
-                    .await
-            {
-                response = classify_source_worker_failure(err);
+            if let Some(source) = source {
+                let start_result = if request_rearms_source_rescan_endpoints {
+                    source
+                        .rearm_source_rescan_request_endpoints_with_failure(endpoint_boundary)
+                        .await
+                } else {
+                    source
+                        .start_runtime_endpoints_with_failure(endpoint_boundary)
+                        .await
+                };
+                if let Err(err) = start_result {
+                    response = classify_source_worker_failure(err);
+                }
             }
         }
         eprintln!(
@@ -1343,21 +1492,28 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
             "fs_meta_source_worker_server: on_runtime_control begin envelopes={}",
             envelopes.len()
         );
-        let (source, summary) = {
+        let (source, summary, endpoint_boundary) = {
             let mut guard = self.state.lock().await;
             if fail_closed_if_publish_pump_dead(&mut guard, "runtime_control").await {
-                (None, Vec::new())
+                (None, Vec::new(), None)
             } else {
                 let summary = match source_control_signals_from_envelopes(envelopes) {
                     Ok(signals) => summarize_source_control_signals(&signals),
                     Err(err) => vec![format!("decode_err={err}")],
                 };
-                (guard.source.clone(), summary)
+                let endpoint_boundary =
+                    source_worker_runtime_endpoint_boundary(&mut guard, context.io_boundary());
+                (guard.source.clone(), summary, Some(endpoint_boundary))
             }
         };
         let Some(source) = source else {
             return Err(CnxError::NotReady(
                 "worker runtime not initialized for runtime control frames".into(),
+            ));
+        };
+        let Some(endpoint_boundary) = endpoint_boundary else {
+            return Err(CnxError::NotReady(
+                "worker runtime boundary not initialized for runtime control frames".into(),
             ));
         };
         let result = match source
@@ -1366,7 +1522,7 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
         {
             Ok(()) => {
                 source
-                    .start_runtime_endpoints_with_failure(context.io_boundary())
+                    .start_runtime_endpoints_with_failure(endpoint_boundary)
                     .await
             }
             Err(err) => Err(err),
@@ -1781,6 +1937,64 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shared_source_worker_runtime_boundary_uses_latest_target_for_endpoint_io() {
+        let first = Arc::new(PublishCaptureBoundary::default());
+        let second = Arc::new(PublishCaptureBoundary::default());
+        let first_target: Arc<dyn ChannelIoSubset> = first.clone();
+        let target = Arc::new(StdMutex::new(first_target));
+        let boundary: Arc<dyn ChannelIoSubset> =
+            Arc::new(SharedSourceWorkerRuntimeBoundary::new(target.clone()));
+        let event = Event::new(
+            EventMetadata {
+                origin_id: NodeId("node-a".to_string()),
+                timestamp_us: 1,
+                logical_ts: None,
+                correlation_id: None,
+                ingress_auth: None,
+                trace: None,
+            },
+            bytes::Bytes::from_static(b"accepted"),
+        );
+
+        boundary
+            .channel_send(
+                BoundaryContext::default(),
+                ChannelSendRequest {
+                    channel_key: ChannelKey("source-manual-rescan.node_a:v1.req:reply".into()),
+                    events: vec![event.clone()],
+                    timeout_ms: Some(100),
+                },
+            )
+            .await
+            .expect("send through first target");
+
+        let second_target: Arc<dyn ChannelIoSubset> = second.clone();
+        replace_pump_boundary_target(&target, second_target);
+        boundary
+            .channel_send(
+                BoundaryContext::default(),
+                ChannelSendRequest {
+                    channel_key: ChannelKey("source-manual-rescan.node_a:v1.req:reply".into()),
+                    events: vec![event],
+                    timeout_ms: Some(100),
+                },
+            )
+            .await
+            .expect("send through updated target");
+
+        assert_eq!(
+            first.sent_batches_snapshot().len(),
+            1,
+            "source worker endpoint boundary must use the initial runtime target before replacement",
+        );
+        assert_eq!(
+            second.sent_batches_snapshot().len(),
+            1,
+            "source worker endpoint boundary must use the latest runtime target after replacement",
+        );
+    }
+
     fn record_path_data_counts(
         path_counts: &mut std::collections::BTreeMap<String, usize>,
         batch: &[Event],
@@ -2028,6 +2242,7 @@ mod tests {
             pending_init: Some((NodeId("node-a-29775285406139598021591041".to_string()), cfg)),
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
@@ -2173,6 +2388,7 @@ mod tests {
             pending_init: Some((NodeId("node-c-local-sink-status-helper".to_string()), cfg)),
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
@@ -2309,6 +2525,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn targeted_rescan_when_ready_publishes_baseline_after_zero_grant_runtime_managed_watch_scan_wave()
+     {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(nfs1.join("data")).expect("create nfs1 data dir");
+        std::fs::create_dir_all(nfs2.join("data")).expect("create nfs2 data dir");
+        std::fs::write(nfs1.join("data").join("a.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join("data").join("b.txt"), b"b").expect("seed nfs2");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                test_watch_scan_root("nfs1", nfs1.clone()),
+                test_watch_scan_root("nfs2", nfs2.clone()),
+            ],
+            host_object_grants: Vec::new(),
+            ..SourceConfig::default()
+        };
+
+        let mut state = SourceWorkerState {
+            source: None,
+            pending_init: Some((NodeId("node-c-local-targeted-rescan".to_string()), cfg)),
+            pump_task: None,
+            pump_boundary: None,
+            runtime_endpoint_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        };
+
+        let boundary = Arc::new(PublishCaptureBoundary::default());
+        bootstrap_start_source_runtime(&mut state, boundary.clone(), in_memory_state_boundary())
+            .await
+            .expect("bootstrap start source runtime");
+
+        let source_wave = |generation| {
+            vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source roots activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source rescan activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source scan activate"),
+            ]
+        };
+
+        let (response, stop) = execute_worker_action(plan_worker_request(
+            SourceWorkerRequest::OnControlFrame {
+                envelopes: source_wave(2),
+            },
+            &mut state,
+        ))
+        .await;
+        assert!(matches!(response, SourceWorkerResponse::Ack));
+        assert!(
+            !stop,
+            "source worker should stay alive after zero-grant watch-scan wave"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let statuses = state
+                .source
+                .as_ref()
+                .expect("source after bootstrap")
+                .status_snapshot()
+                .concrete_roots;
+            let primary_ready = statuses
+                .iter()
+                .filter(|root| root.logical_root_id == "nfs1" || root.logical_root_id == "nfs2")
+                .filter(|root| root.active && root.is_group_primary && root.scan_enabled)
+                .map(|root| root.logical_root_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if primary_ready.contains("nfs1") && primary_ready.contains("nfs2") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "targeted rescan must wait until local source-primary scan roots are active before testing acceptance: concrete_roots={statuses:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let (response, stop) = execute_worker_action(plan_worker_request(
+            SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch,
+            &mut state,
+        ))
+        .await;
+        assert!(matches!(
+            response,
+            SourceWorkerResponse::RescanRequestEpoch(_)
+        ));
+        assert!(
+            !stop,
+            "targeted_rescan_when_ready should not stop the worker in zero-grant watch-scan mode"
+        );
+
+        let event_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let origin_counts = boundary.sent_origin_counts_for_route(&event_route);
+            let data_events = boundary.sent_data_events_for_route(&event_route);
+            if origin_counts.get("nfs1").copied().unwrap_or(0) > 0
+                && origin_counts.get("nfs2").copied().unwrap_or(0) > 0
+                && data_events > 0
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "zero-grant runtime-managed watch-scan targeted_rescan_when_ready must publish baseline events for both local roots through the source worker server publish pump: origin_counts={origin_counts:?} data_events={data_events} sent_batches={:?}",
+                boundary.sent_batches_snapshot(),
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        stop_source_runtime(&mut state).await;
+    }
+
+    #[tokio::test]
     async fn trigger_rescan_when_ready_publishes_baseline_to_loopback_boundary_after_zero_grant_runtime_managed_watch_scan_wave()
      {
         let tmp = tempdir().expect("create temp dir");
@@ -2333,6 +2734,7 @@ mod tests {
             pending_init: Some((NodeId("node-c-local-sink-status-helper".to_string()), cfg)),
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
@@ -2495,6 +2897,7 @@ mod tests {
             pending_init: None,
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         }));
@@ -2652,7 +3055,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_source_control_spawns_non_target_scoped_rescan_drain_after_broad_activation() {
+    async fn worker_source_control_does_not_spawn_non_target_scoped_rescan_after_broad_activation()
+    {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -2674,6 +3078,7 @@ mod tests {
             pending_init: None,
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         }));
@@ -2730,7 +3135,7 @@ mod tests {
             .channel_send(
                 BoundaryContext::default(),
                 ChannelSendRequest {
-                    channel_key: ChannelKey(non_target_route.clone()),
+                    channel_key: ChannelKey(local_route.clone()),
                     events: vec![Event::new(
                         EventMetadata {
                             origin_id: NodeId("api-node".to_string()),
@@ -2746,19 +3151,151 @@ mod tests {
                 },
             )
             .await
-            .expect("send non-target scoped source rescan request");
+            .expect("send local scoped source rescan request");
 
         let replies = boundary
-            .recv_route(&format!("{non_target_route}:reply"), 1000)
+            .recv_route(&format!("{local_route}:reply"), 1000)
             .await
-            .expect("non-target scoped source rescan route must drain with explicit reply");
+            .expect("local scoped source rescan route must reply with target delivery proof");
         assert!(
             replies.iter().any(|event| {
                 event.metadata().origin_id == NodeId("node-a-123".to_string())
                     && event.metadata().correlation_id == Some(77)
-                    && event.payload_bytes() == b"not-target"
             }),
-            "non-target scoped source rescan drain must reply from the local source lane without recording another node's rescan intent: {replies:?}"
+            "local scoped source rescan route must reply from the local source lane: {replies:?}"
+        );
+
+        boundary
+            .channel_send(
+                BoundaryContext::default(),
+                ChannelSendRequest {
+                    channel_key: ChannelKey(non_target_route.clone()),
+                    events: vec![Event::new(
+                        EventMetadata {
+                            origin_id: NodeId("api-node".to_string()),
+                            timestamp_us: 0,
+                            logical_ts: None,
+                            correlation_id: Some(78),
+                            ingress_auth: None,
+                            trace: None,
+                        },
+                        bytes::Bytes::from_static(b"manual-rescan"),
+                    )],
+                    timeout_ms: Some(100),
+                },
+            )
+            .await
+            .expect("send non-target scoped source rescan request");
+        let non_target_reply = boundary
+            .recv_route(&format!("{non_target_route}:reply"), 100)
+            .await;
+        assert!(
+            matches!(non_target_reply, Err(CnxError::Timeout)),
+            "non-target scoped source rescan route must not be drained by this source worker: {non_target_reply:?}"
+        );
+
+        session
+            .on_close(&context)
+            .await
+            .expect("close source worker session");
+    }
+
+    #[tokio::test]
+    async fn worker_rearm_source_rescan_endpoints_surfaces_source_owned_ready_in_observability() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_watch_scan_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![test_export("node-a::nfs1", nfs1)],
+            ..SourceConfig::default()
+        };
+
+        let boundary = Arc::new(LoopbackPublishBoundary::default());
+        let context = WorkerSessionContext::new(
+            boundary.clone(),
+            boundary.clone(),
+            in_memory_state_boundary(),
+        );
+        let state = Arc::new(Mutex::new(SourceWorkerState {
+            source: None,
+            pending_init: None,
+            pump_task: None,
+            pump_boundary: None,
+            runtime_endpoint_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        }));
+        let mut session = SourceWorkerSession { state };
+
+        session
+            .on_init(NodeId("node-a".to_string()), cfg, &context)
+            .await
+            .expect("init source worker session");
+        session
+            .on_start(&context)
+            .await
+            .expect("start source worker session");
+
+        let scoped_route = source_rescan_request_route_for("node-a").0;
+        let control = vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: scoped_route.clone(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 1777507000123,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source scoped route activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 1777507000123,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source scan route activate"),
+        ];
+
+        session
+            .handle_request(
+                SourceWorkerRequest::OnControlFrame { envelopes: control },
+                &context,
+            )
+            .await
+            .expect("apply source scoped route control frame");
+        session
+            .handle_request(SourceWorkerRequest::RearmSourceRescanEndpoints, &context)
+            .await
+            .expect("rearm source rescan endpoints");
+
+        let WorkerLoopControl::Continue(SourceWorkerResponse::ObservabilitySnapshot(snapshot)) =
+            session
+                .handle_request(SourceWorkerRequest::ObservabilitySnapshot, &context)
+                .await
+                .expect("fetch observability after rearm")
+        else {
+            panic!("observability request should return live source snapshot");
+        };
+
+        let ready =
+            format!("ready unit=runtime.exec.source route={scoped_route} generation=1777507000123");
+        assert!(
+            snapshot
+                .last_control_frame_signals_by_node
+                .get("node-a")
+                .is_some_and(|signals| signals.iter().any(|signal| signal == &ready)),
+            "worker observability must surface the source-owned rearm ready proof; expected={ready} control={:?}",
+            snapshot.last_control_frame_signals_by_node
         );
 
         session
@@ -2784,6 +3321,7 @@ mod tests {
             pending_init: Some((NodeId("node-a-boot-fenced".to_string()), cfg)),
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
@@ -2827,6 +3365,7 @@ mod tests {
             pending_init: None,
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         }));
@@ -2907,6 +3446,7 @@ mod tests {
             pending_init: Some((NodeId("node-a-bootstrap-restart".to_string()), cfg)),
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
@@ -3037,6 +3577,7 @@ mod tests {
             pending_init: None,
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         }));
@@ -3211,6 +3752,7 @@ mod tests {
             pending_init: None,
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         }));
@@ -3372,6 +3914,7 @@ mod tests {
             pending_init: Some((NodeId("node-a-ping-output-closed".to_string()), cfg)),
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
@@ -3463,6 +4006,7 @@ mod tests {
             pending_init: Some((NodeId("node-a-control-output-closed".to_string()), cfg)),
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
@@ -3608,6 +4152,7 @@ mod tests {
             )),
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
@@ -3722,6 +4267,7 @@ mod tests {
             pending_init: Some((NodeId("node-a-bootstrap-publish-rebind".to_string()), cfg)),
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
@@ -4098,6 +4644,7 @@ mod tests {
             pending_init: None,
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         }));
@@ -4204,6 +4751,7 @@ mod tests {
             pending_init: None,
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         };
@@ -4331,6 +4879,7 @@ mod tests {
             pending_init: None,
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: vec!["tick unit=runtime.exec.scan".to_string()],
             published_stats,
         };
@@ -4430,6 +4979,7 @@ mod tests {
             pending_init: None,
             pump_task: None,
             pump_boundary: None,
+            runtime_endpoint_boundary: None,
             last_control_frame_signals: Vec::new(),
             published_stats,
         };

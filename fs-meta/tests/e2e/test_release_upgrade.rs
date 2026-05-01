@@ -3,6 +3,7 @@
 use crate::support::api_client::{FsMetaApiClient, OperatorSession};
 use crate::support::cluster5::Cluster5;
 use crate::support::cpu_budget::{assert_cpu_budget, measure_cpu_budget};
+use crate::support::full_demo_roots::{self, FullDemoRoot};
 use crate::support::nfs_lab::NfsLab;
 use crate::support::{reserve_http_addrs, skip_unless_real_nfs_enabled, wait_until};
 use fs_meta::{RootSelector, RootSpec};
@@ -18,8 +19,11 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const RELEASE_UPGRADE_CLUSTER_NODES: [&str; 5] = ["node-a", "node-b", "node-c", "node-d", "node-e"];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UpgradeMode {
+    GenerationTwoApply,
     Smoke,
     PeerSourceControlCompletionAfterNodeARestart,
     FacadeClaimContinuityAfterUpgrade,
@@ -35,6 +39,7 @@ enum UpgradeMode {
 impl UpgradeMode {
     fn app_prefix(self) -> &'static str {
         match self {
+            Self::GenerationTwoApply => "fs-meta-api-upgrade-apply",
             Self::Smoke => "fs-meta-api-upgrade-smoke",
             Self::PeerSourceControlCompletionAfterNodeARestart => {
                 "fs-meta-api-upgrade-peer-source-control"
@@ -49,9 +54,26 @@ impl UpgradeMode {
             Self::CpuBudget => "fs-meta-api-upgrade-cpu",
         }
     }
+
+    fn progress_label(self) -> &'static str {
+        match self {
+            Self::GenerationTwoApply => "upgrade-apply-generation-two",
+            Self::Smoke => "upgrade-generation-two-http",
+            Self::PeerSourceControlCompletionAfterNodeARestart => "upgrade-peer-source-control",
+            Self::FacadeClaimContinuityAfterUpgrade => "upgrade-facade-continuity",
+            Self::RootsPersistAcrossUpgrade => "upgrade-roots-persist",
+            Self::TreeStatsStableAcrossUpgrade => "upgrade-tree-stats",
+            Self::TreeMaterializationAfterUpgrade => "upgrade-tree-materialization",
+            Self::SinkControlRolesAfterUpgrade => "upgrade-sink-scope",
+            Self::SourceControlRolesAfterUpgrade => "upgrade-runtime-scope",
+            Self::UpgradeWindowJoin => "upgrade-window-join",
+            Self::CpuBudget => "upgrade-cpu-budget",
+        }
+    }
 }
 
 struct UpgradeHarness {
+    mode: UpgradeMode,
     cluster: Cluster5,
     lab: NfsLab,
     session: OperatorSession,
@@ -60,10 +82,24 @@ struct UpgradeHarness {
     facade_resource_id: String,
     roots: Vec<RootSpec>,
     baseline_cpu: BTreeMap<String, Vec<u32>>,
+    uses_full_demo_roots: bool,
+}
+
+fn l5_progress(mode: UpgradeMode, step: &str, state: &str) {
+    eprintln!(
+        "[fs-meta-l5-progress] mode={} step={} state={}",
+        mode.progress_label(),
+        step,
+        state
+    );
 }
 
 pub fn run() -> Result<(), String> {
     run_mode(UpgradeMode::Smoke)
+}
+
+pub fn run_generation_two_apply() -> Result<(), String> {
+    run_mode(UpgradeMode::GenerationTwoApply)
 }
 
 fn peer_source_control_env_lock() -> MutexGuard<'static, ()> {
@@ -129,6 +165,10 @@ pub fn run_source_control_roles_after_upgrade() -> Result<(), String> {
     run_mode(UpgradeMode::SourceControlRolesAfterUpgrade)
 }
 
+pub fn run_source_runtime_scope_after_upgrade() -> Result<(), String> {
+    run_mode(UpgradeMode::SourceControlRolesAfterUpgrade)
+}
+
 pub fn run_upgrade_window_join() -> Result<(), String> {
     run_mode(UpgradeMode::UpgradeWindowJoin)
 }
@@ -143,12 +183,14 @@ fn run_mode(mode: UpgradeMode) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut harness = build_upgrade_harness(
-        mode.app_prefix(),
-        matches!(mode, UpgradeMode::UpgradeWindowJoin),
-        1,
-    )?;
+    l5_progress(mode, "00.test", "begin");
+    l5_progress(mode, "01.harness", "begin");
+    let mut harness =
+        build_upgrade_harness(mode, matches!(mode, UpgradeMode::UpgradeWindowJoin), 1)?;
+    l5_progress(mode, "01.harness", "ok");
+    l5_progress(mode, "02.scenario", "begin");
     match mode {
+        UpgradeMode::GenerationTwoApply => scenario_generation_two_apply(&mut harness)?,
         UpgradeMode::Smoke => upgrade_to_generation_two(&mut harness)?,
         UpgradeMode::PeerSourceControlCompletionAfterNodeARestart => {
             scenario_peer_source_control_completion_after_node_a_recovery(&mut harness)?
@@ -175,23 +217,41 @@ fn run_mode(mode: UpgradeMode) -> Result<(), String> {
         UpgradeMode::CpuBudget => scenario_cpu_budget(&mut harness)?,
     }
 
+    l5_progress(mode, "99.test", "ok");
     Ok(())
 }
 
 fn build_upgrade_harness(
-    app_prefix: &str,
+    mode: UpgradeMode,
     preannounce_nfs4: bool,
     facade_count: usize,
 ) -> Result<UpgradeHarness, String> {
+    let app_prefix = mode.app_prefix();
+    l5_progress(mode, "01.01.nfs-lab", "begin");
     let mut lab = NfsLab::start()?;
-    seed_baseline_content(&lab)?;
+    l5_progress(mode, "01.01.nfs-lab", "ok");
+    l5_progress(mode, "01.02.demo-roots", "begin");
+    let full_demo_roots = full_demo_roots::logical_roots_from_env(&["nfs1", "nfs2"])?;
+    if full_demo_roots.is_none() {
+        seed_baseline_content(&lab)?;
+    }
+    l5_progress(mode, "01.02.demo-roots", "ok");
+    l5_progress(mode, "01.03.cluster", "begin");
     let cluster = Cluster5::start()?;
+    l5_progress(mode, "01.03.cluster", "ok");
+    l5_progress(mode, "01.04.cpu-baseline", "begin");
     let baseline_cpu = measure_baseline_cpu(&cluster)?;
+    l5_progress(mode, "01.04.cpu-baseline", "ok");
 
     let app_id = format!("{app_prefix}-{}", unique_suffix());
     let facade_resource_id = format!("fs-meta-tcp-listener-{app_id}");
     let facade_addrs = reserve_http_addrs(facade_count)?;
-    mount_and_announce(&cluster, &mut lab, &facade_resource_id, &facade_addrs)?;
+    l5_progress(mode, "01.05.resources", "begin");
+    if let Some(roots) = full_demo_roots.as_ref() {
+        announce_full_demo_resources(&cluster, roots, &facade_resource_id, &facade_addrs)?;
+    } else {
+        mount_and_announce_lab(&cluster, &mut lab, &facade_resource_id, &facade_addrs)?;
+    }
     if preannounce_nfs4 {
         lab.create_export("nfs4")?;
         let mount_a = lab.mount_export("node-a", "nfs4")?;
@@ -211,19 +271,32 @@ fn build_upgrade_harness(
             })])?;
         }
     }
+    l5_progress(mode, "01.05.resources", "ok");
 
-    let roots = vec![
-        root_spec("nfs1", &lab.export_source("nfs1")),
-        root_spec("nfs2", &lab.export_source("nfs2")),
-    ];
-    let release_v1 =
+    let roots = full_demo_roots
+        .as_ref()
+        .map(|roots| roots.iter().map(FullDemoRoot::root_spec).collect())
+        .unwrap_or_else(|| {
+            vec![
+                root_spec("nfs1", &lab.export_source("nfs1")),
+                root_spec("nfs2", &lab.export_source("nfs2")),
+            ]
+        });
+    let uses_full_demo_roots = full_demo_roots.is_some();
+    let mut release_v1 =
         cluster.build_fs_meta_release(&app_id, &facade_resource_id, roots.clone(), 1, true)?;
+    if uses_full_demo_roots {
+        full_demo_roots::apply_bounded_audit_config(&mut release_v1)?;
+    }
+    l5_progress(mode, "01.06.apply-generation-one", "begin");
     cluster.apply_release("node-a", release_v1)?;
+    l5_progress(mode, "01.06.apply-generation-one", "ok");
 
     let candidate_base_urls = facade_addrs
         .iter()
         .map(|addr| format!("http://{addr}"))
         .collect::<Vec<_>>();
+    l5_progress(mode, "01.07.login", "begin");
     let _base_url = cluster.wait_http_login_ready(
         &candidate_base_urls,
         "operator",
@@ -232,8 +305,10 @@ fn build_upgrade_harness(
     )?;
     let session =
         OperatorSession::login_many(candidate_base_urls.clone(), "operator", "operator123")?;
+    l5_progress(mode, "01.07.login", "ok");
 
     Ok(UpgradeHarness {
+        mode,
         cluster,
         lab,
         session,
@@ -242,17 +317,22 @@ fn build_upgrade_harness(
         facade_resource_id,
         roots,
         baseline_cpu,
+        uses_full_demo_roots,
     })
 }
 
 fn build_generation_two_release(harness: &UpgradeHarness) -> Result<Value, String> {
-    harness.cluster.build_fs_meta_release(
+    let mut release = harness.cluster.build_fs_meta_release(
         &harness.app_id,
         &harness.facade_resource_id,
         harness.roots.clone(),
         2,
         true,
-    )
+    )?;
+    if harness.uses_full_demo_roots {
+        full_demo_roots::apply_bounded_audit_config(&mut release)?;
+    }
+    Ok(release)
 }
 
 fn node_stderr_tail(
@@ -280,10 +360,15 @@ fn node_stderr_tail(
 }
 
 fn apply_generation_two_release_only(harness: &mut UpgradeHarness) -> Result<(), String> {
+    l5_progress(harness.mode, "02.01.apply-generation-two", "begin");
     let release_v2 = build_generation_two_release(harness)?;
     match harness.cluster.apply_release("node-a", release_v2) {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            l5_progress(harness.mode, "02.01.apply-generation-two", "ok");
+            Ok(())
+        }
         Err(err) => {
+            l5_progress(harness.mode, "02.01.apply-generation-two", "fail");
             let node_b_tail = node_stderr_tail(&harness.cluster, "node-b", 80)
                 .unwrap_or_else(|tail_err| format!("<node-b-tail-unavailable: {tail_err}>"));
             if node_b_tail.contains(
@@ -302,7 +387,10 @@ fn apply_generation_two_release_only(harness: &mut UpgradeHarness) -> Result<(),
 
 fn upgrade_to_generation_two(harness: &mut UpgradeHarness) -> Result<(), String> {
     apply_generation_two_release_only(harness)?;
+    l5_progress(harness.mode, "02.02.wait-generation-two", "begin");
     wait_for_generation(&harness.cluster, 2)?;
+    l5_progress(harness.mode, "02.02.wait-generation-two", "ok");
+    l5_progress(harness.mode, "02.03.http-login", "begin");
     let _ = harness.cluster.wait_http_login_ready(
         &harness.candidate_base_urls,
         "operator",
@@ -314,6 +402,7 @@ fn upgrade_to_generation_two(harness: &mut UpgradeHarness) -> Result<(), String>
         "operator",
         "operator123",
     )?;
+    l5_progress(harness.mode, "02.03.http-login", "ok");
     Ok(())
 }
 
@@ -382,15 +471,29 @@ fn scenario_peer_source_control_completion_after_node_a_recovery(
     apply_generation_two_release_only(harness)
 }
 
+fn scenario_generation_two_apply(harness: &mut UpgradeHarness) -> Result<(), String> {
+    apply_generation_two_release_only(harness)
+}
+
 fn scenario_facade_claim_continuity_after_upgrade(
     harness: &mut UpgradeHarness,
 ) -> Result<(), String> {
     let upgrade_result = upgrade_to_generation_two(harness);
+    l5_progress(harness.mode, "03.01.facade-claim-convergence", "begin");
     let convergence_result = wait_for_node_d_facade_claim_convergence(
         &harness.cluster,
         &harness.candidate_base_urls,
         &harness.app_id,
         Duration::from_secs(15),
+    );
+    l5_progress(
+        harness.mode,
+        "03.01.facade-claim-convergence",
+        if convergence_result.is_ok() {
+            "ok"
+        } else {
+            "fail"
+        },
     );
     match (upgrade_result, convergence_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -405,19 +508,23 @@ fn scenario_facade_claim_continuity_after_upgrade(
 fn scenario_roots_persist_across_upgrade(harness: &mut UpgradeHarness) -> Result<(), String> {
     upgrade_to_generation_two(harness)?;
 
+    l5_progress(harness.mode, "03.01.roots-persist", "begin");
     let root_ids = current_root_ids(&mut harness.session)?;
     if root_ids != vec!["nfs1", "nfs2"] {
+        l5_progress(harness.mode, "03.01.roots-persist", "fail");
         return Err(format!(
             "roots changed unexpectedly across upgrade: {:?}",
             harness.session.monitoring_roots()?
         ));
     }
 
+    l5_progress(harness.mode, "03.01.roots-persist", "ok");
     Ok(())
 }
 
 fn scenario_tree_stats_stable_across_upgrade(harness: &mut UpgradeHarness) -> Result<(), String> {
     upgrade_to_generation_two(harness)?;
+    l5_progress(harness.mode, "03.01.tree-stats-login", "begin");
     let _ = harness.cluster.wait_http_login_ready(
         &harness.candidate_base_urls,
         "operator",
@@ -429,11 +536,13 @@ fn scenario_tree_stats_stable_across_upgrade(harness: &mut UpgradeHarness) -> Re
         "operator",
         "operator123",
     )?;
+    l5_progress(harness.mode, "03.01.tree-stats-login", "ok");
     Ok(())
 }
 
 fn scenario_tree_materialization_after_upgrade(harness: &mut UpgradeHarness) -> Result<(), String> {
     upgrade_to_generation_two(harness)?;
+    l5_progress(harness.mode, "03.01.tree-login", "begin");
     let _ = harness.cluster.wait_http_login_ready(
         &harness.candidate_base_urls,
         "operator",
@@ -445,24 +554,48 @@ fn scenario_tree_materialization_after_upgrade(harness: &mut UpgradeHarness) -> 
         "operator",
         "operator123",
     )?;
+    l5_progress(harness.mode, "03.01.tree-login", "ok");
+    l5_progress(harness.mode, "03.02.peer-source-control", "begin");
+    wait_for_peer_source_control_convergence(
+        &harness.cluster,
+        &harness.candidate_base_urls,
+        &harness.app_id,
+        &harness.roots,
+        Duration::from_secs(30),
+    )?;
+    l5_progress(harness.mode, "03.02.peer-source-control", "ok");
+    l5_progress(harness.mode, "03.03.manual-rescan", "begin");
     wait_for_manual_rescan_acceptance(
         &mut harness.session,
         "manual rescan accepted after release-upgrade source scope convergence",
     )?;
+    l5_progress(harness.mode, "03.03.manual-rescan", "ok");
+    l5_progress(harness.mode, "03.04.tree-materialization", "begin");
     wait_for_primary_tree_materialization(
         &mut harness.session,
         "tree materializes after generation-two upgrade",
     )?;
+    l5_progress(harness.mode, "03.04.tree-materialization", "ok");
     Ok(())
 }
 
 fn scenario_sink_control_roles_after_upgrade(harness: &mut UpgradeHarness) -> Result<(), String> {
     let upgrade_result = upgrade_to_generation_two(harness);
+    l5_progress(harness.mode, "03.01.sink-control-convergence", "begin");
     let convergence_result = wait_for_node_a_sink_control_convergence(
         &harness.cluster,
         &harness.candidate_base_urls,
         &harness.app_id,
         Duration::from_secs(15),
+    );
+    l5_progress(
+        harness.mode,
+        "03.01.sink-control-convergence",
+        if convergence_result.is_ok() {
+            "ok"
+        } else {
+            "fail"
+        },
     );
     match (upgrade_result, convergence_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -476,11 +609,22 @@ fn scenario_sink_control_roles_after_upgrade(harness: &mut UpgradeHarness) -> Re
 
 fn scenario_source_control_roles_after_upgrade(harness: &mut UpgradeHarness) -> Result<(), String> {
     let upgrade_result = upgrade_to_generation_two(harness);
+    l5_progress(harness.mode, "03.01.source-control-convergence", "begin");
     let convergence_result = wait_for_peer_source_control_convergence(
         &harness.cluster,
         &harness.candidate_base_urls,
         &harness.app_id,
+        &harness.roots,
         Duration::from_secs(15),
+    );
+    l5_progress(
+        harness.mode,
+        "03.01.source-control-convergence",
+        if convergence_result.is_ok() {
+            "ok"
+        } else {
+            "fail"
+        },
     );
     match (upgrade_result, convergence_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -495,6 +639,7 @@ fn scenario_source_control_roles_after_upgrade(harness: &mut UpgradeHarness) -> 
 fn scenario_upgrade_window_join(harness: &mut UpgradeHarness) -> Result<(), String> {
     upgrade_to_generation_two(harness)?;
 
+    l5_progress(harness.mode, "03.01.window-nfs4", "begin");
     if harness.lab.mount_path("node-a", "nfs4").is_none()
         || harness.lab.mount_path("node-c", "nfs4").is_none()
         || harness.lab.mount_path("node-d", "nfs4").is_none()
@@ -517,34 +662,47 @@ fn scenario_upgrade_window_join(harness: &mut UpgradeHarness) -> Result<(), Stri
             })])?;
         }
     }
+    l5_progress(harness.mode, "03.01.window-nfs4", "ok");
+    l5_progress(harness.mode, "03.02.window-write", "begin");
     harness
         .lab
         .write_file("nfs4", "upgrade-window/new.txt", "during-upgrade\n")?;
+    l5_progress(harness.mode, "03.02.window-write", "ok");
+    l5_progress(harness.mode, "03.03.window-generation", "begin");
     wait_for_generation(&harness.cluster, 2)?;
+    l5_progress(harness.mode, "03.03.window-generation", "ok");
 
     Ok(())
 }
 
 fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
     upgrade_to_generation_two(harness)?;
+    l5_progress(harness.mode, "03.01.facade-claim-convergence", "begin");
     wait_for_node_d_facade_claim_convergence(
         &harness.cluster,
         &harness.candidate_base_urls,
         &harness.app_id,
         Duration::from_secs(15),
     )?;
+    l5_progress(harness.mode, "03.01.facade-claim-convergence", "ok");
+    l5_progress(harness.mode, "03.02.sink-control-convergence", "begin");
     wait_for_node_a_sink_control_convergence(
         &harness.cluster,
         &harness.candidate_base_urls,
         &harness.app_id,
         Duration::from_secs(15),
     )?;
+    l5_progress(harness.mode, "03.02.sink-control-convergence", "ok");
+    l5_progress(harness.mode, "03.03.source-control-convergence", "begin");
     wait_for_peer_source_control_convergence(
         &harness.cluster,
         &harness.candidate_base_urls,
         &harness.app_id,
+        &harness.roots,
         Duration::from_secs(15),
     )?;
+    l5_progress(harness.mode, "03.03.source-control-convergence", "ok");
+    l5_progress(harness.mode, "03.04.cpu-login", "begin");
     let ready_base = harness.cluster.wait_http_login_ready(
         &harness.candidate_base_urls,
         "operator",
@@ -556,17 +714,25 @@ fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
         "operator",
         "operator123",
     )?;
+    l5_progress(harness.mode, "03.04.cpu-login", "ok");
+    l5_progress(harness.mode, "03.05.manual-rescan", "begin");
     wait_for_manual_rescan_acceptance(
         &mut harness.session,
         "manual rescan accepted before cpu-budget tree materialization",
     )?;
+    l5_progress(harness.mode, "03.05.manual-rescan", "ok");
+    l5_progress(harness.mode, "03.06.tree-materialization", "begin");
     wait_for_primary_tree_materialization(&mut harness.session, "cpu-budget tree materializes")?;
+    l5_progress(harness.mode, "03.06.tree-materialization", "ok");
 
+    l5_progress(harness.mode, "03.07.polling-load", "begin");
     let (stop, worker) = spawn_light_polling(
         ready_base,
         harness.session.token().to_string(),
         harness.session.query_api_key().to_string(),
     );
+    l5_progress(harness.mode, "03.07.polling-load", "ok");
+    l5_progress(harness.mode, "03.08.cpu-measure", "begin");
     let steady_cpu = measure_steady_cpu(&harness.cluster, &harness.app_id)?;
     eprintln!(
         "[fs-meta-api-upgrade] cpu-budget baseline_pids={:?} steady_pids={:?}",
@@ -584,7 +750,15 @@ fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
     );
     stop.store(true, Ordering::Relaxed);
     let _ = worker.join();
-    assert_cpu_budget(&summary)
+    l5_progress(harness.mode, "03.08.cpu-measure", "ok");
+    l5_progress(harness.mode, "03.09.cpu-assert", "begin");
+    let result = assert_cpu_budget(&summary);
+    l5_progress(
+        harness.mode,
+        "03.09.cpu-assert",
+        if result.is_ok() { "ok" } else { "fail" },
+    );
+    result
 }
 
 fn wait_for_generation(cluster: &Cluster5, generation: i64) -> Result<(), String> {
@@ -613,9 +787,7 @@ fn wait_for_node_a_sink_control_convergence(
             let sink_active =
                 cluster.unit_active_pids_for_instance("node-a", app_id, "runtime.exec.sink")?;
             let node_status = cluster.status("node-a")?;
-            let app_status = probe_status_session(cluster, candidate_base_urls)
-                .ok()
-                .and_then(|mut session| session.status().ok());
+            let app_status = probe_management_status(candidate_base_urls).ok();
             let status_view = app_status.as_ref().unwrap_or(&node_status);
             let scheduled_sink = status_debug_groups_by_node(
                 status_view,
@@ -664,7 +836,7 @@ fn wait_for_node_d_facade_claim_convergence(
         || {
             let facade_active = cluster.facade_pids_for_instance("node-d", app_id)?;
             let node_status = cluster.status("node-d")?;
-            let _session = probe_status_session(cluster, &[node_d_url.clone()])?;
+            let _ = probe_management_status(&[node_d_url.clone()])?;
             let source_status_active =
                 activation_route_has_active_pids(&node_status, "source-status:v1.req");
             let sink_status_active =
@@ -685,87 +857,393 @@ fn wait_for_node_d_facade_claim_convergence(
     )
 }
 
+fn expected_source_runtime_scope_map(
+    node_name: &str,
+    expected_groups: &[String],
+) -> BTreeMap<String, Vec<String>> {
+    BTreeMap::from([(node_name.to_string(), expected_groups.to_vec())])
+}
+
+fn source_runtime_scope_schedule_ready(
+    status: &Value,
+    node_name: &str,
+    expected_groups: &[String],
+) -> bool {
+    source_runtime_scope_debug_schedule_ready(status, node_name, expected_groups)
+        || source_runtime_scope_domain_ready(status, node_name, expected_groups)
+}
+
+fn source_runtime_scope_debug_schedule_ready(
+    status: &Value,
+    node_name: &str,
+    expected_groups: &[String],
+) -> bool {
+    let expected = expected_source_runtime_scope_map(node_name, expected_groups);
+    status_debug_groups_by_node(
+        status,
+        "source",
+        "scheduled_source_groups_by_node",
+        node_name,
+    ) == expected
+        && status_debug_groups_by_node(status, "source", "scheduled_scan_groups_by_node", node_name)
+            == expected
+}
+
+fn source_runtime_scope_domain_ready(
+    status: &Value,
+    node_name: &str,
+    expected_groups: &[String],
+) -> bool {
+    expected_groups.iter().all(|group| {
+        source_logical_root_ready(status, group)
+            && source_concrete_root_ready_for_node(status, node_name, group)
+    })
+}
+
+fn source_logical_root_ready(status: &Value, group: &str) -> bool {
+    status
+        .get("source")
+        .and_then(|source| source.get("logical_roots"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|root| {
+            root.get("root_id").and_then(Value::as_str) == Some(group)
+                && root
+                    .get("matched_grants")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|count| count > 0)
+                && root
+                    .get("active_members")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|count| count > 0)
+        })
+}
+
+fn source_concrete_root_ready_for_node(status: &Value, node_name: &str, group: &str) -> bool {
+    status
+        .get("source")
+        .and_then(|source| source.get("concrete_roots"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|root| {
+            root.get("logical_root_id").and_then(Value::as_str) == Some(group)
+                && source_concrete_root_belongs_to_node(root, node_name)
+                && root.get("active").and_then(Value::as_bool).unwrap_or(false)
+                && root
+                    .get("scan_enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                && root.get("last_error").is_none_or(|value| value.is_null())
+        })
+}
+
+fn source_concrete_root_belongs_to_node(root: &Value, node_name: &str) -> bool {
+    let node_prefix = format!("{node_name}-");
+    let node_object_prefix = format!("{node_name}::");
+    let mut saw_node_scoped_ref = false;
+    for field in ["root_key", "object_ref"] {
+        let Some(value) = root.get(field).and_then(Value::as_str) else {
+            continue;
+        };
+        if value == node_name
+            || value.starts_with(&node_prefix)
+            || value.starts_with(&node_object_prefix)
+        {
+            return true;
+        }
+        if value.contains("::") || value.starts_with("node-") {
+            saw_node_scoped_ref = true;
+        }
+    }
+    !saw_node_scoped_ref
+}
+
+fn source_concrete_root_node_name(root: &Value) -> Option<&'static str> {
+    for field in ["root_key", "object_ref"] {
+        let Some(value) = root.get(field).and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(node_name) = runtime_node_key_cluster_name(value) {
+            return Some(node_name);
+        }
+    }
+    None
+}
+
+fn runtime_node_key_cluster_name(key: &str) -> Option<&'static str> {
+    RELEASE_UPGRADE_CLUSTER_NODES
+        .iter()
+        .copied()
+        .find(|node_name| {
+            key == *node_name
+                || key
+                    .strip_prefix(node_name)
+                    .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with("::"))
+        })
+}
+
+fn source_runtime_scope_debug_groups_by_cluster_node(
+    status: &Value,
+    field: &str,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let Some(debug_field) = status
+        .get("source")
+        .and_then(|v| v.get("debug"))
+        .and_then(|v| v.get(field))
+        .and_then(Value::as_object)
+    else {
+        return BTreeMap::new();
+    };
+
+    let mut by_node: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (key, value) in debug_field {
+        let Some(node_name) = runtime_node_key_cluster_name(key) else {
+            continue;
+        };
+        let groups = by_node.entry(node_name.to_string()).or_default();
+        if let Some(rows) = value.as_array() {
+            groups.extend(rows.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+    }
+    by_node.retain(|_, groups| !groups.is_empty());
+    by_node
+}
+
+fn source_runtime_scope_debug_owner_nodes_by_group(
+    status: &Value,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let scheduled_source = source_runtime_scope_debug_groups_by_cluster_node(
+        status,
+        "scheduled_source_groups_by_node",
+    );
+    let scheduled_scan =
+        source_runtime_scope_debug_groups_by_cluster_node(status, "scheduled_scan_groups_by_node");
+    let mut owners_by_group: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (node_name, source_groups) in scheduled_source {
+        let Some(scan_groups) = scheduled_scan.get(&node_name) else {
+            continue;
+        };
+        for group in source_groups.intersection(scan_groups) {
+            owners_by_group
+                .entry(group.clone())
+                .or_default()
+                .insert(node_name.clone());
+        }
+    }
+    owners_by_group
+}
+
+fn source_runtime_scope_domain_owner_nodes_by_group(
+    status: &Value,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut owners_by_group: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let Some(concrete_roots) = status
+        .get("source")
+        .and_then(|source| source.get("concrete_roots"))
+        .and_then(Value::as_array)
+    else {
+        return owners_by_group;
+    };
+
+    for root in concrete_roots {
+        let Some(group) = root.get("logical_root_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(node_name) = source_concrete_root_node_name(root) else {
+            continue;
+        };
+        if source_logical_root_ready(status, group)
+            && source_concrete_root_ready_for_node(status, node_name, group)
+        {
+            owners_by_group
+                .entry(group.to_string())
+                .or_default()
+                .insert(node_name.to_string());
+        }
+    }
+    owners_by_group
+}
+
+fn merge_source_runtime_scope_owners(
+    target: &mut BTreeMap<String, BTreeSet<String>>,
+    source: BTreeMap<String, BTreeSet<String>>,
+) {
+    for (group, nodes) in source {
+        target.entry(group).or_default().extend(nodes);
+    }
+}
+
+fn source_runtime_scope_owner_nodes_by_group(
+    statuses: &[&Value],
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut owners_by_group = BTreeMap::new();
+    for status in statuses {
+        merge_source_runtime_scope_owners(
+            &mut owners_by_group,
+            source_runtime_scope_debug_owner_nodes_by_group(status),
+        );
+        merge_source_runtime_scope_owners(
+            &mut owners_by_group,
+            source_runtime_scope_domain_owner_nodes_by_group(status),
+        );
+    }
+    owners_by_group
+}
+
+fn source_runtime_scope_groups_covered(
+    owners_by_group: &BTreeMap<String, BTreeSet<String>>,
+    expected_groups: &[String],
+) -> bool {
+    expected_groups.iter().all(|group| {
+        owners_by_group
+            .get(group)
+            .is_some_and(|owners| !owners.is_empty())
+    })
+}
+
+fn source_runtime_scope_owner_nodes(
+    owners_by_group: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeSet<String> {
+    owners_by_group
+        .values()
+        .flat_map(|nodes| nodes.iter().cloned())
+        .collect()
+}
+
+fn source_runtime_scope_inactive_owner_nodes(
+    cluster: &Cluster5,
+    app_id: &str,
+    owner_nodes: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let mut inactive = Vec::new();
+    for node_name in owner_nodes {
+        let source_active =
+            cluster.unit_active_pids_for_instance(node_name, app_id, "runtime.exec.source")?;
+        let scan_active =
+            cluster.unit_active_pids_for_instance(node_name, app_id, "runtime.exec.scan")?;
+        if source_active.is_empty() || scan_active.is_empty() {
+            inactive.push(format!(
+                "{node_name}: source_active={source_active:?} scan_active={scan_active:?}"
+            ));
+        }
+    }
+    Ok(inactive)
+}
+
+fn expected_source_runtime_scope_groups(roots: &[RootSpec]) -> Vec<String> {
+    let mut groups = roots
+        .iter()
+        .map(|root| root.id.clone())
+        .collect::<Vec<String>>();
+    groups.sort();
+    groups.dedup();
+    groups
+}
+
+fn source_runtime_scope_status_view<'a>(
+    node_status: &'a Value,
+    app_status: Option<&'a Value>,
+    node_name: &str,
+    expected_groups: &[String],
+) -> &'a Value {
+    if source_runtime_scope_schedule_ready(node_status, node_name, expected_groups) {
+        return node_status;
+    }
+    app_status.unwrap_or(node_status)
+}
+
+fn source_runtime_scope_debug_summary_by_node(
+    statuses_by_node: &BTreeMap<String, Value>,
+) -> Vec<String> {
+    statuses_by_node
+        .iter()
+        .map(|(node_name, status)| {
+            format!(
+                "{node_name}: raw_scheduled_source={} raw_scheduled_scan={} routes={:?}",
+                status_debug_groups_field(status, "source", "scheduled_source_groups_by_node"),
+                status_debug_groups_field(status, "source", "scheduled_scan_groups_by_node"),
+                activation_route_summaries(status)
+            )
+        })
+        .collect()
+}
+
+fn source_runtime_scope_status_probe_summary(status: &Value) -> String {
+    let logical_roots = status
+        .get("source")
+        .and_then(|source| source.get("logical_roots"))
+        .and_then(Value::as_array)
+        .map(|roots| roots.len())
+        .unwrap_or(0);
+    let concrete_roots = status
+        .get("source")
+        .and_then(|source| source.get("concrete_roots"))
+        .and_then(Value::as_array)
+        .map(|roots| roots.len())
+        .unwrap_or(0);
+    format!(
+        "raw_scheduled_source={} raw_scheduled_scan={} logical_roots={} concrete_roots={}",
+        status_debug_groups_field(status, "source", "scheduled_source_groups_by_node"),
+        status_debug_groups_field(status, "source", "scheduled_scan_groups_by_node"),
+        logical_roots,
+        concrete_roots,
+    )
+}
+
+fn source_runtime_scope_app_status_probe_summary(result: &Result<Value, String>) -> String {
+    match result {
+        Ok(status) => source_runtime_scope_status_probe_summary(status),
+        Err(err) => format!("error={err}"),
+    }
+}
+
 fn wait_for_peer_source_control_convergence(
     cluster: &Cluster5,
     candidate_base_urls: &[String],
     app_id: &str,
+    roots: &[RootSpec],
     timeout: Duration,
 ) -> Result<(), String> {
+    let expected_groups = expected_source_runtime_scope_groups(roots);
     wait_until(
         timeout,
-        "node-b/c/d source control converges after generation-two upgrade",
+        "current-root source runtime-scope converges after generation-two upgrade",
         || {
-            let mut failures = Vec::new();
-            let app_status = probe_status_session(cluster, candidate_base_urls)
-                .ok()
-                .and_then(|mut session| session.status().ok());
-            for (node_name, expected_groups) in [
-                ("node-b", vec!["nfs1".to_string()]),
-                ("node-c", vec!["nfs1".to_string(), "nfs2".to_string()]),
-                ("node-d", vec!["nfs2".to_string()]),
-            ] {
-                let source_active = cluster.unit_active_pids_for_instance(
-                    node_name,
-                    app_id,
-                    "runtime.exec.source",
-                )?;
-                let scan_active = cluster.unit_active_pids_for_instance(
-                    node_name,
-                    app_id,
-                    "runtime.exec.scan",
-                )?;
-                let node_status = cluster.status(node_name)?;
-                let status_view = app_status.as_ref().unwrap_or(&node_status);
-                let scheduled_source = status_debug_groups_by_node(
-                    status_view,
-                    "source",
-                    "scheduled_source_groups_by_node",
-                    node_name,
-                );
-                let scheduled_scan = status_debug_groups_by_node(
-                    status_view,
-                    "source",
-                    "scheduled_scan_groups_by_node",
-                    node_name,
-                );
-                let raw_scheduled_source = status_debug_groups_field(
-                    status_view,
-                    "source",
-                    "scheduled_source_groups_by_node",
-                );
-                let raw_scheduled_scan = status_debug_groups_field(
-                    status_view,
-                    "source",
-                    "scheduled_scan_groups_by_node",
-                );
-                let _expected = BTreeMap::from([(node_name.to_string(), expected_groups.clone())]);
-                if source_active.is_empty() || scan_active.is_empty() {
-                    failures.push(format!(
-                    "{node_name}: source_active={source_active:?} scan_active={scan_active:?} scheduled_source={scheduled_source:?} scheduled_scan={scheduled_scan:?} raw_scheduled_source={raw_scheduled_source} raw_scheduled_scan={raw_scheduled_scan} routes={:?}",
-                    activation_route_summaries(&node_status)
-                ));
-                }
+            let app_status_result = probe_management_status(candidate_base_urls);
+            let mut statuses_by_node = BTreeMap::new();
+            for node_name in RELEASE_UPGRADE_CLUSTER_NODES {
+                statuses_by_node.insert(node_name.to_string(), cluster.status(node_name)?);
             }
-            if failures.is_empty() {
+            let mut status_refs = Vec::new();
+            if let Ok(status) = app_status_result.as_ref() {
+                status_refs.push(status);
+            }
+            status_refs.extend(statuses_by_node.values());
+
+            let owners_by_group = source_runtime_scope_owner_nodes_by_group(&status_refs);
+            let owner_nodes = source_runtime_scope_owner_nodes(&owners_by_group);
+            let inactive_owner_nodes =
+                source_runtime_scope_inactive_owner_nodes(cluster, app_id, &owner_nodes)?;
+            if source_runtime_scope_groups_covered(&owners_by_group, &expected_groups)
+                && !owner_nodes.is_empty()
+                && inactive_owner_nodes.is_empty()
+            {
                 Ok(true)
             } else {
-                Err(failures.join(" || "))
+                Err(format!(
+                    "current-root source runtime-scope not converged: expected_groups={expected_groups:?} owner_nodes_by_group={owners_by_group:?} inactive_owner_nodes={inactive_owner_nodes:?} app_status={} node_debug={:?}",
+                    source_runtime_scope_app_status_probe_summary(&app_status_result),
+                    source_runtime_scope_debug_summary_by_node(&statuses_by_node)
+                ))
             }
         },
     )
 }
 
-fn probe_status_session(
-    cluster: &Cluster5,
-    candidate_base_urls: &[String],
-) -> Result<OperatorSession, String> {
-    let ready_base = cluster.wait_http_login_ready(
-        candidate_base_urls,
-        "operator",
-        "operator123",
-        Duration::from_secs(2),
-    )?;
-    OperatorSession::login_many(vec![ready_base], "operator", "operator123")
+fn probe_management_status(candidate_base_urls: &[String]) -> Result<Value, String> {
+    OperatorSession::management_status_many(candidate_base_urls, "operator", "operator123")
 }
 
 fn measure_baseline_cpu(cluster: &Cluster5) -> Result<BTreeMap<String, Vec<u32>>, String> {
@@ -843,7 +1321,37 @@ fn seed_baseline_content(lab: &NfsLab) -> Result<(), String> {
     Ok(())
 }
 
-fn mount_and_announce(
+fn announce_full_demo_resources(
+    cluster: &Cluster5,
+    roots: &[FullDemoRoot],
+    facade_resource_id: &str,
+    facade_addrs: &[String],
+) -> Result<(), String> {
+    for (node_name, export_name) in [
+        ("node-a", "nfs1"),
+        ("node-b", "nfs1"),
+        ("node-c", "nfs1"),
+        ("node-a", "nfs2"),
+        ("node-c", "nfs2"),
+        ("node-d", "nfs2"),
+    ] {
+        let root = roots
+            .iter()
+            .find(|root| root.id == export_name)
+            .ok_or_else(|| format!("full demo root {export_name} not mapped"))?;
+        cluster.announce_resources_clusterwide(vec![json!({
+            "resource_id": export_name,
+            "node_id": cluster.node_id(node_name)?,
+            "resource_kind": "nfs",
+            "source": root.source.clone(),
+            "host_ip": root.host_ip.clone(),
+            "mount_hint": root.mount_point.display().to_string(),
+        })])?;
+    }
+    announce_facade_resources(cluster, facade_resource_id, facade_addrs)
+}
+
+fn mount_and_announce_lab(
     cluster: &Cluster5,
     lab: &mut NfsLab,
     facade_resource_id: &str,
@@ -866,6 +1374,14 @@ fn mount_and_announce(
             "mount_hint": mount_path.display().to_string(),
         })])?;
     }
+    announce_facade_resources(cluster, facade_resource_id, facade_addrs)
+}
+
+fn announce_facade_resources(
+    cluster: &Cluster5,
+    facade_resource_id: &str,
+    facade_addrs: &[String],
+) -> Result<(), String> {
     for (node_name, bind_addr) in ["node-d", "node-e"].into_iter().zip(facade_addrs.iter()) {
         cluster.announce_resources_clusterwide(vec![json!({
             "resource_id": facade_resource_id,
@@ -1059,6 +1575,184 @@ fn unique_suffix() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_source_control_gate_rejects_active_pids_without_runtime_scope() {
+        let status = json!({
+            "source": {
+                "debug": {
+                    "scheduled_source_groups_by_node": {},
+                    "scheduled_scan_groups_by_node": {}
+                }
+            }
+        });
+
+        assert!(
+            !source_runtime_scope_schedule_ready(
+                &status,
+                "node-c",
+                &["nfs1".to_string(), "nfs2".to_string()],
+            ),
+            "release-upgrade source convergence must not pass on source/scan process liveness without app-visible runtime-scope groups"
+        );
+    }
+
+    #[test]
+    fn peer_source_control_gate_accepts_instance_scoped_runtime_scope() {
+        let status = json!({
+            "source": {
+                "debug": {
+                    "scheduled_source_groups_by_node": {
+                        "node-c-123": ["nfs2", "nfs1"]
+                    },
+                    "scheduled_scan_groups_by_node": {
+                        "node-c-123": ["nfs1", "nfs2"]
+                    }
+                }
+            }
+        });
+
+        assert!(
+            source_runtime_scope_schedule_ready(
+                &status,
+                "node-c",
+                &["nfs1".to_string(), "nfs2".to_string()],
+            ),
+            "release-upgrade source convergence should accept app-visible runtime-scope groups keyed by the runtime node instance id"
+        );
+    }
+
+    #[test]
+    fn peer_source_control_gate_accepts_current_root_coverage_on_selected_owners() {
+        let status = json!({
+            "source": {
+                "debug": {
+                    "scheduled_source_groups_by_node": {
+                        "node-b-123": ["nfs1"],
+                        "node-d-123": ["nfs2"]
+                    },
+                    "scheduled_scan_groups_by_node": {
+                        "node-b-123": ["nfs1"],
+                        "node-d-123": ["nfs2"]
+                    }
+                }
+            }
+        });
+        let expected_groups = vec!["nfs1".to_string(), "nfs2".to_string()];
+        let owners_by_group = source_runtime_scope_owner_nodes_by_group(&[&status]);
+
+        assert_eq!(
+            owners_by_group.get("nfs1"),
+            Some(&BTreeSet::from(["node-b".to_string()])),
+            "nfs1 should be covered by the app-selected source owner"
+        );
+        assert_eq!(
+            owners_by_group.get("nfs2"),
+            Some(&BTreeSet::from(["node-d".to_string()])),
+            "nfs2 should be covered by the app-selected source owner"
+        );
+        assert!(
+            source_runtime_scope_groups_covered(&owners_by_group, &expected_groups),
+            "release-upgrade source convergence should validate current-root coverage instead of a fixed demo node list"
+        );
+    }
+
+    #[test]
+    fn peer_source_control_gate_rejects_missing_current_root_coverage() {
+        let status = json!({
+            "source": {
+                "debug": {
+                    "scheduled_source_groups_by_node": {
+                        "node-b-123": ["nfs1"]
+                    },
+                    "scheduled_scan_groups_by_node": {
+                        "node-b-123": ["nfs1"]
+                    }
+                }
+            }
+        });
+        let expected_groups = vec!["nfs1".to_string(), "nfs2".to_string()];
+        let owners_by_group = source_runtime_scope_owner_nodes_by_group(&[&status]);
+
+        assert!(
+            !source_runtime_scope_groups_covered(&owners_by_group, &expected_groups),
+            "release-upgrade source convergence must fail when any current root has no app-visible source owner"
+        );
+    }
+
+    #[test]
+    fn peer_source_control_gate_accepts_domain_health_when_schedule_maps_are_absent() {
+        let status = json!({
+            "source": {
+                "logical_roots": [{
+                    "root_id": "nfs1",
+                    "service_state": "serving-degraded",
+                    "matched_grants": 1,
+                    "active_members": 1,
+                    "coverage_mode": "audit_with_metadata",
+                    "coverage_capabilities": {}
+                }],
+                "concrete_roots": [{
+                    "root_key": "node-b::nfs1",
+                    "logical_root_id": "nfs1",
+                    "object_ref": "node-b::nfs1",
+                    "participation_state": "active",
+                    "coverage_mode": "audit_with_metadata",
+                    "coverage_capabilities": {},
+                    "watch_enabled": true,
+                    "scan_enabled": true,
+                    "active": true,
+                    "last_error": Value::Null
+                }],
+                "debug": {
+                    "scheduled_source_groups_by_node": {},
+                    "scheduled_scan_groups_by_node": {}
+                }
+            }
+        });
+
+        assert!(
+            source_runtime_scope_schedule_ready(&status, "node-b", &["nfs1".to_string()]),
+            "release-upgrade operations gate should accept complete source domain health when route-schedule debug maps are absent during cutover"
+        );
+    }
+
+    #[test]
+    fn peer_source_control_status_view_does_not_let_partial_facade_erase_node_local_scope() {
+        let node_status = json!({
+            "source": {
+                "debug": {
+                    "scheduled_source_groups_by_node": {
+                        "node-b": ["nfs1"]
+                    },
+                    "scheduled_scan_groups_by_node": {
+                        "node-b": ["nfs1"]
+                    }
+                }
+            }
+        });
+        let partial_facade_status = json!({
+            "source": {
+                "debug": {
+                    "scheduled_source_groups_by_node": Value::Null,
+                    "scheduled_scan_groups_by_node": Value::Null
+                }
+            }
+        });
+        let expected_groups = vec!["nfs1".to_string()];
+
+        let status_view = source_runtime_scope_status_view(
+            &node_status,
+            Some(&partial_facade_status),
+            "node-b",
+            &expected_groups,
+        );
+
+        assert!(
+            source_runtime_scope_schedule_ready(status_view, "node-b", &expected_groups),
+            "release-upgrade source convergence must not let a partial facade aggregate hide positive node-local runtime-scope evidence"
+        );
+    }
 
     #[test]
     fn steady_cpu_sample_pids_ignore_internal_managed_pids_in_favor_of_host_descendants() {

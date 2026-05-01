@@ -2,11 +2,12 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
-use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::Duration;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use capanix_app_sdk::runtime::RouteKey;
 use capanix_app_sdk::{CnxError, Event};
@@ -25,11 +26,19 @@ use crate::runtime::routes::sink_query_request_route_for;
 const ENDPOINT_READY_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 const ENDPOINT_RETRY_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const REQUEST_RETRYABLE_RECV_GAP_RETRY_LIMIT: usize = 12;
+const REQUEST_REPLY_SEND_RETRY_LIMIT: usize = 12;
+const REQUEST_REPLY_SEND_RETRY_DELAY: Duration = Duration::from_millis(50);
 const STREAM_STALE_RECV_GAP_RETRY_LIMIT: usize = 12;
+const IDLE_RECV_QUIET_WINDOW: Duration = Duration::from_millis(1_500);
 
 struct RecvEntryObservedBoundary<H> {
     inner: Arc<dyn ChannelIoSubset>,
     before_recv: Arc<H>,
+}
+
+struct RecvPendingObservedBoundary<H> {
+    inner: Arc<dyn ChannelIoSubset>,
+    on_pending_recv: Arc<H>,
 }
 
 #[async_trait::async_trait]
@@ -58,6 +67,47 @@ where
             if !observed {
                 observed = true;
                 (before_recv)();
+            }
+            poll
+        })
+        .await
+    }
+
+    fn channel_close(
+        &self,
+        ctx: BoundaryContext,
+        channel: ChannelKey,
+    ) -> capanix_app_sdk::Result<()> {
+        self.inner.channel_close(ctx, channel)
+    }
+}
+
+#[async_trait::async_trait]
+impl<H> ChannelIoSubset for RecvPendingObservedBoundary<H>
+where
+    H: Fn() + Send + Sync + 'static,
+{
+    async fn channel_send(
+        &self,
+        ctx: BoundaryContext,
+        request: ChannelSendRequest,
+    ) -> capanix_app_sdk::Result<()> {
+        self.inner.channel_send(ctx, request).await
+    }
+
+    async fn channel_recv(
+        &self,
+        ctx: BoundaryContext,
+        request: ChannelRecvRequest,
+    ) -> capanix_app_sdk::Result<Vec<Event>> {
+        let mut inner = Box::pin(self.inner.channel_recv(ctx, request));
+        let on_pending_recv = self.on_pending_recv.clone();
+        let mut observed = false;
+        futures_util::future::poll_fn(move |cx| {
+            let poll = inner.as_mut().poll(cx);
+            if !observed && poll.is_pending() {
+                observed = true;
+                (on_pending_recv)();
             }
             poll
         })
@@ -153,6 +203,24 @@ fn is_authoritative_ipc_transport_close(err: &CnxError) -> bool {
     )
 }
 
+fn is_authoritative_sidecar_transport_close(err: &CnxError) -> bool {
+    matches!(
+        err,
+        CnxError::TransportClosed(message)
+            if message.contains("transport closed")
+                && message.contains("sidecar")
+                && (message.contains("bridge stopped")
+                    || message.contains("bridge closed")
+                    || message.contains("Broken pipe")
+                    || message.contains("early eof")
+                    || message.contains("Connection reset by peer"))
+    )
+}
+
+fn is_authoritative_endpoint_transport_close(err: &CnxError) -> bool {
+    is_authoritative_ipc_transport_close(err) || is_authoritative_sidecar_transport_close(err)
+}
+
 fn is_retryable_worker_bridge_peer_error(err: &CnxError) -> bool {
     matches!(
         err,
@@ -235,12 +303,76 @@ impl EndpointJoin {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EndpointReadyMode {
+    FirstRecvPoll,
+    FirstReceivable,
+}
+
+#[derive(Clone)]
+struct EndpointReadySignal {
+    tx: Arc<StdMutex<Option<SyncSender<()>>>>,
+}
+
+impl EndpointReadySignal {
+    fn new(tx: SyncSender<()>) -> Self {
+        Self {
+            tx: Arc::new(StdMutex::new(Some(tx))),
+        }
+    }
+
+    fn signal(&self) {
+        if let Some(tx) = self.tx.lock().expect("endpoint ready tx lock").take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+#[derive(Default)]
+struct EndpointReceiveState {
+    inflight_recv_count: AtomicUsize,
+    receivable_observation_count: AtomicU64,
+}
+
+impl EndpointReceiveState {
+    fn enter_recv(self: &Arc<Self>) -> EndpointReceiveGuard {
+        self.inflight_recv_count.fetch_add(1, Ordering::AcqRel);
+        EndpointReceiveGuard {
+            state: self.clone(),
+        }
+    }
+
+    fn mark_receivable(&self) {
+        self.receivable_observation_count
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn is_receive_armed(&self) -> bool {
+        self.inflight_recv_count.load(Ordering::Acquire) > 0
+            && self.receivable_observation_count.load(Ordering::Acquire) > 0
+    }
+}
+
+struct EndpointReceiveGuard {
+    state: Arc<EndpointReceiveState>,
+}
+
+impl Drop for EndpointReceiveGuard {
+    fn drop(&mut self) {
+        self.state
+            .inflight_recv_count
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub(crate) struct ManagedEndpointTask {
     name: String,
     route_key: String,
+    boundary_id: usize,
     unit_ids: Vec<String>,
     shutdown: CancellationToken,
     terminal_reason: Arc<StdMutex<Option<String>>>,
+    receive_state: Arc<EndpointReceiveState>,
     join: Option<EndpointJoin>,
 }
 
@@ -253,6 +385,10 @@ fn shutdown_blocking_join_inflight() -> usize {
 }
 
 impl ManagedEndpointTask {
+    fn boundary_id_for(boundary: &Arc<dyn ChannelIoSubset>) -> usize {
+        Arc::as_ptr(boundary) as *const () as usize
+    }
+
     fn spawn_join<Fut>(runner: Fut) -> EndpointJoin
     where
         Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -383,33 +519,94 @@ impl ManagedEndpointTask {
         F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
     {
+        Self::spawn_with_contexts_and_ready_mode(
+            boundary,
+            route,
+            name,
+            contexts,
+            shutdown,
+            handler,
+            EndpointReadyMode::FirstRecvPoll,
+        )
+    }
+
+    pub(crate) fn spawn_with_unit_wait_receivable<F, Fut>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        unit_id: impl Into<String>,
+        shutdown: CancellationToken,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+    {
+        Self::spawn_with_contexts_and_ready_mode(
+            boundary,
+            route,
+            name,
+            vec![BoundaryContext::for_unit(unit_id)],
+            shutdown,
+            handler,
+            EndpointReadyMode::FirstReceivable,
+        )
+    }
+
+    fn spawn_with_contexts_and_ready_mode<F, Fut>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        contexts: Vec<BoundaryContext>,
+        shutdown: CancellationToken,
+        handler: F,
+        ready_mode: EndpointReadyMode,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+    {
         let name_owned = name.into();
         let route_key = route.0.clone();
+        let boundary_id = Self::boundary_id_for(&boundary);
         let unit_ids = contexts
             .iter()
             .filter_map(|ctx| ctx.unit_id.clone())
             .collect::<Vec<_>>();
         let join_name = name_owned.clone();
         let route_key_for_runner = route_key.clone();
-        let shutdown_for_task = shutdown.clone();
+        let task_shutdown = shutdown.child_token();
+        let shutdown_for_task = task_shutdown.clone();
         let terminal_reason = Arc::new(StdMutex::new(None));
         let terminal_reason_for_runner = terminal_reason.clone();
+        let receive_state = Arc::new(EndpointReceiveState::default());
+        let receive_state_for_runner = receive_state.clone();
         let (ready_tx, ready_rx) = sync_channel(1);
-        let ready_tx = Arc::new(StdMutex::new(Some(ready_tx)));
-        let boundary: Arc<dyn ChannelIoSubset> = Arc::new(RecvEntryObservedBoundary {
-            inner: boundary,
-            before_recv: Arc::new(move || {
-                if let Some(tx) = ready_tx
-                    .lock()
-                    .expect("endpoint request ready tx lock")
-                    .take()
-                {
-                    let _ = tx.send(());
-                }
-            }),
-        });
+        let ready_signal = EndpointReadySignal::new(ready_tx);
+        let boundary: Arc<dyn ChannelIoSubset> = match ready_mode {
+            EndpointReadyMode::FirstRecvPoll => {
+                let ready_signal = ready_signal.clone();
+                Arc::new(RecvEntryObservedBoundary {
+                    inner: boundary,
+                    before_recv: Arc::new(move || ready_signal.signal()),
+                })
+            }
+            EndpointReadyMode::FirstReceivable => {
+                let ready_signal = ready_signal.clone();
+                let receive_state = receive_state.clone();
+                Arc::new(RecvPendingObservedBoundary {
+                    inner: boundary,
+                    on_pending_recv: Arc::new(move || {
+                        receive_state.mark_receivable();
+                        ready_signal.signal();
+                    }),
+                })
+            }
+        };
         let handler = Arc::new(handler);
-        let runner = run_endpoint_loop_with_contexts(
+        let receivable_ready =
+            (ready_mode == EndpointReadyMode::FirstReceivable).then_some(ready_signal.clone());
+        let runner = run_endpoint_loop_with_contexts_and_ready_signal(
             boundary,
             route,
             join_name.clone(),
@@ -417,6 +614,8 @@ impl ManagedEndpointTask {
             shutdown_for_task,
             handler,
             terminal_reason_for_runner.clone(),
+            receivable_ready,
+            receive_state_for_runner,
         );
         let runner = async move {
             let outcome = AssertUnwindSafe(runner).catch_unwind().await;
@@ -445,9 +644,11 @@ impl ManagedEndpointTask {
         Self {
             name: name_owned,
             route_key,
+            boundary_id,
             unit_ids,
-            shutdown,
+            shutdown: task_shutdown,
             terminal_reason,
+            receive_state,
             join: Some(join),
         }
     }
@@ -475,7 +676,7 @@ impl ManagedEndpointTask {
             should_recv,
             || {
                 async move {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(REQUEST_REPLY_SEND_RETRY_DELAY).await;
                 }
                 .boxed()
             },
@@ -538,13 +739,16 @@ impl ManagedEndpointTask {
     {
         let name_owned = name.into();
         let route_key = route.0.clone();
+        let boundary_id = Self::boundary_id_for(&boundary);
         let unit_id = unit_id.into();
         let join_name = name_owned.clone();
         let name_for_runner = name_owned.clone();
         let route_key_for_runner = route_key.clone();
-        let shutdown_for_task = shutdown.clone();
+        let task_shutdown = shutdown.child_token();
+        let shutdown_for_task = task_shutdown.clone();
         let terminal_reason = Arc::new(StdMutex::new(None));
         let terminal_reason_for_runner = terminal_reason.clone();
+        let receive_state = Arc::new(EndpointReceiveState::default());
         let should_recv = Arc::new(should_recv);
         let wait_until_receivable = Arc::new(wait_until_receivable);
         let before_recv = Arc::new(before_recv);
@@ -592,9 +796,11 @@ impl ManagedEndpointTask {
         Self {
             name: name_owned,
             route_key,
+            boundary_id,
             unit_ids: vec![unit_id],
-            shutdown,
+            shutdown: task_shutdown,
             terminal_reason,
+            receive_state,
             join: Some(join),
         }
     }
@@ -607,6 +813,10 @@ impl ManagedEndpointTask {
         &self.unit_ids
     }
 
+    pub(crate) fn belongs_to_boundary(&self, boundary: &Arc<dyn ChannelIoSubset>) -> bool {
+        self.boundary_id == Self::boundary_id_for(boundary)
+    }
+
     pub(crate) fn is_finished(&self) -> bool {
         self.join.as_ref().is_none_or(EndpointJoin::is_finished)
     }
@@ -616,6 +826,10 @@ impl ManagedEndpointTask {
             .lock()
             .expect("terminal_reason lock")
             .clone()
+    }
+
+    pub(crate) fn is_receive_armed(&self) -> bool {
+        self.receive_state.is_receive_armed()
     }
 
     pub(crate) fn request_shutdown(&self) {
@@ -689,6 +903,34 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
     F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
 {
+    run_endpoint_loop_with_contexts_and_ready_signal(
+        boundary,
+        route,
+        join_name,
+        contexts,
+        shutdown_for_task,
+        handler,
+        terminal_reason,
+        None,
+        Arc::new(EndpointReceiveState::default()),
+    )
+    .await
+}
+
+async fn run_endpoint_loop_with_contexts_and_ready_signal<F, Fut>(
+    boundary: Arc<dyn ChannelIoSubset>,
+    route: RouteKey,
+    join_name: String,
+    contexts: Vec<BoundaryContext>,
+    shutdown_for_task: CancellationToken,
+    handler: Arc<F>,
+    terminal_reason: Arc<StdMutex<Option<String>>>,
+    receivable_ready: Option<EndpointReadySignal>,
+    receive_state: Arc<EndpointReceiveState>,
+) where
+    F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+{
     let debug_materialized_route = debug_materialized_route_lifecycle_enabled()
         && is_materialized_internal_query_route(&route);
     let debug_endpoint_requests = debug_endpoint_request_lifecycle_enabled()
@@ -710,8 +952,9 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
     let reply_channel = ChannelKey(format!("{}:reply", route.0));
     let mut exit_reason = None::<String>;
     let mut retryable_recv_gap_count = 0usize;
+    let mut stale_recv_gap_count = 0usize;
 
-    loop {
+    'recv_loop: loop {
         if shutdown_for_task.is_cancelled() {
             exit_reason = Some("shutdown_cancelled".into());
             break;
@@ -719,7 +962,7 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
         let mut received = None::<(BoundaryContext, Vec<Event>)>;
         let mut fatal_err = None::<CnxError>;
         let mut saw_retryable_gap = false;
-        let recv_timeout_ms = Duration::from_millis(250).as_millis() as u64;
+        let recv_timeout_ms = IDLE_RECV_QUIET_WINDOW.as_millis() as u64;
         #[cfg(test)]
         maybe_run_endpoint_before_first_recv_poll_hook(&route, &join_name);
         let mut pending = contexts
@@ -728,7 +971,9 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
             .map(|ctx| {
                 let boundary = boundary.clone();
                 let request_channel = request_channel.clone();
+                let receive_state = receive_state.clone();
                 async move {
+                    let _recv_guard = receive_state.enter_recv();
                     let recv_result = AssertUnwindSafe(boundary.channel_recv(
                         ctx.clone(),
                         ChannelRecvRequest {
@@ -744,7 +989,13 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
             })
             .collect::<Vec<_>>();
         while !pending.is_empty() {
-            let ((ctx, recv_result), _, rest) = futures_util::future::select_all(pending).await;
+            let ((ctx, recv_result), _, rest) = tokio::select! {
+                result = futures_util::future::select_all(pending) => result,
+                _ = shutdown_for_task.cancelled() => {
+                    exit_reason = Some("shutdown_cancelled".into());
+                    break 'recv_loop;
+                }
+            };
             pending = rest;
             let requests = match recv_result {
                 Err(_) => {
@@ -758,11 +1009,23 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
                 }
                 Ok(result) => match result {
                     Ok(events) => {
+                        receive_state.mark_receivable();
+                        if let Some(ready) = &receivable_ready {
+                            ready.signal();
+                        }
                         retryable_recv_gap_count = 0;
+                        stale_recv_gap_count = 0;
                         events
                     }
-                    Err(CnxError::Timeout) => continue,
+                    Err(CnxError::Timeout) => {
+                        receive_state.mark_receivable();
+                        if let Some(ready) = &receivable_ready {
+                            ready.signal();
+                        }
+                        continue;
+                    }
                     Err(err) if is_retryable_worker_bridge_peer_error(&err) => {
+                        stale_recv_gap_count = 0;
                         retryable_recv_gap_count = retryable_recv_gap_count.saturating_add(1);
                         if retryable_recv_gap_count >= REQUEST_RETRYABLE_RECV_GAP_RETRY_LIMIT {
                             if fatal_err.is_none() {
@@ -790,7 +1053,7 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
                     | Err(err @ CnxError::TransportClosed(_))
                     | Err(err @ CnxError::ChannelClosed)
                     | Err(err @ CnxError::LinkError(_)) => {
-                        if is_authoritative_ipc_transport_close(&err) {
+                        if is_authoritative_endpoint_transport_close(&err) {
                             if fatal_err.is_none() {
                                 fatal_err = Some(err);
                             }
@@ -812,6 +1075,7 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
                         continue;
                     }
                     Err(err) if is_stale_grant_attachment_recv_gap(&err) => {
+                        stale_recv_gap_count = stale_recv_gap_count.saturating_add(1);
                         close_stale_recv_channel(
                             boundary.clone(),
                             ctx.clone(),
@@ -824,6 +1088,18 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
                             route.0,
                             err
                         );
+                        if stale_recv_gap_count >= REQUEST_RETRYABLE_RECV_GAP_RETRY_LIMIT {
+                            if fatal_err.is_none() {
+                                let reason = format!(
+                                    "stale grant-attachment recv gap retry exhausted after {} attempts",
+                                    stale_recv_gap_count
+                                );
+                                *terminal_reason.lock().expect("terminal_reason lock") =
+                                    Some(format!("recv_failed:access denied: {reason}"));
+                                fatal_err = Some(CnxError::AccessDenied(reason));
+                            }
+                            continue;
+                        }
                         saw_retryable_gap = true;
                         continue;
                     }
@@ -893,51 +1169,63 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
             continue;
         }
         let response_count = responses.len();
-        if let Err(err) = boundary
-            .channel_send(
-                recv_ctx.clone(),
-                ChannelSendRequest {
-                    channel_key: reply_channel.clone(),
-                    events: responses,
-                    timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
-                },
-            )
-            .await
-        {
-            match err {
-                err @ CnxError::Timeout
-                | err @ CnxError::Backpressure
-                | err @ CnxError::NotSupported(_)
-                | err @ CnxError::NotReady(_)
-                | err @ CnxError::TransportClosed(_)
-                | err @ CnxError::ChannelClosed
-                | err @ CnxError::LinkError(_) => {
+        let mut reply_sent = false;
+        for attempt in 1..=REQUEST_REPLY_SEND_RETRY_LIMIT {
+            match boundary
+                .channel_send(
+                    recv_ctx.clone(),
+                    ChannelSendRequest {
+                        channel_key: reply_channel.clone(),
+                        events: responses.clone(),
+                        timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
+                    },
+                )
+                .await
+            {
+                Ok(()) => {
+                    reply_sent = true;
+                    break;
+                }
+                Err(
+                    err @ CnxError::Timeout
+                    | err @ CnxError::Backpressure
+                    | err @ CnxError::NotSupported(_)
+                    | err @ CnxError::NotReady(_)
+                    | err @ CnxError::TransportClosed(_)
+                    | err @ CnxError::ChannelClosed
+                    | err @ CnxError::LinkError(_),
+                ) if attempt < REQUEST_REPLY_SEND_RETRY_LIMIT => {
                     if debug_materialized_route {
                         eprintln!(
-                            "fs_meta_runtime_endpoint: materialized_route send_retry route={} task={} err={}",
-                            route.0, join_name, err
+                            "fs_meta_runtime_endpoint: materialized_route send_retry route={} task={} attempt={} err={}",
+                            route.0, join_name, attempt, err
                         );
                     }
                     log::debug!(
-                        "endpoint task {} send retry for {} after transient error: {:?}",
+                        "endpoint task {} reply send retry {}/{} for {} after transient error: {:?}",
                         join_name,
+                        attempt,
+                        REQUEST_REPLY_SEND_RETRY_LIMIT,
                         route.0,
                         err
                     );
                     tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
                 }
-                err => {
+                Err(err) => {
                     log::warn!(
-                        "endpoint task {} send failed for {}: {:?}",
+                        "endpoint task {} send failed for {} after {} attempts: {:?}",
                         join_name,
                         route.0,
+                        attempt,
                         err
                     );
                     exit_reason = Some(format!("send_failed:{err}"));
                     break;
                 }
             }
+        }
+        if !reply_sent {
+            break;
         }
         if debug_endpoint_requests {
             eprintln!(
@@ -949,6 +1237,9 @@ async fn run_endpoint_loop_with_contexts<F, Fut>(
 
     let final_reason = exit_reason.unwrap_or_else(|| "loop_returned".into());
     *terminal_reason.lock().expect("terminal_reason lock") = Some(final_reason.clone());
+    if let Some(ready) = &receivable_ready {
+        ready.signal();
+    }
     if debug_materialized_route {
         eprintln!(
             "fs_meta_runtime_endpoint: materialized_route loop_exit route={} task={} reason={}",
@@ -1033,16 +1324,21 @@ async fn run_stream_loop_with_wait<F, Fut, G, W, H>(
                 stream_channel.0, join_name
             );
         }
-        let events = match boundary
-            .channel_recv(
-                ctx.clone(),
-                ChannelRecvRequest {
-                    channel_key: stream_channel.clone(),
-                    timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
-                },
-            )
-            .await
-        {
+        let recv = boundary.channel_recv(
+            ctx.clone(),
+            ChannelRecvRequest {
+                channel_key: stream_channel.clone(),
+                timeout_ms: Some(IDLE_RECV_QUIET_WINDOW.as_millis() as u64),
+            },
+        );
+        let events = match tokio::select! {
+            result = recv => result,
+            _ = shutdown_for_task.cancelled() => {
+                *terminal_reason.lock().expect("terminal_reason lock") =
+                    Some("shutdown_cancelled".to_string());
+                break;
+            }
+        } {
             Ok(events) => {
                 stale_recv_gap_count = 0;
                 events
@@ -1071,7 +1367,7 @@ async fn run_stream_loop_with_wait<F, Fut, G, W, H>(
             | Err(err @ CnxError::ChannelClosed)
             | Err(err @ CnxError::LinkError(_)) => {
                 stale_recv_gap_count = 0;
-                if is_authoritative_ipc_transport_close(&err) {
+                if is_authoritative_endpoint_transport_close(&err) {
                     eprintln!(
                         "fs_meta_runtime_endpoint: terminal stream recv failure task={} route={} err={:?}",
                         join_name, stream_channel.0, err
@@ -1277,6 +1573,7 @@ mod tests {
     struct ReplyTimeoutThenRecoverBoundary {
         recv_keys: Mutex<Vec<String>>,
         send_keys: Mutex<Vec<String>>,
+        send_payloads: Mutex<Vec<Vec<u8>>>,
         recv_steps: Mutex<VecDeque<RecvStep>>,
         send_steps: Mutex<VecDeque<SendStep>>,
     }
@@ -1301,6 +1598,11 @@ mod tests {
         close_keys: Mutex<Vec<String>>,
     }
 
+    struct IdleTimeoutBoundary {
+        recv_attempts: AtomicUsize,
+        last_timeout_ms: AtomicUsize,
+    }
+
     #[derive(Clone, Copy)]
     enum FirstFailure {
         NotSupported,
@@ -1310,6 +1612,7 @@ mod tests {
         RetryableBridgePeerError,
         RetryableBridgeInternalError,
         AuthoritativeIpcTransportClosed,
+        SidecarTransportClosed,
     }
 
     enum RecvStep {
@@ -1373,6 +1676,7 @@ mod tests {
             Self {
                 recv_keys: Mutex::new(Vec::new()),
                 send_keys: Mutex::new(Vec::new()),
+                send_payloads: Mutex::new(Vec::new()),
                 recv_steps: Mutex::new(VecDeque::from([
                     RecvStep::Events(first),
                     RecvStep::Events(second),
@@ -1411,6 +1715,15 @@ mod tests {
             Self {
                 recv_attempts: AtomicUsize::new(0),
                 close_keys: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl IdleTimeoutBoundary {
+        fn new() -> Self {
+            Self {
+                recv_attempts: AtomicUsize::new(0),
+                last_timeout_ms: AtomicUsize::new(0),
             }
         }
     }
@@ -1454,6 +1767,9 @@ mod tests {
                     FirstFailure::AuthoritativeIpcTransportClosed => Err(
                         CnxError::TransportClosed("IPC control transport closed".into()),
                     ),
+                    FirstFailure::SidecarTransportClosed => Err(CnxError::TransportClosed(
+                        "transport closed: sidecar control bridge stopped".into(),
+                    )),
                 };
             }
             Err(CnxError::Internal("stop after first recv".into()))
@@ -1502,6 +1818,15 @@ mod tests {
                 .lock()
                 .expect("send_keys lock")
                 .push(request.channel_key.0);
+            self.send_payloads
+                .lock()
+                .expect("send_payloads lock")
+                .extend(
+                    request
+                        .events
+                        .iter()
+                        .map(|event| event.payload_bytes().to_vec()),
+                );
             match self
                 .send_steps
                 .lock()
@@ -1643,6 +1968,21 @@ mod tests {
                 .expect("close_keys lock")
                 .push(channel.0);
             Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for IdleTimeoutBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            self.recv_attempts.fetch_add(1, Ordering::SeqCst);
+            let timeout_ms = request.timeout_ms.unwrap_or(0) as usize;
+            self.last_timeout_ms.store(timeout_ms, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(timeout_ms as u64)).await;
+            Err(CnxError::Timeout)
         }
     }
 
@@ -1849,6 +2189,62 @@ mod tests {
         handle.join().expect("endpoint spawn thread should join");
     }
 
+    #[test]
+    fn request_endpoint_idle_receive_uses_quiet_cancellable_window() {
+        let boundary = Arc::new(IdleTimeoutBoundary::new());
+        let mut endpoint = ManagedEndpointTask::spawn(
+            boundary.clone(),
+            RouteKey("sink-status:v1.req".into()),
+            "idle-request-endpoint",
+            CancellationToken::new(),
+            |_events: Vec<Event>| std::future::ready(Vec::new()),
+        );
+
+        std::thread::sleep(Duration::from_millis(700));
+        let attempts = boundary.recv_attempts.load(Ordering::SeqCst);
+        let timeout_ms = boundary.last_timeout_ms.load(Ordering::SeqCst);
+        crate::runtime_app::shared_tokio_runtime()
+            .block_on(endpoint.shutdown(Duration::from_millis(300)));
+
+        assert!(
+            attempts <= 1,
+            "idle request endpoints must not poll empty runtime routes multiple times inside one quiet window; attempts={attempts}"
+        );
+        assert!(
+            timeout_ms >= 1_000,
+            "idle request endpoint receive timeout must be a quiet window, not a high-frequency CPU polling interval; timeout_ms={timeout_ms}"
+        );
+    }
+
+    #[test]
+    fn stream_endpoint_idle_receive_uses_quiet_cancellable_window() {
+        let boundary = Arc::new(IdleTimeoutBoundary::new());
+        let mut endpoint = ManagedEndpointTask::spawn_stream(
+            boundary.clone(),
+            RouteKey("source-logical-roots-control:v1.stream".into()),
+            "idle-stream-endpoint",
+            "runtime.exec.source",
+            CancellationToken::new(),
+            || true,
+            |_events: Vec<Event>| std::future::ready(()),
+        );
+
+        std::thread::sleep(Duration::from_millis(700));
+        let attempts = boundary.recv_attempts.load(Ordering::SeqCst);
+        let timeout_ms = boundary.last_timeout_ms.load(Ordering::SeqCst);
+        crate::runtime_app::shared_tokio_runtime()
+            .block_on(endpoint.shutdown(Duration::from_millis(300)));
+
+        assert!(
+            attempts <= 1,
+            "idle stream endpoints must not poll empty runtime routes multiple times inside one quiet window; attempts={attempts}"
+        );
+        assert!(
+            timeout_ms >= 1_000,
+            "idle stream endpoint receive timeout must be a quiet window, not a high-frequency CPU polling interval; timeout_ms={timeout_ms}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn endpoint_shutdown_timeout_must_not_leave_blocking_join_task_inflight() {
         SHUTDOWN_BLOCKING_JOIN_INFLIGHT.store(0, Ordering::SeqCst);
@@ -1862,9 +2258,11 @@ mod tests {
         let mut endpoint = ManagedEndpointTask {
             name: "test-endpoint".to_string(),
             route_key: "sink-status:v1.req".to_string(),
+            boundary_id: 0,
             unit_ids: Vec::new(),
             shutdown: CancellationToken::new(),
             terminal_reason: Arc::new(StdMutex::new(None)),
+            receive_state: Arc::new(EndpointReceiveState::default()),
             join: Some(EndpointJoin::Thread(join)),
         };
 
@@ -2071,6 +2469,45 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_loop_must_not_spin_forever_on_persistent_stale_grant_attachment_recv_gaps() {
+        let boundary = Arc::new(PersistentStaleGrantAttachmentBoundary::new());
+        let terminal_reason = test_terminal_reason();
+        let result = crate::runtime_app::shared_tokio_runtime().block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(800),
+                run_endpoint_loop(
+                    boundary.clone(),
+                    RouteKey("source-status:v1.req".into()),
+                    "test-endpoint".into(),
+                    BoundaryContext::for_unit("runtime.exec.source"),
+                    CancellationToken::new(),
+                    Arc::new(|_events: Vec<Event>| std::future::ready(Vec::new())),
+                    terminal_reason.clone(),
+                ),
+            )
+            .await
+        });
+
+        assert!(
+            result.is_ok(),
+            "persistent stale grant-attachment recv gaps must terminate this request endpoint instead of repeatedly closing a shared request route"
+        );
+        let reason = terminal_reason
+            .lock()
+            .expect("terminal_reason lock")
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            reason.contains("stale grant-attachment"),
+            "terminal reason should preserve stale grant-attachment continuity evidence; reason={reason}"
+        );
+        assert!(
+            boundary.recv_attempts.load(Ordering::SeqCst) > 1,
+            "request endpoint should still retry stale recv gaps before escalating"
+        );
+    }
+
+    #[test]
     fn endpoint_loop_retries_invalid_or_revoked_grant_attachment_tokens() {
         let boundary = Arc::new(RecordingBoundary {
             recv_keys: Mutex::new(Vec::new()),
@@ -2107,6 +2544,39 @@ mod tests {
             !close_keys.contains(&"source-status:v1.req:reply".to_string()),
             "terminal endpoint cleanup must not permanently close reusable reply route after stale request-route reset; close_keys={close_keys:?}"
         );
+    }
+
+    #[test]
+    fn endpoint_receivable_ready_wait_does_not_return_on_stale_grant_gap() {
+        let boundary = Arc::new(RecordingBoundary {
+            recv_keys: Mutex::new(Vec::new()),
+            recv_unit_ids: Mutex::new(Vec::new()),
+            close_keys: Mutex::new(Vec::new()),
+            first_failure: Mutex::new(Some(FirstFailure::StaleGrantAttachment)),
+        });
+        let mut endpoint = ManagedEndpointTask::spawn_with_unit_wait_receivable(
+            boundary.clone(),
+            RouteKey("source-manual-rescan.node_a:v1.req".into()),
+            "source:source-manual-rescan.node_a:v1.req",
+            "runtime.exec.source",
+            CancellationToken::new(),
+            |_events: Vec<Event>| std::future::ready(Vec::new()),
+        );
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert!(
+            recv_keys.len() >= 2,
+            "receivable-ready spawn must wait through stale grant gaps until a recv can arm; recv_keys={recv_keys:?}"
+        );
+        let close_keys = boundary.close_keys.lock().expect("close_keys lock").clone();
+        assert_eq!(
+            close_keys.first().map(String::as_str),
+            Some("source-manual-rescan.node_a:v1.req"),
+            "stale scoped source-rescan recv must close the stale channel before readiness is reported"
+        );
+
+        crate::runtime_app::shared_tokio_runtime()
+            .block_on(endpoint.shutdown(Duration::from_secs(1)));
     }
 
     #[test]
@@ -2199,6 +2669,41 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("IPC control transport closed")),
             "terminal reason should preserve the authoritative IPC transport-close evidence"
+        );
+    }
+
+    #[test]
+    fn endpoint_loop_exits_on_sidecar_transport_close() {
+        let boundary = Arc::new(RecordingBoundary {
+            recv_keys: Mutex::new(Vec::new()),
+            recv_unit_ids: Mutex::new(Vec::new()),
+            close_keys: Mutex::new(Vec::new()),
+            first_failure: Mutex::new(Some(FirstFailure::SidecarTransportClosed)),
+        });
+        let terminal_reason = test_terminal_reason();
+        crate::runtime_app::shared_tokio_runtime().block_on(run_endpoint_loop(
+            boundary.clone(),
+            RouteKey("source-manual-rescan.node_a:v1.req".into()),
+            "test-endpoint".into(),
+            BoundaryContext::for_unit("runtime.exec.source"),
+            CancellationToken::new(),
+            Arc::new(|_events: Vec<Event>| std::future::ready(Vec::new())),
+            terminal_reason.clone(),
+        ));
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert_eq!(
+            recv_keys,
+            vec!["source-manual-rescan.node_a:v1.req".to_string()],
+            "sidecar transport close means the endpoint is pinned to a stale worker boundary and must exit for same-turn rearm"
+        );
+        assert!(
+            terminal_reason
+                .lock()
+                .expect("terminal_reason lock")
+                .as_deref()
+                .is_some_and(|reason| reason.contains("sidecar control bridge stopped")),
+            "terminal reason should preserve the sidecar transport-close evidence"
         );
     }
 
@@ -2349,9 +2854,20 @@ mod tests {
             send_keys,
             vec![
                 "materialized-find:v1.req:reply".to_string(),
+                "materialized-find:v1.req:reply".to_string(),
                 "materialized-find:v1.req:reply".to_string()
             ],
-            "endpoint loop should keep serving later materialized batches after a transient reply send timeout"
+            "endpoint loop must retry the same reply batch before serving later materialized batches after a transient reply send timeout"
+        );
+        let send_payloads = boundary
+            .send_payloads
+            .lock()
+            .expect("send_payloads lock")
+            .clone();
+        assert_eq!(
+            send_payloads,
+            vec![b"first".to_vec(), b"first".to_vec(), b"second".to_vec()],
+            "transient reply send timeout must not drop the already generated first reply"
         );
     }
 
@@ -2377,9 +2893,20 @@ mod tests {
             send_keys,
             vec![
                 "materialized-find:v1.req:reply".to_string(),
+                "materialized-find:v1.req:reply".to_string(),
                 "materialized-find:v1.req:reply".to_string()
             ],
-            "endpoint loop should keep serving later materialized batches after transient reply send backpressure"
+            "endpoint loop must retry the same reply batch before serving later materialized batches after transient reply send backpressure"
+        );
+        let send_payloads = boundary
+            .send_payloads
+            .lock()
+            .expect("send_payloads lock")
+            .clone();
+        assert_eq!(
+            send_payloads,
+            vec![b"first".to_vec(), b"first".to_vec(), b"second".to_vec()],
+            "transient reply send backpressure must not drop the already generated first reply"
         );
     }
 
@@ -2490,6 +3017,43 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("IPC control transport closed")),
             "terminal stream reason should preserve the authoritative IPC transport-close evidence"
+        );
+    }
+
+    #[test]
+    fn stream_loop_exits_on_sidecar_transport_close() {
+        let boundary = Arc::new(RecordingBoundary {
+            recv_keys: Mutex::new(Vec::new()),
+            recv_unit_ids: Mutex::new(Vec::new()),
+            close_keys: Mutex::new(Vec::new()),
+            first_failure: Mutex::new(Some(FirstFailure::SidecarTransportClosed)),
+        });
+        let terminal_reason = test_terminal_reason();
+        crate::runtime_app::shared_tokio_runtime().block_on(run_stream_loop(
+            boundary.clone(),
+            RouteKey("source-manual-rescan-control:v1.stream".into()),
+            "test-stream".into(),
+            "runtime.exec.source".to_string(),
+            CancellationToken::new(),
+            Arc::new(|| true),
+            Arc::new(|| {}),
+            Arc::new(|_events: Vec<Event>| std::future::ready(())),
+            terminal_reason.clone(),
+        ));
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert_eq!(
+            recv_keys,
+            vec!["source-manual-rescan-control:v1.stream".to_string()],
+            "sidecar transport close means the stream endpoint is pinned to a stale worker boundary and must exit for same-turn rearm"
+        );
+        assert!(
+            terminal_reason
+                .lock()
+                .expect("terminal_reason lock")
+                .as_deref()
+                .is_some_and(|reason| reason.contains("sidecar control bridge stopped")),
+            "terminal stream reason should preserve the sidecar transport-close evidence"
         );
     }
 

@@ -371,9 +371,45 @@ fn router(state: ApiState, control_gate: Arc<ApiControlGate>) -> Result<Router> 
         .layer(cors))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApiManagementReadinessGate {
+    FullManagementWrite,
+    SourceRepair,
+}
+
+impl ApiManagementReadinessGate {
+    fn is_ready(self, control_gate: &ApiControlGate) -> bool {
+        match self {
+            Self::FullManagementWrite => control_gate.is_management_write_ready(),
+            Self::SourceRepair => control_gate.is_source_repair_ready(),
+        }
+    }
+
+    fn blocked_by_management_write_drain(self) -> bool {
+        matches!(self, Self::FullManagementWrite)
+    }
+
+    async fn wait_ready(self, control_gate: &ApiControlGate) {
+        match self {
+            Self::FullManagementWrite => control_gate.wait_management_write_ready().await,
+            Self::SourceRepair => control_gate.wait_source_repair_ready().await,
+        }
+    }
+
+    fn recovery(
+        self,
+        control_gate: &ApiControlGate,
+    ) -> Option<super::state::ManagementWriteRecovery> {
+        match self {
+            Self::FullManagementWrite => control_gate.management_write_recovery(),
+            Self::SourceRepair => control_gate.source_repair_recovery(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ApiRequestRoutePolicy {
-    requires_control_readiness: bool,
+    management_readiness_gate: Option<ApiManagementReadinessGate>,
     counts_toward_control_drain: bool,
     counts_toward_facade_request_drain: bool,
 }
@@ -381,10 +417,17 @@ struct ApiRequestRoutePolicy {
 fn api_request_route_policy(method: &Method, path: &str) -> ApiRequestRoutePolicy {
     let roots_put = matches!(method, &Method::PUT) && path == "/api/fs-meta/v1/monitoring/roots";
     let rescan = matches!(method, &Method::POST) && path == "/api/fs-meta/v1/index/rescan";
-    let management_write = roots_put || rescan;
+    let management_readiness_gate = if roots_put {
+        Some(ApiManagementReadinessGate::FullManagementWrite)
+    } else if rescan {
+        Some(ApiManagementReadinessGate::SourceRepair)
+    } else {
+        None
+    };
+    let management_write = management_readiness_gate.is_some();
 
     ApiRequestRoutePolicy {
-        requires_control_readiness: management_write,
+        management_readiness_gate,
         counts_toward_control_drain: management_write,
         counts_toward_facade_request_drain: matches!(
             (method, path),
@@ -412,9 +455,13 @@ async fn projection_request_facade_guard(
     next: Next,
 ) -> Response {
     let policy = api_request_route_policy(request.method(), request.uri().path());
-    let facade_request_guard = (policy.counts_toward_facade_request_drain
-        && !policy.requires_control_readiness)
-        .then(|| control_gate.begin_facade_request());
+    let facade_request_guard = if policy.counts_toward_facade_request_drain
+        && policy.management_readiness_gate.is_none()
+    {
+        Some(control_gate.begin_facade_request())
+    } else {
+        None
+    };
     response_with_owned_guards(next.run(request).await, None, facade_request_guard)
 }
 
@@ -424,17 +471,30 @@ async fn request_control_readiness_guard(
     next: Next,
 ) -> Response {
     let policy = api_request_route_policy(request.method(), request.uri().path());
-    let facade_request_guard = policy
-        .requires_control_readiness
-        .then(|| control_gate.begin_facade_request());
-    if !policy.requires_control_readiness {
+    let Some(readiness_gate) = policy.management_readiness_gate else {
         return next.run(request).await;
-    }
-    if control_gate.is_management_write_ready() {
+    };
+    let facade_request_guard = policy
+        .management_readiness_gate
+        .is_some()
+        .then(|| control_gate.begin_facade_request());
+    if readiness_gate.is_ready(&control_gate) {
         return response_with_owned_guards(next.run(request).await, None, facade_request_guard);
     }
+    if readiness_gate.blocked_by_management_write_drain()
+        && control_gate.is_management_write_drain_closed()
+    {
+        return response_with_owned_guards(
+            ApiError::service_unavailable(
+            "fs-meta management request handling is unavailable until runtime control initializes the app",
+        )
+            .into_response(),
+            None,
+            facade_request_guard,
+        );
+    }
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    if let Some(recovery) = control_gate.management_write_recovery() {
+    if let Some(recovery) = readiness_gate.recovery(&control_gate) {
         let recovery_budget = ready_deadline
             .saturating_duration_since(tokio::time::Instant::now())
             .min(Duration::from_secs(10));
@@ -453,9 +513,9 @@ async fn request_control_readiness_guard(
         }
     }
     let remaining = ready_deadline.saturating_duration_since(tokio::time::Instant::now());
-    if !control_gate.is_management_write_ready()
+    if !readiness_gate.is_ready(&control_gate)
         && (remaining.is_zero()
-            || tokio::time::timeout(remaining, control_gate.wait_management_write_ready())
+            || tokio::time::timeout(remaining, readiness_gate.wait_ready(&control_gate))
                 .await
                 .is_err())
     {
@@ -688,15 +748,22 @@ mod tests {
 
     #[test]
     fn request_control_readiness_covers_management_writes() {
-        for (method, path) in [
-            (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
-            (Method::POST, "/api/fs-meta/v1/index/rescan"),
-            (Method::POST, "/api/fs-meta/v1/query-api-keys"),
-            (Method::DELETE, "/api/fs-meta/v1/query-api-keys/key-1"),
+        for (method, path, expected_gate) in [
+            (
+                Method::PUT,
+                "/api/fs-meta/v1/monitoring/roots",
+                ApiManagementReadinessGate::FullManagementWrite,
+            ),
+            (
+                Method::POST,
+                "/api/fs-meta/v1/index/rescan",
+                ApiManagementReadinessGate::SourceRepair,
+            ),
         ] {
-            assert!(
-                api_request_route_policy(&method, path).requires_control_readiness,
-                "{method} {path} should require control readiness"
+            assert_eq!(
+                api_request_route_policy(&method, path).management_readiness_gate,
+                Some(expected_gate),
+                "{method} {path} should require the expected management readiness gate"
             );
         }
 
@@ -711,8 +778,10 @@ mod tests {
             (Method::GET, "/api/fs-meta/v1/tree"),
         ] {
             assert!(
-                !api_request_route_policy(&method, path).requires_control_readiness,
-                "{method} {path} should not require control readiness"
+                api_request_route_policy(&method, path)
+                    .management_readiness_gate
+                    .is_none(),
+                "{method} {path} should not require management readiness"
             );
         }
     }
@@ -753,7 +822,7 @@ mod tests {
         assert_eq!(
             api_request_route_policy(&Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
             ApiRequestRoutePolicy {
-                requires_control_readiness: true,
+                management_readiness_gate: Some(ApiManagementReadinessGate::FullManagementWrite),
                 counts_toward_control_drain: true,
                 counts_toward_facade_request_drain: true,
             }
@@ -761,21 +830,15 @@ mod tests {
     }
 
     #[test]
-    fn api_request_route_policy_assigns_control_writes_to_all_three_gates() {
-        for (method, path) in [
-            (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
-            (Method::POST, "/api/fs-meta/v1/index/rescan"),
-        ] {
-            assert_eq!(
-                api_request_route_policy(&method, path),
-                ApiRequestRoutePolicy {
-                    requires_control_readiness: true,
-                    counts_toward_control_drain: true,
-                    counts_toward_facade_request_drain: true,
-                },
-                "{method} {path} should use all control-write gates"
-            );
-        }
+    fn api_request_route_policy_assigns_rescan_to_source_repair_gate() {
+        assert_eq!(
+            api_request_route_policy(&Method::POST, "/api/fs-meta/v1/index/rescan"),
+            ApiRequestRoutePolicy {
+                management_readiness_gate: Some(ApiManagementReadinessGate::SourceRepair),
+                counts_toward_control_drain: true,
+                counts_toward_facade_request_drain: true,
+            }
+        );
     }
 
     #[test]
@@ -787,7 +850,7 @@ mod tests {
             assert_eq!(
                 api_request_route_policy(&method, path),
                 ApiRequestRoutePolicy {
-                    requires_control_readiness: false,
+                    management_readiness_gate: None,
                     counts_toward_control_drain: false,
                     counts_toward_facade_request_drain: true,
                 },
@@ -801,7 +864,7 @@ mod tests {
         assert_eq!(
             api_request_route_policy(&Method::GET, "/api/fs-meta/v1/tree"),
             ApiRequestRoutePolicy {
-                requires_control_readiness: false,
+                management_readiness_gate: None,
                 counts_toward_control_drain: false,
                 counts_toward_facade_request_drain: true,
             }
@@ -1041,10 +1104,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn rescan_control_readiness_guard_runs_recovery_before_waiting_not_ready() {
+    async fn rescan_control_readiness_guard_runs_source_repair_recovery_before_waiting_not_ready() {
         let control_gate = Arc::new(ApiControlGate::new(false));
         let recovery_calls = Arc::new(AtomicUsize::new(0));
-        control_gate.set_management_write_recovery(Some(Arc::new({
+        control_gate.set_source_repair_recovery(Some(Arc::new({
             let control_gate = control_gate.clone();
             let recovery_calls = recovery_calls.clone();
             move || {
@@ -1052,7 +1115,7 @@ mod tests {
                 let recovery_calls = recovery_calls.clone();
                 Box::pin(async move {
                     recovery_calls.fetch_add(1, Ordering::SeqCst);
-                    control_gate.set_ready_state(true, true);
+                    control_gate.set_ready_state_with_source_repair(true, false, true);
                     Ok(())
                 })
             }
@@ -1096,12 +1159,292 @@ mod tests {
         assert_eq!(
             recovery_calls.load(Ordering::SeqCst),
             1,
-            "rescan readiness guard must drive exactly one bounded recovery before allowing the handler"
+            "rescan readiness guard must drive exactly one bounded source-repair recovery before allowing the handler"
         );
         assert_eq!(
             handler_calls.load(Ordering::SeqCst),
             1,
-            "rescan handler must run after management-write recovery reopens the gate"
+            "rescan handler must run after source-repair recovery reopens the gate"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rescan_control_readiness_guard_uses_source_repair_ready_without_full_management() {
+        let control_gate = Arc::new(ApiControlGate::new(false));
+        control_gate.set_ready_state_with_source_repair(true, false, true);
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/fs-meta/v1/index/rescan",
+                post({
+                    let handler_calls = handler_calls.clone();
+                    move || {
+                        let handler_calls = handler_calls.clone();
+                        async move {
+                            handler_calls.fetch_add(1, Ordering::SeqCst);
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .with_state(control_gate.clone())
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                request_control_readiness_guard,
+            ));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/fs-meta/v1/index/rescan")
+                    .body(Body::empty())
+                    .expect("build rescan request"),
+            ),
+        )
+        .await
+        .expect("rescan source-repair readiness must not wait for full management readiness")
+        .expect("route rescan request");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            handler_calls.load(Ordering::SeqCst),
+            1,
+            "source-repair-ready rescan should enter handler even while sink/full management readiness is closed"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn roots_put_control_readiness_guard_requires_full_management_when_source_repair_ready() {
+        let control_gate = Arc::new(ApiControlGate::new(false));
+        control_gate.set_ready_state_with_source_repair(true, false, true);
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/fs-meta/v1/monitoring/roots",
+                put({
+                    let handler_calls = handler_calls.clone();
+                    move || {
+                        let handler_calls = handler_calls.clone();
+                        async move {
+                            handler_calls.fetch_add(1, Ordering::SeqCst);
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .with_state(control_gate.clone())
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                request_control_readiness_guard,
+            ));
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                app.oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri("/api/fs-meta/v1/monitoring/roots")
+                        .body(Body::empty())
+                        .expect("build roots_put request"),
+                ),
+            )
+            .await
+            .is_err(),
+            "roots_put must still wait for full management-write readiness when only source repair is ready"
+        );
+        assert_eq!(
+            handler_calls.load(Ordering::SeqCst),
+            0,
+            "full-management roots_put must not enter the handler on source-repair readiness alone"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn roots_put_control_readiness_guard_does_not_recover_after_full_management_drain_close()
+    {
+        let control_gate = Arc::new(ApiControlGate::new(true));
+        let recovery_calls = Arc::new(AtomicUsize::new(0));
+        control_gate.set_management_write_recovery(Some(Arc::new({
+            let control_gate = control_gate.clone();
+            let recovery_calls = recovery_calls.clone();
+            move || {
+                let control_gate = control_gate.clone();
+                let recovery_calls = recovery_calls.clone();
+                Box::pin(async move {
+                    recovery_calls.fetch_add(1, Ordering::SeqCst);
+                    control_gate.set_ready(true);
+                    Ok(())
+                })
+            }
+        })));
+        control_gate.close_management_write_gate();
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/fs-meta/v1/monitoring/roots",
+                put({
+                    let handler_calls = handler_calls.clone();
+                    move || {
+                        let handler_calls = handler_calls.clone();
+                        async move {
+                            handler_calls.fetch_add(1, Ordering::SeqCst);
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .with_state(control_gate.clone())
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                request_control_readiness_guard,
+            ));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/fs-meta/v1/monitoring/roots")
+                    .body(Body::empty())
+                    .expect("build roots_put request"),
+            ),
+        )
+        .await
+        .expect("drain-closed roots_put must fail without waiting for recovery")
+        .expect("route rescan request");
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            recovery_calls.load(Ordering::SeqCst),
+            0,
+            "drain-closed full management writes must not run readiness recovery"
+        );
+        assert_eq!(
+            handler_calls.load(Ordering::SeqCst),
+            0,
+            "drain-closed full management writes must fail before handler execution"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rescan_control_readiness_guard_runs_source_repair_recovery_during_full_management_drain()
+     {
+        let control_gate = Arc::new(ApiControlGate::new(true));
+        let recovery_calls = Arc::new(AtomicUsize::new(0));
+        control_gate.set_source_repair_recovery(Some(Arc::new({
+            let control_gate = control_gate.clone();
+            let recovery_calls = recovery_calls.clone();
+            move || {
+                let control_gate = control_gate.clone();
+                let recovery_calls = recovery_calls.clone();
+                Box::pin(async move {
+                    recovery_calls.fetch_add(1, Ordering::SeqCst);
+                    control_gate.set_ready_state_with_source_repair(false, false, true);
+                    Ok(())
+                })
+            }
+        })));
+        control_gate.close_management_write_gate();
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/fs-meta/v1/index/rescan",
+                post({
+                    let handler_calls = handler_calls.clone();
+                    move || {
+                        let handler_calls = handler_calls.clone();
+                        async move {
+                            handler_calls.fetch_add(1, Ordering::SeqCst);
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .with_state(control_gate.clone())
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                request_control_readiness_guard,
+            ));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/fs-meta/v1/index/rescan")
+                    .body(Body::empty())
+                    .expect("build rescan request"),
+            ),
+        )
+        .await
+        .expect("drain-closed source repair must run bounded recovery")
+        .expect("route rescan request");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            recovery_calls.load(Ordering::SeqCst),
+            1,
+            "manual rescan must run source-repair recovery while full management drain is closed"
+        );
+        assert_eq!(
+            handler_calls.load(Ordering::SeqCst),
+            1,
+            "source-repair recovery should reopen the rescan gate without reopening full management writes"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rescan_control_readiness_guard_allows_source_repair_ready_during_full_management_drain()
+     {
+        let control_gate = Arc::new(ApiControlGate::new(true));
+        control_gate.close_management_write_gate();
+        control_gate.set_ready_state_with_source_repair(true, false, true);
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/fs-meta/v1/index/rescan",
+                post({
+                    let handler_calls = handler_calls.clone();
+                    move || {
+                        let handler_calls = handler_calls.clone();
+                        async move {
+                            handler_calls.fetch_add(1, Ordering::SeqCst);
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .with_state(control_gate.clone())
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                request_control_readiness_guard,
+            ));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/fs-meta/v1/index/rescan")
+                    .body(Body::empty())
+                    .expect("build rescan request"),
+            ),
+        )
+        .await
+        .expect("source-repair-ready rescan must not be blocked by full-management drain")
+        .expect("route rescan request");
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            handler_calls.load(Ordering::SeqCst),
+            1,
+            "manual rescan uses the source-repair plane and must not wait for full sink/materialization management readiness"
         );
     }
 

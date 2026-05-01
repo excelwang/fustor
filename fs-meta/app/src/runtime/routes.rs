@@ -13,4 +13,5 @@ pub use fs_meta::product_model::routes::{
     source_find_request_route_for, source_find_route_bindings_for, source_find_route_key_for,
     source_rescan_request_route_for, source_rescan_route_bindings_for, source_rescan_route_key_for,
     source_roots_control_route_key_for, source_roots_control_stream_route_for,
+    source_status_request_route_for, source_status_route_bindings_for, source_status_route_key_for,
 };

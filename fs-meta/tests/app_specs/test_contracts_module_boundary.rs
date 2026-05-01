@@ -924,8 +924,11 @@ fn status_paths_use_nonblocking_worker_observation_reads() {
         ".observability_snapshot()\n                .await\n                .unwrap_or_else"
     ));
     assert!(runtime_app.contains("let internal_query_active = query_active || query_peer_active;"));
-    assert!(runtime_app
-        .contains("if !internal_query_active || !spawned_routes.insert(route.0.clone())"));
+    assert!(runtime_app.contains("let source_route_active = self"));
+    assert!(runtime_app.contains("vec![execution_units::SOURCE_RUNTIME_UNIT_ID]"));
+    assert!(runtime_app.contains(
+        "preferred_internal_query_endpoint_units(query_active, query_peer_active, false)"
+    ));
     assert!(runtime_app.contains("route_key == source_status_route"));
     assert!(runtime_app.contains("route_key == source_find_route"));
     assert!(

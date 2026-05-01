@@ -4,6 +4,7 @@
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
+use std::error::Error;
 use std::time::Duration;
 
 const RECONNECT_RETRY_WINDOW: Duration = Duration::from_secs(90);
@@ -203,7 +204,7 @@ impl FsMetaApiClient {
         }
         self.decode(
             req.send()
-                .map_err(|e| format!("GET {} failed: {e}", path))?,
+                .map_err(|e| format!("GET {} failed: {}", path, format_reqwest_error(&e)))?,
         )
     }
 
@@ -224,7 +225,7 @@ impl FsMetaApiClient {
                 .headers(self.auth_headers(token)?)
                 .json(body)
                 .send()
-                .map_err(|e| format!("POST {} failed: {e}", path))?,
+                .map_err(|e| format!("POST {} failed: {}", path, format_reqwest_error(&e)))?,
         )
     }
 
@@ -240,7 +241,7 @@ impl FsMetaApiClient {
                 .header(CONTENT_TYPE, "application/json")
                 .json(body)
                 .send()
-                .map_err(|e| format!("POST {} failed: {e}", path))?,
+                .map_err(|e| format!("POST {} failed: {}", path, format_reqwest_error(&e)))?,
         )
     }
 
@@ -261,7 +262,7 @@ impl FsMetaApiClient {
                 .headers(self.auth_headers(token)?)
                 .json(body)
                 .send()
-                .map_err(|e| format!("PUT {} failed: {e}", path))?,
+                .map_err(|e| format!("PUT {} failed: {}", path, format_reqwest_error(&e)))?,
         )
     }
 
@@ -272,7 +273,7 @@ impl FsMetaApiClient {
                 .timeout(self.request_timeout(path))
                 .headers(self.auth_headers(token)?)
                 .send()
-                .map_err(|e| format!("DELETE {} failed: {e}", path))?,
+                .map_err(|e| format!("DELETE {} failed: {}", path, format_reqwest_error(&e)))?,
         )
     }
 
@@ -330,7 +331,68 @@ impl FsMetaApiClient {
     }
 }
 
+fn format_reqwest_error(err: &reqwest::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    if err.is_timeout() {
+        parts.push("kind=timeout".to_string());
+    }
+    if err.is_connect() {
+        parts.push("kind=connect".to_string());
+    }
+    if err.is_request() {
+        parts.push("kind=request".to_string());
+    }
+    if err.is_body() {
+        parts.push("kind=body".to_string());
+    }
+    if let Some(status) = err.status() {
+        parts.push(format!("status={status}"));
+    }
+    let mut source = err.source();
+    while let Some(err) = source {
+        parts.push(format!("source={err}"));
+        source = err.source();
+    }
+    parts.join("; ")
+}
+
 impl OperatorSession {
+    pub fn management_status_many(
+        base_urls: &[String],
+        username: &str,
+        password: &str,
+    ) -> Result<Value, String> {
+        let candidate_base_urls = dedupe_base_urls(base_urls.to_vec());
+        if candidate_base_urls.is_empty() {
+            return Err("no facade base URLs provided".into());
+        }
+        let mut last_err = String::new();
+        for base_url in candidate_base_urls {
+            let client = FsMetaApiClient::new(base_url.clone())?;
+            let login = match client.login(username, password) {
+                Ok(login) => login,
+                Err(err) => {
+                    last_err = format!("{base_url}: {err}");
+                    continue;
+                }
+            };
+            let token = match extract_token(login) {
+                Ok(token) => token,
+                Err(err) => {
+                    last_err = format!("{base_url}: {err}");
+                    continue;
+                }
+            };
+            match client.status(&token) {
+                Ok(status) => return Ok(status),
+                Err(err) => {
+                    last_err = format!("{base_url}: {err}");
+                }
+            }
+        }
+        Err(format!("no reachable facade management status: {last_err}"))
+    }
+
     pub fn login_many(
         base_urls: Vec<String>,
         username: impl Into<String>,
@@ -708,6 +770,10 @@ pub fn is_retryable_management_unavailable_error(err: &str) -> bool {
     err.contains("http 503 failed")
         && (err.contains("temporarily unavailable while runtime workers reconfigure")
             || err.contains("runtime control initializes the app"))
+        || (err.contains("http 503 failed")
+            && err.contains("manual rescan current roots runtime-scope readiness failed")
+            && err.contains("drained/fenced")
+            && err.contains("grant attachments"))
 }
 
 pub fn extract_token(login: Value) -> Result<String, String> {
@@ -984,6 +1050,77 @@ connection: close
         let response = session
             .with_management_reauth(|client, token| client.rescan(token))
             .expect("management request should fail over while one facade initializes control");
+
+        assert_eq!(response.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(session.client.base_url(), format!("http://{}", second_addr));
+        first_server.join().expect("join first facade server");
+        second_server.join().expect("join second facade server");
+    }
+
+    #[test]
+    fn management_request_failsover_when_manual_rescan_hits_stale_runtime_facade() {
+        let first = TcpListener::bind("127.0.0.1:0").expect("bind first facade listener");
+        let first_addr = first.local_addr().expect("first listener addr");
+        let second = TcpListener::bind("127.0.0.1:0").expect("bind second facade listener");
+        let second_addr = second.local_addr().expect("second listener addr");
+
+        let first_server = std::thread::spawn(move || {
+            let (mut stream, _) = first.accept().expect("accept first rescan request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"error":"manual rescan current roots runtime-scope readiness failed: roots update applied locally but peer runtime-scope second-wave convergence did not settle before followup exhausted: expected_source={\"nfs1\", \"nfs2\"} expected_scan={\"nfs1\", \"nfs2\"} expected_sink=not-required last_err=access denied: pid Pid(1) is drained/fenced and cannot obtain new grant attachments last_source=none last_source_per_origin=none last_runtime_scope=none"}"#;
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable
+content-type: application/json
+content-length: {}
+connection: close
+
+{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write first rescan response");
+            stream.flush().expect("flush first rescan response");
+        });
+
+        let second_server = std::thread::spawn(move || {
+            let (mut stream, _) = second.accept().expect("accept second rescan request");
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"status":"ok"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK
+content-type: application/json
+content-length: {}
+connection: close
+
+{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write second rescan response");
+            stream.flush().expect("flush second rescan response");
+        });
+
+        let mut session = OperatorSession {
+            client: FsMetaApiClient::new(format!("http://{}", first_addr)).expect("client"),
+            candidate_base_urls: vec![
+                format!("http://{}", first_addr),
+                format!("http://{}", second_addr),
+            ],
+            username: "operator".to_string(),
+            password: "operator123".to_string(),
+            management_token: "ignored".to_string(),
+            query_api_key: "ignored".to_string(),
+        };
+
+        let response = session
+            .with_management_reauth(|client, token| client.rescan(token))
+            .expect("manual rescan should fail over when one facade reports stale drained runtime attachments");
 
         assert_eq!(response.get("status").and_then(Value::as_str), Some("ok"));
         assert_eq!(session.client.base_url(), format!("http://{}", second_addr));

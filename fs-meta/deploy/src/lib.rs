@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use capanix_app_sdk::runtime::{RouteKey, RoutePlanMode, RoutePlanSpec};
+use capanix_app_sdk::runtime::{NodeId, RouteKey, RoutePlanMode, RoutePlanPeer, RoutePlanSpec};
 use capanix_app_sdk::{CnxError, Result};
 use capanix_deploy_sdk::compile_relation_target_intent_value;
 use fs_meta::RootSpec;
@@ -19,7 +19,8 @@ use fs_meta::product_model::routes::{
     ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, sink_query_request_route_for,
     sink_query_route_key_for, sink_roots_control_route_key_for, source_find_request_route_for,
     source_find_route_key_for, source_rescan_request_route_for, source_rescan_route_key_for,
-    source_roots_control_route_key_for,
+    source_roots_control_route_key_for, source_status_request_route_for,
+    source_status_route_key_for,
 };
 
 const EMPTY_ROOTS_BOOTSTRAP_CONTROL_SCOPE_ID: &str = "__fsmeta_empty_roots_bootstrap";
@@ -295,6 +296,19 @@ fn ensure_scoped_internal_request_reply_ports(
                 ROUTE_KEY_SOURCE_RESCAN_INTERNAL
             ))
         })?;
+    let source_status_template = ports
+        .iter()
+        .find(|port| {
+            port.get("route_key").and_then(serde_yaml::Value::as_str)
+                == Some(ROUTE_KEY_SOURCE_STATUS_INTERNAL)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            CnxError::InvalidInput(format!(
+                "fs-meta startup manifest missing internal source-status port {}",
+                ROUTE_KEY_SOURCE_STATUS_INTERNAL
+            ))
+        })?;
     let source_roots_control_template = ports
         .iter()
         .find(|port| {
@@ -341,6 +355,10 @@ fn ensure_scoped_internal_request_reply_ports(
                 source_rescan_template.clone(),
             ),
             (
+                source_status_route_key_for(&node_id),
+                source_status_template.clone(),
+            ),
+            (
                 source_roots_control_route_key_for(&node_id),
                 source_roots_control_template.clone(),
             ),
@@ -364,6 +382,7 @@ fn ensure_scoped_internal_request_reply_ports(
                     ROUTE_KEY_SINK_QUERY_INTERNAL
                         | ROUTE_KEY_SOURCE_FIND_INTERNAL
                         | ROUTE_KEY_SOURCE_RESCAN_INTERNAL
+                        | ROUTE_KEY_SOURCE_STATUS_INTERNAL
                         | ROUTE_KEY_SOURCE_ROOTS_CONTROL
                         | ROUTE_KEY_SINK_ROOTS_CONTROL
                 )
@@ -505,64 +524,140 @@ fn scope_unit_intent_to_scope_worker_intent_value(
     }))
 }
 
+fn route_plan_peer_for_node_id(node_id: &str) -> RoutePlanPeer {
+    RoutePlanPeer {
+        node_id: NodeId(node_id.to_string()),
+        addr: String::new(),
+    }
+}
+
+fn route_plan_peers_for_node_ids<'a>(
+    node_ids: impl IntoIterator<Item = &'a String>,
+) -> Vec<RoutePlanPeer> {
+    node_ids
+        .into_iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|node_id| route_plan_peer_for_node_id(&node_id))
+        .collect()
+}
+
+fn route_plan_json(route_key: RouteKey, peers: Vec<RoutePlanPeer>) -> serde_json::Value {
+    serde_json::to_value(RoutePlanSpec {
+        route_key,
+        mode: RoutePlanMode::FanOut,
+        peers,
+    })
+    .unwrap_or_else(|_| serde_json::json!({}))
+}
+
 fn build_route_plans_json(_spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
     let mut plans = Vec::new();
-    let mut push_plan = |route_key: RouteKey| {
-        plans.push(
-            serde_json::to_value(RoutePlanSpec {
-                route_key,
-                mode: RoutePlanMode::FanOut,
-                peers: Vec::new(),
-            })
-            .unwrap_or_else(|_| serde_json::json!({})),
-        );
-    };
-    push_plan(RouteKey(format!(
-        "{}.stream",
-        ROUTE_KEY_SOURCE_RESCAN_CONTROL
-    )));
-    push_plan(RouteKey(format!(
-        "{}.req",
-        ROUTE_KEY_SOURCE_RESCAN_INTERNAL
-    )));
-    push_plan(RouteKey(format!(
-        "{}.stream",
-        ROUTE_KEY_SOURCE_ROOTS_CONTROL
-    )));
-    push_plan(RouteKey(format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL)));
-    push_plan(RouteKey(format!("{}.stream", ROUTE_KEY_EVENTS)));
-    push_plan(RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL)));
+    let all_route_plan_peers = route_plan_peers_for_node_ids(&_spec.route_plan_node_ids);
+    plans.push(route_plan_json(
+        RouteKey(format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)),
+        Vec::new(),
+    ));
+    plans.push(route_plan_json(
+        RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL)),
+        Vec::new(),
+    ));
+    plans.push(route_plan_json(
+        RouteKey(format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL)),
+        Vec::new(),
+    ));
+    plans.push(route_plan_json(
+        RouteKey(format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL)),
+        Vec::new(),
+    ));
+    plans.push(route_plan_json(
+        RouteKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
+        Vec::new(),
+    ));
+    plans.push(route_plan_json(
+        RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL)),
+        Vec::new(),
+    ));
     for node_id in _spec
         .route_plan_node_ids
         .iter()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>()
     {
-        push_plan(RouteKey(format!(
-            "{}.stream",
-            source_roots_control_route_key_for(&node_id)
-        )));
-        push_plan(source_rescan_request_route_for(&node_id));
-        push_plan(RouteKey(format!(
-            "{}.stream",
-            sink_roots_control_route_key_for(&node_id)
-        )));
-        push_plan(sink_query_request_route_for(&node_id));
+        plans.push(route_plan_json(
+            RouteKey(format!(
+                "{}.stream",
+                source_roots_control_route_key_for(&node_id)
+            )),
+            vec![route_plan_peer_for_node_id(&node_id)],
+        ));
+        let source_rescan_route = source_rescan_request_route_for(&node_id);
+        plans.push(route_plan_json(
+            source_rescan_route.clone(),
+            vec![route_plan_peer_for_node_id(&node_id)],
+        ));
+        plans.push(route_plan_json(
+            RouteKey(format!("{}:reply", source_rescan_route.0)),
+            all_route_plan_peers.clone(),
+        ));
+        let source_status_route = source_status_request_route_for(&node_id);
+        plans.push(route_plan_json(
+            source_status_route.clone(),
+            vec![route_plan_peer_for_node_id(&node_id)],
+        ));
+        plans.push(route_plan_json(
+            RouteKey(format!("{}:reply", source_status_route.0)),
+            all_route_plan_peers.clone(),
+        ));
+        plans.push(route_plan_json(
+            RouteKey(format!(
+                "{}.stream",
+                sink_roots_control_route_key_for(&node_id)
+            )),
+            vec![route_plan_peer_for_node_id(&node_id)],
+        ));
+        let sink_query_route = sink_query_request_route_for(&node_id);
+        plans.push(route_plan_json(
+            sink_query_route.clone(),
+            vec![route_plan_peer_for_node_id(&node_id)],
+        ));
+        plans.push(route_plan_json(
+            RouteKey(format!("{}:reply", sink_query_route.0)),
+            all_route_plan_peers.clone(),
+        ));
     }
-    push_plan(RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)));
-    push_plan(RouteKey(format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)));
-    push_plan(RouteKey(format!(
-        "{}.req",
-        ROUTE_KEY_SOURCE_STATUS_INTERNAL
-    )));
-    push_plan(RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)));
+    plans.push(route_plan_json(
+        RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)),
+        Vec::new(),
+    ));
+    plans.push(route_plan_json(
+        RouteKey(format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)),
+        Vec::new(),
+    ));
+    plans.push(route_plan_json(
+        RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)),
+        Vec::new(),
+    ));
+    plans.push(route_plan_json(
+        RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)),
+        Vec::new(),
+    ));
     for node_id in _spec
         .route_plan_node_ids
         .iter()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>()
     {
-        push_plan(source_find_request_route_for(&node_id));
+        let source_find_route = source_find_request_route_for(&node_id);
+        plans.push(route_plan_json(
+            source_find_route.clone(),
+            vec![route_plan_peer_for_node_id(&node_id)],
+        ));
+        plans.push(route_plan_json(
+            RouteKey(format!("{}:reply", source_find_route.0)),
+            all_route_plan_peers.clone(),
+        ));
     }
     plans
 }
@@ -597,6 +692,10 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
         );
         route_units.insert(
             source_rescan_request_route_for(&node_id).0,
+            serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
+        );
+        route_units.insert(
+            source_status_request_route_for(&node_id).0,
             serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
         );
     }
@@ -1003,6 +1102,78 @@ mod tests {
                 }),
                 "release route_plans must include source rescan request route {expected_route} so management rescan reaches active source runners"
             );
+        }
+    }
+
+    #[test]
+    fn route_plans_target_node_scoped_source_request_and_reply_lanes() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let plans = build_route_plans_json(&spec);
+        for node_id in &spec.route_plan_node_ids {
+            for request_route in [
+                source_rescan_request_route_for(node_id).0,
+                source_status_request_route_for(node_id).0,
+            ] {
+                let reply_route = format!("{request_route}:reply");
+                let request_plan = plans
+                    .iter()
+                    .find(|plan| {
+                        plan.get("route_key").and_then(serde_json::Value::as_str)
+                            == Some(request_route.as_str())
+                    })
+                    .expect("scoped source request route plan");
+                let request_peers = request_plan
+                    .get("peers")
+                    .and_then(serde_json::Value::as_array)
+                    .expect("request route peers");
+                assert_eq!(
+                    request_peers.len(),
+                    1,
+                    "node-scoped source request route must target exactly the named source node"
+                );
+                assert_eq!(
+                    request_peers[0]
+                        .get("node_id")
+                        .and_then(serde_json::Value::as_str),
+                    Some(node_id.as_str())
+                );
+
+                let reply_plan = plans
+                    .iter()
+                    .find(|plan| {
+                        plan.get("route_key").and_then(serde_json::Value::as_str)
+                            == Some(reply_route.as_str())
+                    })
+                    .expect("scoped source reply route plan");
+                let reply_peer_ids = reply_plan
+                    .get("peers")
+                    .and_then(serde_json::Value::as_array)
+                    .expect("reply route peers")
+                    .iter()
+                    .filter_map(|peer| peer.get("node_id").and_then(serde_json::Value::as_str))
+                    .collect::<std::collections::BTreeSet<_>>();
+                let expected = spec
+                    .route_plan_node_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    reply_peer_ids, expected,
+                    "node-scoped source reply route must remain reachable by current route-plan nodes"
+                );
+            }
         }
     }
 
@@ -1619,6 +1790,95 @@ mod tests {
             assert!(
                 scoped_use_port.contains("node_"),
                 "scoped source-rescan use_port should remain node-distinct for runtime attach identity: {scoped_use_port}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_manifest_activation_routes_cover_owner_scoped_internal_source_status_for_known_nodes()
+     {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let manifest_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/manifests/fs-meta.yaml");
+        let manifest =
+            build_startup_manifest_value(&manifest_path, &spec).expect("load startup manifest");
+        let activation_routes = activation_routes_from_manifest(&manifest);
+
+        for expected_route in spec
+            .route_plan_node_ids
+            .iter()
+            .map(|node_id| source_status_request_route_for(node_id).0)
+        {
+            assert!(
+                activation_routes.contains(&expected_route),
+                "startup manifest activation routes must cover owner-scoped source-status route {expected_route}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_manifest_scoped_source_status_ports_use_distinct_use_port_identity() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let manifest_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/manifests/fs-meta.yaml");
+        let manifest =
+            build_startup_manifest_value(&manifest_path, &spec).expect("load startup manifest");
+        let ports = manifest
+            .get("ports")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("ports sequence");
+
+        let generic_use_port = ports
+            .iter()
+            .find(|port| {
+                port.get("route_key").and_then(serde_yaml::Value::as_str)
+                    == Some(ROUTE_KEY_SOURCE_STATUS_INTERNAL)
+            })
+            .and_then(|port| port.get("use_port"))
+            .and_then(serde_yaml::Value::as_str)
+            .expect("generic source status use_port");
+
+        for node_id in &spec.route_plan_node_ids {
+            let scoped_use_port = ports
+                .iter()
+                .find(|port| {
+                    port.get("route_key").and_then(serde_yaml::Value::as_str)
+                        == Some(source_status_route_key_for(node_id).as_str())
+                })
+                .and_then(|port| port.get("use_port"))
+                .and_then(serde_yaml::Value::as_str)
+                .expect("scoped source status use_port");
+            assert_ne!(
+                scoped_use_port, generic_use_port,
+                "scoped source-status ports must not reuse the generic use_port identity"
+            );
+            assert!(
+                scoped_use_port.contains("node_"),
+                "scoped source-status use_port should remain node-distinct for runtime attach identity: {scoped_use_port}"
             );
         }
     }

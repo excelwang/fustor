@@ -25,6 +25,7 @@ use tempfile::tempdir;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::Duration;
 
+use crate::runtime::orchestration::SinkRuntimeUnit;
 use crate::runtime::routes::{
     METHOD_SINK_QUERY, ROUTE_KEY_EVENTS, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_ROOTS_CONTROL,
     ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
@@ -469,6 +470,22 @@ fn sink_control_frame_machine_deadline_exhaustion_beats_reset_retry_policy() {
 }
 
 #[test]
+fn sink_control_frame_machine_retained_replay_fails_fast_after_retryable_reset() {
+    let deadline = std::time::Instant::now() + Duration::from_millis(250);
+    let machine = SinkControlFrameMachine::new_retained_replay(deadline, &[]);
+
+    match machine.followup_after_error(CnxError::Timeout) {
+        SinkControlFrameFollowup::RestartAndFailFast(SinkFailure {
+            cause: CnxError::Timeout,
+            reason: SinkFailureReason::TimeoutLike,
+        }) => {}
+        other => panic!(
+            "retained sink replay must reconnect once and fail closed to app boundary, got {other:?}"
+        ),
+    }
+}
+
+#[test]
 fn sink_status_probe_retry_disposition_deadline_exhaustion_beats_reset_retry_policy() {
     match classify_sink_retry_disposition(
         std::time::Instant::now(),
@@ -761,6 +778,26 @@ fn sink_worker_client_retry_helper_uses_typed_runtime_adapter_mapping() {
     assert!(
         !sink_impl.contains(".with_started_retry(|client| {"),
         "workers/sink hard cut regressed; sink worker typed retry helper bounced back through the raw runtime retry shell",
+    );
+}
+
+#[test]
+fn sink_retained_replay_control_rpc_uses_single_started_attempt() {
+    let sink_impl = include_str!("../sink.rs");
+    let start = sink_impl
+        .find("async fn on_control_frame_with_timeouts_with_policy_with_failure(")
+        .expect("sink control-frame policy executor should exist");
+    let end = start
+        + sink_impl[start..]
+            .find("match rpc_result {")
+            .expect("sink control-frame dispatch should map an RPC result");
+    let executor = &sink_impl[start..end];
+
+    assert!(
+        executor.contains("if retained_replay_fail_closed {")
+            && executor.contains("self.with_started_once_with_failure(|client|")
+            && executor.contains("self.with_started_retry_with_failure(|client|"),
+        "sink retained control replay must use one started worker attempt and leave retry/reconnect policy to the sink control-frame machine",
     );
 }
 

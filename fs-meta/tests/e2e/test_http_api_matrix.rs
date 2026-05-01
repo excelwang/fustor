@@ -2,6 +2,7 @@
 
 use crate::support::api_client::{ApiResponse, FsMetaApiClient, OperatorSession};
 use crate::support::cluster5::Cluster5;
+use crate::support::full_demo_roots::{self, FullDemoRoot};
 use crate::support::nfs_lab::NfsLab;
 use crate::support::oracle::FsTreeOracle;
 use crate::support::{reserve_http_addrs, skip_unless_real_nfs_enabled, wait_until};
@@ -49,6 +50,9 @@ struct MatrixHarness {
     client: FsMetaApiClient,
     candidate_base_urls: Vec<String>,
     facade_count: usize,
+    roots: Vec<RootSpec>,
+    root_sources: BTreeMap<String, String>,
+    uses_full_demo_roots: bool,
 }
 
 const MINI_EXPORTS: [&str; 5] = [
@@ -170,13 +174,13 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
             run_status_and_grants_checks(
                 &harness.client,
                 &mut session,
-                &harness.lab,
+                &harness.root_sources,
                 harness.facade_count,
                 false,
                 false,
             )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
-            run_roots_matrix(&mut session, &harness.lab)?;
+            run_roots_matrix(&mut session, &harness.roots)?;
             eprintln!("[fs-meta-api-matrix] step=query-matrix");
             run_query_matrix(&harness.cluster, &mut session, &harness.lab)?;
             let metrics = session.bound_route_metrics()?;
@@ -199,13 +203,13 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
             run_status_and_grants_checks(
                 &harness.client,
                 &mut session,
-                &harness.lab,
+                &harness.root_sources,
                 harness.facade_count,
                 false,
                 false,
             )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
-            run_roots_matrix(&mut session, &harness.lab)?;
+            run_roots_matrix(&mut session, &harness.roots)?;
             eprintln!("[fs-meta-api-matrix] step=query-matrix");
             run_full_query_capacity_baseline_phase(&mut session)?;
             let metrics = session.bound_route_metrics()?;
@@ -228,7 +232,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
             run_status_and_grants_checks(
                 &harness.client,
                 &mut session,
-                &harness.lab,
+                &harness.root_sources,
                 harness.facade_count,
                 false,
                 false,
@@ -237,6 +241,12 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
     }
 
     if matches!(mode, MatrixMode::LiveOnlyOnly) {
+        if harness.uses_full_demo_roots {
+            return Err(
+                "live-only mutation phase requires the local NFS lab; unset FSMETA_FULL_NFS_ROOTS_FILE for this non-matrix diagnostic"
+                    .to_string(),
+            );
+        }
         eprintln!("[fs-meta-api-matrix] step=query-live-only");
         run_query_live_only_rescan_phase(&harness.cluster, &mut session, &harness.lab)?;
     }
@@ -248,16 +258,43 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
 
 fn build_matrix_harness(app_prefix: &str) -> Result<MatrixHarness, String> {
     let mut lab = NfsLab::start_with_exports(FULL_EXPORTS)?;
-    seed_baseline_content(&lab)?;
+    let full_demo_roots = full_demo_roots::logical_roots_from_env(&FULL_EXPORTS)?;
+    if full_demo_roots.is_none() {
+        seed_baseline_content(&lab)?;
+    }
     let cluster = Cluster5::start()?;
     let app_id = format!("{app_prefix}-{}", unique_suffix());
     let facade_resource_id = format!("fs-meta-tcp-listener-{app_id}");
     let facade_addrs = reserve_http_addrs(1)?;
-    install_baseline_resources(&cluster, &mut lab, &facade_resource_id, &facade_addrs)?;
+    if let Some(roots) = full_demo_roots.as_ref() {
+        install_full_demo_resources(&cluster, roots, &facade_resource_id, &facade_addrs)?;
+    } else {
+        install_baseline_resources(&cluster, &mut lab, &facade_resource_id, &facade_addrs)?;
+    }
 
-    let roots = baseline_roots(&lab);
-    let release =
+    let roots = full_demo_roots
+        .as_ref()
+        .map(|roots| roots.iter().map(FullDemoRoot::root_spec).collect())
+        .unwrap_or_else(|| baseline_roots(&lab));
+    let root_sources: BTreeMap<String, String> = full_demo_roots
+        .as_ref()
+        .map(|roots| {
+            roots
+                .iter()
+                .map(|root| (root.id.clone(), root.source.clone()))
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            FULL_EXPORTS
+                .iter()
+                .map(|export_name| ((*export_name).to_string(), lab.export_source(export_name)))
+                .collect()
+        });
+    let mut release =
         cluster.build_fs_meta_release(&app_id, &facade_resource_id, roots.clone(), 1, true)?;
+    if full_demo_roots.is_some() {
+        full_demo_roots::apply_bounded_audit_config(&mut release)?;
+    }
     cluster.apply_release("node-a", release)?;
 
     let candidate_base_urls = facade_addrs
@@ -278,6 +315,9 @@ fn build_matrix_harness(app_prefix: &str) -> Result<MatrixHarness, String> {
         client,
         candidate_base_urls,
         facade_count: facade_addrs.len(),
+        roots,
+        root_sources,
+        uses_full_demo_roots: full_demo_roots.is_some(),
     })
 }
 
@@ -306,6 +346,10 @@ fn build_mini_matrix_harness() -> Result<MatrixHarness, String> {
         Duration::from_secs(120),
     )?;
     let client = FsMetaApiClient::new(base_url)?;
+    let root_sources: BTreeMap<String, String> = MINI_EXPORTS
+        .iter()
+        .map(|export_name| ((*export_name).to_string(), lab.export_source(export_name)))
+        .collect();
 
     Ok(MatrixHarness {
         cluster,
@@ -313,6 +357,9 @@ fn build_mini_matrix_harness() -> Result<MatrixHarness, String> {
         client,
         candidate_base_urls,
         facade_count: facade_addrs.len(),
+        roots,
+        root_sources,
+        uses_full_demo_roots: false,
     })
 }
 
@@ -598,7 +645,7 @@ fn run_login_matrix(client: &FsMetaApiClient) -> Result<(), String> {
 fn run_status_and_grants_checks(
     client: &FsMetaApiClient,
     session: &mut OperatorSession,
-    lab: &NfsLab,
+    root_sources: &BTreeMap<String, String>,
     facade_count: usize,
     require_sink_groups: bool,
     require_sink_live_nodes: bool,
@@ -722,9 +769,11 @@ fn run_status_and_grants_checks(
         ));
     }
     for export_name in FULL_EXPORTS {
+        let expected_source = root_sources
+            .get(export_name)
+            .ok_or_else(|| format!("missing expected source for export {export_name}"))?;
         if !rows.iter().any(|row| {
-            row.get("fs_source").and_then(Value::as_str)
-                == Some(lab.export_source(export_name).as_str())
+            row.get("fs_source").and_then(Value::as_str) == Some(expected_source.as_str())
         }) {
             return Err(format!(
                 "runtime grants missing export {export_name}: {grants}"
@@ -1288,7 +1337,10 @@ fn validate_status_coverage_capabilities(
     Ok(())
 }
 
-fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), String> {
+fn run_roots_matrix(
+    session: &mut OperatorSession,
+    baseline_roots: &[RootSpec],
+) -> Result<(), String> {
     eprintln!("[fs-meta-api-matrix] substep=monitoring-roots-current");
     let current = session.monitoring_roots()?;
     let current_rows = current
@@ -1319,7 +1371,17 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
         ));
     }
 
-    let roots = baseline_roots(lab);
+    let roots = baseline_roots.to_vec();
+    let selector = selector_payload(
+        roots
+            .first()
+            .ok_or_else(|| "baseline roots must not be empty".to_string())?,
+    );
+    let second_selector = selector_payload(
+        roots
+            .get(1)
+            .ok_or_else(|| "baseline roots must contain at least two roots".to_string())?,
+    );
     let preview = session
         .client()
         .preview_roots_raw(session.token(), &roots_payload(&roots))?;
@@ -1355,7 +1417,7 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
             session.token(),
             &json!([{
                 "id": "",
-                "selector": { "fs_source": lab.export_source("nfs1") },
+                "selector": selector.clone(),
                 "subpath_scope": "/",
                 "watch": true,
                 "scan": true
@@ -1369,7 +1431,7 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
             session.token(),
             &json!([{
                 "id": "bad-subpath",
-                "selector": { "fs_source": lab.export_source("nfs1") },
+                "selector": selector.clone(),
                 "subpath_scope": "relative",
                 "watch": true,
                 "scan": true
@@ -1397,7 +1459,7 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
             session.token(),
             &json!([{
                 "id": "no-watch-scan",
-                "selector": { "fs_source": lab.export_source("nfs1") },
+                "selector": selector.clone(),
                 "subpath_scope": "/",
                 "watch": false,
                 "scan": false
@@ -1412,7 +1474,7 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
             &json!([{
                 "id": "legacy-path",
                 "path": "/legacy",
-                "selector": { "fs_source": lab.export_source("nfs1") },
+                "selector": selector.clone(),
                 "subpath_scope": "/",
                 "watch": true,
                 "scan": true
@@ -1427,7 +1489,7 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
             &json!([{
                 "id": "legacy-source-locator",
                 "source_locator": "legacy://nfs1",
-                "selector": { "fs_source": lab.export_source("nfs1") },
+                "selector": selector.clone(),
                 "subpath_scope": "/",
                 "watch": true,
                 "scan": true
@@ -1442,14 +1504,14 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
             &json!([
                 {
                     "id": "dup",
-                    "selector": { "fs_source": lab.export_source("nfs1") },
+                    "selector": selector.clone(),
                     "subpath_scope": "/",
                     "watch": true,
                     "scan": true
                 },
                 {
                     "id": "dup",
-                    "selector": { "fs_source": lab.export_source("nfs2") },
+                    "selector": second_selector,
                     "subpath_scope": "/",
                     "watch": true,
                     "scan": true
@@ -1461,7 +1523,7 @@ fn run_roots_matrix(session: &mut OperatorSession, lab: &NfsLab) -> Result<(), S
     )?;
 
     eprintln!("[fs-meta-api-matrix] substep=single-root-apply");
-    let single_root = vec![root_spec("nfs1", &lab.export_source("nfs1"))];
+    let single_root = vec![roots[0].clone()];
     let put = session
         .client()
         .update_roots_raw(session.token(), &roots_payload(&single_root))?;
@@ -1731,6 +1793,40 @@ fn install_baseline_resources(
     Ok(())
 }
 
+fn install_full_demo_resources(
+    cluster: &Cluster5,
+    roots: &[FullDemoRoot],
+    facade_resource_id: &str,
+    facade_addrs: &[String],
+) -> Result<(), String> {
+    for (node_name, export_name) in FULL_MOUNTS {
+        let root = roots
+            .iter()
+            .find(|root| root.id == export_name)
+            .ok_or_else(|| format!("full demo root {export_name} not mapped"))?;
+        let node_id = cluster.node_id(node_name)?;
+        cluster.announce_resources_clusterwide(vec![json!({
+            "resource_id": export_name,
+            "node_id": node_id,
+            "resource_kind": "nfs",
+            "source": root.source.clone(),
+            "host_ip": root.host_ip.clone(),
+            "mount_hint": root.mount_point.display().to_string(),
+        })])?;
+    }
+    for (node_name, bind_addr) in ["node-d", "node-e"].into_iter().zip(facade_addrs.iter()) {
+        let node_id = cluster.node_id(node_name)?;
+        cluster.announce_resources_clusterwide(vec![json!({
+            "resource_id": facade_resource_id,
+            "node_id": node_id,
+            "resource_kind": "tcp_listener",
+            "source": format!("http://{node_name}/listener/{facade_resource_id}"),
+            "bind_addr": bind_addr,
+        })])?;
+    }
+    Ok(())
+}
+
 fn install_mini_resources(
     cluster: &Cluster5,
     lab: &mut NfsLab,
@@ -1924,6 +2020,16 @@ fn root_spec(id: &str, fs_source: &str) -> RootSpec {
     }
 }
 
+fn selector_payload(root: &RootSpec) -> Value {
+    json!({
+        "fs_source": root.selector.fs_source.clone(),
+        "mount_point": root.selector.mount_point.as_ref().map(|path| path.display().to_string()),
+        "fs_type": root.selector.fs_type.clone(),
+        "host_ip": root.selector.host_ip.clone(),
+        "host_ref": root.selector.host_ref.clone(),
+    })
+}
+
 fn roots_payload(roots: &[RootSpec]) -> Value {
     Value::Array(
         roots
@@ -1931,13 +2037,7 @@ fn roots_payload(roots: &[RootSpec]) -> Value {
             .map(|root| {
                 json!({
                     "id": root.id,
-                    "selector": {
-                        "fs_source": root.selector.fs_source,
-                        "mount_point": root.selector.mount_point.as_ref().map(|p| p.display().to_string()),
-                        "fs_type": root.selector.fs_type,
-                        "host_ip": root.selector.host_ip,
-                        "host_ref": root.selector.host_ref,
-                    },
+                    "selector": selector_payload(root),
                     "subpath_scope": root.subpath_scope.display().to_string(),
                     "watch": root.watch,
                     "scan": root.scan,

@@ -95,6 +95,7 @@ const TRUSTED_MATERIALIZED_READINESS_SETTLE_BACKOFF: Duration = Duration::from_m
 const LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE: Duration = Duration::from_millis(250);
 const STATUS_ROUTE_ATTEMPT_TIMEOUT_CAP: Duration = Duration::from_secs(5);
 const STATUS_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(30);
+const SOURCE_STATUS_ROUTE_REPLY_HEADROOM: Duration = Duration::from_millis(250);
 const SELECTED_GROUP_PROXY_ROUTE_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 // Force-find is intentionally a slower freshness path. Keep a larger collection
 // window here so the request remains in-flight long enough for overlap guards
@@ -983,6 +984,74 @@ pub(crate) fn internal_status_request_payload() -> Bytes {
     Bytes::from_static(&[0x80])
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct InternalSourceStatusRequest {
+    purpose: Option<String>,
+    live_probe_timeout_ms: Option<u64>,
+}
+
+fn duration_ms_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn source_status_live_probe_timeout_for_collect(collect_timeout: Duration) -> Duration {
+    let live_probe_timeout = collect_timeout.saturating_sub(SOURCE_STATUS_ROUTE_REPLY_HEADROOM);
+    if live_probe_timeout.is_zero() {
+        collect_timeout
+    } else {
+        live_probe_timeout
+    }
+}
+
+pub(crate) fn internal_status_request_payload_with_live_probe_timeout(
+    collect_timeout: Duration,
+) -> Bytes {
+    let live_probe_timeout = source_status_live_probe_timeout_for_collect(collect_timeout);
+    rmp_serde::to_vec_named(&InternalSourceStatusRequest {
+        purpose: None,
+        live_probe_timeout_ms: Some(duration_ms_u64(live_probe_timeout)),
+    })
+    .map(Bytes::from)
+    .unwrap_or_else(|_| internal_status_request_payload())
+}
+
+pub(crate) fn manual_rescan_source_status_request_payload() -> Bytes {
+    rmp_serde::to_vec_named(&InternalSourceStatusRequest {
+        purpose: Some("manual-rescan-delivery".to_string()),
+        live_probe_timeout_ms: None,
+    })
+    .map(Bytes::from)
+    .unwrap_or_else(|_| internal_status_request_payload())
+}
+
+pub(crate) fn manual_rescan_source_status_request_payload_with_live_probe_timeout(
+    collect_timeout: Duration,
+) -> Bytes {
+    let live_probe_timeout = source_status_live_probe_timeout_for_collect(collect_timeout);
+    rmp_serde::to_vec_named(&InternalSourceStatusRequest {
+        purpose: Some("manual-rescan-delivery".to_string()),
+        live_probe_timeout_ms: Some(duration_ms_u64(live_probe_timeout)),
+    })
+    .map(Bytes::from)
+    .unwrap_or_else(|_| manual_rescan_source_status_request_payload())
+}
+
+pub(crate) fn source_status_request_live_probe_timeout(payload: &[u8]) -> Option<Duration> {
+    rmp_serde::from_slice::<InternalSourceStatusRequest>(payload)
+        .ok()
+        .and_then(|request| request.live_probe_timeout_ms)
+        .map(Duration::from_millis)
+}
+
+pub(crate) fn source_status_request_requires_manual_rescan_delivery_evidence(
+    payload: &[u8],
+) -> bool {
+    rmp_serde::from_slice::<InternalSourceStatusRequest>(payload)
+        .ok()
+        .and_then(|request| request.purpose)
+        .is_some_and(|purpose| purpose == "manual-rescan-delivery")
+}
+
 fn merge_source_status_snapshots(mut snapshots: Vec<SourceStatusSnapshot>) -> SourceStatusSnapshot {
     if snapshots.is_empty() {
         return SourceStatusSnapshot::default();
@@ -1281,7 +1350,13 @@ impl StatusRouteMachine {
                         .call_collect(
                             ROUTE_TOKEN_FS_META_INTERNAL,
                             method,
-                            internal_status_request_payload(),
+                            if method == METHOD_SOURCE_STATUS {
+                                internal_status_request_payload_with_live_probe_timeout(
+                                    attempt.attempt_timeout,
+                                )
+                            } else {
+                                internal_status_request_payload()
+                            },
                             attempt.attempt_timeout,
                             attempt.collect_idle_grace,
                         )
@@ -1571,7 +1646,7 @@ async fn load_materialized_status_snapshots_with_failure(
                 Err(err @ CnxError::Timeout)
                 | Err(err @ CnxError::TransportClosed(_))
                 | Err(err @ CnxError::ProtocolViolation(_)) => sink
-                    .status_snapshot_with_failure()
+                    .status_snapshot_nonblocking_for_readiness_fan_in()
                     .await
                     .map_err(|_| QueryWorkerObservationFailure::from(err))?,
                 Err(err) => return Err(err.into()),
@@ -6463,6 +6538,38 @@ fn status_route_plan_caps_attempt_timeout_to_canonical_cap() {
 }
 
 #[test]
+fn source_status_request_carries_live_probe_budget_inside_collect_attempt() {
+    let payload = internal_status_request_payload_with_live_probe_timeout(Duration::from_secs(3));
+
+    assert_eq!(
+        source_status_request_live_probe_timeout(&payload),
+        Some(Duration::from_millis(2750)),
+        "source-status live probe budget must leave route-reply headroom inside the collect attempt"
+    );
+    assert!(
+        !source_status_request_requires_manual_rescan_delivery_evidence(&payload),
+        "ordinary status-route budget payload must not be treated as manual-rescan delivery evidence"
+    );
+}
+
+#[test]
+fn manual_rescan_source_status_request_carries_delivery_probe_budget_inside_collect_attempt() {
+    let payload = manual_rescan_source_status_request_payload_with_live_probe_timeout(
+        Duration::from_secs(20),
+    );
+
+    assert_eq!(
+        source_status_request_live_probe_timeout(&payload),
+        Some(Duration::from_millis(19750)),
+        "manual-rescan source-status delivery probe must leave route-reply headroom inside the collect attempt"
+    );
+    assert!(
+        source_status_request_requires_manual_rescan_delivery_evidence(&payload),
+        "manual-rescan status-route budget payload must preserve delivery-evidence purpose"
+    );
+}
+
+#[test]
 fn status_route_machine_owns_attempt_budget_and_retry_followup() {
     let now = tokio::time::Instant::now();
     let machine = StatusRoutePlan::new(Duration::from_secs(30), STATUS_ROUTE_COLLECT_IDLE_GRACE)
@@ -8885,10 +8992,12 @@ fn origin_count_entry_group_and_count(entry: &str) -> Option<(&str, u64)> {
 fn applied_sink_owner_node_for_group(
     sink_status: &SinkStatusSnapshot,
     group_id: &str,
+    allowed_nodes: &[NodeId],
 ) -> Option<NodeId> {
     sink_status
         .stream_applied_origin_counts_by_node
         .iter()
+        .filter(|(node_id, _)| allowed_nodes.iter().any(|allowed| allowed.0 == **node_id))
         .filter_map(|(node_id, origin_counts)| {
             let applied_count = origin_counts
                 .iter()
@@ -8910,10 +9019,6 @@ fn scheduled_sink_owner_node_for_group(
     sink_status: &SinkStatusSnapshot,
     group_id: &str,
 ) -> Option<NodeId> {
-    if let Some(node_id) = applied_sink_owner_node_for_group(sink_status, group_id) {
-        return Some(node_id);
-    }
-
     let mut scheduled_nodes = sink_status
         .scheduled_groups_by_node
         .iter()
@@ -8923,12 +9028,28 @@ fn scheduled_sink_owner_node_for_group(
     scheduled_nodes.sort_by(|a, b| a.0.cmp(&b.0));
     scheduled_nodes.dedup_by(|a, b| a.0 == b.0);
 
-    if let Some(primary_node) = sink_status
+    let primary_node = sink_status
         .groups
         .iter()
         .find(|group| group.group_id == group_id)
-        .and_then(|group| node_id_from_object_ref(&group.primary_object_ref))
+        .and_then(|group| node_id_from_object_ref(&group.primary_object_ref));
+
+    let mut owner_candidates = scheduled_nodes.clone();
+    if let Some(primary_node) = primary_node.clone()
+        && !owner_candidates.iter().any(|node| node.0 == primary_node.0)
     {
+        owner_candidates.push(primary_node);
+    }
+    owner_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    owner_candidates.dedup_by(|a, b| a.0 == b.0);
+
+    if let Some(node_id) =
+        applied_sink_owner_node_for_group(sink_status, group_id, &owner_candidates)
+    {
+        return Some(node_id);
+    }
+
+    if let Some(primary_node) = primary_node {
         if scheduled_nodes.is_empty() || scheduled_nodes.iter().any(|node| node.0 == primary_node.0)
         {
             return Some(primary_node);

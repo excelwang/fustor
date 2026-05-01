@@ -5,6 +5,7 @@ pub mod cluster5;
 #[path = "../../common/control_protocol.rs"]
 pub mod control_protocol;
 pub mod cpu_budget;
+pub mod full_demo_roots;
 pub mod nfs_lab;
 pub mod oracle;
 #[path = "../../common/runtime_admin.rs"]

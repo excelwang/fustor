@@ -14,7 +14,7 @@ fn e2e_tmp_root() -> PathBuf {
     {
         let dir = PathBuf::from(raw);
         fs::create_dir_all(&dir).expect("create e2e temp root");
-        return dir;
+        return fs::canonicalize(&dir).expect("canonicalize e2e temp root");
     }
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -22,7 +22,7 @@ fn e2e_tmp_root() -> PathBuf {
         .join(".tmp")
         .join("fs-meta-e2e");
     fs::create_dir_all(&dir).expect("create default e2e temp root");
-    dir
+    fs::canonicalize(&dir).expect("canonicalize default e2e temp root")
 }
 
 fn real_nfs_lab_parent_dir() -> PathBuf {
@@ -119,9 +119,11 @@ impl NfsLab {
                 .reason
                 .unwrap_or_else(|| "real NFS preflight failed".to_string()));
         }
+        let lab_parent = real_nfs_lab_parent_dir();
+        cleanup_stale_runtime_app_nfs_state(&lab_parent)?;
         let temp = tempfile::Builder::new()
             .prefix(".tmp")
-            .tempdir_in(real_nfs_lab_parent_dir())
+            .tempdir_in(lab_parent)
             .map_err(|e| format!("create NFS lab tempdir failed: {e}"))?;
         let exports_dir = temp.path().join("exports");
         let mounts_dir = temp.path().join("mounts");
@@ -386,4 +388,153 @@ fn sudo_status<const N: usize>(args: [&str; N]) -> Result<ExitStatus, String> {
         .args(args)
         .status()
         .map_err(|e| format!("sudo {:?} failed to start: {e}", args.as_slice()))
+}
+
+fn cleanup_stale_runtime_app_nfs_state(parent: &Path) -> Result<(), String> {
+    for mount_path in mounted_paths_under_parent(parent)? {
+        let status = sudo_status(["umount", mount_path.to_string_lossy().as_ref()])?;
+        if !status.success() {
+            let fallback =
+                sudo_status(["umount", "-f", "-l", mount_path.to_string_lossy().as_ref()])?;
+            if !fallback.success() {
+                return Err(format!(
+                    "cleanup stale runtime-app NFS mount {} failed with status {}; fallback umount -f -l failed with status {}",
+                    mount_path.display(),
+                    status,
+                    fallback
+                ));
+            }
+        }
+    }
+
+    let output = Command::new("sudo")
+        .arg("-n")
+        .arg("exportfs")
+        .arg("-v")
+        .output()
+        .map_err(|e| format!("list exportfs entries failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("exportfs -v failed with status {}", output.status));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for export_path in exportfs_paths_under_parent(&stdout, parent) {
+        let status = sudo_status(["exportfs", "-u", &format!("127.0.0.1:{}", export_path.display())])?;
+        if !status.success() {
+            return Err(format!(
+                "cleanup stale runtime-app NFS export {} failed with status {}",
+                export_path.display(),
+                status
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn mounted_paths_under_parent(parent: &Path) -> Result<Vec<PathBuf>, String> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("read /proc/self/mountinfo failed: {e}"))?;
+    Ok(mountinfo
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split(" - ").next()?.split_whitespace().collect::<Vec<_>>();
+            let mount_point = fields.get(4)?;
+            let decoded = decode_mountinfo_path(mount_point);
+            decoded.starts_with(parent).then_some(decoded)
+        })
+        .collect())
+}
+
+fn exportfs_paths_under_parent(exportfs_stdout: &str, parent: &Path) -> Vec<PathBuf> {
+    let mut paths = exportfs_stdout
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || !trimmed.starts_with('/') {
+                return None;
+            }
+            let path = PathBuf::from(trimmed.split_whitespace().next()?);
+            path.starts_with(parent).then_some(path)
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+fn decode_mountinfo_path(raw: &str) -> PathBuf {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && bytes[index + 1].is_ascii_digit()
+            && bytes[index + 2].is_ascii_digit()
+            && bytes[index + 3].is_ascii_digit()
+        {
+            let value = (bytes[index + 1] - b'0') * 64
+                + (bytes[index + 2] - b'0') * 8
+                + (bytes[index + 3] - b'0');
+            decoded.push(value);
+            index += 4;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    PathBuf::from(String::from_utf8_lossy(&decoded).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Component, Path};
+
+    use super::{decode_mountinfo_path, exportfs_paths_under_parent, real_nfs_lab_parent_dir};
+
+    #[test]
+    fn real_nfs_lab_parent_dir_is_canonical_for_nfs_export_identity() {
+        let parent = real_nfs_lab_parent_dir();
+        assert!(
+            parent.is_absolute(),
+            "NFS export parent must be absolute: {}",
+            parent.display()
+        );
+        assert!(
+            !parent
+                .components()
+                .any(|component| matches!(component, Component::ParentDir)),
+            "NFS export parent must not contain '..': {}",
+            parent.display()
+        );
+    }
+
+    #[test]
+    fn exportfs_paths_under_parent_extracts_only_runtime_app_exports() {
+        let parent = Path::new("/tmp/fs-meta-e2e/runtime-app-real-nfs");
+        let output = "\
+/tmp/fs-meta-e2e/runtime-app-real-nfs/.tmpabc/exports/nfs1
+\t\t127.0.0.1(sync,rw)
+/tmp/other/.tmpabc/exports/nfs1
+\t\t127.0.0.1(sync,rw)
+/tmp/fs-meta-e2e/runtime-app-real-nfs/.tmpabc/exports/nfs2
+\t\t127.0.0.1(sync,rw)
+";
+
+        assert_eq!(
+            exportfs_paths_under_parent(output, parent),
+            vec![
+                Path::new("/tmp/fs-meta-e2e/runtime-app-real-nfs/.tmpabc/exports/nfs1")
+                    .to_path_buf(),
+                Path::new("/tmp/fs-meta-e2e/runtime-app-real-nfs/.tmpabc/exports/nfs2")
+                    .to_path_buf(),
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_mountinfo_path_decodes_octal_escapes() {
+        assert_eq!(
+            decode_mountinfo_path("/tmp/fs\\040meta/nfs1"),
+            Path::new("/tmp/fs meta/nfs1")
+        );
+    }
 }

@@ -1591,9 +1591,7 @@ impl RunningNode {
         include_admin_key: bool,
     ) {
         cmd.env("CAPANIX_HOME", home_dir)
-            .env("DATANIX_HOME", home_dir)
-            .env("CAPANIX_TARGET_QUORUM_TIMEOUT_MS", "15000")
-            .env("DATANIX_TARGET_QUORUM_TIMEOUT_MS", "15000");
+            .env("DATANIX_HOME", home_dir);
         if include_node_key {
             cmd.env("CAPANIX_NODE_SK_B64", &node.node_sk_b64);
             cmd.env("DATANIX_NODE_SK_B64", &node.node_sk_b64);
@@ -1726,6 +1724,26 @@ fn control_socket_startup_timeout() -> Duration {
     Duration::from_secs(secs.max(1))
 }
 
+fn local_control_socket_io_timeout() -> Duration {
+    let secs = std::env::var("DATANIX_TEST_LOCAL_CTL_IO_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(15);
+    Duration::from_secs(secs.max(1))
+}
+
+fn connect_local_control_socket(socket_path: &Path) -> Result<UnixStream, String> {
+    let stream = UnixStream::connect(socket_path).map_err(|e| format!("connect socket: {e}"))?;
+    let timeout = local_control_socket_io_timeout();
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("set socket read timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| format!("set socket write timeout: {e}"))?;
+    Ok(stream)
+}
+
 fn unique_suffix() -> u128 {
     static NEXT_NONCE: OnceLock<AtomicU64> = OnceLock::new();
     let ts = SystemTime::now()
@@ -1754,8 +1772,7 @@ fn request_cluster_state(socket_path: &Path) -> Result<Value, String> {
         serde_json::from_value(req).map_err(|e| format!("decode ctl request: {e}"))?;
     let body = rmp_serde::to_vec_named(&ControlEnvelope::Command(ctl_req))
         .map_err(|e| format!("encode request envelope: {e}"))?;
-    let mut stream =
-        UnixStream::connect(socket_path).map_err(|e| format!("connect socket: {e}"))?;
+    let mut stream = connect_local_control_socket(socket_path)?;
     let n = body.len() as u32;
     stream
         .write_all(&n.to_le_bytes())
@@ -1840,8 +1857,7 @@ fn request_ctl(socket_path: &Path, req: &Value) -> Result<Value, String> {
         serde_json::from_value(req.clone()).map_err(|e| format!("decode ctl request: {e}"))?;
     let body = rmp_serde::to_vec_named(&ControlEnvelope::Command(ctl_req))
         .map_err(|e| format!("encode request envelope: {e}"))?;
-    let mut stream =
-        UnixStream::connect(socket_path).map_err(|e| format!("connect socket: {e}"))?;
+    let mut stream = connect_local_control_socket(socket_path)?;
     let n = body.len() as u32;
     stream
         .write_all(&n.to_le_bytes())
@@ -1883,8 +1899,7 @@ fn request_ctl_ok(socket_path: &Path, command: Value, auth: Value) -> Result<Val
 fn request_runtime_admin(socket_path: &Path, req: &Value) -> Result<Value, String> {
     let body = encode_runtime_admin_request_value(req.clone())
         .map_err(|e| format!("encode runtime-admin request envelope: {e}"))?;
-    let mut stream =
-        UnixStream::connect(socket_path).map_err(|e| format!("connect socket: {e}"))?;
+    let mut stream = connect_local_control_socket(socket_path)?;
     let n = body.len() as u32;
     stream
         .write_all(&n.to_le_bytes())
@@ -2454,6 +2469,37 @@ mod tests {
             err.contains("control socket") || err.contains("connectable") || err.contains("socket"),
             "error should explain that the path was not a usable control socket: {err}"
         );
+    }
+
+    #[test]
+    fn local_control_socket_client_uses_bounded_io_timeouts() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let socket_path = temp.path().join("ctl.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind test socket");
+        let accept_thread = thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept control client");
+        });
+
+        let stream = connect_local_control_socket(&socket_path)
+            .expect("connect bounded local control socket");
+
+        assert_eq!(
+            stream
+                .read_timeout()
+                .expect("read timeout query should succeed"),
+            Some(local_control_socket_io_timeout()),
+            "local control socket reads must be bounded so e2e wait loops cannot hang behind a stuck daemon handler",
+        );
+        assert_eq!(
+            stream
+                .write_timeout()
+                .expect("write timeout query should succeed"),
+            Some(local_control_socket_io_timeout()),
+            "local control socket writes must be bounded so e2e wait loops cannot hang behind a stuck daemon handler",
+        );
+        drop(stream);
+        accept_thread.join().expect("accept thread should finish");
     }
 
     #[test]
@@ -3116,6 +3162,36 @@ mod tests {
         assert!(
             rust_log.is_none(),
             "real-NFS harness must not force capanixd into RUST_LOG=debug during cpu_budget steady sampling"
+        );
+    }
+
+    #[test]
+    fn running_node_child_env_preserves_capanix_relation_quorum_budget() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let node = NodeIdentity {
+            name: "node-a".to_string(),
+            node_id: "node-a-id".to_string(),
+            node_sk_b64: "node-sk".to_string(),
+            node_pk_b64: "node-pk".to_string(),
+        };
+        let mut cmd = Command::new("env");
+        RunningNode::apply_child_env(&mut cmd, temp.path(), &node, true, true);
+
+        let explicit_quorum_env = cmd
+            .get_envs()
+            .filter_map(|(key, value)| {
+                matches!(
+                    key.to_str(),
+                    Some("CAPANIX_TARGET_QUORUM_TIMEOUT_MS")
+                        | Some("DATANIX_TARGET_QUORUM_TIMEOUT_MS")
+                )
+                .then_some(value)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            explicit_quorum_env.is_empty(),
+            "real-NFS harness must keep capanix's bounded default relation-target quorum budget instead of forcing a shorter demo timeout"
         );
     }
 

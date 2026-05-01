@@ -665,6 +665,116 @@ async fn future_generation_facade_deactivate_without_successor_activate_keeps_qu
 }
 
 #[tokio::test]
+async fn pending_successor_facade_cleanup_deactivate_keeps_active_listener_until_exposure() {
+    let tmp = tempdir().expect("create temp dir");
+    let bind_addr = reserve_bind_addr();
+    let root = tmp.path().join("root-a");
+    fs::create_dir_all(&root).expect("create root");
+    let (passwd_path, shadow_path) = write_auth_files(&tmp);
+    let cfg = FSMetaConfig {
+        source: SourceConfig {
+            roots: vec![source::config::RootSpec::new("root-a", &root)],
+            host_object_grants: vec![granted_mount_root("single-app-node::root-a-1", &root)],
+            ..local_source_config()
+        },
+        api: api::ApiConfig {
+            enabled: true,
+            facade_resource_id: "listener-a".to_string(),
+            local_listener_resources: vec![api::config::ApiListenerResource {
+                resource_id: "listener-a".to_string(),
+                bind_addr: bind_addr.clone(),
+            }],
+            auth: api::ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                ..api::ApiAuthConfig::default()
+            },
+        },
+    };
+    let app = FSMetaApp::with_boundaries(
+        cfg,
+        NodeId("single-app-node".into()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init app");
+    let active_facade = match api::spawn(
+        app.config
+            .api
+            .resolve_for_candidate_ids(&["listener-a".to_string()])
+            .expect("resolve facade config"),
+        app.node_id.clone(),
+        app.runtime_boundary.clone(),
+        app.source.clone(),
+        app.sink.clone(),
+        app.query_sink.clone(),
+        app.runtime_boundary.clone(),
+        app.facade_pending_status.clone(),
+        app.facade_service_state.clone(),
+        app.api_request_tracker.clone(),
+        app.api_control_gate.clone(),
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(CnxError::InvalidInput(msg))
+            if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+        {
+            return;
+        }
+        Err(err) => panic!("spawn active facade: {err}"),
+    };
+    *app.api_task.lock().await = Some(FacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 5,
+        resource_ids: vec!["listener-a".to_string()],
+        handle: active_facade,
+    });
+    let resolved = app
+        .config
+        .api
+        .resolve_for_candidate_ids(&["listener-a".to_string()])
+        .expect("resolve pending facade config");
+    *app.pending_facade.lock().await = Some(PendingFacadeActivation {
+        route_key: facade_control_stream_route(),
+        generation: 6,
+        resource_ids: vec!["listener-a".to_string()],
+        bound_scopes: vec![RuntimeBoundScope {
+            scope_id: "listener-a".to_string(),
+            resource_ids: vec!["listener-a".to_string()],
+        }],
+        group_ids: Vec::new(),
+        runtime_managed: true,
+        runtime_exposure_confirmed: false,
+        resolved,
+    });
+
+    let shutdown_started = Arc::new(Notify::new());
+    let _shutdown_reset = FacadeShutdownStartHookReset;
+    install_facade_shutdown_start_hook(FacadeShutdownStartHook {
+        entered: shutdown_started.clone(),
+        release: None,
+    });
+    let shutdown_wait = shutdown_started.notified();
+
+    app.apply_facade_deactivate(FacadeRuntimeUnit::Facade, &facade_control_stream_route(), 4, false)
+        .await
+        .expect("cleanup facade deactivate should not error");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), shutdown_wait)
+            .await
+            .is_err(),
+        "cleanup-only facade deactivate must not shut down the active listener while a higher-generation successor facade is still waiting for runtime exposure"
+    );
+    assert!(
+        app.api_task.lock().await.is_some(),
+        "active facade must remain installed until the pending successor is exposed"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test]
 async fn uninitialized_same_generation_facade_deactivate_keeps_listener_available() {
     let tmp = tempdir().expect("create temp dir");
     let bind_addr = reserve_bind_addr();

@@ -163,6 +163,120 @@ async fn deferred_sink_replay_after_source_repair_is_lane_scoped_and_clears_on_r
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_source_generation_cutover_arms_worker_replay_obligation() {
+    let _hook_guard = source_release_cutover_hook_guard().await;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    let nfs1_source = nfs1.display().to_string();
+    let nfs2_source = nfs2.display().to_string();
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![
+                        worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                        worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                    ],
+                    host_object_grants: vec![
+                        worker_export_with_fs_source(
+                            "node-a::nfs1",
+                            "node-a",
+                            "127.0.0.11",
+                            &nfs1_source,
+                            nfs1.clone(),
+                        ),
+                        worker_export_with_fs_source(
+                            "node-a::nfs2",
+                            "node-a",
+                            "127.0.0.12",
+                            &nfs2_source,
+                            nfs2.clone(),
+                        ),
+                    ],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".into()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init external-worker app"),
+    );
+
+    let source_scopes = &[
+        ("nfs1", &["node-a::nfs1"][..]),
+        ("nfs2", &["node-a::nfs2"][..]),
+    ];
+    let source_roots_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let source_wave = vec![
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_roots_route.clone(),
+            source_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            source_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            source_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            source_scopes,
+            2,
+        ),
+    ];
+    let source_signals = crate::runtime::orchestration::source_control_signals_from_envelopes(
+        &source_wave,
+    )
+    .expect("decode source cutover wave");
+
+    assert!(
+        !app.source.retained_replay_required().await,
+        "precondition: worker retained source replay starts clear",
+    );
+    app.defer_source_generation_cutover_replay_inline(&source_signals)
+        .await
+        .expect("defer source generation cutover replay");
+
+    assert!(
+        app.source.retained_replay_required().await,
+        "deferred source generation cutover must arm worker retained replay; otherwise source repair can clear app replay without applying retained source state",
+    );
+    let retained = app.source.retained_control_state_for_tests().await;
+    assert!(
+        retained.active_by_route.contains_key(&(
+            execution_units::SOURCE_RUNTIME_UNIT_ID.to_string(),
+            source_roots_route,
+        )),
+        "deferred source generation cutover must retain source route state for recovery",
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_release_cutover_source_retryable_reset_fail_closes_without_inline_replay_blocking_quorum(
 ) {
     let _hook_guard = source_release_cutover_hook_guard().await;
@@ -675,6 +789,12 @@ async fn fail_closed_release_cutover_keeps_source_status_recovery_lane_live() {
             source_scopes,
             2,
         ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            source_scopes,
+            2,
+        ),
     ];
     wave.extend([
         activate_envelope_with_scope_rows(execution_units::SINK_RUNTIME_UNIT_ID, source_scopes, 2),
@@ -754,6 +874,158 @@ async fn fail_closed_release_cutover_keeps_source_status_recovery_lane_live() {
             .iter()
             .any(|snapshot| !snapshot.source_primary_by_group.is_empty()),
         "source status recovery should return source-primary evidence after retained replay",
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_rescan_source_status_repairs_retained_source_replay_before_live_evidence() {
+    let _hook_guard = source_release_cutover_hook_guard().await;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    let nfs1_source = nfs1.display().to_string();
+    let nfs2_source = nfs2.display().to_string();
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![
+                        worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                        worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                    ],
+                    host_object_grants: vec![
+                        worker_export_with_fs_source(
+                            "node-a::nfs1",
+                            "node-a",
+                            "127.0.0.11",
+                            &nfs1_source,
+                            nfs1.clone(),
+                        ),
+                        worker_export_with_fs_source(
+                            "node-a::nfs2",
+                            "node-a",
+                            "127.0.0.12",
+                            &nfs2_source,
+                            nfs2.clone(),
+                        ),
+                    ],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".into()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init external-worker app"),
+    );
+
+    let source_scopes = &[
+        ("nfs1", &["node-a::nfs1"][..]),
+        ("nfs2", &["node-a::nfs2"][..]),
+    ];
+    let mut wave = vec![
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            source_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            source_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            source_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            source_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            source_scopes,
+            2,
+        ),
+    ];
+    wave.extend([
+        activate_envelope_with_scope_rows(execution_units::SINK_RUNTIME_UNIT_ID, source_scopes, 2),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            source_scopes,
+            2,
+        ),
+    ]);
+
+    let _source_apply_error_reset = SourceApplyErrorQueueHookReset;
+    install_source_apply_error_queue_hook(SourceApplyErrorQueueHook {
+        errs: std::collections::VecDeque::from(vec![CnxError::Timeout]),
+    });
+
+    app.on_control_frame(&wave)
+        .await
+        .expect("retryable source reset should fail closed inside app");
+    assert!(
+        app.source_state_replay_required(),
+        "precondition: release cutover source reset must leave retained source replay pending",
+    );
+
+    let adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+        crate::runtime::routes::default_route_bindings(),
+    );
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        query::api::manual_rescan_source_status_request_payload(),
+        Duration::from_secs(12),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("manual-rescan source-status should repair retained source replay and return evidence");
+    let snapshots = events
+        .iter()
+        .map(|event| {
+            rmp_serde::from_slice::<crate::workers::source::SourceObservabilitySnapshot>(
+                event.payload_bytes(),
+            )
+            .expect("decode source observability snapshot")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        snapshots
+            .iter()
+            .any(|snapshot| snapshot.source_primary_by_group.contains_key("nfs1")
+                && snapshot.source_primary_by_group.contains_key("nfs2")),
+        "manual-rescan source-status must return live current-root source evidence after retained replay: {snapshots:?}",
+    );
+    assert!(
+        !app.source_state_replay_required(),
+        "manual-rescan source-status must clear retained source replay before reporting live delivery evidence",
     );
 
     app.close().await.expect("close app");

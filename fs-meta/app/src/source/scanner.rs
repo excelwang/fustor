@@ -9,7 +9,7 @@ use std::io;
 #[cfg(target_family = "unix")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -70,6 +70,57 @@ mod tests {
             NodeId("node-a::nfs1".to_string()),
             Arc::new(host_fs),
         )
+    }
+
+    #[derive(Clone)]
+    struct WideTreeHostFs {
+        width: usize,
+        read_dir_calls: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    impl WideTreeHostFs {
+        fn new(width: usize) -> Self {
+            Self {
+                width,
+                read_dir_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn read_dir_calls(&self) -> Vec<PathBuf> {
+            lock_or_recover(&self.read_dir_calls, "test.wide_tree.read_dir_calls").clone()
+        }
+    }
+
+    impl HostFs for WideTreeHostFs {
+        fn metadata(&self, path: &Path) -> io::Result<HostFsMetadata> {
+            Ok(HostFsMetadata {
+                is_dir: true,
+                len: 0,
+                modified: Some(UNIX_EPOCH + Duration::from_secs(1)),
+                created: Some(UNIX_EPOCH + Duration::from_secs(1)),
+                dev: Some(1),
+                ino: Some(derived_ino_for_path(path)),
+            })
+        }
+
+        fn symlink_metadata(&self, path: &Path) -> io::Result<HostFsMetadata> {
+            self.metadata(path)
+        }
+
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<HostFsDirEntry>> {
+            lock_or_recover(&self.read_dir_calls, "test.wide_tree.read_dir_calls")
+                .push(path.to_path_buf());
+            if path == Path::new("/root") {
+                Ok((0..self.width)
+                    .map(|idx| HostFsDirEntry {
+                        path: PathBuf::from(format!("/root/child-{idx}")),
+                        is_dir: true,
+                    })
+                    .collect())
+            } else {
+                Ok(Vec::new())
+            }
+        }
     }
 
     fn drift_estimator() -> Arc<Mutex<DriftEstimator>> {
@@ -138,6 +189,65 @@ mod tests {
 
         assert!(err.to_string().contains("root missing"));
     }
+
+    #[test]
+    fn audit_scan_closes_epoch_with_budgeted_root_coverage_without_walking_full_tree() {
+        let host_fs = WideTreeHostFs::new(128);
+        let scanner = ParallelScanner::new(
+            PathBuf::from("/root"),
+            PathBuf::new(),
+            2,
+            16,
+            1,
+            NodeId("node-a::nfs1".to_string()),
+            Arc::new(host_fs.clone()),
+        );
+
+        let batches = scanner.scan_audit(
+            7,
+            &mut HashMap::new(),
+            &drift_estimator(),
+            &Arc::new(LogicalClock::new()),
+            None,
+        );
+        let flat = batches.into_iter().flatten().collect::<Vec<_>>();
+        let controls = flat
+            .iter()
+            .filter_map(|event| rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).ok())
+            .collect::<Vec<_>>();
+        let records = flat
+            .iter()
+            .filter_map(|event| rmp_serde::from_slice::<FileMetaRecord>(event.payload_bytes()).ok())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            controls,
+            vec![
+                ControlEvent::EpochStart {
+                    epoch_id: 7,
+                    epoch_type: EpochType::Audit
+                },
+                ControlEvent::EpochEnd {
+                    epoch_id: 7,
+                    epoch_type: EpochType::Audit
+                }
+            ]
+        );
+        assert_eq!(
+            records.len(),
+            1,
+            "audit readiness budget should materialize bounded root coverage only"
+        );
+        assert_eq!(records[0].path, b"/");
+        assert!(
+            records[0].audit_skipped,
+            "root record must expose that the deep subtree was not synchronously audited"
+        );
+        assert!(
+            host_fs.read_dir_calls().is_empty(),
+            "budgeted root coverage must not read the wide subtree before closing the epoch"
+        );
+    }
 }
 
 fn derived_ino_for_path(path: &Path) -> u64 {
@@ -165,6 +275,46 @@ const AUDIT_DEEP_INTERVAL_ROUNDS_MAX: u64 = 1024;
 struct DirAuditState {
     last_fingerprint: Option<u64>,
     last_deep_round: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct AuditWalkOutcome {
+    records: Vec<FileMetaRecord>,
+    truncated: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AuditScanResult {
+    pub(crate) batches: Vec<Vec<Event>>,
+    pub(crate) truncated: bool,
+    pub(crate) record_count: usize,
+    pub(crate) record_budget: usize,
+}
+
+fn claim_audit_record(record_count: &AtomicUsize, record_budget: usize) -> Option<usize> {
+    let mut current = record_count.load(Ordering::SeqCst);
+    loop {
+        if current >= record_budget {
+            return None;
+        }
+        match record_count.compare_exchange(
+            current,
+            current + 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return Some(current + 1),
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn mark_truncated_audit_dirs(records: &mut [FileMetaRecord]) {
+    for record in records {
+        if record.unix_stat.is_dir {
+            record.audit_skipped = true;
+        }
+    }
 }
 
 fn normalize_deep_interval_rounds(raw: u64) -> u64 {
@@ -382,7 +532,27 @@ impl ParallelScanner {
         logical_clock: &Arc<LogicalClock>,
         watch_scheduler: Option<Arc<Mutex<crate::source::watcher::WatchManager>>>,
     ) -> Vec<Vec<Event>> {
+        self.scan_audit_with_summary(
+            epoch_id,
+            mtime_cache,
+            drift_estimator,
+            logical_clock,
+            watch_scheduler,
+        )
+        .batches
+    }
+
+    /// Run an audit scan and return coverage evidence about bounded traversal.
+    pub(crate) fn scan_audit_with_summary(
+        &self,
+        epoch_id: u64,
+        mtime_cache: &mut HashMap<PathBuf, f64>,
+        drift_estimator: &Arc<Mutex<DriftEstimator>>,
+        logical_clock: &Arc<LogicalClock>,
+        watch_scheduler: Option<Arc<Mutex<crate::source::watcher::WatchManager>>>,
+    ) -> AuditScanResult {
         let mut all_batches = Vec::new();
+        let record_budget = self.max_scan_events.max(1);
 
         // EpochStart signal
         let start_signal = ControlEvent::EpochStart {
@@ -395,10 +565,20 @@ impl ParallelScanner {
 
         // Run parallel scan
         let round = self.audit_round.fetch_add(1, Ordering::SeqCst) + 1;
-        let records = self.parallel_walk(mtime_cache, drift_estimator, watch_scheduler, round);
+        let mut outcome = self.parallel_walk(
+            mtime_cache,
+            drift_estimator,
+            watch_scheduler,
+            round,
+            record_budget,
+        );
+        if outcome.truncated {
+            mark_truncated_audit_dirs(&mut outcome.records);
+        }
+        let record_count = outcome.records.len();
 
         // Re-batch
-        let batches = self.rebatch_to_events(records, drift_estimator, logical_clock);
+        let batches = self.rebatch_to_events(outcome.records, drift_estimator, logical_clock);
         all_batches.extend(batches);
 
         // EpochEnd signal
@@ -410,7 +590,12 @@ impl ParallelScanner {
             all_batches.push(vec![ev]);
         }
 
-        all_batches
+        AuditScanResult {
+            batches: all_batches,
+            truncated: outcome.truncated,
+            record_count,
+            record_budget,
+        }
     }
 
     /// Targeted scan for snapshot/on-demand (single path or recursive).
@@ -488,24 +673,28 @@ impl ParallelScanner {
         drift_estimator: &Arc<Mutex<DriftEstimator>>,
         watch_scheduler: Option<Arc<Mutex<crate::source::watcher::WatchManager>>>,
         audit_round: u64,
-    ) -> Vec<FileMetaRecord> {
+        record_budget: usize,
+    ) -> AuditWalkOutcome {
         if self.scan_workers <= 1 {
             return self.parallel_walk_inline(
                 mtime_cache_ref,
                 drift_estimator,
                 watch_scheduler,
                 audit_round,
+                record_budget,
             );
         }
 
         let (work_tx, work_rx) = cb::unbounded::<PathBuf>();
         let (result_tx, result_rx) = cb::unbounded::<Vec<FileMetaRecord>>();
         let pending_dirs = Arc::new(AtomicUsize::new(1));
+        let record_count = Arc::new(AtomicUsize::new(0));
+        let truncated = Arc::new(AtomicBool::new(false));
 
         // Seed with root
         if work_tx.send(self.root_path.clone()).is_err() {
             log::warn!("scanner.parallel_walk: work queue closed during seed");
-            return Vec::new();
+            return AuditWalkOutcome::default();
         }
 
         let visited = Arc::new(Mutex::new(HashSet::<(u64, u64)>::new()));
@@ -521,6 +710,8 @@ impl ParallelScanner {
                 let work_tx = work_tx.clone();
                 let result_tx = result_tx.clone();
                 let pending = Arc::clone(&pending_dirs);
+                let record_count = Arc::clone(&record_count);
+                let truncated = Arc::clone(&truncated);
                 let visited = Arc::clone(&visited);
                 let mtime_cache = Arc::clone(&mtime_cache);
                 let dir_state_cache = Arc::clone(&dir_state_cache);
@@ -539,6 +730,10 @@ impl ParallelScanner {
                         // Instead, check pending_dirs to detect completion.
                         match work_rx.recv_timeout(std::time::Duration::from_millis(10)) {
                             Ok(dir_path) => {
+                                if truncated.load(Ordering::SeqCst) {
+                                    pending.fetch_sub(1, Ordering::SeqCst);
+                                    continue;
+                                }
                                 let mut records = Vec::new();
 
                                 // Register watch first for realtime-covered directories.
@@ -621,6 +816,47 @@ impl ParallelScanner {
                                         unchanged
                                     };
 
+                                    if claim_audit_record(record_count.as_ref(), record_budget)
+                                        .is_none()
+                                    {
+                                        truncated.store(true, Ordering::SeqCst);
+                                        pending.fetch_sub(1, Ordering::SeqCst);
+                                        continue;
+                                    }
+                                    let budget_exhausted_after_dir =
+                                        record_count.load(Ordering::SeqCst) >= record_budget;
+                                    let relative = watcher::make_relative(&dir_path, &root);
+                                    let file_name = dir_path
+                                        .file_name()
+                                        .map(|n| n.as_bytes().to_vec())
+                                        .unwrap_or_default();
+                                    let dir_record = |audit_skipped| {
+                                        FileMetaRecord::scan_update(
+                                            relative.clone(),
+                                            file_name.clone(),
+                                            UnixStat {
+                                                is_dir: true,
+                                                size: 0,
+                                                mtime_us: (current_mtime * 1_000_000.0) as u64,
+                                                ctime_us: 0,
+                                                dev: None,
+                                                ino: None,
+                                            },
+                                            Vec::new(),
+                                            0,
+                                            audit_skipped,
+                                        )
+                                    };
+                                    if budget_exhausted_after_dir {
+                                        records.push(dir_record(true));
+                                        truncated.store(true, Ordering::SeqCst);
+                                        if !records.is_empty() {
+                                            let _ = result_tx.send(records);
+                                        }
+                                        pending.fetch_sub(1, Ordering::SeqCst);
+                                        continue;
+                                    }
+
                                     let entries = match read_dir_with_retry(Arc::clone(&host_fs), &dir_path)
                                     {
                                         Ok(entries) => entries,
@@ -662,31 +898,19 @@ impl ParallelScanner {
                                     };
 
                                     // Emit directory record (includes root on initial scan).
-                                    let relative = watcher::make_relative(&dir_path, &root);
-                                        records.push(FileMetaRecord::scan_update(
-                                            relative,
-                                            dir_path
-                                                .file_name()
-                                                .map(|n| n.as_bytes().to_vec())
-                                                .unwrap_or_default(),
-                                        UnixStat {
-                                            is_dir: true,
-                                            size: 0,
-                                            mtime_us: (current_mtime * 1_000_000.0) as u64,
-                                            ctime_us: 0,
-                                            dev: None,
-                                            ino: None,
-                                        },
-                                        Vec::new(),
-                                        0,
-                                        !should_deep_scan,
-                                    ));
+                                    records.push(dir_record(!should_deep_scan));
 
                                     let parent_relative =
                                         watcher::make_relative(&dir_path, &root);
                                     let parent_mtime_us = (current_mtime * 1_000_000.0) as u64;
 
                                     for entry in entries {
+                                        if truncated.load(Ordering::SeqCst)
+                                            || record_count.load(Ordering::SeqCst) >= record_budget
+                                        {
+                                            truncated.store(true, Ordering::SeqCst);
+                                            break;
+                                        }
                                         if entry.is_dir {
                                             // ALWAYS_RECURSE: still descend into subdirectories.
                                             pending.fetch_add(1, Ordering::SeqCst);
@@ -702,6 +926,15 @@ impl ParallelScanner {
                                         let relative = watcher::make_relative(&entry_path, &root);
                                         match metadata_with_retry(Arc::clone(&host_fs), &entry_path) {
                                             Ok(meta) => {
+                                                if claim_audit_record(
+                                                    record_count.as_ref(),
+                                                    record_budget,
+                                                )
+                                                .is_none()
+                                                {
+                                                    truncated.store(true, Ordering::SeqCst);
+                                                    break;
+                                                }
                                                 let mtime_us = to_epoch_us(meta.modified);
                                                 let ctime_us = to_epoch_us(meta.created);
                                                 records.push(FileMetaRecord::scan_update(
@@ -778,7 +1011,10 @@ impl ParallelScanner {
             };
         }
 
-        all_records
+        AuditWalkOutcome {
+            records: all_records,
+            truncated: truncated.load(Ordering::SeqCst),
+        }
     }
 
     fn parallel_walk_inline(
@@ -787,13 +1023,16 @@ impl ParallelScanner {
         drift_estimator: &Arc<Mutex<DriftEstimator>>,
         watch_scheduler: Option<Arc<Mutex<crate::source::watcher::WatchManager>>>,
         audit_round: u64,
-    ) -> Vec<FileMetaRecord> {
+        record_budget: usize,
+    ) -> AuditWalkOutcome {
         let mut pending = vec![self.root_path.clone()];
         let mut all_records = Vec::new();
         let mut visited = HashSet::<(u64, u64)>::new();
         let mut mtime_cache = std::mem::take(mtime_cache_ref);
         let root = self.root_path.clone();
         let schedule_audit_watches = audit_watch_schedule_enabled();
+        let record_count = AtomicUsize::new(0);
+        let mut truncated = false;
         while let Some(dir_path) = pending.pop() {
             let mut records = Vec::new();
 
@@ -859,6 +1098,41 @@ impl ParallelScanner {
                     unchanged
                 };
 
+                if claim_audit_record(&record_count, record_budget).is_none() {
+                    truncated = true;
+                    break;
+                }
+                let budget_exhausted_after_dir =
+                    record_count.load(Ordering::SeqCst) >= record_budget;
+
+                let relative = watcher::make_relative(&dir_path, &root);
+                let dir_record = |audit_skipped| {
+                    FileMetaRecord::scan_update(
+                        relative.clone(),
+                        dir_path
+                            .file_name()
+                            .map(|n| n.as_bytes().to_vec())
+                            .unwrap_or_default(),
+                        UnixStat {
+                            is_dir: true,
+                            size: 0,
+                            mtime_us: (current_mtime * 1_000_000.0) as u64,
+                            ctime_us: 0,
+                            dev: None,
+                            ino: None,
+                        },
+                        Vec::new(),
+                        0,
+                        audit_skipped,
+                    )
+                };
+                if budget_exhausted_after_dir {
+                    records.push(dir_record(true));
+                    all_records.extend(records);
+                    truncated = true;
+                    break;
+                }
+
                 let entries = match read_dir_with_retry(Arc::clone(&self.host_fs), &dir_path) {
                     Ok(entries) => entries,
                     Err(e) => {
@@ -892,30 +1166,16 @@ impl ParallelScanner {
                     should
                 };
 
-                let relative = watcher::make_relative(&dir_path, &root);
-                records.push(FileMetaRecord::scan_update(
-                    relative,
-                    dir_path
-                        .file_name()
-                        .map(|n| n.as_bytes().to_vec())
-                        .unwrap_or_default(),
-                    UnixStat {
-                        is_dir: true,
-                        size: 0,
-                        mtime_us: (current_mtime * 1_000_000.0) as u64,
-                        ctime_us: 0,
-                        dev: None,
-                        ino: None,
-                    },
-                    Vec::new(),
-                    0,
-                    !should_deep_scan,
-                ));
+                records.push(dir_record(!should_deep_scan));
 
                 let parent_relative = watcher::make_relative(&dir_path, &root);
                 let parent_mtime_us = (current_mtime * 1_000_000.0) as u64;
 
                 for entry in entries {
+                    if record_count.load(Ordering::SeqCst) >= record_budget {
+                        truncated = true;
+                        break;
+                    }
                     if entry.is_dir {
                         pending.push(entry.path);
                         continue;
@@ -929,6 +1189,10 @@ impl ParallelScanner {
                     let relative = watcher::make_relative(&entry_path, &root);
                     match metadata_with_retry(Arc::clone(&self.host_fs), &entry_path) {
                         Ok(meta) => {
+                            if claim_audit_record(&record_count, record_budget).is_none() {
+                                truncated = true;
+                                break;
+                            }
                             let mtime_us = to_epoch_us(meta.modified);
                             let ctime_us = to_epoch_us(meta.created);
                             records.push(FileMetaRecord::scan_update(
@@ -958,10 +1222,16 @@ impl ParallelScanner {
             }
 
             all_records.extend(records);
+            if truncated {
+                break;
+            }
         }
 
         *mtime_cache_ref = mtime_cache;
-        all_records
+        AuditWalkOutcome {
+            records: all_records,
+            truncated,
+        }
     }
 
     /// Walk dir for targeted scan (non-parallel, depth-limited).

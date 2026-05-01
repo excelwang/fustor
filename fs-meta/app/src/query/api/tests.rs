@@ -108,6 +108,7 @@ fn query_api_readiness_and_force_find_fallbacks_use_typed_cached_helpers() {
     for typed_surface in [
         "source\n                .cached_logical_roots_snapshot_with_failure()",
         "local_sink.cached_status_snapshot_with_failure()",
+        ".status_snapshot_nonblocking_for_readiness_fan_in()",
         ".cached_logical_roots_snapshot_with_failure()\n            .map_err(SourceFailure::into_error)?",
     ] {
         assert!(

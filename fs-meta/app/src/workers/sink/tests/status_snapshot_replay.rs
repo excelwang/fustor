@@ -6314,6 +6314,165 @@ async fn status_route_snapshot_does_not_execute_retained_replay_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_route_snapshot_uses_existing_sink_client_once_before_cached_fallback() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            sink_worker_root("nfs1", &nfs1),
+            sink_worker_root("nfs2", &nfs2),
+        ],
+        host_object_grants: Vec::new(),
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    let _reply_reset = SinkWorkerStatusResponseQueueHookReset;
+    install_sink_worker_status_response_queue_hook(SinkWorkerStatusResponseQueueHook {
+        replies: std::iter::repeat_with(|| Err(CnxError::Timeout))
+            .take(64)
+            .collect(),
+    });
+
+    let (_snapshot, used_cached_fallback) = tokio::time::timeout(
+        Duration::from_secs(1),
+        sink.status_snapshot_nonblocking_for_status_route(),
+    )
+    .await
+    .expect("status-route sink snapshot must not enter the generic worker retry loop");
+
+    assert!(
+        used_cached_fallback,
+        "status-route sink snapshot should answer from cache after one bounded existing-client probe failure"
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authoritative_sink_replay_control_frame_clears_worker_replay_required_for_steady_ticks() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            sink_worker_root("nfs1", &nfs1),
+            sink_worker_root("nfs2", &nfs2),
+        ],
+        host_object_grants: Vec::new(),
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    let authoritative_wave = vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["nfs1"]),
+                bound_scope_with_resources("nfs2", &["nfs2"]),
+            ],
+        }))
+        .expect("encode sink query activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS),
+            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["nfs1"]),
+                bound_scope_with_resources("nfs2", &["nfs2"]),
+            ],
+        }))
+        .expect("encode sink events activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: format!(
+                "{}.stream",
+                crate::runtime::routes::ROUTE_KEY_SINK_ROOTS_CONTROL
+            ),
+            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["nfs1"]),
+                bound_scope_with_resources("nfs2", &["nfs2"]),
+            ],
+        }))
+        .expect("encode sink roots-control activate"),
+    ];
+
+    sink.on_control_frame(authoritative_wave.clone())
+        .await
+        .expect("seed retained sink control state");
+    sink.control_state_replay_required
+        .store(1, Ordering::Release);
+    assert!(
+        !sink.current_generation_tick_fast_path_eligible().await,
+        "precondition: replay-required worker state must disable steady tick fast path"
+    );
+
+    sink.on_control_frame(authoritative_wave)
+        .await
+        .expect("runtime-app authoritative retained replay should apply to worker");
+
+    assert_eq!(
+        sink.control_state_replay_required.load(Ordering::Acquire),
+        0,
+        "a successful authoritative retained sink replay must mark the worker current so later steady ticks do not replay the full sink control state again"
+    );
+    assert!(
+        sink.current_generation_tick_fast_path_eligible().await,
+        "successful authoritative retained replay should reopen the steady tick fast path"
+    );
+
+    sink.close().await.expect("close sink worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn materialized_query_still_reads_local_payload_while_control_inflight() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");

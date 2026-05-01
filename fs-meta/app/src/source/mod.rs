@@ -12,6 +12,10 @@ pub(crate) mod watcher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -55,9 +59,9 @@ use crate::runtime::orchestration::{
 };
 use crate::runtime::routes::{
     METHOD_SOURCE_RESCAN, METHOD_SOURCE_RESCAN_CONTROL, METHOD_SOURCE_ROOTS_CONTROL,
-    METHOD_SOURCE_STATUS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
-    source_find_route_bindings_for, source_rescan_request_route_for,
-    source_roots_control_stream_route_for,
+    METHOD_SOURCE_STATUS, ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_TOKEN_FS_META_INTERNAL,
+    default_route_bindings, source_find_route_bindings_for, source_rescan_request_route_for,
+    source_roots_control_stream_route_for, source_status_request_route_for,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
@@ -76,6 +80,50 @@ fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_micros() as u64,
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+static SOURCE_STATUS_MANUAL_RESCAN_REARM_HOOK: OnceLock<Mutex<Option<Arc<AtomicUsize>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct SourceStatusManualRescanRearmHookReset;
+
+#[cfg(test)]
+impl Drop for SourceStatusManualRescanRearmHookReset {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = SOURCE_STATUS_MANUAL_RESCAN_REARM_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+        {
+            *guard = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_source_status_manual_rescan_rearm_hook(
+    counter: Arc<AtomicUsize>,
+) -> SourceStatusManualRescanRearmHookReset {
+    let mut guard = SOURCE_STATUS_MANUAL_RESCAN_REARM_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("source status manual-rescan rearm hook lock");
+    *guard = Some(counter);
+    SourceStatusManualRescanRearmHookReset
+}
+
+#[cfg(test)]
+fn record_source_status_manual_rescan_rearm() {
+    if let Some(counter) = SOURCE_STATUS_MANUAL_RESCAN_REARM_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("source status manual-rescan rearm hook lock")
+        .as_ref()
+        .cloned()
+    {
+        counter.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -315,7 +363,7 @@ fn runtime_scope_row_has_bare_logical_root_id(
     row: &RuntimeBoundScope,
     logical_root_id: &str,
 ) -> bool {
-    row.scope_id == logical_root_id
+    (row.scope_id == logical_root_id && row.resource_ids.is_empty())
         || row
             .resource_ids
             .iter()
@@ -366,6 +414,7 @@ fn runtime_scope_rows_make_root_runnable_locally(
 
 fn runtime_managed_local_resource_ids_for_root(
     root: &RootSpec,
+    node_id: &NodeId,
     active_rows: &[RuntimeBoundScope],
 ) -> BTreeSet<String> {
     let mut object_refs = BTreeSet::new();
@@ -374,9 +423,16 @@ fn runtime_managed_local_resource_ids_for_root(
             continue;
         }
         for resource_id in &row.resource_ids {
-            if runtime_scope_resource_matches_logical_root(resource_id, &root.id)
-                || row.scope_id == root.id
-            {
+            if let Some((host_ref, _)) = resource_id.rsplit_once("::") {
+                if host_ref_matches_node_id(host_ref, node_id)
+                    && (runtime_scope_resource_matches_logical_root(resource_id, &root.id)
+                        || row.scope_id == root.id)
+                {
+                    object_refs.insert(resource_id.clone());
+                }
+                continue;
+            }
+            if resource_id == &root.id {
                 object_refs.insert(resource_id.clone());
             }
         }
@@ -401,8 +457,11 @@ fn synthesize_runtime_managed_local_grants(
         let Some(mount_point) = root.selected_mount_point() else {
             continue;
         };
-        let mut object_refs = runtime_managed_local_resource_ids_for_root(root, source_rows);
-        object_refs.extend(runtime_managed_local_resource_ids_for_root(root, scan_rows));
+        let mut object_refs =
+            runtime_managed_local_resource_ids_for_root(root, node_id, source_rows);
+        object_refs.extend(runtime_managed_local_resource_ids_for_root(
+            root, node_id, scan_rows,
+        ));
         for object_ref in object_refs {
             grants.push(GrantedMountRoot {
                 object_ref,
@@ -996,6 +1055,21 @@ impl SourceStateCell {
         self.rescan_observed_epoch.load(Ordering::Acquire)
     }
 
+    fn mark_rescan_request_observed(&self, request_epoch: u64) {
+        let mut observed = self.rescan_observed_epoch.load(Ordering::Acquire);
+        while observed < request_epoch {
+            match self.rescan_observed_epoch.compare_exchange_weak(
+                observed,
+                request_epoch,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
     fn published_group_epoch_snapshot(&self) -> BTreeMap<String, u64> {
         lock_or_recover(
             &self.published_group_epoch,
@@ -1329,7 +1403,12 @@ impl FSMetaSource {
         &self,
         signals: &[SourceControlSignal],
     ) -> Result<()> {
-        self.perform_apply_orchestration_signals(signals).await
+        self.perform_apply_orchestration_signals(signals).await?;
+        self.control_state
+            .lock()
+            .await
+            .mark_route_state_applied(signals);
+        Ok(())
     }
 
     pub(crate) async fn control_signals_with_replay(
@@ -1343,11 +1422,22 @@ impl FSMetaSource {
 
     pub(crate) async fn record_retained_control_signals(&self, signals: &[SourceControlSignal]) {
         self.control_state.lock().await.retain_signals(signals);
+        if !signals.is_empty() {
+            let mut summary = lock_or_recover(
+                &self.last_control_frame_signals,
+                "source.retained_control.last_control_frame_signals",
+            );
+            apply_retained_control_summary(&mut summary, signals);
+        }
+    }
+
+    pub(crate) async fn retained_control_state_snapshot(&self) -> SourceControlState {
+        self.control_state.lock().await.clone()
     }
 
     #[cfg(test)]
     pub(crate) async fn retained_control_state_for_tests(&self) -> SourceControlState {
-        self.control_state.lock().await.clone()
+        self.retained_control_state_snapshot().await
     }
 
     fn schedule_runtime_refresh(&self, trigger_rescan: bool) {
@@ -1519,15 +1609,21 @@ impl FSMetaSource {
         };
         let desired_signature = Self::runtime_topology_signature(&desired);
         let topology_changed = desired_signature != current_signature;
+        let root_tasks_need_reconcile = self.root_tasks_need_reconcile(&desired);
         Self::sync_object_runtime_health(&self.state_cell.fanout_health, &desired, &self.config);
         if topology_changed {
-            *lock_or_recover(&self.state_cell.roots, "source.refresh_runtime_roots") = desired;
-            let desired_roots =
-                lock_or_recover(&self.state_cell.roots, "source.refresh_runtime_roots.read")
-                    .clone();
+            *lock_or_recover(&self.state_cell.roots, "source.refresh_runtime_roots") =
+                desired.clone();
+        }
+        if topology_changed || root_tasks_need_reconcile {
+            let desired_roots = if topology_changed {
+                lock_or_recover(&self.state_cell.roots, "source.refresh_runtime_roots.read").clone()
+            } else {
+                desired
+            };
             self.reconcile_root_tasks(&desired_roots).await;
         }
-        if trigger_rescan && topology_changed {
+        if trigger_rescan && (topology_changed || root_tasks_need_reconcile) {
             self.trigger_topology_rescan_when_ready().await;
         }
         Ok(())
@@ -1739,6 +1835,49 @@ impl FSMetaSource {
             .collect::<Vec<_>>();
         out.sort();
         out
+    }
+
+    fn root_tasks_need_reconcile(&self, desired_roots: &[RootRuntime]) -> bool {
+        if lock_or_recover(
+            &self.state_cell.stream_binding,
+            "source.root_tasks_need_reconcile.stream_binding",
+        )
+        .is_none()
+        {
+            return false;
+        }
+
+        let desired = desired_roots
+            .iter()
+            .filter(|root| root.active)
+            .map(|root| {
+                (
+                    Self::root_runtime_key(root),
+                    Self::root_task_signature(root),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let tasks = lock_or_recover(
+            &self.state_cell.root_tasks,
+            "source.root_tasks_need_reconcile.root_tasks",
+        );
+        if tasks.len() != desired.len() {
+            return true;
+        }
+        for (key, signature) in desired {
+            let Some(entry) = tasks.get(&key) else {
+                return true;
+            };
+            if entry.active.signature != signature || entry.active.handle.join.is_finished() {
+                return true;
+            }
+            if entry.candidate.as_ref().is_some_and(|candidate| {
+                candidate.signature != signature || candidate.handle.join.is_finished()
+            }) {
+                return true;
+            }
+        }
+        false
     }
 
     fn root_current_is_group_primary(
@@ -2531,8 +2670,6 @@ impl FSMetaSource {
             let node_id_rescan = node_id.clone();
             let node_id_rescan_scoped = node_id.clone();
             let rescan_roots_scoped = rescan_roots.clone();
-            let rescan_fanout_health_scoped = rescan_fanout_health.clone();
-            let rescan_manual_intents_scoped = rescan_manual_intents.clone();
             let routes = source_find_route_bindings_for(&node_id.0);
             match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN) {
                 Ok(route) => {
@@ -2637,8 +2774,6 @@ impl FSMetaSource {
                     move |requests| {
                         let node_id_rescan_scoped = node_id_rescan_scoped.clone();
                         let rescan_roots_scoped = rescan_roots_scoped.clone();
-                        let rescan_fanout_health_scoped = rescan_fanout_health_scoped.clone();
-                        let rescan_manual_intents_scoped = rescan_manual_intents_scoped.clone();
                         async move {
                             eprintln!(
                                 "fs_meta_source: source.rescan scoped endpoint start node={} requests={}",
@@ -2650,25 +2785,25 @@ impl FSMetaSource {
                                 "source.rescan.scoped_endpoint.roots.expected",
                             )
                             .iter()
-                            .filter(|root| root.is_group_primary && root.spec.scan)
+                            .filter(|root| root.active && root.is_group_primary && root.spec.scan)
                             .map(FSMetaSource::root_runtime_key)
                             .collect::<Vec<_>>();
-                            let roots_snapshot = lock_or_recover(
-                                &rescan_roots_scoped,
-                                "source.rescan.scoped_endpoint.roots.trigger",
-                            )
-                            .clone();
-                            FSMetaSource::request_rescan_on_primary_roots(
-                                &roots_snapshot,
-                                Some(&rescan_fanout_health_scoped),
-                                Some(&rescan_manual_intents_scoped),
-                                "manual",
-                            );
-                            eprintln!(
-                                "fs_meta_source: source.rescan scoped endpoint triggered node={} expected_roots={}",
-                                node_id_rescan_scoped.0,
-                                expected.len()
-                            );
+                            let payload = if expected.is_empty() {
+                                eprintln!(
+                                    "fs_meta_source: source.rescan scoped endpoint rejected node={} reason=no-local-source-primary-scan-root",
+                                    node_id_rescan_scoped.0
+                                );
+                                bytes::Bytes::from_static(
+                                    b"scoped source-rescan target has no local source-primary scan root",
+                                )
+                            } else {
+                                eprintln!(
+                                    "fs_meta_source: source.rescan scoped endpoint accepted node={} expected_roots={}",
+                                    node_id_rescan_scoped.0,
+                                    expected.len()
+                                );
+                                bytes::Bytes::from_static(b"accepted")
+                            };
 
                             requests
                                 .into_iter()
@@ -2682,7 +2817,7 @@ impl FSMetaSource {
                                         trace: None,
                                     };
                                     meta.correlation_id = req.metadata().correlation_id;
-                                    Event::new(meta, bytes::Bytes::from_static(b"accepted"))
+                                    Event::new(meta, payload.clone())
                                 })
                                 .collect()
                         }
@@ -2702,7 +2837,7 @@ impl FSMetaSource {
     fn prune_finished_endpoint_tasks(&self, context: &str) {
         let mut tasks = lock_or_recover(&self.endpoint_tasks, context);
         tasks.retain(|task| {
-            if !task.is_finished() {
+            if !task.is_finished() && task.finish_reason().is_none() {
                 return true;
             }
             eprintln!(
@@ -2718,13 +2853,499 @@ impl FSMetaSource {
     fn endpoint_task_route_present(&self, route_key: &str, context: &str) -> bool {
         lock_or_recover(&self.endpoint_tasks, context)
             .iter()
-            .any(|task| task.route_key() == route_key)
+            .any(|task| {
+                task.route_key() == route_key
+                    && !task.is_finished()
+                    && task.finish_reason().is_none()
+            })
+    }
+
+    fn retire_endpoint_tasks_for_different_boundary(
+        &self,
+        boundary: &Arc<dyn ChannelIoSubset>,
+        context: &str,
+    ) {
+        let mut tasks = lock_or_recover(&self.endpoint_tasks, context);
+        tasks.retain(|task| {
+            let retire = !task.is_finished()
+                && task.finish_reason().is_none()
+                && !task.belongs_to_boundary(boundary);
+            if retire {
+                eprintln!(
+                    "fs_meta_source: retiring endpoint from stale runtime boundary route={}",
+                    task.route_key()
+                );
+                task.request_shutdown();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn source_rescan_request_route_from_control_summary(signal: &str) -> Option<String> {
+        let (_, route_suffix) = signal.split_once("route=")?;
+        let route = route_suffix
+            .chars()
+            .take_while(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        (!route.is_empty()).then_some(route)
+    }
+
+    fn is_scoped_source_rescan_request_route(route_key: &str) -> bool {
+        let Some(request_route) = route_key.strip_suffix(".req") else {
+            return false;
+        };
+        let Some((stem, version)) = ROUTE_KEY_SOURCE_RESCAN_INTERNAL.rsplit_once(':') else {
+            return request_route.starts_with(&format!("{ROUTE_KEY_SOURCE_RESCAN_INTERNAL}."));
+        };
+        let Some(route_stem) = request_route.strip_suffix(&format!(":{version}")) else {
+            return false;
+        };
+        route_stem.starts_with(&format!("{stem}."))
     }
 
     fn active_source_rescan_request_routes(&self) -> Result<BTreeSet<String>> {
         let mut routes = BTreeSet::new();
-        routes.insert(source_rescan_request_route_for(&self.node_id.0).0);
+        let local_route = source_rescan_request_route_for(&self.node_id.0).0;
+        routes.insert(local_route.clone());
+        let signals = lock_or_recover(
+            &self.last_control_frame_signals,
+            "source.active_source_rescan_request_routes.last_control_frame_signals",
+        );
+        for signal in signals.iter() {
+            let Some(route_key) = Self::source_rescan_request_route_from_control_summary(signal)
+            else {
+                continue;
+            };
+            if !signal.contains("unit=runtime.exec.source")
+                || !Self::is_scoped_source_rescan_request_route(&route_key)
+            {
+                continue;
+            }
+            if route_key != local_route {
+                continue;
+            }
+            if signal.contains("activate ") {
+                routes.insert(route_key);
+            } else if signal.contains("deactivate ") {
+                routes.remove(&route_key);
+            }
+        }
         Ok(routes)
+    }
+
+    fn source_control_signal_generation(signal: &str) -> Option<u64> {
+        let (_, suffix) = signal.split_once("generation=")?;
+        let digits = suffix
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        (!digits.is_empty())
+            .then(|| digits.parse::<u64>().ok())
+            .flatten()
+    }
+
+    fn source_rescan_route_activation_generation_from_signals(
+        signals: &[String],
+        route: &str,
+    ) -> Option<u64> {
+        signals
+            .iter()
+            .filter(|signal| {
+                signal.contains("activate ")
+                    && signal.contains("unit=runtime.exec.source")
+                    && signal.contains(&format!("route={route}"))
+            })
+            .filter_map(|signal| Self::source_control_signal_generation(signal))
+            .max()
+    }
+
+    fn source_rescan_route_ready_generation_from_signals(
+        signals: &[String],
+        route: &str,
+    ) -> Option<u64> {
+        signals
+            .iter()
+            .filter(|signal| {
+                signal.contains("ready ")
+                    && signal.contains("unit=runtime.exec.source")
+                    && signal.contains(&format!("route={route}"))
+            })
+            .filter_map(|signal| Self::source_control_signal_generation(signal))
+            .max()
+    }
+
+    fn source_rescan_route_ready_matches_current_activation(&self, route: &str) -> bool {
+        let signals = lock_or_recover(
+            &self.last_control_frame_signals,
+            "source.rescan.receivable.route_current_signals",
+        );
+        match Self::source_rescan_route_activation_generation_from_signals(&signals, route) {
+            Some(activation_generation) => {
+                Self::source_rescan_route_ready_generation_from_signals(&signals, route)
+                    == Some(activation_generation)
+            }
+            None => true,
+        }
+    }
+
+    fn retire_unproven_source_rescan_endpoint_tasks_for_manual_status(
+        &self,
+        boundary: &Arc<dyn ChannelIoSubset>,
+    ) {
+        let route = source_rescan_request_route_for(&self.node_id.0).0;
+        let ready_matches_current_activation =
+            self.source_rescan_route_ready_matches_current_activation(&route);
+        let mut tasks = lock_or_recover(
+            &self.endpoint_tasks,
+            "source.rearm_source_rescan_manual_status.retire_unproven",
+        );
+        let has_receive_armed_endpoint = tasks.iter().any(|task| {
+            task.route_key() == route
+                && !task.is_finished()
+                && task.finish_reason().is_none()
+                && task.belongs_to_boundary(boundary)
+                && task.is_receive_armed()
+        });
+        if ready_matches_current_activation && has_receive_armed_endpoint {
+            return;
+        }
+        tasks.retain(|task| {
+            let retire = task.route_key() == route
+                && !task.is_finished()
+                && task.finish_reason().is_none()
+                && (!task.belongs_to_boundary(boundary) || !task.is_receive_armed());
+            if retire {
+                eprintln!(
+                    "fs_meta_source: retiring unproven scoped rescan endpoint route={} before receive-armed ready refresh",
+                    task.route_key()
+                );
+                task.request_shutdown();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn record_source_rescan_route_receivable(&self) {
+        let route = source_rescan_request_route_for(&self.node_id.0).0;
+        let mut signals = lock_or_recover(
+            &self.last_control_frame_signals,
+            "source.rescan.receivable.last_control_frame_signals",
+        );
+        let generation =
+            Self::source_rescan_route_activation_generation_from_signals(&signals, &route);
+        let ready_signal = match generation {
+            Some(generation) => {
+                format!("ready unit=runtime.exec.source route={route} generation={generation}")
+            }
+            None => format!("ready unit=runtime.exec.source route={route}"),
+        };
+        signals.retain(|signal| {
+            !(signal.contains("ready ")
+                && signal.contains("unit=runtime.exec.source")
+                && signal.contains(&format!("route={route}")))
+        });
+        if !signals.iter().any(|signal| signal == &ready_signal) {
+            signals.push(ready_signal);
+        }
+    }
+
+    fn start_source_rescan_request_endpoints_on_boundary(
+        &self,
+        boundary: Arc<dyn ChannelIoSubset>,
+    ) -> Result<()> {
+        let rescan_roots = self.state_cell.roots_handle();
+        let rescan_fanout_health = self.state_cell.fanout_health_handle();
+        let rescan_manual_intents = self.state_cell.manual_rescan_intents_handle();
+        let node_id_rescan = self.node_id.clone();
+        let routes = source_find_route_bindings_for(&self.node_id.0);
+
+        match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN) {
+            Ok(route)
+                if !self.endpoint_task_route_present(
+                    &route.0,
+                    "source.start_rescan_endpoints.route_present.rescan",
+                ) =>
+            {
+                log::info!(
+                    "bound route listening on {}.{} for deferred source {}",
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SOURCE_RESCAN,
+                    node_id_rescan.0
+                );
+                let endpoint_task = ManagedEndpointTask::spawn_with_unit(
+                    boundary.clone(),
+                    route,
+                    format!(
+                        "source:{}:{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN
+                    ),
+                    SOURCE_RUNTIME_UNIT_ID,
+                    self.shutdown.clone(),
+                    move |requests| {
+                        let node_id_rescan = node_id_rescan.clone();
+                        let rescan_roots = rescan_roots.clone();
+                        let rescan_fanout_health = rescan_fanout_health.clone();
+                        let rescan_manual_intents = rescan_manual_intents.clone();
+                        async move {
+                            eprintln!(
+                                "fs_meta_source: source.rescan endpoint start node={} requests={}",
+                                node_id_rescan.0,
+                                requests.len()
+                            );
+                            let expected = lock_or_recover(
+                                &rescan_roots,
+                                "source.rescan.endpoint.roots.expected",
+                            )
+                            .iter()
+                            .filter(|root| root.is_group_primary && root.spec.scan)
+                            .map(FSMetaSource::root_runtime_key)
+                            .collect::<Vec<_>>();
+                            let roots_snapshot = lock_or_recover(
+                                &rescan_roots,
+                                "source.rescan.endpoint.roots.trigger",
+                            )
+                            .clone();
+                            FSMetaSource::request_rescan_on_primary_roots(
+                                &roots_snapshot,
+                                Some(&rescan_fanout_health),
+                                Some(&rescan_manual_intents),
+                                "manual",
+                            );
+                            eprintln!(
+                                "fs_meta_source: source.rescan endpoint triggered node={} expected_roots={}",
+                                node_id_rescan.0,
+                                expected.len()
+                            );
+
+                            requests
+                                .into_iter()
+                                .map(|req| {
+                                    let mut meta = EventMetadata {
+                                        origin_id: node_id_rescan.clone(),
+                                        timestamp_us: now_us(),
+                                        logical_ts: None,
+                                        correlation_id: None,
+                                        ingress_auth: None,
+                                        trace: None,
+                                    };
+                                    meta.correlation_id = req.metadata().correlation_id;
+                                    Event::new(meta, bytes::Bytes::from_static(b"accepted"))
+                                })
+                                .collect()
+                        }
+                    },
+                );
+                lock_or_recover(
+                    &self.endpoint_tasks,
+                    "source.start_rescan_endpoints.rescan_tasks",
+                )
+                .push(endpoint_task);
+            }
+            Err(err) => {
+                log::error!(
+                    "failed to resolve deferred source bound route {}.{}: {:?}",
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SOURCE_RESCAN,
+                    err
+                );
+            }
+            Ok(_) => {}
+        }
+
+        let scoped_route = source_rescan_request_route_for(&self.node_id.0);
+        if !self.endpoint_task_route_present(
+            &scoped_route.0,
+            "source.start_rescan_endpoints.route_present.scoped_rescan",
+        ) {
+            let node_id_rescan_scoped = self.node_id.clone();
+            let rescan_roots_scoped = self.state_cell.roots_handle();
+            log::info!(
+                "bound route listening on {} for deferred source {}",
+                scoped_route.0,
+                node_id_rescan_scoped.0
+            );
+            let endpoint_task = ManagedEndpointTask::spawn_with_unit_wait_receivable(
+                boundary,
+                scoped_route.clone(),
+                format!("source:{}", scoped_route.0),
+                SOURCE_RUNTIME_UNIT_ID,
+                self.shutdown.clone(),
+                move |requests| {
+                    let node_id_rescan_scoped = node_id_rescan_scoped.clone();
+                    let rescan_roots_scoped = rescan_roots_scoped.clone();
+                    async move {
+                        eprintln!(
+                            "fs_meta_source: source.rescan scoped endpoint start node={} requests={}",
+                            node_id_rescan_scoped.0,
+                            requests.len()
+                        );
+                        let expected = lock_or_recover(
+                            &rescan_roots_scoped,
+                            "source.rescan.scoped_endpoint.roots.expected",
+                        )
+                        .iter()
+                        .filter(|root| root.active && root.is_group_primary && root.spec.scan)
+                        .map(FSMetaSource::root_runtime_key)
+                        .collect::<Vec<_>>();
+                        let payload = if expected.is_empty() {
+                            eprintln!(
+                                "fs_meta_source: source.rescan scoped endpoint rejected node={} reason=no-local-source-primary-scan-root",
+                                node_id_rescan_scoped.0
+                            );
+                            bytes::Bytes::from_static(
+                                b"scoped source-rescan target has no local source-primary scan root",
+                            )
+                        } else {
+                            eprintln!(
+                                "fs_meta_source: source.rescan scoped endpoint accepted node={} expected_roots={}",
+                                node_id_rescan_scoped.0,
+                                expected.len()
+                            );
+                            bytes::Bytes::from_static(b"accepted")
+                        };
+
+                        requests
+                            .into_iter()
+                            .map(|req| {
+                                let mut meta = EventMetadata {
+                                    origin_id: node_id_rescan_scoped.clone(),
+                                    timestamp_us: now_us(),
+                                    logical_ts: None,
+                                    correlation_id: None,
+                                    ingress_auth: None,
+                                    trace: None,
+                                };
+                                meta.correlation_id = req.metadata().correlation_id;
+                                Event::new(meta, payload.clone())
+                            })
+                            .collect()
+                    }
+                },
+            );
+            lock_or_recover(
+                &self.endpoint_tasks,
+                "source.start_rescan_endpoints.scoped_rescan_tasks",
+            )
+            .push(endpoint_task);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn rearm_source_rescan_request_endpoints_for_manual_status_on_boundary(
+        &self,
+        boundary: Arc<dyn ChannelIoSubset>,
+    ) -> Result<()> {
+        self.prune_finished_endpoint_tasks("source.rearm_source_rescan_manual_status.prune");
+        self.retire_endpoint_tasks_for_different_boundary(
+            &boundary,
+            "source.rearm_source_rescan_manual_status.retire_stale_boundary",
+        );
+        self.retire_unproven_source_rescan_endpoint_tasks_for_manual_status(&boundary);
+        self.start_source_rescan_request_endpoints_on_boundary(boundary)?;
+        self.record_source_rescan_route_receivable();
+        Ok(())
+    }
+
+    fn start_source_status_endpoint_on_route(
+        &self,
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        route_present_context: &str,
+    ) {
+        if self.endpoint_task_route_present(&route.0, route_present_context) {
+            return;
+        }
+        let status_source = self.clone();
+        let status_node_id = self.node_id.clone();
+        let status_boundary = boundary.clone();
+        let endpoint_task = ManagedEndpointTask::spawn_with_unit(
+            boundary,
+            route,
+            format!(
+                "source:{}:{}",
+                ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS
+            ),
+            SOURCE_RUNTIME_UNIT_ID,
+            self.shutdown.clone(),
+            move |requests| {
+                let status_source = status_source.clone();
+                let status_node_id = status_node_id.clone();
+                let status_boundary = status_boundary.clone();
+                async move {
+                    let manual_rescan_delivery_evidence = requests.iter().any(|req| {
+                        crate::query::api::source_status_request_requires_manual_rescan_delivery_evidence(
+                            req.payload_bytes(),
+                        )
+                    });
+                    let snapshot = if manual_rescan_delivery_evidence {
+                        if let Err(err) = status_source
+                            .rearm_source_rescan_request_endpoints_for_manual_status_on_boundary(
+                                status_boundary,
+                            )
+                            .await
+                        {
+                            eprintln!(
+                                "fs_meta_source: source-status manual-rescan rearm failed node={} err={}",
+                                status_node_id.0, err
+                            );
+                            return Vec::new();
+                        }
+                        #[cfg(test)]
+                        record_source_status_manual_rescan_rearm();
+                        let (snapshot, used_cached_fallback) =
+                            status_source.observability_snapshot_nonblocking_for_status_route();
+                        if used_cached_fallback {
+                            eprintln!(
+                                "fs_meta_source: source-status manual-rescan using cached delivery snapshot node={}",
+                                status_node_id.0
+                            );
+                        }
+                        snapshot
+                    } else {
+                        let (snapshot, used_cached_fallback) =
+                            status_source.observability_snapshot_nonblocking_for_status_route();
+                        if used_cached_fallback {
+                            eprintln!(
+                                "fs_meta_source: source-status endpoint using cached/degraded snapshot node={}",
+                                status_node_id.0
+                            );
+                        }
+                        snapshot
+                    };
+                    let mut responses = Vec::with_capacity(requests.len());
+                    for req in requests {
+                        match rmp_serde::to_vec_named(&snapshot) {
+                            Ok(payload) => responses.push(Event::new(
+                                EventMetadata {
+                                    origin_id: status_node_id.clone(),
+                                    timestamp_us: now_us(),
+                                    logical_ts: None,
+                                    correlation_id: req.metadata().correlation_id,
+                                    ingress_auth: None,
+                                    trace: None,
+                                },
+                                Bytes::from(payload),
+                            )),
+                            Err(err) => eprintln!(
+                                "fs_meta_source: source-status encode failed node={} err={}",
+                                status_node_id.0, err
+                            ),
+                        }
+                    }
+                    responses
+                }
+            },
+        );
+        lock_or_recover(
+            &self.endpoint_tasks,
+            "source.start_runtime_endpoints.status_tasks",
+        )
+        .push(endpoint_task);
     }
 
     pub(crate) async fn start_runtime_endpoints_on_boundary(
@@ -2732,6 +3353,10 @@ impl FSMetaSource {
         boundary: Arc<dyn ChannelIoSubset>,
     ) -> Result<()> {
         self.prune_finished_endpoint_tasks("source.start_runtime_endpoints.prune");
+        self.retire_endpoint_tasks_for_different_boundary(
+            &boundary,
+            "source.start_runtime_endpoints.retire_stale_boundary",
+        );
         self.start_manual_rescan_watch().await?;
 
         let rescan_roots = self.state_cell.roots_handle();
@@ -2740,70 +3365,14 @@ impl FSMetaSource {
         let node_id_rescan = self.node_id.clone();
         let node_id_rescan_scoped = self.node_id.clone();
         let rescan_roots_scoped = rescan_roots.clone();
-        let rescan_fanout_health_scoped = rescan_fanout_health.clone();
-        let rescan_manual_intents_scoped = rescan_manual_intents.clone();
         let routes = source_find_route_bindings_for(&self.node_id.0);
 
         match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS) {
-            Ok(route)
-                if !self.endpoint_task_route_present(
-                    &route.0,
-                    "source.start_runtime_endpoints.route_present.status",
-                ) =>
-            {
-                let status_source = self.clone();
-                let status_node_id = self.node_id.clone();
-                let endpoint_task = ManagedEndpointTask::spawn_with_unit(
-                    boundary.clone(),
-                    route,
-                    format!(
-                        "source:{}:{}",
-                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS
-                    ),
-                    SOURCE_RUNTIME_UNIT_ID,
-                    self.shutdown.clone(),
-                    move |requests| {
-                        let status_source = status_source.clone();
-                        let status_node_id = status_node_id.clone();
-                        async move {
-                            let (snapshot, used_cached_fallback) =
-                                status_source.observability_snapshot_nonblocking_for_status_route();
-                            if used_cached_fallback {
-                                eprintln!(
-                                    "fs_meta_source: source-status endpoint using cached/degraded snapshot node={}",
-                                    status_node_id.0
-                                );
-                            }
-                            let mut responses = Vec::with_capacity(requests.len());
-                            for req in requests {
-                                match rmp_serde::to_vec_named(&snapshot) {
-                                    Ok(payload) => responses.push(Event::new(
-                                        EventMetadata {
-                                            origin_id: status_node_id.clone(),
-                                            timestamp_us: now_us(),
-                                            logical_ts: None,
-                                            correlation_id: req.metadata().correlation_id,
-                                            ingress_auth: None,
-                                            trace: None,
-                                        },
-                                        Bytes::from(payload),
-                                    )),
-                                    Err(err) => eprintln!(
-                                        "fs_meta_source: source-status encode failed node={} err={}",
-                                        status_node_id.0, err
-                                    ),
-                                }
-                            }
-                            responses
-                        }
-                    },
-                );
-                lock_or_recover(
-                    &self.endpoint_tasks,
-                    "source.start_runtime_endpoints.status_tasks",
-                )
-                .push(endpoint_task);
-            }
+            Ok(route) => self.start_source_status_endpoint_on_route(
+                boundary.clone(),
+                route,
+                "source.start_runtime_endpoints.route_present.status",
+            ),
             Err(err) => {
                 log::error!(
                     "failed to resolve source status route {}.{}: {:?}",
@@ -2812,8 +3381,12 @@ impl FSMetaSource {
                     err
                 );
             }
-            Ok(_) => {}
         }
+        self.start_source_status_endpoint_on_route(
+            boundary.clone(),
+            source_status_request_route_for(&self.node_id.0),
+            "source.start_runtime_endpoints.route_present.scoped_status",
+        );
 
         match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN) {
             Ok(route)
@@ -3084,11 +3657,10 @@ impl FSMetaSource {
                     route.0,
                     node_id_rescan_scoped.0
                 );
+                let target_route_key = source_rescan_request_route_for(&node_id_rescan_scoped.0).0;
                 let route_key_for_handler = route.0.clone();
                 let scoped_node_id_for_handler = node_id_rescan_scoped.clone();
                 let scoped_roots_for_handler = rescan_roots_scoped.clone();
-                let scoped_fanout_health_for_handler = rescan_fanout_health_scoped.clone();
-                let scoped_manual_intents_for_handler = rescan_manual_intents_scoped.clone();
                 let endpoint_task = ManagedEndpointTask::spawn_with_unit(
                     boundary.clone(),
                     route.clone(),
@@ -3098,10 +3670,8 @@ impl FSMetaSource {
                     move |requests| {
                         let node_id_rescan_scoped = scoped_node_id_for_handler.clone();
                         let rescan_roots_scoped = scoped_roots_for_handler.clone();
-                        let rescan_fanout_health_scoped = scoped_fanout_health_for_handler.clone();
-                        let rescan_manual_intents_scoped =
-                            scoped_manual_intents_for_handler.clone();
                         let route_key_for_handler = route_key_for_handler.clone();
+                        let target_route_key = target_route_key.clone();
                         async move {
                             eprintln!(
                                 "fs_meta_source: source.rescan scoped endpoint start node={} route={} requests={}",
@@ -3109,32 +3679,48 @@ impl FSMetaSource {
                                 route_key_for_handler,
                                 requests.len()
                             );
+                            if route_key_for_handler != target_route_key {
+                                return requests
+                                    .into_iter()
+                                    .map(|req| {
+                                        let mut meta = EventMetadata {
+                                            origin_id: node_id_rescan_scoped.clone(),
+                                            timestamp_us: now_us(),
+                                            logical_ts: None,
+                                            correlation_id: None,
+                                            ingress_auth: None,
+                                            trace: None,
+                                        };
+                                        meta.correlation_id = req.metadata().correlation_id;
+                                        Event::new(meta, Bytes::from_static(b"not-target"))
+                                    })
+                                    .collect();
+                            }
                             let expected = lock_or_recover(
                                 &rescan_roots_scoped,
                                 "source.rescan.scoped_endpoint.roots.expected",
                             )
                             .iter()
-                            .filter(|root| root.is_group_primary && root.spec.scan)
+                            .filter(|root| root.active && root.is_group_primary && root.spec.scan)
                             .map(FSMetaSource::root_runtime_key)
                             .collect::<Vec<_>>();
-                            let roots_snapshot = lock_or_recover(
-                                &rescan_roots_scoped,
-                                "source.rescan.scoped_endpoint.roots.trigger",
-                            )
-                            .clone();
-                            FSMetaSource::request_rescan_on_primary_roots(
-                                &roots_snapshot,
-                                Some(&rescan_fanout_health_scoped),
-                                Some(&rescan_manual_intents_scoped),
-                                "manual",
-                            );
-                            eprintln!(
-                                "fs_meta_source: source.rescan scoped endpoint triggered node={} route={} expected_roots={}",
-                                node_id_rescan_scoped.0,
-                                route_key_for_handler,
-                                expected.len()
-                            );
-                            let payload = Bytes::from_static(b"accepted");
+                            let payload = if expected.is_empty() {
+                                eprintln!(
+                                    "fs_meta_source: source.rescan scoped endpoint rejected node={} route={} reason=no-local-source-primary-scan-root",
+                                    node_id_rescan_scoped.0, route_key_for_handler,
+                                );
+                                Bytes::from_static(
+                                    b"scoped source-rescan target has no local source-primary scan root",
+                                )
+                            } else {
+                                eprintln!(
+                                    "fs_meta_source: source.rescan scoped endpoint accepted node={} route={} expected_roots={}",
+                                    node_id_rescan_scoped.0,
+                                    route_key_for_handler,
+                                    expected.len()
+                                );
+                                Bytes::from_static(b"accepted")
+                            };
 
                             requests
                                 .into_iter()
@@ -3196,6 +3782,12 @@ impl FSMetaSource {
     }
 
     pub(crate) async fn perform_trigger_rescan_when_ready_epoch(&self) -> u64 {
+        let has_local_source_primary_scan_roots = lock_or_recover(
+            &self.state_cell.roots,
+            "source.trigger_rescan_when_ready_epoch.roots",
+        )
+        .iter()
+        .any(|root| root.is_group_primary && root.spec.scan);
         let status = self.status_snapshot();
         let (published_batches, last_published_at_us) = source_status_publication_marker(&status);
         let last_audit_completed_at_us = source_status_rescan_completion_marker(&status);
@@ -3204,7 +3796,75 @@ impl FSMetaSource {
             last_published_at_us,
             last_audit_completed_at_us,
         );
-        self.trigger_rescan_when_ready().await;
+        if has_local_source_primary_scan_roots {
+            self.trigger_rescan_when_ready().await;
+        } else {
+            self.state_cell.mark_rescan_request_observed(epoch);
+        }
+        epoch
+    }
+
+    fn local_source_primary_scan_root_keys(&self, context: &'static str) -> Vec<String> {
+        lock_or_recover(&self.state_cell.roots, context)
+            .iter()
+            .filter(|root| root.active && root.is_group_primary && root.spec.scan)
+            .map(Self::root_runtime_key)
+            .collect()
+    }
+
+    pub(crate) async fn perform_targeted_rescan_when_ready_epoch(&self) -> Result<u64> {
+        let target_roots = self
+            .local_source_primary_scan_root_keys("source.targeted_rescan_when_ready.roots.initial");
+        if target_roots.is_empty() {
+            return Err(CnxError::InvalidInput(
+                "scoped source-rescan target has no local source-primary scan root".into(),
+            ));
+        }
+        if !self.wait_for_group_primary_scan_roots_ready().await {
+            log::debug!(
+                "source-fs-meta: queue targeted manual rescan before primary scan roots report running: {:?}",
+                target_roots
+            );
+        }
+        let target_roots = self
+            .local_source_primary_scan_root_keys("source.targeted_rescan_when_ready.roots.final");
+        if target_roots.is_empty() {
+            return Err(CnxError::InvalidInput(
+                "scoped source-rescan target lost local source-primary scan root".into(),
+            ));
+        }
+        let status = self.status_snapshot();
+        let (published_batches, last_published_at_us) = source_status_publication_marker(&status);
+        let last_audit_completed_at_us = source_status_rescan_completion_marker(&status);
+        let epoch = self.state_cell.begin_rescan_request_epoch(
+            published_batches,
+            last_published_at_us,
+            last_audit_completed_at_us,
+        );
+        self.trigger_rescan();
+        Ok(epoch)
+    }
+
+    pub(crate) fn submit_rescan_request_epoch(&self) -> u64 {
+        let has_local_source_primary_scan_roots = lock_or_recover(
+            &self.state_cell.roots,
+            "source.submit_rescan_request_epoch.roots",
+        )
+        .iter()
+        .any(|root| root.is_group_primary && root.spec.scan);
+        let status = self.status_snapshot();
+        let (published_batches, last_published_at_us) = source_status_publication_marker(&status);
+        let last_audit_completed_at_us = source_status_rescan_completion_marker(&status);
+        let epoch = self.state_cell.begin_rescan_request_epoch(
+            published_batches,
+            last_published_at_us,
+            last_audit_completed_at_us,
+        );
+        if has_local_source_primary_scan_roots {
+            self.trigger_rescan();
+        } else {
+            self.state_cell.mark_rescan_request_observed(epoch);
+        }
         epoch
     }
 
@@ -4101,6 +4761,7 @@ impl FSMetaSource {
         }
 
         let mut removed_absent = Vec::<(String, RootTaskEntry)>::new();
+        let mut removed_finished = Vec::<(String, RootTaskEntry)>::new();
         let mut stale_candidates = Vec::<(String, RootTaskSlot)>::new();
         let mut watch_disable_replacements = Vec::<RootTaskReplacementFallback>::new();
         let mut replacement_waits = Vec::<(
@@ -4118,13 +4779,28 @@ impl FSMetaSource {
                     if let Some(entry) = tasks.remove(&key) {
                         removed_absent.push((key, entry));
                     }
+                } else if tasks
+                    .get(&key)
+                    .is_some_and(|entry| entry.active.handle.join.is_finished())
+                {
+                    if let Some(entry) = tasks.remove(&key) {
+                        removed_finished.push((key, entry));
+                    }
                 }
             }
             for (key, (root, signature)) in &desired {
                 match tasks.get_mut(key) {
                     Some(existing_entry) if existing_entry.active.signature == *signature => {
                         if let Some(candidate) = existing_entry.candidate.as_ref() {
-                            if candidate.signature == *signature {
+                            if candidate.handle.join.is_finished() {
+                                if let Some(stale) = existing_entry.candidate.take() {
+                                    stale_candidates.push((key.clone(), stale));
+                                    Self::clear_root_task_candidate_health(
+                                        &self.state_cell.fanout_health,
+                                        key,
+                                    );
+                                }
+                            } else if candidate.signature == *signature {
                                 replacement_waits.push((
                                     key.clone(),
                                     signature.clone(),
@@ -4157,7 +4833,15 @@ impl FSMetaSource {
                         }
                         let mut candidate_ready = None;
                         if let Some(candidate) = existing_entry.candidate.as_ref() {
-                            if candidate.signature == *signature {
+                            if candidate.handle.join.is_finished() {
+                                if let Some(stale) = existing_entry.candidate.take() {
+                                    stale_candidates.push((key.clone(), stale));
+                                    Self::clear_root_task_candidate_health(
+                                        &self.state_cell.fanout_health,
+                                        key,
+                                    );
+                                }
+                            } else if candidate.signature == *signature {
                                 candidate_ready = Some(candidate.handle.ready_rx.clone());
                             }
                         }
@@ -4215,6 +4899,24 @@ impl FSMetaSource {
                             },
                         );
                     }
+                }
+            }
+        }
+
+        if !removed_finished.is_empty() {
+            for (key, entry) in removed_finished {
+                Self::cancel_root_task_slot(
+                    &self.state_cell.fanout_health,
+                    &key,
+                    entry.active,
+                    true,
+                )
+                .await;
+                if let Some(candidate) = entry.candidate {
+                    candidate.handle.cancel.cancel();
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
+                    Self::clear_root_task_candidate_health(&self.state_cell.fanout_health, &key);
                 }
             }
         }
@@ -4828,14 +5530,22 @@ impl FSMetaSource {
                         *ec += 1;
                         epoch
                     };
-                    let batches =
-                        scanner.scan_audit(epoch, &mut cache, &drift_est, &clock, scan_watch_mgr);
-                    eprintln!(
-                        "fs_meta_source: initial scan produced batches={} root_key={}",
-                        batches.len(),
-                        initial_scan_root_key_for_scan
+                    let audit = scanner.scan_audit_with_summary(
+                        epoch,
+                        &mut cache,
+                        &drift_est,
+                        &clock,
+                        scan_watch_mgr,
                     );
-                    for (idx, batch) in batches.into_iter().enumerate() {
+                    eprintln!(
+                        "fs_meta_source: initial scan produced batches={} root_key={} records={}/{} truncated={}",
+                        audit.batches.len(),
+                        initial_scan_root_key_for_scan,
+                        audit.record_count,
+                        audit.record_budget,
+                        audit.truncated
+                    );
+                    for (idx, batch) in audit.batches.into_iter().enumerate() {
                         if scan_global_shutdown.is_cancelled() || scan_task_shutdown.is_cancelled()
                         {
                             return;
@@ -5022,7 +5732,7 @@ impl FSMetaSource {
                                 let mut ep = lock_or_recover(&epoch, "source.root.rescan.epoch_counter");
                                 let current_epoch = *ep;
                                 *ep += 1;
-                                scanner.scan_audit(current_epoch, &mut c, &de, &clk, wm)
+                                scanner.scan_audit_with_summary(current_epoch, &mut c, &de, &clk, wm)
                             }).await;
                             Self::mark_root_audit_completed(
                                 &fanout_health,
@@ -5031,8 +5741,16 @@ impl FSMetaSource {
                                 now_us(),
                             );
                             match rescan_batches {
-                                Ok(batches) => {
-                                    for batch in batches.into_iter() {
+                                Ok(audit) => {
+                                    eprintln!(
+                                        "fs_meta_source: rescan produced batches={} root_key={} records={}/{} truncated={}",
+                                        audit.batches.len(),
+                                        root_key,
+                                        audit.record_count,
+                                        audit.record_budget,
+                                        audit.truncated
+                                    );
+                                    for batch in audit.batches.into_iter() {
                                         if rescan_scan_tx.send(batch).await.is_err() {
                                             break;
                                         }
@@ -5388,6 +6106,42 @@ fn summarize_source_control_signals(signals: &[SourceControlSignal]) -> Vec<Stri
             SourceControlSignal::Passthrough(_) => "passthrough".into(),
         })
         .collect()
+}
+
+fn source_control_signal_route_identity(signal: &SourceControlSignal) -> Option<(&str, &str)> {
+    match signal {
+        SourceControlSignal::Activate {
+            unit, route_key, ..
+        }
+        | SourceControlSignal::Deactivate {
+            unit, route_key, ..
+        }
+        | SourceControlSignal::Tick {
+            unit, route_key, ..
+        } => Some((unit.unit_id(), route_key.as_str())),
+        SourceControlSignal::RuntimeHostGrantChange { .. }
+        | SourceControlSignal::ManualRescan { .. }
+        | SourceControlSignal::Passthrough(_) => None,
+    }
+}
+
+fn source_control_summary_entry_matches_route(entry: &str, unit_id: &str, route_key: &str) -> bool {
+    entry.contains(&format!("unit={unit_id}")) && entry.contains(&format!("route={route_key}"))
+}
+
+fn apply_retained_control_summary(summary: &mut Vec<String>, signals: &[SourceControlSignal]) {
+    for signal in signals {
+        let Some((unit_id, route_key)) = source_control_signal_route_identity(signal) else {
+            continue;
+        };
+        summary
+            .retain(|entry| !source_control_summary_entry_matches_route(entry, unit_id, route_key));
+    }
+    for entry in summarize_source_control_signals(signals) {
+        if !summary.iter().any(|existing| existing == &entry) {
+            summary.push(entry);
+        }
+    }
 }
 
 #[cfg(test)]

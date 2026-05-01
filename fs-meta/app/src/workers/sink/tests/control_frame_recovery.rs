@@ -1,4 +1,85 @@
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_initial_sink_control_apply_keeps_standard_rpc_budget_for_existing_client() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![sink_worker_root("nfs1", &nfs1)],
+        host_object_grants: vec![sink_worker_export(
+            "node-d::nfs1",
+            "node-d",
+            "10.0.0.41",
+            nfs1.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = tempdir().expect("create worker socket dir");
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let sink = SinkWorkerClientHandle::new(
+        NodeId("node-d".to_string()),
+        cfg,
+        external_sink_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct sink worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+        .await
+        .expect("sink worker start timed out")
+        .expect("start sink worker");
+
+    let _pause_reset = SinkWorkerControlFramePauseHookReset;
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    install_sink_worker_control_frame_pause_hook(SinkWorkerControlFramePauseHook {
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+
+    let envelope = encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+        route_key: ROUTE_KEY_QUERY.to_string(),
+        unit_id: "runtime.exec.sink".to_string(),
+        lease: None,
+        generation: 1_777_634_405_000,
+        expires_at_ms: 1,
+        bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-d::nfs1"])],
+    }))
+    .expect("encode sink activate");
+    let signals = vec![SinkControlSignal::Activate {
+        unit: SinkRuntimeUnit::Sink,
+        route_key: ROUTE_KEY_QUERY.to_string(),
+        generation: 1_777_634_405_000,
+        bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-d::nfs1"])],
+        envelope,
+    }];
+
+    let facade = SinkFacade::Worker(sink.into());
+    let apply = tokio::spawn(async move {
+        facade
+            .apply_orchestration_signals_with_total_timeout_with_failure(
+                &signals,
+                Duration::from_secs(5),
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("control-frame rpc did not enter pause hook");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    release.notify_waiters();
+
+    apply
+        .await
+        .expect("join control apply")
+        .expect("fresh initial sink control apply must not use the short stale-client budget");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn on_control_frame_retries_stale_drained_fenced_pid_errors() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");

@@ -41,6 +41,8 @@ pub struct AnnouncedResourceExport {
     pub resource_kind: String,
     pub source: String,
     #[serde(default)]
+    pub host_ip: Option<String>,
+    #[serde(default)]
     pub mount_hint: Option<String>,
     #[serde(default)]
     pub bind_addr: Option<String>,

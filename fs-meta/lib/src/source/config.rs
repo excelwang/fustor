@@ -29,6 +29,11 @@ const SOURCE_SCAN_WORKERS_DEFAULT: usize = 2;
 const SOURCE_SCAN_WORKERS_MIN: usize = 1;
 const SOURCE_SCAN_WORKERS_MAX: usize = 16;
 
+const SOURCE_MAX_SCAN_EVENTS_ENV: &str = "FS_META_SOURCE_MAX_SCAN_EVENTS";
+const SOURCE_MAX_SCAN_EVENTS_DEFAULT: usize = 100_000;
+const SOURCE_MAX_SCAN_EVENTS_MIN: usize = 1;
+const SOURCE_MAX_SCAN_EVENTS_MAX: usize = 10_000_000;
+
 const SOURCE_AUDIT_INTERVAL_MS_ENV: &str = "FS_META_SOURCE_AUDIT_INTERVAL_MS";
 const SOURCE_AUDIT_INTERVAL_MS_DEFAULT: u64 = 300_000;
 const SOURCE_AUDIT_INTERVAL_MS_MIN: u64 = 5_000;
@@ -178,7 +183,7 @@ impl Default for SourceConfig {
             scan_workers: Self::scan_workers_from_env(),
             lru_capacity: 65536,
             min_monitoring_window: Duration::from_secs(86400),
-            max_scan_events: 100_000,
+            max_scan_events: Self::max_scan_events_from_env(),
             sink_tombstone_ttl: Self::sink_tombstone_ttl_from_env(),
             sink_tombstone_tolerance_us: Self::sink_tombstone_tolerance_us_from_env(),
             drift_window_size: 10_000,
@@ -191,6 +196,10 @@ impl Default for SourceConfig {
 impl SourceConfig {
     pub(crate) fn normalize_scan_workers(raw: usize) -> usize {
         raw.clamp(SOURCE_SCAN_WORKERS_MIN, SOURCE_SCAN_WORKERS_MAX)
+    }
+
+    pub(crate) fn normalize_max_scan_events(raw: usize) -> usize {
+        raw.clamp(SOURCE_MAX_SCAN_EVENTS_MIN, SOURCE_MAX_SCAN_EVENTS_MAX)
     }
 
     pub(crate) fn normalize_audit_interval_ms(raw: u64) -> Duration {
@@ -230,6 +239,13 @@ impl SourceConfig {
         Self::normalize_scan_workers(Self::parse_env_usize(
             SOURCE_SCAN_WORKERS_ENV,
             SOURCE_SCAN_WORKERS_DEFAULT,
+        ))
+    }
+
+    fn max_scan_events_from_env() -> usize {
+        Self::normalize_max_scan_events(Self::parse_env_usize(
+            SOURCE_MAX_SCAN_EVENTS_ENV,
+            SOURCE_MAX_SCAN_EVENTS_DEFAULT,
         ))
     }
 
@@ -402,6 +418,19 @@ mod tests {
             SOURCE_SCAN_WORKERS_MAX
         );
         assert_eq!(SourceConfig::normalize_scan_workers(4), 4);
+    }
+
+    #[test]
+    fn normalize_max_scan_events_clamps_bounds() {
+        assert_eq!(
+            SourceConfig::normalize_max_scan_events(0),
+            SOURCE_MAX_SCAN_EVENTS_MIN
+        );
+        assert_eq!(
+            SourceConfig::normalize_max_scan_events(usize::MAX),
+            SOURCE_MAX_SCAN_EVENTS_MAX
+        );
+        assert_eq!(SourceConfig::normalize_max_scan_events(512), 512);
     }
 
     #[test]

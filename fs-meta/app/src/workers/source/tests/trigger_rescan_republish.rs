@@ -1316,7 +1316,7 @@ macro_rules! define_trigger_rescan_republish_tests {
             .expect("encode source scan deactivate"),
         ];
         assert!(
-            is_restart_deferred_retire_pending_deactivate_batch(&cleanup_tail),
+            is_drained_retire_cleanup_deactivate_batch(&cleanup_tail),
             "test precondition: cleanup tail must stay cleanup-only and skip post-ack refresh"
         );
 
@@ -2193,9 +2193,9 @@ macro_rules! define_trigger_rescan_republish_tests {
         let node_c_id = "node-c-29799407896396737569357825";
         let node_d_id = "node-d-29799407896396737569357825";
         let node_e_id = "node-e-29799407896396737569357825";
-        let nfs1_source = "127.0.0.1:/exports/nfs1";
-        let nfs2_source = "127.0.0.1:/exports/nfs2";
-        let nfs3_source = "127.0.0.1:/exports/nfs3";
+        let nfs1_source = "fixture:nfs1";
+        let nfs2_source = "fixture:nfs2";
+        let nfs3_source = "fixture:nfs3";
 
         let cfg = SourceConfig {
             roots: vec![

@@ -21,7 +21,19 @@ fn group_has_local_sink_presence(
     sink_groups: &BTreeMap<&str, &crate::sink::SinkGroupStatusSnapshot>,
     scheduled_groups: &BTreeSet<String>,
 ) -> bool {
-    sink_groups.contains_key(group_id) || scheduled_groups.contains(group_id)
+    scheduled_groups.contains(group_id)
+        || sink_groups
+            .get(group_id)
+            .is_some_and(|group| sink_group_has_materialized_presence(group))
+}
+
+fn sink_group_has_materialized_presence(group: &crate::sink::SinkGroupStatusSnapshot) -> bool {
+    group.live_nodes > 0
+        || group.total_nodes > 0
+        || matches!(
+            group.normalized_readiness(),
+            crate::sink::GroupReadinessState::Ready
+        )
 }
 
 fn sink_group_blocks_materialized_observation(

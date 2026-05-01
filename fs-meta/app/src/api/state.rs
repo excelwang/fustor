@@ -62,10 +62,13 @@ pub struct ApiRequestTracker {
 pub struct ApiControlGate {
     ready: AtomicBool,
     management_write_ready: AtomicBool,
+    source_repair_ready: AtomicBool,
+    management_write_drain_closed: AtomicBool,
     epoch: AtomicU64,
     changed: Notify,
     facade_request_tracker: Arc<ApiRequestTracker>,
     management_write_recovery: RwLock<Option<ManagementWriteRecovery>>,
+    source_repair_recovery: RwLock<Option<ManagementWriteRecovery>>,
 }
 
 pub struct ApiRequestGuard {
@@ -99,10 +102,13 @@ impl ApiControlGate {
         Self {
             ready: AtomicBool::new(ready),
             management_write_ready: AtomicBool::new(ready),
+            source_repair_ready: AtomicBool::new(ready),
+            management_write_drain_closed: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             changed: Notify::new(),
             facade_request_tracker: Arc::new(ApiRequestTracker::default()),
             management_write_recovery: RwLock::new(None),
+            source_repair_recovery: RwLock::new(None),
         }
     }
 
@@ -112,6 +118,14 @@ impl ApiControlGate {
 
     pub fn is_management_write_ready(&self) -> bool {
         self.management_write_ready.load(Ordering::Acquire)
+    }
+
+    pub fn is_source_repair_ready(&self) -> bool {
+        self.source_repair_ready.load(Ordering::Acquire)
+    }
+
+    pub fn is_management_write_drain_closed(&self) -> bool {
+        self.management_write_drain_closed.load(Ordering::Acquire)
     }
 
     pub fn readiness_snapshot(&self) -> (bool, bool, u64) {
@@ -127,13 +141,38 @@ impl ApiControlGate {
     }
 
     pub fn set_ready_state(&self, ready: bool, management_write_ready: bool) {
-        if !ready || !management_write_ready {
+        self.set_ready_state_with_source_repair(
+            ready,
+            management_write_ready,
+            management_write_ready,
+        );
+    }
+
+    pub fn set_ready_state_with_source_repair(
+        &self,
+        ready: bool,
+        management_write_ready: bool,
+        source_repair_ready: bool,
+    ) {
+        if !ready || !management_write_ready || !source_repair_ready {
             self.epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        if management_write_ready && source_repair_ready {
+            self.management_write_drain_closed
+                .store(false, Ordering::Release);
         }
         self.ready.store(ready, Ordering::Release);
         self.management_write_ready
             .store(management_write_ready, Ordering::Release);
+        self.source_repair_ready
+            .store(source_repair_ready, Ordering::Release);
         self.changed.notify_waiters();
+    }
+
+    pub fn close_management_write_gate(&self) {
+        self.management_write_drain_closed
+            .store(true, Ordering::Release);
+        self.set_ready_state(self.is_ready(), false);
     }
 
     pub fn epoch(&self) -> u64 {
@@ -166,6 +205,19 @@ impl ApiControlGate {
         }
     }
 
+    pub async fn wait_source_repair_ready(&self) {
+        loop {
+            if self.is_source_repair_ready() {
+                return;
+            }
+            let notified = self.changed.notified();
+            if self.is_source_repair_ready() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub fn set_management_write_recovery(&self, recovery: Option<ManagementWriteRecovery>) {
         if let Ok(mut guard) = self.management_write_recovery.write() {
             *guard = recovery;
@@ -174,6 +226,19 @@ impl ApiControlGate {
 
     pub fn management_write_recovery(&self) -> Option<ManagementWriteRecovery> {
         self.management_write_recovery
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    pub fn set_source_repair_recovery(&self, recovery: Option<ManagementWriteRecovery>) {
+        if let Ok(mut guard) = self.source_repair_recovery.write() {
+            *guard = recovery;
+        }
+    }
+
+    pub fn source_repair_recovery(&self) -> Option<ManagementWriteRecovery> {
+        self.source_repair_recovery
             .read()
             .ok()
             .and_then(|guard| guard.clone())

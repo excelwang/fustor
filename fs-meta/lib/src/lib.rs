@@ -178,6 +178,12 @@ impl FSMetaConfig {
             out.source.scan_workers =
                 source::config::SourceConfig::normalize_scan_workers(value as usize);
         }
+        if let Some(value) = get_int(cfg, "max_scan_events")
+            && value > 0
+        {
+            out.source.max_scan_events =
+                source::config::SourceConfig::normalize_max_scan_events(value as usize);
+        }
         if let Some(value) = get_int(cfg, "audit_interval_ms")
             && value > 0
         {
@@ -261,5 +267,47 @@ impl FSMetaConfig {
         }
         out.api.validate().map_err(CnxError::InvalidInput)?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn minimal_api_config() -> ConfigValue {
+        let mut auth = HashMap::new();
+        auth.insert(
+            "passwd_path".to_string(),
+            ConfigValue::String("/tmp/passwd".into()),
+        );
+        auth.insert(
+            "shadow_path".to_string(),
+            ConfigValue::String("/tmp/shadow".into()),
+        );
+        auth.insert(
+            "query_keys_path".to_string(),
+            ConfigValue::String("/tmp/query-keys.json".into()),
+        );
+
+        let mut api = HashMap::new();
+        api.insert("enabled".to_string(), ConfigValue::Bool(true));
+        api.insert(
+            "facade_resource_id".to_string(),
+            ConfigValue::String("fs-meta-api".into()),
+        );
+        api.insert("auth".to_string(), ConfigValue::Map(auth));
+        ConfigValue::Map(api)
+    }
+
+    #[test]
+    fn manifest_config_parses_source_max_scan_events() {
+        let mut cfg = HashMap::new();
+        cfg.insert("api".to_string(), minimal_api_config());
+        cfg.insert("max_scan_events".to_string(), ConfigValue::Int(512));
+
+        let parsed = FSMetaConfig::from_product_manifest_config(&cfg).expect("config");
+
+        assert_eq!(parsed.source.max_scan_events, 512);
     }
 }

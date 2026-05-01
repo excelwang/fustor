@@ -23,10 +23,14 @@ pub enum SourceWorkerRequest {
     SourcePrimaryByGroupSnapshot,
     LastForceFindRunnerByGroupSnapshot,
     ForceFindInflightGroupsSnapshot,
+    StartRuntimeEndpoints,
+    RearmSourceRescanEndpoints,
     ForceFind { request: InternalQueryRequest },
     ResolveGroupIdForObjectRef { object_ref: String },
     PublishManualRescanSignal,
+    SubmitRescanRequestEpoch,
     TriggerRescanWhenReadyEpoch,
+    TriggerTargetedRescanWhenReadyEpoch,
     OnControlFrame { envelopes: Vec<ControlEnvelope> },
 }
 

@@ -32,6 +32,34 @@ fn internal_status_availability_fails_closed_for_local_api_task_when_facade_is_n
     }
 }
 
+#[test]
+fn source_owned_status_availability_allows_local_api_task_when_facade_is_not_serving() {
+    for state in [
+        FacadeServiceState::Pending,
+        FacadeServiceState::Unavailable,
+    ] {
+        assert_eq!(
+            FSMetaApp::source_status_available_for_endpoint(state, true, true),
+            InternalStatusAvailability::Available,
+            "source-owned source-status must stay available for source runtime-scope aggregation even when a local api_task exists and the facade state is not serving: state={state:?}"
+        );
+    }
+}
+
+#[test]
+fn query_owned_status_availability_still_fails_closed_for_local_api_task() {
+    for state in [
+        FacadeServiceState::Pending,
+        FacadeServiceState::Unavailable,
+    ] {
+        assert_eq!(
+            FSMetaApp::source_status_available_for_endpoint(state, true, false),
+            InternalStatusAvailability::UnavailableLocalFacadeNotServing,
+            "query-owned source-status remains tied to local facade serving state: state={state:?}"
+        );
+    }
+}
+
 #[derive(Default)]
 struct DropUntilFirstEventsRecvBoundary {
     inner: LoopbackWorkerBoundary,
