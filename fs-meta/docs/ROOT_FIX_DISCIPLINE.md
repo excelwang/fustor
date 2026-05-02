@@ -21,6 +21,11 @@ fix the owner of the broken product rule, not the symptom seen by one test.
    product reason. Then update source and tests to match.
 6. Re-run the lowest affected test rung first, then climb the ladder until the
    original environment passes.
+7. If a high-level L5 scenario repeatedly fails across more than one domain
+   boundary, split the scenario into named diagnostic substages before more
+   full-stage reruns. Keep the product gate unchanged; expose progress so the
+   next failure reports the exact domain boundary instead of another coarse
+   timeout.
 
 ## Forbidden Workarounds
 
@@ -60,6 +65,7 @@ NFS exports.
 Each non-trivial failure should leave a short work-log entry with:
 
 - Command and suite.
+- Current matrix progress, including L5 stage/substage when applicable.
 - Environment rung.
 - First raw error.
 - Domain state at failure.

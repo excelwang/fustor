@@ -242,6 +242,26 @@ impl RuntimeUnitGate {
             .is_some_and(|route| route.active))
     }
 
+    pub(crate) fn active_route_keys(&self, unit_id: &str) -> Result<BTreeSet<String>> {
+        self.validate_runtime_unit(unit_id)?;
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| CnxError::Internal("RuntimeUnitGate lock poisoned".into()))?;
+        Ok(gate
+            .units
+            .get(unit_id)
+            .map(|state| {
+                state
+                    .routes
+                    .iter()
+                    .filter(|(_, route)| route.active)
+                    .map(|(route_key, _)| route_key.clone())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     pub(crate) fn has_runtime_state(&self) -> bool {
         self.gate
             .lock()

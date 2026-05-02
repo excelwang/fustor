@@ -96,12 +96,32 @@ run_real_nfs_runtime_filter() {
 }
 
 L5_STAGE_TOTAL=24
+L5_VISIBILITY_SUBSTAGE_TOTAL=7
 
 run_l5_api_stage() {
   local index="$1"
   local stage="$2"
   local filter="$3"
   echo "[fs-meta-test-matrix] l5_progress=${index}/${L5_STAGE_TOTAL}"
+  run_real_nfs_api_filter "l5.${stage}" "$filter"
+}
+
+run_l5_api_substage() {
+  local subindex="$1"
+  local stage="$2"
+  local filter="$3"
+  local effective
+  effective="$(python3 - "$subindex" "$L5_VISIBILITY_SUBSTAGE_TOTAL" <<'PY'
+import sys
+
+subindex = int(sys.argv[1])
+total = int(sys.argv[2])
+print(f"{4 + (subindex / total):.2f}")
+PY
+)"
+  echo "[fs-meta-test-matrix] l5_stage=5/${L5_STAGE_TOTAL}"
+  echo "[fs-meta-test-matrix] l5_subprogress=${subindex}/${L5_VISIBILITY_SUBSTAGE_TOTAL}"
+  echo "[fs-meta-test-matrix] l5_progress=${effective}/${L5_STAGE_TOTAL}"
   run_real_nfs_api_filter "l5.${stage}" "$filter"
 }
 
@@ -241,6 +261,34 @@ operations_real_nfs() {
       run_l5_api_stage 5 "ops.visibility-sink-selection" \
         fs_meta_operations_visibility_change_and_sink_selection_real_nfs
       ;;
+    ops-visibility-roots-narrowed)
+      run_l5_api_substage 1 "ops.visibility.5.1.roots-narrowed" \
+        fs_meta_operations_visibility_roots_narrowed_real_nfs
+      ;;
+    ops-visibility-source-delivery-ready)
+      run_l5_api_substage 2 "ops.visibility.5.2.source-delivery-ready" \
+        fs_meta_operations_visibility_source_delivery_ready_real_nfs
+      ;;
+    ops-visibility-manual-rescan-accepted)
+      run_l5_api_substage 3 "ops.visibility.5.3.manual-rescan-accepted" \
+        fs_meta_operations_visibility_manual_rescan_accepted_real_nfs
+      ;;
+    ops-visibility-grants-visible)
+      run_l5_api_substage 4 "ops.visibility.5.4.grants-visible" \
+        fs_meta_operations_visibility_grants_visible_real_nfs
+      ;;
+    ops-visibility-withdraw-converged)
+      run_l5_api_substage 5 "ops.visibility.5.5.withdraw-converged" \
+        fs_meta_operations_visibility_withdraw_converged_real_nfs
+      ;;
+    ops-visibility-sink-holder-moved)
+      run_l5_api_substage 6 "ops.visibility.5.6.sink-holder-moved" \
+        fs_meta_operations_visibility_sink_holder_moved_real_nfs
+      ;;
+    ops-visibility-facade-live)
+      run_l5_api_substage 7 "ops.visibility.5.7.facade-live" \
+        fs_meta_operations_visibility_facade_live_real_nfs
+      ;;
     ops-sink-failover)
       run_l5_api_stage 18 "ops.sink-failover" \
         fs_meta_operations_sink_failover_real_nfs
@@ -372,6 +420,13 @@ atomic L5 stages:
   ops-force-find-smoke
   ops-force-find-semantics
   ops-visibility-sink-selection
+  ops-visibility-roots-narrowed
+  ops-visibility-source-delivery-ready
+  ops-visibility-manual-rescan-accepted
+  ops-visibility-grants-visible
+  ops-visibility-withdraw-converged
+  ops-visibility-sink-holder-moved
+  ops-visibility-facade-live
   upgrade-apply-generation-two
   upgrade-generation-two-http
   upgrade-peer-source-control

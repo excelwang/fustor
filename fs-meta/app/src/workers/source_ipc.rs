@@ -5,7 +5,9 @@ use capanix_app_sdk::{CnxError, Event, Result};
 
 use crate::query::request::InternalQueryRequest;
 use crate::source::config::{GrantedMountRoot, RootSpec};
-use crate::source::{SourceProgressSnapshot, SourceStatusSnapshot};
+use crate::source::{
+    SourceProgressSnapshot, SourceStatusSnapshot, SourceTargetedRescanDeliveryAcceptance,
+};
 use crate::workers::source::SourceObservabilitySnapshot;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -31,6 +33,8 @@ pub enum SourceWorkerRequest {
     SubmitRescanRequestEpoch,
     TriggerRescanWhenReadyEpoch,
     TriggerTargetedRescanWhenReadyEpoch,
+    CheckTargetedRescanDeliveryAcceptance,
+    AcceptTargetedRescanDelivery,
     OnControlFrame { envelopes: Vec<ControlEnvelope> },
 }
 
@@ -51,6 +55,7 @@ pub enum SourceWorkerResponse {
     Events(Vec<Event>),
     ResolveGroupIdForObjectRef(Option<String>),
     RescanRequestEpoch(u64),
+    TargetedRescanDeliveryAcceptance(SourceTargetedRescanDeliveryAcceptance),
     InvalidInput(String),
     Error(String),
 }

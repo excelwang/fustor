@@ -21,7 +21,7 @@ use crate::runtime::orchestration::{
 };
 use crate::runtime::routes::{ROUTE_KEY_EVENTS, source_rescan_route_key_for};
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
-use crate::source::{FSMetaSource, SourceStatusSnapshot};
+use crate::source::{FSMetaSource, SourceStatusSnapshot, SourceTargetedRescanDeliveryAcceptance};
 use crate::workers::sink::SinkFacade;
 use crate::workers::source_ipc::{
     SourceWorkerRequest, SourceWorkerResponse, decode_request, decode_response, encode_request,
@@ -48,6 +48,8 @@ const SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON: &str =
     "source worker runtime scope served from control cache";
 const SOURCE_WORKER_MANUAL_RESCAN_DELIVERY_CACHE_REASON: &str =
     "source worker manual-rescan delivery served from rearm ack";
+const SOURCE_WORKER_PENDING_SOURCE_STATE_OBSERVATION_REASON: &str =
+    "source worker source state pending; delivery proof withheld";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourceProgressReason {
@@ -4407,6 +4409,18 @@ pub(crate) struct SourceWorkerTriggerRescanWhenReadyCallCountHook {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SourceWorkerRearmCallCountHook {
+    pub count: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SourceWorkerAcceptTargetedDeliveryCallCountHook {
+    pub count: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
 pub(crate) struct SourceWorkerScheduledGroupsErrorHook {
     pub err: CnxError,
 }
@@ -4561,6 +4575,23 @@ fn source_worker_trigger_rescan_when_ready_call_count_hook_cell()
 -> &'static Mutex<Option<SourceWorkerTriggerRescanWhenReadyCallCountHook>> {
     static CELL: std::sync::OnceLock<
         Mutex<Option<SourceWorkerTriggerRescanWhenReadyCallCountHook>>,
+    > = std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn source_worker_rearm_call_count_hook_cell()
+-> &'static Mutex<Option<SourceWorkerRearmCallCountHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerRearmCallCountHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn source_worker_accept_targeted_delivery_call_count_hook_cell()
+-> &'static Mutex<Option<SourceWorkerAcceptTargetedDeliveryCallCountHook>> {
+    static CELL: std::sync::OnceLock<
+        Mutex<Option<SourceWorkerAcceptTargetedDeliveryCallCountHook>>,
     > = std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
@@ -4925,6 +4956,26 @@ pub(crate) fn install_source_worker_trigger_rescan_when_ready_call_count_hook(
 }
 
 #[cfg(test)]
+pub(crate) fn install_source_worker_rearm_call_count_hook(hook: SourceWorkerRearmCallCountHook) {
+    let mut guard = match source_worker_rearm_call_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn install_source_worker_accept_targeted_delivery_call_count_hook(
+    hook: SourceWorkerAcceptTargetedDeliveryCallCountHook,
+) {
+    let mut guard = match source_worker_accept_targeted_delivery_call_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn install_source_worker_scheduled_groups_error_hook(
     hook: SourceWorkerScheduledGroupsErrorHook,
 ) {
@@ -5023,6 +5074,24 @@ pub(crate) fn clear_source_worker_trigger_rescan_when_ready_call_count_hook() {
 }
 
 #[cfg(test)]
+pub(crate) fn clear_source_worker_rearm_call_count_hook() {
+    let mut guard = match source_worker_rearm_call_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_source_worker_accept_targeted_delivery_call_count_hook() {
+    let mut guard = match source_worker_accept_targeted_delivery_call_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
 pub(crate) fn clear_source_worker_scheduled_groups_error_hook() {
     let mut guard = match source_worker_scheduled_groups_error_hook_cell().lock() {
         Ok(guard) => guard,
@@ -5102,6 +5171,28 @@ fn record_source_worker_observability_rpc_attempt() {
 #[cfg(test)]
 fn record_source_worker_trigger_rescan_when_ready_attempt() {
     let guard = match source_worker_trigger_rescan_when_ready_call_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(hook) = guard.as_ref() {
+        hook.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+fn record_source_worker_rearm_attempt() {
+    let guard = match source_worker_rearm_call_count_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(hook) = guard.as_ref() {
+        hook.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+fn record_source_worker_accept_targeted_delivery_attempt() {
+    let guard = match source_worker_accept_targeted_delivery_call_count_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -7115,11 +7206,17 @@ impl SourceWorkerClientHandle {
     async fn rearm_source_rescan_request_endpoints_with_failure(
         &self,
     ) -> std::result::Result<(), SourceFailure> {
+        if self.manual_rescan_delivery_rearm_already_ready().await {
+            self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
+            return Ok(());
+        }
         let deadline = std::time::Instant::now() + SOURCE_WORKER_CONTROL_RPC_TIMEOUT;
         self.replay_retained_control_state_before_observability_read_until(deadline)
             .await?;
         match self
             .with_started_retry_with_failure(|client| async move {
+                #[cfg(test)]
+                record_source_worker_rearm_attempt();
                 Self::call_worker_with_failure(
                     &client,
                     SourceWorkerRequest::RearmSourceRescanEndpoints,
@@ -7144,6 +7241,14 @@ impl SourceWorkerClientHandle {
                 unexpected_source_worker_response_result("for source rescan endpoint rearm", other)
             }
         }
+    }
+
+    async fn manual_rescan_delivery_rearm_already_ready(&self) -> bool {
+        if self.control_op_inflight() || self.retained_replay_required_for_status().await {
+            return false;
+        }
+        self.manual_rescan_delivery_observability_snapshot()
+            .is_some()
     }
 
     async fn execute_start_attempt(&self, timeout: Duration) -> std::result::Result<(), CnxError> {
@@ -7609,6 +7714,94 @@ impl SourceWorkerClientHandle {
         Ok(epoch)
     }
 
+    async fn accept_targeted_rescan_delivery_with_failure(
+        &self,
+    ) -> std::result::Result<(), SourceFailure> {
+        if self.manual_rescan_delivery_acceptance_already_ready().await {
+            self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
+            return Ok(());
+        }
+        match self
+            .with_started_once_with_failure(|client| async move {
+                #[cfg(test)]
+                record_source_worker_accept_targeted_delivery_attempt();
+                Self::call_worker_with_failure(
+                    &client,
+                    SourceWorkerRequest::AcceptTargetedRescanDelivery,
+                    SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                )
+                .await
+            })
+            .await?
+        {
+            SourceWorkerResponse::Ack => {
+                self.with_cache_mut(|cache| {
+                    annotate_cached_manual_rescan_route_receivable_evidence(
+                        cache,
+                        &self.node_id,
+                        &self.config.host_object_grants,
+                    );
+                });
+                self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
+                Ok(())
+            }
+            other => {
+                unexpected_source_worker_response_result("for targeted rescan delivery", other)
+            }
+        }
+    }
+
+    async fn check_targeted_rescan_delivery_acceptance_with_failure(
+        &self,
+    ) -> std::result::Result<SourceTargetedRescanDeliveryAcceptance, SourceFailure> {
+        if self.manual_rescan_delivery_acceptance_already_ready().await {
+            self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
+            return Ok(SourceTargetedRescanDeliveryAcceptance::Accepted);
+        }
+        match self
+            .with_started_once_with_failure(|client| async move {
+                #[cfg(test)]
+                record_source_worker_accept_targeted_delivery_attempt();
+                Self::call_worker_with_failure(
+                    &client,
+                    SourceWorkerRequest::CheckTargetedRescanDeliveryAcceptance,
+                    SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                )
+                .await
+            })
+            .await?
+        {
+            SourceWorkerResponse::TargetedRescanDeliveryAcceptance(
+                SourceTargetedRescanDeliveryAcceptance::Accepted,
+            ) => {
+                self.with_cache_mut(|cache| {
+                    annotate_cached_manual_rescan_route_receivable_evidence(
+                        cache,
+                        &self.node_id,
+                        &self.config.host_object_grants,
+                    );
+                });
+                self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
+                Ok(SourceTargetedRescanDeliveryAcceptance::Accepted)
+            }
+            SourceWorkerResponse::TargetedRescanDeliveryAcceptance(
+                SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary,
+            ) => Ok(SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary),
+            other => unexpected_source_worker_response_result(
+                "for targeted rescan delivery acceptance",
+                other,
+            ),
+        }
+    }
+
+    async fn manual_rescan_delivery_acceptance_already_ready(&self) -> bool {
+        if self.control_op_inflight() || self.retained_replay_required_for_status().await {
+            return false;
+        }
+        self.manual_rescan_delivery_observability_snapshot()
+            .is_some()
+    }
+
     async fn progress_snapshot_with_timeout_with_failure(
         &self,
         timeout: Duration,
@@ -7847,10 +8040,63 @@ impl SourceWorkerClientHandle {
         self.with_cache_mut(|cache| build_runtime_scope_control_cache_observability_snapshot(cache))
     }
 
+    async fn source_state_pending_observability_snapshot_for_status_route(
+        &self,
+    ) -> (SourceObservabilitySnapshot, bool) {
+        let retained_signals = self.control_state.lock().await.replay_signals();
+        let mut snapshot =
+            if let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot() {
+                self.log_observability_cache_fallback(
+                    "runtime_scope_control_cache_while_source_state_pending",
+                    &snapshot,
+                );
+                snapshot
+            } else if let Some(snapshot) = self
+                .retained_control_observability_snapshot_for_pending_source_state(&retained_signals)
+            {
+                self.log_observability_cache_fallback(
+                    "retained_control_scope_while_source_state_pending",
+                    &snapshot,
+                );
+                snapshot
+            } else {
+                self.degraded_observability_snapshot_from_cache(
+                    SOURCE_WORKER_PENDING_SOURCE_STATE_OBSERVATION_REASON,
+                )
+            };
+        strip_delivery_truth_from_source_state_pending_observation(&mut snapshot);
+        (snapshot, true)
+    }
+
+    fn retained_control_observability_snapshot_for_pending_source_state(
+        &self,
+        retained_signals: &[SourceControlSignal],
+    ) -> Option<SourceObservabilitySnapshot> {
+        if retained_signals.is_empty() {
+            return None;
+        }
+        self.with_cache_mut(|cache| {
+            build_pending_source_state_observability_snapshot_from_retained_control(
+                cache,
+                &self.node_id,
+                &self.config,
+                retained_signals,
+            )
+        })
+    }
+
     fn manual_rescan_delivery_observability_snapshot(&self) -> Option<SourceObservabilitySnapshot> {
         self.with_cache_mut(|cache| {
             build_manual_rescan_delivery_observability_snapshot(cache, &self.node_id, &self.config)
         })
+    }
+
+    fn cached_manual_rescan_delivery_observability_snapshot_for_status_route(
+        &self,
+    ) -> Option<SourceObservabilitySnapshot> {
+        let snapshot = self.manual_rescan_delivery_observability_snapshot()?;
+        self.log_observability_cache_fallback("manual_rescan_delivery_rearm_ack", &snapshot);
+        Some(snapshot)
     }
 
     async fn retained_replay_required_for_status(&self) -> bool {
@@ -7915,8 +8161,9 @@ impl SourceWorkerClientHandle {
         &self,
         live_probe_timeout: Option<Duration>,
     ) -> (SourceObservabilitySnapshot, bool) {
-        if let Some(snapshot) = self.manual_rescan_delivery_observability_snapshot() {
-            self.log_observability_cache_fallback("manual_rescan_delivery_rearm_ack", &snapshot);
+        if let Some(snapshot) =
+            self.cached_manual_rescan_delivery_observability_snapshot_for_status_route()
+        {
             return (snapshot, true);
         }
         self.observability_snapshot_nonblocking_for_status_route_with_timeout(live_probe_timeout)
@@ -7966,6 +8213,7 @@ pub(crate) fn source_observability_snapshot_is_degraded_worker_cache(
                     && reason != SOURCE_WORKER_CACHE_STATUS_REASON
                     && reason != SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON
                     && reason != SOURCE_WORKER_MANUAL_RESCAN_DELIVERY_CACHE_REASON
+                    && reason != SOURCE_WORKER_PENDING_SOURCE_STATE_OBSERVATION_REASON
             })
 }
 
@@ -8851,6 +9099,57 @@ fn build_runtime_scope_control_cache_observability_snapshot(
         SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON.to_string(),
     ));
     Some(snapshot)
+}
+
+fn build_pending_source_state_observability_snapshot_from_retained_control(
+    cache: &SourceWorkerSnapshotCache,
+    node_id: &NodeId,
+    config: &SourceConfig,
+    retained_signals: &[SourceControlSignal],
+) -> Option<SourceObservabilitySnapshot> {
+    let mut projected_cache = cache.clone();
+    if projected_cache.logical_roots.is_none() {
+        projected_cache.logical_roots = Some(config.roots.clone());
+    }
+    if projected_cache.grants.is_none() {
+        projected_cache.grants = Some(config.host_object_grants.clone());
+    }
+    projected_cache.lifecycle_state = Some("source-state-pending-retained-control".to_string());
+    prime_cached_schedule_from_control_signals(
+        &mut projected_cache,
+        node_id,
+        retained_signals,
+        &config.roots,
+        &config.host_object_grants,
+    );
+    prime_cached_control_summary_from_control_signals(
+        &mut projected_cache,
+        node_id,
+        retained_signals,
+        &config.host_object_grants,
+    );
+    build_runtime_scope_control_cache_observability_snapshot(&projected_cache)
+}
+
+fn strip_delivery_truth_from_source_state_pending_observation(
+    snapshot: &mut SourceObservabilitySnapshot,
+) {
+    snapshot.source_primary_by_group.clear();
+    snapshot.status.concrete_roots.clear();
+    let pending_reason = SOURCE_WORKER_PENDING_SOURCE_STATE_OBSERVATION_REASON.to_string();
+    if !snapshot
+        .status
+        .degraded_roots
+        .iter()
+        .any(|(root_key, reason)| {
+            root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY && reason == &pending_reason
+        })
+    {
+        snapshot
+            .status
+            .degraded_roots
+            .push((SOURCE_WORKER_DEGRADED_ROOT_KEY.to_string(), pending_reason));
+    }
 }
 
 fn strip_publication_truth_from_runtime_scope_control_cache(
@@ -9839,6 +10138,30 @@ impl SourceFacade {
         }
     }
 
+    pub(crate) async fn accept_targeted_rescan_delivery_with_failure(
+        &self,
+    ) -> std::result::Result<(), SourceFailure> {
+        match self {
+            Self::Local(source) => source
+                .accept_targeted_rescan_delivery_with_failure()
+                .map_err(SourceFailure::from),
+            Self::Worker(client) => client.accept_targeted_rescan_delivery_with_failure().await,
+        }
+    }
+
+    pub(crate) async fn check_targeted_rescan_delivery_acceptance_with_failure(
+        &self,
+    ) -> std::result::Result<SourceTargetedRescanDeliveryAcceptance, SourceFailure> {
+        match self {
+            Self::Local(source) => Ok(source.targeted_rescan_delivery_acceptance()),
+            Self::Worker(client) => {
+                client
+                    .check_targeted_rescan_delivery_acceptance_with_failure()
+                    .await
+            }
+        }
+    }
+
     pub(crate) async fn reconnect_shared_worker_client_with_failure(
         &self,
     ) -> std::result::Result<(), SourceFailure> {
@@ -9935,6 +10258,35 @@ impl SourceFacade {
                         live_probe_timeout,
                     )
                     .await
+            }
+        }
+    }
+
+    pub(crate) async fn source_state_pending_observability_snapshot_for_status_route(
+        &self,
+    ) -> (SourceObservabilitySnapshot, bool) {
+        match self {
+            Self::Local(source) => {
+                let (mut snapshot, _) =
+                    source.observability_snapshot_nonblocking_for_status_route();
+                strip_delivery_truth_from_source_state_pending_observation(&mut snapshot);
+                (snapshot, true)
+            }
+            Self::Worker(client) => {
+                client
+                    .source_state_pending_observability_snapshot_for_status_route()
+                    .await
+            }
+        }
+    }
+
+    pub(crate) fn cached_manual_rescan_delivery_observability_snapshot_for_status_route(
+        &self,
+    ) -> Option<SourceObservabilitySnapshot> {
+        match self {
+            Self::Local(_) => None,
+            Self::Worker(client) => {
+                client.cached_manual_rescan_delivery_observability_snapshot_for_status_route()
             }
         }
     }

@@ -544,6 +544,12 @@ pub struct SourceStatusSnapshot {
     pub degraded_roots: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SourceTargetedRescanDeliveryAcceptance {
+    Accepted,
+    NotLocalSourcePrimary,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceProgressSnapshot {
     pub(crate) rescan_observed_epoch: u64,
@@ -3843,6 +3849,29 @@ impl FSMetaSource {
         );
         self.trigger_rescan();
         Ok(epoch)
+    }
+
+    pub(crate) fn targeted_rescan_delivery_acceptance(
+        &self,
+    ) -> SourceTargetedRescanDeliveryAcceptance {
+        let target_roots =
+            self.local_source_primary_scan_root_keys("source.targeted_rescan_delivery.roots");
+        if target_roots.is_empty() {
+            SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary
+        } else {
+            SourceTargetedRescanDeliveryAcceptance::Accepted
+        }
+    }
+
+    pub(crate) fn accept_targeted_rescan_delivery_with_failure(&self) -> Result<()> {
+        match self.targeted_rescan_delivery_acceptance() {
+            SourceTargetedRescanDeliveryAcceptance::Accepted => Ok(()),
+            SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary => {
+                Err(CnxError::InvalidInput(
+                    "scoped source-rescan target has no local source-primary scan root".into(),
+                ))
+            }
+        }
     }
 
     pub(crate) fn submit_rescan_request_epoch(&self) -> u64 {

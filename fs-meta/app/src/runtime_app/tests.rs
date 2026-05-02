@@ -516,8 +516,20 @@ fn tick_envelope_with_route_key(
 
 #[allow(dead_code)]
 fn trusted_exposure_confirmed_envelope(unit_id: &str, generation: u64) -> ControlEnvelope {
+    trusted_exposure_confirmed_envelope_with_route_key(
+        unit_id,
+        facade_control_stream_route(),
+        generation,
+    )
+}
+
+fn trusted_exposure_confirmed_envelope_with_route_key(
+    unit_id: &str,
+    route_key: impl Into<String>,
+    generation: u64,
+) -> ControlEnvelope {
     encode_runtime_unit_exposure(&RuntimeUnitExposure {
-        route_key: facade_control_stream_route(),
+        route_key: route_key.into(),
         unit_id: unit_id.to_string(),
         generation,
         confirmed_at_us: 1,
@@ -891,6 +903,49 @@ async fn wait_for_sink_ready_groups(
     }
 }
 
+async fn wait_for_runtime_scope_convergence(
+    app: &FSMetaApp,
+    expected_scope_groups: &RuntimeScopeExpectedGroups,
+    context: &str,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let source_groups = app
+            .source
+            .scheduled_source_group_ids()
+            .await
+            .expect("source groups")
+            .unwrap_or_default();
+        let scan_groups = app
+            .source
+            .scheduled_scan_group_ids()
+            .await
+            .expect("scan groups")
+            .unwrap_or_default();
+        let sink_groups = app
+            .sink
+            .scheduled_group_ids()
+            .await
+            .expect("sink groups")
+            .unwrap_or_default();
+        let observation = RuntimeScopeConvergenceObservation {
+            source_groups,
+            scan_groups,
+            sink_groups,
+        };
+        if observation.matches_expected(expected_scope_groups) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{context}: timed out waiting for runtime scope convergence: {} expected={expected_scope_groups:?}",
+            observation.timeout_context()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn selected_group_proxy_tree(
     boundary: Arc<dyn ChannelIoSubset>,
     caller_node: NodeId,
@@ -1212,6 +1267,152 @@ async fn generic_source_status_live_probe_returns_runtime_scope_cache_without_re
             .iter()
             .any(|unit_id| unit_id.as_deref() == Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)),
         "source-status request must be handled by the query-peer app proxy: {recv_unit_ids:?}"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test]
+async fn manual_rescan_source_status_live_probe_returns_runtime_scope_cache_without_repairing_retained_replay()
+ {
+    let tmp = tempdir().expect("create temp dir");
+    let root = tmp.path().join("root-a");
+    fs::create_dir_all(&root).expect("create root");
+    let boundary = Arc::new(SourceStatusUnitAwareBoundary::new(
+        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+    ));
+    let app = FSMetaApp::with_boundaries_and_state(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("test-root", &root)],
+                host_object_grants: vec![granted_mount_root("single-app-node::root-1", &root)],
+                ..local_source_config()
+            },
+            ..FSMetaConfig::default()
+        },
+        local_runtime_worker_binding("source"),
+        local_runtime_worker_binding("sink"),
+        NodeId("single-app-node".into()),
+        Some(boundary.clone()),
+        None,
+        in_memory_state_boundary(),
+    )
+    .expect("init app");
+
+    let source_roots_control_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let source_rescan_control_route = format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL);
+    let source_rescan_route = format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL);
+    let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_roots_control_route,
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_rescan_control_route,
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_rescan_route.clone(),
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            source_rescan_route,
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            source_status_route.clone(),
+            &[("test-root", &["single-app-node::root-1"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("activate query-peer source-status route");
+    let endpoint_units = app
+        .runtime_endpoint_tasks
+        .lock()
+        .await
+        .iter()
+        .find(|task| task.route_key() == source_status_route)
+        .map(|task| task.unit_ids().to_vec())
+        .expect("query-peer source-status proxy endpoint should start");
+    assert!(
+        endpoint_units
+            .iter()
+            .any(|unit_id| unit_id == execution_units::QUERY_PEER_RUNTIME_UNIT_ID)
+            && !endpoint_units
+                .iter()
+                .any(|unit_id| unit_id == execution_units::SOURCE_RUNTIME_UNIT_ID),
+        "test must exercise the app-level source-status proxy, not the embedded source endpoint: {endpoint_units:?}"
+    );
+
+    set_control_initialized_for_tests(&app, false);
+    set_source_replay_required_for_tests(&app, true);
+    app.api_control_gate
+        .set_ready_state_with_source_repair(false, false, false);
+
+    let adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("single-app-node".into()),
+        crate::runtime::routes::default_route_bindings(),
+    );
+    let source_status_payload =
+        crate::query::api::manual_rescan_source_status_request_payload_with_live_probe_timeout(
+            Duration::from_secs(2),
+        );
+    assert_eq!(
+        crate::query::api::source_status_request_live_probe_timeout(&source_status_payload),
+        Some(Duration::from_millis(1750)),
+        "test setup must send a manual-rescan source-status live-probe budget"
+    );
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        source_status_payload,
+        Duration::from_secs(2),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("manual-rescan source-status live probe should respond without retained replay repair");
+
+    assert!(
+        !events.is_empty(),
+        "manual-rescan source-status live probe should return a source snapshot"
+    );
+    let snapshot: crate::workers::source::SourceObservabilitySnapshot =
+        rmp_serde::from_slice(events[0].payload_bytes())
+            .expect("decode manual-rescan source-status snapshot");
+    assert!(
+        snapshot
+            .scheduled_source_groups_by_node
+            .values()
+            .any(|groups| groups.iter().any(|group| group == "test-root")),
+        "manual-rescan source-status must publish runtime-scope source ownership from control cache while retained replay is pending: {snapshot:?}"
+    );
+    assert!(
+        app.source_state_replay_required(),
+        "manual-rescan source-status must not run retained replay repair before serving runtime-scope evidence"
+    );
+    let recv_unit_ids = boundary
+        .source_status_recv_unit_ids
+        .lock()
+        .expect("source_status_recv_unit_ids lock")
+        .clone();
+    assert!(
+        recv_unit_ids
+            .iter()
+            .any(|unit_id| unit_id.as_deref() == Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)),
+        "manual-rescan source-status request must be handled by the query-peer app proxy: {recv_unit_ids:?}"
     );
 
     app.close().await.expect("close app");
@@ -22395,6 +22596,22 @@ async fn source_rescan_routes_serve_worker_source_under_source_runtime_unit() {
     let event_route = format!("{}.stream", ROUTE_KEY_EVENTS);
     boundary.drain_route(&event_route).await;
 
+    struct SourceWorkerTriggerRescanWhenReadyCallCountHookReset;
+
+    impl Drop for SourceWorkerTriggerRescanWhenReadyCallCountHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_trigger_rescan_when_ready_call_count_hook();
+        }
+    }
+
+    let scoped_trigger_count = Arc::new(AtomicUsize::new(0));
+    let _scoped_trigger_reset = SourceWorkerTriggerRescanWhenReadyCallCountHookReset;
+    crate::workers::source::install_source_worker_trigger_rescan_when_ready_call_count_hook(
+        crate::workers::source::SourceWorkerTriggerRescanWhenReadyCallCountHook {
+            count: scoped_trigger_count.clone(),
+        },
+    );
+
     let scoped_adapter = crate::runtime::seam::exchange_host_adapter(
         boundary.clone(),
         NodeId("node-d".to_string()),
@@ -22417,15 +22634,15 @@ async fn source_rescan_routes_serve_worker_source_under_source_runtime_unit() {
         "worker-backed scoped source-rescan route must reply from the target source node"
     );
     assert!(
-        boundary
-            .recv_source_event_under_path(
-                &event_route,
-                "node-a::nfs1",
-                b"/rescan",
-                Duration::from_secs(5),
-            )
-            .await,
-        "worker-backed scoped source-rescan accepted must lead to source publication for the target local source-primary root"
+        scoped_events
+            .iter()
+            .any(|event| event.payload_bytes() == b"accepted"),
+        "worker-backed scoped source-rescan route must return explicit accepted delivery proof"
+    );
+    assert_eq!(
+        scoped_trigger_count.load(AtomicOrdering::Relaxed),
+        0,
+        "scoped source-rescan delivery proof must not synchronously start or wait for source scanning"
     );
 
     let recv_unit_ids = boundary
@@ -22617,7 +22834,7 @@ async fn worker_backed_scoped_source_rescan_route_rejects_without_local_primary_
 }
 
 #[test]
-fn worker_scoped_source_rescan_proxy_submits_without_waiting_for_scan_completion() {
+fn worker_scoped_source_rescan_proxy_accepts_without_starting_scan() {
     let source = include_str!("../runtime_app.rs");
     let proxy_start = source
         .find("spawning source rescan proxy endpoint route={}")
@@ -22628,11 +22845,16 @@ fn worker_scoped_source_rescan_proxy_submits_without_waiting_for_scan_completion
     let proxy_block = &source[proxy_start..proxy_start + proxy_tail];
 
     assert!(
-        proxy_block.contains("submit_targeted_rescan_when_ready_epoch_with_failure"),
-        "worker scoped source-rescan proxy must use target-required submission before replying accepted"
+        proxy_block.contains("accept_targeted_rescan_delivery_with_failure"),
+        "worker scoped source-rescan proxy must verify target ownership before replying accepted"
     );
     assert!(
-        !proxy_block.contains("source.trigger_rescan_when_ready_epoch_with_failure().await"),
+        !proxy_block.contains("submit_targeted_rescan_when_ready_epoch_with_failure")
+            && !proxy_block.contains("source.trigger_rescan_when_ready_epoch_with_failure().await"),
+        "worker scoped source-rescan proxy must not synchronously start source scan before accepted"
+    );
+    assert!(
+        !proxy_block.contains("wait_for_rescan_observed_epoch_with_failure"),
         "worker scoped source-rescan proxy must not wait for scan/materialization completion before accepted"
     );
 }
@@ -22800,6 +23022,10 @@ async fn manual_rescan_source_status_rearms_worker_scoped_rescan_endpoint_after_
         NodeId("api-node".to_string()),
         crate::runtime::routes::default_route_bindings(),
     );
+    let _source_recovery_error_reset = SourceControlRecoveryErrorQueueHookReset;
+    install_source_control_recovery_error_queue_hook(SourceControlRecoveryErrorQueueHook {
+        errs: VecDeque::from([CnxError::Timeout]),
+    });
     let _observability_hook_reset = SourceWorkerObservabilityErrorHookReset;
     crate::workers::source::install_source_worker_observability_error_hook(
         crate::workers::source::SourceWorkerObservabilityErrorHook {
@@ -22841,6 +23067,631 @@ async fn manual_rescan_source_status_rearms_worker_scoped_rescan_endpoint_after_
             .iter()
             .any(|event| event.metadata().origin_id == node_id),
         "rearmed scoped source-rescan route must reply from target source node"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_manual_rescan_status_uses_app_proxy_delivery_instead_of_worker_route_rearm() {
+    struct SourceWorkerDeliveryHookReset;
+
+    impl Drop for SourceWorkerDeliveryHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_rearm_call_count_hook();
+            crate::workers::source::clear_source_worker_accept_targeted_delivery_call_count_hook();
+        }
+    }
+
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(nfs1.join("rescan")).expect("create nfs1 rescan dir");
+    fs::write(nfs1.join("rescan").join("seed.txt"), b"a").expect("seed nfs1");
+    let nfs1_source = nfs1.display().to_string();
+    let node_id = NodeId("node-a-worker-proxy-status".into());
+    let scoped_route = source_rescan_request_route_for(&node_id.0).0;
+    let boundary = Arc::new(RuntimeProxyUnitAwareBoundary::new(None, None, None, None));
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_watch_scan_root("nfs1", &nfs1_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "node-a::nfs1",
+                        "node-a",
+                        "10.0.0.11",
+                        &nfs1_source,
+                        nfs1.clone(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            node_id.clone(),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            scoped_route.clone(),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            scoped_route.clone(),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("source manual-rescan route wave should succeed");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let source_groups = app
+            .source
+            .scheduled_source_group_ids()
+            .await
+            .expect("source groups")
+            .unwrap_or_default();
+        let scan_groups = app
+            .source
+            .scheduled_scan_group_ids()
+            .await
+            .expect("scan groups")
+            .unwrap_or_default();
+        if source_groups == std::collections::BTreeSet::from(["nfs1".to_string()])
+            && scan_groups == std::collections::BTreeSet::from(["nfs1".to_string()])
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for source rescan worker route convergence: source={source_groups:?} scan={scan_groups:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let _hook_reset = SourceWorkerDeliveryHookReset;
+    let rearm_count = Arc::new(AtomicUsize::new(0));
+    let accept_count = Arc::new(AtomicUsize::new(0));
+    crate::workers::source::install_source_worker_rearm_call_count_hook(
+        crate::workers::source::SourceWorkerRearmCallCountHook {
+            count: rearm_count.clone(),
+        },
+    );
+    crate::workers::source::install_source_worker_accept_targeted_delivery_call_count_hook(
+        crate::workers::source::SourceWorkerAcceptTargetedDeliveryCallCountHook {
+            count: accept_count.clone(),
+        },
+    );
+
+    let status_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+        crate::runtime::routes::default_route_bindings(),
+    );
+    let status_events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &status_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        query::api::manual_rescan_source_status_request_payload(),
+        Duration::from_secs(4),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("worker-backed manual-rescan source-status should return app-proxy delivery evidence");
+    assert!(
+        !status_events.is_empty(),
+        "manual-rescan source-status must emit delivery evidence"
+    );
+    assert_eq!(
+        rearm_count.load(AtomicOrdering::SeqCst),
+        0,
+        "worker-backed manual-rescan source-status must not wait for worker-owned external route rearm"
+    );
+    assert!(
+        accept_count.load(AtomicOrdering::SeqCst) > 0,
+        "worker-backed manual-rescan source-status must verify target ownership through the worker delivery check"
+    );
+    let route_generation = app
+        .facade_gate
+        .route_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, &scoped_route)
+        .expect("scoped source-rescan route generation")
+        .expect("scoped source-rescan route active");
+    assert_eq!(
+        app.source_rescan_proxy_ready_generation
+            .load(AtomicOrdering::Acquire),
+        route_generation,
+        "manual-rescan source-status must open the app proxy route for the current source route generation"
+    );
+
+    let scoped_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+        source_rescan_route_bindings_for(&node_id.0),
+    );
+    let scoped_events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &scoped_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_RESCAN,
+        Bytes::from_static(b"manual-rescan"),
+        Duration::from_secs(2),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("app proxy should deliver scoped source-rescan after source-status readiness");
+    assert!(
+        scoped_events.iter().any(|event| {
+            event.metadata().origin_id == node_id && event.payload_bytes() == b"accepted"
+        }),
+        "scoped source-rescan must return target accepted proof: {scoped_events:?}"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_manual_rescan_status_non_target_returns_status_without_marking_proxy_ready() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(nfs1.join("rescan")).expect("create nfs1 rescan dir");
+    fs::write(nfs1.join("rescan").join("seed.txt"), b"a").expect("seed nfs1");
+    let nfs1_source = nfs1.display().to_string();
+    let node_id = NodeId("node-a-worker-proxy-status-nontarget".into());
+    let scoped_route = source_rescan_request_route_for(&node_id.0).0;
+    let boundary = Arc::new(RuntimeProxyUnitAwareBoundary::new(None, None, None, None));
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_watch_scan_root("nfs1", &nfs1_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "node-b::nfs1",
+                        "node-b",
+                        "10.0.0.12",
+                        &nfs1_source,
+                        nfs1.clone(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            node_id.clone(),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            &[("nfs1", &["node-b::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            &[("nfs1", &["node-b::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-b::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-b::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            scoped_route.clone(),
+            &[("nfs1", &["node-b::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            &[("nfs1", &["node-b::nfs1"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("source status route wave should succeed");
+
+    set_control_initialized_for_tests(&app, true);
+    set_source_replay_required_for_tests(&app, false);
+    let route_generation = app
+        .facade_gate
+        .route_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, &scoped_route)
+        .expect("scoped source-rescan route generation")
+        .expect("scoped source-rescan route active");
+    assert!(
+        route_generation > 0,
+        "source-status non-target reproducer must exercise an active scoped source-rescan route"
+    );
+
+    let status_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+        crate::runtime::routes::default_route_bindings(),
+    );
+    let status_events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &status_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        query::api::manual_rescan_source_status_request_payload(),
+        Duration::from_secs(2),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("non-target manual-rescan source-status should still return status evidence");
+    assert!(
+        !status_events.is_empty(),
+        "non-target source-status must reply with status evidence instead of black-holing the request"
+    );
+    assert_eq!(
+        app.source_rescan_proxy_ready_generation
+            .load(AtomicOrdering::Acquire),
+        0,
+        "non-target source-status must not mark the local scoped source-rescan proxy ready"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_manual_rescan_status_target_timeout_returns_status_without_marking_proxy_ready() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(nfs1.join("rescan")).expect("create nfs1 rescan dir");
+    fs::write(nfs1.join("rescan").join("seed.txt"), b"a").expect("seed nfs1");
+    let nfs1_source = nfs1.display().to_string();
+    let node_id = NodeId("node-a-worker-proxy-status-target-timeout".into());
+    let scoped_route = source_rescan_request_route_for(&node_id.0).0;
+    let boundary = Arc::new(RuntimeProxyUnitAwareBoundary::new(None, None, None, None));
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_watch_scan_root("nfs1", &nfs1_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "node-a::nfs1",
+                        "node-a",
+                        "10.0.0.11",
+                        &nfs1_source,
+                        nfs1.clone(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            node_id.clone(),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            scoped_route.clone(),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("source status route wave should succeed");
+
+    set_control_initialized_for_tests(&app, true);
+    set_source_replay_required_for_tests(&app, false);
+    let route_generation = app
+        .facade_gate
+        .route_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, &scoped_route)
+        .expect("scoped source-rescan route generation")
+        .expect("scoped source-rescan route active");
+    assert!(
+        route_generation > 0,
+        "source-status target timeout reproducer must exercise an active scoped source-rescan route"
+    );
+
+    let status_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+        crate::runtime::routes::default_route_bindings(),
+    );
+    let status_events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &status_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        query::api::manual_rescan_source_status_request_payload_with_live_probe_timeout(
+            Duration::from_millis(1),
+        ),
+        Duration::from_millis(500),
+        Duration::from_millis(25),
+    )
+    .await
+    .expect("target manual-rescan source-status should return status evidence when delivery check budget is exhausted");
+    assert!(
+        !status_events.is_empty(),
+        "target source-status must reply with status evidence instead of black-holing the request"
+    );
+    assert_eq!(
+        app.source_rescan_proxy_ready_generation
+            .load(AtomicOrdering::Acquire),
+        0,
+        "delivery-check timeout must not mark the scoped source-rescan proxy ready"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_repair_rearms_scoped_rescan_after_pending_manual_status() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(nfs1.join("rescan")).expect("create nfs1 rescan dir");
+    fs::write(nfs1.join("rescan").join("seed.txt"), b"a").expect("seed nfs1");
+    let nfs1_source = nfs1.display().to_string();
+    let node_id = NodeId("node-a-source-repair-rescan-ready".into());
+    let scoped_route = source_rescan_request_route_for(&node_id.0).0;
+    let boundary = Arc::new(RuntimeProxyUnitAwareBoundary::new(None, None, None, None));
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_watch_scan_root("nfs1", &nfs1_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "node-a::nfs1",
+                        "node-a",
+                        "10.0.0.11",
+                        &nfs1_source,
+                        nfs1.clone(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            node_id.clone(),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            scoped_route.clone(),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            scoped_route.clone(),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+            &[("nfs1", &["node-a::nfs1"])],
+            2,
+        ),
+    ])
+    .await
+    .expect("source manual-rescan route wave should succeed");
+
+    app.source.arm_retained_control_replay().await;
+    app.source_rescan_proxy_ready_generation
+        .store(0, AtomicOrdering::Release);
+    app.control_failure_uninitialized
+        .store(true, AtomicOrdering::Release);
+    set_control_initialized_for_tests(&app, false);
+    set_source_replay_required_for_tests(&app, true);
+
+    let status_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+        crate::runtime::routes::default_route_bindings(),
+    );
+    let status_events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &status_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        query::api::manual_rescan_source_status_request_payload(),
+        Duration::from_secs(2),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("pending manual-rescan source-status should return pending source evidence");
+    assert!(
+        !status_events.is_empty(),
+        "pending manual-rescan source-status must not drop the status reply"
+    );
+    assert_eq!(
+        app.source_rescan_proxy_ready_generation
+            .load(AtomicOrdering::Acquire),
+        0,
+        "pending status evidence alone must not mark the scoped rescan proxy ready"
+    );
+
+    let recovery = app.source_repair_recovery();
+    recovery()
+        .await
+        .expect("source repair should replay retained source state");
+    assert!(
+        !app.source_state_replay_required(),
+        "source repair must clear retained source replay"
+    );
+    let route_generation = app
+        .facade_gate
+        .route_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, &scoped_route)
+        .expect("scoped source-rescan route generation query")
+        .expect("scoped source-rescan route must remain active");
+    assert_eq!(
+        app.source_rescan_proxy_ready_generation
+            .load(AtomicOrdering::Acquire),
+        route_generation,
+        "source repair must restore scoped source-rescan delivery proof for the current route generation"
+    );
+
+    let scoped_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+        source_rescan_route_bindings_for(&node_id.0),
+    );
+    let scoped_events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &scoped_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_RESCAN,
+        Bytes::from_static(b"manual-rescan"),
+        Duration::from_secs(2),
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("source repair should make the scoped source-rescan proxy receivable");
+    assert!(
+        scoped_events.iter().any(|event| {
+            event.metadata().origin_id == node_id && event.payload_bytes() == b"accepted"
+        }),
+        "repaired source state must accept scoped source-rescan delivery; got {scoped_events:?}"
     );
 
     app.close().await.expect("close app");
@@ -33147,6 +33998,95 @@ async fn control_frame_recovery_keeps_retained_sink_cutover_out_of_worker() {
 }
 
 #[tokio::test]
+async fn runtime_unit_exposure_wakeup_keeps_retained_sink_cutover_out_of_worker() {
+    let tmp = tempdir().expect("create temp dir");
+    let fs_source = tmp.path().display().to_string();
+    let app = FSMetaApp::new(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                host_object_grants: vec![worker_export_with_fs_source(
+                    "single-app-node::root-1",
+                    "single-app-node",
+                    "127.0.0.1",
+                    &fs_source,
+                    tmp.path().to_path_buf(),
+                )],
+                ..SourceConfig::default()
+            },
+            ..FSMetaConfig::default()
+        },
+        NodeId("single-app-node".into()),
+    )
+    .expect("init app");
+
+    let source_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+    let sink_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+    let root_scopes = &[("test-root", &["single-app-node::root-1"][..])];
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            source_route,
+            root_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            sink_route.clone(),
+            root_scopes,
+            2,
+        ),
+    ])
+    .await
+    .expect("initial mixed source/sink wave should succeed");
+
+    set_control_initialized_for_tests(&app, false);
+    set_source_replay_required_for_tests(&app, false);
+    set_sink_replay_required_for_tests(&app, true);
+    assert!(
+        app.sink_state_replay_required(),
+        "test setup should leave retained sink replay armed"
+    );
+
+    let worker_entered = Arc::new(Notify::new());
+    let worker_release = Arc::new(Notify::new());
+    let _worker_hook_reset = SinkWorkerControlFramePauseHookReset;
+    crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+        crate::workers::sink::SinkWorkerControlFramePauseHook {
+            entered: worker_entered.clone(),
+            release: worker_release.clone(),
+        },
+    );
+
+    let exposure = [trusted_exposure_confirmed_envelope_with_route_key(
+        execution_units::SINK_RUNTIME_UNIT_ID,
+        sink_route,
+        2,
+    )];
+    let control = app.on_control_frame(&exposure);
+    tokio::pin!(control);
+    tokio::select! {
+        _ = worker_entered.notified() => {
+            worker_release.notify_waiters();
+            panic!("runtime-unit exposure wakeup must not spend worker control budget on retained sink generation cutover replay");
+        }
+        result = &mut control => {
+            result.expect("runtime-unit exposure wakeup should be acknowledged while retained sink replay stays deferred");
+        }
+    }
+
+    assert!(
+        app.sink_state_replay_required(),
+        "runtime-unit exposure wakeup must preserve retained sink replay for management recovery"
+    );
+    assert!(
+        !app.control_initialized(),
+        "runtime-unit exposure wakeup must leave runtime fail-closed while sink replay is still pending"
+    );
+    worker_release.notify_waiters();
+}
+
+#[tokio::test]
 async fn management_recovery_retained_sink_replay_retryable_reset_does_not_reinitialize_full_runtime()
  {
     let tmp = tempdir().expect("create temp dir");
@@ -39249,11 +40189,12 @@ async fn external_runtime_app_selected_group_proxy_materializes_each_local_prima
     let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
     fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
     fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+    let roots = vec![worker_root("nfs1", &nfs1), worker_root("nfs2", &nfs2)];
 
     let app = FSMetaApp::with_boundaries_and_state(
         FSMetaConfig {
             source: SourceConfig {
-                roots: vec![worker_root("nfs1", &nfs1), worker_root("nfs2", &nfs2)],
+                roots: roots.clone(),
                 host_object_grants: vec![
                     worker_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
                     worker_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
@@ -39405,62 +40346,22 @@ async fn external_runtime_app_selected_group_proxy_materializes_each_local_prima
 
     let expected_groups =
         std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
-    let expected_source_groups = std::collections::BTreeSet::new();
-    let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let source_groups = app
-            .source
-            .scheduled_source_group_ids()
-            .await
-            .expect("source groups")
-            .unwrap_or_default();
-        let scan_groups = app
-            .source
-            .scheduled_scan_group_ids()
-            .await
-            .expect("scan groups")
-            .unwrap_or_default();
-        let sink_groups = app
-            .sink
-            .scheduled_group_ids()
-            .await
-            .expect("sink groups")
-            .unwrap_or_default();
-        if source_groups == expected_source_groups
-            && scan_groups == expected_groups
-            && sink_groups == expected_groups
-        {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < scheduling_deadline,
-            "timed out waiting for runtime scope convergence: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let snapshot = app
-            .sink
-            .status_snapshot_with_failure()
-            .await
-            .expect("sink status snapshot");
-        let ready_groups = snapshot
-            .groups
-            .iter()
-            .filter(|group| group.is_ready())
-            .map(|group| group.group_id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        if ready_groups == expected_groups {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < readiness_deadline,
-            "timed out waiting for sink readiness before selected-group proxy query: ready={ready_groups:?} snapshot={snapshot:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let expected_scope_groups =
+        RuntimeScopeExpectedGroups::from_logical_roots(&roots, &expected_groups);
+    wait_for_runtime_scope_convergence(
+        &app,
+        &expected_scope_groups,
+        "selected-group proxy generation-1",
+        Duration::from_secs(10),
+    )
+    .await;
+    wait_for_sink_ready_groups(
+        &app.sink,
+        &expected_groups,
+        "selected-group proxy generation-1",
+        Duration::from_secs(10),
+    )
+    .await;
 
     for group_id in ["nfs1", "nfs2"] {
         let request = selected_group_file_request(b"/force-find-stress/seed.txt", group_id);
@@ -39538,12 +40439,13 @@ async fn external_runtime_app_selected_group_proxy_rematerializes_each_local_pri
     let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
     fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
     fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+    let roots = vec![worker_root("nfs1", &nfs1), worker_root("nfs2", &nfs2)];
 
     let app = Arc::new(
         FSMetaApp::with_boundaries_and_state(
             FSMetaConfig {
                 source: SourceConfig {
-                    roots: vec![worker_root("nfs1", &nfs1), worker_root("nfs2", &nfs2)],
+                    roots: roots.clone(),
                     host_object_grants: vec![
                         worker_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
                         worker_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
@@ -39564,6 +40466,8 @@ async fn external_runtime_app_selected_group_proxy_rematerializes_each_local_pri
 
     let expected_groups =
         std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+    let expected_scope_groups =
+        RuntimeScopeExpectedGroups::from_logical_roots(&roots, &expected_groups);
 
     let source_wave = |generation| {
         vec![
@@ -39694,63 +40598,22 @@ async fn external_runtime_app_selected_group_proxy_rematerializes_each_local_pri
         let app = app.clone();
         let boundary = boundary.clone();
         let expected_groups = expected_groups.clone();
-        let expected_source_groups = std::collections::BTreeSet::new();
+        let expected_scope_groups = expected_scope_groups.clone();
         async move {
-            let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                let source_groups = app
-                    .source
-                    .scheduled_source_group_ids()
-                    .await
-                    .expect("source groups")
-                    .unwrap_or_default();
-                let scan_groups = app
-                    .source
-                    .scheduled_scan_group_ids()
-                    .await
-                    .expect("scan groups")
-                    .unwrap_or_default();
-                let sink_groups = app
-                    .sink
-                    .scheduled_group_ids()
-                    .await
-                    .expect("sink groups")
-                    .unwrap_or_default();
-                if source_groups == expected_source_groups
-                    && scan_groups == expected_groups
-                    && sink_groups == expected_groups
-                {
-                    break;
-                }
-                assert!(
-                    tokio::time::Instant::now() < scheduling_deadline,
-                    "{generation_label}: timed out waiting for runtime scope convergence: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-
-            let readiness_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                let snapshot = app
-                    .sink
-                    .status_snapshot_with_failure()
-                    .await
-                    .expect("sink status snapshot");
-                let ready_groups = snapshot
-                    .groups
-                    .iter()
-                    .filter(|group| group.is_ready())
-                    .map(|group| group.group_id.clone())
-                    .collect::<std::collections::BTreeSet<_>>();
-                if ready_groups == expected_groups {
-                    break;
-                }
-                assert!(
-                    tokio::time::Instant::now() < readiness_deadline,
-                    "{generation_label}: timed out waiting for sink readiness: ready={ready_groups:?} snapshot={snapshot:?}"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            wait_for_runtime_scope_convergence(
+                &app,
+                &expected_scope_groups,
+                &generation_label,
+                Duration::from_secs(10),
+            )
+            .await;
+            wait_for_sink_ready_groups(
+                &app.sink,
+                &expected_groups,
+                &generation_label,
+                Duration::from_secs(10),
+            )
+            .await;
 
             for group_id in ["nfs1", "nfs2"] {
                 let request = selected_group_file_request(b"/force-find-stress/seed.txt", group_id);

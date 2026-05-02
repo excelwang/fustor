@@ -85,6 +85,68 @@ fn fs_meta_operations_visibility_change_and_sink_selection_real_nfs() {
 
 #[test]
 #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operations_visibility_roots_narrowed_real_nfs() {
+    run_l5_entry(
+        "fs_meta_operations_visibility_roots_narrowed_real_nfs",
+        || test_operational_scenarios::run_visibility_change_roots_narrowed(),
+    );
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operations_visibility_source_delivery_ready_real_nfs() {
+    run_l5_entry(
+        "fs_meta_operations_visibility_source_delivery_ready_real_nfs",
+        || test_operational_scenarios::run_visibility_change_source_delivery_ready(),
+    );
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operations_visibility_manual_rescan_accepted_real_nfs() {
+    run_l5_entry(
+        "fs_meta_operations_visibility_manual_rescan_accepted_real_nfs",
+        || test_operational_scenarios::run_visibility_change_manual_rescan_accepted(),
+    );
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operations_visibility_grants_visible_real_nfs() {
+    run_l5_entry(
+        "fs_meta_operations_visibility_grants_visible_real_nfs",
+        || test_operational_scenarios::run_visibility_change_grants_visible(),
+    );
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operations_visibility_withdraw_converged_real_nfs() {
+    run_l5_entry(
+        "fs_meta_operations_visibility_withdraw_converged_real_nfs",
+        || test_operational_scenarios::run_visibility_change_withdraw_converged(),
+    );
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operations_visibility_sink_holder_moved_real_nfs() {
+    run_l5_entry(
+        "fs_meta_operations_visibility_sink_holder_moved_real_nfs",
+        || test_operational_scenarios::run_visibility_change_sink_holder_moved(),
+    );
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operations_visibility_facade_live_real_nfs() {
+    run_l5_entry("fs_meta_operations_visibility_facade_live_real_nfs", || {
+        test_operational_scenarios::run_visibility_change_facade_live()
+    });
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
 fn fs_meta_operations_sink_failover_real_nfs() {
     run_l5_entry("fs_meta_operations_sink_failover_real_nfs", || {
         test_operational_scenarios::run_sink_failover()

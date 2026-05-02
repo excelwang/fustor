@@ -35,9 +35,10 @@ use crate::runtime::routes::{
     METHOD_SOURCE_FIND, METHOD_SOURCE_RESCAN, METHOD_SOURCE_STATUS, ROUTE_KEY_EVENTS,
     ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_INTERNAL,
     ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SINK_STATUS_INTERNAL,
-    ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META,
-    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, sink_query_route_bindings_for,
-    source_find_request_route_for, source_find_route_bindings_for, source_rescan_request_route_for,
+    ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
+    ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_INTERNAL,
+    default_route_bindings, sink_query_route_bindings_for, source_find_request_route_for,
+    source_find_route_bindings_for, source_rescan_request_route_for,
     source_status_request_route_for,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
@@ -48,8 +49,8 @@ use async_trait::async_trait;
 #[cfg(test)]
 use capanix_app_sdk::runtime::ConfigValue;
 use capanix_app_sdk::runtime::{
-    ControlEnvelope, EventMetadata, NodeId, RecvOpts, RuntimeWorkerBinding, RuntimeWorkerBindings,
-    RuntimeWorkerLauncherKind, in_memory_state_boundary,
+    ControlEnvelope, EventMetadata, NodeId, RecvOpts, RouteKey, RuntimeWorkerBinding,
+    RuntimeWorkerBindings, RuntimeWorkerLauncherKind, in_memory_state_boundary,
 };
 use capanix_app_sdk::worker::WorkerMode;
 use capanix_app_sdk::{CnxError, Event, Result, RuntimeBoundary, RuntimeBoundaryApp};
@@ -82,6 +83,7 @@ const ACTIVE_FACADE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFERRED_SOURCE_REPAIR_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+const DEFERRED_SINK_REPAIR_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 const CONTROL_FRAME_LEASE_ACQUIRE_BUDGET: Duration = Duration::from_secs(1);
 const CONTROL_FRAME_LEASE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const INTERNAL_SINK_STATUS_BLOCKING_FALLBACK_BUDGET: Duration = Duration::from_millis(250);
@@ -3395,6 +3397,7 @@ struct PendingFixedBindHandoffRegistrant {
 #[derive(Clone)]
 struct ManagementWriteRecoveryContext {
     instance_id: u64,
+    node_id: NodeId,
     source: Arc<SourceFacade>,
     sink: Arc<SinkFacade>,
     api_task: Arc<Mutex<Option<FacadeActivation>>>,
@@ -3407,6 +3410,9 @@ struct ManagementWriteRecoveryContext {
     runtime_state_changed: Arc<tokio::sync::Notify>,
     pending_fixed_bind_has_suppressed_dependent_routes: Arc<AtomicBool>,
     source_generation_cutover_replay_deferred: Arc<AtomicBool>,
+    sink_generation_cutover_replay_deferred: Arc<AtomicBool>,
+    facade_gate: RuntimeUnitGate,
+    source_rescan_proxy_ready_generation: Arc<AtomicU64>,
     control_frame_serial: Arc<Mutex<()>>,
     inflight: Arc<AtomicBool>,
 }
@@ -3446,6 +3452,45 @@ impl ManagementWriteRecoveryContext {
         self.update_runtime_control_state(|state| state.clear_source_replay());
         self.source_generation_cutover_replay_deferred
             .store(false, Ordering::Release);
+        self.mark_source_rescan_proxy_ready_for_current_generation();
+    }
+
+    fn clear_sink_replay_after_repair(&self) {
+        self.update_runtime_control_state(|state| state.clear_sink_replay());
+        self.sink_generation_cutover_replay_deferred
+            .store(false, Ordering::Release);
+    }
+
+    fn mark_source_rescan_proxy_ready_for_current_generation(&self) {
+        let route_key = source_rescan_request_route_for(&self.node_id.0).0;
+        let Ok(true) = self
+            .facade_gate
+            .route_active(execution_units::SOURCE_RUNTIME_UNIT_ID, &route_key)
+        else {
+            return;
+        };
+        let Ok(Some(generation)) = self
+            .facade_gate
+            .route_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, &route_key)
+        else {
+            return;
+        };
+        if generation != 0 {
+            self.source_rescan_proxy_ready_generation
+                .store(generation, Ordering::Release);
+        }
+    }
+
+    fn restore_control_after_retained_replay_recovery(&self) {
+        let state_after_repair = self.runtime_control_state();
+        if state_after_repair.replay_fully_cleared()
+            && (state_after_repair.control_initialized()
+                || self.control_failure_uninitialized.load(Ordering::Acquire))
+        {
+            self.update_runtime_control_state(|state| state.mark_initialized());
+            self.control_failure_uninitialized
+                .store(false, Ordering::Release);
+        }
     }
 
     async fn publish_recovered_facade_state(&self) {
@@ -3499,14 +3544,14 @@ impl ManagementWriteRecoveryContext {
     async fn repair_sink_replay_if_required(&self) -> std::result::Result<(), CnxError> {
         if self.runtime_control_state().sink_state_replay_required() {
             if !self.sink.retained_replay_required() {
-                self.update_runtime_control_state(|state| state.clear_sink_replay());
+                self.clear_sink_replay_after_repair();
             } else {
                 self.sink
                     .status_snapshot_with_failure()
                     .await
                     .map_err(SinkFailure::into_error)?;
                 if !self.sink.retained_replay_required() {
-                    self.update_runtime_control_state(|state| state.clear_sink_replay());
+                    self.clear_sink_replay_after_repair();
                 }
             }
         }
@@ -3534,11 +3579,7 @@ impl ManagementWriteRecoveryContext {
 
         self.repair_sink_replay_if_required().await?;
 
-        if self.runtime_control_state().replay_fully_cleared() {
-            self.update_runtime_control_state(|state| state.mark_initialized());
-            self.control_failure_uninitialized
-                .store(false, Ordering::Release);
-        }
+        self.restore_control_after_retained_replay_recovery();
         self.publish_recovered_facade_state().await;
         Ok(())
     }
@@ -3555,6 +3596,7 @@ impl ManagementWriteRecoveryContext {
         };
         let _serial = self.control_frame_serial.lock().await;
         self.repair_source_replay_if_required().await?;
+        self.restore_control_after_retained_replay_recovery();
         self.publish_recovered_facade_state().await;
         Ok(())
     }
@@ -4666,6 +4708,20 @@ fn source_rescan_proxy_ready_for_current_generation(
         return false;
     };
     current_generation != 0 && ready_generation.load(Ordering::Acquire) == current_generation
+}
+
+fn is_scoped_source_rescan_request_route(route_key: &str) -> bool {
+    let Some(request_route) = route_key.strip_suffix(".req") else {
+        return false;
+    };
+    let Some((route_stem, route_version)) = ROUTE_KEY_SOURCE_RESCAN_INTERNAL.rsplit_once(':')
+    else {
+        return request_route.starts_with(&format!("{ROUTE_KEY_SOURCE_RESCAN_INTERNAL}."));
+    };
+    let Some(route_suffix) = request_route.strip_suffix(&format!(":{route_version}")) else {
+        return false;
+    };
+    route_suffix.starts_with(&format!("{route_stem}."))
 }
 
 struct SourceRescanProxyReadyBoundary {
@@ -6401,7 +6457,8 @@ pub struct FSMetaApp {
     management_write_recovery_inflight: Arc<AtomicBool>,
     source_generation_cutover_replay_deferred: Arc<AtomicBool>,
     deferred_source_repair_recovery_scheduled: Arc<AtomicBool>,
-    sink_generation_cutover_replay_deferred: AtomicBool,
+    deferred_sink_repair_recovery_scheduled: Arc<AtomicBool>,
+    sink_generation_cutover_replay_deferred: Arc<AtomicBool>,
     api_request_tracker: Arc<ApiRequestTracker>,
     api_control_gate: Arc<ApiControlGate>,
     control_frame_serial: Arc<Mutex<()>>,
@@ -6727,6 +6784,7 @@ impl FSMetaApp {
     fn management_write_recovery(&self) -> ManagementWriteRecovery {
         let context = ManagementWriteRecoveryContext {
             instance_id: self.instance_id,
+            node_id: self.node_id.clone(),
             source: self.source.clone(),
             sink: self.sink.clone(),
             api_task: self.api_task.clone(),
@@ -6743,6 +6801,11 @@ impl FSMetaApp {
             source_generation_cutover_replay_deferred: self
                 .source_generation_cutover_replay_deferred
                 .clone(),
+            sink_generation_cutover_replay_deferred: self
+                .sink_generation_cutover_replay_deferred
+                .clone(),
+            facade_gate: self.facade_gate.clone(),
+            source_rescan_proxy_ready_generation: self.source_rescan_proxy_ready_generation.clone(),
             control_frame_serial: self.control_frame_serial.clone(),
             inflight: self.management_write_recovery_inflight.clone(),
         };
@@ -6755,6 +6818,7 @@ impl FSMetaApp {
     fn source_repair_recovery(&self) -> ManagementWriteRecovery {
         let context = ManagementWriteRecoveryContext {
             instance_id: self.instance_id,
+            node_id: self.node_id.clone(),
             source: self.source.clone(),
             sink: self.sink.clone(),
             api_task: self.api_task.clone(),
@@ -6771,6 +6835,11 @@ impl FSMetaApp {
             source_generation_cutover_replay_deferred: self
                 .source_generation_cutover_replay_deferred
                 .clone(),
+            sink_generation_cutover_replay_deferred: self
+                .sink_generation_cutover_replay_deferred
+                .clone(),
+            facade_gate: self.facade_gate.clone(),
+            source_rescan_proxy_ready_generation: self.source_rescan_proxy_ready_generation.clone(),
             control_frame_serial: self.control_frame_serial.clone(),
             inflight: self.management_write_recovery_inflight.clone(),
         };
@@ -6784,6 +6853,10 @@ impl FSMetaApp {
         runtime_gate_state: &Arc<StdMutex<RuntimeControlState>>,
     ) -> bool {
         RuntimeControlState::from_state_cell(runtime_gate_state).source_state_replay_required()
+    }
+
+    fn sink_repair_still_required(runtime_gate_state: &Arc<StdMutex<RuntimeControlState>>) -> bool {
+        RuntimeControlState::from_state_cell(runtime_gate_state).sink_state_replay_required()
     }
 
     fn schedule_deferred_source_repair_recovery(&self, reason: &'static str) {
@@ -6858,6 +6931,83 @@ impl FSMetaApp {
                 tokio::select! {
                     _ = runtime_state_changed.notified() => {}
                     _ = tokio::time::sleep(DEFERRED_SOURCE_REPAIR_RETRY_INTERVAL) => {}
+                }
+            }
+        });
+    }
+
+    fn schedule_deferred_sink_repair_recovery(&self, reason: &'static str) {
+        if self.closing.load(Ordering::Acquire) {
+            return;
+        }
+        if self
+            .deferred_sink_repair_recovery_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let recovery = self.management_write_recovery();
+        let runtime_gate_state = self.runtime_gate_state.clone();
+        let runtime_state_changed = self.runtime_state_changed.clone();
+        let scheduled = self.deferred_sink_repair_recovery_scheduled.clone();
+        tokio::spawn(async move {
+            eprintln!(
+                "fs_meta_runtime_app: deferred sink repair scheduled reason={}",
+                reason
+            );
+            let deadline = tokio::time::Instant::now() + SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT;
+            loop {
+                if !Self::sink_repair_still_required(&runtime_gate_state) {
+                    eprintln!(
+                        "fs_meta_runtime_app: deferred sink repair done reason={}",
+                        reason
+                    );
+                    scheduled.store(false, Ordering::Release);
+                    return;
+                }
+
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    eprintln!(
+                        "fs_meta_runtime_app: deferred sink repair timed out reason={}",
+                        reason
+                    );
+                    scheduled.store(false, Ordering::Release);
+                    return;
+                }
+
+                match tokio::time::timeout(remaining, recovery()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        eprintln!(
+                            "fs_meta_runtime_app: deferred sink repair failed reason={} err={}",
+                            reason, err
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "fs_meta_runtime_app: deferred sink repair timed out reason={}",
+                            reason
+                        );
+                        scheduled.store(false, Ordering::Release);
+                        return;
+                    }
+                }
+
+                if !Self::sink_repair_still_required(&runtime_gate_state) {
+                    eprintln!(
+                        "fs_meta_runtime_app: deferred sink repair done reason={}",
+                        reason
+                    );
+                    scheduled.store(false, Ordering::Release);
+                    return;
+                }
+
+                tokio::select! {
+                    _ = runtime_state_changed.notified() => {}
+                    _ = tokio::time::sleep(DEFERRED_SINK_REPAIR_RETRY_INTERVAL) => {}
                 }
             }
         });
@@ -6961,7 +7111,7 @@ impl FSMetaApp {
         &self,
         fixed_bind_session: &FixedBindLifecycleSession,
     ) -> std::result::Result<(), RuntimeControlFrameFailure> {
-        self.recover_retained_replay_readiness_with_policy(fixed_bind_session, true)
+        self.recover_retained_replay_readiness_with_policy(fixed_bind_session, false)
             .await
     }
 
@@ -8008,7 +8158,8 @@ impl FSMetaApp {
             management_write_recovery_inflight: Arc::new(AtomicBool::new(false)),
             source_generation_cutover_replay_deferred: Arc::new(AtomicBool::new(false)),
             deferred_source_repair_recovery_scheduled: Arc::new(AtomicBool::new(false)),
-            sink_generation_cutover_replay_deferred: AtomicBool::new(false),
+            deferred_sink_repair_recovery_scheduled: Arc::new(AtomicBool::new(false)),
+            sink_generation_cutover_replay_deferred: Arc::new(AtomicBool::new(false)),
             api_request_tracker,
             api_control_gate,
             control_frame_serial: Arc::new(Mutex::new(())),
@@ -9914,6 +10065,7 @@ impl FSMetaApp {
                 let node_id = self.node_id.clone();
                 let boundary_for_source_status_rearm = boundary.clone();
                 let facade_gate_for_source_status = self.facade_gate.clone();
+                let runtime_gate_state_for_source_status = self.runtime_gate_state.clone();
                 let source_rescan_proxy_ready_generation =
                     self.source_rescan_proxy_ready_generation.clone();
                 let source_rescan_proxy_route_key =
@@ -9943,6 +10095,8 @@ impl FSMetaApp {
                         let boundary_for_source_status_rearm =
                             boundary_for_source_status_rearm.clone();
                         let facade_gate_for_source_status = facade_gate_for_source_status.clone();
+                        let runtime_gate_state_for_source_status =
+                            runtime_gate_state_for_source_status.clone();
                         let source_rescan_proxy_ready_generation =
                             source_rescan_proxy_ready_generation.clone();
                         let source_rescan_proxy_route_key = source_rescan_proxy_route_key.clone();
@@ -10025,151 +10179,231 @@ impl FSMetaApp {
                                         trace_id
                                     );
                                 }
-                                let source_repair_probe_budget = if manual_rescan_delivery_evidence
-                                {
-                                    Some(source_status_live_probe_timeout.unwrap_or(
-                                        MANUAL_RESCAN_SOURCE_STATUS_DEFAULT_PROBE_BUDGET,
-                                    ))
-                                } else {
-                                    None
-                                };
-                                let source_repair_probe_deadline =
-                                    source_repair_probe_budget.map(|budget| {
+                                let manual_rescan_delivery_probe_budget =
+                                    if manual_rescan_delivery_evidence {
+                                        Some(source_status_live_probe_timeout.unwrap_or(
+                                            MANUAL_RESCAN_SOURCE_STATUS_DEFAULT_PROBE_BUDGET,
+                                        ))
+                                    } else {
+                                        None
+                                    };
+                                let manual_rescan_delivery_deadline =
+                                    manual_rescan_delivery_probe_budget.map(|budget| {
                                         tokio::time::Instant::now()
                                             .checked_add(budget)
                                             .unwrap_or_else(tokio::time::Instant::now)
                                     });
-                                if let (Some(probe_budget), Some(probe_deadline)) =
-                                    (source_repair_probe_budget, source_repair_probe_deadline)
-                                {
-                                    let repair_budget = probe_deadline
-                                        .saturating_duration_since(tokio::time::Instant::now());
-                                    let repair_context = if manual_rescan_delivery_evidence {
-                                        "manual-rescan source repair"
-                                    } else {
-                                        "source repair"
-                                    };
-                                    if repair_budget.is_zero() {
-                                        eprintln!(
-                                            "fs_meta_runtime_app: source status endpoint {} failed node={} correlation={:?} trace_id={} budget_ms={} err=operation timed out",
-                                            repair_context,
-                                            node_id.0,
-                                            req.metadata().correlation_id,
-                                            trace_id,
-                                            probe_budget.as_millis()
+                                let (snapshot, used_cached_fallback) =
+                                    if manual_rescan_delivery_evidence {
+                                        let runtime_state = RuntimeControlState::from_state_cell(
+                                            &runtime_gate_state_for_source_status,
                                         );
-                                        if manual_rescan_delivery_evidence {
-                                            continue;
-                                        }
-                                    } else {
-                                        match tokio::time::timeout(
-                                            repair_budget,
-                                            (source_repair_recovery)(),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(())) => {}
-                                            Ok(Err(err)) => {
-                                                eprintln!(
-                                                    "fs_meta_runtime_app: source status endpoint {} failed node={} correlation={:?} trace_id={} budget_ms={} err={}",
-                                                    repair_context,
-                                                    node_id.0,
-                                                    req.metadata().correlation_id,
-                                                    trace_id,
-                                                    probe_budget.as_millis(),
-                                                    err
+                                        if !runtime_state.source_state_current() {
+                                            source
+                                                .source_state_pending_observability_snapshot_for_status_route()
+                                                .await
+                                        } else {
+                                            let probe_budget = manual_rescan_delivery_probe_budget
+                                                .unwrap_or(
+                                                MANUAL_RESCAN_SOURCE_STATUS_DEFAULT_PROBE_BUDGET,
+                                            );
+                                            let probe_deadline = manual_rescan_delivery_deadline
+                                                .unwrap_or_else(tokio::time::Instant::now);
+                                            let rearm_budget = probe_deadline
+                                                .saturating_duration_since(
+                                                    tokio::time::Instant::now(),
                                                 );
-                                                if manual_rescan_delivery_evidence {
+                                            let source_rescan_generation =
+                                                match facade_gate_for_source_status.route_active(
+                                                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                                                    &source_rescan_proxy_route_key,
+                                                ) {
+                                                    Ok(true) => match facade_gate_for_source_status
+                                                        .route_generation(
+                                                            execution_units::SOURCE_RUNTIME_UNIT_ID,
+                                                            &source_rescan_proxy_route_key,
+                                                        ) {
+                                                        Ok(Some(generation)) if generation != 0 => {
+                                                            Some(generation)
+                                                        }
+                                                        _ => {
+                                                            eprintln!(
+                                                                "fs_meta_runtime_app: source status endpoint manual-rescan rearm has no scoped rescan generation node={} route={} correlation={:?} trace_id={}",
+                                                                node_id.0,
+                                                                source_rescan_proxy_route_key,
+                                                                req.metadata().correlation_id,
+                                                                trace_id
+                                                            );
+                                                            None
+                                                        }
+                                                    },
+                                                    _ => None,
+                                                };
+                                            let non_target_status_snapshot = if source.is_worker() {
+                                                let acceptance_result = if rearm_budget.is_zero() {
+                                                    Err(SourceFailure::from(CnxError::Timeout))
+                                                } else {
+                                                    match tokio::time::timeout(
+                                                        rearm_budget,
+                                                        source
+                                                            .check_targeted_rescan_delivery_acceptance_with_failure(),
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(result) => result,
+                                                        Err(_) => {
+                                                            Err(SourceFailure::from(CnxError::Timeout))
+                                                        }
+                                                    }
+                                                };
+                                                match acceptance_result {
+                                                    Ok(
+                                                        source::SourceTargetedRescanDeliveryAcceptance::Accepted,
+                                                    ) => {
+                                                        if let Some(generation) =
+                                                            source_rescan_generation
+                                                        {
+                                                            source_rescan_proxy_ready_generation
+                                                                .store(generation, Ordering::Release);
+                                                        }
+                                                        None
+                                                    }
+                                                    Ok(
+                                                        source::SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary,
+                                                    ) => {
+                                                        eprintln!(
+                                                            "fs_meta_runtime_app: source status endpoint manual-rescan non-target status node={} correlation={:?} trace_id={}",
+                                                            node_id.0,
+                                                            req.metadata().correlation_id,
+                                                            trace_id
+                                                        );
+                                                        let snapshot_budget = probe_deadline
+                                                            .saturating_duration_since(
+                                                                tokio::time::Instant::now(),
+                                                            );
+                                                        Some(
+                                                            source
+                                                                .observability_snapshot_nonblocking_for_status_route_with_timeout(
+                                                                    (!snapshot_budget.is_zero())
+                                                                        .then_some(snapshot_budget),
+                                                                )
+                                                                .await,
+                                                        )
+                                                    }
+                                                    Err(err) => {
+                                                        eprintln!(
+                                                            "fs_meta_runtime_app: source status endpoint manual-rescan rearm failed node={} correlation={:?} trace_id={} budget_ms={} err={}",
+                                                            node_id.0,
+                                                            req.metadata().correlation_id,
+                                                            trace_id,
+                                                            probe_budget.as_millis(),
+                                                            err.as_error()
+                                                        );
+                                                        continue;
+                                                    }
+                                                }
+                                            } else {
+                                                let rearm_result = if rearm_budget.is_zero() {
+                                                    Err(SourceFailure::from(CnxError::Timeout))
+                                                } else {
+                                                    match tokio::time::timeout(
+                                                        rearm_budget,
+                                                        source
+                                                            .rearm_source_rescan_request_endpoints_with_failure(
+                                                                boundary_for_source_status_rearm.clone(),
+                                                            ),
+                                                        )
+                                                        .await
+                                                    {
+                                                        Ok(result) => result,
+                                                        Err(_) => {
+                                                            Err(SourceFailure::from(CnxError::Timeout))
+                                                        }
+                                                    }
+                                                };
+                                                if let Err(err) = rearm_result {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: source status endpoint manual-rescan rearm failed node={} correlation={:?} trace_id={} budget_ms={} err={}",
+                                                        node_id.0,
+                                                        req.metadata().correlation_id,
+                                                        trace_id,
+                                                        probe_budget.as_millis(),
+                                                        err.as_error()
+                                                    );
                                                     continue;
                                                 }
-                                            }
-                                            Err(_) => {
+                                                let Some(source_rescan_generation) =
+                                                    source_rescan_generation
+                                                else {
+                                                    continue;
+                                                };
+                                                source_rescan_proxy_ready_generation.store(
+                                                    source_rescan_generation,
+                                                    Ordering::Release,
+                                                );
+                                                None
+                                            };
+                                            if let Some(snapshot) = non_target_status_snapshot {
+                                                snapshot
+                                            } else if let Some(snapshot) = source
+                                            .cached_manual_rescan_delivery_observability_snapshot_for_status_route()
+                                        {
+                                            (snapshot, true)
+                                        } else {
+                                            let repair_budget = probe_deadline
+                                                .saturating_duration_since(tokio::time::Instant::now());
+                                            if repair_budget.is_zero() {
                                                 eprintln!(
-                                                    "fs_meta_runtime_app: source status endpoint {} failed node={} correlation={:?} trace_id={} budget_ms={} err=operation timed out",
-                                                    repair_context,
+                                                    "fs_meta_runtime_app: source status endpoint manual-rescan source repair failed node={} correlation={:?} trace_id={} budget_ms={} err=operation timed out",
                                                     node_id.0,
                                                     req.metadata().correlation_id,
                                                     trace_id,
                                                     probe_budget.as_millis()
                                                 );
-                                                if manual_rescan_delivery_evidence {
-                                                    continue;
-                                                }
+                                                continue;
                                             }
-                                        }
-                                    }
-                                }
-                                let (snapshot, used_cached_fallback) =
-                                    if manual_rescan_delivery_evidence {
-                                        let probe_budget = source_repair_probe_budget.unwrap_or(
-                                            MANUAL_RESCAN_SOURCE_STATUS_DEFAULT_PROBE_BUDGET,
-                                        );
-                                        let probe_deadline = source_repair_probe_deadline
-                                            .unwrap_or_else(tokio::time::Instant::now);
-                                        let rearm_budget = probe_deadline
-                                            .saturating_duration_since(tokio::time::Instant::now());
-                                        let rearm_result = if rearm_budget.is_zero() {
-                                            Err(SourceFailure::from(CnxError::Timeout))
-                                        } else {
                                             match tokio::time::timeout(
-                                                rearm_budget,
-                                                source
-                                                    .rearm_source_rescan_request_endpoints_with_failure(
-                                                        boundary_for_source_status_rearm.clone(),
-                                                    ),
+                                                repair_budget,
+                                                (source_repair_recovery)(),
                                             )
                                             .await
                                             {
-                                                Ok(result) => result,
-                                                Err(_) => Err(SourceFailure::from(CnxError::Timeout)),
+                                                Ok(Ok(())) => {}
+                                                Ok(Err(err)) => {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: source status endpoint manual-rescan source repair failed node={} correlation={:?} trace_id={} budget_ms={} err={}",
+                                                        node_id.0,
+                                                        req.metadata().correlation_id,
+                                                        trace_id,
+                                                        probe_budget.as_millis(),
+                                                        err
+                                                    );
+                                                    continue;
+                                                }
+                                                Err(_) => {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: source status endpoint manual-rescan source repair failed node={} correlation={:?} trace_id={} budget_ms={} err=operation timed out",
+                                                        node_id.0,
+                                                        req.metadata().correlation_id,
+                                                        trace_id,
+                                                        probe_budget.as_millis()
+                                                    );
+                                                    continue;
+                                                }
                                             }
-                                        };
-                                        if let Err(err) = rearm_result {
-                                            eprintln!(
-                                                "fs_meta_runtime_app: source status endpoint manual-rescan rearm failed node={} correlation={:?} trace_id={} budget_ms={} err={}",
-                                                node_id.0,
-                                                req.metadata().correlation_id,
-                                                trace_id,
-                                                probe_budget.as_millis(),
-                                                err.as_error()
-                                            );
-                                            continue;
-                                        }
-                                        if let Ok(true) = facade_gate_for_source_status
-                                            .route_active(
-                                                execution_units::SOURCE_RUNTIME_UNIT_ID,
-                                                &source_rescan_proxy_route_key,
-                                            )
-                                        {
-                                            let Ok(Some(source_rescan_generation)) =
-                                                facade_gate_for_source_status.route_generation(
-                                                    execution_units::SOURCE_RUNTIME_UNIT_ID,
-                                                    &source_rescan_proxy_route_key,
-                                                )
-                                            else {
-                                                eprintln!(
-                                                    "fs_meta_runtime_app: source status endpoint manual-rescan rearm has no scoped rescan generation node={} route={} correlation={:?} trace_id={}",
-                                                    node_id.0,
-                                                    source_rescan_proxy_route_key,
-                                                    req.metadata().correlation_id,
-                                                    trace_id
-                                                );
-                                                continue;
-                                            };
-                                            source_rescan_proxy_ready_generation
-                                                .store(source_rescan_generation, Ordering::Release);
-                                        }
                                         let snapshot_budget = probe_deadline
                                             .saturating_duration_since(tokio::time::Instant::now());
                                         source
-                                            .manual_rescan_delivery_observability_snapshot_for_status_route_with_timeout(
+                                            .observability_snapshot_nonblocking_for_status_route_with_timeout(
                                                 (!snapshot_budget.is_zero())
                                                     .then_some(snapshot_budget),
                                             )
                                             .await
+                                        }
+                                        }
                                     } else {
                                         let remaining_live_probe_budget =
-                                            source_repair_probe_deadline.map(|deadline| {
+                                            manual_rescan_delivery_deadline.map(|deadline| {
                                                 deadline.saturating_duration_since(
                                                     tokio::time::Instant::now(),
                                                 )
@@ -10593,72 +10827,56 @@ impl FSMetaApp {
             }
         }
         let scoped_source_rescan_route = source_rescan_request_route_for(&self.node_id.0);
-        if matches!(&*self.source, SourceFacade::Worker(_)) {
-            let route_active = self
-                .facade_gate
-                .route_active(
-                    execution_units::SOURCE_RUNTIME_UNIT_ID,
-                    &scoped_source_rescan_route.0,
-                )
-                .unwrap_or(false);
-            if !source_active
-                || !route_active
-                || !spawned_routes.insert(scoped_source_rescan_route.0.clone())
-            {
-                // Not currently selected as source scoped-rescan owner, route inactive, or already running.
-            } else {
-                let source = self.source.clone();
-                let node_id = self.node_id.clone();
-                let source_rescan_boundary = Arc::new(SourceRescanProxyReadyBoundary::new(
-                    boundary.clone(),
-                    scoped_source_rescan_route.0.clone(),
-                    self.facade_gate.clone(),
-                    self.source_rescan_proxy_ready_generation.clone(),
-                ));
-                eprintln!(
-                    "fs_meta_runtime_app: spawning source rescan proxy endpoint route={}",
-                    scoped_source_rescan_route.0
-                );
-                let endpoint = ManagedEndpointTask::spawn_with_unit(
-                    source_rescan_boundary,
-                    scoped_source_rescan_route,
-                    format!(
-                        "app:{}:{}:scoped",
-                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN
-                    ),
-                    execution_units::SOURCE_RUNTIME_UNIT_ID,
-                    tokio_util::sync::CancellationToken::new(),
-                    move |requests| {
-                        let source = source.clone();
-                        let node_id = node_id.clone();
-                        async move {
-                            if requests.is_empty() {
-                                return Vec::new();
-                            }
-                            let submit_result = source
-                                .submit_targeted_rescan_when_ready_epoch_with_failure()
-                                .await;
-                            let mut responses = Vec::with_capacity(requests.len());
-                            for req in requests {
-                                match &submit_result {
-                                    Ok(_) => responses.push(Event::new(
-                                        EventMetadata {
-                                            origin_id: node_id.clone(),
-                                            timestamp_us: now_us(),
-                                            logical_ts: None,
-                                            correlation_id: req.metadata().correlation_id,
-                                            ingress_auth: None,
-                                            trace: None,
-                                        },
-                                        bytes::Bytes::from_static(b"accepted"),
-                                    )),
-                                    Err(err) => {
-                                        eprintln!(
-                                            "fs_meta_runtime_app: source rescan proxy failed node={} err={}",
-                                            node_id.0,
-                                            err.as_error()
-                                        );
-                                        responses.push(Event::new(
+        let source_rescan_routes = if source_active {
+            self.facade_gate
+                .active_route_keys(execution_units::SOURCE_RUNTIME_UNIT_ID)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|route_key| is_scoped_source_rescan_request_route(route_key))
+                .collect::<std::collections::BTreeSet<_>>()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        for source_rescan_route_key in source_rescan_routes {
+            if source_rescan_route_key == scoped_source_rescan_route.0 {
+                if matches!(&*self.source, SourceFacade::Worker(_))
+                    && spawned_routes.insert(source_rescan_route_key.clone())
+                {
+                    let source_rescan_route = RouteKey(source_rescan_route_key.clone());
+                    let source = self.source.clone();
+                    let node_id = self.node_id.clone();
+                    let source_rescan_boundary = Arc::new(SourceRescanProxyReadyBoundary::new(
+                        boundary.clone(),
+                        source_rescan_route_key.clone(),
+                        self.facade_gate.clone(),
+                        self.source_rescan_proxy_ready_generation.clone(),
+                    ));
+                    eprintln!(
+                        "fs_meta_runtime_app: spawning source rescan proxy endpoint route={}",
+                        source_rescan_route_key
+                    );
+                    let endpoint = ManagedEndpointTask::spawn_with_unit(
+                        source_rescan_boundary,
+                        source_rescan_route,
+                        format!(
+                            "app:{}:{}:scoped",
+                            ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN
+                        ),
+                        execution_units::SOURCE_RUNTIME_UNIT_ID,
+                        tokio_util::sync::CancellationToken::new(),
+                        move |requests| {
+                            let source = source.clone();
+                            let node_id = node_id.clone();
+                            async move {
+                                if requests.is_empty() {
+                                    return Vec::new();
+                                }
+                                let delivery_result =
+                                    source.accept_targeted_rescan_delivery_with_failure().await;
+                                let mut responses = Vec::with_capacity(requests.len());
+                                for req in requests {
+                                    match &delivery_result {
+                                        Ok(()) => responses.push(Event::new(
                                             EventMetadata {
                                                 origin_id: node_id.clone(),
                                                 timestamp_us: now_us(),
@@ -10667,17 +10885,77 @@ impl FSMetaApp {
                                                 ingress_auth: None,
                                                 trace: None,
                                             },
-                                            bytes::Bytes::from(err.as_error().to_string()),
-                                        ));
+                                            bytes::Bytes::from_static(b"accepted"),
+                                        )),
+                                        Err(err) => {
+                                            eprintln!(
+                                                "fs_meta_runtime_app: source rescan proxy failed node={} err={}",
+                                                node_id.0,
+                                                err.as_error()
+                                            );
+                                            responses.push(Event::new(
+                                                EventMetadata {
+                                                    origin_id: node_id.clone(),
+                                                    timestamp_us: now_us(),
+                                                    logical_ts: None,
+                                                    correlation_id: req.metadata().correlation_id,
+                                                    ingress_auth: None,
+                                                    trace: None,
+                                                },
+                                                bytes::Bytes::from(err.as_error().to_string()),
+                                            ));
+                                        }
                                     }
                                 }
+                                responses
                             }
-                            responses
-                        }
-                    },
-                );
-                tasks.push(endpoint);
+                        },
+                    );
+                    tasks.push(endpoint);
+                }
+                continue;
             }
+            if !spawned_routes.insert(source_rescan_route_key.clone()) {
+                continue;
+            }
+            let source_rescan_route = RouteKey(source_rescan_route_key.clone());
+            let node_id = self.node_id.clone();
+            eprintln!(
+                "fs_meta_runtime_app: spawning source rescan non-target drain endpoint route={}",
+                source_rescan_route_key
+            );
+            let endpoint = ManagedEndpointTask::spawn_with_unit(
+                boundary.clone(),
+                source_rescan_route,
+                format!(
+                    "app:{}:{}:non-target",
+                    ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN
+                ),
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                tokio_util::sync::CancellationToken::new(),
+                move |requests| {
+                    let node_id = node_id.clone();
+                    async move {
+                        requests
+                            .into_iter()
+                            .map(|req| {
+                                Event::new(
+                                    EventMetadata {
+                                        origin_id: node_id.clone(),
+                                        timestamp_us: now_us(),
+                                        logical_ts: None,
+                                        correlation_id: req.metadata().correlation_id,
+                                        ingress_auth: None,
+                                        trace: None,
+                                    },
+                                    bytes::Bytes::from_static(b"not-target"),
+                                )
+                            })
+                            .collect()
+                    }
+                },
+            );
+            tasks.push(endpoint);
         }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND) {
             if internal_query_active {
@@ -12888,6 +13166,9 @@ impl FSMetaApp {
         )
         .await;
         self.schedule_deferred_source_repair_recovery("source-generation-cutover");
+        if require_sink_replay {
+            self.schedule_deferred_sink_repair_recovery("source-generation-cutover-sink-followup");
+        }
     }
 
     async fn mark_control_uninitialized_after_deferred_sink_replay_with_session(
@@ -12902,6 +13183,7 @@ impl FSMetaApp {
             ControlFailureReplayRequirement::Sink,
         )
         .await;
+        self.schedule_deferred_sink_repair_recovery("sink-generation-cutover");
     }
 
     async fn mark_control_uninitialized_after_failure_preserving_internal_status_with_session(
@@ -15190,10 +15472,9 @@ impl FSMetaApp {
                     );
                     return Ok(());
                 }
-                if !runtime_unit_exposure_present
-                    && self
-                        .sink_generation_cutover_replay_should_defer_inline()
-                        .await
+                if self
+                    .sink_generation_cutover_replay_should_defer_inline()
+                    .await
                 {
                     self.mark_control_uninitialized_after_deferred_sink_replay_with_session(
                         &fixed_bind_session,
@@ -15653,6 +15934,9 @@ impl FSMetaApp {
             }
             SourceControlWaveDisposition::Idle => {}
         }
+        if !source_signals.is_empty() {
+            self.ensure_runtime_endpoints_started().await?;
+        }
         self.finish_source_control_apply_and_publish_source_repair(
             &mut source_control_apply_inflight,
             false,
@@ -15796,10 +16080,9 @@ impl FSMetaApp {
                 }
             }
             SinkControlWaveDisposition::ReplayRetained => {
-                if !runtime_unit_exposure_present
-                    && self
-                        .sink_generation_cutover_replay_should_defer_inline()
-                        .await
+                if self
+                    .sink_generation_cutover_replay_should_defer_inline()
+                    .await
                 {
                     self.mark_control_uninitialized_after_deferred_sink_replay_with_session(
                         &fixed_bind_session,

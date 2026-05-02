@@ -17,10 +17,60 @@ enum OperationalMode {
     ForceFindExecutionSemantics,
     NewNfsJoin,
     RootPathModify,
-    VisibilityChangeAndSinkSelection,
     SinkFailover,
     FacadeFailoverAndResourceSwitch,
     NfsRetire,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum VisibilityPhase {
+    RootsNarrowed,
+    SourceDeliveryReady,
+    ManualRescanAccepted,
+    GrantsVisible,
+    WithdrawConverged,
+    SinkHolderMoved,
+    FacadeLive,
+}
+
+impl VisibilityPhase {
+    const TOTAL: usize = 7;
+
+    fn index(self) -> usize {
+        match self {
+            Self::RootsNarrowed => 1,
+            Self::SourceDeliveryReady => 2,
+            Self::ManualRescanAccepted => 3,
+            Self::GrantsVisible => 4,
+            Self::WithdrawConverged => 5,
+            Self::SinkHolderMoved => 6,
+            Self::FacadeLive => 7,
+        }
+    }
+
+    fn step(self) -> &'static str {
+        match self {
+            Self::RootsNarrowed => "5.1.roots-narrowed",
+            Self::SourceDeliveryReady => "5.2.source-delivery-ready",
+            Self::ManualRescanAccepted => "5.3.manual-rescan-accepted",
+            Self::GrantsVisible => "5.4.grants-visible",
+            Self::WithdrawConverged => "5.5.withdraw-converged",
+            Self::SinkHolderMoved => "5.6.sink-holder-moved",
+            Self::FacadeLive => "5.7.facade-live",
+        }
+    }
+
+    fn app_prefix(self) -> &'static str {
+        match self {
+            Self::RootsNarrowed => "fs-meta-api-ops-visibility-5-1",
+            Self::SourceDeliveryReady => "fs-meta-api-ops-visibility-5-2",
+            Self::ManualRescanAccepted => "fs-meta-api-ops-visibility-5-3",
+            Self::GrantsVisible => "fs-meta-api-ops-visibility-5-4",
+            Self::WithdrawConverged => "fs-meta-api-ops-visibility-5-5",
+            Self::SinkHolderMoved => "fs-meta-api-ops-visibility-5-6",
+            Self::FacadeLive => "fs-meta-api-ops-visibility-5-7",
+        }
+    }
 }
 
 impl OperationalMode {
@@ -30,7 +80,6 @@ impl OperationalMode {
             Self::ForceFindExecutionSemantics => "fs-meta-api-ops-force-find",
             Self::NewNfsJoin => "fs-meta-api-ops-nfs-join",
             Self::RootPathModify => "fs-meta-api-ops-root-path",
-            Self::VisibilityChangeAndSinkSelection => "fs-meta-api-ops-visibility",
             Self::SinkFailover => "fs-meta-api-ops-sink-failover",
             Self::FacadeFailoverAndResourceSwitch => "fs-meta-api-ops-facade-failover",
             Self::NfsRetire => "fs-meta-api-ops-nfs-retire",
@@ -64,7 +113,35 @@ pub fn run_root_path_modify() -> Result<(), String> {
 }
 
 pub fn run_visibility_change_and_sink_selection() -> Result<(), String> {
-    run_mode(OperationalMode::VisibilityChangeAndSinkSelection)
+    run_visibility_change_and_sink_selection_until(VisibilityPhase::FacadeLive)
+}
+
+pub fn run_visibility_change_roots_narrowed() -> Result<(), String> {
+    run_visibility_change_and_sink_selection_until(VisibilityPhase::RootsNarrowed)
+}
+
+pub fn run_visibility_change_source_delivery_ready() -> Result<(), String> {
+    run_visibility_change_and_sink_selection_until(VisibilityPhase::SourceDeliveryReady)
+}
+
+pub fn run_visibility_change_manual_rescan_accepted() -> Result<(), String> {
+    run_visibility_change_and_sink_selection_until(VisibilityPhase::ManualRescanAccepted)
+}
+
+pub fn run_visibility_change_grants_visible() -> Result<(), String> {
+    run_visibility_change_and_sink_selection_until(VisibilityPhase::GrantsVisible)
+}
+
+pub fn run_visibility_change_withdraw_converged() -> Result<(), String> {
+    run_visibility_change_and_sink_selection_until(VisibilityPhase::WithdrawConverged)
+}
+
+pub fn run_visibility_change_sink_holder_moved() -> Result<(), String> {
+    run_visibility_change_and_sink_selection_until(VisibilityPhase::SinkHolderMoved)
+}
+
+pub fn run_visibility_change_facade_live() -> Result<(), String> {
+    run_visibility_change_and_sink_selection_until(VisibilityPhase::FacadeLive)
 }
 
 pub fn run_sink_failover() -> Result<(), String> {
@@ -77,6 +154,25 @@ pub fn run_facade_failover_and_resource_switch() -> Result<(), String> {
 
 pub fn run_nfs_retire() -> Result<(), String> {
     run_mode(OperationalMode::NfsRetire)
+}
+
+fn run_visibility_change_and_sink_selection_until(
+    target_phase: VisibilityPhase,
+) -> Result<(), String> {
+    if let Some(reason) = skip_unless_real_nfs_enabled() {
+        eprintln!("[fs-meta-api-ops] visibility-change skipped: {reason}");
+        return Ok(());
+    }
+
+    let mut harness = build_operational_harness(target_phase.app_prefix(), false, 1)?;
+    scenario_visibility_change_and_sink_selection(
+        &harness.cluster,
+        &mut harness.lab,
+        &mut harness.session,
+        &harness.app_id,
+        &harness.facade_resource_id,
+        target_phase,
+    )
 }
 
 #[test]
@@ -131,15 +227,6 @@ fn run_mode(mode: OperationalMode) -> Result<(), String> {
         }
         OperationalMode::RootPathModify => {
             scenario_root_path_modify(&harness.cluster, &harness.lab, &mut harness.session)?;
-        }
-        OperationalMode::VisibilityChangeAndSinkSelection => {
-            scenario_visibility_change_and_sink_selection(
-                &harness.cluster,
-                &mut harness.lab,
-                &mut harness.session,
-                &harness.app_id,
-                &harness.facade_resource_id,
-            )?;
         }
         OperationalMode::SinkFailover => {
             scenario_sink_failover(&harness.cluster, &mut harness.session, &harness.app_id)?;
@@ -1210,97 +1297,415 @@ fn scenario_root_path_modify(
     Ok(())
 }
 
+fn visibility_phase_progress(phase: VisibilityPhase, state: &str) {
+    let completed = phase.index();
+    let effective = 4.0 + (completed as f64 / VisibilityPhase::TOTAL as f64);
+    eprintln!(
+        "[fs-meta-l5-progress] case=ops-visibility-sink-selection step={} state={} l5_stage=5/24 l5_subprogress={}/{} l5_progress={effective:.2}/24",
+        phase.step(),
+        state,
+        completed,
+        VisibilityPhase::TOTAL
+    );
+}
+
+fn visibility_phase_step<T>(
+    phase: VisibilityPhase,
+    op: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let started = std::time::Instant::now();
+    visibility_phase_progress(phase, "begin");
+    match op() {
+        Ok(value) => {
+            eprintln!(
+                "[fs-meta-l5-progress] case=ops-visibility-sink-selection step={} state=ok elapsed_ms={}",
+                phase.step(),
+                started.elapsed().as_millis()
+            );
+            visibility_phase_progress(phase, "ok");
+            Ok(value)
+        }
+        Err(err) => {
+            eprintln!(
+                "[fs-meta-l5-progress] case=ops-visibility-sink-selection step={} state=fail elapsed_ms={} err={}",
+                phase.step(),
+                started.elapsed().as_millis(),
+                err
+            );
+            Err(format!("{} failed: {err}", phase.step()))
+        }
+    }
+}
+
+fn visibility_stop_at(target_phase: VisibilityPhase, current_phase: VisibilityPhase) -> bool {
+    target_phase == current_phase
+}
+
+fn status_debug_nodes_for_group_from_statuses(
+    statuses: &[Value],
+    section: &str,
+    field: &str,
+    group_id: &str,
+) -> BTreeSet<String> {
+    let mut nodes = BTreeSet::new();
+    for status in statuses {
+        let Some(groups_by_node) = status
+            .get(section)
+            .and_then(|value| value.get("debug"))
+            .and_then(|value| value.get(field))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for (node, groups) in groups_by_node {
+            let has_group = groups
+                .as_array()
+                .map(|groups| {
+                    groups
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|group| group == group_id)
+                })
+                .unwrap_or(false);
+            if has_group {
+                nodes.insert(node.clone());
+            }
+        }
+    }
+    nodes
+}
+
+fn source_primary_for_group_from_statuses(statuses: &[Value], group_id: &str) -> Option<String> {
+    statuses.iter().find_map(|status| {
+        status
+            .get("source")
+            .and_then(|source| source.get("debug"))
+            .and_then(|debug| debug.get("source_primary_by_group"))
+            .and_then(Value::as_object)
+            .and_then(|groups| groups.get(group_id))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+fn source_logical_root_diagnostics_from_statuses(statuses: &[Value], root_id: &str) -> Vec<Value> {
+    statuses
+        .iter()
+        .flat_map(|status| {
+            status
+                .get("source")
+                .and_then(|source| source.get("logical_roots"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(move |root| root.get("root_id").and_then(Value::as_str) == Some(root_id))
+                .map(|root| {
+                    json!({
+                        "root_id": root.get("root_id").cloned().unwrap_or(Value::Null),
+                        "status": root.get("status").cloned().unwrap_or(Value::Null),
+                        "matched_grants": root.get("matched_grants").cloned().unwrap_or(Value::Null),
+                        "active_members": root.get("active_members").cloned().unwrap_or(Value::Null),
+                        "coverage_mode": root.get("coverage_mode").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn source_concrete_root_diagnostics_from_statuses(
+    statuses: &[Value],
+    group_id: &str,
+) -> Vec<Value> {
+    let object_ref_suffix = format!("::{group_id}");
+    statuses
+        .iter()
+        .flat_map(|status| {
+            status
+                .get("source")
+                .and_then(|source| source.get("concrete_roots"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|root| {
+                    root.get("object_ref")
+                        .and_then(Value::as_str)
+                        .map(|object_ref| {
+                            object_ref == group_id || object_ref.ends_with(&object_ref_suffix)
+                        })
+                        .unwrap_or(false)
+                })
+                .map(|root| {
+                    json!({
+                        "object_ref": root.get("object_ref").cloned().unwrap_or(Value::Null),
+                        "status": root.get("status").cloned().unwrap_or(Value::Null),
+                        "active": root.get("active").cloned().unwrap_or(Value::Null),
+                        "watch_enabled": root.get("watch_enabled").cloned().unwrap_or(Value::Null),
+                        "scan_enabled": root.get("scan_enabled").cloned().unwrap_or(Value::Null),
+                        "coverage_mode": root.get("coverage_mode").cloned().unwrap_or(Value::Null),
+                        "rescan_pending": root.get("rescan_pending").cloned().unwrap_or(Value::Null),
+                        "last_error": root.get("last_error").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn visibility_source_status_debug(
+    cluster: &Cluster5,
+    session: &mut OperatorSession,
+    group_id: &str,
+) -> Result<String, String> {
+    let monitoring_roots = session
+        .monitoring_roots()
+        .unwrap_or_else(|err| json!({ "error": err }));
+    let statuses = session.status_all()?;
+    let source_nodes = status_debug_nodes_for_group_from_statuses(
+        &statuses,
+        "source",
+        "scheduled_source_groups_by_node",
+        group_id,
+    );
+    let scan_nodes = status_debug_nodes_for_group_from_statuses(
+        &statuses,
+        "source",
+        "scheduled_scan_groups_by_node",
+        group_id,
+    );
+    let sink_nodes = status_debug_nodes_for_group_from_statuses(
+        &statuses,
+        "sink",
+        "scheduled_groups_by_node",
+        group_id,
+    );
+    let source_primary = source_primary_for_group_from_statuses(&statuses, group_id);
+    let logical_roots = source_logical_root_diagnostics_from_statuses(&statuses, group_id);
+    let concrete_roots = source_concrete_root_diagnostics_from_statuses(&statuses, group_id);
+    let grants = match session.runtime_grants() {
+        Ok(grants) => {
+            let active_holders = active_grant_node_names_for_group(cluster, &grants, group_id)
+                .unwrap_or_else(|_| BTreeSet::new());
+            json!({
+                "active_holders": active_holders,
+                "object_refs": active_grant_object_refs_for_group(&grants, group_id),
+            })
+        }
+        Err(err) => json!({ "error": err }),
+    };
+    Ok(format!(
+        "visibility_source_status_debug={}",
+        json!({
+            "group": group_id,
+            "monitoring_roots": monitoring_roots,
+            "source_nodes": source_nodes,
+            "scan_nodes": scan_nodes,
+            "sink_nodes": sink_nodes,
+            "source_primary": source_primary,
+            "logical_roots": logical_roots,
+            "concrete_roots": concrete_roots,
+            "grants": grants,
+        })
+    ))
+}
+
+fn wait_visibility_source_delivery_ready(
+    cluster: &Cluster5,
+    session: &mut OperatorSession,
+    group_id: &str,
+) -> Result<(), String> {
+    wait_until(
+        Duration::from_secs(60),
+        "nfs2 source delivery route ready",
+        || {
+            let current = session.monitoring_roots()?;
+            let roots_ok = current
+                .get("roots")
+                .and_then(Value::as_array)
+                .map(|roots| {
+                    roots.len() == 1 && roots[0].get("id").and_then(Value::as_str) == Some(group_id)
+                })
+                .unwrap_or(false);
+            let statuses = session.status_all()?;
+            let source_nodes = status_debug_nodes_for_group_from_statuses(
+                &statuses,
+                "source",
+                "scheduled_source_groups_by_node",
+                group_id,
+            );
+            let scan_nodes = status_debug_nodes_for_group_from_statuses(
+                &statuses,
+                "source",
+                "scheduled_scan_groups_by_node",
+                group_id,
+            );
+            let source_primary = source_primary_for_group_from_statuses(&statuses, group_id);
+            let logical_roots = source_logical_root_diagnostics_from_statuses(&statuses, group_id);
+            let concrete_roots =
+                source_concrete_root_diagnostics_from_statuses(&statuses, group_id);
+            let logical_ready = logical_roots.iter().any(|root| {
+                root.get("matched_grants")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+                    > 0
+                    && root
+                        .get("active_members")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                        > 0
+            });
+            let concrete_ready = concrete_roots.iter().any(|root| {
+                root.get("active").and_then(Value::as_bool).unwrap_or(false)
+                    && root
+                        .get("scan_enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+            });
+            let source_route_ready = source_primary.is_some() || !source_nodes.is_empty();
+            let scan_route_ready = !scan_nodes.is_empty() || logical_ready || concrete_ready;
+            if roots_ok && source_route_ready && scan_route_ready {
+                return Ok(true);
+            }
+            Err(format!(
+                "source delivery not ready: roots_ok={roots_ok} source_route_ready={source_route_ready} scan_route_ready={scan_route_ready}; {}",
+                visibility_source_status_debug(cluster, session, group_id)?
+            ))
+        },
+    )
+}
+
 fn scenario_visibility_change_and_sink_selection(
     cluster: &Cluster5,
     lab: &mut NfsLab,
     session: &mut OperatorSession,
     app_id: &str,
     facade_resource_id: &str,
+    target_phase: VisibilityPhase,
 ) -> Result<(), String> {
-    // Narrow roots to a single scope so sink realization is unambiguous.
-    let single_root = json!([root_payload("nfs2", &lab.export_source("nfs2"), "/")]);
-    session.update_roots(&single_root)?;
-    session.rescan()?;
-    wait_until(Duration::from_secs(30), "single root nfs2 active", || {
-        let current = session.monitoring_roots()?;
-        Ok(current
-            .get("roots")
-            .and_then(Value::as_array)
-            .map(|rows| {
-                rows.len() == 1 && rows[0].get("id").and_then(Value::as_str) == Some("nfs2")
-            })
-            .unwrap_or(false))
+    visibility_phase_step(VisibilityPhase::RootsNarrowed, || {
+        let single_root = json!([root_payload("nfs2", &lab.export_source("nfs2"), "/")]);
+        session.update_roots(&single_root)?;
+        wait_until(Duration::from_secs(30), "single root nfs2 active", || {
+            let current = session.monitoring_roots()?;
+            Ok(current
+                .get("roots")
+                .and_then(Value::as_array)
+                .map(|rows| {
+                    rows.len() == 1 && rows[0].get("id").and_then(Value::as_str) == Some("nfs2")
+                })
+                .unwrap_or(false))
+        })
     })?;
-
-    wait_until(
-        Duration::from_secs(60),
-        "nfs2 grants active on visible members",
-        || {
-            let grants = session.runtime_grants()?;
-            let a = format!("{}::nfs2", cluster.node_id("node-a")?);
-            let c = format!("{}::nfs2", cluster.node_id("node-c")?);
-            let d = format!("{}::nfs2", cluster.node_id("node-d")?);
-            if active_grant_exists(&grants, &a)
-                && active_grant_exists(&grants, &c)
-                && active_grant_exists(&grants, &d)
-            {
-                return Ok(true);
-            }
-            Err(format!(
-                "expected active nfs2 grants missing: a={a} c={c} d={d} grants={grants}"
-            ))
-        },
-    )?;
-
-    let before_holder = current_sink_holder_for_group(cluster, app_id, "nfs2")?;
-    cluster
-        .withdraw_resources_clusterwide(&cluster.node_id("node-d")?, vec!["nfs2".to_string()])?;
-    let _ = lab.unmount_export("node-d", "nfs2");
-
-    wait_until(
-        Duration::from_secs(180),
-        "nfs2 withdrawn from node-d grants",
-        || {
-            let grants = session.runtime_grants()?;
-            let d = format!("{}::nfs2", cluster.node_id("node-d")?);
-            if !active_grant_exists(&grants, &d) {
-                return Ok(true);
-            }
-            Err(format!(
-                "withdrawn nfs2 grant still active: d={d} grants={grants}"
-            ))
-        },
-    )?;
-
-    wait_until(
-        Duration::from_secs(90),
-        "sink holder not on withdrawn node",
-        || {
-            let holder = current_sink_holder_for_group(cluster, app_id, "nfs2")?;
-            Ok(holder.is_some() && holder != Some("node-d".to_string()))
-        },
-    )?;
-    let after_holder = current_sink_holder_for_group(cluster, app_id, "nfs2")?
-        .ok_or_else(|| "sink holder disappeared after visibility change".to_string())?;
-    if after_holder == "node-d" {
-        return Err("sink holder remained on withdrawn node-d".to_string());
-    }
-    if before_holder == Some("node-d".to_string()) && after_holder == "node-d" {
-        return Err("sink holder did not move away from withdrawn node-d".to_string());
+    if visibility_stop_at(target_phase, VisibilityPhase::RootsNarrowed) {
+        return Ok(());
     }
 
-    // Keep the domain invariant at the API boundary: changing source/sink visibility must
-    // not make the management facade unavailable.
-    let status = session.status().map_err(|err| {
-        format!(
-            "facade unavailable while adjusting sink visibility for {facade_resource_id}: {err}"
+    visibility_phase_step(VisibilityPhase::SourceDeliveryReady, || {
+        wait_visibility_source_delivery_ready(cluster, session, "nfs2")
+    })?;
+    if visibility_stop_at(target_phase, VisibilityPhase::SourceDeliveryReady) {
+        return Ok(());
+    }
+
+    visibility_phase_step(VisibilityPhase::ManualRescanAccepted, || {
+        session.rescan().map(|_| ()).map_err(|err| {
+            let debug = visibility_source_status_debug(cluster, session, "nfs2")
+                .unwrap_or_else(|debug_err| format!("source_status_debug_failed={debug_err}"));
+            format!("manual rescan acceptance failed: {err}; {debug}")
+        })
+    })?;
+    if visibility_stop_at(target_phase, VisibilityPhase::ManualRescanAccepted) {
+        return Ok(());
+    }
+
+    let before_holder = visibility_phase_step(VisibilityPhase::GrantsVisible, || {
+        wait_until(
+            Duration::from_secs(60),
+            "nfs2 grants active on visible members",
+            || {
+                let grants = session.runtime_grants()?;
+                let a = format!("{}::nfs2", cluster.node_id("node-a")?);
+                let c = format!("{}::nfs2", cluster.node_id("node-c")?);
+                let d = format!("{}::nfs2", cluster.node_id("node-d")?);
+                if active_grant_exists(&grants, &a)
+                    && active_grant_exists(&grants, &c)
+                    && active_grant_exists(&grants, &d)
+                {
+                    return Ok(true);
+                }
+                Err(format!(
+                    "expected active nfs2 grants missing: a={a} c={c} d={d} grants={grants}"
+                ))
+            },
+        )?;
+        current_sink_holder_for_group(cluster, app_id, "nfs2")
+    })?;
+    if visibility_stop_at(target_phase, VisibilityPhase::GrantsVisible) {
+        return Ok(());
+    }
+
+    visibility_phase_step(VisibilityPhase::WithdrawConverged, || {
+        cluster.withdraw_resources_clusterwide(
+            &cluster.node_id("node-d")?,
+            vec!["nfs2".to_string()],
+        )?;
+        let _ = lab.unmount_export("node-d", "nfs2");
+        wait_until(
+            Duration::from_secs(180),
+            "nfs2 withdrawn from node-d grants",
+            || {
+                let grants = session.runtime_grants()?;
+                let d = format!("{}::nfs2", cluster.node_id("node-d")?);
+                if !active_grant_exists(&grants, &d) {
+                    return Ok(true);
+                }
+                Err(format!(
+                    "withdrawn nfs2 grant still active: d={d} grants={grants}"
+                ))
+            },
         )
     })?;
-    if status.get("api_facade_liveness").is_none() {
-        return Err(format!(
-            "facade status missing liveness while adjusting sink visibility for {facade_resource_id}: {status}"
-        ));
+    if visibility_stop_at(target_phase, VisibilityPhase::WithdrawConverged) {
+        return Ok(());
     }
+
+    visibility_phase_step(VisibilityPhase::SinkHolderMoved, || {
+        wait_until(
+            Duration::from_secs(90),
+            "sink holder not on withdrawn node",
+            || {
+                let holder = current_sink_holder_for_group(cluster, app_id, "nfs2")?;
+                Ok(holder.is_some() && holder != Some("node-d".to_string()))
+            },
+        )?;
+        let after_holder = current_sink_holder_for_group(cluster, app_id, "nfs2")?
+            .ok_or_else(|| "sink holder disappeared after visibility change".to_string())?;
+        if after_holder == "node-d" {
+            return Err("sink holder remained on withdrawn node-d".to_string());
+        }
+        if before_holder == Some("node-d".to_string()) && after_holder == "node-d" {
+            return Err("sink holder did not move away from withdrawn node-d".to_string());
+        }
+        Ok(())
+    })?;
+    if visibility_stop_at(target_phase, VisibilityPhase::SinkHolderMoved) {
+        return Ok(());
+    }
+
+    visibility_phase_step(VisibilityPhase::FacadeLive, || {
+        let status = session.status().map_err(|err| {
+            format!(
+                "facade unavailable while adjusting sink visibility for {facade_resource_id}: {err}"
+            )
+        })?;
+        if status.get("api_facade_liveness").is_none() {
+            return Err(format!(
+                "facade status missing liveness while adjusting sink visibility for {facade_resource_id}: {status}"
+            ));
+        }
+        Ok(())
+    })?;
+
     Ok(())
 }
 

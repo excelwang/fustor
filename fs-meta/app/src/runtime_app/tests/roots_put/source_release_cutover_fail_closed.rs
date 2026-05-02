@@ -880,7 +880,8 @@ async fn fail_closed_release_cutover_keeps_source_status_recovery_lane_live() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn manual_rescan_source_status_repairs_retained_source_replay_before_live_evidence() {
+async fn manual_rescan_source_status_does_not_repair_retained_source_replay_before_source_state_current(
+) {
     let _hook_guard = source_release_cutover_hook_guard().await;
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
@@ -1006,7 +1007,7 @@ async fn manual_rescan_source_status_repairs_retained_source_replay_before_live_
         Duration::from_millis(100),
     )
     .await
-    .expect("manual-rescan source-status should repair retained source replay and return evidence");
+    .expect("manual-rescan source-status should return observation without retained replay repair");
     let snapshots = events
         .iter()
         .map(|event| {
@@ -1019,13 +1020,25 @@ async fn manual_rescan_source_status_repairs_retained_source_replay_before_live_
     assert!(
         snapshots
             .iter()
-            .any(|snapshot| snapshot.source_primary_by_group.contains_key("nfs1")
-                && snapshot.source_primary_by_group.contains_key("nfs2")),
-        "manual-rescan source-status must return live current-root source evidence after retained replay: {snapshots:?}",
+            .any(|snapshot| snapshot
+                .scheduled_source_groups_by_node
+                .values()
+                .any(|groups| groups.iter().any(|group| group == "nfs1"))
+                && snapshot
+                    .scheduled_source_groups_by_node
+                    .values()
+                    .any(|groups| groups.iter().any(|group| group == "nfs2"))),
+        "manual-rescan source-status should still report runtime-scope ownership from control/cache while source replay is pending: {snapshots:?}",
     );
     assert!(
-        !app.source_state_replay_required(),
-        "manual-rescan source-status must clear retained source replay before reporting live delivery evidence",
+        snapshots
+            .iter()
+            .all(|snapshot| snapshot.source_primary_by_group.is_empty()),
+        "manual-rescan source-status must not report live delivery target evidence while source replay is pending: {snapshots:?}",
+    );
+    assert!(
+        app.source_state_replay_required(),
+        "manual-rescan source-status must not clear retained source replay from a status read",
     );
 
     app.close().await.expect("close app");

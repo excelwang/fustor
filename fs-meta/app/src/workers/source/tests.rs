@@ -2508,6 +2508,39 @@ async fn worker_targeted_rescan_rejects_without_local_primary_scan_root() {
     client.close().await.expect("close source worker");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_targeted_rescan_delivery_check_reports_non_target_without_error() {
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        SourceConfig::default(),
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    let acceptance = client
+        .check_targeted_rescan_delivery_acceptance_with_failure()
+        .await
+        .expect("targeted source-rescan delivery check should return domain acceptance state");
+    assert_eq!(
+        acceptance,
+        SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary,
+        "delivery acceptance check should report a non-target without turning status collection into an error"
+    );
+
+    client.close().await.expect("close source worker");
+}
+
 #[test]
 fn source_facade_apply_orchestration_local_branch_uses_typed_helper() {
     let source_impl = include_str!("../source.rs");
@@ -2691,6 +2724,22 @@ struct SourceWorkerObservabilityCallCountHookReset;
 impl Drop for SourceWorkerObservabilityCallCountHookReset {
     fn drop(&mut self) {
         clear_source_worker_observability_call_count_hook();
+    }
+}
+
+struct SourceWorkerRearmCallCountHookReset;
+
+impl Drop for SourceWorkerRearmCallCountHookReset {
+    fn drop(&mut self) {
+        clear_source_worker_rearm_call_count_hook();
+    }
+}
+
+struct SourceWorkerAcceptTargetedDeliveryCallCountHookReset;
+
+impl Drop for SourceWorkerAcceptTargetedDeliveryCallCountHookReset {
+    fn drop(&mut self) {
+        clear_source_worker_accept_targeted_delivery_call_count_hook();
     }
 }
 
@@ -14099,6 +14148,253 @@ async fn nonblocking_status_observability_times_out_live_probe_inside_route_budg
     assert_eq!(
         snapshot.scheduled_scan_groups_by_node.get("node-b"),
         Some(&vec!["nfs1".to_string()])
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_rescan_delivery_status_uses_rearm_ack_cache_without_live_probe() {
+    let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
+    let _delay_hook_reset = SourceWorkerObservabilityDelayHookReset;
+    let _count_hook_reset = SourceWorkerObservabilityCallCountHookReset;
+    let _rearm_count_hook_reset = SourceWorkerRearmCallCountHookReset;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let node_id = NodeId("node-b".to_string());
+    let cfg = SourceConfig {
+        roots: vec![worker_watch_scan_root("nfs1", &nfs1)],
+        host_object_grants: vec![worker_source_export(
+            "node-b::nfs1",
+            "node-b",
+            "10.0.0.21",
+            nfs1.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        node_id.clone(),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    let source_rescan_route = source_rescan_request_route_for(&node_id.0).0;
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])],
+            }))
+            .expect("encode source scan activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: source_rescan_route.clone(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 3,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])],
+            }))
+            .expect("encode source manual-rescan route activate"),
+        ])
+        .await
+        .expect("apply source + scan + manual-rescan control");
+
+    client
+        .rearm_source_rescan_request_endpoints_with_failure()
+        .await
+        .expect("manual-rescan source endpoint rearm");
+
+    let rearm_rpc_count = Arc::new(AtomicUsize::new(0));
+    install_source_worker_rearm_call_count_hook(SourceWorkerRearmCallCountHook {
+        count: rearm_rpc_count.clone(),
+    });
+    client
+        .rearm_source_rescan_request_endpoints_with_failure()
+        .await
+        .expect("already armed manual-rescan source endpoint rearm");
+    assert_eq!(
+        rearm_rpc_count.load(Ordering::Relaxed),
+        0,
+        "manual-rescan rearm must preserve healthy already-armed endpoints from current delivery evidence instead of queueing another worker control RPC"
+    );
+
+    let observability_rpc_count = Arc::new(AtomicUsize::new(0));
+    install_source_worker_observability_call_count_hook(SourceWorkerObservabilityCallCountHook {
+        count: observability_rpc_count.clone(),
+    });
+    install_source_worker_observability_delay_hook(SourceWorkerObservabilityDelayHook {
+        delay: Duration::from_millis(250),
+    });
+
+    let (snapshot, used_cached_fallback) = tokio::time::timeout(
+        Duration::from_millis(150),
+        client.manual_rescan_delivery_observability_snapshot_for_status_route_with_timeout(Some(
+            Duration::from_millis(50),
+        )),
+    )
+    .await
+    .expect("manual-rescan delivery status must not wait for live source observability");
+
+    assert!(
+        used_cached_fallback,
+        "manual-rescan delivery status should use the rearm-ack cache as delivery proof"
+    );
+    assert_eq!(
+        observability_rpc_count.load(Ordering::Relaxed),
+        0,
+        "manual-rescan delivery proof must not call live observability or wait on audit"
+    );
+    assert!(
+        snapshot.status.logical_roots.iter().any(|root| {
+            root.root_id == "nfs1" && root.status == "manual_rescan_delivery_ready"
+        }),
+        "rearm-ack snapshot should carry current logical-root delivery readiness: {:?}",
+        snapshot.status.logical_roots
+    );
+    assert!(
+        snapshot.status.concrete_roots.iter().any(|root| {
+            root.logical_root_id == "nfs1"
+                && root.object_ref == "node-b::nfs1"
+                && root.is_group_primary
+                && root.status == "manual_rescan_delivery_ready"
+        }),
+        "rearm-ack snapshot should carry local source-primary concrete-root delivery readiness: {:?}",
+        snapshot.status.concrete_roots
+    );
+    assert!(
+        snapshot
+            .status
+            .degraded_roots
+            .iter()
+            .any(|(root_key, reason)| {
+                root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY
+                    && reason == SOURCE_WORKER_MANUAL_RESCAN_DELIVERY_CACHE_REASON
+            }),
+        "manual-rescan delivery cache provenance must be explicit: {:?}",
+        snapshot.status.degraded_roots
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_rescan_scoped_accept_uses_rearm_ack_cache_without_live_probe() {
+    let _rearm_count_hook_reset = SourceWorkerRearmCallCountHookReset;
+    let _accept_count_hook_reset = SourceWorkerAcceptTargetedDeliveryCallCountHookReset;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let node_id = NodeId("node-b".to_string());
+    let cfg = SourceConfig {
+        roots: vec![worker_watch_scan_root("nfs1", &nfs1)],
+        host_object_grants: vec![worker_source_export(
+            "node-b::nfs1",
+            "node-b",
+            "10.0.0.21",
+            nfs1.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        node_id.clone(),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    let source_rescan_route = source_rescan_request_route_for(&node_id.0).0;
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])],
+            }))
+            .expect("encode source scan activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: source_rescan_route,
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 3,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])],
+            }))
+            .expect("encode source manual-rescan route activate"),
+        ])
+        .await
+        .expect("apply source + scan + manual-rescan control");
+
+    client
+        .rearm_source_rescan_request_endpoints_with_failure()
+        .await
+        .expect("manual-rescan source endpoint rearm");
+
+    let accept_rpc_count = Arc::new(AtomicUsize::new(0));
+    install_source_worker_accept_targeted_delivery_call_count_hook(
+        SourceWorkerAcceptTargetedDeliveryCallCountHook {
+            count: accept_rpc_count.clone(),
+        },
+    );
+    client
+        .accept_targeted_rescan_delivery_with_failure()
+        .await
+        .expect("scoped manual-rescan delivery accept from rearm proof");
+
+    assert_eq!(
+        accept_rpc_count.load(Ordering::Relaxed),
+        0,
+        "scoped manual-rescan acceptance must use current rearm-ack delivery proof instead of queueing another worker control RPC"
     );
 
     client.close().await.expect("close source worker");

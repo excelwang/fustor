@@ -47,6 +47,24 @@ Within `operations-real-nfs`, run groups in this order:
 4. `recovery-switch`: sink/facade failover and activation-scope preservation.
 5. `resource-budget`: CPU budget after correctness is stable.
 
+L5 stage 5, `ops-visibility-sink-selection`, is intentionally exposed as one
+product gate plus seven diagnostic substages. The external L5 count stays
+`5/24`; substages print `l5_subprogress=x/7` and effective progress
+`(4 + x/7)/24` so repeated failures show their exact boundary:
+
+1. `ops-visibility-roots-narrowed`: management roots narrow to `nfs2`.
+2. `ops-visibility-source-delivery-ready`: source and scan routes for `nfs2`
+   are visible without requiring source audit completion or fixed file counts.
+3. `ops-visibility-manual-rescan-accepted`: manual rescan is accepted by the
+   source path.
+4. `ops-visibility-grants-visible`: visible members hold active `nfs2` grants.
+5. `ops-visibility-withdraw-converged`: withdrawn `node-d::nfs2` grant leaves
+   active grants.
+6. `ops-visibility-sink-holder-moved`: sink ownership moves away from the
+   withdrawn node.
+7. `ops-visibility-facade-live`: facade remains live after the visibility
+   change.
+
 ## Public Commands
 
 Use `fs-meta/docs/examples/test-matrix-commands.sh <suite>` from the repository

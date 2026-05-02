@@ -571,6 +571,38 @@ fn republish_scheduled_groups_into_zero_row_summary_republishes_when_live_rows_c
 }
 
 #[test]
+fn republish_scheduled_groups_into_zero_row_summary_materializes_rows_when_schedule_map_already_exists()
+ {
+    let mut snapshot = SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    republish_scheduled_groups_into_zero_row_summary(
+        &mut snapshot,
+        &NodeId("node-b".to_string()),
+        &std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+    );
+
+    let visible_groups = snapshot
+        .groups
+        .iter()
+        .map(|group| format!("{}:{:?}", group.group_id, group.readiness))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        visible_groups,
+        std::collections::BTreeSet::from([
+            "nfs1:PendingMaterialization".to_string(),
+            "nfs2:PendingMaterialization".to_string(),
+        ]),
+        "a cached scheduled-groups map is not sufficient status evidence unless the same groups are also exposed as visible pending-materialization rows: {snapshot:?}"
+    );
+}
+
+#[test]
 fn fold_live_sink_status_snapshot_returns_cached_for_control_inflight_scheduled_zero_when_cached_ready_truth_survives()
  {
     let cached_snapshot = SinkStatusSnapshot {

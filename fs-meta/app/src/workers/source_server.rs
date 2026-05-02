@@ -21,8 +21,8 @@ use tokio::task::JoinHandle;
 use crate::FileMetaRecord;
 use crate::query::path::is_under_query_path;
 use crate::runtime::orchestration::{SourceControlSignal, source_control_signals_from_envelopes};
-use crate::source::FSMetaSource;
 use crate::source::config::SourceConfig;
+use crate::source::{FSMetaSource, SourceTargetedRescanDeliveryAcceptance};
 use crate::workers::source::SourceFailure;
 use crate::workers::source::SourceObservabilitySnapshot;
 use crate::workers::source::SourceWorkerRpc;
@@ -186,6 +186,10 @@ fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
         SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch => {
             "TriggerTargetedRescanWhenReadyEpoch"
         }
+        SourceWorkerRequest::CheckTargetedRescanDeliveryAcceptance => {
+            "CheckTargetedRescanDeliveryAcceptance"
+        }
+        SourceWorkerRequest::AcceptTargetedRescanDelivery => "AcceptTargetedRescanDelivery",
         SourceWorkerRequest::OnControlFrame { .. } => "OnControlFrame",
     }
 }
@@ -725,6 +729,8 @@ fn request_requires_live_publish_pump(request: &SourceWorkerRequest) -> bool {
             | SourceWorkerRequest::SubmitRescanRequestEpoch
             | SourceWorkerRequest::TriggerRescanWhenReadyEpoch
             | SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch
+            | SourceWorkerRequest::CheckTargetedRescanDeliveryAcceptance
+            | SourceWorkerRequest::AcceptTargetedRescanDelivery
             | SourceWorkerRequest::ProgressSnapshot
             | SourceWorkerRequest::ObservabilitySnapshot
             | SourceWorkerRequest::StartRuntimeEndpoints
@@ -1249,6 +1255,30 @@ fn plan_worker_request(
         },
         SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch => match state.source.clone() {
             Some(source) => SourceWorkerAction::TriggerTargetedRescanWhenReadyEpoch { source },
+            None => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
+        SourceWorkerRequest::CheckTargetedRescanDeliveryAcceptance => match state.source.as_ref() {
+            Some(source) => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::TargetedRescanDeliveryAcceptance(
+                    source.targeted_rescan_delivery_acceptance(),
+                ),
+                false,
+            ),
+            None => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::TargetedRescanDeliveryAcceptance(
+                    SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary,
+                ),
+                false,
+            ),
+        },
+        SourceWorkerRequest::AcceptTargetedRescanDelivery => match state.source.as_ref() {
+            Some(source) => match source.accept_targeted_rescan_delivery_with_failure() {
+                Ok(()) => SourceWorkerAction::Immediate(SourceWorkerResponse::Ack, false),
+                Err(err) => SourceWorkerAction::Immediate(classify_source_worker_error(err), false),
+            },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
