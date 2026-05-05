@@ -5,8 +5,61 @@ set -euo pipefail
 # root. The public suite surface is organized by feature priority first, then
 # environment: business -> environment -> operations.
 
-: "${CAPANIX_WORKER_HOST_BINARY:=/root/repo/capanix/target/debug/capanix_worker_host}"
+: "${CAPANIX_WORKER_HOST_BINARY:=}"
 : "${FSMETA_FULL_NFS_ROOTS_FILE:=}"
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/../../.." && pwd)"
+
+resolve_worker_host_binary() {
+  local bin_name="capanix_worker_host"
+  if [[ "${OS:-}" == "Windows_NT" ]]; then
+    bin_name="capanix_worker_host.exe"
+  fi
+
+  if [[ -n "${CAPANIX_WORKER_HOST_BINARY}" ]]; then
+    if [[ "${CAPANIX_WORKER_HOST_BINARY}" != /* ]]; then
+      echo "CAPANIX_WORKER_HOST_BINARY must be an absolute path: ${CAPANIX_WORKER_HOST_BINARY}" >&2
+      exit 2
+    fi
+    if [[ ! -x "${CAPANIX_WORKER_HOST_BINARY}" ]]; then
+      echo "CAPANIX_WORKER_HOST_BINARY is not executable: ${CAPANIX_WORKER_HOST_BINARY}" >&2
+      exit 2
+    fi
+    printf '%s\n' "${CAPANIX_WORKER_HOST_BINARY}"
+    return 0
+  fi
+
+  local candidate
+  for candidate in \
+    "${repo_root}/../capanix/target/debug/${bin_name}" \
+    "${repo_root}/../capanix/.target/debug/${bin_name}"
+  do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  if command -v "${bin_name}" >/dev/null 2>&1; then
+    command -v "${bin_name}"
+    return 0
+  fi
+
+  cat >&2 <<EOF2
+unable to resolve capanix worker host binary
+- set CAPANIX_WORKER_HOST_BINARY to an absolute executable path, or
+- keep a sibling capanix checkout at ../capanix with target/debug/${bin_name}
+repo_root=${repo_root}
+EOF2
+  exit 2
+}
+
+ensure_worker_host_binary() {
+  CAPANIX_WORKER_HOST_BINARY="$(resolve_worker_host_binary)"
+  export CAPANIX_WORKER_HOST_BINARY
+  echo "[fs-meta-test-matrix] worker_host_binary=${CAPANIX_WORKER_HOST_BINARY}"
+}
 
 announce_suite() {
   local suite="$1"
@@ -151,12 +204,14 @@ business_api_fast() {
 
 business_fast() {
   announce_suite "business-fast" "local/tmpfs/mock-worker" "no" "no"
+  ensure_worker_host_binary
   contract_fast
   business_api_fast
 }
 
 business_mini_nfs() {
   announce_suite "business-mini-nfs" "5-node-mini-real-nfs" "no" "no"
+  ensure_worker_host_binary
   CAPANIX_REAL_NFS_E2E=1 \
     CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
     cargo test -p fustor-specs-root --test fs_meta_api_e2e \
@@ -165,6 +220,7 @@ business_mini_nfs() {
 
 environment_full_nfs() {
   announce_suite "environment-full-nfs" "5-node-full-real-nfs-demo" "yes" "no"
+  ensure_worker_host_binary
   require_full_demo_assets
   CAPANIX_REAL_NFS_E2E=1 \
     CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
@@ -178,6 +234,7 @@ environment_full_nfs() {
 
 operations_local() {
   announce_suite "operations-local" "local-worker-runtime" "no" "yes"
+  ensure_worker_host_binary
   CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
     cargo test -p fs-meta-runtime --lib workers::source::tests::source_control \
       -- --nocapture --test-threads=1
@@ -198,6 +255,7 @@ operations_local() {
 operations_real_nfs() {
   local stage="${1:-all}"
   announce_suite "operations-real-nfs" "5-node-full-real-nfs-demo" "yes" "yes"
+  ensure_worker_host_binary
   require_full_demo_assets
   case "$stage" in
     all)

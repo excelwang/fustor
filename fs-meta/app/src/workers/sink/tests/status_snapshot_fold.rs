@@ -571,8 +571,8 @@ fn republish_scheduled_groups_into_zero_row_summary_republishes_when_live_rows_c
 }
 
 #[test]
-fn republish_scheduled_groups_into_zero_row_summary_materializes_rows_when_schedule_map_already_exists()
- {
+fn republish_scheduled_groups_into_zero_row_summary_does_not_materialize_rows_from_schedule_only()
+{
     let mut snapshot = SinkStatusSnapshot {
         scheduled_groups_by_node: std::collections::BTreeMap::from([(
             "node-b".to_string(),
@@ -587,18 +587,51 @@ fn republish_scheduled_groups_into_zero_row_summary_materializes_rows_when_sched
         &std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
     );
 
-    let visible_groups = snapshot
-        .groups
-        .iter()
-        .map(|group| format!("{}:{:?}", group.group_id, group.readiness))
-        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
-        visible_groups,
-        std::collections::BTreeSet::from([
-            "nfs1:PendingMaterialization".to_string(),
-            "nfs2:PendingMaterialization".to_string(),
+        snapshot.scheduled_groups_by_node,
+        std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]),
+        "zero-row republish must preserve the scheduling fact for diagnostics: {snapshot:?}"
+    );
+    assert!(
+        snapshot.groups.is_empty(),
+        "scheduled-groups metadata alone must not fabricate visible group rows: {snapshot:?}"
+    );
+}
+
+#[test]
+fn republish_scheduled_groups_into_zero_row_summary_updates_this_node_without_dropping_other_nodes()
+{
+    let mut snapshot = SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs0".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    republish_scheduled_groups_into_zero_row_summary(
+        &mut snapshot,
+        &NodeId("node-b".to_string()),
+        &std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+    );
+
+    assert_eq!(
+        snapshot.scheduled_groups_by_node,
+        std::collections::BTreeMap::from([
+            ("node-a".to_string(), vec!["nfs0".to_string()]),
+            (
+                "node-b".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            ),
         ]),
-        "a cached scheduled-groups map is not sufficient status evidence unless the same groups are also exposed as visible pending-materialization rows: {snapshot:?}"
+        "republishing one node's cached schedule must not drop other nodes' scheduling facts: {snapshot:?}"
+    );
+    assert!(
+        snapshot.groups.is_empty(),
+        "republishing schedule metadata must remain diagnostics-only until real group rows arrive: {snapshot:?}"
     );
 }
 

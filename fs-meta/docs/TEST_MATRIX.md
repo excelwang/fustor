@@ -106,6 +106,10 @@ All real-NFS tests stay ignored by default. They require
 `CAPANIX_REAL_NFS_E2E=1`, a valid `CAPANIX_WORKER_HOST_BINARY`, and explicit
 `--ignored` cargo execution from the matrix script.
 
+If `CAPANIX_WORKER_HOST_BINARY` is unset, the matrix script resolves a sibling
+`../capanix/target/debug/capanix_worker_host` (or `.target/debug`) relative to
+the current `fustor` checkout before falling back to `PATH`.
+
 Full real-NFS suites must be validated against the current 5-node demo
 environment, but concrete demo host addresses stay outside the fustor main
 branch. Set `FSMETA_FULL_NFS_ROOTS_FILE` to a local demo roots asset before

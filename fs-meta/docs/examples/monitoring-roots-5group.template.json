@@ -1,0 +1,66 @@
+commit cee83167236889931affa6d02ecb1c012490c48e
+Author: Your Name <you@example.com>
+Date:   Sun May 3 08:09:12 2026 +0800
+
+    fs-meta: merge demo assets with env-driven setup
+
+diff --git a/fs-meta/docs/examples/monitoring-roots-5group.template.json b/fs-meta/docs/examples/monitoring-roots-5group.template.json
+new file mode 100644
+index 0000000..6742870
+--- /dev/null
++++ b/fs-meta/docs/examples/monitoring-roots-5group.template.json
+@@ -0,0 +1,54 @@
++{
++  "roots": [
++    {
++      "id": "nfs-144",
++      "selector": {
++        "host_ip": "${FSMETA_DEMO_HOST_1}",
++        "mount_point": "${FSMETA_DEMO_MOUNT_1}"
++      },
++      "subpath_scope": "/",
++      "watch": true,
++      "scan": true
++    },
++    {
++      "id": "nfs-145",
++      "selector": {
++        "host_ip": "${FSMETA_DEMO_HOST_2}",
++        "mount_point": "${FSMETA_DEMO_MOUNT_2}"
++      },
++      "subpath_scope": "/",
++      "watch": true,
++      "scan": true
++    },
++    {
++      "id": "nfs-146",
++      "selector": {
++        "host_ip": "${FSMETA_DEMO_HOST_3}",
++        "mount_point": "${FSMETA_DEMO_MOUNT_3}"
++      },
++      "subpath_scope": "/",
++      "watch": true,
++      "scan": true
++    },
++    {
++      "id": "nfs-147",
++      "selector": {
++        "host_ip": "${FSMETA_DEMO_HOST_4}",
++        "mount_point": "${FSMETA_DEMO_MOUNT_4}"
++      },
++      "subpath_scope": "/",
++      "watch": true,
++      "scan": true
++    },
++    {
++      "id": "nfs-148",
++      "selector": {
++        "host_ip": "${FSMETA_DEMO_HOST_5}",
++        "mount_point": "${FSMETA_DEMO_MOUNT_5}"
++      },
++      "subpath_scope": "/",
++      "watch": true,
++      "scan": true
++    }
++  ]
++}

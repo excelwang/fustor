@@ -23,9 +23,8 @@ use crate::runtime::routes::{METHOD_FIND, ROUTE_TOKEN_FS_META, default_route_bin
 use crate::sink::SinkStatusSnapshotIssue;
 use crate::sink::VisibilityLagSample;
 use crate::sink::{
-    GroupReadinessState, SinkFileMeta, SinkGroupStatusSnapshot, SinkStatusConcern,
-    SinkStatusConcernProjection, SinkStatusSnapshot, SinkStatusSnapshotReadinessSummary,
-    sink_status_origin_entry_group_id,
+    SinkFileMeta, SinkStatusConcern, SinkStatusConcernProjection, SinkStatusSnapshot,
+    SinkStatusSnapshotReadinessSummary, sink_status_origin_entry_group_id,
 };
 use crate::source::config::{GrantedMountRoot, SourceConfig};
 use crate::workers::sink_ipc::{
@@ -1225,34 +1224,6 @@ fn republish_scheduled_groups_into_zero_row_summary(
     if !snapshot.groups.is_empty() && !zero_rows_only && !rows_cover_cached_schedule {
         return;
     }
-    let mut existing_groups = snapshot
-        .groups
-        .iter()
-        .map(|group| group.group_id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    for group_id in groups {
-        if existing_groups.insert(group_id.clone()) {
-            snapshot.groups.push(SinkGroupStatusSnapshot {
-                group_id: group_id.clone(),
-                primary_object_ref: "unassigned".to_string(),
-                total_nodes: 0,
-                live_nodes: 0,
-                tombstoned_count: 0,
-                attested_count: 0,
-                suspect_count: 0,
-                blind_spot_count: 0,
-                shadow_time_us: 0,
-                shadow_lag_us: 0,
-                overflow_pending_materialization: false,
-                readiness: GroupReadinessState::PendingMaterialization,
-                materialized_revision: 1,
-                estimated_heap_bytes: 0,
-            });
-        }
-    }
-    snapshot
-        .groups
-        .sort_by(|left, right| left.group_id.cmp(&right.group_id));
     snapshot
         .scheduled_groups_by_node
         .insert(node_id.0.clone(), groups.iter().cloned().collect());
