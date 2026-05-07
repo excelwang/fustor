@@ -769,11 +769,9 @@ pub fn is_retryable_query_unavailable_error(err: &str) -> bool {
 pub fn is_retryable_management_unavailable_error(err: &str) -> bool {
     err.contains("http 503 failed")
         && (err.contains("temporarily unavailable while runtime workers reconfigure")
-            || err.contains("runtime control initializes the app"))
-        || (err.contains("http 503 failed")
-            && err.contains("manual rescan current roots runtime-scope readiness failed")
-            && err.contains("drained/fenced")
-            && err.contains("grant attachments"))
+            || err.contains("runtime control initializes the app")
+            || err.contains("manual rescan current roots runtime-scope readiness failed")
+            || err.contains("manual rescan scoped source route pending"))
 }
 
 pub fn extract_token(login: Value) -> Result<String, String> {
@@ -912,6 +910,26 @@ mod tests {
         assert!(
             HTTP_TIMEOUT_PROJECTION >= HTTP_TIMEOUT_DEFAULT,
             "projection requests should allow at least as much time as ordinary management requests"
+        );
+    }
+
+    #[test]
+    fn management_retry_includes_manual_rescan_runtime_scope_readiness() {
+        let err = r#"http 503 failed: {"error":"manual rescan current roots runtime-scope readiness failed: roots update applied locally but peer runtime-scope second-wave convergence did not settle before followup exhausted"}"#;
+
+        assert!(
+            is_retryable_management_unavailable_error(err),
+            "manual-rescan runtime-scope readiness is a temporary convergence state and should stay in the management retry window"
+        );
+    }
+
+    #[test]
+    fn management_retry_includes_manual_rescan_scoped_source_delivery_pending() {
+        let err = r#"http 503 failed: {"error":"manual rescan scoped source route pending: manual rescan scoped source delivery pending for node node-b: operation timed out"}"#;
+
+        assert!(
+            is_retryable_management_unavailable_error(err),
+            "manual-rescan scoped source delivery pending is a temporary convergence state and should stay in the management retry window"
         );
     }
 

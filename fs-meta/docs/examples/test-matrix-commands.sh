@@ -229,7 +229,12 @@ environment_full_nfs() {
   CAPANIX_REAL_NFS_E2E=1 \
     CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
     cargo test -p fustor-specs-root --test fs_meta_api_e2e \
-      fs_meta_environment -- --ignored --nocapture --test-threads=1
+      fs_meta_environment_full_real_nfs -- --ignored --nocapture --test-threads=1
+  FSMETA_FULL_NFS_ROOTS_FILE= \
+    CAPANIX_REAL_NFS_E2E=1 \
+    CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
+    cargo test -p fustor-specs-root --test fs_meta_api_e2e \
+      fs_meta_environment_live_only_rescan_real_nfs -- --ignored --nocapture --test-threads=1
 }
 
 operations_local() {

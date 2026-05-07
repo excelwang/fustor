@@ -25,7 +25,7 @@ use crate::runtime::routes::sink_query_request_route_for;
 #[cfg(test)]
 const ENDPOINT_READY_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 const ENDPOINT_RETRY_LOG_INTERVAL: Duration = Duration::from_secs(1);
-const REQUEST_RETRYABLE_RECV_GAP_RETRY_LIMIT: usize = 12;
+pub(crate) const REQUEST_RETRYABLE_RECV_GAP_RETRY_LIMIT: usize = 12;
 const REQUEST_REPLY_SEND_RETRY_LIMIT: usize = 12;
 const REQUEST_REPLY_SEND_RETRY_DELAY: Duration = Duration::from_millis(50);
 const STREAM_STALE_RECV_GAP_RETRY_LIMIT: usize = 12;
@@ -309,6 +309,12 @@ enum EndpointReadyMode {
     FirstReceivable,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EndpointStartWait {
+    UntilReady,
+    Detached,
+}
+
 #[derive(Clone)]
 struct EndpointReadySignal {
     tx: Arc<StdMutex<Option<SyncSender<()>>>>,
@@ -326,6 +332,81 @@ impl EndpointReadySignal {
             let _ = tx.send(());
         }
     }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct EndpointReadyWaitPauseHook {
+    pub(crate) name_contains: &'static str,
+    pub(crate) entered: SyncSender<()>,
+    pub(crate) release: Arc<StdMutex<Receiver<()>>>,
+    fired: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl EndpointReadyWaitPauseHook {
+    pub(crate) fn new(
+        name_contains: &'static str,
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+    ) -> Self {
+        Self {
+            name_contains,
+            entered,
+            release: Arc::new(StdMutex::new(release)),
+            fired: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[cfg(test)]
+fn endpoint_ready_wait_pause_hook_cell() -> &'static StdMutex<Option<EndpointReadyWaitPauseHook>> {
+    static CELL: OnceLock<StdMutex<Option<EndpointReadyWaitPauseHook>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn install_endpoint_ready_wait_pause_hook(hook: EndpointReadyWaitPauseHook) {
+    let mut guard = match endpoint_ready_wait_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_endpoint_ready_wait_pause_hook() {
+    let mut guard = match endpoint_ready_wait_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+fn maybe_pause_before_endpoint_ready_wait(name: &str) {
+    let hook = {
+        let guard = match endpoint_ready_wait_pause_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    if !name.contains(hook.name_contains) {
+        return;
+    }
+    if hook.fired.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _ = hook.entered.send(());
+    let _ = hook
+        .release
+        .lock()
+        .expect("endpoint ready wait pause release lock")
+        .recv();
 }
 
 #[derive(Default)]
@@ -418,6 +499,8 @@ impl ManagedEndpointTask {
     }
 
     fn wait_until_ready(name: &str, ready_rx: Receiver<()>) {
+        #[cfg(test)]
+        maybe_pause_before_endpoint_ready_wait(name);
         match ready_rx.recv() {
             Ok(()) => {}
             Err(err) => log::warn!("endpoint task {} ready wait failed: {}", name, err),
@@ -442,6 +525,29 @@ impl ManagedEndpointTask {
             BoundaryContext::default(),
             shutdown,
             handler,
+            EndpointStartWait::UntilReady,
+        )
+    }
+
+    pub(crate) fn spawn_without_ready_wait<F, Fut>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        shutdown: CancellationToken,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+    {
+        Self::spawn_with_context(
+            boundary,
+            route,
+            name,
+            BoundaryContext::default(),
+            shutdown,
+            handler,
+            EndpointStartWait::Detached,
         )
     }
 
@@ -464,6 +570,30 @@ impl ManagedEndpointTask {
             BoundaryContext::for_unit(unit_id),
             shutdown,
             handler,
+            EndpointStartWait::UntilReady,
+        )
+    }
+
+    pub(crate) fn spawn_with_unit_without_ready_wait<F, Fut>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        unit_id: impl Into<String>,
+        shutdown: CancellationToken,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+    {
+        Self::spawn_with_context(
+            boundary,
+            route,
+            name,
+            BoundaryContext::for_unit(unit_id),
+            shutdown,
+            handler,
+            EndpointStartWait::Detached,
         )
     }
 
@@ -489,7 +619,48 @@ impl ManagedEndpointTask {
             !contexts.is_empty(),
             "spawn_with_units requires at least one endpoint recv context"
         );
-        Self::spawn_with_contexts(boundary, route, name, contexts, shutdown, handler)
+        Self::spawn_with_contexts(
+            boundary,
+            route,
+            name,
+            contexts,
+            shutdown,
+            handler,
+            EndpointStartWait::UntilReady,
+        )
+    }
+
+    pub(crate) fn spawn_with_units_without_ready_wait<F, Fut, I, S>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        unit_ids: I,
+        shutdown: CancellationToken,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let contexts: Vec<BoundaryContext> = unit_ids
+            .into_iter()
+            .map(|unit_id| BoundaryContext::for_unit(unit_id.into()))
+            .collect();
+        assert!(
+            !contexts.is_empty(),
+            "spawn_with_units_without_ready_wait requires at least one endpoint recv context"
+        );
+        Self::spawn_with_contexts(
+            boundary,
+            route,
+            name,
+            contexts,
+            shutdown,
+            handler,
+            EndpointStartWait::Detached,
+        )
     }
 
     fn spawn_with_context<F, Fut>(
@@ -499,12 +670,21 @@ impl ManagedEndpointTask {
         ctx: BoundaryContext,
         shutdown: CancellationToken,
         handler: F,
+        start_wait: EndpointStartWait,
     ) -> Self
     where
         F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
     {
-        Self::spawn_with_contexts(boundary, route, name, vec![ctx], shutdown, handler)
+        Self::spawn_with_contexts(
+            boundary,
+            route,
+            name,
+            vec![ctx],
+            shutdown,
+            handler,
+            start_wait,
+        )
     }
 
     fn spawn_with_contexts<F, Fut>(
@@ -514,6 +694,7 @@ impl ManagedEndpointTask {
         contexts: Vec<BoundaryContext>,
         shutdown: CancellationToken,
         handler: F,
+        start_wait: EndpointStartWait,
     ) -> Self
     where
         F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
@@ -527,6 +708,7 @@ impl ManagedEndpointTask {
             shutdown,
             handler,
             EndpointReadyMode::FirstRecvPoll,
+            start_wait,
         )
     }
 
@@ -550,6 +732,31 @@ impl ManagedEndpointTask {
             shutdown,
             handler,
             EndpointReadyMode::FirstReceivable,
+            EndpointStartWait::UntilReady,
+        )
+    }
+
+    pub(crate) fn spawn_with_unit_wait_receivable_without_ready_wait<F, Fut>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        unit_id: impl Into<String>,
+        shutdown: CancellationToken,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+    {
+        Self::spawn_with_contexts_and_ready_mode(
+            boundary,
+            route,
+            name,
+            vec![BoundaryContext::for_unit(unit_id)],
+            shutdown,
+            handler,
+            EndpointReadyMode::FirstReceivable,
+            EndpointStartWait::Detached,
         )
     }
 
@@ -561,6 +768,7 @@ impl ManagedEndpointTask {
         shutdown: CancellationToken,
         handler: F,
         ready_mode: EndpointReadyMode,
+        start_wait: EndpointStartWait,
     ) -> Self
     where
         F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
@@ -639,7 +847,9 @@ impl ManagedEndpointTask {
             }
         };
         let join = Self::spawn_join(runner);
-        Self::wait_until_ready(&name_owned, ready_rx);
+        if start_wait == EndpointStartWait::UntilReady {
+            Self::wait_until_ready(&name_owned, ready_rx);
+        }
 
         Self {
             name: name_owned,
@@ -1009,22 +1219,17 @@ async fn run_endpoint_loop_with_contexts_and_ready_signal<F, Fut>(
                 }
                 Ok(result) => match result {
                     Ok(events) => {
-                        receive_state.mark_receivable();
-                        if let Some(ready) = &receivable_ready {
-                            ready.signal();
-                        }
+                        mark_endpoint_receivable(&receive_state, &receivable_ready);
                         retryable_recv_gap_count = 0;
                         stale_recv_gap_count = 0;
                         events
                     }
                     Err(CnxError::Timeout) => {
-                        receive_state.mark_receivable();
-                        if let Some(ready) = &receivable_ready {
-                            ready.signal();
-                        }
+                        mark_endpoint_receivable(&receive_state, &receivable_ready);
                         continue;
                     }
                     Err(err) if is_retryable_worker_bridge_peer_error(&err) => {
+                        mark_endpoint_receivable(&receive_state, &receivable_ready);
                         stale_recv_gap_count = 0;
                         retryable_recv_gap_count = retryable_recv_gap_count.saturating_add(1);
                         if retryable_recv_gap_count >= REQUEST_RETRYABLE_RECV_GAP_RETRY_LIMIT {
@@ -1059,6 +1264,7 @@ async fn run_endpoint_loop_with_contexts_and_ready_signal<F, Fut>(
                             }
                             continue;
                         }
+                        mark_endpoint_receivable(&receive_state, &receivable_ready);
                         if debug_materialized_route {
                             eprintln!(
                                 "fs_meta_runtime_endpoint: materialized_route recv_retry route={} task={} err={}",
@@ -1082,6 +1288,7 @@ async fn run_endpoint_loop_with_contexts_and_ready_signal<F, Fut>(
                             request_channel.clone(),
                         )
                         .await;
+                        mark_endpoint_receivable(&receive_state, &receivable_ready);
                         log::debug!(
                             "endpoint task {} recv retry for {} after stale grant-attachment gap: {:?}",
                             join_name,
@@ -1245,6 +1452,16 @@ async fn run_endpoint_loop_with_contexts_and_ready_signal<F, Fut>(
             "fs_meta_runtime_endpoint: materialized_route loop_exit route={} task={} reason={}",
             route.0, join_name, final_reason
         );
+    }
+}
+
+fn mark_endpoint_receivable(
+    receive_state: &Arc<EndpointReceiveState>,
+    receivable_ready: &Option<EndpointReadySignal>,
+) {
+    receive_state.mark_receivable();
+    if let Some(ready) = receivable_ready {
+        ready.signal();
     }
 }
 
@@ -1598,6 +1815,11 @@ mod tests {
         close_keys: Mutex<Vec<String>>,
     }
 
+    struct StaleThenClosedBoundary {
+        recv_attempts: AtomicUsize,
+        close_keys: Mutex<Vec<String>>,
+    }
+
     struct IdleTimeoutBoundary {
         recv_attempts: AtomicUsize,
         last_timeout_ms: AtomicUsize,
@@ -1711,6 +1933,15 @@ mod tests {
     }
 
     impl PersistentStaleGrantAttachmentBoundary {
+        fn new() -> Self {
+            Self {
+                recv_attempts: AtomicUsize::new(0),
+                close_keys: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl StaleThenClosedBoundary {
         fn new() -> Self {
             Self {
                 recv_attempts: AtomicUsize::new(0),
@@ -1956,6 +2187,35 @@ mod tests {
             Err(CnxError::AccessDenied(
                 "pid Pid(1) is drained/fenced and cannot obtain new grant attachments".into(),
             ))
+        }
+
+        fn channel_close(
+            &self,
+            _ctx: BoundaryContext,
+            channel: ChannelKey,
+        ) -> capanix_app_sdk::Result<()> {
+            self.close_keys
+                .lock()
+                .expect("close_keys lock")
+                .push(channel.0);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for StaleThenClosedBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            _request: ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            let attempt = self.recv_attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Err(CnxError::AccessDenied(
+                    "pid Pid(1) is drained/fenced and cannot obtain new grant attachments".into(),
+                ));
+            }
+            Err(CnxError::ChannelClosed)
         }
 
         fn channel_close(
@@ -2547,7 +2807,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_receivable_ready_wait_does_not_return_on_stale_grant_gap() {
+    fn endpoint_receivable_ready_returns_after_closing_stale_grant_gap() {
         let boundary = Arc::new(RecordingBoundary {
             recv_keys: Mutex::new(Vec::new()),
             recv_unit_ids: Mutex::new(Vec::new()),
@@ -2564,9 +2824,10 @@ mod tests {
         );
 
         let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
-        assert!(
-            recv_keys.len() >= 2,
-            "receivable-ready spawn must wait through stale grant gaps until a recv can arm; recv_keys={recv_keys:?}"
+        assert_eq!(
+            recv_keys,
+            vec!["source-manual-rescan.node_a:v1.req".to_string()],
+            "receivable-ready spawn may return after the endpoint closes a stale request route because a later rearm request can reopen it"
         );
         let close_keys = boundary.close_keys.lock().expect("close_keys lock").clone();
         assert_eq!(
@@ -2577,6 +2838,48 @@ mod tests {
 
         crate::runtime_app::shared_tokio_runtime()
             .block_on(endpoint.shutdown(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn endpoint_receivable_ready_returns_after_stale_gap_before_rearm_request() {
+        let boundary = Arc::new(StaleThenClosedBoundary::new());
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let boundary_for_spawn = boundary.clone();
+        let spawn_thread = std::thread::spawn(move || {
+            let endpoint = ManagedEndpointTask::spawn_with_unit_wait_receivable(
+                boundary_for_spawn,
+                RouteKey("source-manual-rescan.node_a:v1.req".into()),
+                "source:source-manual-rescan.node_a:v1.req",
+                "runtime.exec.source",
+                CancellationToken::new(),
+                |_events: Vec<Event>| std::future::ready(Vec::new()),
+            );
+            let _ = ready_tx.send(endpoint);
+        });
+
+        let mut endpoint = ready_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("receivable-ready spawn must not block behind stale-then-closed recv gaps");
+        assert!(
+            boundary.recv_attempts.load(Ordering::SeqCst) >= 1,
+            "spawn should reach the scoped source-rescan recv lane before reporting readiness"
+        );
+        assert_eq!(
+            boundary
+                .close_keys
+                .lock()
+                .expect("close_keys lock")
+                .first()
+                .map(String::as_str),
+            Some("source-manual-rescan.node_a:v1.req"),
+            "stale request route should still be closed before the rearm request reopens it"
+        );
+
+        crate::runtime_app::shared_tokio_runtime()
+            .block_on(endpoint.shutdown(Duration::from_secs(1)));
+        spawn_thread
+            .join()
+            .expect("spawn thread should finish after endpoint handoff");
     }
 
     #[test]

@@ -432,7 +432,6 @@ fn api_request_route_policy(method: &Method, path: &str) -> ApiRequestRoutePolic
         counts_toward_facade_request_drain: matches!(
             (method, path),
             (&Method::POST, "/api/fs-meta/v1/session/login")
-                | (&Method::GET, "/api/fs-meta/v1/status")
                 | (&Method::GET, "/api/fs-meta/v1/runtime/grants")
                 | (&Method::GET, "/api/fs-meta/v1/monitoring/roots")
                 | (&Method::PUT, "/api/fs-meta/v1/monitoring/roots")
@@ -495,22 +494,13 @@ async fn request_control_readiness_guard(
     }
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     if let Some(recovery) = readiness_gate.recovery(&control_gate) {
-        let recovery_budget = ready_deadline
-            .saturating_duration_since(tokio::time::Instant::now())
-            .min(Duration::from_secs(10));
-        if !recovery_budget.is_zero() {
-            match tokio::time::timeout(recovery_budget, recovery()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    eprintln!(
-                        "fs_meta_api_server: management write readiness recovery failed err={err}"
-                    );
-                }
-                Err(_) => {
-                    eprintln!("fs_meta_api_server: management write readiness recovery timed out");
-                }
+        tokio::spawn(async move {
+            if let Err(err) = recovery().await {
+                eprintln!(
+                    "fs_meta_api_server: management write readiness recovery failed err={err}"
+                );
             }
-        }
+        });
     }
     let remaining = ready_deadline.saturating_duration_since(tokio::time::Instant::now());
     if !readiness_gate.is_ready(&control_gate)
@@ -789,7 +779,6 @@ mod tests {
     fn projection_requests_count_toward_facade_request_drain() {
         for (method, path) in [
             (Method::POST, "/api/fs-meta/v1/session/login"),
-            (Method::GET, "/api/fs-meta/v1/status"),
             (Method::GET, "/api/fs-meta/v1/runtime/grants"),
             (Method::GET, "/api/fs-meta/v1/monitoring/roots"),
             (Method::PUT, "/api/fs-meta/v1/monitoring/roots"),
@@ -809,12 +798,27 @@ mod tests {
             );
         }
 
-        for (method, path) in [(Method::OPTIONS, "/healthz")] {
+        for (method, path) in [
+            (Method::GET, "/api/fs-meta/v1/status"),
+            (Method::OPTIONS, "/healthz"),
+        ] {
             assert!(
                 !api_request_route_policy(&method, path).counts_toward_facade_request_drain,
                 "{method} {path} should not count toward facade request drain"
             );
         }
+    }
+
+    #[test]
+    fn status_observation_does_not_hold_facade_request_drain() {
+        assert_eq!(
+            api_request_route_policy(&Method::GET, "/api/fs-meta/v1/status"),
+            ApiRequestRoutePolicy {
+                management_readiness_gate: None,
+                counts_toward_control_drain: false,
+                counts_toward_facade_request_drain: false,
+            }
+        );
     }
 
     #[test]
@@ -1165,6 +1169,109 @@ mod tests {
             handler_calls.load(Ordering::SeqCst),
             1,
             "rescan handler must run after source-repair recovery reopens the gate"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rescan_control_readiness_guard_keeps_source_repair_recovery_running_after_request_timeout()
+     {
+        tokio::time::pause();
+
+        let control_gate = Arc::new(ApiControlGate::new(false));
+        let recovery_calls = Arc::new(AtomicUsize::new(0));
+        let recovery_completions = Arc::new(AtomicUsize::new(0));
+        let release_recovery = Arc::new(Notify::new());
+        control_gate.set_source_repair_recovery(Some(Arc::new({
+            let control_gate = control_gate.clone();
+            let recovery_calls = recovery_calls.clone();
+            let recovery_completions = recovery_completions.clone();
+            let release_recovery = release_recovery.clone();
+            move || {
+                let control_gate = control_gate.clone();
+                let recovery_calls = recovery_calls.clone();
+                let recovery_completions = recovery_completions.clone();
+                let release_recovery = release_recovery.clone();
+                Box::pin(async move {
+                    recovery_calls.fetch_add(1, Ordering::SeqCst);
+                    release_recovery.notified().await;
+                    recovery_completions.fetch_add(1, Ordering::SeqCst);
+                    control_gate.set_ready_state_with_source_repair(true, false, true);
+                    Ok(())
+                })
+            }
+        })));
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/fs-meta/v1/index/rescan",
+                post({
+                    let handler_calls = handler_calls.clone();
+                    move || {
+                        let handler_calls = handler_calls.clone();
+                        async move {
+                            handler_calls.fetch_add(1, Ordering::SeqCst);
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .with_state(control_gate.clone())
+            .layer(middleware::from_fn_with_state(
+                control_gate.clone(),
+                request_control_readiness_guard,
+            ));
+
+        let response_task = tokio::spawn(
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/fs-meta/v1/index/rescan")
+                    .body(Body::empty())
+                    .expect("build rescan request"),
+            ),
+        );
+        while recovery_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            recovery_calls.load(Ordering::SeqCst),
+            1,
+            "source-repair recovery should start when the rescan gate is closed"
+        );
+
+        tokio::time::advance(Duration::from_secs(16)).await;
+        tokio::task::yield_now().await;
+        let response = response_task
+            .await
+            .expect("join timed-out rescan request")
+            .expect("route timed-out rescan request");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            handler_calls.load(Ordering::SeqCst),
+            0,
+            "timed-out rescan must not enter the handler before source repair is ready"
+        );
+        assert_eq!(
+            recovery_completions.load(Ordering::SeqCst),
+            0,
+            "precondition: source-repair recovery is still waiting when the request times out"
+        );
+
+        release_recovery.notify_waiters();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            recovery_completions.load(Ordering::SeqCst),
+            1,
+            "request timeout must not cancel the service-level source-repair recovery"
+        );
+        assert!(
+            control_gate.is_source_repair_ready(),
+            "background source repair should be able to reopen the rescan plane after the caller timed out"
         );
     }
 

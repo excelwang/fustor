@@ -490,6 +490,18 @@ fn plan_worker_request(
                 false,
             ),
         },
+        SinkWorkerRequest::LogicalRootsGenerationSnapshot => match state.sink.as_ref() {
+            Some(sink) => SinkWorkerAction::Immediate(
+                SinkWorkerResponse::LogicalRootsGeneration(
+                    sink.current_logical_roots_generation(),
+                ),
+                false,
+            ),
+            None => SinkWorkerAction::Immediate(
+                SinkWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
         SinkWorkerRequest::ScheduledGroupIds => match state.sink.as_ref() {
             Some(sink) => match sink.scheduled_group_ids_snapshot_with_failure() {
                 Ok(groups) => SinkWorkerAction::Immediate(

@@ -131,11 +131,13 @@ QueryObservationState =
    1. `FacadeServiceState=serving|degraded`
    2. the target group remains inside current service scope (`GroupServiceState` is not `not-selected` or `retired`)
    3. `QueryObservationState=trusted-materialized`
-6. When `QueryObservationState=materialized-untrusted`, `read_class=materialized` MAY answer and `read_class=trusted-materialized` MUST fail closed with explicit not-ready semantics.
-7. Availability ordering is a product contract, not an implementation accident:
+6. `QueryObservationState=trusted-materialized` requires the covered sink/source groups to have ready materialization and no current service-readiness blockers: pending materialization, overflow-pending materialization, or explicit source degradation keep the state `materialized-untrusted`.
+7. Per-node reliability gaps such as unattested nodes, blind spots, or suspect nodes are query-result reliability evidence. They are surfaced through `groups[].reliable=false` and `unreliable_reason`; they MUST NOT by themselves close the trusted-materialized service gate because audit cost depends on file count and environment behavior.
+8. When `QueryObservationState=materialized-untrusted`, `read_class=materialized` MAY answer and `read_class=trusted-materialized` MUST fail closed with explicit not-ready semantics.
+9. Availability ordering is a product contract, not an implementation accident:
    1. `/on-demand-force-find` availability window MUST be a superset of materialized `/tree` and `/stats` availability
    2. materialized `/tree` and `/stats` availability MUST be a superset of trusted-materialized `/tree` and `/stats` availability
-8. Internal replay, retained, tick-fast-path, bridge-reset, or cache-fallback diagnostics MAY explain why a request is unavailable, but they MUST NOT define a competing service-level availability window outside the rules above.
+10. Internal replay, retained, tick-fast-path, bridge-reset, or cache-fallback diagnostics MAY explain why a request is unavailable, but they MUST NOT define a competing service-level availability window outside the rules above.
 
 ## [decision] ReadinessPlaneSeparation
 

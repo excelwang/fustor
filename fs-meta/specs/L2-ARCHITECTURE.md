@@ -105,6 +105,7 @@ version: 3.0.0
    4. newly activated generation rebuilds in-memory observation state through baseline scan/audit/rescan rather than expecting durable tree carry-over.
    5. observation-eligibility path evaluates whether rebuilt observation has caught up far enough to be trusted as the current external result source.
    6. trusted external exposure remains on the previous eligible generation or explicit degraded observation state until the candidate reaches app-owned `observation_eligible`.
+   7. runtime-managed source/sink endpoints are current-boundary resources: after a generation or boundary replacement, an endpoint on a stale boundary MAY drain or shut down, but it MUST NOT suppress endpoint creation on the current boundary for the same route key.
 
 ## ARCHITECTURE.OWNERSHIP
 

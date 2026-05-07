@@ -17,8 +17,9 @@ use fs_meta::product_model::routes::{
     ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_KEY_SOURCE_FIND_INTERNAL,
     ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
     ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, sink_query_request_route_for,
-    sink_query_route_key_for, sink_roots_control_route_key_for, source_find_request_route_for,
-    source_find_route_key_for, source_rescan_request_route_for, source_rescan_route_key_for,
+    sink_query_route_key_for, sink_roots_control_route_key_for, sink_status_request_route_for,
+    sink_status_route_key_for, source_find_request_route_for, source_find_route_key_for,
+    source_rescan_request_route_for, source_rescan_route_key_for,
     source_roots_control_route_key_for, source_status_request_route_for,
     source_status_route_key_for,
 };
@@ -309,6 +310,19 @@ fn ensure_scoped_internal_request_reply_ports(
                 ROUTE_KEY_SOURCE_STATUS_INTERNAL
             ))
         })?;
+    let sink_status_template = ports
+        .iter()
+        .find(|port| {
+            port.get("route_key").and_then(serde_yaml::Value::as_str)
+                == Some(ROUTE_KEY_SINK_STATUS_INTERNAL)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            CnxError::InvalidInput(format!(
+                "fs-meta startup manifest missing internal sink-status port {}",
+                ROUTE_KEY_SINK_STATUS_INTERNAL
+            ))
+        })?;
     let source_roots_control_template = ports
         .iter()
         .find(|port| {
@@ -359,6 +373,10 @@ fn ensure_scoped_internal_request_reply_ports(
                 source_status_template.clone(),
             ),
             (
+                sink_status_route_key_for(&node_id),
+                sink_status_template.clone(),
+            ),
+            (
                 source_roots_control_route_key_for(&node_id),
                 source_roots_control_template.clone(),
             ),
@@ -383,6 +401,7 @@ fn ensure_scoped_internal_request_reply_ports(
                         | ROUTE_KEY_SOURCE_FIND_INTERNAL
                         | ROUTE_KEY_SOURCE_RESCAN_INTERNAL
                         | ROUTE_KEY_SOURCE_STATUS_INTERNAL
+                        | ROUTE_KEY_SINK_STATUS_INTERNAL
                         | ROUTE_KEY_SOURCE_ROOTS_CONTROL
                         | ROUTE_KEY_SINK_ROOTS_CONTROL
                 )
@@ -626,6 +645,15 @@ fn build_route_plans_json(_spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
             RouteKey(format!("{}:reply", sink_query_route.0)),
             all_route_plan_peers.clone(),
         ));
+        let sink_status_route = sink_status_request_route_for(&node_id);
+        plans.push(route_plan_json(
+            sink_status_route.clone(),
+            vec![route_plan_peer_for_node_id(&node_id)],
+        ));
+        plans.push(route_plan_json(
+            RouteKey(format!("{}:reply", sink_status_route.0)),
+            all_route_plan_peers.clone(),
+        ));
     }
     plans.push(route_plan_json(
         RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)),
@@ -678,7 +706,7 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SOURCE_FIND_INTERNAL),
-        serde_json::json!([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
+        serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
     );
     for node_id in spec
         .route_plan_node_ids
@@ -688,7 +716,7 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
     {
         route_units.insert(
             source_find_request_route_for(&node_id).0,
-            serde_json::json!([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
+            serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
         );
         route_units.insert(
             source_rescan_request_route_for(&node_id).0,
@@ -741,6 +769,10 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
             sink_query_request_route_for(&node_id).0,
             serde_json::json!([SINK_RUNTIME_UNIT_ID]),
         );
+        route_units.insert(
+            sink_status_request_route_for(&node_id).0,
+            serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+        );
     }
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SINK_QUERY_PROXY),
@@ -748,7 +780,7 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SINK_STATUS_INTERNAL),
-        serde_json::json!([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
+        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SOURCE_STATUS_INTERNAL),
@@ -869,7 +901,7 @@ fn root_spec_release_json(root: &RootSpec) -> serde_json::Value {
 fn root_spec_app_scope_json(root: &RootSpec) -> serde_json::Value {
     let mut unit_scopes = vec![serde_json::json!({
         "unit_id": "runtime.exec.sink",
-        "eligibility": "scope_members",
+        "eligibility": "resource_visible_nodes",
         "cardinality": "one"
     })];
     if root.watch || root.scan {
@@ -935,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn watched_roots_bind_one_sink_owner_from_scope_members() {
+    fn watched_roots_bind_one_sink_owner_from_resource_visible_nodes() {
         let scope = root_spec_app_scope_json(&RootSpec::new("nfs1", "/mnt/nfs1"));
         let unit_scopes = scope
             .get("unit_scopes")
@@ -947,8 +979,8 @@ mod tests {
             .expect("sink unit scope");
         assert_eq!(
             sink.get("eligibility"),
-            Some(&serde_json::json!("scope_members")),
-            "sink materialization owner should be selected from the monitoring group members"
+            Some(&serde_json::json!("resource_visible_nodes")),
+            "sink materialization owner should be selected from resource visibility so one-cardinality ownership is global, not local-only"
         );
         assert_eq!(
             sink.get("cardinality"),
@@ -1234,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn route_units_assign_sink_status_to_query_facades() {
+    fn route_units_assign_sink_status_to_sink_runtime_owner() {
         let spec = FsMetaReleaseSpec {
             app_id: "test-app".to_string(),
             api_facade_resource_id: "listener".to_string(),
@@ -1261,8 +1293,8 @@ mod tests {
 
         assert_eq!(
             unit_ids,
-            std::collections::BTreeSet::from([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
-            "sink-status route ownership must stay with query/query-peer facade units, not the sink runtime unit"
+            std::collections::BTreeSet::from([SINK_RUNTIME_UNIT_ID]),
+            "sink-status readiness evidence must be published by the sink runtime owner, not by query/query-peer local facade units"
         );
     }
 
@@ -1360,11 +1392,49 @@ mod tests {
             let scoped_units = route_units_map
                 .get(&expected_route)
                 .and_then(serde_json::Value::as_array);
-            assert!(
-                scoped_units.is_some(),
-                "release route_units must include owner-scoped internal source-find route {expected_route} when runtime node ids are known"
+            let units = scoped_units
+                .unwrap_or_else(|| panic!("release route_units must include owner-scoped internal source-find route {expected_route} when runtime node ids are known"))
+                .iter()
+                .map(|unit| unit.as_str().expect("route unit string"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                units,
+                vec![SOURCE_RUNTIME_UNIT_ID],
+                "source-find executes fresh source scans, so scoped source-find routes must be owned by source runtime units"
             );
         }
+    }
+
+    #[test]
+    fn route_units_place_generic_internal_source_find_on_source_runtime() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec!["node-a-123456789".to_string()],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let route_units = release_doc["units"][0]["runtime"]["route_units"]
+            .as_object()
+            .expect("route_units object");
+        let route_key = request_reply_activation_route_key(ROUTE_KEY_SOURCE_FIND_INTERNAL);
+        let units = route_units
+            .get(&route_key)
+            .and_then(serde_json::Value::as_array)
+            .expect("generic source-find route units")
+            .iter()
+            .map(|unit| unit.as_str().expect("route unit string"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            units,
+            vec![SOURCE_RUNTIME_UNIT_ID],
+            "generic source-find route must target source runtime units instead of query/query-peer proxy units"
+        );
     }
 
     #[test]
@@ -2264,6 +2334,139 @@ mod tests {
             }),
             "non-empty roots release must not add the empty-roots bootstrap scope",
         );
+    }
+
+    #[test]
+    fn route_plans_include_owner_scoped_internal_sink_status_for_known_nodes() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let plans = build_route_plans_json(&spec);
+        for expected_route in spec
+            .route_plan_node_ids
+            .iter()
+            .map(|node_id| sink_status_request_route_for(node_id).0)
+        {
+            let has_request_route = plans.iter().any(|plan| {
+                plan.get("route_key").and_then(serde_json::Value::as_str)
+                    == Some(expected_route.as_str())
+            });
+            let reply_route = format!("{expected_route}:reply");
+            let has_reply_route = plans.iter().any(|plan| {
+                plan.get("route_key").and_then(serde_json::Value::as_str)
+                    == Some(reply_route.as_str())
+            });
+            assert!(
+                has_request_route && has_reply_route,
+                "release route_plans must include owner-scoped sink-status request/reply route {expected_route}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_units_include_owner_scoped_internal_sink_status_for_known_nodes() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let route_units = release_doc["units"][0]["runtime"]["route_units"]
+            .as_object()
+            .expect("route_units object");
+        for expected_route in spec
+            .route_plan_node_ids
+            .iter()
+            .map(|node_id| sink_status_request_route_for(node_id).0)
+        {
+            let units = route_units
+                .get(&expected_route)
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| {
+                    panic!("release route_units must include owner-scoped sink-status route {expected_route}")
+                })
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                units,
+                std::collections::BTreeSet::from([SINK_RUNTIME_UNIT_ID]),
+                "owner-scoped sink-status route must be published by the sink runtime owner"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_manifest_scoped_sink_status_ports_use_distinct_use_port_identity() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec![
+                "node-a-123456789".to_string(),
+                "node-b-987654321".to_string(),
+            ],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let manifest_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/manifests/fs-meta.yaml");
+        let manifest =
+            build_startup_manifest_value(&manifest_path, &spec).expect("load startup manifest");
+        let ports = manifest
+            .get("ports")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("ports sequence");
+
+        let generic_use_port = ports
+            .iter()
+            .find(|port| {
+                port.get("route_key").and_then(serde_yaml::Value::as_str)
+                    == Some(ROUTE_KEY_SINK_STATUS_INTERNAL)
+            })
+            .and_then(|port| port.get("use_port"))
+            .and_then(serde_yaml::Value::as_str)
+            .expect("generic sink status use_port");
+
+        for node_id in &spec.route_plan_node_ids {
+            let scoped_use_port = ports
+                .iter()
+                .find(|port| {
+                    port.get("route_key").and_then(serde_yaml::Value::as_str)
+                        == Some(sink_status_route_key_for(node_id).as_str())
+                })
+                .and_then(|port| port.get("use_port"))
+                .and_then(serde_yaml::Value::as_str)
+                .expect("scoped sink status use_port");
+            assert_ne!(
+                scoped_use_port, generic_use_port,
+                "scoped sink-status ports must not reuse the generic use_port identity"
+            );
+            assert!(
+                scoped_use_port.contains("node_"),
+                "scoped sink-status use_port should remain node-distinct for runtime attach identity: {scoped_use_port}"
+            );
+        }
     }
 
     #[test]

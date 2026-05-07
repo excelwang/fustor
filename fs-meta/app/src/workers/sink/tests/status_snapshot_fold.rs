@@ -477,8 +477,8 @@ fn snapshot_looks_stale_empty_prefers_exported_readiness_over_legacy_initial_aud
 }
 
 #[test]
-fn republish_scheduled_groups_into_zero_row_summary_prefers_exported_readiness_over_legacy_initial_audit_bool()
- {
+fn republish_scheduled_group_ids_into_status_summary_preserves_exported_group_rows()
+{
     let mut snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs1".to_string(),
@@ -500,7 +500,7 @@ fn republish_scheduled_groups_into_zero_row_summary_prefers_exported_readiness_o
         ..SinkStatusSnapshot::default()
     };
 
-    republish_scheduled_groups_into_zero_row_summary(
+    republish_scheduled_group_ids_into_status_summary(
         &mut snapshot,
         &NodeId("node-b".to_string()),
         &std::collections::BTreeSet::from(["nfs1".to_string()]),
@@ -509,13 +509,13 @@ fn republish_scheduled_groups_into_zero_row_summary_prefers_exported_readiness_o
     assert_eq!(
         snapshot.scheduled_groups_by_node,
         std::collections::BTreeMap::from([("node-b".to_string(), vec!["nfs1".to_string()])]),
-        "zero-row republish must trust exported readiness over stale initial_audit_completed=true"
+        "scheduled-group republish must preserve exported group rows and only add the schedule map"
     );
 }
 
 #[test]
-fn republish_scheduled_groups_into_zero_row_summary_republishes_when_live_rows_cover_cached_schedule()
- {
+fn republish_scheduled_group_ids_into_status_summary_republishes_when_live_rows_cover_cached_schedule()
+{
     let mut snapshot = SinkStatusSnapshot {
         groups: vec![
             crate::sink::SinkGroupStatusSnapshot {
@@ -554,7 +554,7 @@ fn republish_scheduled_groups_into_zero_row_summary_republishes_when_live_rows_c
         ..SinkStatusSnapshot::default()
     };
 
-    republish_scheduled_groups_into_zero_row_summary(
+    republish_scheduled_group_ids_into_status_summary(
         &mut snapshot,
         &NodeId("node-b".to_string()),
         &std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
@@ -571,7 +571,7 @@ fn republish_scheduled_groups_into_zero_row_summary_republishes_when_live_rows_c
 }
 
 #[test]
-fn republish_scheduled_groups_into_zero_row_summary_does_not_materialize_rows_from_schedule_only()
+fn republish_scheduled_group_ids_into_status_summary_does_not_materialize_rows_from_schedule_only()
 {
     let mut snapshot = SinkStatusSnapshot {
         scheduled_groups_by_node: std::collections::BTreeMap::from([(
@@ -581,7 +581,7 @@ fn republish_scheduled_groups_into_zero_row_summary_does_not_materialize_rows_fr
         ..SinkStatusSnapshot::default()
     };
 
-    republish_scheduled_groups_into_zero_row_summary(
+    republish_scheduled_group_ids_into_status_summary(
         &mut snapshot,
         &NodeId("node-b".to_string()),
         &std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
@@ -602,7 +602,7 @@ fn republish_scheduled_groups_into_zero_row_summary_does_not_materialize_rows_fr
 }
 
 #[test]
-fn republish_scheduled_groups_into_zero_row_summary_updates_this_node_without_dropping_other_nodes()
+fn republish_scheduled_group_ids_into_status_summary_updates_this_node_without_dropping_other_nodes()
 {
     let mut snapshot = SinkStatusSnapshot {
         scheduled_groups_by_node: std::collections::BTreeMap::from([(
@@ -612,7 +612,7 @@ fn republish_scheduled_groups_into_zero_row_summary_updates_this_node_without_dr
         ..SinkStatusSnapshot::default()
     };
 
-    republish_scheduled_groups_into_zero_row_summary(
+    republish_scheduled_group_ids_into_status_summary(
         &mut snapshot,
         &NodeId("node-b".to_string()),
         &std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),

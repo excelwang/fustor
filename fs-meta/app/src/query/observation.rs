@@ -39,7 +39,28 @@ fn sink_group_has_materialized_presence(group: &crate::sink::SinkGroupStatusSnap
 fn sink_group_blocks_materialized_observation(
     group: &crate::sink::SinkGroupStatusSnapshot,
 ) -> bool {
-    !matches!(group.readiness, crate::sink::GroupReadinessState::Ready)
+    !matches!(
+        group.normalized_readiness(),
+        crate::sink::GroupReadinessState::Ready
+    )
+}
+
+fn source_logical_root_degrades_materialized_observation(
+    root: &crate::source::SourceLogicalRootHealthSnapshot,
+) -> bool {
+    if root.matched_grants == 0 || root.active_members == 0 {
+        return false;
+    }
+    let status_head = root
+        .status
+        .split_once(':')
+        .map(|(head, _)| head)
+        .unwrap_or(root.status.as_str());
+    status_head != "ready"
+        && (root.status.contains("degraded")
+            || root.status.contains("error")
+            || root.status.contains("failed")
+            || root.status.contains("overflow"))
 }
 
 pub fn materialized_query_observation_evidence(
@@ -80,11 +101,18 @@ pub fn materialized_query_observation_evidence(
         }
     }
 
-    let degraded_groups = source_status
+    let mut degraded_groups = source_status
         .degraded_roots
         .iter()
         .map(|(root_id, _)| root_id.clone())
         .collect::<BTreeSet<_>>();
+    degraded_groups.extend(
+        source_status
+            .logical_roots
+            .iter()
+            .filter(|root| source_logical_root_degrades_materialized_observation(root))
+            .map(|root| root.root_id.clone()),
+    );
 
     let mut initial_audit_groups = BTreeSet::new();
     let mut overflow_pending_groups = BTreeSet::new();
@@ -119,11 +147,21 @@ pub fn candidate_group_observation_evidence(
         .iter()
         .map(|group| (group.group_id.as_str(), group))
         .collect::<BTreeMap<_, _>>();
-    let degraded_groups = source_status
+    let mut degraded_groups = source_status
         .degraded_roots
         .iter()
         .map(|(root_id, _)| root_id.clone())
         .collect::<BTreeSet<_>>();
+    degraded_groups.extend(
+        source_status
+            .logical_roots
+            .iter()
+            .filter(|root| {
+                candidate_groups.contains(&root.root_id)
+                    && source_logical_root_degrades_materialized_observation(root)
+            })
+            .map(|root| root.root_id.clone()),
+    );
     let scheduled_groups = sink_status
         .scheduled_groups_by_node
         .values()
@@ -176,6 +214,7 @@ mod tests {
     use super::*;
     use crate::sink::SinkGroupStatusSnapshot;
     use crate::source::{SourceConcreteRootHealthSnapshot, SourceLogicalRootHealthSnapshot};
+    use capanix_managed_state_sdk::ObservationState;
 
     fn concrete_root(
         logical_root_id: &str,
@@ -243,6 +282,87 @@ mod tests {
             materialized_revision: 1,
             estimated_heap_bytes: 0,
         }
+    }
+
+    fn ready_sink_group(group_id: &str) -> SinkGroupStatusSnapshot {
+        SinkGroupStatusSnapshot {
+            group_id: group_id.to_string(),
+            primary_object_ref: format!("node-a::{group_id}"),
+            total_nodes: 10,
+            live_nodes: 10,
+            tombstoned_count: 0,
+            attested_count: 10,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 1,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 1,
+            estimated_heap_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn materialized_query_observation_evidence_keeps_ready_sink_group_with_unattested_nodes_available()
+     {
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            }],
+            concrete_roots: vec![concrete_root("nfs1", true)],
+            ..SourceStatusSnapshot::default()
+        };
+        let mut group = ready_sink_group("nfs1");
+        group.attested_count = 9;
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![group],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let evidence = materialized_query_observation_evidence(&source_status, &sink_status);
+        assert_eq!(evidence.candidate_groups, BTreeSet::from(["nfs1".to_string()]));
+        assert!(evidence.degraded_groups.is_empty());
+        let status = evaluate_observation_status(
+            &evidence,
+            ObservationTrustPolicy::materialized_query(),
+        );
+        assert_eq!(status.state, ObservationState::TrustedMaterialized);
+    }
+
+    #[test]
+    fn materialized_query_observation_evidence_keeps_ready_sink_group_with_blind_spots_available()
+     {
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            }],
+            concrete_roots: vec![concrete_root("nfs1", true)],
+            ..SourceStatusSnapshot::default()
+        };
+        let mut group = ready_sink_group("nfs1");
+        group.blind_spot_count = 1;
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![group],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let evidence = materialized_query_observation_evidence(&source_status, &sink_status);
+        assert_eq!(evidence.candidate_groups, BTreeSet::from(["nfs1".to_string()]));
+        assert!(evidence.degraded_groups.is_empty());
+        let status = evaluate_observation_status(
+            &evidence,
+            ObservationTrustPolicy::materialized_query(),
+        );
+        assert_eq!(status.state, ObservationState::TrustedMaterialized);
     }
 
     #[test]
@@ -511,6 +631,50 @@ mod tests {
     }
 
     #[test]
+    fn materialized_query_observation_evidence_uses_normalized_sink_readiness() {
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            }],
+            concrete_roots: vec![concrete_root("nfs1", true)],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![SinkGroupStatusSnapshot {
+                group_id: "nfs1".to_string(),
+                primary_object_ref: "node-a::nfs1".to_string(),
+                total_nodes: 3,
+                live_nodes: 3,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 10,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
+                materialized_revision: 7,
+                estimated_heap_bytes: 0,
+            }],
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..SinkStatusSnapshot::default()
+        };
+
+        let evidence = materialized_query_observation_evidence(&source_status, &sink_status);
+        assert!(
+            evidence.initial_audit_groups.is_empty(),
+            "query observation must use normalized sink readiness so live materialized groups are not downgraded to initial-audit blockers: {evidence:?}"
+        );
+    }
+
+    #[test]
     fn candidate_group_observation_evidence_prefers_exported_readiness_over_legacy_initial_audit_bool()
      {
         let source_status = SourceStatusSnapshot {
@@ -544,6 +708,45 @@ mod tests {
         assert!(
             evidence.initial_audit_groups.is_empty(),
             "candidate-group observation must trust exported sink readiness over stale legacy initial_audit_completed=false: {evidence:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_group_observation_evidence_uses_normalized_sink_readiness() {
+        let source_status = SourceStatusSnapshot {
+            concrete_roots: vec![concrete_root("nfs1", true)],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![SinkGroupStatusSnapshot {
+                group_id: "nfs1".to_string(),
+                primary_object_ref: "node-a::nfs1".to_string(),
+                total_nodes: 3,
+                live_nodes: 3,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 10,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::WaitingForMaterializedRoot,
+                materialized_revision: 7,
+                estimated_heap_bytes: 0,
+            }],
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..SinkStatusSnapshot::default()
+        };
+        let candidate_groups = BTreeSet::from(["nfs1".to_string()]);
+
+        let evidence =
+            candidate_group_observation_evidence(&source_status, &sink_status, &candidate_groups);
+        assert!(
+            evidence.initial_audit_groups.is_empty(),
+            "candidate-group observation must use normalized sink readiness so live materialized groups are not downgraded to initial-audit blockers: {evidence:?}"
         );
     }
 }

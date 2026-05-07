@@ -14,6 +14,7 @@ use crate::workers::source::SourceObservabilitySnapshot;
 pub enum SourceWorkerRequest {
     UpdateLogicalRoots { roots: Vec<RootSpec> },
     LogicalRootsSnapshot,
+    LogicalRootsGenerationSnapshot,
     HostObjectGrantsSnapshot,
     HostObjectGrantsVersionSnapshot,
     StatusSnapshot,
@@ -31,6 +32,7 @@ pub enum SourceWorkerRequest {
     ResolveGroupIdForObjectRef { object_ref: String },
     PublishManualRescanSignal,
     SubmitRescanRequestEpoch,
+    SubmitTargetedRescanRequestEpoch,
     TriggerRescanWhenReadyEpoch,
     TriggerTargetedRescanWhenReadyEpoch,
     CheckTargetedRescanDeliveryAcceptance,
@@ -42,6 +44,7 @@ pub enum SourceWorkerRequest {
 pub enum SourceWorkerResponse {
     Ack,
     LogicalRoots(Vec<RootSpec>),
+    LogicalRootsGeneration(u64),
     HostObjectGrants(Vec<GrantedMountRoot>),
     HostObjectGrantsVersion(u64),
     StatusSnapshot(SourceStatusSnapshot),

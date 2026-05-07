@@ -102,6 +102,14 @@ pub fn sink_query_request_route_for(node_id: &str) -> RouteKey {
     request_reply_route_key(&sink_query_route_key_for(node_id))
 }
 
+pub fn sink_status_route_key_for(node_id: &str) -> String {
+    scoped_internal_route_key(ROUTE_KEY_SINK_STATUS_INTERNAL, node_id)
+}
+
+pub fn sink_status_request_route_for(node_id: &str) -> RouteKey {
+    request_reply_route_key(&sink_status_route_key_for(node_id))
+}
+
 pub fn sink_roots_control_route_key_for(node_id: &str) -> String {
     scoped_internal_route_key(ROUTE_KEY_SINK_ROOTS_CONTROL, node_id)
 }
@@ -112,6 +120,7 @@ pub fn sink_roots_control_stream_route_for(node_id: &str) -> RouteKey {
 
 fn build_route_bindings(
     sink_query_route_key: &str,
+    sink_status_route_key: &str,
     source_status_route_key: &str,
     source_find_route_key: &str,
     source_rescan_route_key: &str,
@@ -147,7 +156,7 @@ fn build_route_bindings(
         PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SINK_STATUS.into(),
-            route: request_reply_route_key(ROUTE_KEY_SINK_STATUS_INTERNAL),
+            route: request_reply_route_key(sink_status_route_key),
         },
         PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
@@ -190,6 +199,7 @@ fn build_route_bindings(
 pub fn default_route_bindings() -> Arc<PostBindDispatchTable> {
     build_route_bindings(
         ROUTE_KEY_SINK_QUERY_INTERNAL,
+        ROUTE_KEY_SINK_STATUS_INTERNAL,
         ROUTE_KEY_SOURCE_STATUS_INTERNAL,
         ROUTE_KEY_SOURCE_FIND_INTERNAL,
         ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
@@ -203,6 +213,7 @@ pub fn sink_query_route_bindings_for(node_id: &str) -> Arc<PostBindDispatchTable
     let sink_roots_control_route_key = sink_roots_control_route_key_for(node_id);
     build_route_bindings(
         &route_key,
+        ROUTE_KEY_SINK_STATUS_INTERNAL,
         ROUTE_KEY_SOURCE_STATUS_INTERNAL,
         ROUTE_KEY_SOURCE_FIND_INTERNAL,
         ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
@@ -215,6 +226,7 @@ pub fn source_rescan_route_bindings_for(node_id: &str) -> Arc<PostBindDispatchTa
     let source_rescan_route_key = source_rescan_route_key_for(node_id);
     build_route_bindings(
         ROUTE_KEY_SINK_QUERY_INTERNAL,
+        ROUTE_KEY_SINK_STATUS_INTERNAL,
         ROUTE_KEY_SOURCE_STATUS_INTERNAL,
         ROUTE_KEY_SOURCE_FIND_INTERNAL,
         &source_rescan_route_key,
@@ -228,6 +240,7 @@ pub fn source_find_route_bindings_for(node_id: &str) -> Arc<PostBindDispatchTabl
     let source_roots_control_route_key = source_roots_control_route_key_for(node_id);
     build_route_bindings(
         ROUTE_KEY_SINK_QUERY_INTERNAL,
+        ROUTE_KEY_SINK_STATUS_INTERNAL,
         ROUTE_KEY_SOURCE_STATUS_INTERNAL,
         &route_key,
         ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
@@ -240,7 +253,21 @@ pub fn source_status_route_bindings_for(node_id: &str) -> Arc<PostBindDispatchTa
     let route_key = source_status_route_key_for(node_id);
     build_route_bindings(
         ROUTE_KEY_SINK_QUERY_INTERNAL,
+        ROUTE_KEY_SINK_STATUS_INTERNAL,
         &route_key,
+        ROUTE_KEY_SOURCE_FIND_INTERNAL,
+        ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
+        ROUTE_KEY_SOURCE_ROOTS_CONTROL,
+        ROUTE_KEY_SINK_ROOTS_CONTROL,
+    )
+}
+
+pub fn sink_status_route_bindings_for(node_id: &str) -> Arc<PostBindDispatchTable> {
+    let route_key = sink_status_route_key_for(node_id);
+    build_route_bindings(
+        ROUTE_KEY_SINK_QUERY_INTERNAL,
+        &route_key,
+        ROUTE_KEY_SOURCE_STATUS_INTERNAL,
         ROUTE_KEY_SOURCE_FIND_INTERNAL,
         ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
         ROUTE_KEY_SOURCE_ROOTS_CONTROL,
@@ -291,6 +318,20 @@ mod tests {
             route,
             source_status_request_route_for(node_id),
             "node-scoped source status route bindings must collect source-owned readiness from the named source node",
+        );
+    }
+
+    #[test]
+    fn sink_status_route_bindings_bind_scoped_sink_status_for_known_node() {
+        let node_id = "node-b-987654321";
+        let routes = sink_status_route_bindings_for(node_id);
+        let route = routes
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("resolve sink status route");
+        assert_eq!(
+            route,
+            sink_status_request_route_for(node_id),
+            "node-scoped sink status route bindings must collect sink-owned readiness from the named sink node",
         );
     }
 

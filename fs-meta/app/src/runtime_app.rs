@@ -28,22 +28,27 @@ use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::execution_units;
 use crate::runtime::orchestration::{
     FacadeControlSignal, FacadeRuntimeUnit, SinkControlSignal, SinkRuntimeUnit,
-    SourceControlSignal, split_app_control_signals,
+    SourceControlSignal, manual_rescan_scoped_target_acceptance_timeout_from_payload,
+    split_app_control_signals,
 };
+#[cfg(test)]
+use crate::runtime::routes::ROUTE_KEY_SOURCE_FIND_INTERNAL;
 use crate::runtime::routes::{
     METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS,
     METHOD_SOURCE_FIND, METHOD_SOURCE_RESCAN, METHOD_SOURCE_STATUS, ROUTE_KEY_EVENTS,
     ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_INTERNAL,
     ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SINK_STATUS_INTERNAL,
-    ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
-    ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_INTERNAL,
-    default_route_bindings, sink_query_route_bindings_for, source_find_request_route_for,
-    source_find_route_bindings_for, source_rescan_request_route_for,
+    ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META,
+    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, sink_query_route_bindings_for,
+    sink_status_request_route_for, source_find_route_bindings_for, source_rescan_request_route_for,
     source_status_request_route_for,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::workers::sink::{SinkFacade, SinkFailure, SinkWorkerClientHandle};
-use crate::workers::source::{SourceFacade, SourceFailure, SourceWorkerClientHandle};
+use crate::workers::source::{
+    SourceFacade, SourceFailure, SourceWorkerClientHandle,
+    annotate_manual_rescan_route_receivable_evidence,
+};
 use crate::{FSMetaConfig, api, source};
 use async_trait::async_trait;
 #[cfg(test)]
@@ -131,12 +136,8 @@ fn facade_signal_generation(signal: &FacadeControlSignal) -> u64 {
 }
 
 fn facade_publication_signal_is_sink_status_activate(signal: &FacadeControlSignal) -> bool {
-    matches!(
-        signal,
-        FacadeControlSignal::Activate { unit, route_key, .. }
-            if matches!(unit, FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer)
-                && route_key == &format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
-    )
+    let _ = signal;
+    false
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1294,6 +1295,7 @@ enum SinkGenerationCutoverDisposition {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ControlFailureRecoveryLanePolicy {
     WithdrawInternalStatus,
+    PreserveSourceStatus,
     PreserveInternalStatus,
 }
 
@@ -3095,6 +3097,58 @@ fn post_recovery_sink_timeout_defers_scheduled_only_zero_state() {
 }
 
 #[test]
+fn post_recovery_sink_timeout_defers_pending_materialization_state() {
+    let snapshot = crate::sink::SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            String::from("node-a"),
+            vec![String::from("g1"), String::from("g2")],
+        )]),
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: String::from("g1"),
+                primary_object_ref: String::from("node-a::g1"),
+                total_nodes: 1,
+                live_nodes: 1,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::Ready,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: String::from("g2"),
+                primary_object_ref: String::from("node-a::g2"),
+                total_nodes: 3,
+                live_nodes: 2,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            },
+        ],
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        FSMetaApp::sink_status_snapshot_should_defer_republish_after_retained_replay_timeout(
+            &snapshot
+        ),
+        "pending materialization after retained replay is catch-up evidence and must not be treated as a terminal control-frame failure"
+    );
+}
+
+#[test]
 fn local_sink_status_republish_timeout_defers_scheduled_only_zero_state() {
     let snapshot = crate::sink::SinkStatusSnapshot {
         scheduled_groups_by_node: std::collections::BTreeMap::from([(
@@ -3408,6 +3462,7 @@ struct ManagementWriteRecoveryContext {
     control_failure_uninitialized: Arc<AtomicBool>,
     runtime_gate_state: Arc<StdMutex<RuntimeControlState>>,
     runtime_state_changed: Arc<tokio::sync::Notify>,
+    retained_sink_control_state: Arc<Mutex<RetainedSinkControlState>>,
     pending_fixed_bind_has_suppressed_dependent_routes: Arc<AtomicBool>,
     source_generation_cutover_replay_deferred: Arc<AtomicBool>,
     sink_generation_cutover_replay_deferred: Arc<AtomicBool>,
@@ -3459,6 +3514,54 @@ impl ManagementWriteRecoveryContext {
         self.update_runtime_control_state(|state| state.clear_sink_replay());
         self.sink_generation_cutover_replay_deferred
             .store(false, Ordering::Release);
+    }
+
+    async fn app_retained_sink_replay_signals(&self) -> Vec<SinkControlSignal> {
+        let retained = self.retained_sink_control_state.lock().await.clone();
+        let retained_sink_generation = retained
+            .active_by_route
+            .values()
+            .filter_map(|signal| match signal {
+                SinkControlSignal::Activate { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .max();
+        let retained_source_generation = self
+            .source
+            .control_signals_with_replay(&[])
+            .await
+            .iter()
+            .map(source_signal_generation)
+            .max();
+        let generation = retained_sink_generation
+            .into_iter()
+            .chain(retained_source_generation)
+            .max();
+        let mut replayed = FSMetaApp::sink_signals_from_state(&retained);
+        if let Some(generation) = generation {
+            replayed = replayed
+                .iter()
+                .map(|signal| FSMetaApp::rebase_sink_signal_generation(signal, generation))
+                .collect();
+        }
+        replayed
+    }
+
+    async fn replay_app_retained_sink_state_if_present(
+        &self,
+    ) -> std::result::Result<bool, CnxError> {
+        let signals = self.app_retained_sink_replay_signals().await;
+        if signals.is_empty() {
+            return Ok(false);
+        }
+        self.sink
+            .apply_orchestration_signals_with_total_timeout_with_failure(
+                &signals,
+                SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
+            )
+            .await
+            .map_err(SinkFailure::into_error)?;
+        Ok(true)
     }
 
     fn mark_source_rescan_proxy_ready_for_current_generation(&self) {
@@ -3543,7 +3646,11 @@ impl ManagementWriteRecoveryContext {
 
     async fn repair_sink_replay_if_required(&self) -> std::result::Result<(), CnxError> {
         if self.runtime_control_state().sink_state_replay_required() {
-            if !self.sink.retained_replay_required() {
+            if self.replay_app_retained_sink_state_if_present().await? {
+                if !self.sink.retained_replay_required() {
+                    self.clear_sink_replay_after_repair();
+                }
+            } else if !self.sink.retained_replay_required() {
                 self.clear_sink_replay_after_repair();
             } else {
                 self.sink
@@ -4583,25 +4690,16 @@ const SINK_QUERY_PROXY_BRIDGE_IDLE_GRACE: Duration = Duration::from_millis(150);
 
 fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
     let sink_query_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
-    let sink_status_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
     let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
-    let source_find_route = format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL);
     match unit {
         FacadeRuntimeUnit::Facade => route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
         FacadeRuntimeUnit::Query => {
             route_key == format!("{}.req", ROUTE_KEY_QUERY)
                 || route_key == sink_query_proxy_route
-                || route_key == sink_status_route
                 || route_key == source_status_route
-                || route_key == source_find_route
-                || is_per_peer_source_find_request_route(route_key)
         }
         FacadeRuntimeUnit::QueryPeer => {
-            route_key == sink_query_proxy_route
-                || route_key == sink_status_route
-                || route_key == source_status_route
-                || route_key == source_find_route
-                || is_per_peer_source_find_request_route(route_key)
+            route_key == sink_query_proxy_route || route_key == source_status_route
         }
     }
 }
@@ -4631,10 +4729,7 @@ fn preferred_internal_query_endpoint_units(
 
 fn is_dual_lane_internal_query_route(route_key: &str) -> bool {
     route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
-        || route_key == format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
         || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
-        || route_key == format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)
-        || is_per_peer_source_find_request_route(route_key)
 }
 
 fn internal_query_route_still_active(facade_gate: &RuntimeUnitGate, route_key: &str) -> bool {
@@ -4710,6 +4805,31 @@ fn source_rescan_proxy_ready_for_current_generation(
     current_generation != 0 && ready_generation.load(Ordering::Acquire) == current_generation
 }
 
+fn mark_source_rescan_proxy_ready_for_current_generation_if_receive_armed(
+    facade_gate: &RuntimeUnitGate,
+    route_key: &str,
+    ready_generation: &AtomicU64,
+    receive_armed: bool,
+) -> bool {
+    if !receive_armed {
+        return false;
+    }
+    let Ok(true) = facade_gate.route_active(execution_units::SOURCE_RUNTIME_UNIT_ID, route_key)
+    else {
+        return false;
+    };
+    let Ok(Some(current_generation)) =
+        facade_gate.route_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, route_key)
+    else {
+        return false;
+    };
+    if current_generation == 0 {
+        return false;
+    }
+    ready_generation.store(current_generation, Ordering::Release);
+    true
+}
+
 fn is_scoped_source_rescan_request_route(route_key: &str) -> bool {
     let Some(request_route) = route_key.strip_suffix(".req") else {
         return false;
@@ -4724,14 +4844,18 @@ fn is_scoped_source_rescan_request_route(route_key: &str) -> bool {
     route_suffix.starts_with(&format!("{route_stem}."))
 }
 
-struct SourceRescanProxyReadyBoundary {
+fn source_rescan_delivery_error_is_pending(err: &CnxError) -> bool {
+    matches!(err, CnxError::Timeout | CnxError::NotReady(_))
+}
+
+struct SourceRescanProxyReceiveReadyBoundary {
     inner: Arc<dyn ChannelIoSubset>,
     route_key: String,
     facade_gate: RuntimeUnitGate,
     ready_generation: Arc<AtomicU64>,
 }
 
-impl SourceRescanProxyReadyBoundary {
+impl SourceRescanProxyReceiveReadyBoundary {
     fn new(
         inner: Arc<dyn ChannelIoSubset>,
         route_key: String,
@@ -4748,7 +4872,7 @@ impl SourceRescanProxyReadyBoundary {
 }
 
 #[async_trait]
-impl ChannelIoSubset for SourceRescanProxyReadyBoundary {
+impl ChannelIoSubset for SourceRescanProxyReceiveReadyBoundary {
     async fn channel_send(&self, ctx: BoundaryContext, request: ChannelSendRequest) -> Result<()> {
         self.inner.channel_send(ctx, request).await
     }
@@ -4759,16 +4883,16 @@ impl ChannelIoSubset for SourceRescanProxyReadyBoundary {
         request: ChannelRecvRequest,
     ) -> Result<Vec<Event>> {
         if request.channel_key.0 == self.route_key
-            && !source_rescan_proxy_ready_for_current_generation(
-                &self.facade_gate,
-                &self.route_key,
-                &self.ready_generation,
-            )
+            && let Ok(true) = self
+                .facade_gate
+                .route_active(execution_units::SOURCE_RUNTIME_UNIT_ID, &self.route_key)
+            && let Ok(Some(current_generation)) = self
+                .facade_gate
+                .route_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, &self.route_key)
+            && current_generation != 0
         {
-            return Err(CnxError::NotReady(format!(
-                "source rescan proxy route {} awaits manual status rearm",
-                self.route_key
-            )));
+            self.ready_generation
+                .store(current_generation, Ordering::Release);
         }
         self.inner.channel_recv(ctx, request).await
     }
@@ -4786,30 +4910,32 @@ fn is_internal_status_route(route_key: &str) -> bool {
 fn is_facade_dependent_query_route(route_key: &str) -> bool {
     route_key == format!("{}.req", ROUTE_KEY_QUERY)
         || route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
-        || route_key == format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
         || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
-        || route_key == format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)
-        || is_per_peer_source_find_request_route(route_key)
 }
 
 fn is_serving_facade_business_read_route(route_key: &str) -> bool {
     route_key == format!("{}.req", ROUTE_KEY_QUERY)
         || route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
-        || route_key == format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
 }
 
 fn is_uninitialized_cleanup_query_route_with_policy(
     route_key: &str,
     recovery_lane_policy: ControlFailureRecoveryLanePolicy,
 ) -> bool {
-    is_internal_status_route(route_key)
+    route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
         && recovery_lane_policy == ControlFailureRecoveryLanePolicy::WithdrawInternalStatus
         || route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
-            && recovery_lane_policy == ControlFailureRecoveryLanePolicy::WithdrawInternalStatus
+            && matches!(
+                recovery_lane_policy,
+                ControlFailureRecoveryLanePolicy::WithdrawInternalStatus
+                    | ControlFailureRecoveryLanePolicy::PreserveSourceStatus
+            )
         || is_per_peer_sink_query_request_route(route_key)
-            && recovery_lane_policy == ControlFailureRecoveryLanePolicy::WithdrawInternalStatus
-        || route_key == format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)
-        || is_per_peer_source_find_request_route(route_key)
+            && matches!(
+                recovery_lane_policy,
+                ControlFailureRecoveryLanePolicy::WithdrawInternalStatus
+                    | ControlFailureRecoveryLanePolicy::PreserveSourceStatus
+            )
 }
 
 fn is_uninitialized_cleanup_query_route_tail_with_policy(
@@ -4841,19 +4967,6 @@ fn is_per_peer_sink_roots_control_stream_route(route_key: &str) -> bool {
         return stream_route.starts_with(&format!("{ROUTE_KEY_SINK_ROOTS_CONTROL}."));
     };
     let Some(route_stem) = stream_route.strip_suffix(&format!(":{version}")) else {
-        return false;
-    };
-    route_stem.starts_with(&format!("{stem}."))
-}
-
-fn is_per_peer_source_find_request_route(route_key: &str) -> bool {
-    let Some(request_route) = route_key.strip_suffix(".req") else {
-        return false;
-    };
-    let Some((stem, version)) = ROUTE_KEY_SOURCE_FIND_INTERNAL.rsplit_once(':') else {
-        return request_route.starts_with(&format!("{ROUTE_KEY_SOURCE_FIND_INTERNAL}."));
-    };
-    let Some(route_stem) = request_route.strip_suffix(&format!(":{version}")) else {
         return false;
     };
     route_stem.starts_with(&format!("{stem}."))
@@ -6470,7 +6583,7 @@ pub struct FSMetaApp {
     source_rescan_proxy_ready_generation: Arc<AtomicU64>,
     mirrored_query_peer_routes: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
     runtime_gate_state: Arc<StdMutex<RuntimeControlState>>,
-    retained_sink_control_state: Mutex<RetainedSinkControlState>,
+    retained_sink_control_state: Arc<Mutex<RetainedSinkControlState>>,
     runtime_state_changed: Arc<tokio::sync::Notify>,
     retained_suppressed_public_query_activates:
         Mutex<std::collections::BTreeMap<(String, String), FacadeControlSignal>>,
@@ -6795,6 +6908,7 @@ impl FSMetaApp {
             control_failure_uninitialized: self.control_failure_uninitialized.clone(),
             runtime_gate_state: self.runtime_gate_state.clone(),
             runtime_state_changed: self.runtime_state_changed.clone(),
+            retained_sink_control_state: self.retained_sink_control_state.clone(),
             pending_fixed_bind_has_suppressed_dependent_routes: self
                 .pending_fixed_bind_has_suppressed_dependent_routes
                 .clone(),
@@ -6829,6 +6943,7 @@ impl FSMetaApp {
             control_failure_uninitialized: self.control_failure_uninitialized.clone(),
             runtime_gate_state: self.runtime_gate_state.clone(),
             runtime_state_changed: self.runtime_state_changed.clone(),
+            retained_sink_control_state: self.retained_sink_control_state.clone(),
             pending_fixed_bind_has_suppressed_dependent_routes: self
                 .pending_fixed_bind_has_suppressed_dependent_routes
                 .clone(),
@@ -7215,17 +7330,29 @@ impl FSMetaApp {
         snapshot.groups.is_empty() && !progress.scheduled_groups.is_empty()
     }
 
+    fn sink_status_snapshot_has_pending_republish_evidence(
+        snapshot: &crate::sink::SinkStatusSnapshot,
+    ) -> bool {
+        matches!(
+            snapshot.concern_projection().concern,
+            Some(crate::sink::SinkStatusConcern::ReplayPending)
+                | Some(crate::sink::SinkStatusConcern::MixedReadiness)
+        )
+    }
+
     fn sink_status_snapshot_should_defer_republish_after_retained_replay_timeout(
         snapshot: &crate::sink::SinkStatusSnapshot,
     ) -> bool {
         FSMetaApp::sink_status_snapshot_summary_is_empty(snapshot)
             || FSMetaApp::sink_status_snapshot_has_scheduled_only_republish_evidence(snapshot)
+            || FSMetaApp::sink_status_snapshot_has_pending_republish_evidence(snapshot)
     }
 
     fn sink_status_snapshot_should_defer_local_republish_after_retained_replay(
         snapshot: &crate::sink::SinkStatusSnapshot,
     ) -> bool {
         FSMetaApp::sink_status_snapshot_has_scheduled_only_republish_evidence(snapshot)
+            || FSMetaApp::sink_status_snapshot_has_pending_republish_evidence(snapshot)
     }
 
     async fn wait_for_runtime_progress_observation_window_until<F, Fut>(
@@ -8183,7 +8310,7 @@ impl FSMetaApp {
             runtime_gate_state: Arc::new(StdMutex::new(RuntimeControlState::bootstrapping(
                 false, false,
             ))),
-            retained_sink_control_state: Mutex::new(RetainedSinkControlState::default()),
+            retained_sink_control_state: Arc::new(Mutex::new(RetainedSinkControlState::default())),
             runtime_state_changed: Arc::new(tokio::sync::Notify::new()),
             retained_suppressed_public_query_activates: Mutex::new(
                 std::collections::BTreeMap::new(),
@@ -9565,6 +9692,23 @@ impl FSMetaApp {
         self.ensure_runtime_proxy_endpoints_started().await
     }
 
+    async fn refresh_source_rescan_proxy_ready_from_retained_endpoint(&self) {
+        let tasks = self.runtime_endpoint_tasks.lock().await;
+        let scoped_source_rescan_route_key = source_rescan_request_route_for(&self.node_id.0).0;
+        for task in tasks.iter() {
+            if task.route_key() == scoped_source_rescan_route_key
+                && runtime_endpoint_task_route_still_active(&self.facade_gate, task)
+            {
+                mark_source_rescan_proxy_ready_for_current_generation_if_receive_armed(
+                    &self.facade_gate,
+                    task.route_key(),
+                    &self.source_rescan_proxy_ready_generation,
+                    task.is_receive_armed(),
+                );
+            }
+        }
+    }
+
     async fn ensure_embedded_runtime_worker_endpoints_started(&self) -> Result<()> {
         let Some(boundary) = self.runtime_boundary.clone() else {
             return Ok(());
@@ -9615,8 +9759,17 @@ impl FSMetaApp {
         *tasks = retained_tasks;
         let mut spawned_routes = self.runtime_endpoint_routes.lock().await;
         spawned_routes.clear();
+        let scoped_source_rescan_route_key = source_rescan_request_route_for(&self.node_id.0).0;
         for task in tasks.iter() {
             if runtime_endpoint_task_route_still_active(&self.facade_gate, task) {
+                if task.route_key() == scoped_source_rescan_route_key {
+                    mark_source_rescan_proxy_ready_for_current_generation_if_receive_armed(
+                        &self.facade_gate,
+                        task.route_key(),
+                        &self.source_rescan_proxy_ready_generation,
+                        task.is_receive_armed(),
+                    );
+                }
                 spawned_routes.insert(task.route_key().to_string());
             }
         }
@@ -9653,7 +9806,7 @@ impl FSMetaApp {
                     "fs_meta_runtime_app: spawning public query endpoint route={}",
                     route.0
                 );
-                let endpoint = ManagedEndpointTask::spawn(
+                let endpoint = ManagedEndpointTask::spawn_without_ready_wait(
                     boundary.clone(),
                     route,
                     format!("app:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
@@ -9729,270 +9882,218 @@ impl FSMetaApp {
                 tasks.push(endpoint);
             }
         }
+        let mut sink_status_endpoint_routes = Vec::new();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS) {
-            if internal_query_active {
-                let prefer_query_peer_first = self
-                    .mirrored_query_peer_routes
-                    .lock()
-                    .await
-                    .contains_key(&route.0);
-                let endpoint_unit_ids = preferred_internal_query_endpoint_units(
-                    query_active,
-                    query_peer_active,
-                    prefer_query_peer_first,
+            if self
+                .facade_gate
+                .route_active(execution_units::SINK_RUNTIME_UNIT_ID, &route.0)
+                .unwrap_or(false)
+            {
+                sink_status_endpoint_routes.push(route);
+            }
+        }
+        let node_scoped_sink_status_route = sink_status_request_route_for(&self.node_id.0);
+        if self
+            .facade_gate
+            .route_active(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &node_scoped_sink_status_route.0,
+            )
+            .unwrap_or(false)
+        {
+            sink_status_endpoint_routes.push(node_scoped_sink_status_route);
+        }
+        for route in sink_status_endpoint_routes {
+            let endpoint_unit_ids = vec![execution_units::SINK_RUNTIME_UNIT_ID];
+            if endpoint_unit_ids.is_empty()
+                || !route_still_active_for_units(&self.facade_gate, &route.0, &endpoint_unit_ids)
+                || !spawned_routes.insert(route.0.clone())
+            {
+                // Not currently selected as sink-status owner, route inactive, or already running.
+            } else {
+                let active_unit_ids = endpoint_unit_ids.clone();
+                let facade_gate = self.facade_gate.clone();
+                let runtime_gate_state = self.runtime_gate_state.clone();
+                let sink = self.sink.clone();
+                let route_key = route.0.clone();
+                eprintln!(
+                    "fs_meta_runtime_app: spawning sink status endpoint route={}",
+                    route.0
                 );
-                if endpoint_unit_ids.is_empty()
-                    || !route_still_active_for_units(
-                        &self.facade_gate,
-                        &route.0,
-                        &endpoint_unit_ids,
-                    )
-                    || !spawned_routes.insert(route.0.clone())
-                {
-                    // Not currently selected as query/query-peer sink-status owner, route inactive, or already running.
-                } else {
-                    let active_unit_ids = endpoint_unit_ids.clone();
-                    let facade_service_state = self.facade_service_state.clone();
-                    let facade_gate = self.facade_gate.clone();
-                    let api_task = self.api_task.clone();
-                    let runtime_gate_state = self.runtime_gate_state.clone();
-                    let sink = self.sink.clone();
-                    let route_key = route.0.clone();
-                    eprintln!(
-                        "fs_meta_runtime_app: spawning sink status endpoint route={}",
-                        route.0
-                    );
-                    let endpoint = ManagedEndpointTask::spawn_with_units(
-                        boundary.clone(),
-                        route,
-                        format!(
-                            "app:{}:{}",
-                            ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS
-                        ),
-                        endpoint_unit_ids,
-                        tokio_util::sync::CancellationToken::new(),
-                        move |requests| {
-                            let facade_service_state = facade_service_state.clone();
-                            let facade_gate = facade_gate.clone();
-                            let api_task = api_task.clone();
-                            let runtime_gate_state = runtime_gate_state.clone();
-                            let sink = sink.clone();
-                            let route_key = route_key.clone();
-                            let active_unit_ids = active_unit_ids.clone();
-                            async move {
-                                let mut responses = Vec::new();
-                                for req in requests {
-                                    let published_facade_state = *facade_service_state
-                                        .read()
-                                        .expect("read published facade service state");
-                                    let local_api_task_present = api_task.lock().await.is_some();
-                                    if !matches!(
-                                        Self::internal_status_available_from_published_facade_state(
-                                            published_facade_state,
-                                            local_api_task_present,
+                let endpoint = ManagedEndpointTask::spawn_with_units_without_ready_wait(
+                    boundary.clone(),
+                    route,
+                    format!(
+                        "app:{}:{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS
+                    ),
+                    endpoint_unit_ids,
+                    tokio_util::sync::CancellationToken::new(),
+                    move |requests| {
+                        let facade_gate = facade_gate.clone();
+                        let runtime_gate_state = runtime_gate_state.clone();
+                        let sink = sink.clone();
+                        let route_key = route_key.clone();
+                        let active_unit_ids = active_unit_ids.clone();
+                        async move {
+                            let mut responses = Vec::new();
+                            for req in requests {
+                                #[cfg(test)]
+                                maybe_pause_runtime_proxy_request("sink_status").await;
+                                if !route_still_active_for_units(
+                                    &facade_gate,
+                                    &route_key,
+                                    &active_unit_ids,
+                                ) {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: sink status endpoint unavailable reason=route_deactivated_after_pause route={}",
+                                        route_key
+                                    );
+                                    match explicit_empty_sink_status_reply(
+                                        &req.metadata().origin_id,
+                                        req.metadata().correlation_id,
+                                    ) {
+                                        Ok(event) => responses.push(event),
+                                        Err(err) => eprintln!(
+                                            "fs_meta_runtime_app: sink status endpoint deactivated empty reply encode failed: {err}"
                                         ),
-                                        InternalStatusAvailability::Available
-                                    ) {
-                                        eprintln!(
-                                            "fs_meta_runtime_app: sink status endpoint unavailable reason=facade_state_not_serving state={:?}",
-                                            published_facade_state
-                                        );
-                                        continue;
                                     }
-                                    #[cfg(test)]
-                                    maybe_pause_runtime_proxy_request("sink_status").await;
-                                    if !route_still_active_for_units(
-                                        &facade_gate,
-                                        &route_key,
-                                        &active_unit_ids,
-                                    ) {
-                                        eprintln!(
-                                            "fs_meta_runtime_app: sink status endpoint unavailable reason=route_deactivated_after_pause route={}",
-                                            route_key
-                                        );
-                                        match explicit_empty_sink_status_reply(
+                                    continue;
+                                }
+                                match sink.status_snapshot_nonblocking_for_status_route().await {
+                                    Ok((snapshot, _used_cached_fallback)) => {
+                                        if debug_status_endpoint_response_enabled() {
+                                            eprintln!(
+                                                "fs_meta_runtime_app: sink status endpoint response {}",
+                                                summarize_sink_status_endpoint(&snapshot)
+                                            );
+                                        }
+                                        match sink_status_reply(
+                                            &snapshot,
                                             &req.metadata().origin_id,
                                             req.metadata().correlation_id,
                                         ) {
                                             Ok(event) => responses.push(event),
                                             Err(err) => eprintln!(
-                                                "fs_meta_runtime_app: sink status endpoint deactivated empty reply encode failed: {err}"
+                                                "fs_meta_runtime_app: sink status endpoint reply encode failed: {err}"
                                             ),
                                         }
-                                        continue;
                                     }
-                                    let published_facade_state = *facade_service_state
-                                        .read()
-                                        .expect("read published facade service state after pause");
-                                    let local_api_task_present = api_task.lock().await.is_some();
-                                    if !matches!(
-                                        Self::internal_status_available_from_published_facade_state(
-                                            published_facade_state,
-                                            local_api_task_present,
-                                        ),
-                                        InternalStatusAvailability::Available
-                                    ) {
-                                        eprintln!(
-                                            "fs_meta_runtime_app: sink status endpoint unavailable reason=facade_state_not_serving_after_pause state={:?}",
-                                            published_facade_state
-                                        );
-                                        continue;
-                                    }
-                                    match sink.status_snapshot_nonblocking_for_status_route().await
-                                    {
-                                        Ok((snapshot, _used_cached_fallback)) => {
-                                            if debug_status_endpoint_response_enabled() {
-                                                eprintln!(
-                                                    "fs_meta_runtime_app: sink status endpoint response {}",
-                                                    summarize_sink_status_endpoint(&snapshot)
-                                                );
-                                            }
-                                            match sink_status_reply(
-                                                &snapshot,
+                                    Err(err) => {
+                                        let mut terminal_err = err;
+                                        if !route_still_active_for_units(
+                                            &facade_gate,
+                                            &route_key,
+                                            &active_unit_ids,
+                                        ) {
+                                            eprintln!(
+                                                "fs_meta_runtime_app: sink status endpoint fail-closed after route deactivate route={} err={}",
+                                                route_key, terminal_err
+                                            );
+                                            match explicit_empty_sink_status_reply(
                                                 &req.metadata().origin_id,
                                                 req.metadata().correlation_id,
                                             ) {
                                                 Ok(event) => responses.push(event),
-                                                Err(err) => eprintln!(
-                                                    "fs_meta_runtime_app: sink status endpoint reply encode failed: {err}"
+                                                Err(reply_err) => eprintln!(
+                                                    "fs_meta_runtime_app: sink status endpoint deactivated empty reply encode failed: {reply_err}"
                                                 ),
                                             }
+                                            continue;
                                         }
-                                        Err(err) => {
-                                            let mut terminal_err = err;
-                                            if !route_still_active_for_units(
-                                                &facade_gate,
-                                                &route_key,
-                                                &active_unit_ids,
+                                        let sink_control_inflight =
+                                            sink.control_op_inflight().await;
+                                        if matches!(terminal_err, CnxError::Timeout)
+                                            && !sink_control_inflight
+                                            && let Ok(cached_snapshot) =
+                                                sink.cached_status_snapshot_with_failure()
+                                            && sink_status_snapshot_has_ready_scheduled_groups(
+                                                &cached_snapshot,
+                                            )
+                                        {
+                                            eprintln!(
+                                                "fs_meta_runtime_app: sink status endpoint cached fallback err={} {}",
+                                                terminal_err,
+                                                summarize_sink_status_endpoint(&cached_snapshot)
+                                            );
+                                            match sink_status_reply(
+                                                &cached_snapshot,
+                                                &req.metadata().origin_id,
+                                                req.metadata().correlation_id,
                                             ) {
-                                                eprintln!(
-                                                    "fs_meta_runtime_app: sink status endpoint fail-closed after route deactivate route={} err={}",
-                                                    route_key, terminal_err
-                                                );
-                                                match explicit_empty_sink_status_reply(
-                                                    &req.metadata().origin_id,
-                                                    req.metadata().correlation_id,
-                                                ) {
-                                                    Ok(event) => responses.push(event),
-                                                    Err(reply_err) => eprintln!(
-                                                        "fs_meta_runtime_app: sink status endpoint deactivated empty reply encode failed: {reply_err}"
-                                                    ),
-                                                }
-                                                continue;
+                                                Ok(event) => responses.push(event),
+                                                Err(reply_err) => eprintln!(
+                                                    "fs_meta_runtime_app: sink status endpoint cached fallback encode failed: {reply_err}"
+                                                ),
                                             }
-                                            let sink_control_inflight =
-                                                sink.control_op_inflight().await;
-                                            if matches!(terminal_err, CnxError::Timeout)
-                                                && !sink_control_inflight
-                                                && let Ok(cached_snapshot) =
-                                                    sink.cached_status_snapshot_with_failure()
-                                                && sink_status_snapshot_has_ready_scheduled_groups(
-                                                    &cached_snapshot,
-                                                )
+                                            continue;
+                                        }
+                                        if matches!(terminal_err, CnxError::Timeout)
+                                            && !sink_control_inflight
+                                        {
+                                            match tokio::time::timeout(
+                                                INTERNAL_SINK_STATUS_BLOCKING_FALLBACK_BUDGET,
+                                                sink.status_snapshot_with_failure(),
+                                            )
+                                            .await
                                             {
-                                                eprintln!(
-                                                    "fs_meta_runtime_app: sink status endpoint cached fallback err={} {}",
-                                                    terminal_err,
-                                                    summarize_sink_status_endpoint(
-                                                        &cached_snapshot
-                                                    )
-                                                );
-                                                match sink_status_reply(
-                                                    &cached_snapshot,
-                                                    &req.metadata().origin_id,
-                                                    req.metadata().correlation_id,
-                                                ) {
-                                                    Ok(event) => responses.push(event),
-                                                    Err(reply_err) => eprintln!(
-                                                        "fs_meta_runtime_app: sink status endpoint cached fallback encode failed: {reply_err}"
-                                                    ),
-                                                }
-                                                continue;
-                                            }
-                                            if matches!(terminal_err, CnxError::Timeout)
-                                                && !sink_control_inflight
-                                            {
-                                                match tokio::time::timeout(
-                                                    INTERNAL_SINK_STATUS_BLOCKING_FALLBACK_BUDGET,
-                                                    sink.status_snapshot_with_failure(),
-                                                )
-                                                .await
-                                                {
-                                                    Ok(Ok(snapshot)) => {
-                                                        if !route_still_active_for_units(
-                                                            &facade_gate,
-                                                            &route_key,
-                                                            &active_unit_ids,
-                                                        ) {
-                                                            eprintln!(
-                                                                "fs_meta_runtime_app: sink status endpoint blocking fallback deactivated route={}",
-                                                                route_key
-                                                            );
-                                                            match explicit_empty_sink_status_reply(
-                                                                &req.metadata().origin_id,
-                                                                req.metadata().correlation_id,
-                                                            ) {
-                                                                Ok(event) => responses.push(event),
-                                                                Err(reply_err) => eprintln!(
-                                                                    "fs_meta_runtime_app: sink status endpoint blocking fallback deactivated empty reply encode failed: {reply_err}"
-                                                                ),
-                                                            }
-                                                            continue;
-                                                        }
+                                                Ok(Ok(snapshot)) => {
+                                                    if !route_still_active_for_units(
+                                                        &facade_gate,
+                                                        &route_key,
+                                                        &active_unit_ids,
+                                                    ) {
                                                         eprintln!(
-                                                            "fs_meta_runtime_app: sink status endpoint blocking fallback {}",
-                                                            summarize_sink_status_endpoint(
-                                                                &snapshot
-                                                            )
+                                                            "fs_meta_runtime_app: sink status endpoint blocking fallback deactivated route={}",
+                                                            route_key
                                                         );
-                                                        match sink_status_reply(
-                                                            &snapshot,
+                                                        match explicit_empty_sink_status_reply(
                                                             &req.metadata().origin_id,
                                                             req.metadata().correlation_id,
                                                         ) {
                                                             Ok(event) => responses.push(event),
                                                             Err(reply_err) => eprintln!(
-                                                                "fs_meta_runtime_app: sink status endpoint blocking fallback encode failed: {reply_err}"
+                                                                "fs_meta_runtime_app: sink status endpoint blocking fallback deactivated empty reply encode failed: {reply_err}"
                                                             ),
                                                         }
                                                         continue;
                                                     }
-                                                    Ok(Err(fallback_err)) => {
-                                                        terminal_err = fallback_err.into_error();
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: sink status endpoint blocking fallback {}",
+                                                        summarize_sink_status_endpoint(&snapshot)
+                                                    );
+                                                    match sink_status_reply(
+                                                        &snapshot,
+                                                        &req.metadata().origin_id,
+                                                        req.metadata().correlation_id,
+                                                    ) {
+                                                        Ok(event) => responses.push(event),
+                                                        Err(reply_err) => eprintln!(
+                                                            "fs_meta_runtime_app: sink status endpoint blocking fallback encode failed: {reply_err}"
+                                                        ),
                                                     }
-                                                    Err(_) => {
-                                                        terminal_err = CnxError::Timeout;
-                                                    }
+                                                    continue;
+                                                }
+                                                Ok(Err(fallback_err)) => {
+                                                    terminal_err = fallback_err.into_error();
+                                                }
+                                                Err(_) => {
+                                                    terminal_err = CnxError::Timeout;
                                                 }
                                             }
-                                            if matches!(terminal_err, CnxError::Timeout)
-                                                && RuntimeControlState::from_state_cell(
-                                                    &runtime_gate_state,
-                                                )
-                                                .control_initialized()
-                                            {
-                                                let route_still_active =
-                                                    internal_query_route_still_active(
-                                                        &facade_gate,
-                                                        &route_key,
-                                                    );
-                                                let published_facade_state =
-                                                *facade_service_state
-                                                    .read()
-                                                    .expect(
-                                                        "read published facade service state after sink timeout fallback",
-                                                    );
-                                                let local_api_task_present =
-                                                    api_task.lock().await.is_some();
-                                                if route_still_active
-                                                && matches!(
-                                                    Self::internal_status_available_from_published_facade_state(
-                                                        published_facade_state,
-                                                        local_api_task_present,
-                                                    ),
-                                                    InternalStatusAvailability::Available
-                                                )
-                                            {
+                                        }
+                                        if matches!(terminal_err, CnxError::Timeout)
+                                            && RuntimeControlState::from_state_cell(
+                                                &runtime_gate_state,
+                                            )
+                                            .control_initialized()
+                                        {
+                                            let route_still_active = route_still_active_for_units(
+                                                &facade_gate,
+                                                &route_key,
+                                                &active_unit_ids,
+                                            );
+                                            if route_still_active {
                                                 eprintln!(
                                                     "fs_meta_runtime_app: sink status endpoint initialized timeout empty fallback route={}",
                                                     route_key
@@ -10008,20 +10109,19 @@ impl FSMetaApp {
                                                 }
                                                 continue;
                                             }
-                                            }
-                                            eprintln!(
-                                                "fs_meta_runtime_app: sink status endpoint failed err={}",
-                                                terminal_err
-                                            );
                                         }
+                                        eprintln!(
+                                            "fs_meta_runtime_app: sink status endpoint failed err={}",
+                                            terminal_err
+                                        );
                                     }
                                 }
-                                responses
                             }
-                        },
-                    );
-                    tasks.push(endpoint);
-                }
+                            responses
+                        }
+                    },
+                );
+                tasks.push(endpoint);
             }
         }
         let mut source_status_endpoint_routes = Vec::new();
@@ -10077,7 +10177,7 @@ impl FSMetaApp {
                     "fs_meta_runtime_app: spawning source status endpoint route={}",
                     route.0
                 );
-                let endpoint = ManagedEndpointTask::spawn_with_units(
+                let endpoint = ManagedEndpointTask::spawn_with_units_without_ready_wait(
                     boundary.clone(),
                     route,
                     format!(
@@ -10213,95 +10313,41 @@ impl FSMetaApp {
                                                 .saturating_duration_since(
                                                     tokio::time::Instant::now(),
                                                 );
-                                            let source_rescan_generation =
-                                                match facade_gate_for_source_status.route_active(
-                                                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                                            let source_rescan_proxy_ready =
+                                                source_rescan_proxy_ready_for_current_generation(
+                                                    &facade_gate_for_source_status,
                                                     &source_rescan_proxy_route_key,
-                                                ) {
-                                                    Ok(true) => match facade_gate_for_source_status
-                                                        .route_generation(
-                                                            execution_units::SOURCE_RUNTIME_UNIT_ID,
-                                                            &source_rescan_proxy_route_key,
-                                                        ) {
-                                                        Ok(Some(generation)) if generation != 0 => {
-                                                            Some(generation)
-                                                        }
-                                                        _ => {
-                                                            eprintln!(
-                                                                "fs_meta_runtime_app: source status endpoint manual-rescan rearm has no scoped rescan generation node={} route={} correlation={:?} trace_id={}",
-                                                                node_id.0,
-                                                                source_rescan_proxy_route_key,
-                                                                req.metadata().correlation_id,
-                                                                trace_id
-                                                            );
-                                                            None
-                                                        }
-                                                    },
-                                                    _ => None,
-                                                };
+                                                    &source_rescan_proxy_ready_generation,
+                                                );
                                             let non_target_status_snapshot = if source.is_worker() {
-                                                let acceptance_result = if rearm_budget.is_zero() {
-                                                    Err(SourceFailure::from(CnxError::Timeout))
-                                                } else {
-                                                    match tokio::time::timeout(
-                                                        rearm_budget,
-                                                        source
-                                                            .check_targeted_rescan_delivery_acceptance_with_failure(),
-                                                    )
-                                                    .await
-                                                    {
-                                                        Ok(result) => result,
-                                                        Err(_) => {
-                                                            Err(SourceFailure::from(CnxError::Timeout))
-                                                        }
-                                                    }
-                                                };
-                                                match acceptance_result {
-                                                    Ok(
-                                                        source::SourceTargetedRescanDeliveryAcceptance::Accepted,
-                                                    ) => {
-                                                        if let Some(generation) =
-                                                            source_rescan_generation
-                                                        {
-                                                            source_rescan_proxy_ready_generation
-                                                                .store(generation, Ordering::Release);
-                                                        }
-                                                        None
-                                                    }
-                                                    Ok(
-                                                        source::SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary,
-                                                    ) => {
-                                                        eprintln!(
-                                                            "fs_meta_runtime_app: source status endpoint manual-rescan non-target status node={} correlation={:?} trace_id={}",
-                                                            node_id.0,
-                                                            req.metadata().correlation_id,
-                                                            trace_id
-                                                        );
-                                                        let snapshot_budget = probe_deadline
-                                                            .saturating_duration_since(
-                                                                tokio::time::Instant::now(),
-                                                            );
-                                                        Some(
-                                                            source
-                                                                .observability_snapshot_nonblocking_for_status_route_with_timeout(
-                                                                    (!snapshot_budget.is_zero())
-                                                                        .then_some(snapshot_budget),
-                                                                )
-                                                                .await,
-                                                        )
-                                                    }
-                                                    Err(err) => {
-                                                        eprintln!(
-                                                            "fs_meta_runtime_app: source status endpoint manual-rescan rearm failed node={} correlation={:?} trace_id={} budget_ms={} err={}",
-                                                            node_id.0,
-                                                            req.metadata().correlation_id,
-                                                            trace_id,
-                                                            probe_budget.as_millis(),
-                                                            err.as_error()
-                                                        );
-                                                        continue;
-                                                    }
+                                                if !source_rescan_proxy_ready {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: source status endpoint manual-rescan route not receive-armed node={} route={} correlation={:?} trace_id={}",
+                                                        node_id.0,
+                                                        source_rescan_proxy_route_key,
+                                                        req.metadata().correlation_id,
+                                                        trace_id
+                                                    );
                                                 }
+                                                let (mut snapshot, used_cached_fallback) =
+                                                    if source_rescan_proxy_ready
+                                                        && let Some(snapshot) = source
+                                                            .manual_rescan_app_route_observability_snapshot_for_status_route()
+                                                            .await
+                                                    {
+                                                        (snapshot, true)
+                                                    } else {
+                                                        source
+                                                            .source_state_pending_observability_snapshot_for_status_route()
+                                                            .await
+                                                    };
+                                                if source_rescan_proxy_ready {
+                                                    annotate_manual_rescan_route_receivable_evidence(
+                                                        &mut snapshot,
+                                                        &node_id,
+                                                    );
+                                                }
+                                                Some((snapshot, used_cached_fallback))
                                             } else {
                                                 let rearm_result = if rearm_budget.is_zero() {
                                                     Err(SourceFailure::from(CnxError::Timeout))
@@ -10332,15 +10378,9 @@ impl FSMetaApp {
                                                     );
                                                     continue;
                                                 }
-                                                let Some(source_rescan_generation) =
-                                                    source_rescan_generation
-                                                else {
+                                                if !source_rescan_proxy_ready {
                                                     continue;
                                                 };
-                                                source_rescan_proxy_ready_generation.store(
-                                                    source_rescan_generation,
-                                                    Ordering::Release,
-                                                );
                                                 None
                                             };
                                             if let Some(snapshot) = non_target_status_snapshot {
@@ -10395,8 +10435,7 @@ impl FSMetaApp {
                                             .saturating_duration_since(tokio::time::Instant::now());
                                         source
                                             .observability_snapshot_nonblocking_for_status_route_with_timeout(
-                                                (!snapshot_budget.is_zero())
-                                                    .then_some(snapshot_budget),
+                                                Some(snapshot_budget),
                                             )
                                             .await
                                         }
@@ -10500,7 +10539,7 @@ impl FSMetaApp {
                     let sink = self.sink.clone();
                     let source = self.source.clone();
                     let node_id = self.node_id.clone();
-                    let endpoint = ManagedEndpointTask::spawn_with_units(
+                    let endpoint = ManagedEndpointTask::spawn_with_units_without_ready_wait(
                         boundary.clone(),
                         route,
                         format!(
@@ -10845,55 +10884,49 @@ impl FSMetaApp {
                     let source_rescan_route = RouteKey(source_rescan_route_key.clone());
                     let source = self.source.clone();
                     let node_id = self.node_id.clone();
-                    let source_rescan_boundary = Arc::new(SourceRescanProxyReadyBoundary::new(
-                        boundary.clone(),
-                        source_rescan_route_key.clone(),
-                        self.facade_gate.clone(),
-                        self.source_rescan_proxy_ready_generation.clone(),
-                    ));
+                    let source_rescan_boundary =
+                        Arc::new(SourceRescanProxyReceiveReadyBoundary::new(
+                            boundary.clone(),
+                            source_rescan_route_key.clone(),
+                            self.facade_gate.clone(),
+                            self.source_rescan_proxy_ready_generation.clone(),
+                        ));
                     eprintln!(
                         "fs_meta_runtime_app: spawning source rescan proxy endpoint route={}",
                         source_rescan_route_key
                     );
-                    let endpoint = ManagedEndpointTask::spawn_with_unit(
-                        source_rescan_boundary,
-                        source_rescan_route,
-                        format!(
-                            "app:{}:{}:scoped",
-                            ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN
-                        ),
-                        execution_units::SOURCE_RUNTIME_UNIT_ID,
-                        tokio_util::sync::CancellationToken::new(),
-                        move |requests| {
-                            let source = source.clone();
-                            let node_id = node_id.clone();
-                            async move {
-                                if requests.is_empty() {
-                                    return Vec::new();
-                                }
-                                let delivery_result =
-                                    source.accept_targeted_rescan_delivery_with_failure().await;
-                                let mut responses = Vec::with_capacity(requests.len());
-                                for req in requests {
-                                    match &delivery_result {
-                                        Ok(()) => responses.push(Event::new(
-                                            EventMetadata {
-                                                origin_id: node_id.clone(),
-                                                timestamp_us: now_us(),
-                                                logical_ts: None,
-                                                correlation_id: req.metadata().correlation_id,
-                                                ingress_auth: None,
-                                                trace: None,
-                                            },
-                                            bytes::Bytes::from_static(b"accepted"),
-                                        )),
-                                        Err(err) => {
-                                            eprintln!(
-                                                "fs_meta_runtime_app: source rescan proxy failed node={} err={}",
-                                                node_id.0,
-                                                err.as_error()
-                                            );
-                                            responses.push(Event::new(
+                    let endpoint =
+                        ManagedEndpointTask::spawn_with_unit_wait_receivable_without_ready_wait(
+                            source_rescan_boundary,
+                            source_rescan_route,
+                            format!(
+                                "app:{}:{}:scoped",
+                                ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN
+                            ),
+                            execution_units::SOURCE_RUNTIME_UNIT_ID,
+                            tokio_util::sync::CancellationToken::new(),
+                            move |requests| {
+                                let source = source.clone();
+                                let node_id = node_id.clone();
+                                async move {
+                                    if requests.is_empty() {
+                                        return Vec::new();
+                                    }
+                                    let scoped_target_acceptance_timeout =
+                                    requests.iter().find_map(|request| {
+                                        manual_rescan_scoped_target_acceptance_timeout_from_payload(
+                                            request.payload_bytes(),
+                                        )
+                                    });
+                                    let delivery_result = source
+                                    .submit_targeted_rescan_request_epoch_with_acceptance_timeout_with_failure(
+                                        scoped_target_acceptance_timeout,
+                                    )
+                                    .await;
+                                    let mut responses = Vec::with_capacity(requests.len());
+                                    for req in requests {
+                                        match &delivery_result {
+                                            Ok(_) => responses.push(Event::new(
                                                 EventMetadata {
                                                     origin_id: node_id.clone(),
                                                     timestamp_us: now_us(),
@@ -10902,15 +10935,47 @@ impl FSMetaApp {
                                                     ingress_auth: None,
                                                     trace: None,
                                                 },
-                                                bytes::Bytes::from(err.as_error().to_string()),
-                                            ));
+                                                bytes::Bytes::from_static(b"accepted"),
+                                            )),
+                                            Err(err) => {
+                                                let payload =
+                                                    if source_rescan_delivery_error_is_pending(
+                                                        err.as_error(),
+                                                    ) {
+                                                        bytes::Bytes::from(format!(
+                                                            "pending: {}",
+                                                            err.as_error()
+                                                        ))
+                                                    } else {
+                                                        bytes::Bytes::from(
+                                                            err.as_error().to_string(),
+                                                        )
+                                                    };
+                                                eprintln!(
+                                                    "fs_meta_runtime_app: source rescan proxy failed node={} err={}",
+                                                    node_id.0,
+                                                    err.as_error()
+                                                );
+                                                responses.push(Event::new(
+                                                    EventMetadata {
+                                                        origin_id: node_id.clone(),
+                                                        timestamp_us: now_us(),
+                                                        logical_ts: None,
+                                                        correlation_id: req
+                                                            .metadata()
+                                                            .correlation_id,
+                                                        ingress_auth: None,
+                                                        trace: None,
+                                                    },
+                                                    payload,
+                                                ));
+                                            }
                                         }
                                     }
+                                    responses
                                 }
-                                responses
-                            }
-                        },
-                    );
+                            },
+                        );
                     tasks.push(endpoint);
                 }
                 continue;
@@ -10924,7 +10989,7 @@ impl FSMetaApp {
                 "fs_meta_runtime_app: spawning source rescan non-target drain endpoint route={}",
                 source_rescan_route_key
             );
-            let endpoint = ManagedEndpointTask::spawn_with_unit(
+            let endpoint = ManagedEndpointTask::spawn_with_unit_without_ready_wait(
                 boundary.clone(),
                 source_rescan_route,
                 format!(
@@ -10958,26 +11023,12 @@ impl FSMetaApp {
             tasks.push(endpoint);
         }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND) {
-            if internal_query_active {
-                let prefer_query_peer_first = self
-                    .mirrored_query_peer_routes
-                    .lock()
-                    .await
-                    .contains_key(&route.0);
-                let endpoint_unit_ids = preferred_internal_query_endpoint_units(
-                    query_active,
-                    query_peer_active,
-                    prefer_query_peer_first,
-                );
-                if endpoint_unit_ids.is_empty()
-                    || !route_still_active_for_units(
-                        &self.facade_gate,
-                        &route.0,
-                        &endpoint_unit_ids,
-                    )
+            if source_active {
+                let endpoint_unit_ids = vec![execution_units::SOURCE_RUNTIME_UNIT_ID];
+                if !route_still_active_for_units(&self.facade_gate, &route.0, &endpoint_unit_ids)
                     || !spawned_routes.insert(route.0.clone())
                 {
-                    // Not currently selected as query/query-peer source-find owner, route inactive, or already running.
+                    // Not currently selected as source-find owner, route inactive, or already running.
                 } else {
                     eprintln!(
                         "fs_meta_runtime_app: spawning source find proxy endpoint route={}",
@@ -10985,7 +11036,7 @@ impl FSMetaApp {
                     );
                     let source = self.source.clone();
                     let node_id = self.node_id.clone();
-                    let endpoint = ManagedEndpointTask::spawn_with_units(
+                    let endpoint = ManagedEndpointTask::spawn_with_units_without_ready_wait(
                         boundary.clone(),
                         route,
                         format!(
@@ -11114,26 +11165,12 @@ impl FSMetaApp {
         if let Ok(route) =
             scoped_source_find_routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
         {
-            if internal_query_active {
-                let prefer_query_peer_first = self
-                    .mirrored_query_peer_routes
-                    .lock()
-                    .await
-                    .contains_key(&route.0);
-                let endpoint_unit_ids = preferred_internal_query_endpoint_units(
-                    query_active,
-                    query_peer_active,
-                    prefer_query_peer_first,
-                );
-                if endpoint_unit_ids.is_empty()
-                    || !route_still_active_for_units(
-                        &self.facade_gate,
-                        &route.0,
-                        &endpoint_unit_ids,
-                    )
+            if source_active {
+                let endpoint_unit_ids = vec![execution_units::SOURCE_RUNTIME_UNIT_ID];
+                if !route_still_active_for_units(&self.facade_gate, &route.0, &endpoint_unit_ids)
                     || !spawned_routes.insert(route.0.clone())
                 {
-                    // Not currently selected as query/query-peer scoped source-find owner, route inactive, or already running.
+                    // Not currently selected as scoped source-find owner, route inactive, or already running.
                 } else {
                     eprintln!(
                         "fs_meta_runtime_app: spawning source find proxy endpoint route={}",
@@ -11141,7 +11178,7 @@ impl FSMetaApp {
                     );
                     let source = self.source.clone();
                     let node_id = self.node_id.clone();
-                    let endpoint = ManagedEndpointTask::spawn_with_units(
+                    let endpoint = ManagedEndpointTask::spawn_with_units_without_ready_wait(
                         boundary.clone(),
                         route,
                         format!(
@@ -12466,8 +12503,7 @@ impl FSMetaApp {
                 unit: FacadeRuntimeUnit::QueryPeer,
                 route_key,
                 ..
-            } if route_key == &format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
-                || route_key == &format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
+            } if route_key == &format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
                 || is_per_peer_sink_query_request_route(route_key)
         )
     }
@@ -12478,16 +12514,11 @@ impl FSMetaApp {
     ) -> bool {
         let public_find_route = format!("{}.req", ROUTE_KEY_QUERY);
         let materialized_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
-        let sink_status_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
         match unit {
             FacadeRuntimeUnit::Query => {
-                route_key == public_find_route
-                    || route_key == materialized_proxy_route
-                    || route_key == sink_status_route
+                route_key == public_find_route || route_key == materialized_proxy_route
             }
-            FacadeRuntimeUnit::QueryPeer => {
-                route_key == materialized_proxy_route || route_key == sink_status_route
-            }
+            FacadeRuntimeUnit::QueryPeer => route_key == materialized_proxy_route,
             FacadeRuntimeUnit::Facade => false,
         }
     }
@@ -13015,14 +13046,16 @@ impl FSMetaApp {
     ) {
         #[cfg(test)]
         maybe_pause_before_uninitialized_query_withdraw().await;
-        let mut query_routes = vec![
-            format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
-            source_find_request_route_for(&self.node_id.0).0,
-        ];
+        let mut query_routes = Vec::new();
         if recovery_lane_policy == ControlFailureRecoveryLanePolicy::WithdrawInternalStatus {
-            query_routes.push(format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL));
-            query_routes.push(format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY));
             query_routes.push(format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL));
+        }
+        if matches!(
+            recovery_lane_policy,
+            ControlFailureRecoveryLanePolicy::WithdrawInternalStatus
+                | ControlFailureRecoveryLanePolicy::PreserveSourceStatus
+        ) {
+            query_routes.push(format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY));
         }
         for route_key in &query_routes {
             if preserve_core_business_read_routes
@@ -13157,12 +13190,17 @@ impl FSMetaApp {
         }
         self.mark_control_uninitialized_after_failure_with_session_and_policy_and_replay(
             fixed_bind_session,
-            ControlFailureRecoveryLanePolicy::PreserveInternalStatus,
+            if require_sink_replay {
+                ControlFailureRecoveryLanePolicy::PreserveSourceStatus
+            } else {
+                ControlFailureRecoveryLanePolicy::PreserveInternalStatus
+            },
             if require_sink_replay {
                 ControlFailureReplayRequirement::SourceAndSink
             } else {
                 ControlFailureReplayRequirement::Source
             },
+            true,
         )
         .await;
         self.schedule_deferred_source_repair_recovery("source-generation-cutover");
@@ -13181,6 +13219,7 @@ impl FSMetaApp {
             fixed_bind_session,
             ControlFailureRecoveryLanePolicy::WithdrawInternalStatus,
             ControlFailureReplayRequirement::Sink,
+            true,
         )
         .await;
         self.schedule_deferred_sink_repair_recovery("sink-generation-cutover");
@@ -13206,6 +13245,7 @@ impl FSMetaApp {
             fixed_bind_session,
             recovery_lane_policy,
             ControlFailureReplayRequirement::Full,
+            false,
         )
         .await;
     }
@@ -13215,6 +13255,7 @@ impl FSMetaApp {
         fixed_bind_session: &FixedBindLifecycleSession,
         recovery_lane_policy: ControlFailureRecoveryLanePolicy,
         replay_requirement: ControlFailureReplayRequirement,
+        preserve_core_business_read_routes: bool,
     ) {
         self.update_runtime_control_state(|state| match replay_requirement {
             ControlFailureReplayRequirement::Full => state.mark_uninitialized_with_full_replay(),
@@ -13247,11 +13288,25 @@ impl FSMetaApp {
             .await;
         match recovery_lane_policy {
             ControlFailureRecoveryLanePolicy::WithdrawInternalStatus => {
-                self.withdraw_uninitialized_query_routes().await;
+                self.withdraw_uninitialized_query_routes_with_policy(
+                    ControlFailureRecoveryLanePolicy::WithdrawInternalStatus,
+                    preserve_core_business_read_routes,
+                )
+                .await;
+            }
+            ControlFailureRecoveryLanePolicy::PreserveSourceStatus => {
+                self.withdraw_uninitialized_query_routes_with_policy(
+                    ControlFailureRecoveryLanePolicy::PreserveSourceStatus,
+                    preserve_core_business_read_routes,
+                )
+                .await;
             }
             ControlFailureRecoveryLanePolicy::PreserveInternalStatus => {
-                self.withdraw_uninitialized_query_routes_preserving_internal_status()
-                    .await;
+                self.withdraw_uninitialized_query_routes_with_policy(
+                    ControlFailureRecoveryLanePolicy::PreserveInternalStatus,
+                    preserve_core_business_read_routes,
+                )
+                .await;
             }
         }
     }
@@ -13982,7 +14037,10 @@ impl FSMetaApp {
         self.record_shared_source_route_claims(&filtered_source_signals)
             .await;
         self.apply_source_signals_to_runtime_endpoint_gate(&filtered_source_signals)
-            .map_err(RuntimeWorkerControlApplyFailure::from)
+            .map_err(RuntimeWorkerControlApplyFailure::from)?;
+        self.refresh_source_rescan_proxy_ready_from_retained_endpoint()
+            .await;
+        Ok(())
     }
 
     async fn apply_source_signals_with_recovery(

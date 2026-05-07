@@ -82,6 +82,7 @@ fn source_status_for_cache_key(group_id: &str) -> SourceStatusSnapshot {
 
 fn sink_status_for_cache_key(group_id: &str) -> SinkStatusSnapshot {
     let mut group = sink_group_status(group_id, true);
+    group.primary_object_ref = format!("node-a::{group_id}");
     group.shadow_time_us = 100;
     group.shadow_lag_us = 1;
     group.estimated_heap_bytes = 4096;
@@ -99,6 +100,128 @@ fn sink_status_for_cache_key(group_id: &str) -> SinkStatusSnapshot {
         stream_last_applied_at_us_by_node: BTreeMap::from([("node-a".to_string(), 400)]),
         ..SinkStatusSnapshot::default()
     }
+}
+
+#[test]
+fn materialized_ready_sink_evidence_cache_restores_missing_scheduled_group_for_current_source_primary()
+ {
+    let group_id = "nfs-cache-missing-current-primary";
+    let source_status = source_status_for_cache_key(group_id);
+    let cached_ready = sink_status_for_cache_key(group_id);
+    let _ = apply_materialized_ready_sink_evidence_cache(cached_ready, &source_status);
+
+    let partial_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec![group_id.to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+    let restored = apply_materialized_ready_sink_evidence_cache(partial_status, &source_status);
+
+    assert!(
+        sink_status_covers_ready_readiness_groups(&restored, &BTreeSet::from([group_id.to_string()])),
+        "current source-primary ready evidence must be restored when a later routed status keeps the schedule but omits the group row: {restored:?}"
+    );
+    assert_eq!(
+        materialized_observation_status(&source_status, &restored).state,
+        ObservationState::TrustedMaterialized,
+        "package-local materialized observation must stay trusted across a partial routed status omission"
+    );
+}
+
+#[test]
+fn materialized_ready_sink_evidence_cache_replaces_stale_primary_pending_group_with_current_source_primary()
+ {
+    let group_id = "nfs-cache-stale-primary";
+    let source_status = source_status_for_cache_key(group_id);
+    let cached_ready = sink_status_for_cache_key(group_id);
+    let _ = apply_materialized_ready_sink_evidence_cache(cached_ready, &source_status);
+    let mut stale_pending = sink_group_status(group_id, false);
+    stale_pending.primary_object_ref = format!("node-z::{group_id}");
+
+    let partial_status = SinkStatusSnapshot {
+        groups: vec![stale_pending],
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-z".to_string(),
+            vec![group_id.to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+    let restored = apply_materialized_ready_sink_evidence_cache(partial_status, &source_status);
+    let restored_group = restored
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .expect("restored group");
+
+    assert_eq!(restored_group.primary_object_ref, format!("node-a::{group_id}"));
+    assert!(
+        sink_group_readiness_reports_live_materialized_group(restored_group),
+        "current source-primary ready evidence must outrank stale-primary pending routed evidence: {restored:?}"
+    );
+}
+
+#[test]
+fn trusted_materialized_status_admission_rejects_partial_root_universe_even_when_partial_observation_is_trusted()
+ {
+    let source_status = source_status_for_cache_key("nfs1");
+    let sink_status = sink_status_for_cache_key("nfs1");
+    let readiness_groups = BTreeSet::from(["nfs1".to_string(), "nfs3".to_string()]);
+
+    assert_eq!(
+        materialized_observation_status(&source_status, &sink_status).state,
+        ObservationState::TrustedMaterialized,
+        "partial routed source/sink evidence can be internally self-consistent"
+    );
+    assert!(
+        !trusted_materialized_status_covers_readiness_groups(
+            &source_status,
+            &sink_status,
+            &readiness_groups
+        ),
+        "trusted-materialized admission must not accept a partial routed root universe when the configured active scan roots include more groups"
+    );
+}
+
+#[test]
+fn trusted_materialized_status_admission_ignores_stale_extra_status_roots_outside_current_readiness()
+ {
+    let mut source_status = source_status_for_cache_key("nfs2");
+    let stale_source_status = source_status_for_cache_key("nfs1");
+    source_status
+        .logical_roots
+        .extend(stale_source_status.logical_roots);
+    source_status
+        .concrete_roots
+        .extend(stale_source_status.concrete_roots);
+
+    let mut sink_status = sink_status_for_cache_key("nfs2");
+    let mut stale_pending_group = sink_group_status("nfs1", false);
+    stale_pending_group.primary_object_ref = "node-a::nfs1".to_string();
+    stale_pending_group.overflow_pending_materialization = true;
+    sink_status.groups.push(stale_pending_group);
+    sink_status
+        .scheduled_groups_by_node
+        .entry("node-a".to_string())
+        .or_default()
+        .push("nfs1".to_string());
+
+    let current_readiness_groups = BTreeSet::from(["nfs2".to_string()]);
+
+    assert_ne!(
+        materialized_observation_status(&source_status, &sink_status).state,
+        ObservationState::TrustedMaterialized,
+        "full status remains untrusted because it still contains stale pending nfs1 evidence"
+    );
+    assert!(
+        trusted_materialized_status_covers_readiness_groups(
+            &source_status,
+            &sink_status,
+            &current_readiness_groups
+        ),
+        "trusted-materialized admission must judge the current app-authoritative root set, not stale extra roots from older routed status"
+    );
 }
 
 #[test]

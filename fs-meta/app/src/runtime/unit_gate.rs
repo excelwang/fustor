@@ -14,6 +14,7 @@ struct RouteControlState {
 #[derive(Debug, Clone, Default)]
 struct UnitControlState {
     routes: HashMap<String, RouteControlState>,
+    authoritative_bound_scopes: Option<Vec<RuntimeBoundScope>>,
 }
 
 #[derive(Clone, Default)]
@@ -70,12 +71,8 @@ impl UnitControlGate {
     }
 
     fn sync_active_scopes(&mut self, unit_id: &str, bound_scopes: &[RuntimeBoundScope]) {
-        let Some(state) = self.units.get_mut(unit_id) else {
-            return;
-        };
-        for route in state.routes.values_mut().filter(|route| route.active) {
-            route.bound_scopes = bound_scopes.to_vec();
-        }
+        let state = self.units.entry(unit_id.to_string()).or_default();
+        state.authoritative_bound_scopes = Some(bound_scopes.to_vec());
     }
 
     fn clear_route(&mut self, unit_id: &str, route_key: &str) {
@@ -88,6 +85,37 @@ impl UnitControlGate {
         route.active = false;
         route.bound_scopes.clear();
     }
+}
+
+fn effective_route_bound_scopes(
+    route_bound_scopes: &[RuntimeBoundScope],
+    authoritative_bound_scopes: Option<&[RuntimeBoundScope]>,
+) -> Vec<RuntimeBoundScope> {
+    let Some(authoritative_bound_scopes) = authoritative_bound_scopes else {
+        return route_bound_scopes.to_vec();
+    };
+    let route_resources_by_scope = route_bound_scopes
+        .iter()
+        .map(|scope| {
+            (
+                scope.scope_id.clone(),
+                scope.resource_ids.iter().cloned().collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    authoritative_bound_scopes
+        .iter()
+        .map(|scope| {
+            let resource_ids = route_resources_by_scope
+                .get(&scope.scope_id)
+                .cloned()
+                .unwrap_or_else(|| scope.resource_ids.iter().cloned().collect());
+            RuntimeBoundScope {
+                scope_id: scope.scope_id.clone(),
+                resource_ids: resource_ids.into_iter().collect(),
+            }
+        })
+        .collect()
 }
 
 /// Shared runtime unit control gate for fs-meta modules.
@@ -281,7 +309,10 @@ impl RuntimeUnitGate {
         Ok(gate.units.get(unit_id).cloned().map(|row| {
             let mut merged = BTreeMap::<String, (u64, BTreeSet<String>)>::new();
             for route in row.routes.values().filter(|route| route.active) {
-                for scope in &route.bound_scopes {
+                for scope in effective_route_bound_scopes(
+                    &route.bound_scopes,
+                    row.authoritative_bound_scopes.as_deref(),
+                ) {
                     let incoming = scope.resource_ids.iter().cloned().collect::<BTreeSet<_>>();
                     match merged.entry(scope.scope_id.clone()) {
                         std::collections::btree_map::Entry::Vacant(entry) => {
@@ -337,6 +368,13 @@ mod tests {
         RuntimeBoundScope {
             scope_id: scope_id.to_string(),
             resource_ids: vec![resource_id.to_string()],
+        }
+    }
+
+    fn bare_scope(scope_id: &str) -> RuntimeBoundScope {
+        RuntimeBoundScope {
+            scope_id: scope_id.to_string(),
+            resource_ids: Vec::new(),
         }
     }
 
@@ -414,6 +452,56 @@ mod tests {
             scope_ids,
             BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
             "runtime-managed empty followup activates must not erase previously active scopes",
+        );
+    }
+
+    #[test]
+    fn synced_active_scopes_remain_authoritative_across_later_stale_activate() {
+        let gate = RuntimeUnitGate::new_runtime_managed("test-gate", &["runtime.exec.source"]);
+
+        assert!(
+            gate.apply_activate(
+                "runtime.exec.source",
+                "source-status:v1.req",
+                2,
+                &[
+                    bound_scope("nfs1", "node-a::nfs1"),
+                    bound_scope("nfs2", "node-a::nfs2")
+                ]
+            )
+            .expect("initial activate")
+        );
+        gate.sync_active_scopes(
+            "runtime.exec.source",
+            &[bare_scope("nfs2"), bare_scope("nfs4")],
+        )
+        .expect("sync accepted logical roots");
+        assert!(
+            gate.apply_activate(
+                "runtime.exec.source",
+                "source-status:v1.req",
+                3,
+                &[
+                    bound_scope("nfs1", "node-a::nfs1"),
+                    bound_scope("nfs2", "node-a::nfs2")
+                ]
+            )
+            .expect("later stale activate")
+        );
+
+        let state = gate
+            .unit_state("runtime.exec.source")
+            .expect("unit_state")
+            .expect("unit should exist");
+        let scope_ids = state
+            .1
+            .into_iter()
+            .map(|scope| scope.scope_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            scope_ids,
+            BTreeSet::from(["nfs2".to_string(), "nfs4".to_string()]),
+            "accepted logical roots are app-authoritative; later runtime route hints must not reintroduce retired roots or drop newly accepted roots",
         );
     }
 

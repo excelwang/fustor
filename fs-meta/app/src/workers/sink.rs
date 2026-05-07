@@ -1201,7 +1201,7 @@ fn apply_live_sink_status_snapshot_outcome_side_effects(
     Ok(())
 }
 
-fn republish_scheduled_groups_into_zero_row_summary(
+fn republish_scheduled_group_ids_into_status_summary(
     snapshot: &mut SinkStatusSnapshot,
     node_id: &NodeId,
     groups: &std::collections::BTreeSet<String>,
@@ -1209,24 +1209,23 @@ fn republish_scheduled_groups_into_zero_row_summary(
     if groups.is_empty() {
         return;
     }
-    let zero_rows_only = !snapshot.groups.is_empty()
-        && snapshot
-            .groups
-            .iter()
-            .all(|group| group.live_nodes == 0 && group.total_nodes == 0);
-    let rows_cover_cached_schedule = !snapshot.groups.is_empty()
-        && groups.iter().all(|group_id| {
-            snapshot
-                .groups
-                .iter()
-                .any(|group| group.group_id == *group_id)
-        });
-    if !snapshot.groups.is_empty() && !zero_rows_only && !rows_cover_cached_schedule {
+    let existing_scheduled_groups = snapshot.scheduled_groups();
+    let missing_groups = groups
+        .difference(&existing_scheduled_groups)
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing_groups.is_empty() {
         return;
     }
     snapshot
         .scheduled_groups_by_node
-        .insert(node_id.0.clone(), groups.iter().cloned().collect());
+        .entry(node_id.0.clone())
+        .or_default()
+        .extend(missing_groups);
+    if let Some(entry) = snapshot.scheduled_groups_by_node.get_mut(&node_id.0) {
+        entry.sort();
+        entry.dedup();
+    }
 }
 
 fn host_ref_matches_node_id(host_ref: &str, node_id: &NodeId) -> bool {
@@ -1352,6 +1351,7 @@ pub struct SinkWorkerClientHandle {
     worker: Arc<tokio::sync::Mutex<SharedSinkWorkerClient>>,
     config: Arc<Mutex<SourceConfig>>,
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
+    logical_roots_generation: Arc<AtomicU64>,
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
     scheduled_groups_cache: Arc<Mutex<Option<std::collections::BTreeSet<String>>>>,
     retained_control_state: Arc<tokio::sync::Mutex<RetainedSinkWorkerControlState>>,
@@ -1366,6 +1366,7 @@ struct SharedSinkWorkerHandleState {
     worker: Arc<tokio::sync::Mutex<SharedSinkWorkerClient>>,
     config: Arc<Mutex<SourceConfig>>,
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
+    logical_roots_generation: Arc<AtomicU64>,
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
     scheduled_groups_cache: Arc<Mutex<Option<std::collections::BTreeSet<String>>>>,
     retained_control_state: Arc<tokio::sync::Mutex<RetainedSinkWorkerControlState>>,
@@ -2272,6 +2273,7 @@ impl SinkWorkerClientHandle {
                     })),
                     config: Arc::new(Mutex::new(config.clone())),
                     logical_roots_cache: Arc::new(Mutex::new(config.roots.clone())),
+                    logical_roots_generation: Arc::new(AtomicU64::new(1)),
                     status_cache: Arc::new(Mutex::new(SinkStatusSnapshot::default())),
                     scheduled_groups_cache: Arc::new(Mutex::new(None)),
                     retained_control_state: Arc::new(tokio::sync::Mutex::new(
@@ -2294,6 +2296,7 @@ impl SinkWorkerClientHandle {
             worker: shared.worker.clone(),
             config: shared.config.clone(),
             logical_roots_cache: shared.logical_roots_cache.clone(),
+            logical_roots_generation: shared.logical_roots_generation.clone(),
             status_cache: shared.status_cache.clone(),
             scheduled_groups_cache: shared.scheduled_groups_cache.clone(),
             retained_control_state: shared.retained_control_state.clone(),
@@ -2531,7 +2534,7 @@ impl SinkWorkerClientHandle {
             .status_cache
             .lock()
             .map_err(|_| CnxError::Internal("sink worker status cache lock poisoned".into()))?;
-        republish_scheduled_groups_into_zero_row_summary(&mut guard, &self.node_id, &groups);
+        republish_scheduled_group_ids_into_status_summary(&mut guard, &self.node_id, &groups);
         Ok(())
     }
 
@@ -2935,6 +2938,7 @@ impl SinkWorkerClientHandle {
         }
         self.update_cached_logical_roots(roots.clone())
             .map_err(SinkFailure::from)?;
+        self.logical_roots_generation.fetch_add(1, Ordering::Relaxed);
         self.update_cached_runtime_config(&roots, &host_object_grants)
             .map_err(SinkFailure::from)?;
         self.retain_cached_status_for_surviving_roots(&roots)
@@ -2989,7 +2993,11 @@ impl SinkWorkerClientHandle {
             self.update_cached_scheduled_group_ids(&scheduled_groups)?;
         }
         if let Some(groups) = self.cached_scheduled_group_ids()? {
-            republish_scheduled_groups_into_zero_row_summary(&mut snapshot, &self.node_id, &groups);
+            republish_scheduled_group_ids_into_status_summary(
+                &mut snapshot,
+                &self.node_id,
+                &groups,
+            );
         }
         if debug_control_scope_capture_enabled() {
             eprintln!(
@@ -3146,10 +3154,52 @@ impl SinkWorkerClientHandle {
         }
         self.update_cached_logical_roots(roots.clone())
             .map_err(SinkFailure::from)?;
+        self.logical_roots_generation.fetch_add(1, Ordering::Relaxed);
         self.update_cached_runtime_config(&roots, &host_object_grants)
             .map_err(SinkFailure::from)?;
         self.retain_cached_status_for_surviving_roots(&roots)
             .map_err(SinkFailure::from)
+    }
+
+    async fn logical_roots_generation_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SinkFailure> {
+        let cached_generation = self.logical_roots_generation.load(Ordering::Acquire);
+        let response = self
+            .with_started_retry_with_failure(|client| async move {
+                Self::call_worker_with_failure(
+                    &client,
+                    SinkWorkerRequest::LogicalRootsGenerationSnapshot,
+                    SINK_WORKER_CONTROL_RPC_TIMEOUT,
+                )
+                .await
+            })
+            .await;
+        match response {
+            Ok(SinkWorkerResponse::LogicalRootsGeneration(generation)) => {
+                self.logical_roots_generation
+                    .store(generation, Ordering::Release);
+                Ok(generation)
+            }
+            Ok(other) => {
+                log::warn!(
+                    "sink worker logical roots generation snapshot returned unexpected response on node {}: {:?}; using cached generation {}",
+                    self.node_id.0,
+                    other,
+                    cached_generation
+                );
+                Ok(cached_generation)
+            }
+            Err(err) => {
+                log::warn!(
+                    "sink worker logical roots generation snapshot failed on node {}: {:?}; using cached generation {}",
+                    self.node_id.0,
+                    err.as_error(),
+                    cached_generation
+                );
+                Ok(cached_generation)
+            }
+        }
     }
 
     async fn nonblocking_status_entry_action(
@@ -4728,6 +4778,15 @@ impl SinkFacade {
         match self {
             Self::Local(sink) => sink.logical_roots_snapshot_with_failure(),
             Self::Worker(client) => client.logical_roots_snapshot_with_failure().await,
+        }
+    }
+
+    pub(crate) async fn logical_roots_generation_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SinkFailure> {
+        match self {
+            Self::Local(sink) => Ok(sink.current_logical_roots_generation()),
+            Self::Worker(client) => client.logical_roots_generation_with_failure().await,
         }
     }
 

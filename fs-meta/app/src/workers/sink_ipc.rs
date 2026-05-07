@@ -26,6 +26,7 @@ pub enum SinkWorkerRequest {
         host_object_grants: Vec<GrantedMountRoot>,
     },
     LogicalRootsSnapshot,
+    LogicalRootsGenerationSnapshot,
     ScheduledGroupIds,
     Health,
     StatusSnapshot,
@@ -51,6 +52,7 @@ pub enum SinkWorkerRequest {
 pub enum SinkWorkerResponse {
     Ack,
     LogicalRoots(Vec<RootSpec>),
+    LogicalRootsGeneration(u64),
     ScheduledGroupIds(Option<Vec<String>>),
     Health(HealthStats),
     StatusSnapshot(SinkStatusSnapshot),

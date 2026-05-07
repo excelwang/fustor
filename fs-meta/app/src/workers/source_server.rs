@@ -38,6 +38,8 @@ const SOURCE_WORKER_STOP_ABORT_TIMEOUT: Duration = Duration::from_millis(250);
 const SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const SOURCE_WORKER_BOOTSTRAP_FENCED_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const SOURCE_WORKER_UPDATE_ROOTS_FENCED_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
+const SOURCE_WORKER_EVENT_STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const SOURCE_WORKER_PUBLISH_TRANSIENT_PRESSURE_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 struct SourceWorkerState {
     source: Option<Arc<FSMetaSource>>,
@@ -111,12 +113,6 @@ enum SourceWorkerAction {
         source: Arc<FSMetaSource>,
         authoritative_roots: Vec<crate::source::config::RootSpec>,
     },
-    SyncLogicalRootsAndObservabilitySnapshot {
-        source: Arc<FSMetaSource>,
-        authoritative_roots: Vec<crate::source::config::RootSpec>,
-        last_control_frame_signals: Vec<String>,
-        published_stats: Arc<StdMutex<PublishedBatchStats>>,
-    },
     UpdateLogicalRoots {
         source: Arc<FSMetaSource>,
         roots: Vec<crate::source::config::RootSpec>,
@@ -130,12 +126,22 @@ enum SourceWorkerAction {
     TriggerRescanWhenReadyEpoch {
         source: Arc<FSMetaSource>,
     },
+    SubmitTargetedRescanRequestEpoch {
+        source: Arc<FSMetaSource>,
+    },
     TriggerTargetedRescanWhenReadyEpoch {
         source: Arc<FSMetaSource>,
     },
     OnControlFrame {
         source: Arc<FSMetaSource>,
         envelopes: Vec<ControlEnvelope>,
+    },
+}
+
+enum DeferredSourceWorkerAction {
+    SignalManualRescanIntents {
+        source: Arc<FSMetaSource>,
+        root_keys: std::collections::BTreeSet<String>,
     },
 }
 
@@ -163,6 +169,9 @@ fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
     match request {
         SourceWorkerRequest::UpdateLogicalRoots { .. } => "UpdateLogicalRoots",
         SourceWorkerRequest::LogicalRootsSnapshot => "LogicalRootsSnapshot",
+        SourceWorkerRequest::LogicalRootsGenerationSnapshot => {
+            "LogicalRootsGenerationSnapshot"
+        }
         SourceWorkerRequest::HostObjectGrantsSnapshot => "HostObjectGrantsSnapshot",
         SourceWorkerRequest::HostObjectGrantsVersionSnapshot => "HostObjectGrantsVersionSnapshot",
         SourceWorkerRequest::StatusSnapshot => "StatusSnapshot",
@@ -182,6 +191,7 @@ fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
         SourceWorkerRequest::ResolveGroupIdForObjectRef { .. } => "ResolveGroupIdForObjectRef",
         SourceWorkerRequest::PublishManualRescanSignal => "PublishManualRescanSignal",
         SourceWorkerRequest::SubmitRescanRequestEpoch => "SubmitRescanRequestEpoch",
+        SourceWorkerRequest::SubmitTargetedRescanRequestEpoch => "SubmitTargetedRescanRequestEpoch",
         SourceWorkerRequest::TriggerRescanWhenReadyEpoch => "TriggerRescanWhenReadyEpoch",
         SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch => {
             "TriggerTargetedRescanWhenReadyEpoch"
@@ -670,33 +680,7 @@ where
                     summarize_published_batch_path_counts(&batch, &target),
                 );
             }
-            let mut publish_attempt = 0u64;
-            loop {
-                publish_attempt = publish_attempt.saturating_add(1);
-                let boundary = clone_pump_boundary_target(&boundary);
-                match boundary
-                    .channel_send(
-                        BoundaryContext::default(),
-                        ChannelSendRequest {
-                            channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
-                            events: batch.clone(),
-                            timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
-                        },
-                    )
-                    .await
-                {
-                    Ok(()) => break,
-                    Err(err) => {
-                        log::warn!(
-                            "source worker pump retrying source batch publication origin={} attempt={} err={:?}",
-                            origin,
-                            publish_attempt,
-                            err
-                        );
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            }
+            publish_event_stream_batch(boundary.clone(), &batch, &origin).await;
             record_summarized_path_stats(&published_stats, &publish_update);
             update_published_stats(&published_stats, &publish_update);
             if let Some(summary) = &summary {
@@ -707,6 +691,55 @@ where
             }
         }
     })
+}
+
+async fn publish_event_stream_batch(
+    boundary: Arc<StdMutex<Arc<dyn ChannelIoSubset>>>,
+    batch: &[Event],
+    origin: &str,
+) {
+    let mut pending = std::collections::VecDeque::from([batch.to_vec()]);
+    while let Some(window) = pending.pop_front() {
+        let mut publish_attempt = 0u64;
+        loop {
+            publish_attempt = publish_attempt.saturating_add(1);
+            let target = clone_pump_boundary_target(&boundary);
+            match target
+                .channel_send(
+                    BoundaryContext::default(),
+                    ChannelSendRequest {
+                        channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
+                        events: window.clone(),
+                        timeout_ms: Some(
+                            SOURCE_WORKER_EVENT_STREAM_SEND_TIMEOUT.as_millis() as u64,
+                        ),
+                    },
+                )
+                .await
+            {
+                Ok(()) => break,
+                Err(CnxError::Backpressure) if window.len() > 1 => {
+                    let midpoint = window.len() / 2;
+                    let left = window[..midpoint].to_vec();
+                    let right = window[midpoint..].to_vec();
+                    pending.push_front(right);
+                    pending.push_front(left);
+                    break;
+                }
+                Err(err) => {
+                    log::warn!(
+                        "source worker pump retrying source event publication origin={} window_len={} attempt={} err={:?}",
+                        origin,
+                        window.len(),
+                        publish_attempt,
+                        err
+                    );
+                    tokio::time::sleep(SOURCE_WORKER_PUBLISH_TRANSIENT_PRESSURE_RETRY_BACKOFF)
+                        .await;
+                }
+            }
+        }
+    }
 }
 
 fn bootstrap_not_ready() -> CnxError {
@@ -727,6 +760,7 @@ fn request_requires_live_publish_pump(request: &SourceWorkerRequest) -> bool {
         SourceWorkerRequest::UpdateLogicalRoots { .. }
             | SourceWorkerRequest::PublishManualRescanSignal
             | SourceWorkerRequest::SubmitRescanRequestEpoch
+            | SourceWorkerRequest::SubmitTargetedRescanRequestEpoch
             | SourceWorkerRequest::TriggerRescanWhenReadyEpoch
             | SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch
             | SourceWorkerRequest::CheckTargetedRescanDeliveryAcceptance
@@ -957,6 +991,18 @@ fn plan_worker_request(
                 false,
             ),
         },
+        SourceWorkerRequest::LogicalRootsGenerationSnapshot => match state.source.as_ref() {
+            Some(source) => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::LogicalRootsGeneration(
+                    source.current_logical_roots_generation(),
+                ),
+                false,
+            ),
+            None => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
         SourceWorkerRequest::HostObjectGrantsSnapshot => match state.source.as_ref() {
             Some(source) => match source.host_object_grants_snapshot_with_failure() {
                 Ok(grants) => SourceWorkerAction::Immediate(
@@ -1030,32 +1076,18 @@ fn plan_worker_request(
             ),
         },
         SourceWorkerRequest::ObservabilitySnapshot => match state.source.as_ref() {
-            Some(source) => match source.authoritative_logical_roots_if_changed() {
-                Ok(Some(authoritative_roots)) => {
-                    SourceWorkerAction::SyncLogicalRootsAndObservabilitySnapshot {
-                        source: source.clone(),
-                        authoritative_roots,
-                        last_control_frame_signals: state.last_control_frame_signals.clone(),
-                        published_stats: state.published_stats.clone(),
-                    }
-                }
-                Ok(None) => match source_observability_snapshot_with_failure(
-                    source,
-                    &state.last_control_frame_signals,
-                    &state.published_stats,
-                ) {
-                    Ok(snapshot) => SourceWorkerAction::Immediate(
-                        SourceWorkerResponse::ObservabilitySnapshot(snapshot),
-                        false,
-                    ),
-                    Err(err) => {
-                        SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
-                    }
-                },
-                Err(err) => SourceWorkerAction::Immediate(
-                    SourceWorkerResponse::Error(err.to_string()),
+            Some(source) => match source_observability_snapshot_with_failure(
+                source,
+                &state.last_control_frame_signals,
+                &state.published_stats,
+            ) {
+                Ok(snapshot) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::ObservabilitySnapshot(snapshot),
                     false,
                 ),
+                Err(err) => {
+                    SourceWorkerAction::Immediate(classify_source_worker_failure(err), false)
+                }
             },
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
@@ -1246,6 +1278,13 @@ fn plan_worker_request(
                 false,
             ),
         },
+        SourceWorkerRequest::SubmitTargetedRescanRequestEpoch => match state.source.clone() {
+            Some(source) => SourceWorkerAction::SubmitTargetedRescanRequestEpoch { source },
+            None => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
         SourceWorkerRequest::TriggerRescanWhenReadyEpoch => match state.source.clone() {
             Some(source) => SourceWorkerAction::TriggerRescanWhenReadyEpoch { source },
             None => SourceWorkerAction::Immediate(
@@ -1308,9 +1347,15 @@ fn plan_worker_request(
     }
 }
 
-async fn execute_worker_action(action: SourceWorkerAction) -> (SourceWorkerResponse, bool) {
+async fn execute_worker_action(
+    action: SourceWorkerAction,
+) -> (
+    SourceWorkerResponse,
+    bool,
+    Option<DeferredSourceWorkerAction>,
+) {
     match action {
-        SourceWorkerAction::Immediate(response, stop) => (response, stop),
+        SourceWorkerAction::Immediate(response, stop) => (response, stop, None),
         SourceWorkerAction::SyncLogicalRootsAndStatusSnapshot {
             source,
             authoritative_roots,
@@ -1325,31 +1370,9 @@ async fn execute_worker_action(action: SourceWorkerAction) -> (SourceWorkerRespo
             Ok(()) => (
                 SourceWorkerResponse::StatusSnapshot(source.status_snapshot()),
                 false,
+                None,
             ),
-            Err(err) => (classify_source_worker_error(err), false),
-        },
-        SourceWorkerAction::SyncLogicalRootsAndObservabilitySnapshot {
-            source,
-            authoritative_roots,
-            last_control_frame_signals,
-            published_stats,
-        } => match source
-            .apply_logical_roots_snapshot(
-                authoritative_roots,
-                false,
-                "source_worker_server.observability_snapshot_authority_sync",
-            )
-            .await
-        {
-            Ok(()) => match source_observability_snapshot_with_failure(
-                &source,
-                &last_control_frame_signals,
-                &published_stats,
-            ) {
-                Ok(snapshot) => (SourceWorkerResponse::ObservabilitySnapshot(snapshot), false),
-                Err(err) => (classify_source_worker_failure(err), false),
-            },
-            Err(err) => (classify_source_worker_error(err), false),
+            Err(err) => (classify_source_worker_error(err), false, None),
         },
         SourceWorkerAction::UpdateLogicalRoots { source, roots } => {
             eprintln!(
@@ -1365,7 +1388,7 @@ async fn execute_worker_action(action: SourceWorkerAction) -> (SourceWorkerRespo
                 {
                     Ok(_) => {
                         eprintln!("fs_meta_source_worker_server: update_logical_roots ok");
-                        return (SourceWorkerResponse::Ack, false);
+                        return (SourceWorkerResponse::Ack, false, None);
                     }
                     Err(err)
                         if is_transient_logical_roots_fenced_write_error(err.as_error())
@@ -1382,41 +1405,78 @@ async fn execute_worker_action(action: SourceWorkerAction) -> (SourceWorkerRespo
                             "fs_meta_source_worker_server: update_logical_roots err={}",
                             err.as_error()
                         );
-                        return (classify_source_worker_failure(err), false);
+                        return (classify_source_worker_failure(err), false, None);
                     }
                 }
             }
         }
         SourceWorkerAction::PublishManualRescanSignal { source } => {
             match source.publish_manual_rescan_signal_with_failure().await {
-                Ok(()) => (SourceWorkerResponse::Ack, false),
-                Err(err) => (classify_source_worker_failure(err), false),
+                Ok(()) => (SourceWorkerResponse::Ack, false, None),
+                Err(err) => (classify_source_worker_failure(err), false, None),
             }
         }
         SourceWorkerAction::SubmitRescanRequestEpoch { source } => {
-            match source.submit_rescan_request_epoch_with_failure() {
-                Ok(epoch) => (SourceWorkerResponse::RescanRequestEpoch(epoch), false),
-                Err(err) => (classify_source_worker_failure(err), false),
-            }
+            let (epoch, root_keys) = source.begin_rescan_request_epoch();
+            (
+                SourceWorkerResponse::RescanRequestEpoch(epoch),
+                false,
+                deferred_manual_rescan_signal(source, root_keys),
+            )
         }
         SourceWorkerAction::TriggerRescanWhenReadyEpoch { source } => {
-            match source.trigger_rescan_when_ready_epoch_with_failure().await {
-                Ok(epoch) => (SourceWorkerResponse::RescanRequestEpoch(epoch), false),
-                Err(err) => (classify_source_worker_failure(err), false),
+            let (epoch, root_keys) = source.begin_rescan_request_epoch();
+            (
+                SourceWorkerResponse::RescanRequestEpoch(epoch),
+                false,
+                deferred_manual_rescan_signal(source, root_keys),
+            )
+        }
+        SourceWorkerAction::SubmitTargetedRescanRequestEpoch { source } => {
+            match source.begin_targeted_rescan_request_epoch_with_failure() {
+                Ok((epoch, root_keys)) => (
+                    SourceWorkerResponse::RescanRequestEpoch(epoch),
+                    false,
+                    deferred_manual_rescan_signal(source, root_keys),
+                ),
+                Err(err) => (
+                    classify_source_worker_failure(SourceFailure::from(err)),
+                    false,
+                    None,
+                ),
             }
         }
         SourceWorkerAction::TriggerTargetedRescanWhenReadyEpoch { source } => {
-            match source.targeted_rescan_when_ready_epoch_with_failure().await {
-                Ok(epoch) => (SourceWorkerResponse::RescanRequestEpoch(epoch), false),
-                Err(err) => (classify_source_worker_failure(err), false),
+            match source.begin_targeted_rescan_request_epoch_with_failure() {
+                Ok((epoch, root_keys)) => (
+                    SourceWorkerResponse::RescanRequestEpoch(epoch),
+                    false,
+                    deferred_manual_rescan_signal(source, root_keys),
+                ),
+                Err(err) => (
+                    classify_source_worker_failure(SourceFailure::from(err)),
+                    false,
+                    None,
+                ),
             }
         }
         SourceWorkerAction::OnControlFrame { source, envelopes } => {
             match source.on_control_frame_with_failure(envelopes).await {
-                Ok(_) => (SourceWorkerResponse::Ack, false),
-                Err(err) => (classify_source_worker_failure(err), false),
+                Ok(_) => (SourceWorkerResponse::Ack, false, None),
+                Err(err) => (classify_source_worker_failure(err), false, None),
             }
         }
+    }
+}
+
+fn deferred_manual_rescan_signal(
+    source: Arc<FSMetaSource>,
+    root_keys: std::collections::BTreeSet<String>,
+) -> Option<DeferredSourceWorkerAction> {
+    if root_keys.is_empty() {
+        None
+    } else {
+        Some(DeferredSourceWorkerAction::SignalManualRescanIntents { source, root_keys })
     }
 }
 
@@ -1436,12 +1496,16 @@ pub fn run_source_worker_server(
     run_worker_sidecar_server::<SourceWorkerRpc, _, SourceConfig>(
         control_socket_path,
         data_socket_path,
-        SourceWorkerSession { state },
+        SourceWorkerSession {
+            state,
+            deferred_after_reply: Vec::new(),
+        },
     )
 }
 
 struct SourceWorkerSession {
     state: Arc<Mutex<SourceWorkerState>>,
+    deferred_after_reply: Vec<DeferredSourceWorkerAction>,
 }
 
 #[async_trait::async_trait]
@@ -1475,7 +1539,10 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
                 plan_worker_request(request, &mut guard)
             }
         };
-        let (mut response, stop) = execute_worker_action(action).await;
+        let (mut response, stop, deferred_after_reply) = execute_worker_action(action).await;
+        if let Some(action) = deferred_after_reply {
+            self.deferred_after_reply.push(action);
+        }
         if (request_is_control
             || request_starts_runtime_endpoints
             || request_rearms_source_rescan_endpoints)
@@ -1511,6 +1578,21 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
         } else {
             WorkerLoopControl::Continue(response)
         })
+    }
+
+    async fn after_response_sent(
+        &mut self,
+        _context: &WorkerSessionContext,
+    ) -> capanix_app_sdk::Result<()> {
+        let deferred = std::mem::take(&mut self.deferred_after_reply);
+        for action in deferred {
+            match action {
+                DeferredSourceWorkerAction::SignalManualRescanIntents { source, root_keys } => {
+                    source.signal_recorded_manual_rescan_intents(&root_keys);
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn on_runtime_control(
@@ -1663,6 +1745,15 @@ mod tests {
     };
     use crate::source::config::GrantedMountRoot;
     use crate::source::config::RootSpec;
+    use crate::state::cell::LogicalRootsCell;
+
+    fn run_deferred_after_reply_for_test(action: Option<DeferredSourceWorkerAction>) {
+        if let Some(DeferredSourceWorkerAction::SignalManualRescanIntents { source, root_keys }) =
+            action
+        {
+            source.signal_recorded_manual_rescan_intents(&root_keys);
+        }
+    }
 
     struct NoopBoundary;
 
@@ -1789,6 +1880,12 @@ mod tests {
         sent_batches: StdMutex<Vec<SentBatchSummary>>,
     }
 
+    struct CapacityBackpressureBoundary {
+        capacity: usize,
+        sent_lengths: StdMutex<Vec<usize>>,
+        sent_payloads: StdMutex<Vec<String>>,
+    }
+
     #[derive(Default)]
     struct LoopbackPublishBoundary {
         channels: tokio::sync::Mutex<std::collections::BTreeMap<String, Vec<Event>>>,
@@ -1836,6 +1933,30 @@ mod tests {
             self.sent_batches
                 .lock()
                 .expect("sent_batches_snapshot lock")
+                .clone()
+        }
+    }
+
+    impl CapacityBackpressureBoundary {
+        fn new(capacity: usize) -> Self {
+            Self {
+                capacity,
+                sent_lengths: StdMutex::new(Vec::new()),
+                sent_payloads: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn sent_lengths(&self) -> Vec<usize> {
+            self.sent_lengths
+                .lock()
+                .expect("capacity boundary sent_lengths lock")
+                .clone()
+        }
+
+        fn sent_payloads(&self) -> Vec<String> {
+            self.sent_payloads
+                .lock()
+                .expect("capacity boundary sent_payloads lock")
                 .clone()
         }
     }
@@ -1902,6 +2023,33 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl ChannelIoSubset for CapacityBackpressureBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> Result<()> {
+            if request.events.len() > self.capacity {
+                return Err(CnxError::Backpressure);
+            }
+            self.sent_lengths
+                .lock()
+                .expect("capacity boundary channel_send lock")
+                .push(request.events.len());
+            self.sent_payloads
+                .lock()
+                .expect("capacity boundary sent_payloads lock")
+                .extend(
+                    request
+                        .events
+                        .iter()
+                        .map(|event| String::from_utf8_lossy(event.payload_bytes()).to_string()),
+                );
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
     impl ChannelIoSubset for LoopbackPublishBoundary {
         async fn channel_recv(
             &self,
@@ -1955,6 +2103,59 @@ mod tests {
     }
 
     impl StateBoundary for LoopbackPublishBoundary {}
+
+    #[tokio::test]
+    async fn source_pump_splits_oversized_publication_batches_on_backpressure() {
+        let boundary = Arc::new(CapacityBackpressureBoundary::new(2));
+        let target: Arc<dyn ChannelIoSubset> = boundary.clone();
+        let published_stats = Arc::new(StdMutex::new(PublishedBatchStats::default()));
+        let events = (0..5)
+            .map(|idx| {
+                Event::new(
+                    EventMetadata {
+                        origin_id: NodeId("node-a::nfs1".to_string()),
+                        timestamp_us: idx,
+                        logical_ts: None,
+                        correlation_id: None,
+                        ingress_auth: None,
+                        trace: None,
+                    },
+                    bytes::Bytes::from(format!("record-{idx}")),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut handle = start_source_pump_with_stream(
+            futures_util::stream::iter(vec![events]),
+            Arc::new(StdMutex::new(target)),
+            published_stats,
+        );
+
+        match tokio::time::timeout(Duration::from_millis(500), &mut handle).await {
+            Ok(join) => join.expect("source pump task should complete"),
+            Err(_) => {
+                handle.abort();
+                panic!("source pump retried the same oversized batch instead of splitting it");
+            }
+        }
+
+        let sent_lengths = boundary.sent_lengths();
+        assert!(
+            sent_lengths.iter().all(|len| *len <= 2) && sent_lengths.iter().sum::<usize>() == 5,
+            "source pump must publish only transport-sized windows, got {sent_lengths:?}"
+        );
+        assert_eq!(
+            boundary.sent_payloads(),
+            vec![
+                "record-0".to_string(),
+                "record-1".to_string(),
+                "record-2".to_string(),
+                "record-3".to_string(),
+                "record-4".to_string(),
+            ],
+            "source pump must preserve event order while splitting oversized publication batches"
+        );
+    }
 
     #[derive(Default)]
     struct FailingPublishBoundary {
@@ -2505,7 +2706,7 @@ mod tests {
             ]
         };
 
-        let (response, stop) = execute_worker_action(plan_worker_request(
+        let (response, stop, _deferred_after_reply) = execute_worker_action(plan_worker_request(
             SourceWorkerRequest::OnControlFrame {
                 envelopes: source_wave(2),
             },
@@ -2518,7 +2719,7 @@ mod tests {
             "source worker should stay alive after zero-grant watch-scan wave"
         );
 
-        let (response, stop) = execute_worker_action(plan_worker_request(
+        let (response, stop, deferred_after_reply) = execute_worker_action(plan_worker_request(
             SourceWorkerRequest::TriggerRescanWhenReadyEpoch,
             &mut state,
         ))
@@ -2531,6 +2732,7 @@ mod tests {
             !stop,
             "trigger_rescan_when_ready should not stop the worker in zero-grant watch-scan mode"
         );
+        run_deferred_after_reply_for_test(deferred_after_reply);
 
         let event_route = format!("{}.stream", ROUTE_KEY_EVENTS);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -2555,8 +2757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn targeted_rescan_when_ready_publishes_baseline_after_zero_grant_runtime_managed_watch_scan_wave()
-     {
+    async fn submit_targeted_rescan_request_epoch_defers_scan_signal_until_after_reply() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
@@ -2666,7 +2867,7 @@ mod tests {
             ]
         };
 
-        let (response, stop) = execute_worker_action(plan_worker_request(
+        let (response, stop, _deferred_after_reply) = execute_worker_action(plan_worker_request(
             SourceWorkerRequest::OnControlFrame {
                 envelopes: source_wave(2),
             },
@@ -2703,8 +2904,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
-        let (response, stop) = execute_worker_action(plan_worker_request(
-            SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch,
+        let event_route = format!("{}.stream", ROUTE_KEY_EVENTS);
+        let data_events_before_submit = boundary.sent_data_events_for_route(&event_route);
+        let (response, stop, deferred_after_reply) = execute_worker_action(plan_worker_request(
+            SourceWorkerRequest::SubmitTargetedRescanRequestEpoch,
             &mut state,
         ))
         .await;
@@ -2714,23 +2917,28 @@ mod tests {
         ));
         assert!(
             !stop,
-            "targeted_rescan_when_ready should not stop the worker in zero-grant watch-scan mode"
+            "submit_targeted_rescan_request_epoch should not stop the worker in zero-grant watch-scan mode"
         );
+        assert_eq!(
+            boundary.sent_data_events_for_route(&event_route),
+            data_events_before_submit,
+            "source worker must return the targeted rescan acceptance before signaling scan execution"
+        );
+        run_deferred_after_reply_for_test(deferred_after_reply);
 
-        let event_route = format!("{}.stream", ROUTE_KEY_EVENTS);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let origin_counts = boundary.sent_origin_counts_for_route(&event_route);
             let data_events = boundary.sent_data_events_for_route(&event_route);
             if origin_counts.get("nfs1").copied().unwrap_or(0) > 0
                 && origin_counts.get("nfs2").copied().unwrap_or(0) > 0
-                && data_events > 0
+                && data_events > data_events_before_submit
             {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "zero-grant runtime-managed watch-scan targeted_rescan_when_ready must publish baseline events for both local roots through the source worker server publish pump: origin_counts={origin_counts:?} data_events={data_events} sent_batches={:?}",
+                "zero-grant runtime-managed watch-scan submit_targeted_rescan_request_epoch must publish baseline events for both local roots only after the post-reply scan signal runs: origin_counts={origin_counts:?} data_events={data_events} before={data_events_before_submit} sent_batches={:?}",
                 boundary.sent_batches_snapshot(),
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -2851,7 +3059,7 @@ mod tests {
             ]
         };
 
-        let (response, stop) = execute_worker_action(plan_worker_request(
+        let (response, stop, _deferred_after_reply) = execute_worker_action(plan_worker_request(
             SourceWorkerRequest::OnControlFrame {
                 envelopes: source_wave(2),
             },
@@ -2864,7 +3072,7 @@ mod tests {
             "source worker should stay alive after zero-grant watch-scan wave"
         );
 
-        let (response, stop) = execute_worker_action(plan_worker_request(
+        let (response, stop, deferred_after_reply) = execute_worker_action(plan_worker_request(
             SourceWorkerRequest::TriggerRescanWhenReadyEpoch,
             &mut state,
         ))
@@ -2877,6 +3085,7 @@ mod tests {
             !stop,
             "trigger_rescan_when_ready should not stop the worker in zero-grant watch-scan mode"
         );
+        run_deferred_after_reply_for_test(deferred_after_reply);
 
         let event_route = format!("{}.stream", ROUTE_KEY_EVENTS);
         let baseline_target = b"/data";
@@ -2933,6 +3142,7 @@ mod tests {
         }));
         let mut session = SourceWorkerSession {
             state: state.clone(),
+            deferred_after_reply: Vec::new(),
         };
         let boundary = Arc::new(LoopbackPublishBoundary::default());
         let context = WorkerSessionContext::new(
@@ -3112,7 +3322,10 @@ mod tests {
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         }));
-        let mut session = SourceWorkerSession { state };
+        let mut session = SourceWorkerSession {
+            state,
+            deferred_after_reply: Vec::new(),
+        };
 
         session
             .on_init(NodeId("node-a-123".to_string()), cfg, &context)
@@ -3257,7 +3470,10 @@ mod tests {
             last_control_frame_signals: Vec::new(),
             published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
         }));
-        let mut session = SourceWorkerSession { state };
+        let mut session = SourceWorkerSession {
+            state,
+            deferred_after_reply: Vec::new(),
+        };
 
         session
             .on_init(NodeId("node-a".to_string()), cfg, &context)
@@ -3401,6 +3617,7 @@ mod tests {
         }));
         let mut session = SourceWorkerSession {
             state: state.clone(),
+            deferred_after_reply: Vec::new(),
         };
         let boundary = Arc::new(LoopbackPublishBoundary::default());
         let state_boundary: Arc<dyn StateBoundary> = Arc::new(
@@ -3613,6 +3830,7 @@ mod tests {
         }));
         let mut session = SourceWorkerSession {
             state: state.clone(),
+            deferred_after_reply: Vec::new(),
         };
 
         let source_wave = |generation| {
@@ -3788,6 +4006,7 @@ mod tests {
         }));
         let mut session = SourceWorkerSession {
             state: state.clone(),
+            deferred_after_reply: Vec::new(),
         };
 
         let source_wave = |generation| {
@@ -4094,6 +4313,7 @@ mod tests {
         let state = Arc::new(Mutex::new(state));
         let mut session = SourceWorkerSession {
             state: state.clone(),
+            deferred_after_reply: Vec::new(),
         };
         let boundary = Arc::new(NoopBoundary);
         let context =
@@ -4240,6 +4460,7 @@ mod tests {
         let state = Arc::new(Mutex::new(state));
         let mut session = SourceWorkerSession {
             state: state.clone(),
+            deferred_after_reply: Vec::new(),
         };
         let boundary = Arc::new(NoopBoundary);
         let context =
@@ -4680,6 +4901,7 @@ mod tests {
         }));
         let mut session = SourceWorkerSession {
             state: state.clone(),
+            deferred_after_reply: Vec::new(),
         };
         let boundary = Arc::new(LoopbackPublishBoundary::default());
         let context = WorkerSessionContext::new(
@@ -4802,6 +5024,83 @@ mod tests {
                 .is_some_and(|signals| !signals.is_empty()),
             "worker observability must fall back to the source-owned accepted control summary when worker-side cached summary is empty: {:?}",
             snapshot.last_control_frame_signals_by_node
+        );
+    }
+
+    #[tokio::test]
+    async fn observability_snapshot_request_does_not_run_authoritative_roots_repair() {
+        let boundary = in_memory_state_boundary();
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![
+                test_export("node-a::nfs1", nfs1.clone()),
+                test_export("node-a::nfs2", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries_and_state(
+            cfg.clone(),
+            NodeId("node-a".to_string()),
+            None,
+            boundary.clone(),
+        )
+        .expect("init source");
+
+        let authoritative =
+            LogicalRootsCell::from_state_boundary(SOURCE_RUNTIME_UNIT_ID, cfg.roots, boundary)
+                .expect("authoritative logical roots cell");
+        authoritative
+            .replace(vec![test_root("nfs1", nfs1), test_root("nfs2", nfs2)])
+            .await
+            .expect("replace authoritative logical roots");
+
+        let mut state = SourceWorkerState {
+            source: Some(Arc::new(source)),
+            pending_init: None,
+            pump_task: None,
+            pump_boundary: None,
+            runtime_endpoint_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        };
+
+        let action = plan_worker_request(SourceWorkerRequest::ObservabilitySnapshot, &mut state);
+        let SourceWorkerAction::Immediate(
+            SourceWorkerResponse::ObservabilitySnapshot(snapshot),
+            false,
+        ) = action
+        else {
+            panic!("observability snapshot must be a read-only immediate response");
+        };
+
+        let snapshot_root_ids = snapshot
+            .logical_roots
+            .into_iter()
+            .map(|root| root.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshot_root_ids,
+            vec!["nfs1".to_string()],
+            "observability must report current local source state without hidden authoritative roots repair",
+        );
+        let local_root_ids = state
+            .source
+            .as_ref()
+            .expect("source present")
+            .logical_roots_snapshot()
+            .into_iter()
+            .map(|root| root.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            local_root_ids,
+            vec!["nfs1".to_string()],
+            "observability must not mutate local logical roots while serving a read"
         );
     }
 

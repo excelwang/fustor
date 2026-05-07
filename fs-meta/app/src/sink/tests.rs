@@ -1,6 +1,7 @@
 use super::*;
 use crate::EpochType;
 use crate::query::{QueryScope, TreeQueryOptions};
+use crate::runtime::orchestration::encode_logical_roots_control_payload_with_generation;
 use crate::shared_types::query::UnreliableReason;
 use bytes::Bytes;
 use capanix_app_sdk::runtime::EventMetadata;
@@ -12,15 +13,25 @@ use capanix_runtime_entry_sdk::control::{
     RuntimeHostObjectType, RuntimeObjectDescriptor, RuntimeUnitTick, encode_runtime_exec_control,
     encode_runtime_host_grant_change, encode_runtime_unit_tick,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 
 struct NoopBoundary;
 
 #[async_trait::async_trait]
 impl ChannelIoSubset for NoopBoundary {}
 
-#[derive(Default)]
 struct RouteCountingTimeoutBoundary {
     recv_counts: std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
+    recv_notify: tokio::sync::Notify,
+}
+
+impl Default for RouteCountingTimeoutBoundary {
+    fn default() -> Self {
+        Self {
+            recv_counts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            recv_notify: tokio::sync::Notify::new(),
+        }
+    }
 }
 
 impl RouteCountingTimeoutBoundary {
@@ -39,6 +50,30 @@ impl RouteCountingTimeoutBoundary {
             .expect("route recv counts lock")
             .clone()
     }
+
+    async fn wait_for_recv_count(
+        &self,
+        route_key: &str,
+        expected_count: usize,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.recv_count(route_key) >= expected_count {
+                return true;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            if tokio::time::timeout_at(deadline, self.recv_notify.notified())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -55,6 +90,63 @@ impl ChannelIoSubset for RouteCountingTimeoutBoundary {
             .expect("route recv counts lock")
             .entry(route_key)
             .or_default() += 1;
+        self.recv_notify.notify_waiters();
+        Err(CnxError::Timeout)
+    }
+}
+
+struct RootsControlSequenceBoundary {
+    route_key: String,
+    payloads: Vec<Bytes>,
+    delivered: AtomicBool,
+}
+
+impl RootsControlSequenceBoundary {
+    fn new(route_key: String, payloads: Vec<Vec<u8>>) -> Self {
+        Self {
+            route_key,
+            payloads: payloads.into_iter().map(Bytes::from).collect(),
+            delivered: AtomicBool::new(false),
+        }
+    }
+
+    fn delivered(&self) -> bool {
+        self.delivered.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl ChannelIoSubset for RootsControlSequenceBoundary {
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+    ) -> Result<Vec<Event>> {
+        if request.channel_key.0 == self.route_key
+            && self
+                .delivered
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Ok(self
+                .payloads
+                .iter()
+                .enumerate()
+                .map(|(index, payload)| {
+                    Event::new(
+                        EventMetadata {
+                            origin_id: NodeId("node-a".to_string()),
+                            timestamp_us: (index + 1) as u64,
+                            logical_ts: None,
+                            correlation_id: None,
+                            ingress_auth: None,
+                            trace: None,
+                        },
+                        payload.clone(),
+                    )
+                })
+                .collect());
+        }
         Err(CnxError::Timeout)
     }
 }
@@ -443,6 +535,40 @@ async fn owner_scoped_roots_control_stream_stays_gated_until_route_activation() 
 }
 
 #[tokio::test]
+async fn owner_scoped_sink_status_endpoint_listens_on_request_route_after_activation() {
+    let sink = build_single_group_sink();
+    let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+
+    sink.start_runtime_endpoints(boundary.clone(), NodeId("node-a".to_string()))
+        .expect("start runtime endpoints");
+
+    let sink_status_route = crate::runtime::routes::sink_status_request_route_for("node-a").0;
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: sink_status_route.clone(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope("nfs1")],
+        },
+    ))
+    .expect("encode scoped sink-status activate")])
+        .await
+        .expect("activate owner-scoped sink-status route");
+
+    assert!(
+        boundary
+            .wait_for_recv_count(&sink_status_route, 1, Duration::from_secs(2))
+            .await,
+        "sink owner-scoped status endpoint must listen on the request route after activation; recv_counts={:?}",
+        boundary.recv_counts_snapshot()
+    );
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
 async fn events_stream_stays_gated_until_route_activation() {
     let sink = build_single_group_sink();
     let boundary = Arc::new(RouteCountingTimeoutBoundary::default());
@@ -495,6 +621,52 @@ async fn events_stream_stays_gated_until_route_activation() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn start_runtime_endpoints_rebinds_events_stream_on_new_boundary_after_cutover() {
+    let sink = build_single_group_sink();
+    let old_boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+    let current_boundary = Arc::new(RouteCountingTimeoutBoundary::default());
+    let events_route = format!("{}.stream", crate::runtime::routes::ROUTE_KEY_EVENTS);
+
+    sink.start_runtime_endpoints(old_boundary.clone(), NodeId("node-a".to_string()))
+        .expect("start sink endpoints on old boundary");
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: events_route.clone(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope("nfs1")],
+        },
+    ))
+    .expect("encode old-boundary events activation")])
+        .await
+        .expect("activate old-boundary events route");
+
+    assert!(
+        old_boundary
+            .wait_for_recv_count(&events_route, 1, Duration::from_secs(2))
+            .await,
+        "fixture must prove the old boundary stream endpoint is active before cutover; old={:?}",
+        old_boundary.recv_counts_snapshot()
+    );
+
+    sink.start_runtime_endpoints(current_boundary.clone(), NodeId("node-a".to_string()))
+        .expect("start sink endpoints on current boundary after cutover");
+
+    assert!(
+        current_boundary
+            .wait_for_recv_count(&events_route, 1, Duration::from_secs(2))
+            .await,
+        "current-boundary stream endpoint must be created even when a stale-boundary task has the same route; old={:?} current={:?}",
+        old_boundary.recv_counts_snapshot(),
+        current_boundary.recv_counts_snapshot()
+    );
 
     sink.close().await.expect("close sink");
 }
@@ -3820,6 +3992,209 @@ async fn update_logical_roots_drops_unrelated_pending_materialization_group_from
         scheduled_after_snapshot,
         std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
         "logical-roots sync must not republish nfs3 in scheduled_groups_by_node after force-find subset contraction: {snapshot_after:?}"
+    );
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn roots_control_stream_ignores_older_declaration_after_newer_authoritative_roots() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-a::nfs2", "node-a", "10.0.0.11", "/mnt/nfs2", true),
+    ];
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("build sink");
+
+    let roots_control_route = format!(
+        "{}.stream",
+        crate::runtime::routes::ROUTE_KEY_SINK_ROOTS_CONTROL
+    );
+    let newer_payload = encode_logical_roots_control_payload_with_generation(
+        &vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+        ],
+        2,
+    )
+    .expect("encode newer sink logical-roots control payload");
+    let older_payload = encode_logical_roots_control_payload_with_generation(
+        &vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+        1,
+    )
+    .expect("encode older sink logical-roots control payload");
+    let boundary = Arc::new(RootsControlSequenceBoundary::new(
+        roots_control_route.clone(),
+        vec![newer_payload, older_payload],
+    ));
+
+    sink.start_runtime_endpoints(boundary.clone(), NodeId("node-a".to_string()))
+        .expect("start runtime endpoints");
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: roots_control_route,
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: Vec::new(),
+        },
+    ))
+    .expect("encode sink roots-control activate")])
+        .await
+        .expect("activate sink roots-control route");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let root_ids = sink
+            .logical_roots_snapshot()
+            .expect("sink logical roots snapshot")
+            .into_iter()
+            .map(|root| root.id)
+            .collect::<Vec<_>>();
+        if boundary.delivered() && root_ids == vec!["nfs1".to_string(), "nfs2".to_string()] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "newer sink roots declaration must remain visible after a stale followup; delivered={} logical_roots={root_ids:?}",
+            boundary.delivered(),
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn status_snapshot_reports_runtime_scheduled_bare_group_even_when_grant_projection_points_elsewhere()
+{
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+    ];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-c::nfs1", "node-c", "10.0.0.13", "/mnt/nfs1", true),
+        granted_mount_root("node-a::nfs2", "node-a", "10.0.0.11", "/mnt/nfs2", true),
+    ];
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("init sink");
+
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: "fs-meta.events:v1.stream".to_string(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["nfs1"]),
+                bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+            ],
+        },
+    ))
+    .expect("encode sink activate")])
+        .await
+        .expect("apply sink activate");
+
+    {
+        let mut state = sink.state.write().expect("state lock");
+        state.groups.remove("nfs1");
+    }
+
+    let snapshot = sink
+        .status_snapshot()
+        .expect("status snapshot must build from runtime schedule");
+    let scheduled = snapshot
+        .scheduled_groups_by_node
+        .values()
+        .flat_map(|groups| groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        scheduled.contains("nfs1"),
+        "sink status must report the runtime-owned bare scheduled group even when grant projection is not local: {snapshot:?}"
+    );
+    assert!(
+        snapshot.groups.iter().any(|group| group.group_id == "nfs1"),
+        "sink status must expose a pending row for a runtime-owned scheduled group without current materialized rows: {snapshot:?}"
+    );
+
+    sink.close().await.expect("close sink");
+}
+
+#[tokio::test]
+async fn management_logical_roots_scope_survives_later_stale_runtime_activate() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+    ];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::nfs1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-a::nfs2", "node-a", "10.0.0.11", "/mnt/nfs2", true),
+        granted_mount_root("node-a::nfs4", "node-a", "10.0.0.11", "/mnt/nfs4", true),
+    ];
+    let sink = SinkFileMeta::with_boundaries(
+        NodeId("node-a".to_string()),
+        Some(Arc::new(NoopBoundary)),
+        cfg.clone(),
+    )
+    .expect("init runtime-managed sink");
+
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 1,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+            ],
+        },
+    ))
+    .expect("encode initial sink activate")])
+        .await
+        .expect("apply initial sink activate");
+
+    sink.update_logical_roots_from_management_apply(
+        vec![
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+            RootSpec::new("nfs4", "/mnt/nfs4"),
+        ],
+        &cfg.host_object_grants,
+    )
+    .expect("management roots apply should update sink schedule authority");
+
+    sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+        RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 2,
+            bound_scopes: vec![
+                bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+            ],
+        },
+    ))
+    .expect("encode stale sink activate")])
+        .await
+        .expect("apply later stale sink activate");
+
+    assert_eq!(
+        sink.scheduled_group_ids_snapshot()
+            .expect("scheduled groups after stale activate"),
+        Some(std::collections::BTreeSet::from([
+            "nfs2".to_string(),
+            "nfs4".to_string()
+        ])),
+        "management-accepted logical roots must remain sink schedule authority; later stale runtime route hints must not reintroduce nfs1 or drop nfs4",
     );
 
     sink.close().await.expect("close sink");

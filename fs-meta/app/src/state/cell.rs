@@ -456,6 +456,13 @@ impl LogicalRootsCell {
         }
     }
 
+    pub(crate) fn current_seq(&self) -> u64 {
+        match self.state.lock() {
+            Ok(state) => state.seq,
+            Err(poisoned) => poisoned.into_inner().seq,
+        }
+    }
+
     pub(crate) fn refresh_from_boundary_blocking(&self) -> Result<Vec<RootSpec>, CnxError> {
         let response = statecell_read_blocking(
             &self.state_boundary,

@@ -1119,7 +1119,10 @@ fn scenario_force_find_execution_semantics(
         ("recursive", "true".to_string()),
     ])?;
     if group_total_nodes(&resp_first, "nfs1") == 0 {
-        return Err("first force-find response omitted nfs1 payload".to_string());
+        return Err(format!(
+            "first force-find response omitted nfs1 payload; {}",
+            force_find_response_diagnostic(&resp_first)
+        ));
     }
     let mut observed_runners = BTreeSet::<String>::new();
     if let Ok(runners) = wait_force_find_runners(session, "nfs1", &observed_runners) {
@@ -1131,7 +1134,10 @@ fn scenario_force_find_execution_semantics(
         ("recursive", "true".to_string()),
     ])?;
     if group_total_nodes(&resp_second, "nfs1") == 0 {
-        return Err("second force-find response omitted nfs1 payload".to_string());
+        return Err(format!(
+            "second force-find response omitted nfs1 payload; {}",
+            force_find_response_diagnostic(&resp_second)
+        ));
     }
     if let Ok(runners) = wait_force_find_runners(session, "nfs1", &observed_runners) {
         observed_runners = runners;
@@ -1142,7 +1148,10 @@ fn scenario_force_find_execution_semantics(
         ("recursive", "true".to_string()),
     ])?;
     if group_total_nodes(&resp_third, "nfs1") == 0 {
-        return Err("third force-find response omitted nfs1 payload".to_string());
+        return Err(format!(
+            "third force-find response omitted nfs1 payload; {}",
+            force_find_response_diagnostic(&resp_third)
+        ));
     }
     if let Ok(runners) = wait_force_find_runners(session, "nfs1", &observed_runners) {
         observed_runners = runners;
@@ -1186,15 +1195,16 @@ fn scenario_force_find_execution_semantics(
             let fallback_runners =
                 force_find_runners_from_status_values(&fallback_statuses, "nfs1");
             return Err(format!(
-                "force-find fallback omitted nfs1 payload after unmount on {failing_node}; failing_runner={failing_runner}; observed_runners={observed_runners:?}; fallback_runners={fallback_runners:?}; fallback_resp={fallback_resp}"
+                "force-find fallback omitted nfs1 payload after unmount on {failing_node}; failing_runner={failing_runner}; observed_runners={observed_runners:?}; fallback_runners={fallback_runners:?}; {}",
+                force_find_response_diagnostic(&fallback_resp)
             ));
         }
         let fallback_runner =
             wait_last_force_find_runner(session, "nfs1", Some(failing_runner.as_str())).map_err(
                 |err| {
                     format!(
-                        "force-find fallback runner evidence missing after unmount on {failing_node}: {err}"
-                    )
+                "force-find fallback runner evidence missing after unmount on {failing_node}: {err}"
+            )
                 },
             )?;
         if fallback_runner == failing_runner {
@@ -1675,7 +1685,13 @@ fn scenario_visibility_change_and_sink_selection(
             "sink holder not on withdrawn node",
             || {
                 let holder = current_sink_holder_for_group(cluster, app_id, "nfs2")?;
-                Ok(holder.is_some() && holder != Some("node-d".to_string()))
+                if holder.is_some() && holder != Some("node-d".to_string()) {
+                    return Ok(true);
+                }
+                Err(format!(
+                    "holder={holder:?} rows={:?}",
+                    current_sink_holder_debug_rows(cluster, app_id, "nfs2")?
+                ))
             },
         )?;
         let after_holder = current_sink_holder_for_group(cluster, app_id, "nfs2")?
@@ -1698,9 +1714,14 @@ fn scenario_visibility_change_and_sink_selection(
                 "facade unavailable while adjusting sink visibility for {facade_resource_id}: {err}"
             )
         })?;
-        if status.get("api_facade_liveness").is_none() {
+        let api_facade_liveness = status
+            .get("readiness_planes")
+            .and_then(Value::as_object)
+            .and_then(|planes| planes.get("api_facade_liveness"))
+            .and_then(Value::as_bool);
+        if api_facade_liveness != Some(true) {
             return Err(format!(
-                "facade status missing liveness while adjusting sink visibility for {facade_resource_id}: {status}"
+                "facade status missing open api facade liveness plane while adjusting sink visibility for {facade_resource_id}: {status}"
             ));
         }
         Ok(())
@@ -3156,6 +3177,58 @@ fn first_mount_for_fs_source(grants: &Value, fs_source: &str) -> Result<PathBuf,
 fn group_total_nodes(payload: &Value, group_key: &str) -> u64 {
     let (_, _, total) = group_root_exists_entries_and_total(payload, group_key);
     total
+}
+
+fn force_find_response_diagnostic(payload: &Value) -> String {
+    let group_page = payload
+        .get("group_page")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "<missing>".to_string());
+    let groups = payload
+        .get("groups")
+        .and_then(Value::as_array)
+        .map(|groups| {
+            groups
+                .iter()
+                .map(|group| {
+                    let group_key = group
+                        .get("group")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<missing>");
+                    let status = group
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<missing>");
+                    let root_exists = group
+                        .get("root")
+                        .and_then(|root| root.get("exists"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let entries = group
+                        .get("entries")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    let errors = group
+                        .get("errors")
+                        .and_then(Value::as_array)
+                        .map(|errors| {
+                            errors
+                                .iter()
+                                .map(Value::to_string)
+                                .collect::<Vec<_>>()
+                                .join("|")
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "{group_key}:status={status}:root_exists={root_exists}:entries={entries}:errors=[{errors}]"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "<missing>".to_string());
+    format!("group_page={group_page}; groups=[{groups}]")
 }
 
 fn group_root_exists_entries_and_total(payload: &Value, group_key: &str) -> (bool, usize, u64) {

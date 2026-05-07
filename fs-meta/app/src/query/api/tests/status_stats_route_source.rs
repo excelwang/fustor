@@ -232,6 +232,141 @@ async fn load_materialized_status_snapshots_falls_back_to_local_source_after_rou
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn load_materialized_status_snapshots_preserves_routed_root_group_universe_when_local_source_is_subset()
+{
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a");
+    fs::create_dir_all(&node_a_root).expect("create node-a dir");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-a::nfs1".to_string(),
+        host_ref: "node-a".to_string(),
+        host_ip: "10.0.0.1".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: node_a_root,
+        fs_source: "nfs".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let source = source_facade_with_group("nfs1", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let source_status_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+        lifecycle_state: "running".into(),
+        host_object_grants_version: 1,
+        grants: grants.clone(),
+        logical_roots: Vec::new(),
+        status: SourceStatusSnapshot {
+            current_stream_generation: Some(11),
+            logical_roots: vec![
+                crate::source::SourceLogicalRootHealthSnapshot {
+                    root_id: "nfs1".into(),
+                    status: "ok".into(),
+                    matched_grants: 1,
+                    active_members: 1,
+                    coverage_mode: "realtime_hotset_plus_audit".into(),
+                },
+                crate::source::SourceLogicalRootHealthSnapshot {
+                    root_id: "nfs2".into(),
+                    status: "ok".into(),
+                    matched_grants: 1,
+                    active_members: 1,
+                    coverage_mode: "realtime_hotset_plus_audit".into(),
+                },
+            ],
+            ..SourceStatusSnapshot::default()
+        },
+        source_primary_by_group: BTreeMap::new(),
+        last_force_find_runner_by_group: BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: BTreeMap::from([
+            ("node-a".to_string(), vec!["nfs1".to_string()]),
+            ("node-b".to_string(), vec!["nfs2".to_string()]),
+        ]),
+        scheduled_scan_groups_by_node: BTreeMap::new(),
+        last_control_frame_signals_by_node: BTreeMap::new(),
+        published_batches_by_node: BTreeMap::new(),
+        published_events_by_node: BTreeMap::new(),
+        published_control_events_by_node: BTreeMap::new(),
+        published_data_events_by_node: BTreeMap::new(),
+        last_published_at_us_by_node: BTreeMap::new(),
+        last_published_origins_by_node: BTreeMap::new(),
+        published_origin_counts_by_node: BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: BTreeMap::new(),
+        pending_path_origin_counts_by_node: BTreeMap::new(),
+        yielded_path_origin_counts_by_node: BTreeMap::new(),
+        summarized_path_origin_counts_by_node: BTreeMap::new(),
+        published_path_origin_counts_by_node: BTreeMap::new(),
+    })
+    .expect("encode source-status payload");
+    let sink_status_payload = rmp_serde::to_vec_named(&SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        groups: vec![sink_group_status("nfs1", true)],
+        ..SinkStatusSnapshot::default()
+    })
+    .expect("encode sink-status payload");
+    let boundary = Arc::new(SourceStatusOkSinkStatusExplicitEmptyThenReadyBoundary::new(
+        source_status_payload,
+        vec![sink_status_payload],
+    ));
+    let state = ApiState {
+        backend: QueryBackend::Route {
+            sink,
+            boundary: boundary.clone(),
+            origin_id: NodeId("node-d".to_string()),
+            source: source.clone(),
+        },
+        policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+        pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
+        force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+        force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
+        readiness_source: Some(source),
+        readiness_sink: Some(sink_facade_with_group(&grants)),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
+        materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
+        tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
+    };
+
+    let (source_status, sink_status) = load_materialized_status_snapshots(&state)
+        .await
+        .expect("materialized status snapshots");
+
+    assert_eq!(
+        source_status
+            .logical_roots
+            .iter()
+            .map(|root| root.root_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["nfs1", "nfs2"],
+        "route query readiness must preserve the full source-status fan-in root universe instead of clipping it to the local facade root set"
+    );
+    let message =
+        trusted_materialized_root_readiness_gap_message(
+            b"/",
+            None,
+            None,
+            &source_status,
+            &sink_status,
+        )
+        .expect("missing nfs2 materialization must fail full-root trusted reads closed");
+    assert!(
+        message.contains("sink schedule missing [nfs2]")
+            && message.contains("sink readiness missing [nfs2]"),
+        "full-root readiness gap should explain the missing routed group, got {message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_source_status_snapshot_retries_missing_route_state_without_blind_sleep() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_a_root = tmp.path().join("node-a");

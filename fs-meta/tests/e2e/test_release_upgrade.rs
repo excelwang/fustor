@@ -2,7 +2,7 @@
 
 use crate::support::api_client::{FsMetaApiClient, OperatorSession};
 use crate::support::cluster5::Cluster5;
-use crate::support::cpu_budget::{assert_cpu_budget, measure_cpu_budget};
+use crate::support::cpu_budget::{assert_cpu_budget, sample_cpu_usage, summarize_cpu_budget};
 use crate::support::full_demo_roots::{self, FullDemoRoot};
 use crate::support::nfs_lab::NfsLab;
 use crate::support::{reserve_http_addrs, skip_unless_real_nfs_enabled, wait_until};
@@ -81,7 +81,6 @@ struct UpgradeHarness {
     app_id: String,
     facade_resource_id: String,
     roots: Vec<RootSpec>,
-    baseline_cpu: BTreeMap<String, Vec<u32>>,
     uses_full_demo_roots: bool,
 }
 
@@ -240,7 +239,7 @@ fn build_upgrade_harness(
     let cluster = Cluster5::start()?;
     l5_progress(mode, "01.03.cluster", "ok");
     l5_progress(mode, "01.04.cpu-baseline", "begin");
-    let baseline_cpu = measure_baseline_cpu(&cluster)?;
+    let _daemon_cpu = measure_baseline_cpu(&cluster)?;
     l5_progress(mode, "01.04.cpu-baseline", "ok");
 
     let app_id = format!("{app_prefix}-{}", unique_suffix());
@@ -316,7 +315,6 @@ fn build_upgrade_harness(
         app_id,
         facade_resource_id,
         roots,
-        baseline_cpu,
         uses_full_demo_roots,
     })
 }
@@ -725,37 +723,45 @@ fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
     wait_for_primary_tree_materialization(&mut harness.session, "cpu-budget tree materializes")?;
     l5_progress(harness.mode, "03.06.tree-materialization", "ok");
 
-    l5_progress(harness.mode, "03.07.polling-load", "begin");
+    l5_progress(harness.mode, "03.07.cpu-idle-baseline", "begin");
+    let steady_cpu = measure_steady_cpu(&harness.cluster, &harness.app_id)?;
+    eprintln!(
+        "[fs-meta-api-upgrade] cpu-budget runtime_pids={:?}",
+        steady_cpu
+    );
+    let idle_samples = sample_cpu_usage(
+        &steady_cpu,
+        Duration::from_secs(5),
+        Duration::from_secs(3 * 60),
+    )?;
+    l5_progress(harness.mode, "03.07.cpu-idle-baseline", "ok");
+    l5_progress(harness.mode, "03.08.polling-load", "begin");
     let (stop, worker) = spawn_light_polling(
         ready_base,
         harness.session.token().to_string(),
         harness.session.query_api_key().to_string(),
     );
-    l5_progress(harness.mode, "03.07.polling-load", "ok");
-    l5_progress(harness.mode, "03.08.cpu-measure", "begin");
-    let steady_cpu = measure_steady_cpu(&harness.cluster, &harness.app_id)?;
-    eprintln!(
-        "[fs-meta-api-upgrade] cpu-budget baseline_pids={:?} steady_pids={:?}",
-        harness.baseline_cpu, steady_cpu
-    );
-    let summary = measure_cpu_budget(
-        &harness.baseline_cpu,
+    l5_progress(harness.mode, "03.08.polling-load", "ok");
+    l5_progress(harness.mode, "03.09.cpu-measure", "begin");
+    let polling_samples_result = sample_cpu_usage(
         &steady_cpu,
         Duration::from_secs(5),
         Duration::from_secs(3 * 60),
-    )?;
-    eprintln!(
-        "[fs-meta-api-upgrade] cpu-budget summary mean={:?} p95={:?} cluster_mean={:.2}",
-        summary.per_node_mean_delta, summary.per_node_p95_delta, summary.cluster_mean_delta
     );
     stop.store(true, Ordering::Relaxed);
     let _ = worker.join();
-    l5_progress(harness.mode, "03.08.cpu-measure", "ok");
-    l5_progress(harness.mode, "03.09.cpu-assert", "begin");
+    let polling_samples = polling_samples_result?;
+    let summary = summarize_cpu_budget(&idle_samples, &polling_samples);
+    eprintln!(
+        "[fs-meta-api-upgrade] cpu-budget polling_overhead mean={:?} p95={:?} cluster_mean={:.2}",
+        summary.per_node_mean_delta, summary.per_node_p95_delta, summary.cluster_mean_delta
+    );
+    l5_progress(harness.mode, "03.09.cpu-measure", "ok");
+    l5_progress(harness.mode, "03.10.cpu-assert", "begin");
     let result = assert_cpu_budget(&summary);
     l5_progress(
         harness.mode,
-        "03.09.cpu-assert",
+        "03.10.cpu-assert",
         if result.is_ok() { "ok" } else { "fail" },
     );
     result

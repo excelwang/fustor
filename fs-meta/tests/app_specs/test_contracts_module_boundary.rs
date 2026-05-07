@@ -893,7 +893,7 @@ fn status_paths_use_nonblocking_worker_observation_reads() {
     let query_api = read_app_spec("src/query/api.rs");
     let runtime_app = read_app_spec("src/runtime_app.rs");
     let source_mod = read_app_spec("src/source/mod.rs");
-    let sink_mod = read_app_spec("src/sink/mod.rs");
+    let _sink_mod = read_app_spec("src/sink/mod.rs");
     let worker_source = read_app_spec("src/workers/source.rs");
     let worker_sink = read_app_spec("src/workers/sink.rs");
     let worker_source_ipc = read_app_spec("src/workers/source_ipc.rs");
@@ -930,11 +930,10 @@ fn status_paths_use_nonblocking_worker_observation_reads() {
         "preferred_internal_query_endpoint_units(query_active, query_peer_active, false)"
     ));
     assert!(runtime_app.contains("route_key == source_status_route"));
-    assert!(runtime_app.contains("route_key == source_find_route"));
-    assert!(
-        !sink_mod.contains("routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)"),
-        "sink runtime endpoints must not bind sink-status; query/query-peer facade owns that route"
-    );
+    assert!(runtime_app.contains("source_find_route_bindings_for(&self.node_id.0)"));
+    assert!(runtime_app.contains("spawning source find proxy endpoint"));
+    assert!(runtime_app.contains("vec![execution_units::SINK_RUNTIME_UNIT_ID]"));
+    assert!(runtime_app.contains("sink.status_snapshot_nonblocking_for_status_route().await"));
     assert!(
         !source_mod.contains("routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)"),
         "source runtime endpoints must not bind source-find; query/query-peer facade owns that route"

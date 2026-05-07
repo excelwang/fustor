@@ -45,7 +45,7 @@ Within `operations-real-nfs`, run groups in this order:
 3. `topology-change`: new NFS join, root path modify, retire, and upgrade-window
    join.
 4. `recovery-switch`: sink/facade failover and activation-scope preservation.
-5. `resource-budget`: CPU budget after correctness is stable.
+5. `resource-budget`: incremental steady-polling CPU budget after correctness is stable.
 
 L5 stage 5, `ops-visibility-sink-selection`, is intentionally exposed as one
 product gate plus seven diagnostic substages. The external L5 count stays
@@ -88,7 +88,7 @@ allowed, and whether operations are included.
 | --- | --- |
 | `business-fast` | `app_specs`, `cli_specs`, `specs_fs_meta_contract_fast`, selected-group, force-find, status-stats, and roots-put runtime tests. |
 | `business-mini-nfs` | `fs_meta_business_mini_real_nfs` |
-| `environment-full-nfs` | `fs_meta_business_query_real_nfs`, `fs_meta_environment_full_real_nfs`, `fs_meta_environment_live_only_rescan_real_nfs` |
+| `environment-full-nfs` | `fs_meta_business_query_real_nfs`, `fs_meta_environment_full_real_nfs`, then `fs_meta_environment_live_only_rescan_real_nfs` with `FSMETA_FULL_NFS_ROOTS_FILE` unset so live-only mutations use the local NFS lab instead of the full demo roots. |
 | `operations-local` | Explicit source/sink worker control tests plus `runtime_scope_e2e`. |
 | `operations-real-nfs` | Ordered L5 groups plus `fs_meta_operations_*_real_nfs` and ignored runtime component diagnostics. |
 
@@ -123,9 +123,13 @@ channel caps are valid only for smaller debug environments and must not be used
 as the `operations-real-nfs` gate.
 
 Mini NFS and full real NFS must use separate exports. Mini NFS must not reuse or
-modify full-NFS data. Full real NFS contains large data sets, so tests must use
-bounded readiness, coverage mode, and degraded evidence instead of synchronous
-full-tree audit as a blocking readiness condition.
+modify full-NFS data. Full real NFS contains large data sets, so the L3
+environment baseline validates topology, artifact, source coverage, coverage
+mode, and degraded evidence without requiring synchronous full-tree sink
+materialization. Remaining sink materialization unreadiness is recorded as
+catch-up evidence; trusted materialized reads still fail closed until readiness
+covers the active roots, and strict materialized readiness remains an L5 or
+small deterministic gate.
 
 ## Root-Fix Discipline
 

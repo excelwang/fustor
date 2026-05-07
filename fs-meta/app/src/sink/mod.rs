@@ -53,10 +53,11 @@ use crate::runtime::orchestration::{
     sink_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{
-    METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SOURCE_FIND,
-    METHOD_STREAM, ROUTE_KEY_EVENTS, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_EVENTS,
-    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, sink_query_request_route_for,
-    sink_query_route_bindings_for, sink_roots_control_stream_route_for,
+    METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SINK_STATUS,
+    METHOD_SOURCE_FIND, METHOD_STREAM, ROUTE_KEY_EVENTS, ROUTE_TOKEN_FS_META,
+    ROUTE_TOKEN_FS_META_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
+    sink_query_request_route_for, sink_query_route_bindings_for,
+    sink_roots_control_stream_route_for, sink_status_request_route_for,
 };
 use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::unit_gate::RuntimeUnitGate;
@@ -78,6 +79,26 @@ fn now_us() -> u64 {
         Ok(d) => d.as_micros() as u64,
         Err(_) => 0,
     }
+}
+
+fn sink_status_reply(
+    snapshot: &SinkStatusSnapshot,
+    origin_id: &NodeId,
+    correlation_id: Option<u64>,
+) -> Result<Event> {
+    let payload = rmp_serde::to_vec_named(snapshot)
+        .map_err(|err| CnxError::Internal(format!("encode sink-status payload failed: {err}")))?;
+    Ok(Event::new(
+        EventMetadata {
+            origin_id: origin_id.clone(),
+            timestamp_us: now_us(),
+            logical_ts: None,
+            correlation_id,
+            ingress_auth: None,
+            trace: None,
+        },
+        Bytes::from(payload),
+    ))
 }
 
 fn debug_sink_query_route_trace_enabled() -> bool {
@@ -495,6 +516,14 @@ impl SinkGroupStatusSnapshot {
 
     pub fn is_ready(&self) -> bool {
         matches!(self.normalized_readiness(), GroupReadinessState::Ready)
+    }
+
+    pub(crate) fn has_materialized_service_blocker(&self) -> bool {
+        self.overflow_pending_materialization
+    }
+
+    pub(crate) fn materialized_service_ready(&self) -> bool {
+        self.is_ready() && !self.has_materialized_service_blocker()
     }
 }
 
@@ -1450,6 +1479,7 @@ struct SinkStateCell {
     inner: Arc<RwLock<SinkState>>,
     commit_boundary: CommitBoundary,
     snapshot_cell: Option<SinkStateSnapshotCell>,
+    logical_roots_control_generation: Arc<AtomicU64>,
 }
 
 impl SinkStateCell {
@@ -1468,6 +1498,7 @@ impl SinkStateCell {
             inner: Arc::new(RwLock::new(state)),
             commit_boundary,
             snapshot_cell,
+            logical_roots_control_generation: Arc::new(AtomicU64::new(0)),
         };
         if record_bootstrap {
             cell.record_authoritative_commit(
@@ -1496,6 +1527,34 @@ impl SinkStateCell {
 
     fn record_authoritative_commit(&self, op: &str, detail: String) {
         self.commit_boundary.record(op, detail);
+    }
+
+    fn logical_roots_control_generation_is_stale(&self, generation: u64) -> bool {
+        generation == 0
+            || generation
+                <= self
+                    .logical_roots_control_generation
+                    .load(Ordering::Acquire)
+    }
+
+    fn mark_logical_roots_control_generation(&self, generation: u64) {
+        if generation == 0 {
+            return;
+        }
+        let mut current = self
+            .logical_roots_control_generation
+            .load(Ordering::Acquire);
+        while generation > current {
+            match self.logical_roots_control_generation.compare_exchange(
+                current,
+                generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
     }
 
     fn persist_snapshot(&self) -> Result<()> {
@@ -1569,6 +1628,22 @@ pub struct SinkFileMeta {
 }
 
 impl SinkFileMeta {
+    pub(crate) fn current_logical_roots_generation(&self) -> u64 {
+        let _ = self.logical_roots_cell.refresh_from_boundary_blocking();
+        self.logical_roots_cell.current_seq()
+    }
+
+    fn logical_roots_control_generation_is_stale(&self, generation: u64) -> bool {
+        generation < self.current_logical_roots_generation()
+            || self
+                .state
+                .logical_roots_control_generation_is_stale(generation)
+    }
+
+    fn mark_logical_roots_control_generation(&self, generation: u64) {
+        self.state.mark_logical_roots_control_generation(generation);
+    }
+
     fn stream_recv_epoch(&self) -> u64 {
         self.stream_recv_observer
             .as_ref()
@@ -2236,6 +2311,17 @@ impl SinkFileMeta {
             .any(|task| task.route_key() == route_key)
     }
 
+    fn endpoint_task_route_present_on_boundary(
+        &self,
+        route_key: &str,
+        boundary: &Arc<dyn ChannelIoSubset>,
+        context: &str,
+    ) -> bool {
+        lock_or_recover(&self.endpoint_tasks, context)
+            .iter()
+            .any(|task| task.route_key() == route_key && task.belongs_to_boundary(boundary))
+    }
+
     pub(crate) fn start_runtime_endpoints_on_boundary(
         &self,
         boundary: Arc<dyn ChannelIoSubset>,
@@ -2276,8 +2362,9 @@ impl SinkFileMeta {
         let query_stream_receive_enabled = self.stream_receive_enabled.clone();
         let query_unit_control = self.unit_control.clone();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_QUERY) {
-            if !self.endpoint_task_route_present(
+            if !self.endpoint_task_route_present_on_boundary(
                 &route.0,
+                &boundary,
                 "sink.start_runtime_endpoints.route_present.query",
             ) {
                 eprintln!(
@@ -2386,8 +2473,9 @@ impl SinkFileMeta {
         }
         internal_query_routes.push(sink_query_request_route_for(&node_id_cloned.0));
         for route in internal_query_routes {
-            if self.endpoint_task_route_present(
+            if self.endpoint_task_route_present_on_boundary(
                 &route.0,
+                &boundary,
                 "sink.start_runtime_endpoints.route_present.internal_query",
             ) {
                 continue;
@@ -2524,13 +2612,137 @@ impl SinkFileMeta {
             .push(endpoint);
         }
 
+        let status_state = self.state.clone();
+        let status_root_specs = self.root_specs.clone();
+        let status_logical_roots_cell = self.logical_roots_cell.clone();
+        let status_host_object_grants = self.host_object_grants.clone();
+        let status_visibility_lag = self.visibility_lag.clone();
+        let status_stream_delivery_stats = self.stream_delivery_stats.clone();
+        let status_pending_stream_events = self.pending_stream_events.clone();
+        let status_stream_receive_enabled = self.stream_receive_enabled.clone();
+        let status_unit_control = self.unit_control.clone();
+        let mut status_routes = Vec::<RouteKey>::new();
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS) {
+            status_routes.push(route);
+        }
+        status_routes.push(sink_status_request_route_for(&node_id_cloned.0));
+        for route in status_routes {
+            if self.endpoint_task_route_present_on_boundary(
+                &route.0,
+                &boundary,
+                "sink.start_runtime_endpoints.route_present.status",
+            ) {
+                continue;
+            }
+            let status_state_for_route = status_state.clone();
+            let status_root_specs_for_route = status_root_specs.clone();
+            let status_logical_roots_cell_for_route = status_logical_roots_cell.clone();
+            let status_host_object_grants_for_route = status_host_object_grants.clone();
+            let status_visibility_lag_for_route = status_visibility_lag.clone();
+            let status_stream_delivery_stats_for_route = status_stream_delivery_stats.clone();
+            let status_pending_stream_events_for_route = status_pending_stream_events.clone();
+            let status_stream_receive_enabled_for_route = status_stream_receive_enabled.clone();
+            let status_unit_control_for_route = status_unit_control.clone();
+            let route_key_for_trace = route.0.clone();
+            let route_key_for_log = route_key_for_trace.clone();
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints status spawn begin node={} route={} elapsed_ms={}",
+                node_id_cloned.0,
+                route.0,
+                start.elapsed().as_millis()
+            );
+            let endpoint = ManagedEndpointTask::spawn_with_unit(
+                boundary.clone(),
+                route,
+                format!(
+                    "sink:{}:{}",
+                    ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS
+                ),
+                SINK_RUNTIME_UNIT_ID,
+                self.shutdown.clone(),
+                {
+                    let status_node_id = node_id_cloned.clone();
+                    move |requests| {
+                        let status_state = status_state_for_route.clone();
+                        let status_root_specs = status_root_specs_for_route.clone();
+                        let status_logical_roots_cell = status_logical_roots_cell_for_route.clone();
+                        let status_host_object_grants = status_host_object_grants_for_route.clone();
+                        let status_visibility_lag = status_visibility_lag_for_route.clone();
+                        let status_stream_delivery_stats =
+                            status_stream_delivery_stats_for_route.clone();
+                        let status_pending_stream_events =
+                            status_pending_stream_events_for_route.clone();
+                        let status_stream_receive_enabled =
+                            status_stream_receive_enabled_for_route.clone();
+                        let status_unit_control = status_unit_control_for_route.clone();
+                        let status_node_id = status_node_id.clone();
+                        let route_key_for_trace = route_key_for_trace.clone();
+                        async move {
+                            let mut responses = Vec::new();
+                            for req in requests {
+                                let sink_impl = SinkFileMeta {
+                                    node_id: status_node_id.clone(),
+                                    state: status_state.clone(),
+                                    root_specs: status_root_specs.clone(),
+                                    logical_roots_cell: status_logical_roots_cell.clone(),
+                                    host_object_grants: status_host_object_grants.clone(),
+                                    visibility_lag: status_visibility_lag.clone(),
+                                    stream_delivery_stats: status_stream_delivery_stats.clone(),
+                                    pending_stream_events: status_pending_stream_events.clone(),
+                                    stream_receive_enabled: status_stream_receive_enabled.clone(),
+                                    unit_control: status_unit_control.clone(),
+                                    stream_recv_observer: None,
+                                    stream_recv_ready_notify: None,
+                                    shutdown: CancellationToken::new(),
+                                    endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                                };
+                                let snapshot = sink_impl.status_snapshot().unwrap_or_else(|err| {
+                                    log::warn!(
+                                        "sink status route snapshot failed route={}: {:?}",
+                                        route_key_for_trace,
+                                        err
+                                    );
+                                    SinkStatusSnapshot::default()
+                                });
+                                match sink_status_reply(
+                                    &snapshot,
+                                    &req.metadata().origin_id,
+                                    req.metadata().correlation_id,
+                                ) {
+                                    Ok(event) => responses.push(event),
+                                    Err(err) => log::warn!(
+                                        "sink status route reply encode failed route={}: {:?}",
+                                        route_key_for_trace,
+                                        err
+                                    ),
+                                }
+                            }
+                            responses
+                        }
+                    }
+                },
+            );
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints status spawn ok node={} route={} elapsed_ms={}",
+                node_id_cloned.0,
+                route_key_for_log,
+                start.elapsed().as_millis()
+            );
+            lock_or_recover(
+                &self.endpoint_tasks,
+                "sink.start_runtime_endpoints.status_tasks",
+            )
+            .push(endpoint);
+        }
+
         const FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS: u64 = 750;
         let node_id_proxy = node_id.clone();
         let node_id_proxy_log = node_id_proxy.clone();
         let proxy_adapter = adapter.clone();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_FIND) {
-            if !self.endpoint_task_route_present(
+            if !self.endpoint_task_route_present_on_boundary(
                 &route.0,
+                &boundary,
                 "sink.start_runtime_endpoints.route_present.find",
             ) {
                 eprintln!(
@@ -2637,8 +2849,9 @@ impl SinkFileMeta {
         let stream_receive_enabled = self.stream_receive_enabled.clone();
         let stream_unit_control = self.unit_control.clone();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM) {
-            if !self.endpoint_task_route_present(
+            if !self.endpoint_task_route_present_on_boundary(
                 &route.0,
+                &boundary,
                 "sink.start_runtime_endpoints.route_present.stream",
             ) {
                 eprintln!(
@@ -2753,6 +2966,13 @@ impl SinkFileMeta {
                                         continue;
                                     }
                                 };
+                            if sink.logical_roots_control_generation_is_stale(payload.generation) {
+                                log::warn!(
+                                    "sink logical-roots control stale: payload_generation={}",
+                                    payload.generation,
+                                );
+                                continue;
+                            }
                             let grants = match sink.logical_grants_snapshot() {
                                 Ok(grants) => grants,
                                 Err(err) => {
@@ -2763,8 +2983,13 @@ impl SinkFileMeta {
                                     continue;
                                 }
                             };
-                            if let Err(err) = sink.update_logical_roots(payload.roots, &grants) {
-                                log::warn!("sink logical-roots control apply failed: {:?}", err);
+                            match sink.update_logical_roots(payload.roots, &grants) {
+                                Ok(()) => {
+                                    sink.mark_logical_roots_control_generation(payload.generation)
+                                }
+                                Err(err) => {
+                                    log::warn!("sink logical-roots control apply failed: {:?}", err);
+                                }
                             }
                         }
                     }
@@ -2785,8 +3010,9 @@ impl SinkFileMeta {
         if let Ok(route) = default_route_bindings()
             .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_ROOTS_CONTROL)
         {
-            if !self.endpoint_task_route_present(
+            if !self.endpoint_task_route_present_on_boundary(
                 &route.0,
+                &boundary,
                 "sink.start_runtime_endpoints.route_present.roots_control_default",
             ) {
                 spawn_roots_control_stream(
@@ -2799,8 +3025,9 @@ impl SinkFileMeta {
             }
         }
         let scoped_roots_route = sink_roots_control_stream_route_for(&self.node_id.0);
-        if !self.endpoint_task_route_present(
+        if !self.endpoint_task_route_present_on_boundary(
             &scoped_roots_route.0,
+            &boundary,
             "sink.start_runtime_endpoints.route_present.roots_control_scoped",
         ) {
             spawn_roots_control_stream(scoped_roots_route.clone(), scoped_roots_route.0);
@@ -2833,9 +3060,13 @@ impl SinkFileMeta {
             node_id.0
         );
         self.prune_finished_endpoint_tasks("sink.start_stream_endpoint.prune");
-        if !lock_or_recover(&self.endpoint_tasks, "sink.start_stream_endpoint").is_empty() {
+        if self.endpoint_task_route_present_on_boundary(
+            &format!("{}.stream", ROUTE_TOKEN_FS_META_EVENTS),
+            &boundary,
+            "sink.start_stream_endpoint.route_present",
+        ) {
             eprintln!(
-                "fs_meta_sink: start_stream_endpoint skipped node={} reason=already-started",
+                "fs_meta_sink: start_stream_endpoint skipped node={} reason=already-started-on-current-boundary",
                 node_id.0
             );
             return Ok(());
@@ -2957,139 +3188,6 @@ impl SinkFileMeta {
                 .into_iter()
                 .map(|scope| scope.scope_id)
                 .filter(|scope_id| !scope_id.trim().is_empty())
-                .collect(),
-        ))
-    }
-
-    fn host_ref_matches_local_node(&self, host_ref: &str) -> bool {
-        host_ref == self.node_id.0
-            || self
-                .node_id
-                .0
-                .strip_prefix(host_ref)
-                .is_some_and(|suffix| suffix.starts_with('-'))
-            || self
-                .node_id
-                .0
-                .strip_prefix("cluster-")
-                .is_some_and(|scoped| {
-                    scoped == host_ref
-                        || scoped
-                            .strip_prefix(host_ref)
-                            .is_some_and(|suffix| suffix.starts_with('-'))
-                })
-    }
-
-    fn root_has_local_active_grant(&self, root: &RootSpec, grants: &[GrantedMountRoot]) -> bool {
-        grants.iter().any(|grant| {
-            grant.active
-                && self.host_ref_matches_local_node(&grant.host_ref)
-                && root.selector.matches(grant)
-        })
-    }
-
-    fn root_has_any_matching_grant(root: &RootSpec, grants: &[GrantedMountRoot]) -> bool {
-        grants.iter().any(|grant| root.selector.matches(grant))
-    }
-
-    fn runtime_scope_resource_matches_logical_root(
-        resource_id: &str,
-        logical_root_id: &str,
-    ) -> bool {
-        resource_id == logical_root_id
-            || resource_id
-                .rsplit_once("::")
-                .is_some_and(|(_, tail)| tail == logical_root_id)
-    }
-
-    fn runtime_scope_row_matches_logical_root(
-        row: &RuntimeBoundScope,
-        logical_root_id: &str,
-    ) -> bool {
-        row.scope_id == logical_root_id
-            || row.resource_ids.iter().any(|resource_id| {
-                Self::runtime_scope_resource_matches_logical_root(resource_id, logical_root_id)
-            })
-    }
-
-    fn runtime_scope_row_has_explicit_local_resource_id(
-        &self,
-        row: &RuntimeBoundScope,
-        logical_root_id: &str,
-    ) -> bool {
-        row.resource_ids.iter().any(|resource_id| {
-            Self::runtime_scope_resource_matches_logical_root(resource_id, logical_root_id)
-                && resource_id
-                    .rsplit_once("::")
-                    .is_some_and(|(host_ref, _)| self.host_ref_matches_local_node(host_ref))
-        })
-    }
-
-    fn runtime_scope_row_has_bare_logical_root_id(
-        row: &RuntimeBoundScope,
-        logical_root_id: &str,
-    ) -> bool {
-        row.scope_id == logical_root_id
-            || row
-                .resource_ids
-                .iter()
-                .any(|resource_id| resource_id == logical_root_id)
-    }
-
-    fn root_is_reportable_for_local_sink_status(
-        &self,
-        root: &RootSpec,
-        grants: &[GrantedMountRoot],
-        active_rows: &[RuntimeBoundScope],
-    ) -> bool {
-        if self.root_has_local_active_grant(root, grants) {
-            return true;
-        }
-
-        let has_any_matching_grant = Self::root_has_any_matching_grant(root, grants);
-        let mut saw_bare_logical_root_id = false;
-        for row in active_rows {
-            if !Self::runtime_scope_row_matches_logical_root(row, &root.id) {
-                continue;
-            }
-            if self.runtime_scope_row_has_explicit_local_resource_id(row, &root.id)
-                && !has_any_matching_grant
-            {
-                return true;
-            }
-            if Self::runtime_scope_row_has_bare_logical_root_id(row, &root.id) {
-                saw_bare_logical_root_id = true;
-            }
-        }
-
-        saw_bare_logical_root_id && !has_any_matching_grant
-    }
-
-    fn status_scheduled_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
-        let Some(active_rows) = self.scheduled_bound_scopes()? else {
-            return Ok(None);
-        };
-        if active_rows.is_empty() {
-            return Ok(Some(BTreeSet::new()));
-        }
-        let roots = self
-            .root_specs
-            .read()
-            .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))?
-            .clone();
-        let grants = self.logical_grants_snapshot()?;
-        Ok(Some(
-            roots
-                .iter()
-                .filter(|root| {
-                    active_rows
-                        .iter()
-                        .any(|row| Self::runtime_scope_row_matches_logical_root(row, &root.id))
-                })
-                .filter(|root| {
-                    self.root_is_reportable_for_local_sink_status(root, &grants, &active_rows)
-                })
-                .map(|root| root.id.clone())
                 .collect(),
         ))
     }
@@ -3447,7 +3545,9 @@ impl SinkFileMeta {
         roots: Vec<RootSpec>,
         host_object_grants: &[GrantedMountRoot],
     ) -> Result<()> {
-        self.perform_update_logical_roots_with_scope_policy(roots, host_object_grants, true)
+        self.perform_update_logical_roots_with_scope_policy(roots, host_object_grants, true)?;
+        self.mark_logical_roots_control_generation(self.current_logical_roots_generation());
+        Ok(())
     }
 
     fn perform_update_logical_roots_with_scope_policy(
@@ -3583,7 +3683,7 @@ impl SinkFileMeta {
                 estimated_heap_bytes,
             ));
         }
-        if let Some(scheduled_groups) = self.status_scheduled_group_ids()?
+        if let Some(scheduled_groups) = self.scheduled_group_ids()?
             && !scheduled_groups.is_empty()
         {
             let present_groups = groups

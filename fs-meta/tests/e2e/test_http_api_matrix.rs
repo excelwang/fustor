@@ -26,6 +26,23 @@ enum DemoEvidenceEnvironment {
     Full5Node5Nfs,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DemoEvidencePolicy {
+    QueryBaseline,
+    EnvironmentBaseline,
+    FullAcceptance,
+}
+
+impl DemoEvidencePolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::QueryBaseline => "query-baseline",
+            Self::EnvironmentBaseline => "environment-baseline",
+            Self::FullAcceptance => "full-acceptance",
+        }
+    }
+}
+
 impl DemoEvidenceEnvironment {
     fn as_str(self) -> &'static str {
         match self {
@@ -243,7 +260,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
     if matches!(mode, MatrixMode::LiveOnlyOnly) {
         if harness.uses_full_demo_roots {
             return Err(
-                "live-only mutation phase requires the local NFS lab; unset FSMETA_FULL_NFS_ROOTS_FILE for this non-matrix diagnostic"
+                "live-only mutation phase requires the local NFS lab; run with FSMETA_FULL_NFS_ROOTS_FILE unset"
                     .to_string(),
             );
         }
@@ -251,7 +268,16 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
         run_query_live_only_rescan_phase(&harness.cluster, &mut session, &harness.lab)?;
     }
 
-    emit_demo_evidence_result(&mut session, DemoEvidenceEnvironment::Full5Node5Nfs)?;
+    let evidence_policy = match mode {
+        MatrixMode::QueryBaselineOnly => DemoEvidencePolicy::QueryBaseline,
+        MatrixMode::Full => DemoEvidencePolicy::EnvironmentBaseline,
+        MatrixMode::LiveOnlyOnly => DemoEvidencePolicy::FullAcceptance,
+    };
+    emit_demo_evidence_result(
+        &mut session,
+        DemoEvidenceEnvironment::Full5Node5Nfs,
+        evidence_policy,
+    )?;
 
     Ok(())
 }
@@ -444,8 +470,61 @@ fn run_full_query_capacity_baseline_phase(session: &mut OperatorSession) -> Resu
 fn emit_demo_evidence_result(
     session: &mut OperatorSession,
     environment: DemoEvidenceEnvironment,
+    policy: DemoEvidencePolicy,
 ) -> Result<(), String> {
-    let status = session.status()?;
+    let mut last_report = None::<DemoEvidenceReport>;
+    wait_until(
+        Duration::from_secs(120),
+        "full demo evidence reaches accepted state",
+        || {
+            let status = session.status()?;
+            let report = build_demo_evidence_report(&status, environment)?;
+            let accepted = report.accepted_for(policy);
+            last_report = Some(report);
+            Ok(accepted)
+        },
+    )
+    .map_err(|err| {
+        let evidence = last_report
+            .as_ref()
+            .map(|report| report.evidence.to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        format!("{err}: last_demo_evidence={evidence}")
+    })?;
+    let report = last_report
+        .ok_or_else(|| "demo evidence wait completed without status report".to_string())?;
+    let mut evidence = report.evidence;
+    if let Some(object) = evidence.as_object_mut() {
+        object.insert("policy".to_string(), json!(policy.as_str()));
+        object.insert("policy_result".to_string(), json!("accepted"));
+        object.insert("policy_accepted".to_string(), json!(true));
+    }
+    eprintln!("[fs-meta-api-matrix] demo_evidence_result={evidence}");
+    Ok(())
+}
+
+struct DemoEvidenceReport {
+    evidence: Value,
+    unacceptable_reasons: Vec<String>,
+}
+
+impl DemoEvidenceReport {
+    fn accepted_for(&self, policy: DemoEvidencePolicy) -> bool {
+        match policy {
+            DemoEvidencePolicy::FullAcceptance => self.unacceptable_reasons.is_empty(),
+            DemoEvidencePolicy::EnvironmentBaseline => self
+                .unacceptable_reasons
+                .iter()
+                .all(|reason| reason == "sink_materialization_unready"),
+            DemoEvidencePolicy::QueryBaseline => true,
+        }
+    }
+}
+
+fn build_demo_evidence_report(
+    status: &Value,
+    environment: DemoEvidenceEnvironment,
+) -> Result<DemoEvidenceReport, String> {
     let source = status
         .get("source")
         .ok_or_else(|| format!("status missing source for demo evidence: {status}"))?;
@@ -460,6 +539,11 @@ fn emit_demo_evidence_result(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let root_ids = roots
+        .iter()
+        .filter_map(|root| root.get("root_id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let source_debug = source.get("debug").cloned().unwrap_or_else(|| json!({}));
     let artifact_verified = status.get("runtime_artifact").is_some();
     let mut unacceptable_reasons = Vec::<String>::new();
     if !artifact_verified {
@@ -537,21 +621,20 @@ fn emit_demo_evidence_result(
         "artifact_verified": artifact_verified,
         "expected_root_count": FULL_EXPORTS.len(),
         "root_count": roots.len(),
+        "root_ids": root_ids,
+        "source_debug": source_debug,
         "coverage_modes": coverage_modes,
         "degraded_roots": degraded_roots,
         "expected_sink_group_count": FULL_EXPORTS.len(),
         "sink_group_count": sink_groups.len(),
         "sink_unready": sink_unready,
-        "unacceptable_reasons": unacceptable_reasons,
+        "unacceptable_reasons": unacceptable_reasons.clone(),
         "result": result,
     });
-    eprintln!("[fs-meta-api-matrix] demo_evidence_result={evidence}");
-    if result == "failed" {
-        return Err(format!(
-            "full demo evidence has unacceptable degradation: {evidence}"
-        ));
-    }
-    Ok(())
+    Ok(DemoEvidenceReport {
+        evidence,
+        unacceptable_reasons,
+    })
 }
 
 fn run_query_live_only_rescan_phase(
@@ -2073,11 +2156,41 @@ fn assert_status(actual: u16, expected: u16, context: &str) -> Result<(), String
 }
 
 fn assert_error(response: ApiResponse, expected_status: u16, needle: &str) -> Result<(), String> {
-    assert_status(response.status, expected_status, "error response")?;
+    if response.status != expected_status {
+        return Err(format!(
+            "error response: expected status {expected_status}, got {}; body={}",
+            response.status, response.body
+        ));
+    }
     let body = response.body.to_string();
     if !body.contains(needle) {
         return Err(format!(
             "expected response body to contain '{needle}', got {}",
+            response.body
+        ));
+    }
+    Ok(())
+}
+
+fn assert_trusted_materialized_not_ready(
+    response: ApiResponse,
+    context: &str,
+) -> Result<(), String> {
+    assert_status(response.status, 503, context)?;
+    if response.body.get("code").and_then(Value::as_str) != Some("NOT_READY") {
+        return Err(format!(
+            "{context}: expected NOT_READY code for closed trusted-materialized readiness, got {}",
+            response.body
+        ));
+    }
+    let error = response
+        .body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !error.contains("trusted-materialized") {
+        return Err(format!(
+            "{context}: expected trusted-materialized readiness explanation, got {}",
             response.body
         ));
     }
@@ -2099,7 +2212,13 @@ fn assert_trusted_tree_matches_readiness(
     )?;
 
     if trusted_ready {
-        assert_status(response.status, 200, context)?;
+        if response.status != 200 {
+            let status_after_tree = session.status()?;
+            return Err(format!(
+                "{context}: status reported trusted observation ready but /tree did not return 200; before={status}; after={status_after_tree}; response_status={}; response_body={}",
+                response.status, response.body
+            ));
+        }
         assert_trusted_tree_response(response, context)?;
     } else {
         if response.status == 200 {
@@ -2116,11 +2235,7 @@ fn assert_trusted_tree_matches_readiness(
             }
             assert_trusted_tree_response(response, context)?;
         } else {
-            assert_error(
-                response,
-                503,
-                "trusted-materialized reads remain unavailable",
-            )?;
+            assert_trusted_materialized_not_ready(response, context)?;
         }
     }
 

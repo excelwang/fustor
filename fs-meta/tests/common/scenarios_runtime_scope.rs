@@ -134,7 +134,6 @@ fn append_mount_root_resource_on_node(
 
 fn fs_meta_api_client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("build reqwest client failed: {e}"))
 }
@@ -201,9 +200,16 @@ fn fs_meta_post_json(
         .bearer_auth(bearer)
         .json(body)
         .send()
-        .map_err(|e| format!("POST {path} failed: {e}"))?;
+        .map_err(|e| format_reqwest_error(&format!("POST {path} failed"), e))?;
     if !response.status().is_success() {
-        return Err(format!("POST {path} returned HTTP {}", response.status()));
+        let status = response.status();
+        let body = response
+            .text()
+            .unwrap_or_else(|err| format!("<failed to read body: {err}>"));
+        return Err(format!(
+            "POST {path} returned HTTP {} body={}",
+            status, body
+        ));
     }
     response
         .json()
@@ -1525,12 +1531,49 @@ pub(crate) fn scenario_empty_roots_online_roots_apply_distributed_force_find_e2e
                     )?;
                     let management_token =
                         fs_meta_login_token(&active_bind_addr, "operator", "operator123")?;
-                    let rescan = fs_meta_post_json(
+                    let rescan = match fs_meta_post_json(
                         &active_bind_addr,
                         "/index/rescan",
                         &management_token,
                         &json!({}),
-                    )?;
+                    ) {
+                        Ok(rescan) => rescan,
+                        Err(err) => {
+                            let status_a = c
+                                .layered_status_a_local()
+                                .map(|status| local_fs_meta_status_summary(&status))
+                                .unwrap_or_else(|e| serde_json::json!({ "error": e }));
+                            let status_b = c
+                                .layered_status_b_local()
+                                .map(|status| local_fs_meta_status_summary(&status))
+                                .unwrap_or_else(|e| serde_json::json!({ "error": e }));
+                            let audit_a = c
+                                .ctl_ok_a_local(json!({ "command": "audit_tail", "count": 48 }))
+                                .unwrap_or_else(|_| serde_json::json!(null));
+                            let audit_b = c
+                                .ctl_ok_b_local(json!({ "command": "audit_tail", "count": 48 }))
+                                .unwrap_or_else(|_| serde_json::json!(null));
+                            let public_status_active = match fs_meta_get_json(
+                                &active_bind_addr,
+                                "/status",
+                                &management_token,
+                            ) {
+                                Ok(body) => body,
+                                Err(err) => serde_json::json!({ "error": err }),
+                            };
+                            let single_active_after_rescan = wait_for_single_active_bind_addr(
+                                &api_bind_addr_a,
+                                &api_bind_addr_b,
+                                "operator",
+                                "operator123",
+                            )
+                            .map(|addr| format!("ok:{addr}"))
+                            .unwrap_or_else(|e| e);
+                            return Err(format!(
+                                "empty-roots-e2e rescan failed: {err}; active_bind_addr_before_rescan={active_bind_addr}; single_active_after_rescan={single_active_after_rescan}; public_status_active={public_status_active}; node_a_local={status_a}; node_b_local={status_b}; node_a_audit={audit_a}; node_b_audit={audit_b}"
+                            ));
+                        }
+                    };
                     if rescan.get("accepted").and_then(Value::as_bool) != Some(true) {
                         return Err(format!(
                             "empty-roots-e2e rescan did not return accepted=true: {rescan}"

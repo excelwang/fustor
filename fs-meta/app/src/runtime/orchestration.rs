@@ -17,29 +17,68 @@ pub(crate) const MANUAL_RESCAN_CONTROL_FRAME_KIND: &str = "fs-meta.manual-rescan
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ManualRescanControlPayload {
     pub requested_at_us: u64,
+    #[serde(default)]
+    pub scoped_target_acceptance_timeout_ms: Option<u64>,
 }
 
 pub(crate) fn encode_manual_rescan_envelope(requested_at_us: u64) -> Result<ControlEnvelope> {
+    encode_manual_rescan_envelope_with_scoped_target_acceptance_timeout(requested_at_us, None)
+}
+
+pub(crate) fn encode_manual_rescan_envelope_with_scoped_target_acceptance_timeout(
+    requested_at_us: u64,
+    scoped_target_acceptance_timeout: Option<std::time::Duration>,
+) -> Result<ControlEnvelope> {
     Ok(ControlEnvelope::Frame(ControlFrame {
         kind: MANUAL_RESCAN_CONTROL_FRAME_KIND.to_string(),
-        payload: rmp_serde::to_vec_named(&ManualRescanControlPayload { requested_at_us }).map_err(
-            |err| {
-                CnxError::Internal(format!(
-                    "encode manual rescan control payload failed: {err}"
-                ))
-            },
-        )?,
+        payload: rmp_serde::to_vec_named(&ManualRescanControlPayload {
+            requested_at_us,
+            scoped_target_acceptance_timeout_ms: scoped_target_acceptance_timeout
+                .map(|timeout| timeout.as_millis().min(u128::from(u64::MAX)) as u64),
+        })
+        .map_err(|err| {
+            CnxError::Internal(format!(
+                "encode manual rescan control payload failed: {err}"
+            ))
+        })?,
     }))
+}
+
+pub(crate) fn manual_rescan_scoped_target_acceptance_timeout_from_payload(
+    payload: &[u8],
+) -> Option<std::time::Duration> {
+    let envelope = rmp_serde::from_slice::<ControlEnvelope>(payload).ok()?;
+    let ControlEnvelope::Frame(frame) = envelope else {
+        return None;
+    };
+    if frame.kind != MANUAL_RESCAN_CONTROL_FRAME_KIND {
+        return None;
+    }
+    rmp_serde::from_slice::<ManualRescanControlPayload>(&frame.payload)
+        .ok()
+        .and_then(|payload| payload.scoped_target_acceptance_timeout_ms)
+        .map(std::time::Duration::from_millis)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LogicalRootsControlPayload {
     pub roots: Vec<RootSpec>,
+    #[serde(default)]
+    pub generation: u64,
 }
 
+#[allow(dead_code)]
 pub(crate) fn encode_logical_roots_control_payload(roots: &[RootSpec]) -> Result<Vec<u8>> {
+    encode_logical_roots_control_payload_with_generation(roots, 0)
+}
+
+pub(crate) fn encode_logical_roots_control_payload_with_generation(
+    roots: &[RootSpec],
+    generation: u64,
+) -> Result<Vec<u8>> {
     rmp_serde::to_vec_named(&LogicalRootsControlPayload {
         roots: roots.to_vec(),
+        generation,
     })
     .map_err(|err| {
         CnxError::Internal(format!(
