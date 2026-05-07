@@ -144,7 +144,7 @@
 
         control_entered.notified().await;
 
-        let mut deactivate_task = tokio::spawn({
+        let deactivate_task = tokio::spawn({
             let predecessor = predecessor.clone();
             async move {
                 predecessor
@@ -328,7 +328,7 @@
 
         control_entered.notified().await;
 
-        let mut deactivate_task = tokio::spawn({
+        let deactivate_task = tokio::spawn({
             let predecessor = predecessor.clone();
             async move {
                 predecessor

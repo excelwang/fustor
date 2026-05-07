@@ -1,3 +1,4 @@
+#[tokio::test]
 async fn rpc_metrics_endpoint_returns_ok() {
     let resp = get_bound_route_metrics().await.into_response();
     assert_eq!(resp.status(), StatusCode::OK);

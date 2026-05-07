@@ -98,6 +98,7 @@ pub struct StatusSourceConcreteRoot {
     pub overflow_count: u64,
     pub overflow_pending: bool,
     pub rescan_pending: bool,
+    pub last_rescan_requested_at_us: Option<u64>,
     pub last_rescan_reason: Option<String>,
     pub last_error: Option<String>,
     pub last_audit_started_at_us: Option<u64>,

@@ -3372,18 +3372,6 @@ fn sink_group_status_counts_as_ready(group: &crate::sink::SinkGroupStatusSnapsho
     )
 }
 
-fn sink_status_snapshot_scheduled_groups(
-    snapshot: &crate::sink::SinkStatusSnapshot,
-) -> std::collections::BTreeSet<String> {
-    snapshot.progress_snapshot().scheduled_groups
-}
-
-fn sink_status_snapshot_ready_groups(
-    snapshot: &crate::sink::SinkStatusSnapshot,
-) -> std::collections::BTreeSet<String> {
-    snapshot.progress_snapshot().ready_groups
-}
-
 fn sink_status_snapshot_has_ready_scheduled_groups(
     snapshot: &crate::sink::SinkStatusSnapshot,
 ) -> bool {
@@ -4195,6 +4183,7 @@ fn summarize_sink_status_endpoint(snapshot: &crate::sink::SinkStatusSnapshot) ->
     )
 }
 
+#[cfg(test)]
 fn summarize_source_observability_endpoint(
     snapshot: &crate::workers::source::SourceObservabilitySnapshot,
 ) -> String {
@@ -7582,17 +7571,6 @@ impl FSMetaApp {
         }
     }
 
-    fn cached_sink_status_ready_for_expected_groups(
-        sink: &Arc<SinkFacade>,
-        expected_groups: &std::collections::BTreeSet<String>,
-    ) -> bool {
-        sink.cached_status_snapshot_with_failure()
-            .ok()
-            .is_some_and(|snapshot| {
-                sink_status_snapshot_ready_for_expected_groups(&snapshot, expected_groups)
-            })
-    }
-
     async fn blocking_sink_status_probe_ready_for_expected_groups(
         sink: &Arc<SinkFacade>,
         expected_groups: &std::collections::BTreeSet<String>,
@@ -9234,17 +9212,6 @@ impl FSMetaApp {
             release_handoff,
             shutdown_handoff,
         }
-    }
-
-    #[cfg(test)]
-    async fn settle_fixed_bind_claim_release_followup(
-        &self,
-    ) -> Result<FixedBindClaimReleaseFollowupSnapshot> {
-        let session = self.begin_fixed_bind_lifecycle_session().await;
-        let (snapshot, _) = self
-            .settle_fixed_bind_claim_release_followup_with_session(session)
-            .await?;
-        Ok(snapshot)
     }
 
     #[cfg(test)]
@@ -12600,17 +12567,6 @@ impl FSMetaApp {
         Ok(fixed_bind_session)
     }
 
-    #[cfg(test)]
-    async fn replay_suppressed_public_query_activates_after_publication(&self) -> Result<()> {
-        let fixed_bind_session = self.begin_fixed_bind_lifecycle_session().await;
-        let _ = self
-            .replay_suppressed_public_query_activates_after_publication_with_session(
-                fixed_bind_session,
-            )
-            .await?;
-        Ok(())
-    }
-
     fn facade_spawn_error_is_bind_addr_in_use(err: &CnxError) -> bool {
         let message = err.to_string().to_ascii_lowercase();
         message.contains("fs-meta api bind failed") && message.contains("address already in use")
@@ -13021,22 +12977,6 @@ impl FSMetaApp {
         self.drive_fixed_bind_lifecycle_request(FixedBindLifecycleRequest::Shutdown)
             .await
             .expect("shutdown handoff should complete");
-    }
-
-    async fn withdraw_uninitialized_query_routes(&self) {
-        self.withdraw_uninitialized_query_routes_with_policy(
-            ControlFailureRecoveryLanePolicy::WithdrawInternalStatus,
-            false,
-        )
-        .await;
-    }
-
-    async fn withdraw_uninitialized_query_routes_preserving_internal_status(&self) {
-        self.withdraw_uninitialized_query_routes_with_policy(
-            ControlFailureRecoveryLanePolicy::PreserveInternalStatus,
-            false,
-        )
-        .await;
     }
 
     async fn withdraw_uninitialized_query_routes_with_policy(
@@ -14165,7 +14105,7 @@ impl FSMetaApp {
         } else {
             None
         };
-        let mut replay_followup_pending = replay_followup_signals.clone();
+        let replay_followup_pending = replay_followup_signals.clone();
         let deadline = tokio::time::Instant::now() + SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT;
         loop {
             let replaying_retained_state_only =
@@ -14235,7 +14175,6 @@ impl FSMetaApp {
                     if replaying_retained_state_only {
                         continue;
                     }
-                    replay_followup_pending = None;
                     return Ok(());
                 }
                 Err(err) if fail_closed_restart_deferred_retire_pending => {
@@ -14786,7 +14725,7 @@ impl FSMetaApp {
         } else {
             None
         };
-        let mut replay_followup_pending = replay_followup_signals.clone();
+        let replay_followup_pending = replay_followup_signals.clone();
         let deadline = tokio::time::Instant::now() + SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT;
         loop {
             let replaying_retained_state_only = replay_retained_state
@@ -14805,7 +14744,6 @@ impl FSMetaApp {
                         .iter()
                         .all(|signal| matches!(signal, SinkControlSignal::Tick { .. }))
                 {
-                    replay_followup_pending = None;
                     return Ok(());
                 }
                 followups
@@ -14883,7 +14821,6 @@ impl FSMetaApp {
                     if replaying_retained_state_only {
                         continue;
                     }
-                    replay_followup_pending = None;
                     return Ok(());
                 }
                 Err(err) if fail_closed_restart_deferred_retire_pending => {
@@ -14999,11 +14936,17 @@ impl FSMetaApp {
         unit: FacadeRuntimeUnit,
         route_key: &str,
         generation: u64,
-        _restart_deferred_retire_pending: bool,
+        restart_deferred_retire_pending: bool,
     ) -> Result<()> {
         let session = self.begin_fixed_bind_lifecycle_session().await;
         let _ = self
-            .apply_facade_deactivate_with_session(session, unit, route_key, generation)
+            .apply_facade_deactivate_with_session(
+                session,
+                unit,
+                route_key,
+                generation,
+                restart_deferred_retire_pending,
+            )
             .await?;
         Ok(())
     }
@@ -15014,6 +14957,7 @@ impl FSMetaApp {
         unit: FacadeRuntimeUnit,
         route_key: &str,
         generation: u64,
+        restart_deferred_retire_pending: bool,
     ) -> Result<FixedBindLifecycleSession> {
         let mut session = session;
         eprintln!(
@@ -15192,7 +15136,7 @@ impl FSMetaApp {
                     generation,
                     retain_active_facade,
                     retain_pending_spawn,
-                    restart_deferred_retire_pending: false,
+                    restart_deferred_retire_pending,
                 },
             )
             .await?;
@@ -15250,10 +15194,16 @@ impl FSMetaApp {
                 unit,
                 route_key,
                 generation,
-                restart_deferred_retire_pending: _,
+                restart_deferred_retire_pending,
             } => {
                 return self
-                    .apply_facade_deactivate_with_session(session, unit, &route_key, generation)
+                    .apply_facade_deactivate_with_session(
+                        session,
+                        unit,
+                        &route_key,
+                        generation,
+                        restart_deferred_retire_pending,
+                    )
                     .await;
             }
             FacadeControlSignal::Tick {

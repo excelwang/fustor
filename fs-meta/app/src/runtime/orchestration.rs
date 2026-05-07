@@ -21,6 +21,7 @@ pub(crate) struct ManualRescanControlPayload {
     pub scoped_target_acceptance_timeout_ms: Option<u64>,
 }
 
+#[cfg(test)]
 pub(crate) fn encode_manual_rescan_envelope(requested_at_us: u64) -> Result<ControlEnvelope> {
     encode_manual_rescan_envelope_with_scoped_target_acceptance_timeout(requested_at_us, None)
 }

@@ -524,6 +524,7 @@ impl ParallelScanner {
     }
 
     /// Run a full audit scan. Returns batched events including EpochStart/End.
+    #[cfg(test)]
     pub fn scan_audit(
         &self,
         epoch_id: u64,

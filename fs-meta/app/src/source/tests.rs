@@ -1107,8 +1107,7 @@ async fn source_with_boundary_scoped_rescan_ack_enqueues_local_scan_intent() {
 }
 
 #[tokio::test]
-async fn source_rescan_control_stream_records_intent_without_scan_signal_before_delivery_acceptance()
- {
+async fn source_rescan_control_stream_does_not_consume_execution_before_delivery_acceptance() {
     let source = build_source(vec![test_export(
         "node-a::nfs1",
         "node-a",
@@ -1185,32 +1184,52 @@ async fn source_rescan_control_stream_records_intent_without_scan_signal_before_
         .await
         .expect("publish broad manual-rescan control stream event");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        let requested = lock_or_recover(
-            &source.state_cell.manual_rescan_intents,
-            "test.rescan_control_record_only.intents",
-        )
-        .get(&root_key)
-        .map(|intent| intent.requested)
-        .unwrap_or(0);
-        if requested > 0 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "broad manual-rescan control stream must record source-primary intent"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
     tokio::task::yield_now().await;
+    let requested = lock_or_recover(
+        &source.state_cell.manual_rescan_intents,
+        "test.rescan_control_record_only.intents",
+    )
+    .get(&root_key)
+    .map(|intent| intent.requested)
+    .unwrap_or(0);
+    assert_eq!(
+        requested, 0,
+        "broad manual-rescan control stream is only a delivery lane probe; it must not consume an execution request before scoped or generic request-reply delivery is accepted"
+    );
     assert!(
         matches!(
             rescan_rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ),
-        "broad manual-rescan control stream may record intent but must not wake scan/audit before scoped or generic request-reply delivery is accepted"
+        "broad manual-rescan control stream must not wake scan/audit before scoped or generic request-reply delivery is accepted"
+    );
+
+    let adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary,
+        NodeId("node-d".to_string()),
+        source_rescan_route_bindings_for("node-a"),
+    );
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_RESCAN,
+        Bytes::from_static(b"manual-rescan"),
+        Duration::from_millis(750),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("scoped source rescan request must still enqueue execution after control lane probe");
+
+    assert!(
+        events.iter().any(|event| {
+            event.metadata().origin_id == NodeId("node-a".to_string())
+                && event.payload_bytes() == b"accepted"
+        }),
+        "scoped source rescan route must return accepted proof after control lane probe: {events:?}"
+    );
+    assert!(
+        matches!(rescan_rx.try_recv(), Ok(RescanReason::Manual)),
+        "scoped source rescan accepted proof must enqueue the execution request even after broad control delivery"
     );
 
     source.close().await.expect("close source");
@@ -2048,7 +2067,7 @@ async fn roots_control_stream_ignores_older_declaration_after_newer_authoritativ
 
 #[tokio::test]
 async fn runtime_host_object_grants_changed_survives_restart_on_shared_state_boundary_for_runtime_managed_schedule_recovery()
-{
+ {
     let boundary = in_memory_state_boundary();
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")];
@@ -4242,6 +4261,38 @@ fn manual_rescan_requests_are_coalesced_while_one_is_pending() {
 }
 
 #[test]
+fn topology_reconcile_preserves_rescan_channel_for_unchanged_root() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::exp1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+        .expect("init source");
+    let current = lock_or_recover(
+        &source.state_cell.roots,
+        "test.topology_reconcile_preserves_rescan_channel.roots",
+    )
+    .clone();
+    let mut desired = current.clone();
+    let (replacement_tx, _) = tokio::sync::broadcast::channel(16);
+    desired[0].rescan_tx = replacement_tx;
+
+    let preserved = FSMetaSource::preserve_existing_root_runtime_state(&current, desired);
+    let mut preserved_rx = preserved[0].rescan_tx.subscribe();
+    current[0]
+        .rescan_tx
+        .send(RescanReason::Manual)
+        .expect("preserved channel should have a receiver");
+
+    assert!(matches!(preserved_rx.try_recv(), Ok(RescanReason::Manual)));
+}
+
+#[test]
 fn topology_rescan_is_not_coalesced_behind_pending_manual_rescan() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
@@ -4456,6 +4507,62 @@ async fn trigger_rescan_when_ready_records_deferred_intent_before_primary_root_r
             .is_some_and(|detail| detail.rescan_pending),
         "trigger_rescan_when_ready must record pending manual rescan intent before execution"
     );
+}
+
+#[test]
+fn rescan_request_invalidates_previous_audit_completion_evidence() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::exp1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+        .expect("init source");
+    let primary_root = lock_or_recover(
+        &source.state_cell.roots,
+        "test.rescan_request_invalidates_previous_audit.roots",
+    )
+    .iter()
+    .find(|root| root.is_group_primary)
+    .cloned()
+    .expect("primary root exists");
+    let root_key = FSMetaSource::root_runtime_key(&primary_root);
+
+    FSMetaSource::mark_root_audit_completed(&source.state_cell.fanout_health, &root_key, 10, 20);
+    FSMetaSource::mark_root_rescan_requested(&source.state_cell.fanout_health, &root_key, "manual");
+    {
+        let health = lock_or_recover(
+            &source.state_cell.fanout_health,
+            "test.rescan_request_invalidates_previous_audit.pending",
+        );
+        let detail = health
+            .object_ref_detail
+            .get(&root_key)
+            .expect("root detail exists");
+        assert!(detail.rescan_pending);
+        assert!(detail.last_rescan_requested_at_us.is_some());
+        assert_eq!(detail.last_audit_started_at_us, None);
+        assert_eq!(detail.last_audit_completed_at_us, None);
+        assert_eq!(detail.last_audit_duration_ms, None);
+    }
+
+    FSMetaSource::mark_root_audit_start(&source.state_cell.fanout_health, &root_key, "manual", 30);
+    let health = lock_or_recover(
+        &source.state_cell.fanout_health,
+        "test.rescan_request_invalidates_previous_audit.started",
+    );
+    let detail = health
+        .object_ref_detail
+        .get(&root_key)
+        .expect("root detail exists");
+    assert!(!detail.rescan_pending);
+    assert_eq!(detail.last_audit_started_at_us, Some(30));
+    assert_eq!(detail.last_audit_completed_at_us, None);
+    assert_eq!(detail.last_audit_duration_ms, None);
 }
 
 #[test]

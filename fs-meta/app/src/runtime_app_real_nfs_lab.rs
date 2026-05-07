@@ -103,7 +103,7 @@ impl RealNfsPreflight {
 
 pub struct NfsLab {
     _temp: TempDir,
-    exports_dir: PathBuf,
+    pub(crate) exports_dir: PathBuf,
     mounts_dir: PathBuf,
     mounted: BTreeMap<(String, String), PathBuf>,
     started_rpcbind: bool,
@@ -183,10 +183,6 @@ impl NfsLab {
                 (export == export_name).then(|| mount_path.clone())
             })
             .unwrap_or_else(|| self.exports_dir.join(export_name))
-    }
-
-    pub fn export_source(&self, export_name: &str) -> String {
-        format!("127.0.0.1:{}", self.exports_dir.join(export_name).display())
     }
 
     fn mutable_export_path(&self, export_name: &str, relative: &str) -> Result<PathBuf, String> {

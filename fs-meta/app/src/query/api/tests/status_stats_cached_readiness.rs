@@ -49,6 +49,7 @@ fn source_status_for_cache_key(group_id: &str) -> SourceStatusSnapshot {
             overflow_count: 0,
             overflow_pending: false,
             rescan_pending: false,
+            last_rescan_requested_at_us: None,
             last_rescan_reason: None,
             last_error: None,
             last_audit_started_at_us: Some(10),
@@ -100,6 +101,27 @@ fn sink_status_for_cache_key(group_id: &str) -> SinkStatusSnapshot {
         stream_last_applied_at_us_by_node: BTreeMap::from([("node-a".to_string(), 400)]),
         ..SinkStatusSnapshot::default()
     }
+}
+
+#[test]
+fn materialized_readiness_signature_tracks_source_audit_completion() {
+    let group_id = "nfs-audit-signature";
+    let mut inflight_source = source_status_for_cache_key(group_id);
+    inflight_source.concrete_roots[0].last_audit_completed_at_us = None;
+    let completed_source = source_status_for_cache_key(group_id);
+    let sink_status = sink_status_for_cache_key(group_id);
+
+    let inflight_signature =
+        materialized_read_snapshot_evidence_signature(&inflight_source, &sink_status)
+            .expect("inflight signature");
+    let completed_signature =
+        materialized_read_snapshot_evidence_signature(&completed_source, &sink_status)
+            .expect("completed signature");
+
+    assert_ne!(
+        inflight_signature, completed_signature,
+        "source audit completion is trusted-readiness evidence and must invalidate stale materialized readiness cache entries"
+    );
 }
 
 #[test]
@@ -832,6 +854,7 @@ fn materialized_query_readiness_preserves_retained_group_audit_across_root_set_c
             overflow_count: 0,
             overflow_pending: false,
             rescan_pending: false,
+            last_rescan_requested_at_us: None,
             last_rescan_reason: Some("manual".into()),
             last_error: None,
             last_audit_started_at_us: Some(10),

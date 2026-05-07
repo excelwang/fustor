@@ -507,6 +507,7 @@ impl ManagedEndpointTask {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn<F, Fut>(
         boundary: Arc<dyn ChannelIoSubset>,
         route: RouteKey,
@@ -597,6 +598,7 @@ impl ManagedEndpointTask {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn_with_units<F, Fut, I, S>(
         boundary: Arc<dyn ChannelIoSubset>,
         route: RouteKey,
@@ -895,40 +897,6 @@ impl ManagedEndpointTask {
         )
     }
 
-    pub(crate) fn spawn_stream_with_before_recv<F, Fut, G, H>(
-        boundary: Arc<dyn ChannelIoSubset>,
-        route: RouteKey,
-        name: impl Into<String>,
-        unit_id: impl Into<String>,
-        shutdown: CancellationToken,
-        should_recv: G,
-        before_recv: H,
-        handler: F,
-    ) -> Self
-    where
-        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
-        G: Fn() -> bool + Send + Sync + 'static,
-        H: Fn() + Send + Sync + 'static,
-    {
-        Self::spawn_stream_with_before_recv_and_wait(
-            boundary,
-            route,
-            name,
-            unit_id,
-            shutdown,
-            should_recv,
-            || {
-                async move {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                .boxed()
-            },
-            before_recv,
-            handler,
-        )
-    }
-
     pub(crate) fn spawn_stream_with_before_recv_and_wait<F, Fut, G, W, H>(
         boundary: Arc<dyn ChannelIoSubset>,
         route: RouteKey,
@@ -1077,6 +1045,7 @@ impl ManagedEndpointTask {
     }
 }
 
+#[cfg(test)]
 async fn run_endpoint_loop<F, Fut>(
     boundary: Arc<dyn ChannelIoSubset>,
     route: RouteKey,
@@ -1101,6 +1070,7 @@ async fn run_endpoint_loop<F, Fut>(
     .await
 }
 
+#[cfg(test)]
 async fn run_endpoint_loop_with_contexts<F, Fut>(
     boundary: Arc<dyn ChannelIoSubset>,
     route: RouteKey,
@@ -1465,6 +1435,7 @@ fn mark_endpoint_receivable(
     }
 }
 
+#[cfg(test)]
 async fn run_stream_loop<F, Fut, G, H>(
     boundary: Arc<dyn ChannelIoSubset>,
     route: RouteKey,

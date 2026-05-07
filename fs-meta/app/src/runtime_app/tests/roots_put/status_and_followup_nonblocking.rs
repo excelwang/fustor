@@ -130,7 +130,7 @@ async fn control_frame_does_not_wait_for_inflight_status_request_before_source_r
         },
     );
 
-    let mut status_request = tokio::spawn({
+    let status_request = tokio::spawn({
         let client = client.clone();
         let bind_addr = bind_addr.clone();
         let token = token.clone();

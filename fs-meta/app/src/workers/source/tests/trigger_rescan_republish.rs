@@ -1,5 +1,6 @@
 macro_rules! define_trigger_rescan_republish_tests {
     () => {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn generation_two_real_source_route_trigger_rescan_when_ready_republishes_baseline_after_worker_not_initialized_post_ack_schedule_refresh()
     {
         struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
@@ -578,10 +579,7 @@ macro_rules! define_trigger_rescan_republish_tests {
         let baseline_target = b"/data";
         let republish_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut baseline_counts = std::collections::BTreeMap::<String, usize>::new();
-        let mut latest_snapshot = client
-            .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
-            .await
-            .expect("observability snapshot before baseline publish wait");
+        let mut latest_snapshot;
         loop {
             latest_snapshot = client
                 .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
@@ -931,11 +929,8 @@ macro_rules! define_trigger_rescan_republish_tests {
             std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
         let scheduled_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let initial_worker_instance_id = client.worker_instance_id_for_tests().await;
-        let mut latest_worker_instance_id = initial_worker_instance_id;
-        let mut latest_status = client
-            .status_snapshot_with_failure()
-            .await
-            .expect("status snapshot before concrete-root readiness wait");
+        let mut latest_worker_instance_id;
+        let mut latest_status;
         loop {
             let source_groups = client
                 .scheduled_source_group_ids()
@@ -1121,10 +1116,7 @@ macro_rules! define_trigger_rescan_republish_tests {
         let baseline_target = b"/data";
         let republish_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut baseline_counts = std::collections::BTreeMap::<String, usize>::new();
-        let mut latest_snapshot = client
-            .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
-            .await
-            .expect("observability snapshot before raw baseline publish wait");
+        let mut latest_snapshot;
         loop {
             latest_snapshot = client
                 .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
@@ -1428,10 +1420,7 @@ macro_rules! define_trigger_rescan_republish_tests {
 
         let republish_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut republish_counts = std::collections::BTreeMap::<String, usize>::new();
-        let mut latest_snapshot = client
-            .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
-            .await
-            .expect("observability snapshot before post-cleanup republish wait");
+        let mut latest_snapshot;
         loop {
             latest_snapshot = client
                 .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
@@ -1772,10 +1761,7 @@ macro_rules! define_trigger_rescan_republish_tests {
 
         let republish_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut republish_counts = std::collections::BTreeMap::<String, usize>::new();
-        let mut latest_snapshot = client
-            .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
-            .await
-            .expect("observability snapshot before post-fail-close republish wait");
+        let mut latest_snapshot;
         loop {
             latest_snapshot = client
                 .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
@@ -2101,10 +2087,7 @@ macro_rules! define_trigger_rescan_republish_tests {
 
         let republish_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut republish_counts = std::collections::BTreeMap::<String, usize>::new();
-        let mut latest_snapshot = client
-            .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
-            .await
-            .expect("observability snapshot before post-fail-close manual-rescan wait");
+        let mut latest_snapshot;
         loop {
             latest_snapshot = client
                 .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
@@ -2384,10 +2367,7 @@ macro_rules! define_trigger_rescan_republish_tests {
         ];
         let republish_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut baseline_counts = std::collections::BTreeMap::<String, usize>::new();
-        let mut latest_snapshot = client
-            .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
-            .await
-            .expect("observability snapshot before mixed-cluster manual-rescan wait");
+        let mut latest_snapshot;
         loop {
             latest_snapshot = client
                 .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)

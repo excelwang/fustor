@@ -20,8 +20,10 @@ use crate::runtime::orchestration::{
     SourceControlSignal, SourceRuntimeUnit, source_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{ROUTE_KEY_EVENTS, source_rescan_route_key_for};
+#[cfg(test)]
+use crate::source::SourceTargetedRescanDeliveryAcceptance;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
-use crate::source::{FSMetaSource, SourceStatusSnapshot, SourceTargetedRescanDeliveryAcceptance};
+use crate::source::{FSMetaSource, SourceStatusSnapshot};
 use crate::workers::sink::SinkFacade;
 use crate::workers::source_ipc::{
     SourceWorkerRequest, SourceWorkerResponse, decode_request, decode_response, encode_request,
@@ -77,6 +79,7 @@ struct SourceProgressState {
 enum SourceWaitFor {
     ControlFlowRetry,
     ScheduledGroupsRefresh,
+    #[cfg(test)]
     Observability,
     Started,
     LogicalRoots,
@@ -95,6 +98,7 @@ impl SourceWaitFor {
                         > after.host_object_grants_updated_epoch
                     || current.scheduled_groups_updated_epoch > after.scheduled_groups_updated_epoch
             }
+            #[cfg(test)]
             Self::Observability => {
                 current.worker_client_replaced_epoch > after.worker_client_replaced_epoch
                     || current.observability_updated_epoch > after.observability_updated_epoch
@@ -678,6 +682,7 @@ impl SourceControlFramePostAckCachePriming {
 enum SourceControlFrameReconnectResume {
     Attempt,
     Wait(SourceProgressState),
+    #[cfg(test)]
     RetainedTickReplay,
     Fail(SourceFailure),
 }
@@ -909,6 +914,7 @@ impl SourceControlFrameMachine {
                     deadline: self.operation_deadline,
                 }))
             }
+            #[cfg(test)]
             Some(SourceControlFrameReconnectResume::RetainedTickReplay) => {
                 Ok(SourceControlFrameStep::run(RetainedTickReplayLane {
                     deadline: self.operation_deadline,
@@ -2814,26 +2820,6 @@ fn prime_cached_schedule_from_control_signals(
     }
 }
 
-fn bound_scope_matches_local_grant(
-    bound_scope: &RuntimeBoundScope,
-    node_id: &NodeId,
-    grants: &[GrantedMountRoot],
-) -> bool {
-    bound_scope.resource_ids.iter().any(|resource_id| {
-        host_ref_from_resource_id(resource_id)
-            .is_some_and(|host_ref| host_ref_matches_node_id(host_ref, node_id))
-    }) || grants.iter().any(|grant| {
-        host_ref_matches_node_id(&grant.host_ref, node_id)
-            && (runtime_scope_resource_matches_logical_root(
-                &grant.object_ref,
-                &bound_scope.scope_id,
-            ) || runtime_scope_resource_matches_logical_root(
-                &grant.fs_source,
-                &bound_scope.scope_id,
-            ))
-    })
-}
-
 fn prime_cached_schedule_from_control_signals_for_replay_recovery(
     cache: &mut SourceWorkerSnapshotCache,
     node_id: &NodeId,
@@ -3451,6 +3437,7 @@ pub(crate) fn source_observability_recovery_projection(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn recovered_control_signals_by_node_from_active_status(
     stable_host_ref: &str,
     status: &SourceStatusSnapshot,
@@ -5015,17 +5002,6 @@ pub(crate) fn install_source_worker_accept_targeted_delivery_call_count_hook(
 }
 
 #[cfg(test)]
-pub(crate) fn install_source_worker_accept_targeted_delivery_delay_hook(
-    hook: SourceWorkerAcceptTargetedDeliveryDelayHook,
-) {
-    let mut guard = match source_worker_accept_targeted_delivery_delay_hook_cell().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    *guard = Some(hook);
-}
-
-#[cfg(test)]
 pub(crate) fn install_source_worker_submit_targeted_rescan_delay_hook(
     hook: SourceWorkerSubmitTargetedRescanDelayHook,
 ) {
@@ -5146,15 +5122,6 @@ pub(crate) fn clear_source_worker_rearm_call_count_hook() {
 #[cfg(test)]
 pub(crate) fn clear_source_worker_accept_targeted_delivery_call_count_hook() {
     let mut guard = match source_worker_accept_targeted_delivery_call_count_hook_cell().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    *guard = None;
-}
-
-#[cfg(test)]
-pub(crate) fn clear_source_worker_accept_targeted_delivery_delay_hook() {
-    let mut guard = match source_worker_accept_targeted_delivery_delay_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -6883,7 +6850,9 @@ impl SourceWorkerClientHandle {
         }
     }
 
-    async fn logical_roots_generation_with_failure(&self) -> std::result::Result<u64, SourceFailure> {
+    async fn logical_roots_generation_with_failure(
+        &self,
+    ) -> std::result::Result<u64, SourceFailure> {
         let (worker_instance_id, client) = self.shared_existing_client_with_failure().await?;
         let cached_generation = self.with_cache_mut(|cache| cache.logical_roots_generation);
         let Some(client) = client else {
@@ -7028,28 +6997,6 @@ impl SourceWorkerClientHandle {
                 Ok(snapshot)
             }
             other => unexpected_source_worker_response_result("for status snapshot", other),
-        }
-    }
-
-    #[cfg(test)]
-    async fn lifecycle_state_label_with_failure(
-        &self,
-    ) -> std::result::Result<String, SourceFailure> {
-        match Self::call_worker_with_failure(
-            &self.client_with_failure().await?,
-            SourceWorkerRequest::LifecycleState,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        )
-        .await
-        {
-            Ok(SourceWorkerResponse::LifecycleState(state)) => {
-                self.with_cache_mut(|cache| {
-                    cache.lifecycle_state = Some(state.clone());
-                });
-                Ok(state)
-            }
-            Ok(other) => unexpected_source_worker_response_result("for lifecycle state", other),
-            Err(err) => Err(err),
         }
     }
 
@@ -7366,23 +7313,6 @@ impl SourceWorkerClientHandle {
         match tokio::time::timeout(timeout, attempt).await {
             Ok(result) => result.map_err(SourceFailure::into_error),
             Err(_) => Err(CnxError::Timeout),
-        }
-    }
-
-    async fn start_runtime_endpoints_with_failure(&self) -> std::result::Result<(), SourceFailure> {
-        match self
-            .with_started_retry_with_failure(|client| async move {
-                Self::call_worker_with_failure(
-                    &client,
-                    SourceWorkerRequest::StartRuntimeEndpoints,
-                    SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-                )
-                .await
-            })
-            .await?
-        {
-            SourceWorkerResponse::Ack => Ok(()),
-            other => unexpected_source_worker_response_result("for source endpoint rearm", other),
         }
     }
 
@@ -7866,43 +7796,6 @@ impl SourceWorkerClientHandle {
         Ok(epoch)
     }
 
-    async fn submit_targeted_rescan_when_ready_epoch_with_failure(
-        &self,
-    ) -> std::result::Result<u64, SourceFailure> {
-        let response = self
-            .with_started_once_with_failure(|client| async move {
-                Self::call_worker_with_failure(
-                    &client,
-                    SourceWorkerRequest::TriggerTargetedRescanWhenReadyEpoch,
-                    SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
-                )
-                .await
-            })
-            .await?;
-        let epoch = match response {
-            SourceWorkerResponse::RescanRequestEpoch(epoch) => epoch,
-            other => {
-                return Err(unexpected_source_worker_response_failure(
-                    "for submit_targeted_rescan_when_ready_epoch",
-                    other,
-                ));
-            }
-        };
-        self.with_cache_mut(|cache| {
-            let last_audit_completed_at_us = cache
-                .status
-                .as_ref()
-                .map(source_status_rescan_completion_marker)
-                .unwrap_or_default();
-            let (published_batches, last_published_at_us) = cached_source_publication_marker(cache);
-            cache.rescan_request_published_batches = published_batches;
-            cache.rescan_request_last_published_at_us = last_published_at_us;
-            cache.rescan_request_last_audit_completed_at_us = last_audit_completed_at_us;
-            cache.rescan_request_epoch = cache.rescan_request_epoch.max(epoch);
-        });
-        Ok(epoch)
-    }
-
     async fn submit_targeted_rescan_request_epoch_with_failure(
         &self,
     ) -> std::result::Result<u64, SourceFailure> {
@@ -8040,6 +7933,7 @@ impl SourceWorkerClientHandle {
         Ok(epoch)
     }
 
+    #[cfg(test)]
     async fn accept_targeted_rescan_delivery_with_failure(
         &self,
     ) -> std::result::Result<(), SourceFailure> {
@@ -8081,6 +7975,7 @@ impl SourceWorkerClientHandle {
         }
     }
 
+    #[cfg(test)]
     async fn check_targeted_rescan_delivery_acceptance_with_failure(
         &self,
     ) -> std::result::Result<SourceTargetedRescanDeliveryAcceptance, SourceFailure> {
@@ -8146,6 +8041,7 @@ impl SourceWorkerClientHandle {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn manual_rescan_delivery_acceptance_already_ready(&self) -> bool {
         if self.control_op_inflight() || self.retained_replay_required_for_status().await {
             return false;
@@ -8565,6 +8461,7 @@ impl SourceWorkerClientHandle {
         }
     }
 
+    #[cfg(test)]
     async fn observability_snapshot_nonblocking_for_status_route(
         &self,
     ) -> (SourceObservabilitySnapshot, bool) {
@@ -8572,6 +8469,7 @@ impl SourceWorkerClientHandle {
             .await
     }
 
+    #[cfg(test)]
     async fn manual_rescan_delivery_observability_snapshot_for_status_route_with_timeout(
         &self,
         live_probe_timeout: Option<Duration>,
@@ -9012,6 +8910,7 @@ pub(crate) fn build_live_source_observability_snapshot(
     )
 }
 
+#[cfg(test)]
 fn scheduled_groups_by_node(
     node_id: &NodeId,
     grants: &[GrantedMountRoot],
@@ -9361,6 +9260,7 @@ fn manual_rescan_delivery_status_from_cache(
                 overflow_count: 0,
                 overflow_pending: false,
                 rescan_pending: false,
+                last_rescan_requested_at_us: None,
                 last_rescan_reason: None,
                 last_error: None,
                 last_audit_started_at_us: None,
@@ -10030,14 +9930,6 @@ impl FSMetaSource {
         Ok(self.perform_trigger_rescan_when_ready_epoch().await)
     }
 
-    pub(crate) async fn targeted_rescan_when_ready_epoch_with_failure(
-        &self,
-    ) -> std::result::Result<u64, SourceFailure> {
-        self.perform_targeted_rescan_when_ready_epoch()
-            .await
-            .map_err(SourceFailure::from)
-    }
-
     pub(crate) fn submit_rescan_request_epoch_with_failure(
         &self,
     ) -> std::result::Result<u64, SourceFailure> {
@@ -10316,16 +10208,6 @@ impl SourceFacade {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn lifecycle_state_label_with_failure(
-        &self,
-    ) -> std::result::Result<String, SourceFailure> {
-        match self {
-            Self::Local(source) => source.lifecycle_state_label_with_failure(),
-            Self::Worker(client) => client.lifecycle_state_label_with_failure().await,
-        }
-    }
-
     pub(crate) async fn scheduled_source_group_ids_with_failure(
         &self,
     ) -> std::result::Result<Option<std::collections::BTreeSet<String>>, SourceFailure> {
@@ -10459,16 +10341,6 @@ impl SourceFacade {
         }
     }
 
-    pub(crate) async fn start_runtime_endpoints_with_failure(
-        &self,
-        boundary: Arc<dyn ChannelIoSubset>,
-    ) -> std::result::Result<(), SourceFailure> {
-        match self {
-            Self::Local(source) => source.start_runtime_endpoints_with_failure(boundary).await,
-            Self::Worker(client) => client.start_runtime_endpoints_with_failure().await,
-        }
-    }
-
     pub(crate) async fn rearm_source_rescan_request_endpoints_with_failure(
         &self,
         boundary: Arc<dyn ChannelIoSubset>,
@@ -10545,36 +10417,6 @@ impl SourceFacade {
         }
     }
 
-    pub(crate) async fn submit_targeted_rescan_when_ready_epoch_with_failure(
-        &self,
-    ) -> std::result::Result<u64, SourceFailure> {
-        #[cfg(test)]
-        record_source_worker_trigger_rescan_when_ready_attempt();
-        match self {
-            Self::Local(source) => source.targeted_rescan_when_ready_epoch_with_failure().await,
-            Self::Worker(client) => {
-                client
-                    .submit_targeted_rescan_when_ready_epoch_with_failure()
-                    .await
-            }
-        }
-    }
-
-    pub(crate) async fn submit_targeted_rescan_request_epoch_with_failure(
-        &self,
-    ) -> std::result::Result<u64, SourceFailure> {
-        match self {
-            Self::Local(source) => source
-                .submit_targeted_rescan_request_epoch_with_failure()
-                .map_err(SourceFailure::from),
-            Self::Worker(client) => {
-                client
-                    .submit_targeted_rescan_request_epoch_with_failure()
-                    .await
-            }
-        }
-    }
-
     pub(crate) async fn submit_targeted_rescan_request_epoch_with_acceptance_timeout_with_failure(
         &self,
         acceptance_timeout: Option<Duration>,
@@ -10596,30 +10438,6 @@ impl SourceFacade {
                             .await
                     }
                 }
-            }
-        }
-    }
-
-    pub(crate) async fn accept_targeted_rescan_delivery_with_failure(
-        &self,
-    ) -> std::result::Result<(), SourceFailure> {
-        match self {
-            Self::Local(source) => source
-                .accept_targeted_rescan_delivery_with_failure()
-                .map_err(SourceFailure::from),
-            Self::Worker(client) => client.accept_targeted_rescan_delivery_with_failure().await,
-        }
-    }
-
-    pub(crate) async fn check_targeted_rescan_delivery_acceptance_with_failure(
-        &self,
-    ) -> std::result::Result<SourceTargetedRescanDeliveryAcceptance, SourceFailure> {
-        match self {
-            Self::Local(source) => Ok(source.targeted_rescan_delivery_acceptance()),
-            Self::Worker(client) => {
-                client
-                    .check_targeted_rescan_delivery_acceptance_with_failure()
-                    .await
             }
         }
     }
@@ -10696,27 +10514,6 @@ impl SourceFacade {
             Self::Worker(client) => {
                 client
                     .observability_snapshot_nonblocking_for_status_route_with_timeout(
-                        live_probe_timeout,
-                    )
-                    .await
-            }
-        }
-    }
-
-    pub(crate) async fn manual_rescan_delivery_observability_snapshot_for_status_route_with_timeout(
-        &self,
-        live_probe_timeout: Option<Duration>,
-    ) -> (SourceObservabilitySnapshot, bool) {
-        match self {
-            Self::Local(source) => {
-                let _ = source
-                    .sync_logical_roots_from_authoritative_cell_if_changed()
-                    .await;
-                source.observability_snapshot_nonblocking_for_status_route()
-            }
-            Self::Worker(client) => {
-                client
-                    .manual_rescan_delivery_observability_snapshot_for_status_route_with_timeout(
                         live_probe_timeout,
                     )
                     .await

@@ -492,9 +492,7 @@ fn plan_worker_request(
         },
         SinkWorkerRequest::LogicalRootsGenerationSnapshot => match state.sink.as_ref() {
             Some(sink) => SinkWorkerAction::Immediate(
-                SinkWorkerResponse::LogicalRootsGeneration(
-                    sink.current_logical_roots_generation(),
-                ),
+                SinkWorkerResponse::LogicalRootsGeneration(sink.current_logical_roots_generation()),
                 false,
             ),
             None => SinkWorkerAction::Immediate(
@@ -924,8 +922,7 @@ impl TypedWorkerBootstrapSession<SinkWorkerInitConfig> for SinkWorkerSession {
 mod tests {
     use super::*;
     use crate::runtime::routes::{
-        METHOD_QUERY, METHOD_STREAM, ROUTE_KEY_QUERY, ROUTE_TOKEN_FS_META_EVENTS,
-        default_route_bindings,
+        METHOD_STREAM, ROUTE_KEY_QUERY, ROUTE_TOKEN_FS_META_EVENTS, default_route_bindings,
     };
     use crate::source::config::{GrantedMountRoot, RootSpec};
     use capanix_runtime_entry_sdk::control::{

@@ -84,10 +84,19 @@ fn status_sink_groups_ready(resp: &HttpResponse, expected: Option<&BTreeSet<Stri
     if resp.status != 200 {
         return false;
     }
-    let Some(groups) = resp
-        .json
-        .as_ref()
-        .and_then(|value| value.get("sink"))
+    let Some(json) = resp.json.as_ref() else {
+        return false;
+    };
+    if json
+        .get("readiness_planes")
+        .and_then(|value| value.get("trusted_observation_readiness"))
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return false;
+    }
+    let Some(groups) = json
+        .get("sink")
         .and_then(|value| value.get("groups"))
         .and_then(|value| value.as_array())
     else {

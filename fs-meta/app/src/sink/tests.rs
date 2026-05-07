@@ -4070,7 +4070,7 @@ async fn roots_control_stream_ignores_older_declaration_after_newer_authoritativ
 
 #[tokio::test]
 async fn status_snapshot_reports_runtime_scheduled_bare_group_even_when_grant_projection_points_elsewhere()
-{
+ {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![
         RootSpec::new("nfs1", "/mnt/nfs1"),

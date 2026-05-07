@@ -25,6 +25,7 @@ use crate::runtime::routes::{
     METHOD_SINK_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
     METHOD_SOURCE_STATUS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
     sink_query_route_bindings_for, sink_status_route_bindings_for, source_find_route_bindings_for,
+    source_status_route_bindings_for,
 };
 use crate::runtime::seam::exchange_host_adapter;
 use crate::sink::SinkStatusSnapshot;
@@ -454,6 +455,9 @@ struct MaterializedSourceConcreteRootEvidenceSignature {
     active: bool,
     overflow_pending: bool,
     rescan_pending: bool,
+    last_rescan_requested_at_us: Option<u64>,
+    last_audit_started_at_us: Option<u64>,
+    last_audit_completed_at_us: Option<u64>,
     current_revision: Option<u64>,
     current_stream_generation: Option<u64>,
     candidate_revision: Option<u64>,
@@ -521,6 +525,9 @@ fn materialized_read_snapshot_evidence_signature(
             active: root.active,
             overflow_pending: root.overflow_pending,
             rescan_pending: root.rescan_pending,
+            last_rescan_requested_at_us: root.last_rescan_requested_at_us,
+            last_audit_started_at_us: root.last_audit_started_at_us,
+            last_audit_completed_at_us: root.last_audit_completed_at_us,
             current_revision: root.current_revision,
             current_stream_generation: root.current_stream_generation,
             candidate_revision: root.candidate_revision,
@@ -1058,7 +1065,9 @@ fn merge_source_status_snapshots(mut snapshots: Vec<SourceStatusSnapshot>) -> So
         return SourceStatusSnapshot::default();
     }
     if snapshots.len() == 1 {
-        return snapshots.pop().unwrap_or_default();
+        return normalize_source_status_snapshot_rescan_evidence(
+            snapshots.pop().unwrap_or_default(),
+        );
     }
 
     let mut logical_root_map =
@@ -1095,8 +1104,13 @@ fn merge_source_status_snapshots(mut snapshots: Vec<SourceStatusSnapshot>) -> So
                         *current = entry.clone();
                     }
                     merge_source_concrete_root_audit_evidence(current, &previous, &entry);
+                    normalize_source_concrete_root_rescan_evidence(current);
                 })
-                .or_insert(entry);
+                .or_insert_with(|| {
+                    let mut entry = entry;
+                    normalize_source_concrete_root_rescan_evidence(&mut entry);
+                    entry
+                });
         }
         for (root_key, reason) in snapshot.degraded_roots {
             degraded_root_map.entry(root_key).or_insert(reason);
@@ -1111,25 +1125,70 @@ fn merge_source_status_snapshots(mut snapshots: Vec<SourceStatusSnapshot>) -> So
     }
 }
 
+fn normalize_source_status_snapshot_rescan_evidence(
+    mut snapshot: SourceStatusSnapshot,
+) -> SourceStatusSnapshot {
+    for root in &mut snapshot.concrete_roots {
+        normalize_source_concrete_root_rescan_evidence(root);
+    }
+    snapshot
+}
+
 fn merge_source_concrete_root_audit_evidence(
     current: &mut crate::source::SourceConcreteRootHealthSnapshot,
     previous: &crate::source::SourceConcreteRootHealthSnapshot,
     entry: &crate::source::SourceConcreteRootHealthSnapshot,
 ) {
     if current.last_audit_started_at_us.is_none() {
-        current.last_audit_started_at_us = previous
-            .last_audit_started_at_us
-            .or(entry.last_audit_started_at_us);
+        current.last_audit_started_at_us = most_recent_relevant_audit_timestamp(
+            current,
+            [
+                previous.last_audit_started_at_us,
+                entry.last_audit_started_at_us,
+            ],
+        );
     }
     if current.last_audit_completed_at_us.is_none() {
-        current.last_audit_completed_at_us = previous
-            .last_audit_completed_at_us
-            .or(entry.last_audit_completed_at_us);
+        current.last_audit_completed_at_us = most_recent_relevant_audit_timestamp(
+            current,
+            [
+                previous.last_audit_completed_at_us,
+                entry.last_audit_completed_at_us,
+            ],
+        );
     }
     if current.last_audit_duration_ms.is_none() {
         current.last_audit_duration_ms = previous
             .last_audit_duration_ms
             .or(entry.last_audit_duration_ms);
+    }
+}
+
+fn most_recent_relevant_audit_timestamp(
+    current: &crate::source::SourceConcreteRootHealthSnapshot,
+    candidates: [Option<u64>; 2],
+) -> Option<u64> {
+    let request_floor = current.last_rescan_requested_at_us.unwrap_or_default();
+    candidates
+        .into_iter()
+        .flatten()
+        .filter(|timestamp| *timestamp >= request_floor)
+        .max()
+}
+
+fn normalize_source_concrete_root_rescan_evidence(
+    root: &mut crate::source::SourceConcreteRootHealthSnapshot,
+) {
+    if !root.rescan_pending {
+        return;
+    }
+    let Some(completed_at_us) = root.last_audit_completed_at_us else {
+        return;
+    };
+    let started_at_us = root.last_audit_started_at_us.unwrap_or_default();
+    let requested_at_us = root.last_rescan_requested_at_us.unwrap_or_default();
+    if completed_at_us >= started_at_us && completed_at_us >= requested_at_us {
+        root.rescan_pending = false;
     }
 }
 
@@ -1145,15 +1204,32 @@ fn source_logical_root_merge_score(
 
 fn source_concrete_root_merge_score(
     entry: &crate::source::SourceConcreteRootHealthSnapshot,
-) -> (u8, u8, u8, u8, u64, u64) {
+) -> (u8, u8, u8, u64, u64, u64, u8) {
     (
         u8::from(entry.active),
         u8::from(entry.is_group_primary),
         u8::from(entry.scan_enabled),
-        u8::from(!entry.rescan_pending),
         entry.current_stream_generation.unwrap_or_default(),
         entry.current_revision.unwrap_or_default(),
+        source_concrete_root_status_epoch(entry),
+        u8::from(!entry.rescan_pending),
     )
+}
+
+fn source_concrete_root_status_epoch(
+    entry: &crate::source::SourceConcreteRootHealthSnapshot,
+) -> u64 {
+    [
+        entry.last_rescan_requested_at_us,
+        entry.last_audit_started_at_us,
+        entry.last_audit_completed_at_us,
+        entry.last_emitted_at_us,
+        entry.last_forwarded_at_us,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or_default()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1489,6 +1565,33 @@ async fn route_source_observability_snapshots(
     Ok(snapshots)
 }
 
+async fn route_source_observability_snapshots_via_node(
+    boundary: Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    node_id: NodeId,
+    plan: StatusRoutePlan,
+) -> Result<Vec<SourceObservabilitySnapshot>, CnxError> {
+    let route_bindings = source_status_route_bindings_for(&node_id.0);
+    let events = plan
+        .machine()
+        .collect_status_events_with_routes(
+            boundary,
+            origin_id,
+            METHOD_SOURCE_STATUS,
+            route_bindings,
+            is_retryable_source_status_continuity_gap,
+        )
+        .await?;
+    events
+        .into_iter()
+        .map(|event| {
+            rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes()).map_err(
+                |err| CnxError::Internal(format!("decode source status snapshot failed: {err}")),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
 async fn route_source_status_snapshot(
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
@@ -1579,39 +1682,14 @@ fn merge_sink_status_route_events(events: Vec<Event>) -> Result<SinkStatusSnapsh
     Ok(merge_sink_status_snapshots(snapshots))
 }
 
-fn source_status_covers_readiness_groups(
-    source_status: &SourceStatusSnapshot,
-    readiness_groups: &BTreeSet<String>,
-) -> bool {
-    let mut source_groups = source_status
-        .logical_roots
-        .iter()
-        .map(|root| root.root_id.clone())
-        .collect::<BTreeSet<_>>();
-    source_groups.extend(
-        source_status
-            .concrete_roots
-            .iter()
-            .map(|root| root.logical_root_id.clone()),
-    );
-    readiness_groups.is_subset(&source_groups)
-}
-
 fn sink_status_covers_ready_readiness_groups(
     sink_status: &SinkStatusSnapshot,
     readiness_groups: &BTreeSet<String>,
 ) -> bool {
-    let scheduled_groups = materialized_scheduled_group_ids(sink_status);
-    if !readiness_groups.is_subset(&scheduled_groups) {
-        return false;
-    }
-    let ready_groups = sink_status
-        .groups
-        .iter()
-        .filter(|group| sink_group_readiness_reports_live_materialized_group(group))
-        .map(|group| group.group_id.clone())
-        .collect::<BTreeSet<_>>();
-    readiness_groups.is_subset(&ready_groups)
+    crate::query::observation::sink_status_covers_ready_readiness_groups(
+        sink_status,
+        readiness_groups,
+    )
 }
 
 fn missing_readiness_groups(
@@ -1742,16 +1820,11 @@ fn materialized_status_cache_is_ready(
     sink_status: &SinkStatusSnapshot,
     readiness_groups: &BTreeSet<String>,
 ) -> bool {
-    !readiness_groups.is_empty()
-        && source_status_covers_readiness_groups(source_status, readiness_groups)
-        && sink_status_covers_ready_readiness_groups(sink_status, readiness_groups)
-        && materialized_observation_status_for_readiness_groups(
-            source_status,
-            sink_status,
-            readiness_groups,
-        )
-        .state
-            == ObservationState::TrustedMaterialized
+    crate::query::observation::materialized_status_cache_is_ready(
+        source_status,
+        sink_status,
+        readiness_groups,
+    )
 }
 
 fn materialized_observation_status_for_readiness_groups(
@@ -1759,12 +1832,11 @@ fn materialized_observation_status_for_readiness_groups(
     sink_status: &SinkStatusSnapshot,
     readiness_groups: &BTreeSet<String>,
 ) -> ObservationStatus {
-    if readiness_groups.is_empty() {
-        return materialized_observation_status(source_status, sink_status);
-    }
-    let source_status = filter_source_status_snapshot(source_status.clone(), readiness_groups);
-    let sink_status = filter_sink_status_snapshot(sink_status.clone(), readiness_groups);
-    materialized_observation_status(&source_status, &sink_status)
+    crate::query::observation::materialized_observation_status_for_readiness_groups(
+        source_status,
+        sink_status,
+        readiness_groups,
+    )
 }
 
 fn trusted_materialized_status_covers_readiness_groups(
@@ -1772,11 +1844,11 @@ fn trusted_materialized_status_covers_readiness_groups(
     sink_status: &SinkStatusSnapshot,
     readiness_groups: &BTreeSet<String>,
 ) -> bool {
-    if readiness_groups.is_empty() {
-        return materialized_observation_status(source_status, sink_status).state
-            == ObservationState::TrustedMaterialized;
-    }
-    materialized_status_cache_is_ready(source_status, sink_status, readiness_groups)
+    crate::query::observation::trusted_materialized_status_covers_readiness_groups(
+        source_status,
+        sink_status,
+        readiness_groups,
+    )
 }
 
 fn cached_materialized_status_snapshots(
@@ -1848,7 +1920,7 @@ fn missing_sink_ready_readiness_groups(
         .collect()
 }
 
-fn current_sink_owner_candidate_nodes_for_groups(
+fn current_owner_candidate_nodes_for_groups(
     source: &SourceFacade,
     groups: &BTreeSet<String>,
 ) -> std::result::Result<Vec<NodeId>, SourceFailure> {
@@ -1870,7 +1942,7 @@ fn current_sink_owner_candidate_nodes_for_groups(
     Ok(nodes.into_iter().map(NodeId).collect())
 }
 
-fn current_sink_owner_candidate_nodes_from_source_observability(
+fn current_owner_candidate_nodes_from_source_observability(
     snapshots: &[SourceObservabilitySnapshot],
     groups: &BTreeSet<String>,
 ) -> Vec<NodeId> {
@@ -1936,6 +2008,116 @@ fn collect_nodes_for_groups_from_schedule(
     }
 }
 
+fn missing_source_status_readiness_groups(
+    source_status: &SourceStatusSnapshot,
+    readiness_groups: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut source_groups = source_status
+        .logical_roots
+        .iter()
+        .map(|root| root.root_id.clone())
+        .collect::<BTreeSet<_>>();
+    source_groups.extend(
+        source_status
+            .concrete_roots
+            .iter()
+            .map(|root| root.logical_root_id.clone()),
+    );
+    readiness_groups
+        .difference(&source_groups)
+        .cloned()
+        .collect()
+}
+
+async fn augment_routed_source_status_with_current_owner_evidence(
+    state: &ApiState,
+    mut source_status: SourceStatusSnapshot,
+    readiness_groups: &BTreeSet<String>,
+    plan: StatusRoutePlan,
+    source_observability_snapshots: &[SourceObservabilitySnapshot],
+) -> std::result::Result<SourceStatusSnapshot, QueryWorkerObservationFailure> {
+    if crate::query::observation::source_status_covers_readiness_groups(
+        &source_status,
+        readiness_groups,
+    ) {
+        return Ok(source_status);
+    }
+    let missing_groups = missing_source_status_readiness_groups(&source_status, readiness_groups);
+    if missing_groups.is_empty() {
+        return Ok(source_status);
+    }
+    let Some(source) = &state.readiness_source else {
+        return Ok(source_status);
+    };
+    let QueryBackend::Route {
+        boundary,
+        origin_id,
+        ..
+    } = &state.backend
+    else {
+        return Ok(source_status);
+    };
+    let observed_candidate_nodes = current_owner_candidate_nodes_from_source_observability(
+        source_observability_snapshots,
+        &missing_groups,
+    );
+    let configured_candidate_nodes =
+        match current_owner_candidate_nodes_for_groups(source, &missing_groups) {
+            Ok(nodes) => nodes,
+            Err(err) if observed_candidate_nodes.is_empty() => {
+                return Err(QueryWorkerObservationFailure::from(err));
+            }
+            Err(_) => Vec::new(),
+        };
+    let candidate_nodes = merge_current_sink_owner_candidate_nodes(
+        observed_candidate_nodes,
+        configured_candidate_nodes,
+    );
+    if candidate_nodes.is_empty() {
+        return Ok(source_status);
+    }
+
+    let mut pending = candidate_nodes
+        .into_iter()
+        .map(|node_id| {
+            let boundary = boundary.clone();
+            let origin_id = origin_id.clone();
+            async move {
+                let result = route_source_observability_snapshots_via_node(
+                    boundary,
+                    origin_id,
+                    node_id.clone(),
+                    plan,
+                )
+                .await;
+                (node_id, result)
+            }
+        })
+        .collect::<FuturesUnordered<_>>();
+    while let Some((_node_id, result)) = pending.next().await {
+        let Ok(snapshots) = result else {
+            continue;
+        };
+        let filtered = filter_source_status_snapshot(
+            merge_source_status_snapshots(
+                snapshots
+                    .into_iter()
+                    .map(|snapshot| snapshot.status)
+                    .collect(),
+            ),
+            readiness_groups,
+        );
+        source_status = merge_source_status_snapshots(vec![source_status, filtered]);
+        if crate::query::observation::source_status_covers_readiness_groups(
+            &source_status,
+            readiness_groups,
+        ) {
+            break;
+        }
+    }
+    Ok(source_status)
+}
+
 async fn augment_routed_sink_status_with_current_owner_evidence(
     state: &ApiState,
     mut sink_status: SinkStatusSnapshot,
@@ -1961,12 +2143,12 @@ async fn augment_routed_sink_status_with_current_owner_evidence(
     else {
         return Ok(sink_status);
     };
-    let observed_candidate_nodes = current_sink_owner_candidate_nodes_from_source_observability(
+    let observed_candidate_nodes = current_owner_candidate_nodes_from_source_observability(
         source_observability_snapshots,
         &missing_groups,
     );
     let configured_candidate_nodes =
-        match current_sink_owner_candidate_nodes_for_groups(source, &missing_groups) {
+        match current_owner_candidate_nodes_for_groups(source, &missing_groups) {
             Ok(nodes) => nodes,
             Err(err) if observed_candidate_nodes.is_empty() => {
                 return Err(QueryWorkerObservationFailure::from(err));
@@ -2086,6 +2268,18 @@ async fn load_materialized_status_snapshots_with_failure(
     };
     let readiness_groups =
         materialized_readiness_groups_for_loaded_source(&fallback_readiness_groups, &source_status);
+    let source_status = if matches!(&state.backend, QueryBackend::Route { .. }) {
+        augment_routed_source_status_with_current_owner_evidence(
+            state,
+            source_status,
+            &readiness_groups,
+            status_load_plan.source_route,
+            &routed_source_observability_snapshots,
+        )
+        .await?
+    } else {
+        source_status
+    };
     let source_status = {
         let fresh = filter_source_status_snapshot(source_status, &readiness_groups);
         let mut cache = state.materialized_source_status_cache.lock().map_err(|_| {
@@ -2576,7 +2770,9 @@ fn preserve_loaded_ready_groups_for_request_scoped_service_gate(
             sink_group_readiness_reports_live_materialized_group(group)
                 && !current_by_group
                     .get(group.group_id.as_str())
-                    .is_some_and(|current| sink_group_readiness_reports_live_materialized_group(current))
+                    .is_some_and(|current| {
+                        sink_group_readiness_reports_live_materialized_group(current)
+                    })
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2655,12 +2851,52 @@ async fn load_trusted_materialized_status_snapshots_with_settle(
             &sink_status,
             &readiness_groups,
         );
+        if debug_status_route_fanin_enabled() {
+            let source_roots = source_status
+                .concrete_roots
+                .iter()
+                .map(|root| {
+                    format!(
+                        "{} primary={} active={} scan={} pending={} req={:?} start={:?} done={:?} rev={:?}",
+                        root.logical_root_id,
+                        root.is_group_primary,
+                        root.active,
+                        root.scan_enabled,
+                        root.rescan_pending,
+                        root.last_rescan_requested_at_us,
+                        root.last_audit_started_at_us,
+                        root.last_audit_completed_at_us,
+                        root.current_revision,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let sink_groups = sink_status
+                .groups
+                .iter()
+                .map(|group| {
+                    format!(
+                        "{} ready={} live={} total={} overflow={}",
+                        group.group_id,
+                        sink_group_readiness_reports_live_materialized_group(group),
+                        group.live_nodes,
+                        group.total_nodes,
+                        group.overflow_pending_materialization,
+                    )
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "fs_meta_api_status: materialized_readiness_loop groups={:?} source_roots={:?} sink_groups={:?} observation={}",
+                readiness_groups,
+                source_roots,
+                sink_groups,
+                trusted_materialized_not_ready_message(&observation_status),
+            );
+        }
         if trusted_materialized_status_covers_readiness_groups(
             &source_status,
             &sink_status,
             &readiness_groups,
-        )
-            || Instant::now() >= deadline
+        ) || Instant::now() >= deadline
         {
             return Ok((source_status, sink_status, observation_status));
         }
@@ -2905,7 +3141,9 @@ fn materialized_ready_sink_evidence_key(group: &crate::sink::SinkGroupStatusSnap
     materialized_ready_sink_evidence_key_for(&group.group_id, &group.primary_object_ref)
 }
 
-fn source_primary_object_refs_by_group(source_status: &SourceStatusSnapshot) -> BTreeMap<String, String> {
+fn source_primary_object_refs_by_group(
+    source_status: &SourceStatusSnapshot,
+) -> BTreeMap<String, String> {
     source_status
         .concrete_roots
         .iter()
@@ -3895,17 +4133,13 @@ fn selected_group_sink_status_is_unready_empty(
 fn sink_group_readiness_reports_live_materialized_group(
     group: &crate::sink::SinkGroupStatusSnapshot,
 ) -> bool {
-    group.materialized_service_ready()
-        && group.live_nodes > 0
-        && group.total_nodes > 0
+    crate::query::observation::sink_group_readiness_reports_live_materialized_group(group)
 }
 
 fn sink_group_readiness_reports_unready_empty_group(
     group: &crate::sink::SinkGroupStatusSnapshot,
 ) -> bool {
-    !group.materialized_service_ready()
-        && group.live_nodes == 0
-        && group.total_nodes == 0
+    !group.materialized_service_ready() && group.live_nodes == 0 && group.total_nodes == 0
 }
 
 fn sink_status_snapshot_schedules_group(
@@ -4801,10 +5035,6 @@ impl TreePitSessionTiming {
                 trusted_materialized_empty_selected_group_tree_error(group_key),
             ),
         }
-    }
-
-    fn prepare_stage_for(self, group_plan: TreePitGroupPlan) -> TreePitStagePreparation {
-        self.prepare_stage_for_at(group_plan, tokio::time::Instant::now())
     }
 
     fn prepare_stage_for_at(
@@ -8098,10 +8328,8 @@ fn preserve_loaded_ready_groups_for_request_scoped_service_gate_keeps_loaded_tru
         ..SinkStatusSnapshot::default()
     };
     let current = request_scoped_regression;
-    let preserved = preserve_loaded_ready_groups_for_request_scoped_service_gate(
-        current,
-        &loaded_sink_status,
-    );
+    let preserved =
+        preserve_loaded_ready_groups_for_request_scoped_service_gate(current, &loaded_sink_status);
     let readiness_groups = BTreeSet::from(["nfs1".to_string(), "nfs3".to_string()]);
 
     assert!(
@@ -9081,23 +9309,6 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
     }
 }
 
-#[cfg(test)]
-async fn query_materialized_events_via_selected_group_owner_direct(
-    state: &ApiState,
-    params: InternalQueryRequest,
-    timeout: Duration,
-    selected_group_sink_status: Option<&SinkStatusSnapshot>,
-) -> Result<Vec<Event>, CnxError> {
-    query_materialized_events_via_selected_group_owner_direct_with_failure(
-        state,
-        params,
-        timeout,
-        selected_group_sink_status,
-    )
-    .await
-    .map_err(QueryWorkerObservationFailure::into_error)
-}
-
 async fn query_materialized_events_via_selected_group_owner_direct_with_failure(
     state: &ApiState,
     params: InternalQueryRequest,
@@ -9483,13 +9694,7 @@ async fn collect_group_rankings(
 }
 
 fn materialized_scheduled_group_ids(snapshot: &SinkStatusSnapshot) -> BTreeSet<String> {
-    let mut groups = snapshot
-        .scheduled_groups_by_node
-        .values()
-        .flat_map(|groups| groups.iter().cloned())
-        .collect::<BTreeSet<_>>();
-    groups.extend(snapshot.groups.iter().map(|group| group.group_id.clone()));
-    groups
+    crate::query::observation::materialized_scheduled_group_ids(snapshot)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11100,6 +11305,7 @@ fn merge_source_status_snapshots_preserves_completed_audit_evidence_from_older_s
         overflow_count: 0,
         overflow_pending: false,
         rescan_pending: false,
+        last_rescan_requested_at_us: None,
         last_rescan_reason: Some("manual".to_string()),
         last_error: None,
         last_audit_started_at_us: Some(10),
@@ -11142,6 +11348,7 @@ fn merge_source_status_snapshots_preserves_completed_audit_evidence_from_older_s
         overflow_count: audited_root.overflow_count,
         overflow_pending: audited_root.overflow_pending,
         rescan_pending: audited_root.rescan_pending,
+        last_rescan_requested_at_us: audited_root.last_rescan_requested_at_us,
         last_rescan_reason: None,
         last_error: None,
         last_audit_started_at_us: None,
@@ -11191,6 +11398,35 @@ fn merge_source_status_snapshots_preserves_completed_audit_evidence_from_older_s
     assert_eq!(merged_root.last_audit_started_at_us, Some(10));
     assert_eq!(merged_root.last_audit_completed_at_us, Some(20));
     assert_eq!(merged_root.last_audit_duration_ms, Some(10));
+
+    let completed_root = merged_root.clone();
+    let mut newer_pending_root = completed_root.clone();
+    newer_pending_root.rescan_pending = true;
+    newer_pending_root.last_rescan_requested_at_us = Some(40);
+    newer_pending_root.last_rescan_reason = Some("manual".to_string());
+    newer_pending_root.last_audit_started_at_us = None;
+    newer_pending_root.last_audit_completed_at_us = None;
+    newer_pending_root.last_audit_duration_ms = None;
+    let pending_merged = merge_source_status_snapshots(vec![
+        SourceStatusSnapshot {
+            concrete_roots: vec![completed_root],
+            ..SourceStatusSnapshot::default()
+        },
+        SourceStatusSnapshot {
+            concrete_roots: vec![newer_pending_root],
+            ..SourceStatusSnapshot::default()
+        },
+    ]);
+    let pending_root = pending_merged
+        .concrete_roots
+        .iter()
+        .find(|root| root.root_key == "nfs1@node-a::nfs1@/mnt/fustor-peers/nfs145")
+        .expect("pending root should be preserved");
+
+    assert!(pending_root.rescan_pending);
+    assert_eq!(pending_root.last_rescan_requested_at_us, Some(40));
+    assert_eq!(pending_root.last_audit_started_at_us, None);
+    assert_eq!(pending_root.last_audit_completed_at_us, None);
 }
 
 fn tree_root_json(root: &TreePageRoot) -> serde_json::Value {
@@ -13096,44 +13332,42 @@ async fn get_tree(
             trusted_materialized_not_ready_message(&observation_status)
         );
     }
-    let (request_sink_status, request_scoped_schedule_omitted_ready_groups) =
-        if read_class == ReadClass::TrustedMaterialized {
-            let request_scoped_plan = TreePitSessionPlan::new(policy.query_timeout(), 1)
-                .request_scoped_sink_status_plan();
-            let request_scoped =
-                load_request_scoped_materialized_sink_status_snapshot(&state, request_scoped_plan)
-                    .await
-                    .unwrap_or_else(|| sink_status.clone());
-            let request_scoped_schedule_omitted_ready_groups =
-                request_scoped_schedule_omitted_ready_groups(&sink_status, &request_scoped);
-            let merged = merge_request_scoped_materialized_sink_status_snapshot(
-                &sink_status,
-                request_scoped.clone(),
-            );
-            let preserved_omission =
+    let (request_sink_status, request_scoped_schedule_omitted_ready_groups) = if read_class
+        == ReadClass::TrustedMaterialized
+    {
+        let request_scoped_plan =
+            TreePitSessionPlan::new(policy.query_timeout(), 1).request_scoped_sink_status_plan();
+        let request_scoped =
+            load_request_scoped_materialized_sink_status_snapshot(&state, request_scoped_plan)
+                .await
+                .unwrap_or_else(|| sink_status.clone());
+        let request_scoped_schedule_omitted_ready_groups =
+            request_scoped_schedule_omitted_ready_groups(&sink_status, &request_scoped);
+        let merged = merge_request_scoped_materialized_sink_status_snapshot(
+            &sink_status,
+            request_scoped.clone(),
+        );
+        let preserved_omission =
             preserve_request_loaded_ready_groups_across_partial_request_scoped_schedule_omission(
                 merged,
                 &sink_status,
                 &request_scoped,
             );
-            let preserved =
-                preserve_request_loaded_ready_groups_across_explicit_empty_request_scoped_drift(
-                    preserved_omission,
-                    &sink_status,
-                    &request_scoped,
-                );
-            let service_gate_preserved =
-                preserve_loaded_ready_groups_for_request_scoped_service_gate(
-                    preserved,
-                    &sink_status,
-                );
-            (
-                service_gate_preserved,
-                Some(request_scoped_schedule_omitted_ready_groups),
-            )
-        } else {
-            (sink_status.clone(), None)
-        };
+        let preserved =
+            preserve_request_loaded_ready_groups_across_explicit_empty_request_scoped_drift(
+                preserved_omission,
+                &sink_status,
+                &request_scoped,
+            );
+        let service_gate_preserved =
+            preserve_loaded_ready_groups_for_request_scoped_service_gate(preserved, &sink_status);
+        (
+            service_gate_preserved,
+            Some(request_scoped_schedule_omitted_ready_groups),
+        )
+    } else {
+        (sink_status.clone(), None)
+    };
     if read_class == ReadClass::TrustedMaterialized {
         let root_readiness_groups =
             if trusted_materialized_empty_group_root_requires_fail_closed(&params.path)

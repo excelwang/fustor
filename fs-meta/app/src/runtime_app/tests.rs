@@ -869,7 +869,7 @@ async fn wait_for_sink_ready_groups(
 ) {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_ready_groups = std::collections::BTreeSet::<String>::new();
-    let mut last_status_err = "not observed".to_string();
+    let mut last_status_err;
     let mut last_snapshot = None::<String>;
     loop {
         match sink.status_snapshot_with_failure().await {
@@ -883,11 +883,11 @@ async fn wait_for_sink_ready_groups(
                 if &last_ready_groups == expected_ready_groups {
                     break;
                 }
-                last_status_err = "none".to_string();
+                last_status_err = None;
                 last_snapshot = Some(format!("{snapshot:?}"));
             }
             Err(err) => {
-                last_status_err = format!("{err:?}");
+                last_status_err = Some(format!("{err:?}"));
             }
         }
         assert!(
@@ -4149,9 +4149,6 @@ fn runtime_app_fixed_bind_projection_symbols_are_removed() {
             )
             && source.contains(
                 "fn fixed_bind_gate_publication_snapshot(\n        observation: FacadeGateObservation,\n        publication_ready: bool,\n    ) -> FacadePublicationSnapshot",
-            )
-            && source.contains(
-                "async fn settle_fixed_bind_claim_release_followup(\n        &self,\n    ) -> Result<FixedBindClaimReleaseFollowupSnapshot>",
             )
             && source.contains(
                 "async fn settle_fixed_bind_claim_release_followup_with_session(",
@@ -8750,7 +8747,7 @@ async fn external_worker_status_reports_pending_facade_state_after_remote_collec
     let bind_addr = reserve_bind_addr();
     let (passwd_path, shadow_path) = write_auth_files(&tmp);
     let boundary = Arc::new(LoopbackWorkerBoundary::default());
-    let state_boundary = in_memory_state_boundary();
+    let _state_boundary = in_memory_state_boundary();
     let worker_socket_root = worker_socket_tempdir();
     let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
     let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
@@ -11594,7 +11591,7 @@ async fn route_peer_deactivate_and_facade_shutdown_do_not_break_followup_source_
         login.status()
     );
     let login_body: serde_json::Value = login.json().await.expect("decode login");
-    let management_token = login_body["token"].as_str().expect("token").to_string();
+    let _management_token = login_body["token"].as_str().expect("token").to_string();
 
     app.on_control_frame(&[
         deactivate_envelope_with_route_key(
@@ -11840,7 +11837,7 @@ async fn route_peer_deactivate_and_facade_shutdown_replays_followup_source_contr
         login.status()
     );
     let login_body: serde_json::Value = login.json().await.expect("decode login");
-    let management_token = login_body["token"].as_str().expect("token").to_string();
+    let _management_token = login_body["token"].as_str().expect("token").to_string();
 
     app.on_control_frame(&[
         deactivate_envelope_with_route_key(
@@ -12089,7 +12086,7 @@ async fn route_peer_deactivate_and_facade_shutdown_followup_source_control_survi
         login.status()
     );
     let login_body: serde_json::Value = login.json().await.expect("decode login");
-    let management_token = login_body["token"].as_str().expect("token").to_string();
+    let _management_token = login_body["token"].as_str().expect("token").to_string();
 
     app.on_control_frame(&[
         deactivate_envelope_with_route_key(
@@ -12370,7 +12367,7 @@ async fn route_peer_deactivate_and_facade_shutdown_replays_followup_source_contr
         login.status()
     );
     let login_body: serde_json::Value = login.json().await.expect("decode login");
-    let management_token = login_body["token"].as_str().expect("token").to_string();
+    let _management_token = login_body["token"].as_str().expect("token").to_string();
 
     app.on_control_frame(&[
         deactivate_envelope_with_route_key(
@@ -12769,7 +12766,7 @@ async fn route_peer_deactivate_and_facade_shutdown_restores_runnable_source_sche
         query_key.status()
     );
     let query_key_body: serde_json::Value = query_key.json().await.expect("decode query key");
-    let query_token = query_key_body["api_key"]
+    let _query_token = query_key_body["api_key"]
         .as_str()
         .expect("query api key")
         .to_string();
@@ -14949,7 +14946,7 @@ async fn pending_fixed_bind_release_keeps_control_gate_closed_while_source_repla
         .expect("try spawn pending facade should handle conflict");
     eprintln!("TEST_MARK handoff-red after initial try_spawn");
 
-    let bind_addr = pending.resolved.bind_addr.clone();
+    let _bind_addr = pending.resolved.bind_addr.clone();
     set_source_replay_required_for_tests(&successor, true);
     successor.api_control_gate.set_ready(false);
 
@@ -15117,7 +15114,7 @@ async fn pending_fixed_bind_release_does_not_overwrite_pending_facade_state_with
         .await
         .expect("try spawn pending facade should handle conflict");
 
-    let bind_addr = pending.resolved.bind_addr.clone();
+    let _bind_addr = pending.resolved.bind_addr.clone();
     let hook_entered = Arc::new(Notify::new());
     let hook_release = Arc::new(Notify::new());
     let completion_entered = Arc::new(Notify::new());
@@ -15363,7 +15360,7 @@ async fn pending_fixed_bind_release_reopens_control_gate_when_non_control_pendin
         .await
         .expect("try spawn pending facade should handle conflict");
 
-    let bind_addr = pending.resolved.bind_addr.clone();
+    let _bind_addr = pending.resolved.bind_addr.clone();
     let hook_entered = Arc::new(Notify::new());
     let hook_release = Arc::new(Notify::new());
     let completion_entered = Arc::new(Notify::new());
@@ -15593,7 +15590,7 @@ async fn pending_fixed_bind_release_keeps_facade_unavailable_when_active_control
         .await
         .expect("try spawn pending facade should handle conflict");
 
-    let bind_addr = pending.resolved.bind_addr.clone();
+    let _bind_addr = pending.resolved.bind_addr.clone();
     let hook_entered = Arc::new(Notify::new());
     let hook_release = Arc::new(Notify::new());
     let completion_entered = Arc::new(Notify::new());
@@ -19248,7 +19245,7 @@ async fn route_peer_turnover_restores_runnable_schedule_with_control_injected_pe
         login.status()
     );
     let login_body: serde_json::Value = login.json().await.expect("decode login");
-    let management_token = login_body["token"].as_str().expect("token").to_string();
+    let _management_token = login_body["token"].as_str().expect("token").to_string();
 
     app.on_control_frame(&[
         deactivate_envelope_with_route_key(
@@ -19376,7 +19373,6 @@ async fn route_peer_turnover_keeps_facade_and_query_routes_live_during_replayed_
     use std::collections::VecDeque;
 
     struct SourceControlErrorHookReset;
-    struct SourceWorkerControlFrameErrorQueueHookReset;
     struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
 
     impl Drop for SourceControlErrorHookReset {
@@ -19388,12 +19384,6 @@ async fn route_peer_turnover_keeps_facade_and_query_routes_live_during_replayed_
     impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
         fn drop(&mut self) {
             crate::workers::source::clear_source_worker_scheduled_groups_refresh_error_queue_hook();
-        }
-    }
-
-    impl Drop for SourceWorkerControlFrameErrorQueueHookReset {
-        fn drop(&mut self) {
-            crate::workers::source::clear_source_worker_control_frame_error_queue_hook();
         }
     }
 
@@ -19659,7 +19649,7 @@ async fn route_peer_turnover_keeps_facade_and_query_routes_live_during_replayed_
         login.status()
     );
     let login_body: serde_json::Value = login.json().await.expect("decode login");
-    let management_token = login_body["token"].as_str().expect("token").to_string();
+    let _management_token = login_body["token"].as_str().expect("token").to_string();
 
     app.on_control_frame(&[
         deactivate_envelope_with_route_key(
@@ -20141,16 +20131,9 @@ async fn route_peer_turnover_keeps_facade_and_query_routes_live_during_replayed_
     use std::collections::VecDeque;
 
     struct SourceControlErrorHookReset;
-    struct SourceWorkerControlFrameErrorQueueHookReset;
     struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
 
     impl Drop for SourceControlErrorHookReset {
-        fn drop(&mut self) {
-            crate::workers::source::clear_source_worker_control_frame_error_hook();
-        }
-    }
-
-    impl Drop for SourceWorkerControlFrameErrorQueueHookReset {
         fn drop(&mut self) {
             crate::workers::source::clear_source_worker_control_frame_error_hook();
         }
@@ -20931,6 +20914,7 @@ async fn route_peer_turnover_keeps_facade_and_query_routes_live_during_replayed_
     .expect("first source-only followup should still succeed before the timeout seam");
 
     let previous_instance_id = source_client.worker_instance_id_for_tests().await;
+    let _source_control_error_reset = SourceControlErrorHookReset;
     let _source_error_reset = SourceWorkerControlFrameErrorQueueHookReset;
     crate::workers::source::install_source_worker_control_frame_error_queue_hook(
         crate::workers::source::SourceWorkerControlFrameErrorQueueHook {
@@ -21317,7 +21301,7 @@ async fn sink_status_route_serves_sink_owner_requests_under_sink_runtime_unit_af
         .expect("init app"),
     );
 
-    let mut initial = vec![
+    let initial = vec![
         activate_envelope_with_route_key_and_scope_rows(
             execution_units::SOURCE_RUNTIME_UNIT_ID,
             format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
@@ -26390,7 +26374,7 @@ async fn cleanup_only_sink_query_tail_preserves_retained_sink_activate_before_la
     fs::create_dir_all(nfs2_dir.join("force-find-stress")).expect("create nfs2 dir");
     fs::write(nfs1_dir.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
     fs::write(nfs2_dir.join("force-find-stress").join("seed.txt"), b"b").expect("seed nfs2");
-    let fs_source = tmp.path().display().to_string();
+    let _fs_source = tmp.path().display().to_string();
     let boundary = Arc::new(LoopbackWorkerBoundary::default());
     let state_boundary = in_memory_state_boundary();
     let worker_socket_root = worker_socket_tempdir();
@@ -26511,6 +26495,9 @@ async fn cleanup_only_sink_query_tail_preserves_retained_sink_activate_before_la
         format!("{}.stream", ROUTE_KEY_EVENTS),
     );
 
+    let _sink_pause_reset = SinkWorkerControlFramePauseHookReset;
+    let _sink_error_reset = SinkWorkerControlFrameErrorQueueHookReset;
+    let _retry_reset = SinkWorkerRetryResetHookReset;
     let _reset = SourceControlErrorHookReset;
     crate::workers::source::install_source_worker_control_frame_error_hook(
         crate::workers::source::SourceWorkerControlFrameErrorHook {
@@ -26676,7 +26663,7 @@ async fn cleanup_only_sink_query_tail_later_node_a_mixed_recovery_settles_after_
     fs::create_dir_all(nfs2_dir.join("force-find-stress")).expect("create nfs2 dir");
     fs::write(nfs1_dir.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
     fs::write(nfs2_dir.join("force-find-stress").join("seed.txt"), b"b").expect("seed nfs2");
-    let fs_source = tmp.path().display().to_string();
+    let _fs_source = tmp.path().display().to_string();
     let boundary = Arc::new(LoopbackWorkerBoundary::default());
     let state_boundary = in_memory_state_boundary();
     let worker_socket_root = worker_socket_tempdir();
@@ -26797,6 +26784,7 @@ async fn cleanup_only_sink_query_tail_later_node_a_mixed_recovery_settles_after_
         format!("{}.stream", ROUTE_KEY_EVENTS),
     );
 
+    let _sink_pause_reset = SinkWorkerControlFramePauseHookReset;
     let _source_reset = SourceControlErrorHookReset;
     crate::workers::source::install_source_worker_control_frame_error_hook(
         crate::workers::source::SourceWorkerControlFrameErrorHook {
@@ -38181,7 +38169,6 @@ async fn current_generation_source_roots_tick_timeout_replayed_mixed_wave_reacqu
  {
     struct SourceWorkerScheduledGroupsRefreshErrorQueueHookReset;
     struct SourceWorkerStartPauseHookReset;
-    struct SourceWorkerControlFrameErrorQueueHookReset;
 
     impl Drop for SourceWorkerScheduledGroupsRefreshErrorQueueHookReset {
         fn drop(&mut self) {
@@ -38192,12 +38179,6 @@ async fn current_generation_source_roots_tick_timeout_replayed_mixed_wave_reacqu
     impl Drop for SourceWorkerStartPauseHookReset {
         fn drop(&mut self) {
             crate::workers::source::clear_source_worker_start_pause_hook();
-        }
-    }
-
-    impl Drop for SourceWorkerControlFrameErrorQueueHookReset {
-        fn drop(&mut self) {
-            crate::workers::source::clear_source_worker_control_frame_error_queue_hook();
         }
     }
 
@@ -41680,8 +41661,8 @@ async fn external_runtime_app_selected_group_proxy_real_nfs_remote_same_group_gr
     lab.write_file("nfs2", "force-find-stress/seed.txt", "b\n")
         .expect("seed nfs2");
 
-    let nfs1_source = lab.export_source("nfs1");
-    let nfs2_source = lab.export_source("nfs2");
+    let nfs1_source = format!("127.0.0.1:{}", lab.exports_dir.join("nfs1").display());
+    let nfs2_source = format!("127.0.0.1:{}", lab.exports_dir.join("nfs2").display());
     let nfs1 = lab
         .mount_export("node-a", "nfs1")
         .expect("mount node-a nfs1 export");
@@ -41918,8 +41899,8 @@ async fn external_runtime_app_selected_group_proxy_real_nfs_grant_change_after_a
     lab.write_file("nfs2", "force-find-stress/seed.txt", "b\n")
         .expect("seed nfs2");
 
-    let nfs1_source = lab.export_source("nfs1");
-    let nfs2_source = lab.export_source("nfs2");
+    let nfs1_source = format!("127.0.0.1:{}", lab.exports_dir.join("nfs1").display());
+    let nfs2_source = format!("127.0.0.1:{}", lab.exports_dir.join("nfs2").display());
     let nfs1 = lab
         .mount_export("node-a", "nfs1")
         .expect("mount node-a nfs1 export");
@@ -42156,8 +42137,8 @@ async fn external_runtime_app_selected_group_proxy_real_nfs_peer_owned_source_sc
     lab.write_file("nfs2", "force-find-stress/seed.txt", "b\n")
         .expect("seed nfs2");
 
-    let nfs1_source = lab.export_source("nfs1");
-    let nfs2_source = lab.export_source("nfs2");
+    let nfs1_source = format!("127.0.0.1:{}", lab.exports_dir.join("nfs1").display());
+    let nfs2_source = format!("127.0.0.1:{}", lab.exports_dir.join("nfs2").display());
     let nfs1 = lab
         .mount_export("node-a", "nfs1")
         .expect("mount node-a nfs1 export");

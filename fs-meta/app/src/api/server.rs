@@ -37,9 +37,9 @@ use super::facade_status::{
     PublishedFacadeStatusReader, SharedFacadePendingStatusCell, SharedFacadeServiceStateCell,
 };
 use super::handlers;
-use super::rollout_status::{
-    PublishedRolloutStatusReader, SharedRolloutStatusCell, shared_rollout_status_cell,
-};
+#[cfg(test)]
+use super::rollout_status::shared_rollout_status_cell;
+use super::rollout_status::{PublishedRolloutStatusReader, SharedRolloutStatusCell};
 use super::state::{
     ApiControlGate, ApiRequestGuard, ApiRequestTracker, ApiState, ForceFindRunnerEvidence,
 };
@@ -98,6 +98,7 @@ impl ApiServerHandle {
     }
 }
 
+#[cfg(test)]
 pub async fn spawn(
     cfg: ResolvedApiConfig,
     node_id: NodeId,

@@ -18,8 +18,6 @@ use crate::query::path::root_file_name_bytes;
 use crate::query::request::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
 use crate::runtime::orchestration::{SinkControlSignal, sink_control_signals_from_envelopes};
 #[cfg(test)]
-use crate::runtime::routes::{METHOD_FIND, ROUTE_TOKEN_FS_META, default_route_bindings};
-#[cfg(test)]
 use crate::sink::SinkStatusSnapshotIssue;
 use crate::sink::VisibilityLagSample;
 use crate::sink::{
@@ -36,10 +34,6 @@ const SINK_WORKER_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const SINK_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const SINK_WORKER_CONTROL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const SINK_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
-#[cfg(test)]
-const SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE: Duration = Duration::from_secs(5);
 const SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 const SINK_WORKER_CLOSE_DRAIN_TIMEOUT: Duration = SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT;
 const SINK_WORKER_STALE_CLIENT_BACKGROUND_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
@@ -1101,6 +1095,7 @@ impl SinkStatusScenario {
     }
 }
 
+#[cfg(test)]
 fn reduce_sink_status_scenario_outcome(
     scenario: SinkStatusScenario,
     concern: Option<SinkStatusConcern>,
@@ -2885,6 +2880,7 @@ impl SinkWorkerClientHandle {
             .map_err(SinkFailure::from)
     }
 
+    #[cfg(test)]
     async fn update_logical_roots_with_failure(
         &self,
         roots: Vec<crate::source::config::RootSpec>,
@@ -2938,7 +2934,8 @@ impl SinkWorkerClientHandle {
         }
         self.update_cached_logical_roots(roots.clone())
             .map_err(SinkFailure::from)?;
-        self.logical_roots_generation.fetch_add(1, Ordering::Relaxed);
+        self.logical_roots_generation
+            .fetch_add(1, Ordering::Relaxed);
         self.update_cached_runtime_config(&roots, &host_object_grants)
             .map_err(SinkFailure::from)?;
         self.retain_cached_status_for_surviving_roots(&roots)
@@ -3154,52 +3151,12 @@ impl SinkWorkerClientHandle {
         }
         self.update_cached_logical_roots(roots.clone())
             .map_err(SinkFailure::from)?;
-        self.logical_roots_generation.fetch_add(1, Ordering::Relaxed);
+        self.logical_roots_generation
+            .fetch_add(1, Ordering::Relaxed);
         self.update_cached_runtime_config(&roots, &host_object_grants)
             .map_err(SinkFailure::from)?;
         self.retain_cached_status_for_surviving_roots(&roots)
             .map_err(SinkFailure::from)
-    }
-
-    async fn logical_roots_generation_with_failure(
-        &self,
-    ) -> std::result::Result<u64, SinkFailure> {
-        let cached_generation = self.logical_roots_generation.load(Ordering::Acquire);
-        let response = self
-            .with_started_retry_with_failure(|client| async move {
-                Self::call_worker_with_failure(
-                    &client,
-                    SinkWorkerRequest::LogicalRootsGenerationSnapshot,
-                    SINK_WORKER_CONTROL_RPC_TIMEOUT,
-                )
-                .await
-            })
-            .await;
-        match response {
-            Ok(SinkWorkerResponse::LogicalRootsGeneration(generation)) => {
-                self.logical_roots_generation
-                    .store(generation, Ordering::Release);
-                Ok(generation)
-            }
-            Ok(other) => {
-                log::warn!(
-                    "sink worker logical roots generation snapshot returned unexpected response on node {}: {:?}; using cached generation {}",
-                    self.node_id.0,
-                    other,
-                    cached_generation
-                );
-                Ok(cached_generation)
-            }
-            Err(err) => {
-                log::warn!(
-                    "sink worker logical roots generation snapshot failed on node {}: {:?}; using cached generation {}",
-                    self.node_id.0,
-                    err.as_error(),
-                    cached_generation
-                );
-                Ok(cached_generation)
-            }
-        }
     }
 
     async fn nonblocking_status_entry_action(
@@ -4044,23 +4001,6 @@ impl SinkWorkerClientHandle {
         }
     }
 
-    #[cfg(test)]
-    async fn visibility_lag_samples_since_with_failure(
-        &self,
-        since_us: u64,
-    ) -> std::result::Result<Vec<VisibilityLagSample>, SinkFailure> {
-        match Self::call_worker_with_failure(
-            &self.client_with_failure().await?,
-            SinkWorkerRequest::VisibilityLagSamplesSince { since_us },
-            Duration::from_secs(5),
-        )
-        .await?
-        {
-            SinkWorkerResponse::VisibilityLagSamples(samples) => Ok(samples),
-            other => unexpected_sink_worker_response_result("for visibility lag samples", other),
-        }
-    }
-
     pub(crate) async fn send_with_failure(
         &self,
         events: Vec<Event>,
@@ -4728,21 +4668,6 @@ impl SinkFacade {
             .map_err(SinkFailure::into_error)
     }
 
-    pub(crate) async fn update_logical_roots_with_failure(
-        &self,
-        roots: Vec<crate::source::config::RootSpec>,
-        host_object_grants: &[GrantedMountRoot],
-    ) -> std::result::Result<(), SinkFailure> {
-        match self {
-            Self::Local(sink) => sink.update_logical_roots_with_failure(roots, host_object_grants),
-            Self::Worker(client) => {
-                client
-                    .update_logical_roots_with_failure(roots, host_object_grants.to_vec())
-                    .await
-            }
-        }
-    }
-
     pub(crate) async fn update_logical_roots_from_management_apply_with_failure(
         &self,
         roots: Vec<crate::source::config::RootSpec>,
@@ -4768,25 +4693,6 @@ impl SinkFacade {
         match self {
             Self::Local(sink) => sink.cached_logical_roots_snapshot_with_failure(),
             Self::Worker(client) => client.cached_logical_roots_snapshot_with_failure(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn logical_roots_snapshot_with_failure(
-        &self,
-    ) -> std::result::Result<Vec<crate::source::config::RootSpec>, SinkFailure> {
-        match self {
-            Self::Local(sink) => sink.logical_roots_snapshot_with_failure(),
-            Self::Worker(client) => client.logical_roots_snapshot_with_failure().await,
-        }
-    }
-
-    pub(crate) async fn logical_roots_generation_with_failure(
-        &self,
-    ) -> std::result::Result<u64, SinkFailure> {
-        match self {
-            Self::Local(sink) => Ok(sink.current_logical_roots_generation()),
-            Self::Worker(client) => client.logical_roots_generation_with_failure().await,
         }
     }
 

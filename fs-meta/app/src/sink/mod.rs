@@ -761,10 +761,12 @@ impl SinkStatusSnapshot {
         summary
     }
 
+    #[cfg(test)]
     pub(crate) fn ready_groups(&self) -> BTreeSet<String> {
         self.readiness_summary().ready_groups
     }
 
+    #[cfg(test)]
     pub(crate) fn has_ready_scheduled_groups(&self) -> bool {
         self.progress_snapshot().has_ready_scheduled_groups()
     }
@@ -1751,22 +1753,6 @@ impl SinkFileMeta {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_boundaries_and_state_deferred_authority(
-        node_id: NodeId,
-        boundary: Option<Arc<dyn ChannelIoSubset>>,
-        state_boundary: Arc<dyn StateBoundary>,
-        source_cfg: SourceConfig,
-    ) -> Result<Self> {
-        Self::with_boundaries_and_state_internal(
-            node_id,
-            boundary,
-            state_boundary,
-            source_cfg,
-            true,
-        )
-    }
-
     pub(crate) fn with_boundaries_and_state_internal(
         node_id: NodeId,
         boundary: Option<Arc<dyn ChannelIoSubset>>,
@@ -2303,12 +2289,6 @@ impl SinkFileMeta {
             );
             false
         });
-    }
-
-    fn endpoint_task_route_present(&self, route_key: &str, context: &str) -> bool {
-        lock_or_recover(&self.endpoint_tasks, context)
-            .iter()
-            .any(|task| task.route_key() == route_key)
     }
 
     fn endpoint_task_route_present_on_boundary(
@@ -2915,7 +2895,7 @@ impl SinkFileMeta {
             }
         }
 
-        let mut spawn_roots_control_stream = |route: RouteKey, route_label: String| {
+        let spawn_roots_control_stream = |route: RouteKey, route_label: String| {
             eprintln!(
                 "fs_meta_sink: start_runtime_endpoints roots_control spawn begin node={} route={} elapsed_ms={}",
                 node_id.0,
@@ -2988,7 +2968,10 @@ impl SinkFileMeta {
                                     sink.mark_logical_roots_control_generation(payload.generation)
                                 }
                                 Err(err) => {
-                                    log::warn!("sink logical-roots control apply failed: {:?}", err);
+                                    log::warn!(
+                                        "sink logical-roots control apply failed: {:?}",
+                                        err
+                                    );
                                 }
                             }
                         }
@@ -3611,6 +3594,7 @@ impl SinkFileMeta {
         self.perform_update_logical_roots(roots, host_object_grants)
     }
 
+    #[cfg(test)]
     pub(crate) fn update_logical_roots_from_management_apply(
         &self,
         roots: Vec<RootSpec>,

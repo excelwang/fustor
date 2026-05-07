@@ -252,8 +252,6 @@ struct SourceStatusRetryThenReplyBoundary {
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
     source_reply_sent: std::sync::atomic::AtomicBool,
     sink_reply_sent: std::sync::atomic::AtomicBool,
-    first_retryable_gap_at: std::sync::Mutex<Option<std::time::Instant>>,
-    second_send_at: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 struct SourceStatusMissingRouteStateThenReplyBoundary {
@@ -303,7 +301,6 @@ struct SinkStatusPeerTransportRetryThenReplyBoundary {
 }
 
 struct ForceFindProtocolRetryThenReplyBoundary {
-    source_reply_channel: String,
     payload: Vec<u8>,
     source_status: TestSourceStatusResponder,
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
@@ -313,7 +310,6 @@ struct ForceFindProtocolRetryThenReplyBoundary {
 }
 
 struct ForceFindGroupMissingThenReplyBoundary {
-    source_reply_channel: String,
     payload: Vec<u8>,
     source_status: TestSourceStatusResponder,
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
@@ -335,7 +331,6 @@ struct ForceFindHostUnavailableThenNextRunnerBoundary {
 }
 
 struct ForceFindSingleCandidateGroupMissingThenFallbackBoundary {
-    source_reply_channel: String,
     payload: Vec<u8>,
     source_status: TestSourceStatusResponder,
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
@@ -763,8 +758,6 @@ impl SourceStatusRetryThenReplyBoundary {
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
             source_reply_sent: std::sync::atomic::AtomicBool::new(false),
             sink_reply_sent: std::sync::atomic::AtomicBool::new(false),
-            first_retryable_gap_at: std::sync::Mutex::new(None),
-            second_send_at: std::sync::Mutex::new(None),
         }
     }
 
@@ -775,23 +768,6 @@ impl SourceStatusRetryThenReplyBoundary {
             .expect("source retry boundary send batches lock")
             .get(channel)
             .unwrap_or(&0)
-    }
-
-    fn retry_reissue_delay(&self) -> Option<Duration> {
-        let first_gap_at = *self
-            .first_retryable_gap_at
-            .lock()
-            .expect("source retry boundary first gap lock");
-        let second_send_at = *self
-            .second_send_at
-            .lock()
-            .expect("source retry boundary second send lock");
-        match (first_gap_at, second_send_at) {
-            (Some(first_gap_at), Some(second_send_at)) => {
-                Some(second_send_at.saturating_duration_since(first_gap_at))
-            }
-            _ => None,
-        }
     }
 }
 
@@ -955,15 +931,6 @@ impl SourceStatusOkSinkStatusExplicitEmptyThenReadyBoundary {
         }
     }
 
-    fn send_batch_count(&self, channel: &str) -> usize {
-        *self
-            .send_batches_by_channel
-            .lock()
-            .expect("source/sink explicit-empty-then-ready boundary send batches lock")
-            .get(channel)
-            .unwrap_or(&0)
-    }
-
     fn recv_batch_count(&self, channel: &str) -> usize {
         *self
             .recv_batches_by_channel
@@ -1045,11 +1012,7 @@ impl SinkStatusPeerTransportRetryThenReplyBoundary {
 
 impl ForceFindProtocolRetryThenReplyBoundary {
     fn new(payload: Vec<u8>, source_status_payload: Vec<u8>) -> Self {
-        let source_route = default_route_bindings()
-            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
-            .expect("resolve source-find route");
         Self {
-            source_reply_channel: format!("{}:reply", source_route.0),
             payload,
             source_status: TestSourceStatusResponder::with_payload(source_status_payload),
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
@@ -1057,24 +1020,6 @@ impl ForceFindProtocolRetryThenReplyBoundary {
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
             source_reply_sent: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    fn send_batch_count(&self, channel: &str) -> usize {
-        *self
-            .send_batches_by_channel
-            .lock()
-            .expect("force-find retry boundary send batches lock")
-            .get(channel)
-            .unwrap_or(&0)
-    }
-
-    fn recv_batch_count(&self, channel: &str) -> usize {
-        *self
-            .recv_batches_by_channel
-            .lock()
-            .expect("force-find retry boundary recv batches lock")
-            .get(channel)
-            .unwrap_or(&0)
     }
 
     fn total_send_batch_count(&self) -> usize {
@@ -1098,11 +1043,7 @@ impl ForceFindProtocolRetryThenReplyBoundary {
 
 impl ForceFindGroupMissingThenReplyBoundary {
     fn new(payload: Vec<u8>, source_status_payload: Vec<u8>) -> Self {
-        let source_route = default_route_bindings()
-            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
-            .expect("resolve source-find route");
         Self {
-            source_reply_channel: format!("{}:reply", source_route.0),
             payload,
             source_status: TestSourceStatusResponder::with_payload(source_status_payload),
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
@@ -1110,24 +1051,6 @@ impl ForceFindGroupMissingThenReplyBoundary {
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
             source_reply_sent: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    fn send_batch_count(&self, channel: &str) -> usize {
-        *self
-            .send_batches_by_channel
-            .lock()
-            .expect("force-find group-missing boundary send batches lock")
-            .get(channel)
-            .unwrap_or(&0)
-    }
-
-    fn recv_batch_count(&self, channel: &str) -> usize {
-        *self
-            .recv_batches_by_channel
-            .lock()
-            .expect("force-find group-missing boundary recv batches lock")
-            .get(channel)
-            .unwrap_or(&0)
     }
 
     fn total_send_batch_count(&self) -> usize {
@@ -1179,11 +1102,7 @@ impl ForceFindHostUnavailableThenNextRunnerBoundary {
 
 impl ForceFindSingleCandidateGroupMissingThenFallbackBoundary {
     fn new(payload: Vec<u8>, source_status_payload: Vec<u8>) -> Self {
-        let source_route = default_route_bindings()
-            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)
-            .expect("resolve source-find route");
         Self {
-            source_reply_channel: format!("{}:reply", source_route.0),
             payload,
             source_status: TestSourceStatusResponder::with_payload(source_status_payload),
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
@@ -1193,15 +1112,6 @@ impl ForceFindSingleCandidateGroupMissingThenFallbackBoundary {
             second_send_at: std::sync::Mutex::new(None),
             source_reply_sent: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    fn send_batch_count(&self, channel: &str) -> usize {
-        *self
-            .send_batches_by_channel
-            .lock()
-            .expect("force-find single-candidate boundary send batches lock")
-            .get(channel)
-            .unwrap_or(&0)
     }
 
     fn retry_reissue_delay(&self) -> Option<Duration> {
@@ -1902,7 +1812,6 @@ impl ChannelIoSubset for SourceStatusRetryThenReplyBoundary {
         _ctx: BoundaryContext,
         request: ChannelSendRequest,
     ) -> capanix_app_sdk::Result<()> {
-        let source_request_channel = self.source_reply_channel.trim_end_matches(":reply");
         if let Some(correlation) = request
             .events
             .first()
@@ -1917,16 +1826,9 @@ impl ChannelIoSubset for SourceStatusRetryThenReplyBoundary {
             .send_batches_by_channel
             .lock()
             .expect("source retry boundary send batches lock");
-        let send_count = send_batches
+        *send_batches
             .entry(request.channel_key.0.clone())
-            .or_default();
-        *send_count += 1;
-        if request.channel_key.0 == source_request_channel && *send_count == 2 {
-            *self
-                .second_send_at
-                .lock()
-                .expect("source retry boundary second send lock") = Some(std::time::Instant::now());
-        }
+            .or_default() += 1;
         Ok(())
     }
 
@@ -1954,13 +1856,6 @@ impl ChannelIoSubset for SourceStatusRetryThenReplyBoundary {
                 .copied()
                 .unwrap_or_default();
             if send_count < 2 {
-                let mut first_retryable_gap_at = self
-                    .first_retryable_gap_at
-                    .lock()
-                    .expect("source retry boundary first gap lock");
-                if first_retryable_gap_at.is_none() {
-                    *first_retryable_gap_at = Some(std::time::Instant::now());
-                }
                 return Err(CnxError::Timeout);
             }
             if self

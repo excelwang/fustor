@@ -42,7 +42,7 @@ struct PeerCleanupTailRoutes {
 struct PeerCleanupTailSinkStatusHarness {
     _tmp: tempfile::TempDir,
     _worker_socket_root: tempfile::TempDir,
-    boundary: Arc<LoopbackWorkerBoundary>,
+    _boundary: Arc<LoopbackWorkerBoundary>,
     app: Arc<FSMetaApp>,
     source_client: Arc<crate::workers::source::SourceWorkerClientHandle>,
     routes: PeerCleanupTailRoutes,
@@ -200,7 +200,7 @@ fn peer_cleanup_tail_setup(seed_ready_files: bool) -> PeerCleanupTailSinkStatusH
     PeerCleanupTailSinkStatusHarness {
         _tmp: tmp,
         _worker_socket_root: worker_socket_root,
-        boundary,
+        _boundary: boundary,
         app,
         source_client,
         routes: peer_cleanup_tail_routes(),

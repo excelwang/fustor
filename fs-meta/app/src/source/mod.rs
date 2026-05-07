@@ -508,6 +508,8 @@ pub struct SourceConcreteRootHealthSnapshot {
     pub overflow_count: u64,
     pub overflow_pending: bool,
     pub rescan_pending: bool,
+    #[serde(default)]
+    pub last_rescan_requested_at_us: Option<u64>,
     pub last_rescan_reason: Option<String>,
     pub last_error: Option<String>,
     pub last_audit_started_at_us: Option<u64>,
@@ -559,12 +561,6 @@ pub struct SourceProgressSnapshot {
 }
 
 impl SourceProgressSnapshot {
-    pub(crate) fn scheduled_groups(&self) -> BTreeSet<String> {
-        let mut groups = self.scheduled_source_groups.clone();
-        groups.extend(self.scheduled_scan_groups.iter().cloned());
-        groups
-    }
-
     pub(crate) fn published_expected_groups_since(
         &self,
         request_epoch: u64,
@@ -580,6 +576,7 @@ impl SourceProgressSnapshot {
 }
 
 impl SourceStatusSnapshot {
+    #[cfg(test)]
     pub(crate) fn published_group_ids(&self) -> BTreeSet<String> {
         self.concrete_roots
             .iter()
@@ -790,6 +787,7 @@ struct RootTaskSignature {
     logical_root_id: String,
     object_ref: String,
     monitor_path: std::path::PathBuf,
+    emit_prefix: std::path::PathBuf,
     watch: bool,
     scan: bool,
     audit_interval_ms: Option<u64>,
@@ -848,6 +846,7 @@ struct ConcreteRootHealthEntry {
     overflow_count: u64,
     overflow_pending: bool,
     rescan_pending: bool,
+    last_rescan_requested_at_us: Option<u64>,
     last_rescan_reason: Option<String>,
     last_error: Option<String>,
     last_audit_started_at_us: Option<u64>,
@@ -903,6 +902,7 @@ impl ConcreteRootHealthEntry {
             overflow_count: 0,
             overflow_pending: false,
             rescan_pending: false,
+            last_rescan_requested_at_us: None,
             last_rescan_reason: None,
             last_error: None,
             last_audit_started_at_us: None,
@@ -1046,14 +1046,19 @@ impl SourceStateCell {
     fn logical_roots_control_generation_is_stale(&self, generation: u64) -> bool {
         generation == 0
             || generation < self.current_logical_roots_generation()
-            || generation <= self.logical_roots_control_generation.load(Ordering::Acquire)
+            || generation
+                <= self
+                    .logical_roots_control_generation
+                    .load(Ordering::Acquire)
     }
 
     fn mark_logical_roots_control_generation(&self, generation: u64) {
         if generation == 0 {
             return;
         }
-        let mut current = self.logical_roots_control_generation.load(Ordering::Acquire);
+        let mut current = self
+            .logical_roots_control_generation
+            .load(Ordering::Acquire);
         while generation > current {
             match self.logical_roots_control_generation.compare_exchange(
                 current,
@@ -1636,14 +1641,13 @@ impl FSMetaSource {
             source_groups.as_ref(),
             scan_groups.as_ref(),
         );
-        let current_signature = {
-            let current = lock_or_recover(
-                &self.state_cell.roots,
-                "source.refresh_runtime_roots.current",
-            )
-            .clone();
-            Self::runtime_topology_signature(&current)
-        };
+        let current = lock_or_recover(
+            &self.state_cell.roots,
+            "source.refresh_runtime_roots.current",
+        )
+        .clone();
+        let desired = Self::preserve_existing_root_runtime_state(&current, desired);
+        let current_signature = Self::runtime_topology_signature(&current);
         let desired_signature = Self::runtime_topology_signature(&desired);
         let topology_changed = desired_signature != current_signature;
         let root_tasks_need_reconcile = self.root_tasks_need_reconcile(&desired);
@@ -1849,10 +1853,36 @@ impl FSMetaSource {
             logical_root_id: root.logical_root_id.clone(),
             object_ref: root.object_ref.clone(),
             monitor_path: root.monitor_path.clone(),
+            emit_prefix: root.emit_prefix.clone(),
             watch: root.spec.watch,
             scan: root.spec.scan,
             audit_interval_ms: root.spec.audit_interval_ms,
         }
+    }
+
+    fn preserve_existing_root_runtime_state(
+        current_roots: &[RootRuntime],
+        mut desired_roots: Vec<RootRuntime>,
+    ) -> Vec<RootRuntime> {
+        let current_by_key = current_roots
+            .iter()
+            .map(|root| (Self::root_runtime_key(root), root))
+            .collect::<HashMap<_, _>>();
+        for desired in &mut desired_roots {
+            let key = Self::root_runtime_key(desired);
+            let Some(current) = current_by_key.get(&key) else {
+                continue;
+            };
+            if Self::root_task_signature(current) != Self::root_task_signature(desired) {
+                continue;
+            }
+            desired.host_fs = current.host_fs.clone();
+            desired.scanner = current.scanner.clone();
+            desired.mtime_cache = current.mtime_cache.clone();
+            desired.epoch_counter = current.epoch_counter.clone();
+            desired.rescan_tx = current.rescan_tx.clone();
+        }
+        desired_roots
     }
 
     fn runtime_topology_signature(roots: &[RootRuntime]) -> Vec<String> {
@@ -2318,7 +2348,11 @@ impl FSMetaSource {
             .entry(root_key.to_string())
             .or_default();
         detail.rescan_pending = true;
+        detail.last_rescan_requested_at_us = Some(now_us());
         detail.last_rescan_reason = Some(reason.to_string());
+        detail.last_audit_started_at_us = None;
+        detail.last_audit_completed_at_us = None;
+        detail.last_audit_duration_ms = None;
     }
 
     fn mark_root_overflow_observed(fanout_health: &Arc<Mutex<FanoutHealthState>>, root_key: &str) {
@@ -2346,6 +2380,8 @@ impl FSMetaSource {
         detail.rescan_pending = false;
         detail.last_rescan_reason = Some(reason.to_string());
         detail.last_audit_started_at_us = Some(started_at_us);
+        detail.last_audit_completed_at_us = None;
+        detail.last_audit_duration_ms = None;
     }
 
     fn mark_root_audit_completed(
@@ -3417,9 +3453,6 @@ impl FSMetaSource {
                     METHOD_SOURCE_RESCAN_CONTROL,
                     self.node_id.0
                 );
-                let control_roots = self.state_cell.roots_handle();
-                let control_fanout_health = self.state_cell.fanout_health_handle();
-                let control_manual_rescan_intents = self.state_cell.manual_rescan_intents_handle();
                 let control_route_key = route.0.clone();
                 let control_ready = self.clone();
                 let endpoint_task = ManagedEndpointTask::spawn_stream(
@@ -3432,25 +3465,8 @@ impl FSMetaSource {
                     SOURCE_RUNTIME_UNIT_ID,
                     self.shutdown.clone(),
                     move || control_ready.should_receive_control_stream_route(&control_route_key),
-                    move |events| {
-                        let control_roots = control_roots.clone();
-                        let control_fanout_health = control_fanout_health.clone();
-                        let control_manual_rescan_intents = control_manual_rescan_intents.clone();
-                        async move {
-                            let roots_snapshot = lock_or_recover(
-                                &control_roots,
-                                "source.rescan.control_stream.roots.trigger",
-                            )
-                            .clone();
-                            for _ in 0..events.len() {
-                                FSMetaSource::record_rescan_intent_on_primary_roots(
-                                    &roots_snapshot,
-                                    Some(&control_fanout_health),
-                                    Some(&control_manual_rescan_intents),
-                                    "manual",
-                                );
-                            }
-                        }
+                    move |events| async move {
+                        let _ = events;
                     },
                 );
                 lock_or_recover(
@@ -3776,39 +3792,6 @@ impl FSMetaSource {
             .filter(|root| root.active && root.is_group_primary && root.spec.scan)
             .map(Self::root_runtime_key)
             .collect()
-    }
-
-    pub(crate) async fn perform_targeted_rescan_when_ready_epoch(&self) -> Result<u64> {
-        let target_roots = self
-            .local_source_primary_scan_root_keys("source.targeted_rescan_when_ready.roots.initial");
-        if target_roots.is_empty() {
-            return Err(CnxError::InvalidInput(
-                "scoped source-rescan target has no local source-primary scan root".into(),
-            ));
-        }
-        if !self.wait_for_group_primary_scan_roots_ready().await {
-            log::debug!(
-                "source-fs-meta: queue targeted manual rescan before primary scan roots report running: {:?}",
-                target_roots
-            );
-        }
-        let target_roots = self
-            .local_source_primary_scan_root_keys("source.targeted_rescan_when_ready.roots.final");
-        if target_roots.is_empty() {
-            return Err(CnxError::InvalidInput(
-                "scoped source-rescan target lost local source-primary scan root".into(),
-            ));
-        }
-        let status = self.status_snapshot();
-        let (published_batches, last_published_at_us) = source_status_publication_marker(&status);
-        let last_audit_completed_at_us = source_status_rescan_completion_marker(&status);
-        let epoch = self.state_cell.begin_rescan_request_epoch(
-            published_batches,
-            last_published_at_us,
-            last_audit_completed_at_us,
-        );
-        self.trigger_rescan();
-        Ok(epoch)
     }
 
     pub(crate) fn targeted_rescan_delivery_acceptance(
@@ -4167,6 +4150,7 @@ impl FSMetaSource {
                 overflow_count: entry.overflow_count,
                 overflow_pending: entry.overflow_pending,
                 rescan_pending: entry.rescan_pending,
+                last_rescan_requested_at_us: entry.last_rescan_requested_at_us,
                 last_rescan_reason: entry.last_rescan_reason.clone(),
                 last_error: entry.last_error.clone(),
                 last_audit_started_at_us: entry.last_audit_started_at_us,

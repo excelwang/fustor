@@ -169,9 +169,7 @@ fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
     match request {
         SourceWorkerRequest::UpdateLogicalRoots { .. } => "UpdateLogicalRoots",
         SourceWorkerRequest::LogicalRootsSnapshot => "LogicalRootsSnapshot",
-        SourceWorkerRequest::LogicalRootsGenerationSnapshot => {
-            "LogicalRootsGenerationSnapshot"
-        }
+        SourceWorkerRequest::LogicalRootsGenerationSnapshot => "LogicalRootsGenerationSnapshot",
         SourceWorkerRequest::HostObjectGrantsSnapshot => "HostObjectGrantsSnapshot",
         SourceWorkerRequest::HostObjectGrantsVersionSnapshot => "HostObjectGrantsVersionSnapshot",
         SourceWorkerRequest::StatusSnapshot => "StatusSnapshot",
@@ -219,38 +217,6 @@ fn debug_force_find_route_capture_enabled() -> bool {
             .ok()
             .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
     })
-}
-
-fn host_ref_matches_node_id(host_ref: &str, node_id: &NodeId) -> bool {
-    host_ref == node_id.0
-        || node_id
-            .0
-            .strip_prefix(host_ref)
-            .is_some_and(|suffix| suffix.starts_with('-'))
-        || node_id.0.strip_prefix("cluster-").is_some_and(|scoped| {
-            scoped == host_ref
-                || scoped
-                    .strip_prefix(host_ref)
-                    .is_some_and(|suffix| suffix.starts_with('-'))
-        })
-}
-
-fn stable_host_ref_for_node_id(
-    node_id: &NodeId,
-    grants: &[crate::source::config::GrantedMountRoot],
-) -> String {
-    let host_refs = grants
-        .iter()
-        .filter(|grant| host_ref_matches_node_id(&grant.host_ref, node_id))
-        .map(|grant| grant.host_ref.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    match host_refs.len() {
-        1 => host_refs
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| node_id.0.clone()),
-        _ => node_id.0.clone(),
-    }
 }
 
 fn source_force_find_debug_metadata(

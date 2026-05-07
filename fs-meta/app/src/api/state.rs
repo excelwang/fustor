@@ -179,6 +179,7 @@ impl ApiControlGate {
         self.epoch.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub async fn wait_ready(&self) {
         loop {
             if self.is_ready() {

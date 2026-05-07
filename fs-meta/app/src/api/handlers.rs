@@ -418,11 +418,11 @@ async fn roots_put_second_wave_context_with_current_generation(
         .logical_roots_generation_with_failure()
         .await
         .map_err(|err| {
-            ApiError::internal(format!(
-                "source logical roots generation snapshot failed: {}",
-                err.as_error()
-            ))
-        })?;
+        ApiError::internal(format!(
+            "source logical roots generation snapshot failed: {}",
+            err.as_error()
+        ))
+    })?;
     Ok(context)
 }
 
@@ -494,15 +494,6 @@ fn roots_put_second_wave_source_runtime_scope_ready(
 ) -> bool {
     let observed = roots_put_second_wave_source_runtime_scope_observed_groups(source);
     observed.0 == expected_groups.source_groups && observed.1 == expected_groups.scan_groups
-}
-
-fn roots_put_second_wave_source_runtime_scope_covers_expected(
-    expected_groups: &RootsPutSecondWaveExpectedGroups,
-    source: &SourceObservabilitySnapshot,
-) -> bool {
-    let observed = roots_put_second_wave_source_runtime_scope_observed_groups(source);
-    expected_groups.source_groups.is_subset(&observed.0)
-        && expected_groups.scan_groups.is_subset(&observed.1)
 }
 
 fn roots_put_second_wave_source_runtime_scope_observed_groups(
@@ -986,6 +977,7 @@ fn reset_manual_rescan_delivery_proof_after_roots_control_resend(
     *prefer_scoped_source_probe = !target_node_ids.is_empty();
 }
 
+#[cfg(test)]
 fn manual_rescan_accumulated_source_status_ready_for_delivery(
     roots: &[RootSpec],
     _source_snapshot: &SourceObservabilitySnapshot,
@@ -995,6 +987,7 @@ fn manual_rescan_accumulated_source_status_ready_for_delivery(
         .is_some()
 }
 
+#[cfg(test)]
 fn manual_rescan_source_status_ready_for_current_roots(
     _expected_groups: &RootsPutSecondWaveExpectedGroups,
     roots: &[RootSpec],
@@ -1873,6 +1866,7 @@ where
     }
 }
 
+#[cfg(test)]
 async fn wait_roots_put_source_runtime_scope_readiness(
     context: &RootsPutSecondWaveFollowupContext,
     roots: &[RootSpec],
@@ -1882,6 +1876,7 @@ async fn wait_roots_put_source_runtime_scope_readiness(
         .await
 }
 
+#[cfg(test)]
 async fn wait_roots_put_source_runtime_scope_readiness_with_local_observation<
     LocalObservation,
     LocalObservationFuture,
@@ -1905,6 +1900,7 @@ where
     .await
 }
 
+#[cfg(test)]
 async fn wait_roots_put_source_runtime_scope_readiness_with_local_observation_and_payload<
     LocalObservation,
     LocalObservationFuture,
@@ -1930,6 +1926,7 @@ where
     .await
 }
 
+#[cfg(test)]
 async fn wait_roots_put_source_runtime_scope_readiness_with_local_observations_and_payload<
     LocalFastObservation,
     LocalFastObservationFuture,
@@ -1962,6 +1959,7 @@ where
     .await
 }
 
+#[cfg(test)]
 async fn wait_roots_put_source_runtime_scope_readiness_with_local_observations_and_payload_policy<
     LocalFastObservation,
     LocalFastObservationFuture,
@@ -2466,12 +2464,12 @@ pub async fn status(
             merged_inflight
         );
     }
+    let trusted_observation_readiness =
+        trusted_observation_readiness_for_status(&source, &sink_status);
     let status_source =
         status_source_from_observability(source, &sink_status, runner_sets, merged_inflight);
     let (api_facade_liveness, management_write_readiness, control_epoch) =
         state.control_gate.readiness_snapshot();
-    let trusted_observation_readiness =
-        trusted_observation_readiness_for_status(&status_source, &sink_status);
     let runtime_artifact = runtime_artifact_evidence();
     let authority_epoch = authority_epoch_evidence(
         &status_source,
@@ -2826,6 +2824,7 @@ fn sink_group_service_state(group: &crate::sink::SinkGroupStatusSnapshot) -> Gro
     }
 }
 
+#[cfg(test)]
 fn snapshot_scoped_active_facade_candidate_groups(
     local_source: &SourceObservabilitySnapshot,
     local_sink: &SinkStatusSnapshot,
@@ -3253,6 +3252,7 @@ async fn collect_shared_status_routes_once(
     )
 }
 
+#[cfg(test)]
 async fn merge_remote_status_snapshots<SinkCollect, SinkFuture, SourceCollect, SourceFuture>(
     local_sink: SinkStatusSnapshot,
     local_source: SourceObservabilitySnapshot,
@@ -4427,6 +4427,7 @@ fn source_owner_scope_control_generation_for_group_node(
         .max()
 }
 
+#[cfg(test)]
 fn source_runtime_scope_control_generation_for_group_node(
     source: &SourceObservabilitySnapshot,
     group_id: &str,
@@ -4441,6 +4442,7 @@ fn source_runtime_scope_control_generation_for_group_node(
         .max()
 }
 
+#[cfg(test)]
 fn source_control_signal_defines_runtime_scope(signal: &str, group_id: &str) -> bool {
     signal.contains("activate ") && source_control_signal_applies_to_group(signal, group_id)
 }
@@ -4567,14 +4569,6 @@ fn source_control_signal_scoped_rescan_route_targets_node(signal: &str, node_id:
         return false;
     };
     normalized_route_node_id_matches(scoped_suffix, &normalized_route_node_id(node_id))
-}
-
-fn source_has_scoped_rescan_route_activation_for_group(
-    source: &SourceObservabilitySnapshot,
-    group_id: &str,
-    node_id: &str,
-) -> bool {
-    source_scoped_rescan_route_owner_for_group(source, group_id, node_id).is_some()
 }
 
 fn source_scoped_rescan_route_owner_for_group(
@@ -5059,6 +5053,7 @@ fn manual_rescan_source_primary_target_node_ids_by_root_from_runtime_scope(
     target_node_ids_by_root
 }
 
+#[cfg(test)]
 fn manual_rescan_source_primary_targets_cover_current_roots(
     roots: &[RootSpec],
     source: &SourceObservabilitySnapshot,
@@ -5078,7 +5073,8 @@ fn source_observability_snapshot_is_worker_status_cache(
         .degraded_roots
         .iter()
         .any(|(root_key, reason)| {
-            root_key == "source-worker" && reason == "source worker status served from cache"
+            root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY
+                && reason == SOURCE_WORKER_STATUS_CACHE_REASON
         })
 }
 
@@ -5094,15 +5090,6 @@ fn manual_rescan_source_snapshot_ready_for_delivery(
         return false;
     }
     manual_rescan_target_node_ids_from_receivable_source_snapshot(roots, source).is_some()
-}
-
-fn manual_rescan_source_snapshot_ready_for_target_selection(
-    expected_groups: &RootsPutSecondWaveExpectedGroups,
-    roots: &[RootSpec],
-    source: &SourceObservabilitySnapshot,
-) -> bool {
-    roots_put_second_wave_source_runtime_scope_covers_expected(expected_groups, source)
-        && manual_rescan_source_primary_targets_cover_current_roots(roots, source)
 }
 
 async fn manual_rescan_local_source_observation(
@@ -5606,6 +5593,7 @@ fn status_source_from_observability(
                     overflow_count: entry.overflow_count,
                     overflow_pending: entry.overflow_pending,
                     rescan_pending: entry.rescan_pending,
+                    last_rescan_requested_at_us: entry.last_rescan_requested_at_us,
                     last_rescan_reason: entry.last_rescan_reason,
                     last_error: entry.last_error,
                     last_audit_started_at_us: entry.last_audit_started_at_us,
@@ -5668,63 +5656,26 @@ fn status_source_from_observability(
     }
 }
 
-fn status_source_trusted_groups(status_source: &StatusSource) -> BTreeSet<String> {
-    status_source
-        .logical_roots
-        .iter()
-        .filter(|root| {
-            root.service_state == GroupServiceState::ServingTrusted
-                && root.matched_grants > 0
-                && root.active_members > 0
-        })
-        .map(|root| root.root_id.clone())
-        .collect()
-}
-
-fn status_source_degraded_root_blocks_trusted_observation(
-    status_source: &StatusSource,
-    expected_groups: &BTreeSet<String>,
-    degraded_root: &DegradedRoot,
+fn trusted_observation_readiness_for_status(
+    source: &SourceObservabilitySnapshot,
+    sink_status: &SinkStatusSnapshot,
 ) -> bool {
-    if degraded_root.root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY
-        && degraded_root.reason == SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON
-        && expected_groups.is_subset(&status_source_trusted_groups(status_source))
+    if source_observability_snapshot_is_worker_status_cache(source)
+        || source_observability_snapshot_is_degraded_worker_cache(source)
     {
         return false;
     }
-    true
-}
-
-fn trusted_observation_readiness_for_status(
-    status_source: &StatusSource,
-    sink_status: &SinkStatusSnapshot,
-) -> bool {
-    let expected_materialized_groups = status_source
+    let expected_materialized_groups = source
         .logical_roots
         .iter()
-        .map(|root| root.root_id.clone())
+        .filter(|root| root.scan)
+        .map(|root| root.id.clone())
         .collect::<BTreeSet<_>>();
-    let materialized_groups = sink_status
-        .groups
-        .iter()
-        .map(|group| group.group_id.clone())
-        .collect::<BTreeSet<_>>();
-    !expected_materialized_groups.is_empty()
-        && expected_materialized_groups.is_subset(&status_source_trusted_groups(status_source))
-        && expected_materialized_groups.is_subset(&materialized_groups)
-        && sink_status.groups.iter().all(|group| {
-            matches!(
-                group.normalized_readiness(),
-                crate::sink::GroupReadinessState::Ready
-            )
-        })
-        && !status_source.degraded_roots.iter().any(|degraded_root| {
-            status_source_degraded_root_blocks_trusted_observation(
-                status_source,
-                &expected_materialized_groups,
-                degraded_root,
-            )
-        })
+    crate::query::observation::materialized_status_cache_is_ready(
+        &source.status,
+        sink_status,
+        &expected_materialized_groups,
+    )
 }
 
 fn coverage_capabilities_from_mode(coverage_mode: &str) -> ObservationCoverageCapabilities {
@@ -7159,7 +7110,6 @@ mod tests {
     struct StatusSinkPartialRetryThenReplyBoundary {
         source_request_channel: String,
         source_reply_channel: String,
-        sink_request_channel: String,
         sink_reply_channel: String,
         source_status_payloads: Vec<(String, Vec<u8>)>,
         first_sink_status_payloads: Vec<(String, Vec<u8>)>,
@@ -8979,7 +8929,6 @@ mod tests {
             Self {
                 source_request_channel: source_route.0.clone(),
                 source_reply_channel: format!("{}:reply", source_route.0),
-                sink_request_channel: sink_route.0.clone(),
                 sink_reply_channel: format!("{}:reply", sink_route.0),
                 source_status_payloads: source_snapshots
                     .into_iter()
@@ -10636,6 +10585,7 @@ mod tests {
                     overflow_count: 0,
                     overflow_pending: false,
                     rescan_pending: false,
+                    last_rescan_requested_at_us: None,
                     last_rescan_reason: None,
                     last_error: None,
                     last_audit_started_at_us: None,
@@ -10734,11 +10684,8 @@ mod tests {
             SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON.to_string(),
         ));
 
-        let status_source =
-            status_source_from_observability(source, &sink, BTreeMap::new(), Vec::new());
-
         assert!(
-            trusted_observation_readiness_for_status(&status_source, &sink),
+            trusted_observation_readiness_for_status(&source, &sink),
             "runtime-scope control-cache provenance must not keep public status readiness closed once per-root source and sink evidence is trusted"
         );
     }
@@ -10753,12 +10700,51 @@ mod tests {
             SOURCE_WORKER_STATUS_CACHE_REASON.to_string(),
         ));
 
-        let status_source =
-            status_source_from_observability(source, &sink, BTreeMap::new(), Vec::new());
+        assert!(
+            !trusted_observation_readiness_for_status(&source, &sink),
+            "cache-only source status remains explanation evidence, not trusted observation readiness"
+        );
+    }
+
+    #[test]
+    fn trusted_observation_readiness_rejects_missing_scan_root_source_coverage() {
+        let mut source = local_source_snapshot();
+        let mut sink = local_sink_snapshot();
+        source
+            .logical_roots
+            .push(RootSpec::new("nfs2", "/mnt/nfs2"));
+        sink.groups.push(crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs2".to_string(),
+            primary_object_ref: "obj-b".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 1,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 21,
+            shadow_lag_us: 22,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        });
 
         assert!(
-            !trusted_observation_readiness_for_status(&status_source, &sink),
-            "cache-only source status remains explanation evidence, not trusted observation readiness"
+            !trusted_observation_readiness_for_status(&source, &sink),
+            "public trusted observation readiness must stay closed until source status covers every scan-enabled root"
+        );
+    }
+
+    #[test]
+    fn trusted_observation_readiness_rejects_unready_sink_group() {
+        let source = local_source_snapshot();
+        let mut sink = local_sink_snapshot();
+        sink.groups[0].readiness = crate::sink::GroupReadinessState::PendingMaterialization;
+
+        assert!(
+            !trusted_observation_readiness_for_status(&source, &sink),
+            "public trusted observation readiness must stay closed until every expected sink group is live-materialized"
         );
     }
 
@@ -11835,7 +11821,7 @@ mod tests {
         std::fs::create_dir_all(&nfs1).expect("create nfs1");
         std::fs::create_dir_all(&nfs2).expect("create nfs2");
         let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
-        let auth = Arc::new(
+        let _auth = Arc::new(
             AuthService::new(ApiAuthConfig {
                 passwd_path,
                 shadow_path,
@@ -11866,10 +11852,10 @@ mod tests {
             ],
             ..SourceConfig::default()
         };
-        let source = Arc::new(SourceFacade::local(Arc::new(
+        let _source = Arc::new(SourceFacade::local(Arc::new(
             FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
         )));
-        let sink = Arc::new(SinkFacade::local(Arc::new(
+        let _sink = Arc::new(SinkFacade::local(Arc::new(
             SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg).expect("sink"),
         )));
 
@@ -18519,6 +18505,7 @@ mod tests {
                     overflow_count: 0,
                     overflow_pending: false,
                     rescan_pending: false,
+                    last_rescan_requested_at_us: None,
                     last_rescan_reason: None,
                     last_error: None,
                     last_audit_started_at_us: None,

@@ -300,7 +300,7 @@
 
         control_entered.notified().await;
 
-        let mut status_request = tokio::spawn({
+        let status_request = tokio::spawn({
             let client = client.clone();
             let bind_addr = bind_addr.clone();
             let token = token.clone();

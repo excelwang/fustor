@@ -2403,7 +2403,6 @@ fn source_facade_local_snapshot_metadata_and_progress_helpers_use_local_typed_he
         "Self::Local(source) => source.host_object_grants_snapshot_with_failure(),",
         "Self::Local(source) => source.host_object_grants_version_snapshot_with_failure(),",
         "Self::Local(source) => source.status_snapshot_with_failure(),",
-        "Self::Local(source) => source.lifecycle_state_label_with_failure(),",
         "Self::Local(source) => source.source_primary_by_group_snapshot_with_failure(),",
         "Self::Local(source) => source.last_force_find_runner_by_group_snapshot_with_failure(),",
         "Self::Local(source) => source.force_find_inflight_groups_snapshot_with_failure(),",
@@ -13245,7 +13244,7 @@ async fn external_source_worker_nonblocking_observability_can_serve_stale_publis
         "baseline /data should publish for both local primary roots: {baseline_counts:?}"
     );
 
-    let primed_worker = client.client().await.expect("connect source worker");
+    let _primed_worker = client.client().await.expect("connect source worker");
     let primed = client
         .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
         .await
@@ -13333,7 +13332,7 @@ async fn external_source_worker_nonblocking_observability_can_serve_stale_publis
         stale.published_path_origin_counts_by_node
     );
 
-    let live_worker = client.client().await.expect("reconnect source worker");
+    let _live_worker = client.client().await.expect("reconnect source worker");
     let live = client
         .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
         .await
@@ -13401,7 +13400,7 @@ async fn external_source_worker_nonblocking_observability_preserves_scheduled_gr
         .expect("source worker start timed out")
         .expect("start source worker");
 
-    let primed_worker = client.client().await.expect("connect source worker");
+    let _primed_worker = client.client().await.expect("connect source worker");
     let primed = client
         .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
         .await
@@ -17798,7 +17797,7 @@ async fn external_source_worker_observability_normalizes_instance_suffixed_node_
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let live_worker = client.client().await.expect("connect source worker");
+    let _live_worker = client.client().await.expect("connect source worker");
     let snapshot = client
         .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
         .await
@@ -18180,6 +18179,7 @@ async fn recovered_active_local_status_yields_schedule_and_control_summary_when_
             overflow_count: 0,
             overflow_pending: false,
             rescan_pending: false,
+            last_rescan_requested_at_us: None,
             last_rescan_reason: None,
             last_error: None,
             last_audit_started_at_us: None,
@@ -18699,7 +18699,7 @@ async fn restarted_external_source_worker_preserves_multi_root_observability_aft
     ) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let worker = client.client().await.expect("connect source worker");
+            let _worker = client.client().await.expect("connect source worker");
             let snapshot = client
                 .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
                 .await
@@ -19012,7 +19012,7 @@ async fn restarted_external_source_worker_preserves_single_root_observability_af
                 .await
                 .expect("scheduled scan groups")
                 .unwrap_or_default();
-            let worker = client.client().await.expect("connect source worker");
+            let _worker = client.client().await.expect("connect source worker");
             let snapshot = client
                 .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
                 .await
