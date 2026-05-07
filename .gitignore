@@ -5,6 +5,8 @@
 cluster-out
 .DS_Store
 fs-meta.query-keys.json
+fsmeta-demo.env
+fsmeta-demo-monitoring-roots-5group.json
 .cargo/config.toml
 
 fs-meta.query-keys.json
