@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Command templates for the fs-meta test matrix. Run from the fustor repository
-# root. The public suite surface is organized by feature priority first, then
-# environment: business -> environment -> operations.
+# root. The public suite surface is organized by failure-localization depth:
+# contracts -> single-process -> local runtime -> NFS environment -> real cluster.
 
 : "${CAPANIX_WORKER_HOST_BINARY:=}"
 : "${FSMETA_FULL_NFS_ROOTS_FILE:=}"
@@ -148,8 +148,16 @@ run_real_nfs_runtime_filter() {
       -- --ignored --nocapture --test-threads=1
 }
 
+L5_ACCEPTANCE_STAGE_TOTAL=7
 L5_STAGE_TOTAL=24
 L5_VISIBILITY_SUBSTAGE_TOTAL=7
+
+run_l5_acceptance_marker() {
+  local index="$1"
+  local boundary="$2"
+  echo "[fs-meta-test-matrix] l5_stage=${index}/${L5_ACCEPTANCE_STAGE_TOTAL}"
+  echo "[fs-meta-test-matrix] boundary=${boundary}"
+}
 
 run_l5_api_stage() {
   local index="$1"
@@ -192,7 +200,17 @@ contract_fast() {
   cargo test -p fustor-specs-root --test specs_fs_meta_contract_fast
 }
 
-business_api_fast() {
+root_namespace_contracts() {
+  contract_fast
+  cargo test -p fs-meta-runtime subpath_scope_materializes_root_relative_paths \
+    -- --nocapture --test-threads=1
+  cargo test -p fs-meta-runtime update_logical_roots_resets_materialized_group_when_covered_scope_changes \
+    -- --nocapture --test-threads=1
+}
+
+single_process_closed_loop_core() {
+  cargo test -p fs-meta-runtime slow_watch_setup_does_not_block_initial_scan_stream \
+    -- --nocapture --test-threads=1
   CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
     cargo test -p fs-meta-runtime selected_group -- --nocapture --test-threads=1
   CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
@@ -202,11 +220,46 @@ business_api_fast() {
     cargo test -p fs-meta-runtime roots_put -- --nocapture --test-threads=1
 }
 
-business_fast() {
-  announce_suite "business-fast" "local/tmpfs/mock-worker" "no" "no"
+runtime_local_multinode_core() {
+  CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
+    cargo test -p fs-meta-runtime --lib workers::source::tests::source_control \
+      -- --nocapture --test-threads=1
+  CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
+    cargo test -p fs-meta-runtime --lib workers::source::tests::external_source_worker_force_find \
+      -- --nocapture --test-threads=1
+  CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
+    cargo test -p fs-meta-runtime --lib workers::sink::tests::sink_control_frame_machine \
+      -- --nocapture --test-threads=1
+  CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
+    cargo test -p fs-meta-runtime --lib workers::sink::tests::status_snapshot_nonblocking \
+      -- --nocapture --test-threads=1
+  CAPANIX_RUNTIME_SCOPE_E2E=1 \
+    CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
+    cargo test -p fustor-specs-root --test runtime_scope_e2e -- --nocapture --test-threads=1
+}
+
+contracts_fast() {
+  announce_suite "contracts-fast" "local/no-runtime/no-real-nfs" "no" "no"
+  root_namespace_contracts
+}
+
+single_process_closed_loop() {
+  announce_suite "single-process-closed-loop" "local/tmpfs/mock-worker" "no" "no"
   ensure_worker_host_binary
-  contract_fast
-  business_api_fast
+  single_process_closed_loop_core
+}
+
+runtime_local_multinode() {
+  announce_suite "runtime-local-multinode" "local-capanix-runtime-worker" "no" "yes"
+  ensure_worker_host_binary
+  runtime_local_multinode_core
+}
+
+business_fast() {
+  announce_suite "business-fast" "compat: contracts-fast + single-process-closed-loop" "no" "no"
+  ensure_worker_host_binary
+  root_namespace_contracts
+  single_process_closed_loop_core
 }
 
 business_mini_nfs() {
@@ -238,28 +291,35 @@ environment_full_nfs() {
 }
 
 operations_local() {
-  announce_suite "operations-local" "local-worker-runtime" "no" "yes"
+  announce_suite "operations-local" "compat: runtime-local-multinode" "no" "yes"
   ensure_worker_host_binary
-  CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime --lib workers::source::tests::source_control \
-      -- --nocapture --test-threads=1
-  CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime --lib workers::source::tests::external_source_worker_force_find \
-      -- --nocapture --test-threads=1
-  CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime --lib workers::sink::tests::sink_control_frame_machine \
-      -- --nocapture --test-threads=1
-  CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fs-meta-runtime --lib workers::sink::tests::status_snapshot_nonblocking \
-      -- --nocapture --test-threads=1
-  CAPANIX_RUNTIME_SCOPE_E2E=1 \
-    CAPANIX_WORKER_HOST_BINARY="$CAPANIX_WORKER_HOST_BINARY" \
-    cargo test -p fustor-specs-root --test runtime_scope_e2e -- --nocapture --test-threads=1
+  runtime_local_multinode_core
 }
 
-operations_real_nfs() {
+nfs_environment_gate() {
   local stage="${1:-all}"
-  announce_suite "operations-real-nfs" "5-node-full-real-nfs-demo" "yes" "yes"
+  case "$stage" in
+    all)
+      business_mini_nfs
+      environment_full_nfs
+      ;;
+    mini)
+      business_mini_nfs
+      ;;
+    full)
+      environment_full_nfs
+      ;;
+    *)
+      echo "unknown nfs-environment-gate stage: $stage" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+operations_real_nfs_legacy() {
+  local stage="${1:-all}"
+  announce_suite "operations-real-nfs-legacy-24" "5-node-full-real-nfs-demo" "yes" "yes"
   ensure_worker_host_binary
   require_full_demo_assets
   case "$stage" in
@@ -436,28 +496,120 @@ operations_real_nfs() {
   esac
 }
 
+real_cluster_acceptance() {
+  local stage="${1:-all}"
+  announce_suite "real-cluster-acceptance" "real-cluster-full-nfs" "yes" "yes"
+  ensure_worker_host_binary
+  require_full_demo_assets
+  case "$stage" in
+    all)
+      real_cluster_acceptance preflight
+      real_cluster_acceptance deploy-upgrade
+      real_cluster_acceptance management-api
+      real_cluster_acceptance source-audit
+      real_cluster_acceptance sink-materialization
+      real_cluster_acceptance query
+      real_cluster_acceptance resilience
+      ;;
+    preflight)
+      run_l5_acceptance_marker 1 "preflight"
+      ;;
+    deploy-upgrade)
+      run_l5_acceptance_marker 2 "deploy-upgrade"
+      run_real_nfs_api_filter "l5.acceptance.deploy-upgrade.apply" \
+        fs_meta_operations_release_upgrade_apply_real_nfs
+      run_real_nfs_api_filter "l5.acceptance.deploy-upgrade.http" \
+        fs_meta_operations_release_upgrade_real_nfs
+      ;;
+    management-api)
+      run_l5_acceptance_marker 3 "management-api"
+      run_real_nfs_api_filter "l5.acceptance.management-api.roots-persist" \
+        fs_meta_operations_release_upgrade_roots_persist_real_nfs
+      ;;
+    source-audit)
+      run_l5_acceptance_marker 4 "source-audit"
+      run_real_nfs_runtime_filter "l5.acceptance.source-audit.manual-rescan" \
+        external_source_worker_real_nfs_manual_rescan
+      run_real_nfs_api_filter "l5.acceptance.source-audit.delivery-ready" \
+        fs_meta_operations_visibility_source_delivery_ready_real_nfs
+      ;;
+    sink-materialization)
+      run_l5_acceptance_marker 5 "sink-materialization"
+      run_real_nfs_api_filter "l5.acceptance.sink-materialization.tree" \
+        fs_meta_operations_release_upgrade_tree_materialization_real_nfs
+      ;;
+    query)
+      run_l5_acceptance_marker 6 "query"
+      run_real_nfs_api_filter "l5.acceptance.query.tree-stats" \
+        fs_meta_operations_release_upgrade_tree_stats_stable_real_nfs
+      run_real_nfs_api_filter "l5.acceptance.query.force-find" \
+        fs_meta_operations_scenarios_real_nfs
+      ;;
+    resilience)
+      run_l5_acceptance_marker 7 "resilience"
+      run_real_nfs_api_filter "l5.acceptance.resilience.facade-continuity" \
+        fs_meta_operations_release_upgrade_facade_claim_continuity_real_nfs
+      run_real_nfs_api_filter "l5.acceptance.resilience.sink-failover" \
+        fs_meta_operations_sink_failover_real_nfs
+      ;;
+    foundation-real-runtime|upgrade-core|topology-change|recovery-switch|resource-budget|\
+    runtime-selected-group-proxy|runtime-source-worker-manual-rescan|ops-force-find-smoke|\
+    ops-force-find-semantics|ops-visibility-sink-selection|ops-visibility-roots-narrowed|\
+    ops-visibility-source-delivery-ready|ops-visibility-manual-rescan-accepted|\
+    ops-visibility-grants-visible|ops-visibility-withdraw-converged|\
+    ops-visibility-sink-holder-moved|ops-visibility-facade-live|upgrade-apply-generation-two|\
+    upgrade-generation-two-http|upgrade-peer-source-control|upgrade-sink-scope|\
+    upgrade-runtime-scope|upgrade-roots-persist|upgrade-tree-stats|upgrade-tree-materialization|\
+    ops-new-nfs-join|ops-root-path-modify|ops-nfs-retire|upgrade-window-join|\
+    ops-sink-failover|ops-facade-resource-switch|upgrade-facade-continuity|\
+    ops-activation-preserved|ops-activation-visibility|ops-activation-force-find|\
+    upgrade-cpu-budget)
+      operations_real_nfs_legacy "$stage"
+      ;;
+    legacy-24)
+      operations_real_nfs_legacy all
+      ;;
+    *)
+      echo "unknown real-cluster-acceptance stage: $stage" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+operations_real_nfs() {
+  real_cluster_acceptance "${1:-all}"
+}
+
 progressive_business() {
-  business_fast
-  business_mini_nfs
+  contracts_fast
+  single_process_closed_loop
 }
 
 progressive_environment() {
   progressive_business
-  environment_full_nfs
+  runtime_local_multinode
+  nfs_environment_gate
 }
 
 progressive_operations() {
   progressive_environment
-  operations_local
-  operations_real_nfs
+  real_cluster_acceptance
 }
 
 usage() {
   cat <<'EOF2'
 Usage: fs-meta/docs/examples/test-matrix-commands.sh <suite>
+       fs-meta/docs/examples/test-matrix-commands.sh nfs-environment-gate [mini|full|all]
+       fs-meta/docs/examples/test-matrix-commands.sh real-cluster-acceptance [stage]
        fs-meta/docs/examples/test-matrix-commands.sh operations-real-nfs [stage]
 
 Suites:
+  contracts-fast
+  single-process-closed-loop
+  runtime-local-multinode
+  nfs-environment-gate
+  real-cluster-acceptance
   business-fast
   business-mini-nfs
   environment-full-nfs
@@ -467,17 +619,25 @@ Suites:
   progressive-environment
   progressive-operations
 
-operations-real-nfs stages:
+real-cluster-acceptance stages:
   all
+  preflight
+  deploy-upgrade
+  management-api
+  source-audit
+  sink-materialization
+  query
+  resilience
+  legacy-24
 
-ordered L5 groups:
+legacy operations-real-nfs ordered groups:
   foundation-real-runtime
   upgrade-core
   topology-change
   recovery-switch
   resource-budget
 
-atomic L5 stages:
+legacy atomic L5 stages:
   runtime-selected-group-proxy
   runtime-source-worker-manual-rescan
   ops-force-find-smoke
@@ -513,6 +673,11 @@ EOF2
 }
 
 case "${1:-}" in
+  contracts-fast) contracts_fast ;;
+  single-process-closed-loop) single_process_closed_loop ;;
+  runtime-local-multinode) runtime_local_multinode ;;
+  nfs-environment-gate) nfs_environment_gate "${2:-all}" ;;
+  real-cluster-acceptance) real_cluster_acceptance "${2:-all}" ;;
   business-fast) business_fast ;;
   business-mini-nfs) business_mini_nfs ;;
   environment-full-nfs) environment_full_nfs ;;

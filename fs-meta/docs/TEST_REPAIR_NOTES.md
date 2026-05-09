@@ -2,7 +2,7 @@
 
 本文用于说明当前 `fustor` worktree 后续修订需要遵守的边界。
 
-测试任务理解和报告格式详见 `fs-meta/docs/TEST_TASK_GUIDANCE.md`。L2/L3 运行步骤详见 `fs-meta/docs/TEST_LADDER_RUNBOOK.md`。后续 L1-L5 报告必须按该文档区分 `PASS`、`FAIL_NEEDS_LOCALIZATION`、`FAIL_LOCALIZED`、`BLOCKED_BY_ENV_PREREQ`、`NOT_RUN`，不能用“基线问题”“flaky”“环境问题”替代第一失败边界定位。
+测试任务理解和报告格式详见 `fs-meta/docs/TEST_TASK_GUIDANCE.md`。L1~L5 运行步骤详见 `fs-meta/docs/TEST_LADDER_RUNBOOK.md`。后续报告必须使用新的阶梯名称：`contracts-fast`、`single-process-closed-loop`、`runtime-local-multinode`、`nfs-environment-gate`、`real-cluster-acceptance`。报告状态必须区分 `PASS`、`FAIL_NEEDS_LOCALIZATION`、`FAIL_LOCALIZED`、`BLOCKED_BY_ENV_PREREQ`、`NOT_RUN`，不能用“基线问题”“flaky”“环境问题”替代第一失败边界定位。
 
 ## 1. 提交边界
 

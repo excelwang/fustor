@@ -392,12 +392,10 @@ fn test_unified_audit_scan_and_drift_timestamp_contracts_are_migrated_to_main_sp
     assert!(source_mod.contains("let mut backoff = Duration::from_secs(1);"));
     assert!(source_mod.contains("let max_backoff = Duration::from_secs(300);"));
     assert!(source_mod.contains("Root {} unavailable"));
-    assert!(
-        source_mod.contains("if root.spec.scan && root.is_group_primary")
-            || source_mod.contains(
-                "if root.spec.scan && Self::root_current_is_group_primary(&roots_handle, &root_key)"
-            )
-    );
+    assert!(source_mod.contains("fn root_current_is_group_primary_scan_enabled"));
+    assert!(source_mod.contains("root.active && root.is_group_primary && root.spec.scan"));
+    assert!(source_mod.contains("let current_is_group_primary_scan_enabled ="));
+    assert!(source_mod.contains("&& current_is_group_primary_scan_enabled"));
     assert!(
         source_mod.contains("if root.is_group_primary")
             || source_mod.contains("root_current_is_group_primary")

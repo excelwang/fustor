@@ -7,6 +7,9 @@ cluster-out
 fs-meta.query-keys.json
 fsmeta-demo.env
 fsmeta-demo-monitoring-roots-5group.json
+fs-meta/docs/examples/demo-env.local.sh
+fs-meta/docs/examples/*.local.env
+fs-meta/docs/examples/*monitoring-roots*.local.json
 .cargo/config.toml
 
 fs-meta.query-keys.json

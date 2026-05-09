@@ -3526,6 +3526,10 @@ fn source_status_root_ids_needing_current_owner_evidence(
             .iter()
             .filter(|root| root.logical_root_id == *root_id)
             .collect::<Vec<_>>();
+        if concrete_roots.is_empty() {
+            root_ids.insert(root_id.clone());
+            continue;
+        }
         if concrete_roots.iter().any(|root| {
             crate::query::observation::source_concrete_root_needs_current_owner_evidence(root)
         }) && !concrete_roots.iter().any(|root| {
@@ -10444,6 +10448,95 @@ mod tests {
                 .expect("sent routes lock")
                 .contains(&node_b_route),
             "missing nfs2 source status must be requested from the current source owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_status_fanin_queries_owner_for_logical_only_root() {
+        let roots = vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+        ];
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = roots.clone();
+        authoritative.grants = vec![
+            grant_for_node_root("node-a", "nfs1"),
+            grant_for_node_root("node-b", "nfs2"),
+        ];
+        set_live_group_primary_source_root(&mut authoritative, "nfs1", "node-a");
+        set_live_group_primary_source_root(&mut authoritative, "nfs2", "node-b");
+        authoritative.source_primary_by_group = BTreeMap::from([
+            ("nfs1".to_string(), "node-a::nfs1".to_string()),
+            ("nfs2".to_string(), "node-b::nfs2".to_string()),
+        ]);
+        authoritative.scheduled_source_groups_by_node = BTreeMap::from([
+            ("node-a".to_string(), vec!["nfs1".to_string()]),
+            ("node-b".to_string(), vec!["nfs2".to_string()]),
+        ]);
+        authoritative.scheduled_scan_groups_by_node =
+            authoritative.scheduled_source_groups_by_node.clone();
+
+        let mut generic_logical_only = authoritative.clone();
+        generic_logical_only
+            .status
+            .concrete_roots
+            .retain(|root| root.logical_root_id == "nfs1");
+        generic_logical_only.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-a".to_string(), vec!["nfs1".to_string()])]);
+        generic_logical_only.scheduled_scan_groups_by_node =
+            generic_logical_only.scheduled_source_groups_by_node.clone();
+
+        let mut owner_ready = authoritative.clone();
+        owner_ready
+            .status
+            .logical_roots
+            .retain(|root| root.root_id == "nfs2");
+        owner_ready
+            .status
+            .concrete_roots
+            .retain(|root| root.logical_root_id == "nfs2");
+        owner_ready
+            .source_primary_by_group
+            .retain(|root_id, _| root_id == "nfs2");
+        owner_ready.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-b".to_string(), vec!["nfs2".to_string()])]);
+        owner_ready.scheduled_scan_groups_by_node =
+            owner_ready.scheduled_source_groups_by_node.clone();
+
+        let node_b_route = source_status_request_route_for("node-b").0;
+        let boundary = Arc::new(NodeScopedSourceStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                node_b_route.clone(),
+                ("node-b".to_string(), owner_ready),
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let augmented = augment_management_status_source_with_owner_scoped_evidence(
+            generic_logical_only,
+            &authoritative,
+            Some(boundary.clone()),
+            NodeId("node-a".to_string()),
+        )
+        .await;
+
+        assert!(
+            augmented
+                .status
+                .concrete_roots
+                .iter()
+                .any(|root| root.logical_root_id == "nfs2" && root.object_ref == "node-b::nfs2"),
+            "healthy logical-root status alone must not suppress owner fan-in when the concrete source root is absent"
+        );
+        assert!(
+            boundary
+                .sent_routes
+                .lock()
+                .expect("sent routes lock")
+                .contains(&node_b_route),
+            "missing nfs2 concrete source evidence must be requested from the current source owner"
         );
     }
 

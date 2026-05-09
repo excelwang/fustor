@@ -1,152 +1,129 @@
 # fs-meta Test Matrix
 
-This matrix is organized by execution order: business functionality first,
-environment adaptation second, and operational recovery last. Operations tests
-(worker restart, upgrade, failover, handoff, and generation-skew scenarios) do
-not block the business/API/NFS baseline unless their own suite fails.
+This matrix is organized by failure-localization depth. A higher rung should
+add exactly one class of risk; it must not rediscover semantics that should have
+failed earlier.
 
-## Matrix
+## Ladder
 
-| Stage | Suite | Environment | Covers |
+| Rung | Suite | Environment | Boundary proved |
 | --- | --- | --- | --- |
-| 1 | `business-fast` | local/tmpfs/mock worker | Contracts, query, force-find, status, and management roots apply/rescan. |
-| 2 | `business-mini-nfs` | 5-node mini real NFS with about 10 files per export | Login, status, roots apply/rescan, query, force-find, and key API behavior. |
-| 3 | `environment-full-nfs` | 5-node / 5-NFS full demo validation environment | Real topology, real grants, large-data readiness, coverage mode, and degraded evidence. |
-| 4 | `operations-local` | local worker/runtime | Source/sink control, control replay, handoff, and generation-skew style runtime behavior. |
-| 5 | `operations-real-nfs` | 5-node / 5-NFS full demo validation environment | Real-runtime foundation, release upgrade, topology changes, recovery switches, and CPU budget. |
+| L1 | `contracts-fast` | local, no runtime, no real NFS | Domain contracts and pure source/sink/query semantics. |
+| L2 | `single-process-closed-loop` | local tmpfs/mock worker | Roots → source audit → sink materialization → status/query in one app boundary. |
+| L3 | `runtime-local-multinode` | local capanix runtime/worker-host | Route scope, route direction, owner fan-in, control replay, and worker handoff. |
+| L4 | `nfs-environment-gate` | mini/full real NFS | NFS mounts, grants, roots assets, bounded readiness, and data-volume tolerance. |
+| L5 | `real-cluster-acceptance` | full real cluster | Deploy/upgrade, API management, source/sink readiness, query, and resilience. |
 
-Composite suites:
+Compatibility aliases stay available while reports move to the new names:
 
-- `progressive-business` = `business-fast` + `business-mini-nfs`
-- `progressive-environment` = `progressive-business` + `environment-full-nfs`
-- `progressive-operations` = `progressive-environment` + `operations-local` + `operations-real-nfs`
+- `business-fast` = L1 + L2 compatibility bundle.
+- `business-mini-nfs` = L4 mini-NFS subgate.
+- `environment-full-nfs` = L4 full-NFS subgate.
+- `operations-local` = L3 compatibility alias.
+- `operations-real-nfs` = L5 compatibility alias; legacy 24-stage gates remain callable by name.
 
-## De-duplication and Order
+## Order
 
-Cross-environment repetition is intentional when it proves that the same core
-business capability survives a stricter environment. Same-environment
-same-semantics repetition should be avoided. The ladder order is:
+1. `contracts-fast`: catch product/spec mistakes before any runtime or NFS noise.
+2. `single-process-closed-loop`: prove the app boundary can close roots/source/sink/query locally.
+3. `runtime-local-multinode`: prove capanix route/control behavior without real-NFS variables.
+4. `nfs-environment-gate`: prove real mounts and roots assets without full operational recovery.
+5. `real-cluster-acceptance`: prove the deployed cluster is usable and resilient.
 
-1. `business-fast`: local business/API semantics.
-2. `business-mini-nfs`: the same business API closed over small real NFS data.
-3. `environment-full-nfs`: full demo environment readiness, grants, coverage,
-   and degraded evidence without replaying the complete mini business matrix.
-4. `operations-local`: local worker/runtime control semantics before real-NFS
-   operational recovery.
-5. `operations-real-nfs`: full real-NFS operations, ordered from foundational
-   runtime data paths to upgrade, topology change, recovery, then CPU budget.
+When L5 fails, do not keep repeating L5. Capture the first raw boundary, then
+drop to the lowest rung that can reproduce it.
 
-Within `operations-real-nfs`, run groups in this order:
+## L5 Acceptance Stages
 
-1. `foundation-real-runtime`: runtime proxy, worker-owned manual rescan,
-   force-find, and sink-selection basics.
-2. `upgrade-core`: generation-two apply, HTTP continuity, source/sink/runtime
-   scope, roots, stats, and tree materialization.
-3. `topology-change`: new NFS join, root path modify, retire, and upgrade-window
-   join.
-4. `recovery-switch`: sink/facade failover and activation-scope preservation.
-5. `resource-budget`: incremental steady-polling CPU budget after correctness is stable.
+`real-cluster-acceptance` has seven visible stages:
 
-L5 stage 5, `ops-visibility-sink-selection`, is intentionally exposed as one
-product gate plus seven diagnostic substages. The external L5 count stays
-`5/24`; substages print `l5_subprogress=x/7` and effective progress
-`(4 + x/7)/24` so repeated failures show their exact boundary:
+1. `preflight`: SSH/process/socket/NFS/env prerequisites are present.
+2. `deploy-upgrade`: release upgrade/deploy path applies a new generation.
+3. `management-api`: login, grants, roots preview/apply, and key management work.
+4. `source-audit`: source owners accept rescan and publish initial audit evidence.
+5. `sink-materialization`: sink owners materialize and report ready groups.
+6. `query`: `/tree`, `/stats`, and `/on-demand-force-find` return successful data-plane responses.
+7. `resilience`: restart/failover/upgrade-continuity paths keep the cluster usable.
 
-1. `ops-visibility-roots-narrowed`: management roots narrow to `nfs2`.
-2. `ops-visibility-source-delivery-ready`: source and scan routes for `nfs2`
-   are visible without requiring source audit completion or fixed file counts.
-3. `ops-visibility-manual-rescan-accepted`: manual rescan is accepted by the
-   source path.
-4. `ops-visibility-grants-visible`: visible members hold active `nfs2` grants.
-5. `ops-visibility-withdraw-converged`: withdrawn `node-d::nfs2` grant leaves
-   active grants.
-6. `ops-visibility-sink-holder-moved`: sink ownership moves away from the
-   withdrawn node.
-7. `ops-visibility-facade-live`: facade remains live after the visibility
-   change.
+Each stage prints `l5_stage=x/7` and `boundary=<name>`.
+
+Legacy 24-stage operation gates are retained for focused regression work by
+passing their existing stage names to `real-cluster-acceptance` or
+`operations-real-nfs`.
 
 ## Public Commands
 
-Use `fs-meta/docs/examples/test-matrix-commands.sh <suite>` from the repository
-root. The script intentionally exposes only the suites listed below:
+Use `fs-meta/docs/examples/test-matrix-commands.sh` from the repository root:
 
-- `business-fast`
-- `business-mini-nfs`
-- `environment-full-nfs`
-- `operations-local`
-- `operations-real-nfs`
-- `progressive-business`
-- `progressive-environment`
-- `progressive-operations`
+```bash
+fs-meta/docs/examples/test-matrix-commands.sh contracts-fast
+fs-meta/docs/examples/test-matrix-commands.sh single-process-closed-loop
+fs-meta/docs/examples/test-matrix-commands.sh runtime-local-multinode
+fs-meta/docs/examples/test-matrix-commands.sh nfs-environment-gate mini
+FSMETA_FULL_NFS_ROOTS_FILE=/path/to/roots.json \
+  fs-meta/docs/examples/test-matrix-commands.sh nfs-environment-gate full
+FSMETA_FULL_NFS_ROOTS_FILE=/path/to/roots.json \
+  fs-meta/docs/examples/test-matrix-commands.sh real-cluster-acceptance
+```
 
-Each stage prints the suite name, environment type, whether full real NFS is
-allowed, and whether operations are included.
+Composite suites:
+
+- `progressive-business` = L1 + L2.
+- `progressive-environment` = L1 + L2 + L3 + L4.
+- `progressive-operations` = L1 + L2 + L3 + L4 + L5.
 
 ## Entrypoints
 
 | Suite | Entrypoints |
 | --- | --- |
-| `business-fast` | `app_specs`, `cli_specs`, `specs_fs_meta_contract_fast`, selected-group, force-find, status-stats, and roots-put runtime tests. |
-| `business-mini-nfs` | `fs_meta_business_mini_real_nfs` |
-| `environment-full-nfs` | `fs_meta_business_query_real_nfs`, `fs_meta_environment_full_real_nfs`, then `fs_meta_environment_live_only_rescan_real_nfs` with `FSMETA_FULL_NFS_ROOTS_FILE` unset so live-only mutations use the local NFS lab instead of the full demo roots. |
-| `operations-local` | Explicit source/sink worker control tests plus `runtime_scope_e2e`. |
-| `operations-real-nfs` | Ordered L5 groups plus `fs_meta_operations_*_real_nfs` and ignored runtime component diagnostics. |
+| `contracts-fast` | app/cli/spec contract tests plus root-relative `subpath_scope` and sink scope-reset tests. |
+| `single-process-closed-loop` | local source initial audit, selected-group, force-find, status-stats, and roots-put runtime tests. |
+| `runtime-local-multinode` | source/sink worker control, sink status, and `runtime_scope_e2e`. |
+| `nfs-environment-gate mini` | `fs_meta_business_mini_real_nfs`. |
+| `nfs-environment-gate full` | full real-NFS query/environment/live-only rescan gates using `FSMETA_FULL_NFS_ROOTS_FILE`. |
+| `real-cluster-acceptance` | seven acceptance stages backed by focused real-NFS runtime/API filters. |
 
-## Responsibilities
+## Deployment Regression Mapping
 
-- `tests/e2e/test_http_api_matrix.rs` owns business/API matrix behavior only.
-- `tests/e2e/test_operational_scenarios.rs` owns operational topology and
-  recovery scenarios only.
-- `tests/e2e/test_release_upgrade.rs` owns release-upgrade scenarios, which are
-  executed through the operations layer.
+Recent real-cluster deployment failures must be caught at the lowest owner layer:
+
+| Failure class | Lowest rung | Required proof |
+| --- | --- | --- |
+| Root subpath appears as a materialized output prefix | L1 `contracts-fast` | `subpath_scope` selects the host subtree but emitted paths remain root-relative. |
+| Updating unchanged roots rebuilds unchanged materialized groups | L1 `contracts-fast` | Sink materialization resets only when the covered root scope actually changes. |
+| Source audit stays pending after roots apply | L2 `single-process-closed-loop` | Root task wakes source audit and reaches observable readiness locally. |
+| Sink is scheduled but no trusted/query evidence appears | L2 `single-process-closed-loop` | Roots → source → sink → trusted/query closes without fake visible rows. |
+| Owner status or control reply is lost across nodes | L3 `runtime-local-multinode` | Runtime routes, owner fan-in, and control replay are visible without real NFS. |
+| Full source audit depends on unpredictable file volume | L4 `nfs-environment-gate` | Environment gate reports bounded/degraded evidence, not a hard-coded file-count budget. |
+| Upgrade or failover breaks a deployed cluster | L5 `real-cluster-acceptance` | Seven-stage acceptance identifies the first real-cluster boundary. |
 
 ## Real-NFS Rules
 
 All real-NFS tests stay ignored by default. They require
-`CAPANIX_REAL_NFS_E2E=1`, a valid `CAPANIX_WORKER_HOST_BINARY`, and explicit
-`--ignored` cargo execution from the matrix script.
+`CAPANIX_REAL_NFS_E2E=1`, a valid `CAPANIX_WORKER_HOST_BINARY`, and matrix-script
+execution.
 
-If `CAPANIX_WORKER_HOST_BINARY` is unset, the matrix script resolves a sibling
-`../capanix/target/debug/capanix_worker_host` (or `.target/debug`) relative to
-the current `fustor` checkout before falling back to `PATH`.
+Concrete demo host addresses, passwords, query keys, and mount paths stay out
+of the repository. Use local env files or templates for environment-specific
+values.
 
-Full real-NFS suites must be validated against the current 5-node demo
-environment, but concrete demo host addresses stay outside the fustor main
-branch. Set `FSMETA_FULL_NFS_ROOTS_FILE` to a local demo roots asset before
-running full real-NFS suites. The matrix script verifies that the asset describes
-at least five host entries, and the full API harness emits a
-`demo_evidence_result` for `full-5node-5nfs-demo`.
-
-Full real-NFS operations must use a runtime channel budget for the full
-five-node route set plus one release-upgrade generation overlap. Mini/debug
-channel caps are valid only for smaller debug environments and must not be used
-as the `operations-real-nfs` gate.
-
-Mini NFS and full real NFS must use separate exports. Mini NFS must not reuse or
-modify full-NFS data. Full real NFS contains large data sets, so the L3
-environment baseline validates topology, artifact, source coverage, coverage
-mode, and degraded evidence without requiring synchronous full-tree sink
-materialization. Remaining sink materialization unreadiness is recorded as
-catch-up evidence; trusted materialized reads still fail closed until readiness
-covers the active roots, and strict materialized readiness remains an L5 or
-small deterministic gate.
+Mini NFS and full NFS must use separate exports. Full-NFS data volume is
+unpredictable, so L4 validates topology, grants, bounded readiness, coverage
+mode, and degraded evidence without hard-coded file-count or fixed-time
+budgets. Strict trusted materialization belongs to deterministic small gates or
+L5 acceptance.
 
 ## Root-Fix Discipline
 
-A failing suite must produce a root fix, not a workaround:
+A failing suite must report:
 
-1. Record the suite, environment, first raw error, affected domain object, and
-   observed domain state.
-2. Identify the first raw failing boundary before changing code: source, sink,
-   root authority, group authority, facade, management write path, observation
-   evidence, route, or runtime worker-host boundary.
-3. Fix the owner of that boundary. Generic runtime, worker-host, route delivery,
-   artifact loading, retry/cancel, and reusable host-fs capability issues belong
-   in capanix rather than fustor app logic.
-4. If specs are incomplete or wrong, update specs first, then source and tests.
-5. Re-run from the lowest affected stage upward.
+- `current_ladder_position`
+- `first_raw_boundary`
+- `first_raw_error`
+- `domain_state`
+- `progress_effect`
 
-Forbidden workarounds include skipped assertions, weakened semantics, unbounded
-timeouts, blind sleeps, fake readiness, cached success across changed epochs,
-demo-only production branches, test-only API behavior, and hiding missing
-metadata or management-write failures.
+Forbidden workarounds include skipped assertions, weakened semantics, fixed
+large sleeps, fake readiness, stale cached success across changed epochs,
+demo-only production branches, and hiding missing metadata or management-write
+failures.

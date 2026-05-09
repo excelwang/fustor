@@ -49,16 +49,17 @@ Run from cheapest proof to most realistic proof:
 
 | Rung | Command suite | Meaning |
 | --- | --- | --- |
-| L1 | business-fast | Local contracts, API/query behavior, force-find, status, and management roots pass. |
-| L2 | business-mini-nfs | The 5-node mini NFS topology converges on separate mini exports with about 10 files each. |
-| L3 | environment-full-nfs | Full 5-node / 5-NFS demo topology, grants, bounded readiness, coverage, and degraded evidence pass. |
-| L4 | operations-local | Local worker/runtime restart, replay, handoff, and generation-skew style behavior passes. |
-| L5 | operations-real-nfs | Full demo real-NFS failover, resource switch, retire, activation-scope, release upgrade, and CPU budget behavior pass. |
+| L1 | contracts-fast | Local product contracts, root namespace, query/auth boundary, and source/sink invariants pass without runtime or real NFS. |
+| L2 | single-process-closed-loop | Local roots → source audit → sink materialization → status/query closes inside one app boundary. |
+| L3 | runtime-local-multinode | Local capanix runtime/worker-host route scope, owner fan-in, control replay, handoff, and upgrade-scope behavior pass. |
+| L4 | nfs-environment-gate | Mini/full real-NFS prerequisites, roots assets, grants, mount permissions, bounded readiness, and data-volume tolerance pass. |
+| L5 | real-cluster-acceptance | Real cluster deploy/upgrade, management API, source audit, sink materialization, query, and resilience pass. |
 
-If L3 or L5 finishes suspiciously fast, verify that the test was not skipped,
+If L4 or L5 finishes suspiciously fast, verify that the test was not skipped,
 `--ignored` was used intentionally, the filter matched real tests,
-`CAPANIX_REAL_NFS_E2E=1` was set, and the mounted paths are the intended real
-NFS exports.
+`CAPANIX_REAL_NFS_E2E=1` was set, the roots asset was injected through
+`FSMETA_FULL_NFS_ROOTS_FILE`, and the mounted paths are the intended real NFS
+exports. L5 reports must include the 7-stage acceptance position and boundary.
 
 ## Work Log
 
