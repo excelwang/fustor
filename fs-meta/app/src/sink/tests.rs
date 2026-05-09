@@ -1937,6 +1937,147 @@ fn update_logical_roots_repartitions_groups_with_current_exports() {
 }
 
 #[test]
+fn update_logical_roots_resets_materialized_group_when_covered_scope_changes() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::exp",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+
+    let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg.clone())
+        .expect("init sink");
+    sink.ingest_stream_events(&[
+        mk_control_event(
+            "node-a::exp",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            1,
+        ),
+        mk_source_event(
+            "node-a::exp",
+            mk_record(
+                b"/old-full-root-file.txt",
+                "old-full-root-file.txt",
+                2,
+                EventKind::Update,
+            ),
+        ),
+        mk_control_event(
+            "node-a::exp",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            3,
+        ),
+    ])
+    .expect("materialize old covered scope");
+
+    let before = sink.status_snapshot().expect("status before scope change");
+    let nfs1_before = before
+        .groups
+        .iter()
+        .find(|group| group.group_id == "nfs1")
+        .expect("nfs1 before scope change");
+    assert!(
+        nfs1_before.total_nodes > 0,
+        "precondition: old scope should have materialized data: {before:?}"
+    );
+
+    let mut narrowed = RootSpec::new("nfs1", "/mnt/nfs1");
+    narrowed.subpath_scope = std::path::PathBuf::from("/smoke");
+    sink.update_logical_roots(vec![narrowed], &cfg.host_object_grants)
+        .expect("narrow covered scope");
+
+    let after = sink.status_snapshot().expect("status after scope change");
+    let nfs1_after = after
+        .groups
+        .iter()
+        .find(|group| group.group_id == "nfs1")
+        .expect("nfs1 after scope change");
+    assert_eq!(
+        nfs1_after.total_nodes, 0,
+        "changing the covered scope for the same root id must not retain stale materialized files: {after:?}"
+    );
+    assert_eq!(
+        nfs1_after.readiness,
+        GroupReadinessState::PendingMaterialization,
+        "scope reset must wait for a fresh audit before becoming trusted: {after:?}"
+    );
+}
+
+#[test]
+fn subpath_scope_materializes_root_relative_paths() {
+    let mut cfg = SourceConfig::default();
+    let mut narrowed = RootSpec::new("nfs1", "/mnt/nfs1");
+    narrowed.subpath_scope = std::path::PathBuf::from("/smoke");
+    cfg.roots = vec![narrowed.clone()];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::exp",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+
+    let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg.clone())
+        .expect("init sink");
+    sink.ingest_stream_events(&[
+        mk_control_event(
+            "node-a::exp",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            1,
+        ),
+        mk_source_event("node-a::exp", mk_record(b"/", "/", 2, EventKind::Update)),
+        mk_source_event(
+            "node-a::exp",
+            mk_record(b"/current.txt", "current.txt", 3, EventKind::Update),
+        ),
+        mk_control_event(
+            "node-a::exp",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            4,
+        ),
+    ])
+    .expect("materialize narrowed scope");
+
+    let status = sink
+        .status_snapshot()
+        .expect("status after materialization");
+    let nfs1 = status
+        .groups
+        .iter()
+        .find(|group| group.group_id == "nfs1")
+        .expect("nfs1 status");
+    assert_eq!(
+        nfs1.readiness,
+        GroupReadinessState::Ready,
+        "subpath scope selects the monitored host subtree but sink readiness is based on root-relative audit coverage: {status:?}"
+    );
+
+    let response = sink
+        .materialized_query(&materialized_tree_request(b"/", true, None))
+        .expect("query materialized tree");
+    let payload = decode_tree_payload(&response[0]);
+    assert!(
+        payload_contains_path(&payload, b"/current.txt"),
+        "records from a non-root subpath_scope must remain root-relative in the materialized tree: {payload:?}"
+    );
+}
+
+#[test]
 fn runtime_managed_sink_without_active_scope_preserves_groups_across_logical_root_update() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![
@@ -4064,6 +4205,16 @@ async fn roots_control_stream_ignores_older_declaration_after_newer_authoritativ
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+
+    assert_eq!(
+        sink.scheduled_group_ids_snapshot()
+            .expect("scheduled groups after roots-control stream"),
+        Some(std::collections::BTreeSet::from([
+            "nfs1".to_string(),
+            "nfs2".to_string()
+        ])),
+        "sink roots-control stream is the remote form of management roots apply and must make the declared roots active sink groups",
+    );
 
     sink.close().await.expect("close sink");
 }

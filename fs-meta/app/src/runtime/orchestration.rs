@@ -18,6 +18,8 @@ pub(crate) const MANUAL_RESCAN_CONTROL_FRAME_KIND: &str = "fs-meta.manual-rescan
 pub(crate) struct ManualRescanControlPayload {
     pub requested_at_us: u64,
     #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
     pub scoped_target_acceptance_timeout_ms: Option<u64>,
 }
 
@@ -26,7 +28,20 @@ pub(crate) fn encode_manual_rescan_envelope(requested_at_us: u64) -> Result<Cont
     encode_manual_rescan_envelope_with_scoped_target_acceptance_timeout(requested_at_us, None)
 }
 
+#[cfg(test)]
 pub(crate) fn encode_manual_rescan_envelope_with_scoped_target_acceptance_timeout(
+    requested_at_us: u64,
+    scoped_target_acceptance_timeout: Option<std::time::Duration>,
+) -> Result<ControlEnvelope> {
+    encode_manual_rescan_envelope_with_request_id_and_scoped_target_acceptance_timeout(
+        String::new(),
+        requested_at_us,
+        scoped_target_acceptance_timeout,
+    )
+}
+
+pub(crate) fn encode_manual_rescan_envelope_with_request_id_and_scoped_target_acceptance_timeout(
+    request_id: String,
     requested_at_us: u64,
     scoped_target_acceptance_timeout: Option<std::time::Duration>,
 ) -> Result<ControlEnvelope> {
@@ -34,6 +49,7 @@ pub(crate) fn encode_manual_rescan_envelope_with_scoped_target_acceptance_timeou
         kind: MANUAL_RESCAN_CONTROL_FRAME_KIND.to_string(),
         payload: rmp_serde::to_vec_named(&ManualRescanControlPayload {
             requested_at_us,
+            request_id,
             scoped_target_acceptance_timeout_ms: scoped_target_acceptance_timeout
                 .map(|timeout| timeout.as_millis().min(u128::from(u64::MAX)) as u64),
         })

@@ -576,6 +576,8 @@ fn worker_watch_scan_root(id: &str, path: &Path) -> source::config::RootSpec {
 fn runtime_scope_expected_groups_respects_scan_only_worker_roots() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
     let expected_groups =
         std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
@@ -21665,6 +21667,104 @@ async fn source_owned_node_scoped_source_status_route_serves_without_query_facad
             .iter()
             .any(|unit_id| unit_id.as_deref() == Some(execution_units::SOURCE_RUNTIME_UNIT_ID)),
         "node-scoped source-status requests must recv under runtime.exec.source: {recv_unit_ids:?}"
+    );
+
+    app.close().await.expect("close app");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_owned_node_scoped_status_and_rescan_routes_follow_route_liveness_not_unit_scope() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    let node_id = NodeId("node-empty-scope-source-routes".into());
+    let scoped_source_status_route = source_status_request_route_for(&node_id.0).0;
+    let scoped_source_rescan_route = source_rescan_request_route_for(&node_id.0).0;
+    let boundary = Arc::new(RuntimeProxyUnitAwareBoundary::new(
+        Some(execution_units::SOURCE_RUNTIME_UNIT_ID),
+        None,
+        None,
+        None,
+    ));
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_watch_scan_root(
+                        "nfs1",
+                        &nfs1.display().to_string(),
+                    )],
+                    host_object_grants: Vec::new(),
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            node_id.clone(),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init app"),
+    );
+
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            scoped_source_status_route.clone(),
+            &[],
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            scoped_source_rescan_route.clone(),
+            &[],
+            2,
+        ),
+    ])
+    .await
+    .expect("empty-scope source route activation should succeed");
+
+    assert!(
+        app.facade_gate
+            .route_active(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &scoped_source_status_route,
+            )
+            .expect("source-status route active check"),
+        "node-scoped source-status route should be route-active even when data scopes are empty"
+    );
+    assert!(
+        !app.facade_gate
+            .unit_state(execution_units::SOURCE_RUNTIME_UNIT_ID)
+            .expect("source unit state")
+            .expect("source unit row")
+            .0,
+        "empty data scopes should not be treated as aggregate source data ownership"
+    );
+
+    let routes = app
+        .runtime_endpoint_tasks
+        .lock()
+        .await
+        .iter()
+        .map(|task| task.route_key().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        routes.contains(&scoped_source_status_route),
+        "node-scoped source-status endpoint must follow per-route liveness, not aggregate source data ownership: {routes:?}"
+    );
+    assert!(
+        routes.contains(&scoped_source_rescan_route),
+        "node-scoped source-rescan endpoint must follow per-route liveness, not aggregate source data ownership: {routes:?}"
     );
 
     app.close().await.expect("close app");

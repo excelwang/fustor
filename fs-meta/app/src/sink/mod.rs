@@ -1356,9 +1356,23 @@ impl SinkState {
         grants: &[GrantedMountRoot],
         allowed_groups: Option<&BTreeSet<String>>,
     ) {
+        self.reconcile_host_object_grants_with_previous_roots(&[], roots, grants, allowed_groups);
+    }
+
+    pub(crate) fn reconcile_host_object_grants_with_previous_roots(
+        &mut self,
+        previous_roots: &[RootSpec],
+        roots: &[RootSpec],
+        grants: &[GrantedMountRoot],
+        allowed_groups: Option<&BTreeSet<String>>,
+    ) {
         let tombstone_policy = self.tombstone_policy;
         let mut groups = BTreeMap::<String, GroupSinkState>::new();
         let mut group_by_object_ref = HashMap::<String, String>::new();
+        let previous_roots_by_id = previous_roots
+            .iter()
+            .map(|root| (root.id.as_str(), root))
+            .collect::<HashMap<_, _>>();
         let configured_root_ids = roots
             .iter()
             .map(|root| root.id.clone())
@@ -1386,10 +1400,19 @@ impl SinkState {
             active_member_ids.sort();
             active_member_ids.dedup();
             let primary = select_primary_object_ref(&root.id, &active_member_ids, &member_ids);
-            let mut group = previous_groups
-                .remove(&root.id)
-                .or_else(|| retained_groups.remove(&root.id))
-                .unwrap_or_else(|| GroupSinkState::new(primary.clone(), tombstone_policy));
+            let materialized_scope_changed = previous_roots_by_id
+                .get(root.id.as_str())
+                .is_some_and(|previous| !root_materialized_scope_matches(previous, root));
+            let mut group = if materialized_scope_changed {
+                previous_groups.remove(&root.id);
+                retained_groups.remove(&root.id);
+                GroupSinkState::new(primary.clone(), tombstone_policy)
+            } else {
+                previous_groups
+                    .remove(&root.id)
+                    .or_else(|| retained_groups.remove(&root.id))
+                    .unwrap_or_else(|| GroupSinkState::new(primary.clone(), tombstone_policy))
+            };
             group.primary_object_ref = primary.clone();
             if allowed_groups.is_some_and(|groups| !groups.contains(&root.id)) {
                 if group.preserves_materialized_state_for_omission_window() {
@@ -1451,6 +1474,15 @@ impl SinkState {
         let is_primary = group.primary_object_ref == object_ref;
         Ok((group_id, is_primary, group))
     }
+}
+
+fn root_materialized_scope_matches(previous: &RootSpec, current: &RootSpec) -> bool {
+    previous.subpath_scope == current.subpath_scope
+        && previous.selector.mount_point == current.selector.mount_point
+        && previous.selector.fs_source == current.selector.fs_source
+        && previous.selector.fs_type == current.selector.fs_type
+        && previous.selector.host_ip == current.selector.host_ip
+        && previous.selector.host_ref == current.selector.host_ref
 }
 
 fn select_primary_object_ref(
@@ -2963,7 +2995,10 @@ impl SinkFileMeta {
                                     continue;
                                 }
                             };
-                            match sink.update_logical_roots(payload.roots, &grants) {
+                            match sink.apply_logical_roots_control_stream_declaration(
+                                payload.roots,
+                                &grants,
+                            ) {
                                 Ok(()) => {
                                     sink.mark_logical_roots_control_generation(payload.generation)
                                 }
@@ -3533,6 +3568,14 @@ impl SinkFileMeta {
         Ok(())
     }
 
+    fn apply_logical_roots_control_stream_declaration(
+        &self,
+        roots: Vec<RootSpec>,
+        host_object_grants: &[GrantedMountRoot],
+    ) -> Result<()> {
+        self.perform_update_logical_roots_with_scope_policy(roots, host_object_grants, true)
+    }
+
     fn perform_update_logical_roots_with_scope_policy(
         &self,
         roots: Vec<RootSpec>,
@@ -3569,8 +3612,14 @@ impl SinkFileMeta {
             *grants = host_object_grants.to_vec();
         }
         let allowed_groups = self.scheduled_group_ids()?;
+        let previous_root_specs = root_specs.clone();
         let mut state = self.state.write()?;
-        state.reconcile_host_object_grants(&roots, host_object_grants, allowed_groups.as_ref());
+        state.reconcile_host_object_grants_with_previous_roots(
+            &previous_root_specs,
+            &roots,
+            host_object_grants,
+            allowed_groups.as_ref(),
+        );
         *root_specs = roots;
         drop(state);
         drop(root_specs);

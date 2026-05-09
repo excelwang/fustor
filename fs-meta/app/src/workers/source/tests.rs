@@ -14051,6 +14051,147 @@ async fn nonblocking_status_observability_uses_control_cache_when_runtime_scope_
     client.close().await.expect("close source worker");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_owner_health_observability_reads_live_worker_before_control_cache() {
+    let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
+    let _count_hook_reset = SourceWorkerObservabilityCallCountHookReset;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![
+            worker_watch_scan_root("nfs1", &nfs1),
+            worker_watch_scan_root("nfs2", &nfs2),
+        ],
+        host_object_grants: vec![
+            worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+            worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode source scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    let live = client
+        .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+        .await
+        .expect("prime complete live observability snapshot");
+    client.update_cached_observability_snapshot(&live);
+    client.with_cache_mut(|cache| {
+        cache.published_batches_by_node = Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            0,
+        )]));
+        cache.published_events_by_node = Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            0,
+        )]));
+        cache.published_control_events_by_node = Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            0,
+        )]));
+        cache.published_data_events_by_node = Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            0,
+        )]));
+        cache.last_published_at_us_by_node = Some(std::collections::BTreeMap::new());
+        cache.last_published_origins_by_node = Some(std::collections::BTreeMap::new());
+        cache.published_origin_counts_by_node = Some(std::collections::BTreeMap::new());
+        cache.last_live_observability_snapshot_at = Some(
+            Instant::now()
+                - SOURCE_WORKER_NONBLOCKING_OBSERVABILITY_CACHE_TTL
+                - Duration::from_millis(50),
+        );
+    });
+
+    let observability_rpc_count = Arc::new(AtomicUsize::new(0));
+    install_source_worker_observability_call_count_hook(SourceWorkerObservabilityCallCountHook {
+        count: observability_rpc_count.clone(),
+    });
+
+    let (owner_health, used_cached_fallback) = client
+        .current_owner_health_observability_snapshot_for_status_route_with_timeout(Some(
+            Duration::from_secs(2),
+        ))
+        .await;
+
+    assert!(
+        !used_cached_fallback,
+        "current-owner health status must be live worker evidence, not ownership control-cache evidence"
+    );
+    assert_eq!(
+        observability_rpc_count.load(Ordering::Relaxed),
+        1,
+        "current-owner health status must issue a live worker read before accepting control-cache ownership"
+    );
+    assert_eq!(
+        owner_health.scheduled_source_groups_by_node.get("node-a"),
+        Some(&vec!["nfs1".to_string(), "nfs2".to_string()])
+    );
+    assert!(
+        !owner_health
+            .status
+            .degraded_roots
+            .iter()
+            .any(|(root_key, reason)| {
+                root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY
+                    && reason == SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON
+            }),
+        "live current-owner health must not carry control-cache provenance: {:?}",
+        owner_health.status.degraded_roots
+    );
+
+    client.close().await.expect("close source worker");
+}
+
 #[test]
 fn stable_status_root_health_cache_can_skip_live_refresh_after_publication() {
     let worker_socket_dir = worker_socket_tempdir();
@@ -14134,6 +14275,132 @@ fn stable_status_root_health_cache_can_skip_live_refresh_after_publication() {
         "stable cached status must keep cache provenance: {:?}",
         snapshot.status.degraded_roots
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_owner_health_observability_reads_live_worker_before_stable_status_cache() {
+    let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
+    let _count_hook_reset = SourceWorkerObservabilityCallCountHookReset;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![worker_watch_scan_root("nfs1", &nfs1)],
+        host_object_grants: vec![worker_source_export(
+            "node-a::nfs1",
+            "node-a",
+            "10.0.0.11",
+            nfs1.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+            }))
+            .expect("encode source scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    let live = client
+        .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+        .await
+        .expect("prime live observability snapshot");
+    client.update_cached_observability_snapshot(&live);
+    client.with_cache_mut(|cache| {
+        let mut cached_status = cache.status.clone().unwrap_or_default();
+        for root in &mut cached_status.concrete_roots {
+            root.rescan_pending = true;
+            root.last_rescan_requested_at_us = Some(100);
+            root.last_audit_started_at_us = None;
+            root.last_audit_completed_at_us = None;
+            root.last_audit_duration_ms = None;
+        }
+        cache.status = Some(cached_status);
+        cache.published_batches_by_node = Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            1,
+        )]));
+        cache.published_events_by_node = Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            1,
+        )]));
+        cache.last_live_observability_snapshot_at = Some(
+            Instant::now()
+                - SOURCE_WORKER_NONBLOCKING_OBSERVABILITY_CACHE_TTL
+                - Duration::from_millis(50),
+        );
+    });
+
+    let observability_rpc_count = Arc::new(AtomicUsize::new(0));
+    install_source_worker_observability_call_count_hook(SourceWorkerObservabilityCallCountHook {
+        count: observability_rpc_count.clone(),
+    });
+
+    let (owner_health, used_cached_fallback) = client
+        .current_owner_health_observability_snapshot_for_status_route_with_timeout(Some(
+            Duration::from_secs(2),
+        ))
+        .await;
+
+    assert!(
+        !used_cached_fallback,
+        "current-owner health status must not accept stable status cache before live worker evidence"
+    );
+    assert_eq!(
+        observability_rpc_count.load(Ordering::Relaxed),
+        1,
+        "current-owner health status must live-probe even when stable status cache is eligible for generic status"
+    );
+    assert!(
+        !owner_health
+            .status
+            .degraded_roots
+            .iter()
+            .any(|(root_key, reason)| {
+                root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY
+                    && reason == SOURCE_WORKER_CACHE_STATUS_REASON
+            }),
+        "live current-owner health must not carry stable-cache provenance: {:?}",
+        owner_health.status.degraded_roots
+    );
+
+    client.close().await.expect("close source worker");
 }
 
 #[test]

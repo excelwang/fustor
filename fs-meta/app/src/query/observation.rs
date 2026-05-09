@@ -16,23 +16,41 @@ fn concrete_root_counts_as_materialized_candidate(
         && !root.status.starts_with("waiting_for_root:")
 }
 
-fn source_concrete_root_blocks_materialized_observation(
+pub fn source_concrete_root_completed_current_audit(
     root: &crate::source::SourceConcreteRootHealthSnapshot,
 ) -> bool {
-    let completed_audit_covers_current_request =
-        root.last_audit_completed_at_us
-            .is_some_and(|completed_at_us| {
-                let started_at_us = root.last_audit_started_at_us.unwrap_or_default();
-                let requested_at_us = root.last_rescan_requested_at_us.unwrap_or_default();
-                completed_at_us >= started_at_us && completed_at_us >= requested_at_us
-            });
+    root.last_audit_completed_at_us
+        .is_some_and(|completed_at_us| {
+            let started_at_us = root.last_audit_started_at_us.unwrap_or_default();
+            let requested_at_us = root.last_rescan_requested_at_us.unwrap_or_default();
+            completed_at_us >= started_at_us && completed_at_us >= requested_at_us
+        })
+}
+
+pub fn source_concrete_root_has_current_owner_evidence(
+    root: &crate::source::SourceConcreteRootHealthSnapshot,
+) -> bool {
+    concrete_root_counts_as_materialized_candidate(root)
+        && source_concrete_root_completed_current_audit(root)
+}
+
+pub fn source_concrete_root_needs_current_owner_evidence(
+    root: &crate::source::SourceConcreteRootHealthSnapshot,
+) -> bool {
     let audit_inflight = root.last_audit_started_at_us.is_some_and(|started_at_us| {
         !root
             .last_audit_completed_at_us
             .is_some_and(|completed_at_us| completed_at_us >= started_at_us)
     });
     concrete_root_counts_as_materialized_candidate(root)
-        && ((root.rescan_pending && !completed_audit_covers_current_request) || audit_inflight)
+        && ((root.rescan_pending && !source_concrete_root_completed_current_audit(root))
+            || audit_inflight)
+}
+
+fn source_concrete_root_blocks_materialized_observation(
+    root: &crate::source::SourceConcreteRootHealthSnapshot,
+) -> bool {
+    source_concrete_root_needs_current_owner_evidence(root)
 }
 
 fn group_has_local_sink_presence(
@@ -47,7 +65,11 @@ fn group_has_local_sink_presence(
 }
 
 fn sink_group_has_materialized_presence(group: &crate::sink::SinkGroupStatusSnapshot) -> bool {
-    group.live_nodes > 0
+    let has_bound_primary = !group.primary_object_ref.is_empty()
+        && group.primary_object_ref != "unassigned"
+        && group.primary_object_ref != group.group_id;
+    has_bound_primary
+        || group.live_nodes > 0
         || group.total_nodes > 0
         || matches!(
             group.normalized_readiness(),

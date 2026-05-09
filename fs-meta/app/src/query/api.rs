@@ -1044,6 +1044,18 @@ pub(crate) fn manual_rescan_source_status_request_payload_with_live_probe_timeou
     .unwrap_or_else(|_| manual_rescan_source_status_request_payload())
 }
 
+pub(crate) fn current_owner_health_source_status_request_payload_with_live_probe_timeout(
+    collect_timeout: Duration,
+) -> Bytes {
+    let live_probe_timeout = source_status_live_probe_timeout_for_collect(collect_timeout);
+    rmp_serde::to_vec_named(&InternalSourceStatusRequest {
+        purpose: Some("current-owner-health".to_string()),
+        live_probe_timeout_ms: Some(duration_ms_u64(live_probe_timeout)),
+    })
+    .map(Bytes::from)
+    .unwrap_or_else(|_| internal_status_request_payload_with_live_probe_timeout(collect_timeout))
+}
+
 pub(crate) fn source_status_request_live_probe_timeout(payload: &[u8]) -> Option<Duration> {
     rmp_serde::from_slice::<InternalSourceStatusRequest>(payload)
         .ok()
@@ -1060,7 +1072,16 @@ pub(crate) fn source_status_request_requires_manual_rescan_delivery_evidence(
         .is_some_and(|purpose| purpose == "manual-rescan-delivery")
 }
 
-fn merge_source_status_snapshots(mut snapshots: Vec<SourceStatusSnapshot>) -> SourceStatusSnapshot {
+pub(crate) fn source_status_request_requires_current_owner_health_evidence(payload: &[u8]) -> bool {
+    rmp_serde::from_slice::<InternalSourceStatusRequest>(payload)
+        .ok()
+        .and_then(|request| request.purpose)
+        .is_some_and(|purpose| purpose == "current-owner-health")
+}
+
+pub(crate) fn merge_source_status_snapshots(
+    mut snapshots: Vec<SourceStatusSnapshot>,
+) -> SourceStatusSnapshot {
     if snapshots.is_empty() {
         return SourceStatusSnapshot::default();
     }
@@ -1340,6 +1361,27 @@ enum StatusRouteMachinePhase {
     Failed(RouteTerminalError),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceStatusRouteRequestKind {
+    Generic,
+    CurrentOwnerHealth,
+}
+
+impl SourceStatusRouteRequestKind {
+    fn payload(self, attempt_timeout: Duration) -> Bytes {
+        match self {
+            Self::Generic => {
+                internal_status_request_payload_with_live_probe_timeout(attempt_timeout)
+            }
+            Self::CurrentOwnerHealth => {
+                current_owner_health_source_status_request_payload_with_live_probe_timeout(
+                    attempt_timeout,
+                )
+            }
+        }
+    }
+}
+
 impl StatusRoutePlan {
     pub(crate) fn new(route_timeout: Duration, collect_idle_grace: Duration) -> Self {
         Self {
@@ -1458,6 +1500,56 @@ impl StatusRouteMachine {
         route_bindings: Arc<PostBindDispatchTable>,
         is_retryable_gap: fn(&CnxError) -> bool,
     ) -> Result<Vec<Event>, CnxError> {
+        if method == METHOD_SOURCE_STATUS {
+            return self
+                .collect_source_status_events_with_routes(
+                    boundary,
+                    origin_id,
+                    route_bindings,
+                    SourceStatusRouteRequestKind::Generic,
+                    is_retryable_gap,
+                )
+                .await;
+        }
+        self.collect_status_events_with_routes_and_payload(
+            boundary,
+            origin_id,
+            method,
+            route_bindings,
+            |_| internal_status_request_payload(),
+            is_retryable_gap,
+        )
+        .await
+    }
+
+    async fn collect_source_status_events_with_routes(
+        self,
+        boundary: Arc<dyn ChannelIoSubset>,
+        origin_id: NodeId,
+        route_bindings: Arc<PostBindDispatchTable>,
+        request_kind: SourceStatusRouteRequestKind,
+        is_retryable_gap: fn(&CnxError) -> bool,
+    ) -> Result<Vec<Event>, CnxError> {
+        self.collect_status_events_with_routes_and_payload(
+            boundary,
+            origin_id,
+            METHOD_SOURCE_STATUS,
+            route_bindings,
+            move |attempt_timeout| request_kind.payload(attempt_timeout),
+            is_retryable_gap,
+        )
+        .await
+    }
+
+    async fn collect_status_events_with_routes_and_payload(
+        self,
+        boundary: Arc<dyn ChannelIoSubset>,
+        origin_id: NodeId,
+        method: &'static str,
+        route_bindings: Arc<PostBindDispatchTable>,
+        request_payload: impl Fn(Duration) -> Bytes,
+        is_retryable_gap: fn(&CnxError) -> bool,
+    ) -> Result<Vec<Event>, CnxError> {
         let mut phase = self.entry_phase();
         loop {
             match phase {
@@ -1471,13 +1563,7 @@ impl StatusRouteMachine {
                         .call_collect(
                             ROUTE_TOKEN_FS_META_INTERNAL,
                             method,
-                            if method == METHOD_SOURCE_STATUS {
-                                internal_status_request_payload_with_live_probe_timeout(
-                                    attempt.attempt_timeout,
-                                )
-                            } else {
-                                internal_status_request_payload()
-                            },
+                            request_payload(attempt.attempt_timeout),
                             attempt.attempt_timeout,
                             attempt.collect_idle_grace,
                         )
@@ -1570,15 +1656,16 @@ async fn route_source_observability_snapshots_via_node(
     origin_id: NodeId,
     node_id: NodeId,
     plan: StatusRoutePlan,
+    request_kind: SourceStatusRouteRequestKind,
 ) -> Result<Vec<SourceObservabilitySnapshot>, CnxError> {
     let route_bindings = source_status_route_bindings_for(&node_id.0);
     let events = plan
         .machine()
-        .collect_status_events_with_routes(
+        .collect_source_status_events_with_routes(
             boundary,
             origin_id,
-            METHOD_SOURCE_STATUS,
             route_bindings,
+            request_kind,
             is_retryable_source_status_continuity_gap,
         )
         .await?;
@@ -2008,7 +2095,7 @@ fn collect_nodes_for_groups_from_schedule(
     }
 }
 
-fn missing_source_status_readiness_groups(
+fn source_status_readiness_groups_needing_current_owner_evidence(
     source_status: &SourceStatusSnapshot,
     readiness_groups: &BTreeSet<String>,
 ) -> BTreeSet<String> {
@@ -2024,7 +2111,23 @@ fn missing_source_status_readiness_groups(
             .map(|root| root.logical_root_id.clone()),
     );
     readiness_groups
-        .difference(&source_groups)
+        .iter()
+        .filter(|group| {
+            let group_id = group.as_str();
+            if !source_groups.contains(group_id) {
+                return true;
+            }
+            let group_concrete_roots = source_status
+                .concrete_roots
+                .iter()
+                .filter(|root| root.logical_root_id == group_id)
+                .collect::<Vec<_>>();
+            group_concrete_roots.iter().any(|root| {
+                crate::query::observation::source_concrete_root_needs_current_owner_evidence(root)
+            }) && !group_concrete_roots.iter().any(|root| {
+                crate::query::observation::source_concrete_root_has_current_owner_evidence(root)
+            })
+        })
         .cloned()
         .collect()
 }
@@ -2036,14 +2139,12 @@ async fn augment_routed_source_status_with_current_owner_evidence(
     plan: StatusRoutePlan,
     source_observability_snapshots: &[SourceObservabilitySnapshot],
 ) -> std::result::Result<SourceStatusSnapshot, QueryWorkerObservationFailure> {
-    if crate::query::observation::source_status_covers_readiness_groups(
-        &source_status,
-        readiness_groups,
-    ) {
-        return Ok(source_status);
-    }
-    let missing_groups = missing_source_status_readiness_groups(&source_status, readiness_groups);
-    if missing_groups.is_empty() {
+    let groups_needing_owner_evidence =
+        source_status_readiness_groups_needing_current_owner_evidence(
+            &source_status,
+            readiness_groups,
+        );
+    if groups_needing_owner_evidence.is_empty() {
         return Ok(source_status);
     }
     let Some(source) = &state.readiness_source else {
@@ -2059,10 +2160,10 @@ async fn augment_routed_source_status_with_current_owner_evidence(
     };
     let observed_candidate_nodes = current_owner_candidate_nodes_from_source_observability(
         source_observability_snapshots,
-        &missing_groups,
+        &groups_needing_owner_evidence,
     );
     let configured_candidate_nodes =
-        match current_owner_candidate_nodes_for_groups(source, &missing_groups) {
+        match current_owner_candidate_nodes_for_groups(source, &groups_needing_owner_evidence) {
             Ok(nodes) => nodes,
             Err(err) if observed_candidate_nodes.is_empty() => {
                 return Err(QueryWorkerObservationFailure::from(err));
@@ -2088,6 +2189,7 @@ async fn augment_routed_source_status_with_current_owner_evidence(
                     origin_id,
                     node_id.clone(),
                     plan,
+                    SourceStatusRouteRequestKind::CurrentOwnerHealth,
                 )
                 .await;
                 (node_id, result)
@@ -2108,10 +2210,12 @@ async fn augment_routed_source_status_with_current_owner_evidence(
             readiness_groups,
         );
         source_status = merge_source_status_snapshots(vec![source_status, filtered]);
-        if crate::query::observation::source_status_covers_readiness_groups(
+        if source_status_readiness_groups_needing_current_owner_evidence(
             &source_status,
             readiness_groups,
-        ) {
+        )
+        .is_empty()
+        {
             break;
         }
     }
@@ -2298,6 +2402,7 @@ async fn load_materialized_status_snapshots_with_failure(
         });
         merged
     };
+    let mut explicit_empty_all_active_recollect_attempted = false;
     if let QueryBackend::Route {
         boundary,
         origin_id,
@@ -2308,20 +2413,33 @@ async fn load_materialized_status_snapshots_with_failure(
             &sink_status,
             &readiness_groups,
         )
-        && let Ok(retry_snapshot) = route_sink_status_snapshot(
+    {
+        explicit_empty_all_active_recollect_attempted = true;
+        if let Ok(retry_snapshot) = route_sink_status_snapshot(
             boundary.clone(),
             origin_id.clone(),
             status_load_plan.explicit_empty_sink_recollect,
         )
         .await
-    {
-        sink_status = retry_snapshot;
+        {
+            sink_status = retry_snapshot;
+        }
     }
+    let sink_owner_evidence_plan = if explicit_empty_all_active_recollect_attempted
+        && sink_status_snapshot_reports_explicit_empty_for_all_active_readiness_groups(
+            &source_status,
+            &sink_status,
+            &readiness_groups,
+        ) {
+        status_load_plan.explicit_empty_sink_recollect
+    } else {
+        status_load_plan.sink_route
+    };
     sink_status = augment_routed_sink_status_with_current_owner_evidence(
         state,
         sink_status,
         &readiness_groups,
-        status_load_plan.sink_route,
+        sink_owner_evidence_plan,
         &routed_source_observability_snapshots,
     )
     .await?;
@@ -2362,6 +2480,18 @@ async fn load_materialized_status_snapshots_with_failure(
                     &local_sink_status,
                     &route_explicit_empty_groups,
                 );
+            let route_explicit_empty_groups_to_preserve =
+                route_explicit_empty_groups_still_present(
+                    &sink_status,
+                    &route_explicit_empty_groups,
+                )
+                .difference(&explicit_empty_groups_to_clear)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let local_sink_status = remove_sink_status_groups(
+                local_sink_status,
+                &route_explicit_empty_groups_to_preserve,
+            );
             if sink_status_snapshot_has_better_groups(&sink_status, &local_sink_status)
                 || !explicit_empty_groups_to_clear.is_empty()
             {
@@ -3013,6 +3143,39 @@ fn remove_groups_from_scheduled_map(
                 .collect::<Vec<_>>();
             (!groups.is_empty()).then_some((node_id, groups))
         })
+        .collect()
+}
+
+fn remove_sink_status_groups(
+    mut snapshot: SinkStatusSnapshot,
+    group_ids: &BTreeSet<String>,
+) -> SinkStatusSnapshot {
+    if group_ids.is_empty() {
+        return snapshot;
+    }
+    snapshot
+        .groups
+        .retain(|group| !group_ids.contains(&group.group_id));
+    snapshot.scheduled_groups_by_node =
+        remove_groups_from_scheduled_map(snapshot.scheduled_groups_by_node, group_ids);
+    recompute_sink_status_totals(snapshot)
+}
+
+fn route_explicit_empty_groups_still_present(
+    snapshot: &SinkStatusSnapshot,
+    route_explicit_empty_groups: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    if route_explicit_empty_groups.is_empty() {
+        return BTreeSet::new();
+    }
+    snapshot
+        .groups
+        .iter()
+        .filter(|group| {
+            route_explicit_empty_groups.contains(&group.group_id)
+                && fresh_sink_group_explicitly_empty(group)
+        })
+        .map(|group| group.group_id.clone())
         .collect()
 }
 

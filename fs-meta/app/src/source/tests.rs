@@ -2,7 +2,11 @@ use super::*;
 use crate::ControlEvent;
 use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
 use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID};
-use crate::runtime::orchestration::encode_logical_roots_control_payload_with_generation;
+use crate::runtime::orchestration::{
+    encode_logical_roots_control_payload_with_generation,
+    encode_manual_rescan_envelope_with_request_id_and_scoped_target_acceptance_timeout,
+    encode_manual_rescan_envelope_with_scoped_target_acceptance_timeout,
+};
 use crate::runtime::routes::{
     METHOD_SOURCE_RESCAN, METHOD_SOURCE_STATUS, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
     ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_TOKEN_FS_META_INTERNAL,
@@ -23,9 +27,23 @@ use capanix_runtime_entry_sdk::control::{
     RuntimeHostObjectType, RuntimeObjectDescriptor, RuntimeUnitTick, encode_runtime_exec_control,
     encode_runtime_host_grant_change, encode_runtime_unit_tick,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
+
+struct SlowFailingWatchProvider {
+    delay: Duration,
+}
+
+impl capanix_host_adapter_fs::HostFsWatchProvider for SlowFailingWatchProvider {
+    fn create(&self) -> std::io::Result<Box<dyn capanix_host_adapter_fs::HostFsWatch>> {
+        std::thread::sleep(self.delay);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "watch setup intentionally slow",
+        ))
+    }
+}
 
 struct NoopBoundary;
 
@@ -364,13 +382,17 @@ fn pending_root_task_handle() -> RootTaskHandle {
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let (_ready_tx, ready_rx) = tokio::sync::watch::channel(false);
-    let join = tokio::spawn(async move {
-        task_cancel.cancelled().await;
+    let (rescan_tx, _) = tokio::sync::broadcast::channel(8);
+    let join = std::thread::spawn(move || {
+        while !task_cancel.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     });
     RootTaskHandle {
         cancel,
-        join,
+        join: Some(join),
         ready_rx,
+        rescan_tx,
     }
 }
 
@@ -993,6 +1015,103 @@ async fn owner_scoped_source_rescan_endpoint_acknowledges_before_root_running() 
             .iter()
             .any(|event| event.metadata().origin_id == NodeId("node-a".to_string())),
         "scoped source rescan route must reply from the source node: {events:?}"
+    );
+
+    source.close().await.expect("close source");
+}
+
+#[tokio::test]
+async fn owner_scoped_source_rescan_endpoint_waits_for_current_roots_apply() {
+    let boundary = Arc::new(SourceLoopbackBoundary::default());
+    let mut cfg = SourceConfig::default();
+    cfg.host_object_grants = vec![test_export(
+        "node-a::nfs1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source =
+        FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), Some(boundary.clone()))
+            .expect("build source with empty roots");
+    let scope = RuntimeBoundScope {
+        scope_id: "nfs1".to_string(),
+        resource_ids: vec!["node-a::nfs1".to_string()],
+    };
+    source
+        .unit_control
+        .sync_active_scopes(SOURCE_RUNTIME_UNIT_ID, std::slice::from_ref(&scope))
+        .expect("activate source scope");
+    source
+        .unit_control
+        .sync_active_scopes(SOURCE_SCAN_RUNTIME_UNIT_ID, &[scope])
+        .expect("activate scan scope");
+    source
+        .unit_control
+        .apply_activate(
+            SOURCE_RUNTIME_UNIT_ID,
+            &crate::runtime::routes::source_rescan_request_route_for("node-a").0,
+            1,
+            &[RuntimeBoundScope {
+                scope_id: "nfs1".to_string(),
+                resource_ids: vec!["node-a::nfs1".to_string()],
+            }],
+        )
+        .expect("activate source route");
+    source
+        .unit_control
+        .apply_activate(
+            SOURCE_SCAN_RUNTIME_UNIT_ID,
+            &format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            1,
+            &[RuntimeBoundScope {
+                scope_id: "nfs1".to_string(),
+                resource_ids: vec!["node-a::nfs1".to_string()],
+            }],
+        )
+        .expect("activate scan route");
+    source
+        .start_source_rescan_request_endpoints_on_boundary(boundary.clone())
+        .expect("start source rescan endpoints");
+
+    let delayed_source = source.clone();
+    let delayed_apply = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        delayed_source
+            .update_logical_roots(vec![root("nfs1", "/mnt/nfs1")])
+            .await
+            .expect("apply delayed roots");
+    });
+
+    let envelope = encode_manual_rescan_envelope_with_scoped_target_acceptance_timeout(
+        1,
+        Some(Duration::from_millis(500)),
+    )
+    .expect("encode manual rescan envelope");
+    let payload = Bytes::from(rmp_serde::to_vec_named(&envelope).expect("serialize envelope"));
+    let adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary,
+        NodeId("node-d".to_string()),
+        source_rescan_route_bindings_for("node-a"),
+    );
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_RESCAN,
+        payload,
+        Duration::from_secs(2),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("scoped source rescan must wait for current roots apply before replying");
+    delayed_apply.await.expect("delayed roots task");
+
+    assert!(
+        events.iter().any(|event| {
+            event.metadata().origin_id == NodeId("node-a".to_string())
+                && event.payload_bytes() == b"accepted"
+        }),
+        "scoped source rescan route must accept after delayed roots apply: {events:?}"
     );
 
     source.close().await.expect("close source");
@@ -2224,6 +2343,94 @@ async fn runtime_host_object_grants_changed_survives_restart_on_shared_state_bou
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[tokio::test]
+async fn bootstrap_runtime_scope_does_not_disable_dynamic_roots() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::nfs1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+
+    let source = FSMetaSource::with_boundaries(
+        cfg,
+        NodeId("node-a".to_string()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init runtime-managed source");
+
+    source
+        .on_control_frame(&[
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: METHOD_SOURCE_ROOTS_CONTROL.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "__fsmeta_empty_roots_bootstrap".to_string(),
+                    resource_ids: vec![],
+                }],
+            }))
+            .expect("encode source bootstrap activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: METHOD_SOURCE_RESCAN.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "__fsmeta_empty_roots_bootstrap".to_string(),
+                    resource_ids: vec![],
+                }],
+            }))
+            .expect("encode scan bootstrap activate"),
+        ])
+        .await
+        .expect("apply bootstrap runtime scope");
+
+    assert!(
+        source
+            .scheduled_source_group_ids()
+            .expect("source schedule")
+            .is_none(),
+        "bootstrap control scope is not a business root schedule"
+    );
+    assert!(
+        source
+            .scheduled_scan_group_ids()
+            .expect("scan schedule")
+            .is_none(),
+        "bootstrap control scope is not a business scan schedule"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let roots = lock_or_recover(&source.state_cell.roots, "test.bootstrap_scope.roots").clone();
+        if roots.len() == 1 && roots[0].logical_root_id == "nfs1" && roots[0].is_group_primary {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "bootstrap runtime scope must keep dynamic roots runnable; roots={}",
+            roots
+                .iter()
+                .map(|root| format!(
+                    "{}:active={}:primary={}:scan={}",
+                    root.logical_root_id, root.active, root.is_group_primary, root.spec.scan
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    source.close().await.expect("close source");
 }
 
 #[tokio::test]
@@ -4191,7 +4398,7 @@ fn trigger_rescan_targets_group_primary_only() {
 }
 
 #[test]
-fn manual_rescan_requests_are_coalesced_while_one_is_pending() {
+fn manual_rescan_requests_rewake_pending_intent_until_worker_completes_it() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
     cfg.host_object_grants = vec![test_export(
@@ -4205,7 +4412,7 @@ fn manual_rescan_requests_are_coalesced_while_one_is_pending() {
         .expect("init source");
     let primary_root = lock_or_recover(
         &source.state_cell.roots,
-        "test.manual_rescan_requests_are_coalesced.roots",
+        "test.manual_rescan_requests_rewake_pending_intent.roots",
     )
     .iter()
     .find(|root| root.is_group_primary)
@@ -4217,13 +4424,17 @@ fn manual_rescan_requests_are_coalesced_while_one_is_pending() {
     FSMetaSource::request_rescan_on_primary_roots(
         std::slice::from_ref(&primary_root),
         None,
+        None,
         Some(&source.state_cell.manual_rescan_intents),
+        None,
         "manual",
     );
     FSMetaSource::request_rescan_on_primary_roots(
         std::slice::from_ref(&primary_root),
         None,
+        None,
         Some(&source.state_cell.manual_rescan_intents),
+        None,
         "manual",
     );
 
@@ -4232,14 +4443,15 @@ fn manual_rescan_requests_are_coalesced_while_one_is_pending() {
         RescanReason::Manual
     ));
     assert!(matches!(
-        rx.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        rx.try_recv()
+            .expect("second request must re-wake the pending intent"),
+        RescanReason::Manual
     ));
 
     {
         let mut intents = lock_or_recover(
             &source.state_cell.manual_rescan_intents,
-            "test.manual_rescan_requests_are_coalesced.intents",
+            "test.manual_rescan_requests_rewake_pending_intent.intents",
         );
         let entry = intents.get_mut(&root_key).expect("intent exists");
         assert_eq!(entry.requested, 2);
@@ -4250,7 +4462,9 @@ fn manual_rescan_requests_are_coalesced_while_one_is_pending() {
     FSMetaSource::request_rescan_on_primary_roots(
         std::slice::from_ref(&primary_root),
         None,
+        None,
         Some(&source.state_cell.manual_rescan_intents),
+        None,
         "manual",
     );
     assert!(matches!(
@@ -4258,6 +4472,151 @@ fn manual_rescan_requests_are_coalesced_while_one_is_pending() {
             .expect("next signal should be re-armed after completion"),
         RescanReason::Manual
     ));
+}
+
+#[tokio::test]
+async fn manual_rescan_request_wakes_durable_intent_waiters_without_broadcast_receiver() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::exp1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+        .expect("init source");
+    let primary_root = lock_or_recover(
+        &source.state_cell.roots,
+        "test.manual_rescan_request_wakes_durable_intent.roots",
+    )
+    .iter()
+    .find(|root| root.is_group_primary)
+    .cloned()
+    .expect("primary root exists");
+    let mut wake = source.manual_rescan_intent_wake.subscribe();
+
+    FSMetaSource::request_rescan_on_primary_roots(
+        std::slice::from_ref(&primary_root),
+        None,
+        None,
+        Some(&source.state_cell.manual_rescan_intents),
+        Some(&source.manual_rescan_intent_wake),
+        "manual",
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), wake.changed())
+        .await
+        .expect("manual rescan intent update must wake waiters")
+        .expect("manual rescan wake channel must stay open");
+}
+
+#[tokio::test]
+async fn manual_rescan_control_request_id_is_not_ordered_by_remote_wall_clock() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::exp1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+        .expect("init source");
+    let primary_root = lock_or_recover(
+        &source.state_cell.roots,
+        "test.manual_rescan_control_request_id.roots",
+    )
+    .iter()
+    .find(|root| root.is_group_primary)
+    .cloned()
+    .expect("primary root exists");
+    let mut rx = primary_root.rescan_tx.subscribe();
+
+    let future_clock_request =
+        encode_manual_rescan_envelope_with_request_id_and_scoped_target_acceptance_timeout(
+            "node-future:2000:1".to_string(),
+            2_000,
+            None,
+        )
+        .expect("encode future-clock request");
+    let lower_clock_request =
+        encode_manual_rescan_envelope_with_request_id_and_scoped_target_acceptance_timeout(
+            "node-current:1000:2".to_string(),
+            1_000,
+            None,
+        )
+        .expect("encode lower-clock request");
+
+    source
+        .on_control_frame(&[future_clock_request])
+        .await
+        .expect("accept future-clock request");
+    assert!(matches!(
+        rx.try_recv().expect("future-clock request should rescan"),
+        RescanReason::Manual
+    ));
+
+    source
+        .on_control_frame(std::slice::from_ref(&lower_clock_request))
+        .await
+        .expect("accept lower-clock request with distinct id");
+    assert!(matches!(
+        rx.try_recv()
+            .expect("distinct lower-clock request should rescan"),
+        RescanReason::Manual
+    ));
+
+    source
+        .on_control_frame(&[lower_clock_request])
+        .await
+        .expect("deduplicate same request id");
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn manual_rescan_signal_intent_skips_completed_intent_but_accepts_direct_signal() {
+    let intents = Arc::new(Mutex::new(HashMap::<String, ManualRescanIntent>::new()));
+    assert_eq!(
+        FSMetaSource::manual_rescan_signal_intent_for_root(&intents, "nfs1@node-a"),
+        ManualRescanSignalIntent::Direct
+    );
+    {
+        let mut guard = lock_or_recover(
+            &intents,
+            "test.manual_rescan_signal_intent_skips_completed_intent.intents",
+        );
+        guard.insert(
+            "nfs1@node-a".to_string(),
+            ManualRescanIntent {
+                requested: 2,
+                completed: 1,
+            },
+        );
+    }
+    assert_eq!(
+        FSMetaSource::manual_rescan_signal_intent_for_root(&intents, "nfs1@node-a"),
+        ManualRescanSignalIntent::Pending(2)
+    );
+    {
+        let mut guard = lock_or_recover(
+            &intents,
+            "test.manual_rescan_signal_intent_marks_completed.intents",
+        );
+        guard
+            .get_mut("nfs1@node-a")
+            .expect("intent exists")
+            .completed = 2;
+    }
+    assert_eq!(
+        FSMetaSource::manual_rescan_signal_intent_for_root(&intents, "nfs1@node-a"),
+        ManualRescanSignalIntent::AlreadyCompleted
+    );
 }
 
 #[test]
@@ -4292,6 +4651,96 @@ fn topology_reconcile_preserves_rescan_channel_for_unchanged_root() {
     assert!(matches!(preserved_rx.try_recv(), Ok(RescanReason::Manual)));
 }
 
+#[tokio::test]
+async fn rescan_signal_prefers_active_root_task_channel_when_snapshot_channel_was_rebuilt() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::exp1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+        .expect("init source");
+    let current_root = lock_or_recover(
+        &source.state_cell.roots,
+        "test.rescan_signal_prefers_active_task.roots",
+    )
+    .iter()
+    .find(|root| root.is_group_primary)
+    .cloned()
+    .expect("primary root exists");
+    let root_key = FSMetaSource::root_runtime_key(&current_root);
+    let task_rescan_tx = current_root.rescan_tx.clone();
+    let mut task_rx = task_rescan_tx.subscribe();
+    let mut rebuilt_snapshot_root = current_root.clone();
+    let (rebuilt_tx, _) = tokio::sync::broadcast::channel(16);
+    rebuilt_snapshot_root.rescan_tx = rebuilt_tx;
+    let mut rebuilt_rx = rebuilt_snapshot_root.rescan_tx.subscribe();
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let join = std::thread::spawn(move || {
+        while !task_cancel.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
+    lock_or_recover(
+        &source.state_cell.root_tasks,
+        "test.rescan_signal_prefers_active_task.root_tasks",
+    )
+    .insert(
+        root_key,
+        RootTaskEntry {
+            active: RootTaskSlot {
+                revision: 1,
+                stream_generation: 1,
+                signature: FSMetaSource::root_task_signature(&current_root),
+                handle: RootTaskHandle {
+                    cancel: cancel.clone(),
+                    join: Some(join),
+                    ready_rx,
+                    rescan_tx: task_rescan_tx,
+                },
+            },
+            candidate: None,
+        },
+    );
+
+    FSMetaSource::request_rescan_on_primary_roots(
+        std::slice::from_ref(&rebuilt_snapshot_root),
+        Some(&source.state_cell.root_tasks),
+        None,
+        Some(&source.state_cell.manual_rescan_intents),
+        None,
+        "manual",
+    );
+
+    assert!(matches!(
+        task_rx
+            .try_recv()
+            .expect("running root task channel must receive manual rescan"),
+        RescanReason::Manual
+    ));
+    assert!(matches!(
+        rebuilt_rx.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    let entry = lock_or_recover(
+        &source.state_cell.root_tasks,
+        "test.rescan_signal_prefers_active_task.cleanup",
+    )
+    .remove(&FSMetaSource::root_runtime_key(&current_root))
+    .expect("root task exists");
+    entry
+        .active
+        .handle
+        .cancel_and_join(Duration::from_secs(2))
+        .await;
+}
+
 #[test]
 fn topology_rescan_is_not_coalesced_behind_pending_manual_rescan() {
     let mut cfg = SourceConfig::default();
@@ -4318,17 +4767,23 @@ fn topology_rescan_is_not_coalesced_behind_pending_manual_rescan() {
     FSMetaSource::request_rescan_on_primary_roots(
         std::slice::from_ref(&primary_root),
         None,
+        None,
         Some(&source.state_cell.manual_rescan_intents),
+        None,
         "manual",
     );
     FSMetaSource::request_rescan_on_primary_roots(
         std::slice::from_ref(&primary_root),
         None,
+        None,
         Some(&source.state_cell.manual_rescan_intents),
+        None,
         "manual",
     );
     FSMetaSource::request_rescan_on_primary_roots(
         std::slice::from_ref(&primary_root),
+        None,
+        None,
         None,
         None,
         "topology",
@@ -4336,6 +4791,11 @@ fn topology_rescan_is_not_coalesced_behind_pending_manual_rescan() {
 
     assert!(matches!(
         rx.try_recv().expect("manual signal should be sent"),
+        RescanReason::Manual
+    ));
+    assert!(matches!(
+        rx.try_recv()
+            .expect("second manual request re-wakes the pending intent"),
         RescanReason::Manual
     ));
     assert!(matches!(
@@ -4566,7 +5026,7 @@ fn rescan_request_invalidates_previous_audit_completion_evidence() {
 }
 
 #[test]
-fn root_task_signature_ignores_group_primary_flag_changes() {
+fn root_task_signature_tracks_group_primary_flag_changes() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
     cfg.host_object_grants = vec![test_export(
@@ -4588,7 +5048,10 @@ fn root_task_signature_ignores_group_primary_flag_changes() {
 
     let before = FSMetaSource::root_task_signature(&runtime);
     let after = FSMetaSource::root_task_signature(&flipped);
-    assert_eq!(before, after);
+    assert_ne!(
+        before, after,
+        "source-primary ownership controls initial scan/audit responsibility; a task must be reconciled when that ownership changes"
+    );
 }
 
 #[test]
@@ -4745,6 +5208,227 @@ async fn pub_initial_scan_preserves_epoch_boundaries_for_each_primary_root() {
     );
 
     let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test]
+async fn slow_watch_setup_does_not_block_initial_scan_stream() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_micros();
+    let root_dir = std::env::temp_dir().join(format!("fs-meta-slow-watch-setup-{unique}"));
+    std::fs::create_dir_all(&root_dir).expect("create root dir");
+    std::fs::write(root_dir.join("seed.txt"), b"seed").expect("seed file");
+
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", root_dir.clone())];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::nfs1",
+        "node-a",
+        "10.0.0.11",
+        root_dir.clone(),
+        true,
+    )];
+    cfg.scan_workers = 1;
+    cfg.batch_size = 64;
+
+    let host_fs = Arc::new(capanix_host_adapter_fs::LocalHostFs);
+    let facade = Arc::new(capanix_host_adapter_fs::HostFsFacade::new(
+        root_dir.clone(),
+        "node-a::nfs1",
+        host_fs.clone(),
+        Arc::new(SlowFailingWatchProvider {
+            delay: Duration::from_millis(600),
+        }),
+    ));
+    let scanner_host_fs: Arc<dyn capanix_host_adapter_fs::HostFs> = facade.clone();
+    let root = RootRuntime {
+        logical_root_id: "nfs1".to_string(),
+        spec: RootSpec::new("nfs1", root_dir.clone()),
+        object_ref: "node-a::nfs1".to_string(),
+        active: true,
+        is_group_primary: true,
+        monitor_path: root_dir.clone(),
+        host_fs: facade,
+        emit_prefix: std::path::PathBuf::from("/"),
+        scanner: Arc::new(ParallelScanner::new(
+            root_dir.clone(),
+            std::path::PathBuf::from("/"),
+            cfg.scan_workers,
+            cfg.batch_size,
+            cfg.max_scan_events,
+            NodeId("node-a::nfs1".to_string()),
+            scanner_host_fs,
+        )),
+        mtime_cache: Arc::new(Mutex::new(HashMap::new())),
+        epoch_counter: Arc::new(Mutex::new(0)),
+        rescan_tx: tokio::sync::broadcast::channel(8).0,
+    };
+    let root_key = FSMetaSource::root_runtime_key(&root);
+    let roots_handle = Arc::new(Mutex::new(vec![root.clone()]));
+    let fanout_health = Arc::new(Mutex::new(FanoutHealthState::default()));
+
+    let startup_started = std::time::Instant::now();
+    let stream = FSMetaSource::root_stream(
+        cfg,
+        Arc::new(Mutex::new(DriftEstimator::new(32, 10, 1_000_000))),
+        Arc::new(LogicalClock::new()),
+        CancellationToken::new(),
+        CancellationToken::new(),
+        root,
+        false,
+        Arc::new(Sentinel::new(SentinelConfig::default())),
+        fanout_health,
+        roots_handle,
+        Arc::new(Mutex::new(HashMap::new())),
+        tokio::sync::watch::channel(0).1,
+        root_key,
+    )
+    .await
+    .expect("root stream should start");
+    assert!(
+        startup_started.elapsed() < Duration::from_millis(250),
+        "slow optional watch setup must not block source stream startup; elapsed={:?}",
+        startup_started.elapsed()
+    );
+    tokio::pin!(stream);
+
+    let mut data_events = 0_usize;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let batch = match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => break,
+            Err(_) => continue,
+        };
+        data_events += batch
+            .iter()
+            .filter(|event| rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_err())
+            .count();
+        if data_events > 0 {
+            break;
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(root_dir);
+    assert!(
+        data_events > 0,
+        "initial audit must publish data even when realtime watch setup is slow"
+    );
+}
+
+#[tokio::test]
+async fn initial_scan_waits_for_late_scan_enabled_group_primary_ownership() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_micros();
+    let root_dir = std::env::temp_dir().join(format!("fs-meta-late-primary-{unique}"));
+    std::fs::create_dir_all(&root_dir).expect("create root dir");
+    std::fs::write(root_dir.join("seed.txt"), b"seed").expect("seed file");
+
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", root_dir.clone())];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::nfs1",
+        "node-a",
+        "10.0.0.11",
+        root_dir.clone(),
+        true,
+    )];
+    cfg.scan_workers = 1;
+    cfg.batch_size = 64;
+
+    let scanner_host_fs: Arc<dyn capanix_host_adapter_fs::HostFs> =
+        Arc::new(capanix_host_adapter_fs::LocalHostFs);
+    let mut root = RootRuntime {
+        logical_root_id: "nfs1".to_string(),
+        spec: {
+            let mut spec = RootSpec::new("nfs1", root_dir.clone());
+            spec.watch = false;
+            spec.scan = false;
+            spec
+        },
+        object_ref: "node-a::nfs1".to_string(),
+        active: true,
+        is_group_primary: false,
+        monitor_path: root_dir.clone(),
+        host_fs: Arc::new(capanix_host_adapter_fs::HostFsFacade::new(
+            root_dir.clone(),
+            "node-a::nfs1",
+            Arc::new(capanix_host_adapter_fs::LocalHostFs),
+            Arc::new(capanix_host_adapter_fs::LocalHostFsWatchProvider),
+        )),
+        emit_prefix: std::path::PathBuf::from("/"),
+        scanner: Arc::new(ParallelScanner::new(
+            root_dir.clone(),
+            std::path::PathBuf::from("/"),
+            cfg.scan_workers,
+            cfg.batch_size,
+            cfg.max_scan_events,
+            NodeId("node-a::nfs1".to_string()),
+            scanner_host_fs,
+        )),
+        mtime_cache: Arc::new(Mutex::new(HashMap::new())),
+        epoch_counter: Arc::new(Mutex::new(0)),
+        rescan_tx: tokio::sync::broadcast::channel(8).0,
+    };
+    let root_key = FSMetaSource::root_runtime_key(&root);
+    let roots_handle = Arc::new(Mutex::new(vec![root.clone()]));
+    let fanout_health = Arc::new(Mutex::new(FanoutHealthState::default()));
+
+    let stream = FSMetaSource::root_stream(
+        cfg,
+        Arc::new(Mutex::new(DriftEstimator::new(32, 10, 1_000_000))),
+        Arc::new(LogicalClock::new()),
+        CancellationToken::new(),
+        CancellationToken::new(),
+        root.clone(),
+        false,
+        Arc::new(Sentinel::new(SentinelConfig::default())),
+        fanout_health,
+        roots_handle.clone(),
+        Arc::new(Mutex::new(HashMap::new())),
+        tokio::sync::watch::channel(0).1,
+        root_key,
+    )
+    .await
+    .expect("root stream should start before primary ownership is visible");
+    tokio::pin!(stream);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .is_err(),
+        "non-primary source task must not publish group audit before ownership is visible"
+    );
+
+    root.is_group_primary = true;
+    root.spec.scan = true;
+    *lock_or_recover(&roots_handle, "test.late_primary.roots") = vec![root];
+
+    let mut data_events = 0_usize;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let batch = match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => break,
+            Err(_) => continue,
+        };
+        data_events += batch
+            .iter()
+            .filter(|event| rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_err())
+            .count();
+        if data_events > 0 {
+            break;
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(root_dir);
+    assert!(
+        data_events > 0,
+        "initial audit must start after this node becomes the group-primary owner"
+    );
 }
 
 #[tokio::test]
@@ -5170,6 +5854,7 @@ async fn current_pub_stream_preserves_mixed_origin_target_membership_once_batch_
     stream_binding
         .tx
         .send(batch)
+        .await
         .expect("enqueue mixed-origin batch");
 
     let batch = tokio::time::timeout(Duration::from_millis(250), stream.next())
@@ -5241,6 +5926,7 @@ async fn current_pub_stream_surfaces_ready_later_origin_within_bounded_fairness_
         stream_binding
             .tx
             .send(batch)
+            .await
             .expect("enqueue nfs1 backlog batch");
     }
     let nfs2_batch = vec![mk_source_record_event(
@@ -5257,6 +5943,7 @@ async fn current_pub_stream_surfaces_ready_later_origin_within_bounded_fairness_
     stream_binding
         .tx
         .send(nfs2_batch)
+        .await
         .expect("enqueue nfs2 batch behind backlog");
 
     let fairness_window = 8usize;
@@ -5457,18 +6144,18 @@ async fn second_pub_stream_after_partial_root_respawn_still_yields_all_primary_r
     );
     assert_eq!(
         final_snapshot.current_stream_generation,
-        Some(2),
-        "second pub stream should advance the bound stream generation"
+        Some(1),
+        "new pub subscriptions should reuse the durable source event generation"
     );
     assert_eq!(
         final_generations.get("node-a::nfs1"),
-        Some(&Some(2)),
-        "nfs1 should be bound to the second pub stream generation: {final_generations:?}"
+        Some(&Some(1)),
+        "nfs1 should remain bound to the durable source event generation: {final_generations:?}"
     );
     assert_eq!(
         final_generations.get("node-a::nfs2"),
-        Some(&Some(2)),
-        "nfs2 should be rebound onto the second pub stream generation instead of staying on a stale sender: {final_generations:?}"
+        Some(&Some(1)),
+        "nfs2 should remain on the durable source event generation instead of a stale per-subscriber sender: {final_generations:?}"
     );
 
     let _ = std::fs::remove_dir_all(base);
@@ -5553,11 +6240,16 @@ async fn control_refresh_reconciles_missing_root_tasks_when_topology_is_unchange
         "fixture must remove the two active root tasks"
     );
     for (_, entry) in lost_tasks {
-        entry.active.handle.cancel.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(2), entry.active.handle.join).await;
+        entry
+            .active
+            .handle
+            .cancel_and_join(Duration::from_secs(2))
+            .await;
         if let Some(candidate) = entry.candidate {
-            candidate.handle.cancel.cancel();
-            let _ = tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
+            candidate
+                .handle
+                .cancel_and_join(Duration::from_secs(2))
+                .await;
         }
     }
     while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(25), stream.next()).await {}
@@ -5666,14 +6358,14 @@ async fn reconcile_root_tasks_falls_back_to_controlled_replace_when_candidate_ne
     let mut stale_signature = desired_signature.clone();
     stale_signature.watch = !desired_signature.watch;
 
-    let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<Event>>();
-    drop(out_rx);
+    let (out_tx, out_rx) = mpsc::channel::<Vec<Event>>(16);
     *lock_or_recover(
         &source.state_cell.stream_binding,
         "test.fallback.stream_binding",
     ) = Some(SourceStreamBinding {
         generation: 4,
         tx: out_tx,
+        rx: Arc::new(AsyncMutex::new(out_rx)),
     });
     source
         .state_cell

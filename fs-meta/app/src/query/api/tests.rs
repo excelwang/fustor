@@ -4,7 +4,7 @@ use crate::runtime::routes::{
     METHOD_SINK_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
     METHOD_SOURCE_STATUS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
     sink_query_request_route_for, sink_status_request_route_for, source_find_request_route_for,
-    source_find_route_bindings_for,
+    source_find_route_bindings_for, source_status_request_route_for,
 };
 use crate::sink::SinkFileMeta;
 use crate::source::FSMetaSource;

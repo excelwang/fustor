@@ -624,9 +624,17 @@
             .collect::<Vec<_>>();
         assert!(
             snapshots.iter().any(|snapshot| {
-                snapshot.groups.is_empty()
-                    && snapshot.scheduled_groups_by_node.is_empty()
+                snapshot.scheduled_groups_by_node.is_empty()
                     && snapshot.last_control_frame_signals_by_node.is_empty()
+                    && (snapshot.groups.is_empty()
+                        || snapshot.groups.iter().all(|group| {
+                            group.total_nodes == 0
+                                && group.live_nodes == 0
+                                && !matches!(
+                                    group.normalized_readiness(),
+                                    crate::sink::GroupReadinessState::Ready
+                                )
+                        }))
             }),
             "initialized inflight internal sink-status timeout must emit an explicit empty reply: {snapshots:?}"
         );

@@ -6,7 +6,7 @@ use capanix_app_sdk::runtime::NodeId;
 use capanix_host_adapter_fs::{
     ExchangeHostAdapter, HostFsFacade, PostBindDispatchTable,
     exchange_host_adapter_from_channel_boundary, local_host_fs_facade,
-    local_mount_root_host_fs_facade,
+    local_mount_root_subpath_host_fs_facade,
 };
 use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
 
@@ -22,6 +22,7 @@ pub(crate) fn exchange_host_adapter(
 
 /// Keep runtime-api boundary conversion out of business modules.
 pub(crate) fn resolve_host_fs_facade(
+    mount_root_path: PathBuf,
     root_path: PathBuf,
     _boundary: Option<Arc<dyn ChannelIoSubset>>,
     _caller_node: &NodeId,
@@ -32,7 +33,7 @@ pub(crate) fn resolve_host_fs_facade(
 ) -> io::Result<HostFsFacade> {
     let requires_mount_root_guard = host_grant_requires_mount_root_guard(fs_type, fs_source);
     if requires_mount_root_guard {
-        Ok(local_mount_root_host_fs_facade(root_path, object_ref))
+        local_mount_root_subpath_host_fs_facade(mount_root_path, root_path, object_ref)
     } else {
         Ok(local_host_fs_facade(root_path, object_ref))
     }

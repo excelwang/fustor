@@ -13,7 +13,7 @@ use capanix_runtime_entry_sdk::worker_runtime::{
     RuntimeWorkerClientFactory, TypedRuntimeWorkerClient, TypedWorkerClient, TypedWorkerInit,
 };
 use futures_util::StreamExt;
-use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::query::request::InternalQueryRequest;
 use crate::runtime::orchestration::{
@@ -52,6 +52,22 @@ const SOURCE_WORKER_MANUAL_RESCAN_DELIVERY_CACHE_REASON: &str =
     "source worker manual-rescan delivery served from app route proof";
 const SOURCE_WORKER_PENDING_SOURCE_STATE_OBSERVATION_REASON: &str =
     "source worker source state pending; delivery proof withheld";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceObservabilityStatusReadMode {
+    OwnershipFast,
+    CurrentOwnerHealth,
+}
+
+impl SourceObservabilityStatusReadMode {
+    fn can_use_control_cache_before_live_probe(self) -> bool {
+        matches!(self, Self::OwnershipFast)
+    }
+
+    fn can_use_status_cache_before_live_probe(self) -> bool {
+        matches!(self, Self::OwnershipFast)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourceProgressReason {
@@ -8132,6 +8148,7 @@ impl SourceWorkerClientHandle {
     async fn observability_snapshot_nonblocking_with_access_path(
         &self,
         live_probe_timeout: Duration,
+        read_mode: SourceObservabilityStatusReadMode,
     ) -> std::result::Result<(SourceObservabilitySnapshot, bool), SourceFailure> {
         if self.control_op_inflight() {
             if let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot() {
@@ -8152,7 +8169,8 @@ impl SourceWorkerClientHandle {
             }
             return Ok((snapshot, true));
         }
-        if self.retained_replay_required_for_status().await
+        if read_mode.can_use_control_cache_before_live_probe()
+            && self.retained_replay_required_for_status().await
             && let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot()
         {
             self.log_observability_cache_fallback(
@@ -8176,15 +8194,21 @@ impl SourceWorkerClientHandle {
             }
             return Ok((snapshot, true));
         };
-        if let Some(snapshot) = self.recent_nonblocking_observability_cache_snapshot() {
+        if read_mode.can_use_status_cache_before_live_probe()
+            && let Some(snapshot) = self.recent_nonblocking_observability_cache_snapshot()
+        {
             self.log_observability_cache_fallback("recent_live_cache", &snapshot);
             return Ok((snapshot, true));
         }
-        if let Some(snapshot) = self.stable_status_root_health_observability_cache_snapshot() {
+        if read_mode.can_use_status_cache_before_live_probe()
+            && let Some(snapshot) = self.stable_status_root_health_observability_cache_snapshot()
+        {
             self.log_observability_cache_fallback("stable_status_root_health_cache", &snapshot);
             return Ok((snapshot, true));
         }
-        if let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot() {
+        if read_mode.can_use_control_cache_before_live_probe()
+            && let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot()
+        {
             self.log_observability_cache_fallback(
                 "runtime_scope_control_cache_for_status_control_scope",
                 &snapshot,
@@ -8211,15 +8235,21 @@ impl SourceWorkerClientHandle {
             }
             return Ok((snapshot, true));
         }
-        if let Some(snapshot) = self.recent_nonblocking_observability_cache_snapshot() {
+        if read_mode.can_use_status_cache_before_live_probe()
+            && let Some(snapshot) = self.recent_nonblocking_observability_cache_snapshot()
+        {
             self.log_observability_cache_fallback("recent_live_cache", &snapshot);
             return Ok((snapshot, true));
         }
-        if let Some(snapshot) = self.stable_status_root_health_observability_cache_snapshot() {
+        if read_mode.can_use_status_cache_before_live_probe()
+            && let Some(snapshot) = self.stable_status_root_health_observability_cache_snapshot()
+        {
             self.log_observability_cache_fallback("stable_status_root_health_cache", &snapshot);
             return Ok((snapshot, true));
         }
-        if let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot() {
+        if read_mode.can_use_control_cache_before_live_probe()
+            && let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot()
+        {
             self.log_observability_cache_fallback(
                 "runtime_scope_control_cache_for_status_control_scope",
                 &snapshot,
@@ -8439,7 +8469,10 @@ impl SourceWorkerClientHandle {
         let live_probe_timeout =
             live_probe_timeout.unwrap_or(SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT);
         match self
-            .observability_snapshot_nonblocking_with_access_path(live_probe_timeout)
+            .observability_snapshot_nonblocking_with_access_path(
+                live_probe_timeout,
+                SourceObservabilityStatusReadMode::OwnershipFast,
+            )
             .await
         {
             Ok(outcome) => outcome,
@@ -8451,6 +8484,38 @@ impl SourceWorkerClientHandle {
                 if debug_control_scope_capture_enabled() {
                     eprintln!(
                         "fs_meta_source_worker_client: observability_snapshot cache_fallback node={} reason=worker_unavailable err={} {}",
+                        self.node_id.0,
+                        err.as_error(),
+                        summarize_source_observability_snapshot(&snapshot)
+                    );
+                }
+                (snapshot, true)
+            }
+        }
+    }
+
+    async fn current_owner_health_observability_snapshot_for_status_route_with_timeout(
+        &self,
+        live_probe_timeout: Option<Duration>,
+    ) -> (SourceObservabilitySnapshot, bool) {
+        let live_probe_timeout =
+            live_probe_timeout.unwrap_or(SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT);
+        match self
+            .observability_snapshot_nonblocking_with_access_path(
+                live_probe_timeout,
+                SourceObservabilityStatusReadMode::CurrentOwnerHealth,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let snapshot = self.degraded_observability_snapshot_from_cache(format!(
+                    "source worker unavailable: {}",
+                    err.as_error()
+                ));
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_source_worker_client: observability_snapshot cache_fallback node={} reason=current_owner_health_worker_unavailable err={} {}",
                         self.node_id.0,
                         err.as_error(),
                         summarize_source_observability_snapshot(&snapshot)
@@ -9735,6 +9800,22 @@ pub enum SourceFacade {
     Worker(Arc<SourceWorkerClientHandle>),
 }
 
+pub struct SourcePumpHandle {
+    shutdown: CancellationToken,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SourcePumpHandle {
+    pub(crate) fn abort(mut self) {
+        self.shutdown.cancel();
+        if let Some(join) = self.join.take()
+            && join.is_finished()
+        {
+            let _ = join.join();
+        }
+    }
+}
+
 impl FSMetaSource {
     pub(crate) fn with_boundaries_and_state_with_failure(
         config: SourceConfig,
@@ -9864,6 +9945,13 @@ impl FSMetaSource {
         (self.local_observability_snapshot(), false)
     }
 
+    pub(crate) async fn current_owner_health_observability_snapshot_for_status_route_with_timeout(
+        &self,
+        _live_probe_timeout: Option<Duration>,
+    ) -> (SourceObservabilitySnapshot, bool) {
+        (self.local_observability_snapshot(), false)
+    }
+
     pub(crate) fn lifecycle_state_label_with_failure(
         &self,
     ) -> std::result::Result<String, SourceFailure> {
@@ -9969,12 +10057,13 @@ impl SourceFacade {
         &self,
         sink: Arc<SinkFacade>,
         boundary: Option<Arc<dyn ChannelIoSubset>>,
-    ) -> std::result::Result<Option<JoinHandle<()>>, SourceFailure> {
+    ) -> std::result::Result<Option<SourcePumpHandle>, SourceFailure> {
         match self {
-            Self::Local(source) => {
-                let stream = source.pub_stream_with_failure().await?;
-                Ok(Some(spawn_local_source_pump(stream, sink, boundary)))
-            }
+            Self::Local(source) => Ok(Some(spawn_local_source_pump(
+                source.clone(),
+                sink,
+                boundary,
+            )?)),
             Self::Worker(client) => {
                 client.start_with_failure().await?;
                 Ok(None)
@@ -9987,7 +10076,7 @@ impl SourceFacade {
         &self,
         sink: Arc<SinkFacade>,
         boundary: Option<Arc<dyn ChannelIoSubset>>,
-    ) -> Result<Option<JoinHandle<()>>> {
+    ) -> Result<Option<SourcePumpHandle>> {
         self.start_with_failure(sink, boundary)
             .await
             .map_err(SourceFailure::into_error)
@@ -10521,6 +10610,27 @@ impl SourceFacade {
         }
     }
 
+    pub(crate) async fn current_owner_health_observability_snapshot_for_status_route_with_timeout(
+        &self,
+        live_probe_timeout: Option<Duration>,
+    ) -> (SourceObservabilitySnapshot, bool) {
+        match self {
+            Self::Local(source) => {
+                let _ = source
+                    .sync_logical_roots_from_authoritative_cell_if_changed()
+                    .await;
+                source.observability_snapshot_nonblocking_for_status_route()
+            }
+            Self::Worker(client) => {
+                client
+                    .current_owner_health_observability_snapshot_for_status_route_with_timeout(
+                        live_probe_timeout,
+                    )
+                    .await
+            }
+        }
+    }
+
     pub(crate) async fn source_state_pending_observability_snapshot_for_status_route(
         &self,
     ) -> (SourceObservabilitySnapshot, bool) {
@@ -10586,49 +10696,98 @@ impl SourceFacade {
     }
 }
 
-fn spawn_local_source_pump(
+async fn run_local_source_pump(
     stream: std::pin::Pin<Box<dyn futures_core::Stream<Item = Vec<Event>> + Send>>,
     sink: Arc<SinkFacade>,
     boundary: Option<Arc<dyn ChannelIoSubset>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Some(boundary) = boundary {
-            tokio::pin!(stream);
-            while let Some(batch) = stream.next().await {
-                let origin = batch
-                    .first()
-                    .map(|event| event.metadata().origin_id.0.clone())
-                    .unwrap_or_else(|| "__empty__".to_string());
-                if let Err(err) = boundary
-                    .channel_send(
-                        BoundaryContext::default(),
-                        ChannelSendRequest {
-                            channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
-                            events: batch,
-                            timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
-                        },
-                    )
-                    .await
-                {
-                    log::error!(
-                        "fs-meta app pump failed to publish source batch on stream route origin={}: {:?}",
-                        origin,
-                        err
-                    );
-                    break;
-                }
-            }
-        } else {
-            tokio::pin!(stream);
-            while let Some(batch) = stream.next().await {
-                if let Err(err) = sink.send_with_failure(&batch).await {
-                    log::error!(
-                        "fs-meta app pump failed to apply batch: {:?}",
-                        err.as_error()
-                    );
-                }
+) {
+    if let Some(boundary) = boundary {
+        tokio::pin!(stream);
+        while let Some(batch) = stream.next().await {
+            let origin = batch
+                .first()
+                .map(|event| event.metadata().origin_id.0.clone())
+                .unwrap_or_else(|| "__empty__".to_string());
+            if let Err(err) = boundary
+                .channel_send(
+                    BoundaryContext::default(),
+                    ChannelSendRequest {
+                        channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
+                        events: batch,
+                        timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
+                    },
+                )
+                .await
+            {
+                log::error!(
+                    "fs-meta app pump failed to publish source batch on stream route origin={}: {:?}",
+                    origin,
+                    err
+                );
+                break;
             }
         }
+    } else {
+        tokio::pin!(stream);
+        while let Some(batch) = stream.next().await {
+            if let Err(err) = sink.send_with_failure(&batch).await {
+                log::error!(
+                    "fs-meta app pump failed to apply batch: {:?}",
+                    err.as_error()
+                );
+            }
+        }
+    }
+}
+
+fn spawn_local_source_pump(
+    source: Arc<FSMetaSource>,
+    sink: Arc<SinkFacade>,
+    boundary: Option<Arc<dyn ChannelIoSubset>>,
+) -> std::result::Result<SourcePumpHandle, SourceFailure> {
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let join = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build fs-meta source pump runtime")
+            .block_on(async move {
+                let stream = match source.pub_stream_with_failure().await {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(err));
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(Ok(()));
+                tokio::select! {
+                    _ = task_shutdown.cancelled() => {}
+                    _ = run_local_source_pump(stream, sink, boundary) => {}
+                }
+            })
+    });
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            if join.is_finished() {
+                let _ = join.join();
+            }
+            return Err(err);
+        }
+        Err(err) => {
+            if join.is_finished() {
+                let _ = join.join();
+            }
+            return Err(SourceFailure::from(CnxError::Internal(format!(
+                "source pump startup channel closed: {err}"
+            ))));
+        }
+    }
+    Ok(SourcePumpHandle {
+        shutdown,
+        join: Some(join),
     })
 }
 

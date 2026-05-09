@@ -145,6 +145,7 @@ struct SessionLoginResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProductConfig {
     api: ProductApiConfig,
     #[serde(default)]
@@ -721,7 +722,8 @@ fn prepare_state_dir(base: Option<&Path>, leaf: &str) -> anyhow::Result<PathBuf>
         .unwrap_or_else(|| PathBuf::from("."));
     let dir = root.join(leaf);
     fs::create_dir_all(&dir)?;
-    Ok(dir)
+    dir.canonicalize()
+        .with_context(|| format!("canonicalize state dir {} failed", dir.display()))
 }
 
 fn resolve_fs_meta_runtime_inputs() -> anyhow::Result<(PathBuf, PathBuf)> {
@@ -1033,10 +1035,12 @@ fn write_runtime_admin_temp_file(
 mod tests {
     use super::{
         ProductAuthConfig, build_auth_config, build_deploy_intent,
-        derive_route_plan_node_ids_from_config_dump, load_product_config, workspace_root,
+        derive_route_plan_node_ids_from_config_dump, load_product_config, prepare_state_dir,
+        workspace_root,
     };
     use serde_json::json;
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1069,6 +1073,24 @@ mod tests {
                 .expect("bootstrap management")
                 .username,
             "admin"
+        );
+    }
+
+    #[test]
+    fn product_config_rejects_business_roots_in_deploy_config() {
+        let path = unique_temp_path("roots-in-deploy-config");
+        fs::write(
+            &path,
+            "api:\n  facade_resource_id: fs-meta-tcp-listener\nroots:\n  - id: nfs1\n    selector:\n      host_ip: 10.0.0.11\n      mount_point: /mnt/nfs1\n",
+        )
+        .expect("write config with roots");
+
+        let err = load_product_config(&path).expect_err("deploy config must reject roots");
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            format!("{err:?}").contains("unknown field `roots`"),
+            "deploy config should fail explicitly instead of silently dropping roots: {err:?}"
         );
     }
 
@@ -1196,6 +1218,26 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_state_dir_returns_absolute_path_for_relative_deploy_config() {
+        let cwd = std::env::current_dir().expect("current dir");
+        let relative = Path::new(".");
+        let state_dir =
+            prepare_state_dir(Some(relative), ".fsmeta-state").expect("prepare state dir");
+
+        assert!(
+            state_dir.is_absolute(),
+            "deploy-generated manifest paths must be absolute so daemon-side runtime discovery does not depend on the fsmeta CLI working directory; state_dir={}",
+            state_dir.display()
+        );
+
+        let expected = cwd
+            .join(".fsmeta-state")
+            .canonicalize()
+            .expect("canonical state dir");
+        assert_eq!(state_dir, expected);
     }
 
     #[test]

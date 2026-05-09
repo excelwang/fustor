@@ -25,7 +25,7 @@ use bytes::Bytes;
 
 use futures_core::Stream;
 use futures_util::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -55,7 +55,9 @@ use crate::FileMetaRecord;
 use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNITS};
 use crate::runtime::orchestration::{
     MANUAL_RESCAN_CONTROL_FRAME_KIND, ManualRescanControlPayload, SourceControlSignal,
-    SourceRuntimeUnit, decode_logical_roots_control_payload, source_control_signals_from_envelopes,
+    SourceRuntimeUnit, decode_logical_roots_control_payload,
+    manual_rescan_scoped_target_acceptance_timeout_from_payload,
+    source_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{
     METHOD_SOURCE_RESCAN, METHOD_SOURCE_RESCAN_CONTROL, METHOD_SOURCE_ROOTS_CONTROL,
@@ -75,6 +77,8 @@ use crate::workers::source::SourceControlState;
 
 #[cfg(test)]
 use crate::runtime::routes::ROUTE_KEY_QUERY;
+
+const MANUAL_RESCAN_SEEN_REQUEST_IDS_LIMIT: usize = 256;
 
 fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -167,6 +171,10 @@ fn lock_or_recover<'a, T>(m: &'a Mutex<T>, context: &str) -> MutexGuard<'a, T> {
 
 fn debug_control_scope_capture_enabled() -> bool {
     std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
+}
+
+fn debug_source_root_task_enabled() -> bool {
+    std::env::var_os("FSMETA_DEBUG_SOURCE_ROOT_TASK").is_some()
 }
 
 fn debug_stream_path_capture_target() -> Option<Vec<u8>> {
@@ -722,6 +730,8 @@ pub struct FSMetaSource {
     manual_rescan_signal: SignalCell,
     /// Background watcher that fans cluster manual-rescan requests into local primary roots.
     manual_rescan_watch_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Stateful wakeup for durable manual-rescan intents that may outlive a best-effort signal.
+    manual_rescan_intent_wake: watch::Sender<u64>,
     /// Monotonic runtime host-object-grants version guard.
     host_object_grants_version: Arc<AtomicU64>,
     /// Runtime control gating snapshot keyed by unit id.
@@ -740,6 +750,8 @@ pub struct FSMetaSource {
     last_control_frame_signals: Arc<Mutex<Vec<String>>>,
     /// Highest manual-rescan control request timestamp accepted from runtime control streams.
     manual_rescan_control_high_watermark_us: Arc<AtomicU64>,
+    /// Recently accepted manual-rescan request identities.
+    manual_rescan_control_seen_request_ids: Arc<Mutex<VecDeque<String>>>,
     /// Canonical retained source control state for local/runtime replay.
     control_state: Arc<tokio::sync::Mutex<SourceControlState>>,
     /// Coalesced runtime-topology refresh trigger.
@@ -770,16 +782,49 @@ struct RootRuntime {
     rescan_tx: tokio::sync::broadcast::Sender<RescanReason>,
 }
 
+type SharedWatchManager = Arc<Mutex<WatchManager>>;
+type WatchManagerSlot = Arc<Mutex<Option<SharedWatchManager>>>;
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ManualRescanIntent {
     requested: u64,
     completed: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualRescanSignalIntent {
+    Direct,
+    Pending(u64),
+    AlreadyCompleted,
+}
+
 struct RootTaskHandle {
     cancel: CancellationToken,
-    join: JoinHandle<()>,
+    join: Option<std::thread::JoinHandle<()>>,
     ready_rx: tokio::sync::watch::Receiver<bool>,
+    rescan_tx: tokio::sync::broadcast::Sender<RescanReason>,
+}
+
+impl RootTaskHandle {
+    fn is_finished(&self) -> bool {
+        self.join.as_ref().is_some_and(|join| join.is_finished())
+    }
+
+    async fn cancel_and_join(mut self, timeout: Duration) {
+        self.cancel.cancel();
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !join.is_finished() {
+            if tokio::time::Instant::now() >= deadline {
+                log::warn!("source root task did not exit within {:?}", timeout);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = join.join();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -788,6 +833,7 @@ struct RootTaskSignature {
     object_ref: String,
     monitor_path: std::path::PathBuf,
     emit_prefix: std::path::PathBuf,
+    is_group_primary: bool,
     watch: bool,
     scan: bool,
     audit_interval_ms: Option<u64>,
@@ -814,7 +860,8 @@ struct RootTaskEntry {
 #[derive(Clone)]
 struct SourceStreamBinding {
     generation: u64,
-    tx: mpsc::UnboundedSender<Vec<Event>>,
+    tx: mpsc::Sender<Vec<Event>>,
+    rx: Arc<AsyncMutex<mpsc::Receiver<Vec<Event>>>>,
 }
 
 struct RootTaskReplacementFallback {
@@ -1345,8 +1392,10 @@ impl FSMetaSource {
                     .clone();
                     FSMetaSource::request_rescan_on_primary_roots(
                         &roots_snapshot,
+                        Some(&self.state_cell.root_tasks),
                         Some(&self.state_cell.fanout_health),
                         Some(&self.state_cell.manual_rescan_intents),
+                        Some(&self.manual_rescan_intent_wake),
                         "manual",
                     );
                 }
@@ -1549,11 +1598,19 @@ impl FSMetaSource {
         }
         let groups = match self.unit_control.unit_state(unit.unit_id())? {
             Some((true, rows)) => {
-                let active_groups = rows
+                let logical_roots = self.logical_roots_snapshot();
+                let logical_root_ids = logical_roots
                     .iter()
+                    .map(|root| root.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let active_root_groups = rows
+                    .iter()
+                    .filter(|row| logical_root_ids.contains(row.scope_id.as_str()))
                     .map(|row| row.scope_id.clone())
                     .collect::<BTreeSet<_>>();
-                let logical_roots = self.logical_roots_snapshot();
+                if !rows.is_empty() && active_root_groups.is_empty() {
+                    return Ok(None);
+                }
                 let host_object_grants = self.host_object_grants_snapshot();
                 let runnable_local_groups = logical_roots
                     .iter()
@@ -1571,7 +1628,7 @@ impl FSMetaSource {
                     })
                     .map(|root| root.id.clone())
                     .collect::<BTreeSet<_>>();
-                active_groups
+                active_root_groups
                     .intersection(&runnable_local_groups)
                     .cloned()
                     .collect::<BTreeSet<_>>()
@@ -1679,7 +1736,9 @@ impl FSMetaSource {
         let roots = lock_or_recover(&self.state_cell.roots, "source.topology_rescan.roots").clone();
         Self::request_rescan_on_primary_roots(
             &roots,
+            Some(&self.state_cell.root_tasks),
             Some(&self.state_cell.fanout_health),
+            None,
             None,
             "topology",
         );
@@ -1735,8 +1794,9 @@ impl FSMetaSource {
                 concrete.id = format!("{}@{}", root.id, member.object_ref);
                 concrete.watch = root.watch && source_scheduled;
                 concrete.scan = root.scan && scan_scheduled;
-                let emit_prefix = root.subpath_scope.clone();
+                let emit_prefix = std::path::PathBuf::from("/");
                 let host_fs = match resolve_host_fs_facade(
+                    member.mount_point.clone(),
                     monitor_path.clone(),
                     boundary.clone(),
                     node_id,
@@ -1854,6 +1914,7 @@ impl FSMetaSource {
             object_ref: root.object_ref.clone(),
             monitor_path: root.monitor_path.clone(),
             emit_prefix: root.emit_prefix.clone(),
+            is_group_primary: root.is_group_primary,
             watch: root.spec.watch,
             scan: root.spec.scan,
             audit_interval_ms: root.spec.audit_interval_ms,
@@ -1935,11 +1996,11 @@ impl FSMetaSource {
             let Some(entry) = tasks.get(&key) else {
                 return true;
             };
-            if entry.active.signature != signature || entry.active.handle.join.is_finished() {
+            if entry.active.signature != signature || entry.active.handle.is_finished() {
                 return true;
             }
             if entry.candidate.as_ref().is_some_and(|candidate| {
-                candidate.signature != signature || candidate.handle.join.is_finished()
+                candidate.signature != signature || candidate.handle.is_finished()
             }) {
                 return true;
             }
@@ -1955,6 +2016,16 @@ impl FSMetaSource {
             .iter()
             .find(|root| Self::root_runtime_key(root) == root_key)
             .is_some_and(|root| root.active && root.is_group_primary)
+    }
+
+    fn root_current_is_group_primary_scan_enabled(
+        roots_handle: &Arc<Mutex<Vec<RootRuntime>>>,
+        root_key: &str,
+    ) -> bool {
+        lock_or_recover(roots_handle, "source.root.current_primary_scan")
+            .iter()
+            .find(|root| Self::root_runtime_key(root) == root_key)
+            .is_some_and(|root| root.active && root.is_group_primary && root.spec.scan)
     }
 
     async fn wait_for_task_handles_ready(
@@ -1989,8 +2060,7 @@ impl FSMetaSource {
             slot.stream_generation,
             "draining",
         );
-        slot.handle.cancel.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(2), slot.handle.join).await;
+        slot.handle.cancel_and_join(Duration::from_secs(2)).await;
         Self::finish_root_task_draining(
             fanout_health,
             root_key,
@@ -1998,25 +2068,6 @@ impl FSMetaSource {
             slot.stream_generation,
             retired,
         );
-    }
-
-    async fn restart_root_tasks_for_current_stream(&self) {
-        let existing = {
-            let mut tasks = lock_or_recover(
-                &self.state_cell.root_tasks,
-                "source.restart_root_tasks_for_current_stream",
-            );
-            tasks.drain().collect::<Vec<_>>()
-        };
-        for (key, entry) in existing {
-            Self::cancel_root_task_slot(&self.state_cell.fanout_health, &key, entry.active, true)
-                .await;
-            if let Some(candidate) = entry.candidate {
-                candidate.handle.cancel.cancel();
-                let _ = tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
-                Self::clear_root_task_candidate_health(&self.state_cell.fanout_health, &key);
-            }
-        }
     }
 
     fn close_rescan_channels(rescan_channel_open: &mut bool, periodic_channel_open: &mut bool) {
@@ -2549,8 +2600,10 @@ impl FSMetaSource {
 
     fn request_rescan_on_primary_roots(
         roots: &[RootRuntime],
+        root_tasks: Option<&Arc<Mutex<HashMap<String, RootTaskEntry>>>>,
         fanout_health: Option<&Arc<Mutex<FanoutHealthState>>>,
         manual_rescan_intents: Option<&Arc<Mutex<HashMap<String, ManualRescanIntent>>>>,
+        manual_rescan_intent_wake: Option<&watch::Sender<u64>>,
         reason: &str,
     ) {
         let signal_root_keys = Self::record_rescan_intent_on_primary_roots(
@@ -2559,7 +2612,53 @@ impl FSMetaSource {
             manual_rescan_intents,
             reason,
         );
-        Self::signal_rescan_on_primary_root_keys(roots, &signal_root_keys);
+        if reason == "manual" && !signal_root_keys.is_empty() {
+            if let Some(wake) = manual_rescan_intent_wake {
+                Self::wake_manual_rescan_intents(wake);
+            }
+        }
+        Self::signal_rescan_on_primary_root_keys(roots, root_tasks, &signal_root_keys);
+    }
+
+    fn wake_manual_rescan_intents(wake: &watch::Sender<u64>) {
+        let next = wake.borrow().saturating_add(1);
+        let _ = wake.send(next);
+    }
+
+    fn source_primary_scan_root_keys(roots: &[RootRuntime]) -> Vec<String> {
+        roots
+            .iter()
+            .filter(|root| root.active && root.is_group_primary && root.spec.scan)
+            .map(Self::root_runtime_key)
+            .collect::<Vec<_>>()
+    }
+
+    async fn wait_for_source_primary_scan_roots(
+        roots: Arc<Mutex<Vec<RootRuntime>>>,
+        timeout: Option<Duration>,
+    ) -> Vec<RootRuntime> {
+        let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+        loop {
+            let snapshot =
+                lock_or_recover(&roots, "source.rescan.scoped_endpoint.roots.expected").clone();
+            if !Self::source_primary_scan_root_keys(&snapshot).is_empty() {
+                return snapshot;
+            }
+            let Some(deadline) = deadline else {
+                return snapshot;
+            };
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return snapshot;
+            }
+            tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
+        }
+    }
+
+    fn scoped_rescan_acceptance_timeout(requests: &[Event]) -> Option<Duration> {
+        requests.first().and_then(|request| {
+            manual_rescan_scoped_target_acceptance_timeout_from_payload(request.payload_bytes())
+        })
     }
 
     fn record_rescan_intent_on_primary_roots(
@@ -2582,11 +2681,8 @@ impl FSMetaSource {
             {
                 let mut intents = lock_or_recover(intents, "source.manual_rescan_intents.queue");
                 let entry = intents.entry(root_key).or_default();
-                let should_signal = entry.requested <= entry.completed;
                 entry.requested = entry.requested.saturating_add(1);
-                if should_signal {
-                    signal_root_keys.insert(Self::root_runtime_key(root));
-                }
+                signal_root_keys.insert(Self::root_runtime_key(root));
             } else {
                 signal_root_keys.insert(Self::root_runtime_key(root));
             }
@@ -2596,19 +2692,55 @@ impl FSMetaSource {
 
     fn signal_rescan_on_primary_root_keys(
         roots: &[RootRuntime],
+        root_tasks: Option<&Arc<Mutex<HashMap<String, RootTaskEntry>>>>,
         root_keys: &std::collections::BTreeSet<String>,
     ) {
         if root_keys.is_empty() {
             return;
+        }
+        let mut signaled = std::collections::BTreeSet::new();
+        if let Some(root_tasks) = root_tasks {
+            let tasks = lock_or_recover(root_tasks, "source.rescan.signal.root_tasks");
+            for root_key in root_keys {
+                let Some(entry) = tasks.get(root_key) else {
+                    continue;
+                };
+                if entry
+                    .active
+                    .handle
+                    .rescan_tx
+                    .send(RescanReason::Manual)
+                    .is_ok()
+                {
+                    signaled.insert(root_key.clone());
+                }
+            }
         }
         for root in roots {
             if !root.is_group_primary {
                 continue;
             }
             let root_key = Self::root_runtime_key(root);
-            if root_keys.contains(&root_key) {
+            if root_keys.contains(&root_key) && !signaled.contains(&root_key) {
                 let _ = root.rescan_tx.send(RescanReason::Manual);
             }
+        }
+    }
+
+    fn manual_rescan_signal_intent_for_root(
+        manual_rescan_intents: &Arc<Mutex<HashMap<String, ManualRescanIntent>>>,
+        root_key: &str,
+    ) -> ManualRescanSignalIntent {
+        let intents = lock_or_recover(
+            manual_rescan_intents,
+            "source.root.manual_rescan_intents.signal_intent",
+        );
+        match intents.get(root_key) {
+            Some(intent) if intent.requested > intent.completed => {
+                ManualRescanSignalIntent::Pending(intent.requested)
+            }
+            Some(_) => ManualRescanSignalIntent::AlreadyCompleted,
+            None => ManualRescanSignalIntent::Direct,
         }
     }
 
@@ -2750,6 +2882,7 @@ impl FSMetaSource {
             ),
             manual_rescan_signal,
             manual_rescan_watch_task: Arc::new(Mutex::new(None)),
+            manual_rescan_intent_wake: watch::channel(0).0,
             host_object_grants_version: Arc::new(AtomicU64::new(
                 initial_host_object_grants_version,
             )),
@@ -2761,6 +2894,7 @@ impl FSMetaSource {
             force_find_last_runner: Arc::new(Mutex::new(BTreeMap::new())),
             last_control_frame_signals: Arc::new(Mutex::new(Vec::new())),
             manual_rescan_control_high_watermark_us: Arc::new(AtomicU64::new(0)),
+            manual_rescan_control_seen_request_ids: Arc::new(Mutex::new(VecDeque::new())),
             control_state: Arc::new(tokio::sync::Mutex::new(SourceControlState::default())),
             runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
             runtime_refresh_rescan: Arc::new(AtomicBool::new(false)),
@@ -3002,8 +3136,10 @@ impl FSMetaSource {
         boundary: Arc<dyn ChannelIoSubset>,
     ) -> Result<()> {
         let rescan_roots = self.state_cell.roots_handle();
+        let rescan_root_tasks = self.state_cell.root_tasks.clone();
         let rescan_fanout_health = self.state_cell.fanout_health_handle();
         let rescan_manual_intents = self.state_cell.manual_rescan_intents_handle();
+        let rescan_manual_wake = self.manual_rescan_intent_wake.clone();
         let node_id_rescan = self.node_id.clone();
         let routes = source_find_route_bindings_for(&self.node_id.0);
 
@@ -3021,8 +3157,10 @@ impl FSMetaSource {
                     node_id_rescan.0
                 );
                 let rescan_roots_for_handler = rescan_roots.clone();
+                let rescan_root_tasks_for_handler = rescan_root_tasks.clone();
                 let rescan_fanout_health_for_handler = rescan_fanout_health.clone();
                 let rescan_manual_intents_for_handler = rescan_manual_intents.clone();
+                let rescan_manual_wake_for_handler = rescan_manual_wake.clone();
                 let endpoint_task = ManagedEndpointTask::spawn_with_unit(
                     boundary.clone(),
                     route,
@@ -3035,8 +3173,10 @@ impl FSMetaSource {
                     move |requests| {
                         let node_id_rescan = node_id_rescan.clone();
                         let rescan_roots = rescan_roots_for_handler.clone();
+                        let rescan_root_tasks = rescan_root_tasks_for_handler.clone();
                         let rescan_fanout_health = rescan_fanout_health_for_handler.clone();
                         let rescan_manual_intents = rescan_manual_intents_for_handler.clone();
+                        let rescan_manual_wake = rescan_manual_wake_for_handler.clone();
                         async move {
                             eprintln!(
                                 "fs_meta_source: source.rescan endpoint start node={} requests={}",
@@ -3058,8 +3198,10 @@ impl FSMetaSource {
                             .clone();
                             FSMetaSource::request_rescan_on_primary_roots(
                                 &roots_snapshot,
+                                Some(&rescan_root_tasks),
                                 Some(&rescan_fanout_health),
                                 Some(&rescan_manual_intents),
+                                Some(&rescan_manual_wake),
                                 "manual",
                             );
                             eprintln!(
@@ -3110,8 +3252,10 @@ impl FSMetaSource {
         ) {
             let node_id_rescan_scoped = self.node_id.clone();
             let rescan_roots_scoped = self.state_cell.roots_handle();
+            let rescan_root_tasks_scoped = rescan_root_tasks.clone();
             let rescan_fanout_health_scoped = rescan_fanout_health.clone();
             let rescan_manual_intents_scoped = rescan_manual_intents.clone();
+            let rescan_manual_wake_scoped = rescan_manual_wake.clone();
             log::info!(
                 "bound route listening on {} for deferred source {}",
                 scoped_route.0,
@@ -3126,24 +3270,24 @@ impl FSMetaSource {
                 move |requests| {
                     let node_id_rescan_scoped = node_id_rescan_scoped.clone();
                     let rescan_roots_scoped = rescan_roots_scoped.clone();
+                    let rescan_root_tasks_scoped = rescan_root_tasks_scoped.clone();
                     let rescan_fanout_health_scoped = rescan_fanout_health_scoped.clone();
                     let rescan_manual_intents_scoped = rescan_manual_intents_scoped.clone();
+                    let rescan_manual_wake_scoped = rescan_manual_wake_scoped.clone();
                     async move {
                         eprintln!(
                             "fs_meta_source: source.rescan scoped endpoint start node={} requests={}",
                             node_id_rescan_scoped.0,
                             requests.len()
                         );
-                        let roots_snapshot = lock_or_recover(
-                            &rescan_roots_scoped,
-                            "source.rescan.scoped_endpoint.roots.expected",
+                        let acceptance_timeout =
+                            FSMetaSource::scoped_rescan_acceptance_timeout(&requests);
+                        let roots_snapshot = FSMetaSource::wait_for_source_primary_scan_roots(
+                            rescan_roots_scoped.clone(),
+                            acceptance_timeout,
                         )
-                        .clone();
-                        let expected = roots_snapshot
-                            .iter()
-                            .filter(|root| root.active && root.is_group_primary && root.spec.scan)
-                            .map(FSMetaSource::root_runtime_key)
-                            .collect::<Vec<_>>();
+                        .await;
+                        let expected = FSMetaSource::source_primary_scan_root_keys(&roots_snapshot);
                         let payload = if expected.is_empty() {
                             eprintln!(
                                 "fs_meta_source: source.rescan scoped endpoint rejected node={} reason=no-local-source-primary-scan-root",
@@ -3155,8 +3299,10 @@ impl FSMetaSource {
                         } else {
                             FSMetaSource::request_rescan_on_primary_roots(
                                 &roots_snapshot,
+                                Some(&rescan_root_tasks_scoped),
                                 Some(&rescan_fanout_health_scoped),
                                 Some(&rescan_manual_intents_scoped),
+                                Some(&rescan_manual_wake_scoped),
                                 "manual",
                             );
                             eprintln!(
@@ -3241,7 +3387,33 @@ impl FSMetaSource {
                             req.payload_bytes(),
                         )
                     });
-                    let snapshot = if manual_rescan_delivery_evidence {
+                    let current_owner_health_evidence = requests.iter().any(|req| {
+                        crate::query::api::source_status_request_requires_current_owner_health_evidence(
+                            req.payload_bytes(),
+                        )
+                    });
+                    let source_status_live_probe_timeout = requests
+                        .iter()
+                        .filter_map(|req| {
+                            crate::query::api::source_status_request_live_probe_timeout(
+                                req.payload_bytes(),
+                            )
+                        })
+                        .min();
+                    let snapshot = if current_owner_health_evidence {
+                        let (snapshot, used_cached_fallback) = status_source
+                            .current_owner_health_observability_snapshot_for_status_route_with_timeout(
+                                source_status_live_probe_timeout,
+                            )
+                            .await;
+                        if used_cached_fallback {
+                            eprintln!(
+                                "fs_meta_source: source-status current-owner-health using cached/degraded snapshot node={}",
+                                status_node_id.0
+                            );
+                        }
+                        snapshot
+                    } else if manual_rescan_delivery_evidence {
                         if let Err(err) = status_source
                             .rearm_source_rescan_request_endpoints_for_manual_status_on_boundary(
                                 status_boundary,
@@ -3319,8 +3491,10 @@ impl FSMetaSource {
         self.start_manual_rescan_watch().await?;
 
         let rescan_roots = self.state_cell.roots_handle();
+        let rescan_root_tasks = self.state_cell.root_tasks.clone();
         let rescan_fanout_health = self.state_cell.fanout_health_handle();
         let rescan_manual_intents = self.state_cell.manual_rescan_intents_handle();
+        let rescan_manual_wake = self.manual_rescan_intent_wake.clone();
         let node_id_rescan = self.node_id.clone();
         let node_id_rescan_scoped = self.node_id.clone();
         let rescan_roots_scoped = rescan_roots.clone();
@@ -3361,8 +3535,10 @@ impl FSMetaSource {
                     node_id_rescan.0
                 );
                 let rescan_roots_for_handler = rescan_roots.clone();
+                let rescan_root_tasks_for_handler = rescan_root_tasks.clone();
                 let rescan_fanout_health_for_handler = rescan_fanout_health.clone();
                 let rescan_manual_intents_for_handler = rescan_manual_intents.clone();
+                let rescan_manual_wake_for_handler = rescan_manual_wake.clone();
                 let endpoint_task = ManagedEndpointTask::spawn_with_unit(
                     boundary.clone(),
                     route,
@@ -3375,8 +3551,10 @@ impl FSMetaSource {
                     move |requests| {
                         let node_id_rescan = node_id_rescan.clone();
                         let rescan_roots = rescan_roots_for_handler.clone();
+                        let rescan_root_tasks = rescan_root_tasks_for_handler.clone();
                         let rescan_fanout_health = rescan_fanout_health_for_handler.clone();
                         let rescan_manual_intents = rescan_manual_intents_for_handler.clone();
+                        let rescan_manual_wake = rescan_manual_wake_for_handler.clone();
                         async move {
                             eprintln!(
                                 "fs_meta_source: source.rescan endpoint start node={} requests={}",
@@ -3398,8 +3576,10 @@ impl FSMetaSource {
                             .clone();
                             FSMetaSource::request_rescan_on_primary_roots(
                                 &roots_snapshot,
+                                Some(&rescan_root_tasks),
                                 Some(&rescan_fanout_health),
                                 Some(&rescan_manual_intents),
+                                Some(&rescan_manual_wake),
                                 "manual",
                             );
                             eprintln!(
@@ -3617,8 +3797,10 @@ impl FSMetaSource {
                 let route_key_for_handler = route.0.clone();
                 let scoped_node_id_for_handler = node_id_rescan_scoped.clone();
                 let scoped_roots_for_handler = rescan_roots_scoped.clone();
+                let scoped_root_tasks_for_handler = rescan_root_tasks.clone();
                 let scoped_fanout_health_for_handler = rescan_fanout_health.clone();
                 let scoped_manual_intents_for_handler = rescan_manual_intents.clone();
+                let scoped_manual_wake_for_handler = rescan_manual_wake.clone();
                 let endpoint_task = ManagedEndpointTask::spawn_with_unit(
                     boundary.clone(),
                     route.clone(),
@@ -3628,8 +3810,10 @@ impl FSMetaSource {
                     move |requests| {
                         let node_id_rescan_scoped = scoped_node_id_for_handler.clone();
                         let rescan_roots_scoped = scoped_roots_for_handler.clone();
+                        let rescan_root_tasks = scoped_root_tasks_for_handler.clone();
                         let rescan_fanout_health = scoped_fanout_health_for_handler.clone();
                         let rescan_manual_intents = scoped_manual_intents_for_handler.clone();
+                        let rescan_manual_wake = scoped_manual_wake_for_handler.clone();
                         let route_key_for_handler = route_key_for_handler.clone();
                         let target_route_key = target_route_key.clone();
                         async move {
@@ -3656,18 +3840,15 @@ impl FSMetaSource {
                                     })
                                     .collect();
                             }
-                            let roots_snapshot = lock_or_recover(
-                                &rescan_roots_scoped,
-                                "source.rescan.scoped_endpoint.roots.expected",
+                            let acceptance_timeout =
+                                FSMetaSource::scoped_rescan_acceptance_timeout(&requests);
+                            let roots_snapshot = FSMetaSource::wait_for_source_primary_scan_roots(
+                                rescan_roots_scoped.clone(),
+                                acceptance_timeout,
                             )
-                            .clone();
-                            let expected = roots_snapshot
-                                .iter()
-                                .filter(|root| {
-                                    root.active && root.is_group_primary && root.spec.scan
-                                })
-                                .map(FSMetaSource::root_runtime_key)
-                                .collect::<Vec<_>>();
+                            .await;
+                            let expected =
+                                FSMetaSource::source_primary_scan_root_keys(&roots_snapshot);
                             let payload = if expected.is_empty() {
                                 eprintln!(
                                     "fs_meta_source: source.rescan scoped endpoint rejected node={} route={} reason=no-local-source-primary-scan-root",
@@ -3679,8 +3860,10 @@ impl FSMetaSource {
                             } else {
                                 FSMetaSource::request_rescan_on_primary_roots(
                                     &roots_snapshot,
+                                    Some(&rescan_root_tasks),
                                     Some(&rescan_fanout_health),
                                     Some(&rescan_manual_intents),
+                                    Some(&rescan_manual_wake),
                                     "manual",
                                 );
                                 eprintln!(
@@ -3736,8 +3919,10 @@ impl FSMetaSource {
         let roots = lock_or_recover(&self.state_cell.roots, "source.trigger_rescan.roots").clone();
         Self::request_rescan_on_primary_roots(
             &roots,
+            Some(&self.state_cell.root_tasks),
             Some(&self.state_cell.fanout_health),
             Some(&self.state_cell.manual_rescan_intents),
+            Some(&self.manual_rescan_intent_wake),
             "manual",
         );
     }
@@ -3751,7 +3936,14 @@ impl FSMetaSource {
             "source.signal_recorded_manual_rescan_intents.roots",
         )
         .clone();
-        Self::signal_rescan_on_primary_root_keys(&roots, root_keys);
+        Self::signal_rescan_on_primary_root_keys(
+            &roots,
+            Some(&self.state_cell.root_tasks),
+            root_keys,
+        );
+        if !root_keys.is_empty() {
+            Self::wake_manual_rescan_intents(&self.manual_rescan_intent_wake);
+        }
     }
 
     pub async fn trigger_rescan_when_ready(&self) {
@@ -4384,15 +4576,15 @@ impl FSMetaSource {
     }
 
     fn accept_manual_rescan_control_envelope(&self, envelope: &ControlEnvelope) -> Result<bool> {
-        let requested_at_us = match envelope {
+        let payload = match envelope {
             ControlEnvelope::Frame(frame) if frame.kind == MANUAL_RESCAN_CONTROL_FRAME_KIND => {
-                rmp_serde::from_slice::<ManualRescanControlPayload>(&frame.payload)
-                    .map_err(|err| {
+                rmp_serde::from_slice::<ManualRescanControlPayload>(&frame.payload).map_err(
+                    |err| {
                         CnxError::InvalidInput(format!(
                             "decode manual rescan control payload failed: {err}"
                         ))
-                    })?
-                    .requested_at_us
+                    },
+                )?
             }
             _ => {
                 return Err(CnxError::InvalidInput(
@@ -4400,6 +4592,22 @@ impl FSMetaSource {
                 ));
             }
         };
+        let request_id = payload.request_id.trim();
+        if !request_id.is_empty() {
+            let mut seen = lock_or_recover(
+                &self.manual_rescan_control_seen_request_ids,
+                "source.manual_rescan_control.seen_request_ids",
+            );
+            if seen.iter().any(|seen_id| seen_id == request_id) {
+                return Ok(false);
+            }
+            seen.push_back(request_id.to_string());
+            while seen.len() > MANUAL_RESCAN_SEEN_REQUEST_IDS_LIMIT {
+                seen.pop_front();
+            }
+            return Ok(true);
+        }
+        let requested_at_us = payload.requested_at_us;
         let mut observed = self
             .manual_rescan_control_high_watermark_us
             .load(Ordering::Acquire);
@@ -4556,7 +4764,7 @@ impl FSMetaSource {
     fn spawn_root_task(
         &self,
         root: RootRuntime,
-        out_tx: mpsc::UnboundedSender<Vec<Event>>,
+        out_tx: mpsc::Sender<Vec<Event>>,
         stream_generation: u64,
         role: RootTaskRole,
         revision: u64,
@@ -4572,14 +4780,21 @@ impl FSMetaSource {
         let fanout_health = self.state_cell.fanout_health_handle();
         let roots_handle = self.state_cell.roots_handle();
         let manual_rescan_intents = self.state_cell.manual_rescan_intents_handle();
+        let manual_rescan_intent_wake = self.manual_rescan_intent_wake.subscribe();
         let enqueued_path_origin_counts = self.enqueued_path_origin_counts.clone();
         let state_cell = self.state_cell.clone();
         let sentinel = self.sentinel.clone();
         let apply_startup_delay = self.boundary.is_some();
-        let join = tokio::spawn(async move {
-            let mut backoff = Duration::from_secs(1);
-            let max_backoff = Duration::from_secs(60);
-            loop {
+        let root_rescan_tx = root.rescan_tx.clone();
+        let join = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build fs-meta source root task runtime")
+                .block_on(async move {
+                    let mut backoff = Duration::from_secs(1);
+                    let max_backoff = Duration::from_secs(60);
+                    loop {
                 if global_shutdown.is_cancelled() || task_cancel.is_cancelled() {
                     break;
                 }
@@ -4603,11 +4818,16 @@ impl FSMetaSource {
                     fanout_health.clone(),
                     roots_handle.clone(),
                     manual_rescan_intents.clone(),
+                    manual_rescan_intent_wake.clone(),
                     root_key.clone(),
                 )
                 .await;
                 match stream {
                     Ok(stream) => {
+                        eprintln!(
+                            "fs_meta_source: root task stream ready root_key={} role={:?} revision={} stream_generation={}",
+                            root_key, role, revision, stream_generation
+                        );
                         let _ = ready_tx.send(true);
                         Self::update_root_task_slot_health(
                             &fanout_health,
@@ -4682,31 +4902,27 @@ impl FSMetaSource {
                                     path_origins
                                 );
                             }
-                            if out_tx.send(batch).is_err() {
-                                Self::update_root_task_slot_health(
+                            let send_result = tokio::select! {
+                                _ = global_shutdown.cancelled() => break,
+                                _ = task_cancel.cancelled() => break,
+                                result = out_tx.send(batch) => result,
+                            };
+                            if send_result.is_ok() {
+                                Self::record_current_stream_enqueued_path_counts(
+                                    &enqueued_path_origin_counts,
+                                    stream_generation,
+                                    &path_origin_counts,
+                                );
+                                state_cell.mark_group_published(&root.logical_root_id);
+                                Self::mark_root_forwarded_batch(
                                     &fanout_health,
                                     &root_key,
-                                    revision,
-                                    stream_generation,
-                                    role,
-                                    "output_closed",
+                                    batch_len,
+                                    path_matching,
+                                    last_forwarded_at_us,
+                                    last_forwarded_origins,
                                 );
-                                return;
                             }
-                            Self::record_current_stream_enqueued_path_counts(
-                                &enqueued_path_origin_counts,
-                                stream_generation,
-                                &path_origin_counts,
-                            );
-                            state_cell.mark_group_published(&root.logical_root_id);
-                            Self::mark_root_forwarded_batch(
-                                &fanout_health,
-                                &root_key,
-                                batch_len,
-                                path_matching,
-                                last_forwarded_at_us,
-                                last_forwarded_origins,
-                            );
                         }
                         backoff = Duration::from_secs(1);
                     }
@@ -4749,19 +4965,21 @@ impl FSMetaSource {
                     }
                 }
             }
-            Self::update_root_task_slot_health(
-                &fanout_health,
-                &root_key,
-                revision,
-                stream_generation,
-                role,
-                "stopped",
-            );
+                    Self::update_root_task_slot_health(
+                        &fanout_health,
+                        &root_key,
+                        revision,
+                        stream_generation,
+                        role,
+                        "stopped",
+                    );
+                })
         });
         RootTaskHandle {
             cancel,
-            join,
+            join: Some(join),
             ready_rx,
+            rescan_tx: root_rescan_tx,
         }
     }
 
@@ -4818,7 +5036,7 @@ impl FSMetaSource {
                     }
                 } else if tasks
                     .get(&key)
-                    .is_some_and(|entry| entry.active.handle.join.is_finished())
+                    .is_some_and(|entry| entry.active.handle.is_finished())
                 {
                     if let Some(entry) = tasks.remove(&key) {
                         removed_finished.push((key, entry));
@@ -4829,7 +5047,7 @@ impl FSMetaSource {
                 match tasks.get_mut(key) {
                     Some(existing_entry) if existing_entry.active.signature == *signature => {
                         if let Some(candidate) = existing_entry.candidate.as_ref() {
-                            if candidate.handle.join.is_finished() {
+                            if candidate.handle.is_finished() {
                                 if let Some(stale) = existing_entry.candidate.take() {
                                     stale_candidates.push((key.clone(), stale));
                                     Self::clear_root_task_candidate_health(
@@ -4870,7 +5088,7 @@ impl FSMetaSource {
                         }
                         let mut candidate_ready = None;
                         if let Some(candidate) = existing_entry.candidate.as_ref() {
-                            if candidate.handle.join.is_finished() {
+                            if candidate.handle.is_finished() {
                                 if let Some(stale) = existing_entry.candidate.take() {
                                     stale_candidates.push((key.clone(), stale));
                                     Self::clear_root_task_candidate_health(
@@ -4950,9 +5168,10 @@ impl FSMetaSource {
                 )
                 .await;
                 if let Some(candidate) = entry.candidate {
-                    candidate.handle.cancel.cancel();
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
+                    candidate
+                        .handle
+                        .cancel_and_join(Duration::from_secs(2))
+                        .await;
                     Self::clear_root_task_candidate_health(&self.state_cell.fanout_health, &key);
                 }
             }
@@ -4966,8 +5185,7 @@ impl FSMetaSource {
                 stale.stream_generation,
                 "draining",
             );
-            stale.handle.cancel.cancel();
-            let _ = tokio::time::timeout(Duration::from_secs(2), stale.handle.join).await;
+            stale.handle.cancel_and_join(Duration::from_secs(2)).await;
             Self::finish_root_task_draining(
                 &self.state_cell.fanout_health,
                 &key,
@@ -5001,8 +5219,10 @@ impl FSMetaSource {
             )
             .await;
             if let Some(candidate) = entry.candidate {
-                candidate.handle.cancel.cancel();
-                let _ = tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
+                candidate
+                    .handle
+                    .cancel_and_join(Duration::from_secs(2))
+                    .await;
                 Self::clear_root_task_candidate_health(
                     &self.state_cell.fanout_health,
                     &replacement.key,
@@ -5149,8 +5369,10 @@ impl FSMetaSource {
                 candidate.stream_generation,
                 "timed_out: overlap candidate did not become ready",
             );
-            candidate.handle.cancel.cancel();
-            let _ = tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
+            candidate
+                .handle
+                .cancel_and_join(Duration::from_secs(2))
+                .await;
             Self::clear_root_task_candidate_health(&self.state_cell.fanout_health, &fallback.key);
             Self::cancel_root_task_slot(
                 &self.state_cell.fanout_health,
@@ -5202,9 +5424,10 @@ impl FSMetaSource {
                 )
                 .await;
                 if let Some(candidate) = entry.candidate {
-                    candidate.handle.cancel.cancel();
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
+                    candidate
+                        .handle
+                        .cancel_and_join(Duration::from_secs(2))
+                        .await;
                     Self::clear_root_task_candidate_health(&self.state_cell.fanout_health, &key);
                 }
                 if desired_root_keys.contains(&key) {
@@ -5229,21 +5452,29 @@ impl FSMetaSource {
             ));
         }
         self.start_manual_rescan_watch().await?;
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<Event>>();
-        let stream_generation = self.state_cell.next_stream_generation();
-        let had_existing_stream =
-            lock_or_recover(&self.state_cell.stream_binding, "source.pub.stream_binding")
-                .replace(SourceStreamBinding {
-                    generation: stream_generation,
-                    tx: out_tx.clone(),
-                })
-                .is_some();
-        self.reset_current_stream_path_frontier_stats(stream_generation);
+        let (out_rx, stream_generation, new_stream_binding) = {
+            let mut binding =
+                lock_or_recover(&self.state_cell.stream_binding, "source.pub.stream_binding");
+            match binding.as_ref() {
+                Some(existing) => (existing.rx.clone(), existing.generation, false),
+                None => {
+                    let stream_generation = self.state_cell.next_stream_generation();
+                    let (tx, rx) = mpsc::channel::<Vec<Event>>(1024);
+                    let rx = Arc::new(AsyncMutex::new(rx));
+                    *binding = Some(SourceStreamBinding {
+                        generation: stream_generation,
+                        tx: tx.clone(),
+                        rx: rx.clone(),
+                    });
+                    (rx, stream_generation, true)
+                }
+            }
+        };
+        if new_stream_binding {
+            self.reset_current_stream_path_frontier_stats(stream_generation);
+        }
         *lock_or_recover(&self.state, "source.pub.state") = LifecycleState::Scanning;
         let roots_snapshot = lock_or_recover(&self.state_cell.roots, "source.pub.roots").clone();
-        if had_existing_stream {
-            self.restart_root_tasks_for_current_stream().await;
-        }
         self.reconcile_root_tasks(&roots_snapshot).await;
         *lock_or_recover(&self.state, "source.pub.state.ready") = LifecycleState::Ready;
 
@@ -5255,7 +5486,11 @@ impl FSMetaSource {
             let mut input_closed = false;
             loop {
                 while !input_closed {
-                    match out_rx.try_recv() {
+                    let recv_result = {
+                        let mut out_rx = out_rx.lock().await;
+                        out_rx.try_recv()
+                    };
+                    match recv_result {
                         Ok(events) => {
                             Self::enqueue_current_stream_batch(
                                 &mut pending_by_queue,
@@ -5263,8 +5498,8 @@ impl FSMetaSource {
                                 events,
                             );
                         }
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
                             input_closed = true;
                             break;
                         }
@@ -5308,7 +5543,10 @@ impl FSMetaSource {
                 }
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
-                    batch = out_rx.recv() => match batch {
+                    batch = async {
+                        let mut out_rx = out_rx.lock().await;
+                        out_rx.recv().await
+                    } => match batch {
                         Some(events) => {
                             Self::enqueue_current_stream_batch(
                                 &mut pending_by_queue,
@@ -5328,6 +5566,10 @@ impl FSMetaSource {
         self.build_pub_stream().await
     }
 
+    fn current_watch_manager(slot: &WatchManagerSlot) -> Option<SharedWatchManager> {
+        lock_or_recover(slot, "source.root_stream.watch_manager_slot").clone()
+    }
+
     async fn root_stream(
         config: SourceConfig,
         drift_estimator: Arc<Mutex<DriftEstimator>>,
@@ -5340,8 +5582,10 @@ impl FSMetaSource {
         fanout_health: Arc<Mutex<FanoutHealthState>>,
         roots_handle: Arc<Mutex<Vec<RootRuntime>>>,
         manual_rescan_intents: Arc<Mutex<HashMap<String, ManualRescanIntent>>>,
+        mut manual_rescan_intent_wake: watch::Receiver<u64>,
         root_key: String,
     ) -> Result<Pin<Box<dyn Stream<Item = Vec<Event>> + Send>>> {
+        let debug_root_task = debug_source_root_task_enabled();
         let root_path = root.monitor_path.clone();
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(300);
@@ -5350,11 +5594,13 @@ impl FSMetaSource {
             if global_shutdown.is_cancelled() || task_shutdown.is_cancelled() {
                 return Err(CnxError::ChannelClosed);
             }
-            eprintln!(
-                "fs_meta_source: probing root availability root_key={} path={}",
-                root_key,
-                root_path.display()
-            );
+            if debug_root_task {
+                eprintln!(
+                    "fs_meta_source: probing root availability root_key={} path={}",
+                    root_key,
+                    root_path.display()
+                );
+            }
             let probe_host_fs = Arc::clone(&root.host_fs);
             let probe_path = root_path.clone();
             let probe_result = tokio::time::timeout(
@@ -5364,20 +5610,24 @@ impl FSMetaSource {
             .await;
             match probe_result {
                 Ok(Ok(Ok(_))) => {
-                    eprintln!(
-                        "fs_meta_source: root availability ok root_key={} path={}",
-                        root_key,
-                        root_path.display()
-                    );
+                    if debug_root_task {
+                        eprintln!(
+                            "fs_meta_source: root availability ok root_key={} path={}",
+                            root_key,
+                            root_path.display()
+                        );
+                    }
                     break;
                 }
                 Ok(Ok(Err(e))) => {
-                    eprintln!(
-                        "fs_meta_source: root unavailable root_key={} path={} err={}",
-                        root_key,
-                        root_path.display(),
-                        e
-                    );
+                    if debug_root_task {
+                        eprintln!(
+                            "fs_meta_source: root unavailable root_key={} path={} err={}",
+                            root_key,
+                            root_path.display(),
+                            e
+                        );
+                    }
                     Self::update_object_health(
                         &fanout_health,
                         &root_key,
@@ -5447,190 +5697,113 @@ impl FSMetaSource {
             }
         }
 
-        let watch_manager = if root.spec.watch {
-            match root.host_fs.watch_session_open() {
-                Ok(backend) => match WatchManager::new(
-                    &config,
-                    root_path.clone(),
-                    root.emit_prefix.clone(),
-                    Box::new(backend),
-                ) {
-                    Ok(manager) => {
-                        let manager = Arc::new(Mutex::new(manager));
-                        let schedule_result = {
-                            let mut mgr =
-                                lock_or_recover(&manager, "source.root_stream.root_schedule");
-                            mgr.schedule(&root_path)
-                        };
-                        if let Err(err) = schedule_result {
-                            log::warn!(
-                                "root {} watch schedule failed ({}); continuing with scan/audit",
-                                root.spec.id,
-                                err
-                            );
-                            Self::set_object_last_error(
-                                &fanout_health,
-                                &root_key,
-                                format!("root watch schedule failed: {err}"),
-                            );
-                        }
-                        Some(manager)
-                    }
-                    Err(err) => {
-                        log::warn!(
-                            "root {} watch manager init failed ({}); degrading to scan-only",
-                            root.spec.id,
-                            err
-                        );
-                        Self::set_object_last_error(
-                            &fanout_health,
-                            &root_key,
-                            format!("root watch manager init failed: {err}"),
-                        );
-                        None
-                    }
-                },
-                Err(err) => {
-                    let actions = sentinel.handle_signal(HealthSignal::WatchInitFailed {
-                        root_key: root_key.clone(),
-                        error: err.to_string(),
-                    });
-                    Self::execute_sentinel_actions(
-                        &actions,
-                        &root_key,
-                        Some(&root.rescan_tx),
-                        Some(&fanout_health),
-                    );
-                    log::warn!(
-                        "root {} watch backend init failed ({}); degrading to scan-only",
-                        root.spec.id,
-                        err
-                    );
-                    Self::set_object_last_error(
-                        &fanout_health,
-                        &root_key,
-                        format!("failed to initialize host watch backend: {err}"),
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let watch_manager_slot: WatchManagerSlot = Arc::new(Mutex::new(None));
 
         let (scan_tx, mut scan_rx) = mpsc::channel::<Vec<Event>>(256);
         let rescan_scan_tx = scan_tx.clone();
-        if root.spec.scan && Self::root_current_is_group_primary(&roots_handle, &root_key) {
-            let scanner = Arc::clone(&root.scanner);
-            let drift_est = Arc::clone(&drift_estimator);
-            let clock = Arc::clone(&logical_clock);
-            let mtime_cache = Arc::clone(&root.mtime_cache);
-            let epoch_counter = Arc::clone(&root.epoch_counter);
-            let scan_global_shutdown = global_shutdown.clone();
-            let scan_task_shutdown = task_shutdown.clone();
-            let scan_watch_mgr = watch_manager.clone();
-            let initial_scan_health = fanout_health.clone();
-            let initial_scan_root_key = root_key.clone();
-            tokio::spawn(async move {
-                // CONTRACTS.CLUSTER.COLD_START: Delay initial Epoch 0 scan by 10 seconds.
-                // This prevents a massive CPU storm during cluster convergence, where components
-                // like gossip + routing need CPU to form the cluster cleanly.
-                let startup_delay = if apply_startup_delay {
-                    epoch0_scan_delay()
-                } else {
-                    Duration::ZERO
-                };
-                if !startup_delay.is_zero() {
-                    tokio::time::sleep(startup_delay).await;
-                }
-
-                if scan_global_shutdown.is_cancelled() || scan_task_shutdown.is_cancelled() {
-                    return;
-                }
-
-                let audit_started_at_us = now_us();
-                Self::mark_root_audit_start(
-                    &initial_scan_health,
-                    &initial_scan_root_key,
-                    "initial_scan",
-                    audit_started_at_us,
-                );
-                let initial_scan_root_key_for_scan = initial_scan_root_key.clone();
-
-                let scan_result = tokio::task::spawn_blocking(move || {
-                    let mut cache =
-                        lock_or_recover(&mtime_cache, "source.root.scan_audit.mtime_cache");
-                    let epoch = {
-                        let mut ec =
-                            lock_or_recover(&epoch_counter, "source.root.scan_audit.epoch_counter");
-                        let epoch = *ec;
-                        *ec += 1;
-                        epoch
-                    };
-                    let audit = scanner.scan_audit_with_summary(
-                        epoch,
-                        &mut cache,
-                        &drift_est,
-                        &clock,
-                        scan_watch_mgr,
-                    );
-                    eprintln!(
-                        "fs_meta_source: initial scan produced batches={} root_key={} records={}/{} truncated={}",
-                        audit.batches.len(),
-                        initial_scan_root_key_for_scan,
-                        audit.record_count,
-                        audit.record_budget,
-                        audit.truncated
-                    );
-                    for (idx, batch) in audit.batches.into_iter().enumerate() {
-                        if scan_global_shutdown.is_cancelled() || scan_task_shutdown.is_cancelled()
-                        {
-                            return;
-                        }
-                        eprintln!(
-                            "fs_meta_source: initial scan enqueue batch_index={} len={} root_key={}",
-                            idx,
-                            batch.len(),
-                            initial_scan_root_key_for_scan
-                        );
-                        if scan_tx.blocking_send(batch).is_err() {
-                            return;
-                        }
-                    }
-                })
-                .await;
-                Self::mark_root_audit_completed(
-                    &initial_scan_health,
-                    &initial_scan_root_key,
-                    audit_started_at_us,
-                    now_us(),
-                );
-                if let Err(err) = scan_result {
-                    Self::set_object_last_error(
-                        &initial_scan_health,
-                        &initial_scan_root_key,
-                        format!("initial scan join failed: {err}"),
-                    );
-                }
-            });
-        } else {
-            drop(scan_tx);
-        }
 
         let (watch_tx, mut watch_rx) = mpsc::channel::<Vec<Event>>(256);
         let mut rescan_rx = root.rescan_tx.subscribe();
-        let watch_handle = if let Some(manager) = watch_manager.clone() {
-            Some(watcher::start_watch_loop(
-                manager,
-                Arc::clone(&drift_estimator),
-                watch_tx,
-                global_shutdown.clone(),
-                NodeId(root.object_ref.clone()),
-                Arc::clone(&logical_clock),
-                root.host_fs.clone(),
-                config.throttle_interval,
-                Some(root.rescan_tx.clone()),
-            ))
+        let watch_handle = if root.spec.watch {
+            let setup_config = config.clone();
+            let setup_root_path = root_path.clone();
+            let setup_emit_prefix = root.emit_prefix.clone();
+            let setup_host_fs = root.host_fs.clone();
+            let setup_root_id = root.spec.id.clone();
+            let setup_root_key = root_key.clone();
+            let setup_fanout_health = fanout_health.clone();
+            let setup_sentinel = sentinel.clone();
+            let setup_rescan_tx = root.rescan_tx.clone();
+            let setup_watch_slot = watch_manager_slot.clone();
+            let setup_shutdown = global_shutdown.clone();
+            let watch_loop_drift = Arc::clone(&drift_estimator);
+            let watch_loop_node_id = NodeId(root.object_ref.clone());
+            let watch_loop_clock = Arc::clone(&logical_clock);
+            let watch_loop_host_fs = root.host_fs.clone();
+            let watch_loop_throttle = config.throttle_interval;
+            Some(tokio::spawn(async move {
+                let setup_result = tokio::task::spawn_blocking(move || {
+                    let backend = setup_host_fs
+                        .watch_session_open()
+                        .map_err(|err| format!("failed to initialize host watch backend: {err}"))?;
+                    let manager = WatchManager::new(
+                        &setup_config,
+                        setup_root_path.clone(),
+                        setup_emit_prefix,
+                        Box::new(backend),
+                    )
+                    .map_err(|err| format!("root watch manager init failed: {err}"))?;
+                    let manager = Arc::new(Mutex::new(manager));
+                    {
+                        let mut mgr = lock_or_recover(&manager, "source.root_stream.root_schedule");
+                        mgr.schedule(&setup_root_path)
+                            .map_err(|err| format!("root watch schedule failed: {err}"))?;
+                    }
+                    Ok::<_, String>(manager)
+                })
+                .await;
+                let manager = match setup_result {
+                    Ok(Ok(manager)) => manager,
+                    Ok(Err(err)) => {
+                        let actions = setup_sentinel.handle_signal(HealthSignal::WatchInitFailed {
+                            root_key: setup_root_key.clone(),
+                            error: err.clone(),
+                        });
+                        Self::execute_sentinel_actions(
+                            &actions,
+                            &setup_root_key,
+                            Some(&setup_rescan_tx),
+                            Some(&setup_fanout_health),
+                        );
+                        log::warn!(
+                            "root {} watch setup failed ({}); continuing with scan/audit",
+                            setup_root_id,
+                            err
+                        );
+                        Self::set_object_last_error(&setup_fanout_health, &setup_root_key, err);
+                        return;
+                    }
+                    Err(err) => {
+                        let message = format!("root watch setup task failed: {err}");
+                        let actions = setup_sentinel.handle_signal(HealthSignal::WatchInitFailed {
+                            root_key: setup_root_key.clone(),
+                            error: message.clone(),
+                        });
+                        Self::execute_sentinel_actions(
+                            &actions,
+                            &setup_root_key,
+                            Some(&setup_rescan_tx),
+                            Some(&setup_fanout_health),
+                        );
+                        log::warn!(
+                            "root {} watch setup failed ({}); continuing with scan/audit",
+                            setup_root_id,
+                            message
+                        );
+                        Self::set_object_last_error(&setup_fanout_health, &setup_root_key, message);
+                        return;
+                    }
+                };
+                if setup_shutdown.is_cancelled() {
+                    return;
+                }
+                *lock_or_recover(
+                    &setup_watch_slot,
+                    "source.root_stream.watch_manager_slot.install",
+                ) = Some(manager.clone());
+                let watch_loop = watcher::start_watch_loop(
+                    manager,
+                    watch_loop_drift,
+                    watch_tx,
+                    setup_shutdown,
+                    watch_loop_node_id,
+                    watch_loop_clock,
+                    watch_loop_host_fs,
+                    watch_loop_throttle,
+                    Some(setup_rescan_tx),
+                );
+                let _ = watch_loop.await;
+            }))
         } else {
             drop(watch_tx);
             None
@@ -5641,7 +5814,13 @@ impl FSMetaSource {
         let rescan_clock = Arc::clone(&logical_clock);
         let rescan_mtime_cache = Arc::clone(&root.mtime_cache);
         let rescan_epoch = Arc::clone(&root.epoch_counter);
-        let rescan_watch = watch_manager;
+        let rescan_watch_slot = watch_manager_slot.clone();
+        let initial_scanner = Arc::clone(&root.scanner);
+        let initial_drift = Arc::clone(&drift_estimator);
+        let initial_clock = Arc::clone(&logical_clock);
+        let initial_mtime_cache = Arc::clone(&root.mtime_cache);
+        let initial_epoch = Arc::clone(&root.epoch_counter);
+        let initial_watch_slot = watch_manager_slot.clone();
         let audit_interval = root
             .spec
             .audit_interval_ms
@@ -5649,15 +5828,36 @@ impl FSMetaSource {
             .unwrap_or(config.audit_interval);
 
         let output_stream = stream! {
+            // CONTRACTS.CLUSTER.COLD_START: Delay initial Epoch 0 scan by default.
+            // The scan remains owned by this root stream, not a detached side task, so
+            // roots/control churn cannot leave a serving primary with no audit owner.
+            let startup_delay = if apply_startup_delay {
+                epoch0_scan_delay()
+            } else {
+                Duration::ZERO
+            };
+            if debug_root_task {
+                eprintln!(
+                    "fs_meta_source: root stream entered root_key={} startup_delay_ms={} watch={} scan={}",
+                    root_key,
+                    startup_delay.as_millis(),
+                    root.spec.watch,
+                    root.spec.scan
+                );
+            }
+            let mut initial_scan_pending = true;
+            let mut initial_scan_delay_elapsed = startup_delay.is_zero();
+            let mut initial_scan_sleep = Box::pin(tokio::time::sleep(startup_delay));
+            let mut initial_scan_wait_logged = false;
             let mut audit_tick = tokio::time::interval(audit_interval);
             let mut scan_channel_open = true;
             let mut periodic_channel_open = root.spec.scan && !audit_interval.is_zero();
+            let mut periodic_first_tick_discarded = !periodic_channel_open;
             let mut watch_channel_open = watch_handle.is_some();
             let mut last_manual_dispatch_target = 0_u64;
+            let mut first_loop_state_logged = false;
             if periodic_channel_open {
                 audit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                // Discard immediate first tick so periodic scan starts after one full interval.
-                audit_tick.tick().await;
             }
             let mut rescan_channel_open = root.spec.scan;
             let dispatch_pending_manual = |last_manual_dispatch_target: &mut u64| {
@@ -5681,16 +5881,142 @@ impl FSMetaSource {
             };
             if rescan_channel_open {
                 dispatch_pending_manual(&mut last_manual_dispatch_target);
+                if debug_root_task {
+                    eprintln!(
+                        "fs_meta_source: root stream initial manual dispatch checked root_key={}",
+                        root_key
+                    );
+                }
             }
             loop {
                 dispatch_pending_manual(&mut last_manual_dispatch_target);
                 let current_is_group_primary =
                     Self::root_current_is_group_primary(&roots_handle, &root_key);
+                let current_is_group_primary_scan_enabled =
+                    Self::root_current_is_group_primary_scan_enabled(&roots_handle, &root_key);
                 let rescan_open = rescan_channel_open;
                 let periodic_open = periodic_channel_open && current_is_group_primary;
+                let initial_delay_open = initial_scan_pending && !initial_scan_delay_elapsed;
+                let initial_ready_open = initial_scan_pending
+                    && initial_scan_delay_elapsed
+                    && current_is_group_primary_scan_enabled;
+                let initial_wait_open = initial_scan_pending
+                    && initial_scan_delay_elapsed
+                    && !current_is_group_primary_scan_enabled;
+                if debug_root_task && !first_loop_state_logged {
+                    eprintln!(
+                        "fs_meta_source: root stream first select root_key={} primary={} scan_primary={} initial_delay_open={} initial_ready_open={} rescan_open={} periodic_open={} watch_open={} scan_open={}",
+                        root_key,
+                        current_is_group_primary,
+                        current_is_group_primary_scan_enabled,
+                        initial_delay_open,
+                        initial_ready_open,
+                        rescan_open,
+                        periodic_open,
+                        watch_channel_open,
+                        scan_channel_open
+                    );
+                    first_loop_state_logged = true;
+                }
+                if debug_root_task && initial_wait_open && !initial_scan_wait_logged {
+                    eprintln!(
+                        "fs_meta_source: initial scan waiting for scan-enabled group-primary ownership root_key={}",
+                        root_key
+                    );
+                    initial_scan_wait_logged = true;
+                }
                 tokio::select! {
                     _ = global_shutdown.cancelled() => break,
                     _ = task_shutdown.cancelled() => break,
+                    changed = manual_rescan_intent_wake.changed(), if rescan_channel_open => {
+                        if changed.is_err() {
+                            Self::close_rescan_channels(
+                                &mut rescan_channel_open,
+                                &mut periodic_channel_open,
+                            );
+                        }
+                    }
+                    _ = &mut initial_scan_sleep, if initial_delay_open => {
+                        initial_scan_delay_elapsed = true;
+                        if debug_root_task {
+                            eprintln!(
+                                "fs_meta_source: initial scan delay elapsed root_key={}",
+                                root_key
+                            );
+                        }
+                    }
+                    _ = tokio::time::sleep(RESCAN_READY_POLL_INTERVAL), if initial_wait_open => {}
+                    _ = async {}, if initial_ready_open => {
+                        if debug_root_task {
+                            eprintln!(
+                                "fs_meta_source: initial scan starting root_key={}",
+                                root_key
+                            );
+                        }
+                        let audit_started_at_us = now_us();
+                        Self::mark_root_audit_start(
+                            &fanout_health,
+                            &root_key,
+                            "initial_scan",
+                            audit_started_at_us,
+                        );
+                        let scanner = Arc::clone(&initial_scanner);
+                        let de = Arc::clone(&initial_drift);
+                        let clk = Arc::clone(&initial_clock);
+                        let cache = Arc::clone(&initial_mtime_cache);
+                        let epoch = Arc::clone(&initial_epoch);
+                        let wm = Self::current_watch_manager(&initial_watch_slot);
+                        let initial_scan_root_key_for_scan = root_key.clone();
+                        let scan_result = tokio::task::spawn_blocking(move || {
+                            let mut c = lock_or_recover(&cache, "source.root.scan_audit.mtime_cache");
+                            let mut ep = lock_or_recover(&epoch, "source.root.scan_audit.epoch_counter");
+                            let current_epoch = *ep;
+                            *ep += 1;
+                            scanner.scan_audit_with_summary(current_epoch, &mut c, &de, &clk, wm)
+                        }).await;
+                        Self::mark_root_audit_completed(
+                            &fanout_health,
+                            &root_key,
+                            audit_started_at_us,
+                            now_us(),
+                        );
+                        match scan_result {
+                            Ok(audit) => {
+                                if debug_root_task {
+                                    eprintln!(
+                                        "fs_meta_source: initial scan produced batches={} root_key={} records={}/{} truncated={}",
+                                        audit.batches.len(),
+                                        initial_scan_root_key_for_scan,
+                                        audit.record_count,
+                                        audit.record_budget,
+                                        audit.truncated
+                                    );
+                                }
+                                for (idx, batch) in audit.batches.into_iter().enumerate() {
+                                    if global_shutdown.is_cancelled() || task_shutdown.is_cancelled() {
+                                        break;
+                                    }
+                                    if debug_root_task {
+                                        eprintln!(
+                                            "fs_meta_source: initial scan enqueue batch_index={} len={} root_key={}",
+                                            idx,
+                                            batch.len(),
+                                            initial_scan_root_key_for_scan
+                                        );
+                                    }
+                                    yield batch;
+                                }
+                            }
+                            Err(err) => {
+                                Self::set_object_last_error(
+                                    &fanout_health,
+                                    &root_key,
+                                    format!("initial scan join failed: {err}"),
+                                );
+                            }
+                        }
+                        initial_scan_pending = false;
+                    }
                     batch = scan_rx.recv(), if scan_channel_open => match batch {
                         Some(batch) => yield batch,
                         None => {
@@ -5705,6 +6031,10 @@ impl FSMetaSource {
                         },
                     },
                     _ = audit_tick.tick(), if periodic_open => {
+                        if !periodic_first_tick_discarded {
+                            periodic_first_tick_discarded = true;
+                            continue;
+                        }
                         Self::mark_root_rescan_requested(
                             &fanout_health,
                             &root_key,
@@ -5736,15 +6066,23 @@ impl FSMetaSource {
                                 RescanReason::Periodic => "periodic",
                                 RescanReason::Overflow => "overflow",
                             };
-                            let manual_requested_target = if matches!(reason, RescanReason::Manual) {
-                                lock_or_recover(
+                            let manual_signal_intent = if matches!(reason, RescanReason::Manual) {
+                                Some(Self::manual_rescan_signal_intent_for_root(
                                     &manual_rescan_intents,
-                                    "source.root.manual_rescan_intents.requested_target",
-                                )
-                                .get(&root_key)
-                                .map(|intent| intent.requested)
+                                    &root_key,
+                                ))
                             } else {
                                 None
+                            };
+                            if matches!(
+                                manual_signal_intent,
+                                Some(ManualRescanSignalIntent::AlreadyCompleted)
+                            ) {
+                                continue;
+                            }
+                            let manual_requested_target = match manual_signal_intent {
+                                Some(ManualRescanSignalIntent::Pending(target)) => Some(target),
+                                _ => None,
                             };
                             let audit_started_at_us = now_us();
                             Self::mark_root_audit_start(
@@ -5758,7 +6096,7 @@ impl FSMetaSource {
                             let clk = Arc::clone(&rescan_clock);
                             let cache = Arc::clone(&rescan_mtime_cache);
                             let epoch = Arc::clone(&rescan_epoch);
-                            let wm = rescan_watch.clone();
+                            let wm = Self::current_watch_manager(&rescan_watch_slot);
                             let manual_full_audit = matches!(reason, RescanReason::Manual);
                             let rescan_batches = tokio::task::spawn_blocking(move || {
                                 let mut c = lock_or_recover(&cache, "source.root.rescan.mtime_cache");
@@ -6064,11 +6402,16 @@ impl FSMetaSource {
             "source.close.root_tasks",
         ));
         for (_key, entry) in tasks.drain() {
-            entry.active.handle.cancel.cancel();
-            let _ = tokio::time::timeout(Duration::from_secs(2), entry.active.handle.join).await;
+            entry
+                .active
+                .handle
+                .cancel_and_join(Duration::from_secs(2))
+                .await;
             if let Some(candidate) = entry.candidate {
-                candidate.handle.cancel.cancel();
-                let _ = tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
+                candidate
+                    .handle
+                    .cancel_and_join(Duration::from_secs(2))
+                    .await;
             }
         }
         *lock_or_recover(

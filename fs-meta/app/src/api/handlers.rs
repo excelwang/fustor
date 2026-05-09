@@ -3,7 +3,6 @@ use std::future::Future;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
-#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Once, OnceLock};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
@@ -28,12 +27,13 @@ use tokio::sync::Notify;
 use crate::domain_state::{FacadeServiceState, GroupServiceState, NodeParticipationState};
 use crate::query::ObservationState;
 use crate::query::api::{
-    StatusRoutePlan, internal_status_request_payload,
-    internal_status_request_payload_with_live_probe_timeout,
+    StatusRoutePlan, current_owner_health_source_status_request_payload_with_live_probe_timeout,
+    internal_status_request_payload, internal_status_request_payload_with_live_probe_timeout,
     manual_rescan_source_status_request_payload,
     manual_rescan_source_status_request_payload_with_live_probe_timeout,
-    merge_sink_status_snapshots, refresh_policy_from_host_object_grants,
-    route_sink_status_snapshot, source_status_request_requires_manual_rescan_delivery_evidence,
+    merge_sink_status_snapshots, merge_source_status_snapshots,
+    refresh_policy_from_host_object_grants, route_sink_status_snapshot,
+    source_status_request_requires_manual_rescan_delivery_evidence,
 };
 use crate::query::observation::{
     ObservationTrustPolicy, candidate_group_observation_evidence, evaluate_observation_status,
@@ -41,7 +41,7 @@ use crate::query::observation::{
 };
 use crate::runtime::execution_units;
 use crate::runtime::orchestration::encode_logical_roots_control_payload_with_generation;
-use crate::runtime::orchestration::encode_manual_rescan_envelope_with_scoped_target_acceptance_timeout;
+use crate::runtime::orchestration::encode_manual_rescan_envelope_with_request_id_and_scoped_target_acceptance_timeout;
 use crate::runtime::routes::ROUTE_KEY_SOURCE_RESCAN_CONTROL;
 #[cfg(test)]
 use crate::runtime::routes::source_status_request_route_for;
@@ -87,6 +87,7 @@ const SOURCE_WORKER_DEGRADED_ROOT_KEY: &str = "source-worker";
 const SOURCE_WORKER_STATUS_CACHE_REASON: &str = "source worker status served from cache";
 const SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON: &str =
     "source worker runtime scope served from control cache";
+static MANUAL_RESCAN_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn manual_rescan_scoped_target_acceptance_timeout() -> Duration {
     MANUAL_RESCAN_ROUTE_TIMEOUT.saturating_sub(MANUAL_RESCAN_ROUTE_IDLE_GRACE)
@@ -1079,7 +1080,7 @@ async fn collect_node_scoped_status_source_observability_origin_snapshot(
         .call_collect(
             ROUTE_TOKEN_FS_META_INTERNAL,
             METHOD_SOURCE_STATUS,
-            internal_status_request_payload_with_live_probe_timeout(timeout),
+            current_owner_health_source_status_request_payload_with_live_probe_timeout(timeout),
             timeout,
             Duration::ZERO,
         )
@@ -3463,11 +3464,29 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
 fn management_status_authoritative_source_root_ids(
     source: &SourceObservabilitySnapshot,
 ) -> BTreeSet<String> {
-    source
+    let root_ids = source
         .logical_roots
         .iter()
         .map(|root| root.id.clone())
-        .collect()
+        .collect::<BTreeSet<_>>();
+    if !root_ids.is_empty() {
+        return root_ids;
+    }
+
+    let mut status_root_ids = source
+        .status
+        .logical_roots
+        .iter()
+        .map(|root| root.root_id.clone())
+        .collect::<BTreeSet<_>>();
+    status_root_ids.extend(
+        source
+            .status
+            .concrete_roots
+            .iter()
+            .map(|root| root.logical_root_id.clone()),
+    );
+    status_root_ids
 }
 
 fn source_status_current_health_root_ids(source: &SourceObservabilitySnapshot) -> BTreeSet<String> {
@@ -3493,6 +3512,29 @@ fn source_status_missing_authoritative_root_ids(
         .difference(&current_root_ids)
         .cloned()
         .collect()
+}
+
+fn source_status_root_ids_needing_current_owner_evidence(
+    source: &SourceObservabilitySnapshot,
+    expected_root_ids: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut root_ids = source_status_missing_authoritative_root_ids(source, expected_root_ids);
+    for root_id in expected_root_ids {
+        let concrete_roots = source
+            .status
+            .concrete_roots
+            .iter()
+            .filter(|root| root.logical_root_id == *root_id)
+            .collect::<Vec<_>>();
+        if concrete_roots.iter().any(|root| {
+            crate::query::observation::source_concrete_root_needs_current_owner_evidence(root)
+        }) && !concrete_roots.iter().any(|root| {
+            crate::query::observation::source_concrete_root_has_current_owner_evidence(root)
+        }) {
+            root_ids.insert(root_id.clone());
+        }
+    }
+    root_ids
 }
 
 fn source_status_current_health_covers_authoritative_roots(
@@ -3543,6 +3585,16 @@ fn collect_source_owner_candidate_nodes_from_snapshot(
         }
     }
     for root in source
+        .status
+        .concrete_roots
+        .iter()
+        .filter(|root| missing_root_ids.contains(&root.logical_root_id))
+    {
+        if let Some(node_id) = roots_put_control_target_node_id_for_ref_or_node(&root.object_ref) {
+            nodes.insert(node_id);
+        }
+    }
+    for root in source
         .logical_roots
         .iter()
         .filter(|root| missing_root_ids.contains(&root.id))
@@ -3588,9 +3640,9 @@ async fn augment_management_status_source_with_owner_scoped_evidence(
         source,
         &expected_root_ids,
     );
-    let missing_root_ids =
-        source_status_missing_authoritative_root_ids(&source, &expected_root_ids);
-    if missing_root_ids.is_empty() {
+    let root_ids_needing_owner_evidence =
+        source_status_root_ids_needing_current_owner_evidence(&source, &expected_root_ids);
+    if root_ids_needing_owner_evidence.is_empty() {
         return source;
     }
     let Some(boundary) = boundary else {
@@ -3599,7 +3651,7 @@ async fn augment_management_status_source_with_owner_scoped_evidence(
     let candidate_node_ids = management_status_source_owner_candidate_node_ids(
         &source,
         authoritative_source,
-        &missing_root_ids,
+        &root_ids_needing_owner_evidence,
     );
     if candidate_node_ids.is_empty() {
         return source;
@@ -3641,7 +3693,9 @@ async fn augment_management_status_source_with_owner_scoped_evidence(
             source,
             &expected_root_ids,
         );
-        if source_status_missing_authoritative_root_ids(&source, &expected_root_ids).is_empty() {
+        if source_status_root_ids_needing_current_owner_evidence(&source, &expected_root_ids)
+            .is_empty()
+        {
             break;
         }
     }
@@ -4125,13 +4179,20 @@ pub async fn rescan(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_micros().min(u128::from(u64::MAX)) as u64)
             .unwrap_or(0);
-        let envelope = encode_manual_rescan_envelope_with_scoped_target_acceptance_timeout(
-            requested_at_us,
-            Some(manual_rescan_scoped_target_acceptance_timeout()),
-        )
-        .map_err(|err| {
-            ApiError::internal(format!("manual rescan envelope encode failed: {err}"))
-        })?;
+        let request_sequence = MANUAL_RESCAN_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let request_id = format!(
+            "{}:{}:{}",
+            state.node_id.0, requested_at_us, request_sequence
+        );
+        let envelope =
+            encode_manual_rescan_envelope_with_request_id_and_scoped_target_acceptance_timeout(
+                request_id,
+                requested_at_us,
+                Some(manual_rescan_scoped_target_acceptance_timeout()),
+            )
+            .map_err(|err| {
+                ApiError::internal(format!("manual rescan envelope encode failed: {err}"))
+            })?;
         let payload = rmp_serde::to_vec_named(&envelope).map_err(|err| {
             ApiError::internal(format!("manual rescan envelope serialize failed: {err}"))
         })?;
@@ -6361,26 +6422,7 @@ fn merge_source_observability_snapshots(
             && !source_observability_snapshot_is_degraded_worker_cache(&merged)
             && has_live_data(&merged);
 
-    let mut logical_root_map = merged
-        .status
-        .logical_roots
-        .iter()
-        .cloned()
-        .map(|entry| (entry.root_id.clone(), entry))
-        .collect::<BTreeMap<_, _>>();
-    let mut concrete_root_map = merged
-        .status
-        .concrete_roots
-        .iter()
-        .cloned()
-        .map(|entry| (entry.root_key.clone(), entry))
-        .collect::<BTreeMap<_, _>>();
-    let mut degraded_root_map = merged
-        .status
-        .degraded_roots
-        .iter()
-        .cloned()
-        .collect::<BTreeMap<_, _>>();
+    let mut status_snapshots = vec![merged.status.clone()];
     let mut grant_map = merged
         .grants
         .iter()
@@ -6400,6 +6442,7 @@ fn merge_source_observability_snapshots(
         .collect::<BTreeSet<_>>();
 
     for snapshot in iter {
+        status_snapshots.push(snapshot.status.clone());
         if !source_observability_snapshot_is_worker_status_cache(&snapshot)
             && !source_observability_snapshot_is_degraded_worker_cache(&snapshot)
             && has_live_data(&snapshot)
@@ -6470,26 +6513,11 @@ fn merge_source_observability_snapshots(
         for root in snapshot.logical_roots {
             root_map.entry(root.id.clone()).or_insert(root);
         }
-        for entry in snapshot.status.logical_roots {
-            logical_root_map
-                .entry(entry.root_id.clone())
-                .or_insert(entry);
-        }
-        for entry in snapshot.status.concrete_roots {
-            concrete_root_map
-                .entry(entry.root_key.clone())
-                .or_insert(entry);
-        }
-        for (root_key, reason) in snapshot.status.degraded_roots {
-            degraded_root_map.entry(root_key).or_insert(reason);
-        }
     }
 
     merged.grants = grant_map.into_values().collect();
     merged.logical_roots = root_map.into_values().collect();
-    merged.status.logical_roots = logical_root_map.into_values().collect();
-    merged.status.concrete_roots = concrete_root_map.into_values().collect();
-    merged.status.degraded_roots = degraded_root_map.into_iter().collect();
+    merged.status = merge_source_status_snapshots(status_snapshots);
     if saw_non_cache_live_snapshot {
         merged.status.degraded_roots.retain(|(root_key, reason)| {
             !(root_key == "source-worker" && reason == "source worker status served from cache")
@@ -10416,6 +10444,217 @@ mod tests {
                 .expect("sent routes lock")
                 .contains(&node_b_route),
             "missing nfs2 source status must be requested from the current source owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_status_source_fanin_queries_owner_when_generic_reply_has_pending_concrete_root()
+     {
+        let roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = roots.clone();
+        authoritative.grants = vec![grant_for_node_root("node-b", "nfs1")];
+        set_live_group_primary_source_root(&mut authoritative, "nfs1", "node-b");
+        authoritative.source_primary_by_group =
+            BTreeMap::from([("nfs1".to_string(), "node-b::nfs1".to_string())]);
+        authoritative.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-b".to_string(), vec!["nfs1".to_string()])]);
+        authoritative.scheduled_scan_groups_by_node =
+            authoritative.scheduled_source_groups_by_node.clone();
+
+        let mut generic_pending = authoritative.clone();
+        generic_pending.status.concrete_roots[0].rescan_pending = true;
+        generic_pending.status.concrete_roots[0].last_rescan_requested_at_us = Some(100);
+        generic_pending.status.concrete_roots[0].last_audit_started_at_us = None;
+        generic_pending.status.concrete_roots[0].last_audit_completed_at_us = None;
+        generic_pending.status.concrete_roots[0].last_audit_duration_ms = None;
+
+        let mut owner_ready = authoritative.clone();
+        owner_ready.status.concrete_roots[0].rescan_pending = false;
+        owner_ready.status.concrete_roots[0].last_rescan_requested_at_us = Some(100);
+        owner_ready.status.concrete_roots[0].last_audit_started_at_us = Some(110);
+        owner_ready.status.concrete_roots[0].last_audit_completed_at_us = Some(120);
+        owner_ready.status.concrete_roots[0].last_audit_duration_ms = Some(0);
+
+        let node_b_route = source_status_request_route_for("node-b").0;
+        let boundary = Arc::new(NodeScopedSourceStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                node_b_route.clone(),
+                ("node-b".to_string(), owner_ready),
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let augmented = augment_management_status_source_with_owner_scoped_evidence(
+            generic_pending,
+            &authoritative,
+            Some(boundary.clone()),
+            NodeId("node-a".to_string()),
+        )
+        .await;
+
+        let concrete = augmented
+            .status
+            .concrete_roots
+            .iter()
+            .find(|root| root.logical_root_id == "nfs1")
+            .expect("nfs1 concrete root");
+        assert!(
+            !concrete.rescan_pending,
+            "owner-scoped source-status must clear stale generic pending concrete-root evidence"
+        );
+        assert_eq!(concrete.last_audit_completed_at_us, Some(120));
+        assert!(
+            boundary
+                .sent_routes
+                .lock()
+                .expect("sent routes lock")
+                .contains(&node_b_route),
+            "pending generic concrete-root evidence must request current source owner status"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_status_source_fanin_uses_authoritative_grants_when_route_maps_are_absent() {
+        let roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = roots.clone();
+        authoritative.grants = vec![grant_for_node_root("node-b", "nfs1")];
+        authoritative.source_primary_by_group.clear();
+        authoritative.scheduled_source_groups_by_node.clear();
+        authoritative.scheduled_scan_groups_by_node.clear();
+
+        let mut generic_pending = authoritative.clone();
+        set_live_group_primary_source_root(&mut generic_pending, "nfs1", "node-b");
+        generic_pending.status.concrete_roots[0].rescan_pending = true;
+        generic_pending.status.concrete_roots[0].last_rescan_requested_at_us = Some(100);
+        generic_pending.status.concrete_roots[0].last_audit_started_at_us = None;
+        generic_pending.status.concrete_roots[0].last_audit_completed_at_us = None;
+        generic_pending.status.concrete_roots[0].last_audit_duration_ms = None;
+        generic_pending.source_primary_by_group.clear();
+        generic_pending.scheduled_source_groups_by_node.clear();
+        generic_pending.scheduled_scan_groups_by_node.clear();
+
+        let mut owner_ready = authoritative.clone();
+        set_live_group_primary_source_root(&mut owner_ready, "nfs1", "node-b");
+        owner_ready.status.concrete_roots[0].rescan_pending = false;
+        owner_ready.status.concrete_roots[0].last_rescan_requested_at_us = Some(100);
+        owner_ready.status.concrete_roots[0].last_audit_started_at_us = Some(110);
+        owner_ready.status.concrete_roots[0].last_audit_completed_at_us = Some(120);
+        owner_ready.status.concrete_roots[0].last_audit_duration_ms = Some(0);
+
+        let node_b_route = source_status_request_route_for("node-b").0;
+        let boundary = Arc::new(NodeScopedSourceStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                node_b_route.clone(),
+                ("node-b".to_string(), owner_ready),
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let augmented = augment_management_status_source_with_owner_scoped_evidence(
+            generic_pending,
+            &authoritative,
+            Some(boundary.clone()),
+            NodeId("node-a".to_string()),
+        )
+        .await;
+
+        let concrete = augmented
+            .status
+            .concrete_roots
+            .iter()
+            .find(|root| root.logical_root_id == "nfs1")
+            .expect("nfs1 concrete root");
+        assert!(
+            !concrete.rescan_pending,
+            "authoritative roots/grants must be enough to locate the current owner when route debug maps are absent"
+        );
+        assert!(
+            boundary
+                .sent_routes
+                .lock()
+                .expect("sent routes lock")
+                .contains(&node_b_route),
+            "owner-scoped source-status must fall back to authoritative grants, not depend on debug route maps"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_status_source_fanin_uses_status_roots_when_config_roots_are_absent() {
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots.clear();
+        authoritative.grants.clear();
+        authoritative.source_primary_by_group.clear();
+        authoritative.scheduled_source_groups_by_node.clear();
+        authoritative.scheduled_scan_groups_by_node.clear();
+        authoritative.status.logical_roots.clear();
+        authoritative
+            .status
+            .logical_roots
+            .push(SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".to_string(),
+                status: String::new(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "selected-group".to_string(),
+            });
+        set_live_group_primary_source_root(&mut authoritative, "nfs1", "node-b");
+
+        let mut generic_pending = authoritative.clone();
+        generic_pending.status.concrete_roots[0].rescan_pending = true;
+        generic_pending.status.concrete_roots[0].last_rescan_requested_at_us = Some(100);
+        generic_pending.status.concrete_roots[0].last_audit_started_at_us = None;
+        generic_pending.status.concrete_roots[0].last_audit_completed_at_us = None;
+        generic_pending.status.concrete_roots[0].last_audit_duration_ms = None;
+
+        let mut owner_ready = authoritative.clone();
+        owner_ready.status.concrete_roots[0].rescan_pending = false;
+        owner_ready.status.concrete_roots[0].last_rescan_requested_at_us = Some(100);
+        owner_ready.status.concrete_roots[0].last_audit_started_at_us = Some(110);
+        owner_ready.status.concrete_roots[0].last_audit_completed_at_us = Some(120);
+        owner_ready.status.concrete_roots[0].last_audit_duration_ms = Some(0);
+
+        let node_b_route = source_status_request_route_for("node-b").0;
+        let boundary = Arc::new(NodeScopedSourceStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                node_b_route.clone(),
+                ("node-b".to_string(), owner_ready),
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let augmented = augment_management_status_source_with_owner_scoped_evidence(
+            generic_pending,
+            &authoritative,
+            Some(boundary.clone()),
+            NodeId("node-a".to_string()),
+        )
+        .await;
+
+        let concrete = augmented
+            .status
+            .concrete_roots
+            .iter()
+            .find(|root| root.logical_root_id == "nfs1")
+            .expect("nfs1 concrete root");
+        assert!(
+            !concrete.rescan_pending,
+            "management status must not skip owner evidence when runtime-scope cache carries status roots but not config roots"
+        );
+        assert!(
+            boundary
+                .sent_routes
+                .lock()
+                .expect("sent routes lock")
+                .contains(&node_b_route),
+            "status root/concrete object_ref evidence must identify the owner route"
         );
     }
 

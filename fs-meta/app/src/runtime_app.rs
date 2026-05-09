@@ -46,7 +46,7 @@ use crate::runtime::routes::{
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::workers::sink::{SinkFacade, SinkFailure, SinkWorkerClientHandle};
 use crate::workers::source::{
-    SourceFacade, SourceFailure, SourceWorkerClientHandle,
+    SourceFacade, SourceFailure, SourcePumpHandle, SourceWorkerClientHandle,
     annotate_manual_rescan_route_receivable_evidence,
 };
 use crate::{FSMetaConfig, api, source};
@@ -73,7 +73,6 @@ use capanix_runtime_entry_sdk::worker_runtime::RuntimeWorkerClientFactory;
 use capanix_runtime_entry_sdk::{RuntimeBootstrapContext, RuntimeLoadedServiceApp};
 use capanix_service_sdk::AppBuilder;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 
 use crate::sink::SinkFileMeta;
 #[cfg(test)]
@@ -6546,7 +6545,7 @@ pub struct FSMetaApp {
     source: Arc<SourceFacade>,
     sink: Arc<SinkFacade>,
     query_sink: Arc<SinkFacade>,
-    pump_task: Mutex<Option<JoinHandle<()>>>,
+    pump_task: Mutex<Option<SourcePumpHandle>>,
     runtime_endpoint_tasks: Mutex<Vec<ManagedEndpointTask>>,
     runtime_endpoint_routes: Mutex<std::collections::BTreeSet<String>>,
     api_task: Arc<Mutex<Option<FacadeActivation>>>,
@@ -10119,11 +10118,11 @@ impl FSMetaApp {
             ));
         }
         for (route, endpoint_unit_ids) in source_status_endpoint_routes {
-            if !source_active
-                || endpoint_unit_ids.is_empty()
+            if endpoint_unit_ids.is_empty()
                 || !spawned_routes.insert(route.0.clone())
+                || !route_still_active_for_units(&self.facade_gate, &route.0, &endpoint_unit_ids)
             {
-                // Not currently selected as source-status owner, or already running.
+                // Not currently selected as source-status owner, route inactive, or already running.
             } else {
                 let facade_service_state = self.facade_service_state.clone();
                 let api_task = self.api_task.clone();
@@ -10230,6 +10229,10 @@ impl FSMetaApp {
                                     crate::query::api::source_status_request_requires_manual_rescan_delivery_evidence(
                                         req.payload_bytes(),
                                     );
+                                let current_owner_health_evidence =
+                                    crate::query::api::source_status_request_requires_current_owner_health_evidence(
+                                        req.payload_bytes(),
+                                    );
                                 let source_status_live_probe_timeout =
                                     crate::query::api::source_status_request_live_probe_timeout(
                                         req.payload_bytes(),
@@ -10261,7 +10264,13 @@ impl FSMetaApp {
                                             .unwrap_or_else(tokio::time::Instant::now)
                                     });
                                 let (snapshot, used_cached_fallback) =
-                                    if manual_rescan_delivery_evidence {
+                                    if current_owner_health_evidence {
+                                        source
+                                            .current_owner_health_observability_snapshot_for_status_route_with_timeout(
+                                                source_status_live_probe_timeout,
+                                            )
+                                            .await
+                                    } else if manual_rescan_delivery_evidence {
                                         let runtime_state = RuntimeControlState::from_state_cell(
                                             &runtime_gate_state_for_source_status,
                                         );
@@ -10833,16 +10842,13 @@ impl FSMetaApp {
             }
         }
         let scoped_source_rescan_route = source_rescan_request_route_for(&self.node_id.0);
-        let source_rescan_routes = if source_active {
-            self.facade_gate
-                .active_route_keys(execution_units::SOURCE_RUNTIME_UNIT_ID)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|route_key| is_scoped_source_rescan_request_route(route_key))
-                .collect::<std::collections::BTreeSet<_>>()
-        } else {
-            std::collections::BTreeSet::new()
-        };
+        let source_rescan_routes = self
+            .facade_gate
+            .active_route_keys(execution_units::SOURCE_RUNTIME_UNIT_ID)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|route_key| is_scoped_source_rescan_request_route(route_key))
+            .collect::<std::collections::BTreeSet<_>>();
         for source_rescan_route_key in source_rescan_routes {
             if source_rescan_route_key == scoped_source_rescan_route.0 {
                 if matches!(&*self.source, SourceFacade::Worker(_))
