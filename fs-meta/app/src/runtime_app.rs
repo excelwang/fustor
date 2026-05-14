@@ -77,6 +77,7 @@ use tokio::sync::Mutex;
 use crate::sink::SinkFileMeta;
 #[cfg(test)]
 use crate::sink::{SinkGroupStatusSnapshot, SinkStatusSnapshot};
+use crate::source::SourceTargetedRescanDeliveryAcceptance;
 #[cfg(test)]
 use crate::source::config::SourceConfig;
 
@@ -4259,6 +4260,20 @@ fn selected_group_empty_materialized_reply(
     )))
 }
 
+fn sink_query_proxy_error_reply(err: &CnxError, correlation_id: Option<u64>) -> Event {
+    Event::new(
+        EventMetadata {
+            origin_id: NodeId("sink-query-proxy".to_string()),
+            timestamp_us: now_us(),
+            logical_ts: None,
+            correlation_id,
+            ingress_auth: None,
+            trace: None,
+        },
+        bytes::Bytes::from(err.to_string()),
+    )
+}
+
 fn explicit_empty_sink_status_reply(
     origin_id: &NodeId,
     correlation_id: Option<u64>,
@@ -4297,16 +4312,20 @@ fn selected_group_bridge_eligible_from_sink_status(
     selected_group_bridge_state_from_sink_status(request, snapshot, selected_group).eligible()
 }
 
-fn node_id_from_object_ref(object_ref: &str) -> Option<NodeId> {
-    object_ref
-        .split_once("::")
-        .map(|(node_id, _)| NodeId(node_id.to_string()))
-}
-
 fn scheduled_sink_owner_node_for_group(
     snapshot: &crate::sink::SinkStatusSnapshot,
     group_id: &str,
 ) -> Option<NodeId> {
+    if let Some(node_id) = snapshot
+        .primary_host_ref_by_group
+        .get(group_id)
+        .map(|host_ref| host_ref.trim())
+        .filter(|host_ref| !host_ref.is_empty())
+        .map(|host_ref| NodeId(host_ref.to_string()))
+    {
+        return Some(node_id);
+    }
+
     let mut scheduled_nodes = snapshot
         .scheduled_groups_by_node
         .iter()
@@ -4315,18 +4334,6 @@ fn scheduled_sink_owner_node_for_group(
         .collect::<Vec<_>>();
     scheduled_nodes.sort_by(|a, b| a.0.cmp(&b.0));
     scheduled_nodes.dedup_by(|a, b| a.0 == b.0);
-
-    if let Some(primary_node) = snapshot
-        .groups
-        .iter()
-        .find(|group| group.group_id == group_id)
-        .and_then(|group| node_id_from_object_ref(&group.primary_object_ref))
-    {
-        if scheduled_nodes.is_empty() || scheduled_nodes.iter().any(|node| node.0 == primary_node.0)
-        {
-            return Some(primary_node);
-        }
-    }
 
     scheduled_nodes.into_iter().next()
 }
@@ -4375,11 +4382,7 @@ fn selected_group_bridge_state_from_sink_status(
         .find(|group| group.group_id == selected_group)
         .map(|group| selected_group_bridge_group_readiness_rank(request, group))
         .unwrap_or(0);
-    let owner_node = if readiness_rank > 0 {
-        scheduled_sink_owner_node_for_group(snapshot, selected_group)
-    } else {
-        None
-    };
+    let owner_node = scheduled_sink_owner_node_for_group(snapshot, selected_group);
     SelectedGroupBridgeState {
         readiness_rank,
         owner_node,
@@ -4438,18 +4441,15 @@ fn selected_group_sink_query_bridge_bindings(
         return default_route_bindings();
     };
     let state = selected_group_bridge_state_from_sink_status(request, snapshot, selected_group);
-    if !state.eligible() {
-        return default_route_bindings();
-    }
     if let Some(owner_node) = state.owner_node {
         return sink_query_route_bindings_for(&owner_node.0);
     }
     default_route_bindings()
 }
 
-fn selected_group_payload_has_materialized_data(
+fn selected_group_tree_payload_has_materialized_data(
     request: &InternalQueryRequest,
-    payload: &MaterializedQueryPayload,
+    payload: &TreeGroupPayload,
 ) -> bool {
     let trusted_root_tree_request = request.op == crate::query::QueryOp::Tree
         && request.scope.path.as_slice() == b"/"
@@ -4457,16 +4457,36 @@ fn selected_group_payload_has_materialized_data(
         && request.tree_options.as_ref().is_some_and(|options| {
             options.read_class == crate::query::ReadClass::TrustedMaterialized
         });
+    if trusted_root_tree_request {
+        payload.root.exists && (payload.root.has_children || !payload.entries.is_empty())
+    } else {
+        payload.root.exists || payload.root.has_children || !payload.entries.is_empty()
+    }
+}
+
+fn selected_group_payload_has_materialized_data(
+    request: &InternalQueryRequest,
+    payload: &MaterializedQueryPayload,
+) -> bool {
     match payload {
         MaterializedQueryPayload::Tree(payload) => {
-            if trusted_root_tree_request {
-                payload.root.exists && (payload.root.has_children || !payload.entries.is_empty())
-            } else {
-                payload.root.exists || payload.root.has_children || !payload.entries.is_empty()
-            }
+            selected_group_tree_payload_has_materialized_data(request, payload)
         }
         MaterializedQueryPayload::Stats(_) => false,
     }
+}
+
+fn selected_group_tree_payload_is_proxy_empty_placeholder(
+    request: &InternalQueryRequest,
+    payload: &TreeGroupPayload,
+) -> bool {
+    payload.root.path == request.scope.path
+        && !payload.root.exists
+        && !payload.root.has_children
+        && payload.entries.is_empty()
+        && payload.root.modified_time_us == 0
+        && payload.reliability.unreliable_reason
+            == Some(crate::shared_types::query::UnreliableReason::Unattested)
 }
 
 fn should_bridge_selected_group_sink_query(
@@ -4510,7 +4530,10 @@ fn should_bridge_selected_group_sink_query(
     if has_selected_group_tree_payload && trusted_non_root_unbounded_tree_request {
         return false;
     }
-    if has_selected_group_tree_payload && !trusted_tree_request {
+    if has_selected_group_tree_payload
+        && !trusted_tree_request
+        && local_selected_group_bridge_eligible
+    {
         return false;
     }
     let has_materialized_tree_data = local_events.iter().any(|event| {
@@ -4520,10 +4543,7 @@ fn should_bridge_selected_group_sink_query(
         )
     });
     if !local_selected_group_bridge_eligible {
-        return trusted_tree_request
-            && local_events.is_empty()
-            && !selected_group_tree_has_materialized_data
-            && !has_materialized_tree_data;
+        return !selected_group_tree_has_materialized_data && !has_materialized_tree_data;
     }
     !has_materialized_tree_data
 }
@@ -4569,7 +4589,7 @@ fn selected_group_sink_query_bridge_decision_without_status(
         return Some(false);
     }
     if has_selected_group_tree_payload && !trusted_tree_request {
-        return Some(false);
+        return None;
     }
     let has_materialized_tree_data = local_events.iter().any(|event| {
         matches!(
@@ -4581,6 +4601,40 @@ fn selected_group_sink_query_bridge_decision_without_status(
         return Some(false);
     }
     None
+}
+
+fn discard_selected_group_empty_tree_payloads_shadowed_by_data(
+    request: &InternalQueryRequest,
+    events: &mut Vec<Event>,
+) {
+    if request.op != crate::query::QueryOp::Tree {
+        return;
+    }
+    let Some(selected_group) = request.scope.selected_group.as_deref() else {
+        return;
+    };
+    let has_selected_group_data = events.iter().any(|event| {
+        event.metadata().origin_id.0 == selected_group
+            && matches!(
+                rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes()),
+                Ok(MaterializedQueryPayload::Tree(payload))
+                    if payload.root.path == request.scope.path
+                        && selected_group_tree_payload_has_materialized_data(request, &payload)
+            )
+    });
+    if !has_selected_group_data {
+        return;
+    }
+    events.retain(|event| {
+        if event.metadata().origin_id.0 != selected_group {
+            return true;
+        }
+        !matches!(
+            rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes()),
+            Ok(MaterializedQueryPayload::Tree(payload))
+                if selected_group_tree_payload_is_proxy_empty_placeholder(request, &payload)
+        )
+    });
 }
 
 fn should_fail_closed_selected_group_empty_after_bridge_failure(
@@ -10305,8 +10359,55 @@ impl FSMetaApp {
                                                         trace_id
                                                     );
                                                 }
+                                                let delivery_acceptance =
+                                                    if source_rescan_proxy_ready {
+                                                        let acceptance_budget = probe_deadline
+                                                            .saturating_duration_since(
+                                                                tokio::time::Instant::now(),
+                                                            );
+                                                        if acceptance_budget.is_zero() {
+                                                            SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
+                                                        } else {
+                                                            match tokio::time::timeout(
+                                                            acceptance_budget,
+                                                            source
+                                                                .targeted_rescan_delivery_acceptance_with_failure(),
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(Ok(acceptance)) => acceptance,
+                                                            Ok(Err(err)) => {
+                                                                eprintln!(
+                                                                    "fs_meta_runtime_app: source status endpoint manual-rescan delivery acceptance check failed node={} correlation={:?} trace_id={} budget_ms={} err={}",
+                                                                    node_id.0,
+                                                                    req.metadata().correlation_id,
+                                                                    trace_id,
+                                                                    probe_budget.as_millis(),
+                                                                    err.as_error()
+                                                                );
+                                                                SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
+                                                            }
+                                                            Err(_) => {
+                                                                eprintln!(
+                                                                    "fs_meta_runtime_app: source status endpoint manual-rescan delivery acceptance check timed out node={} correlation={:?} trace_id={} budget_ms={}",
+                                                                    node_id.0,
+                                                                    req.metadata().correlation_id,
+                                                                    trace_id,
+                                                                    probe_budget.as_millis()
+                                                                );
+                                                                SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
+                                                            }
+                                                        }
+                                                        }
+                                                    } else {
+                                                        SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
+                                                    };
+                                                let delivery_accepted = matches!(
+                                                    delivery_acceptance,
+                                                    SourceTargetedRescanDeliveryAcceptance::Accepted
+                                                );
                                                 let (mut snapshot, used_cached_fallback) =
-                                                    if source_rescan_proxy_ready
+                                                    if delivery_accepted
                                                         && let Some(snapshot) = source
                                                             .manual_rescan_app_route_observability_snapshot_for_status_route()
                                                             .await
@@ -10317,7 +10418,7 @@ impl FSMetaApp {
                                                             .source_state_pending_observability_snapshot_for_status_route()
                                                             .await
                                                     };
-                                                if source_rescan_proxy_ready {
+                                                if delivery_accepted {
                                                     annotate_manual_rescan_route_receivable_evidence(
                                                         &mut snapshot,
                                                         &node_id,
@@ -10339,7 +10440,7 @@ impl FSMetaApp {
                                                     {
                                                         Ok(result) => result,
                                                         Err(_) => {
-                                                            Err(SourceFailure::from(CnxError::Timeout))
+                                                        Err(SourceFailure::from(CnxError::Timeout))
                                                         }
                                                     }
                                                 };
@@ -10354,10 +10455,85 @@ impl FSMetaApp {
                                                     );
                                                     continue;
                                                 }
+                                                let source_rescan_proxy_ready =
+                                                    source_rescan_proxy_ready_for_current_generation(
+                                                        &facade_gate_for_source_status,
+                                                        &source_rescan_proxy_route_key,
+                                                        &source_rescan_proxy_ready_generation,
+                                                    );
                                                 if !source_rescan_proxy_ready {
                                                     continue;
-                                                };
-                                                None
+                                                }
+                                                let acceptance_budget = probe_deadline
+                                                    .saturating_duration_since(
+                                                        tokio::time::Instant::now(),
+                                                    );
+                                                if acceptance_budget.is_zero() {
+                                                    Some(
+                                                        source
+                                                            .source_state_pending_observability_snapshot_for_status_route()
+                                                            .await,
+                                                    )
+                                                } else {
+                                                    let delivery_acceptance = match tokio::time::timeout(
+                                                        acceptance_budget,
+                                                        source
+                                                            .targeted_rescan_delivery_acceptance_with_failure(),
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(Ok(acceptance)) => acceptance,
+                                                        Ok(Err(err)) => {
+                                                            eprintln!(
+                                                                "fs_meta_runtime_app: source status endpoint manual-rescan local delivery acceptance check failed node={} correlation={:?} trace_id={} budget_ms={} err={}",
+                                                                node_id.0,
+                                                                req.metadata().correlation_id,
+                                                                trace_id,
+                                                                probe_budget.as_millis(),
+                                                                err.as_error()
+                                                            );
+                                                            SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
+                                                        }
+                                                        Err(_) => {
+                                                            eprintln!(
+                                                                "fs_meta_runtime_app: source status endpoint manual-rescan local delivery acceptance check timed out node={} correlation={:?} trace_id={} budget_ms={}",
+                                                                node_id.0,
+                                                                req.metadata().correlation_id,
+                                                                trace_id,
+                                                                probe_budget.as_millis()
+                                                            );
+                                                            SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
+                                                        }
+                                                    };
+                                                    if !matches!(
+                                                        delivery_acceptance,
+                                                        SourceTargetedRescanDeliveryAcceptance::Accepted
+                                                    ) {
+                                                        Some(
+                                                            source
+                                                                .source_state_pending_observability_snapshot_for_status_route()
+                                                                .await,
+                                                        )
+                                                    } else {
+                                                let snapshot_budget = probe_deadline
+                                                    .saturating_duration_since(
+                                                        tokio::time::Instant::now(),
+                                                    );
+                                                let (
+                                                    mut snapshot,
+                                                    used_cached_fallback,
+                                                ) = source
+                                                    .observability_snapshot_nonblocking_for_status_route_with_timeout(
+                                                        Some(snapshot_budget),
+                                                    )
+                                                    .await;
+                                                annotate_manual_rescan_route_receivable_evidence(
+                                                    &mut snapshot,
+                                                    &node_id,
+                                                );
+                                                Some((snapshot, used_cached_fallback))
+                                                    }
+                                                }
                                             };
                                             if let Some(snapshot) = non_target_status_snapshot {
                                                 snapshot
@@ -10707,15 +10883,19 @@ impl FSMetaApp {
                                                     )
                                                     .await
                                                     {
-                                                        Ok(mut bridged) => {
-                                                            if trace_sink_query_route {
-                                                                eprintln!(
-                                                                    "fs_meta_runtime_app: sink query proxy bridged internal sink query events={}",
-                                                                    bridged.len()
-                                                                );
-                                                            }
-                                                            events.append(&mut bridged);
-                                                        }
+	                                                            Ok(mut bridged) => {
+	                                                                if trace_sink_query_route {
+	                                                                    eprintln!(
+	                                                                        "fs_meta_runtime_app: sink query proxy bridged internal sink query events={}",
+	                                                                        bridged.len()
+	                                                                    );
+	                                                                }
+	                                                                events.append(&mut bridged);
+	                                                                discard_selected_group_empty_tree_payloads_shadowed_by_data(
+	                                                                    &params,
+	                                                                    &mut events,
+	                                                                );
+	                                                            }
                                                         Err(err) => {
                                                             eprintln!(
                                                                 "fs_meta_runtime_app: sink query proxy bridge failed err={}",
@@ -10811,24 +10991,9 @@ impl FSMetaApp {
                                                 "fs_meta_runtime_app: sink query proxy failed err={}",
                                                 err
                                             );
-                                            responses.push(Event::new(
-                                                EventMetadata {
-                                                    origin_id: NodeId(
-                                                        params
-                                                            .scope
-                                                            .selected_group
-                                                            .clone()
-                                                            .unwrap_or_else(|| {
-                                                                "sink-query-proxy".to_string()
-                                                            }),
-                                                    ),
-                                                    timestamp_us: now_us(),
-                                                    logical_ts: None,
-                                                    correlation_id: req.metadata().correlation_id,
-                                                    ingress_auth: None,
-                                                    trace: None,
-                                                },
-                                                bytes::Bytes::from(err.to_string()),
+                                            responses.push(sink_query_proxy_error_reply(
+                                                &err,
+                                                req.metadata().correlation_id,
                                             ));
                                         }
                                     }

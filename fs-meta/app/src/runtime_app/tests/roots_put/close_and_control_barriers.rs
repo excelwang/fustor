@@ -1095,11 +1095,18 @@
             "roots_put must not dispatch source update_logical_roots before runtime control initializes the restarted app"
         );
 
+        let mut update_after_control = std::pin::pin!(update_entered.notified());
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(update_after_control.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+
         app.on_control_frame(&[activate_envelope("runtime.exec.source")])
             .await
             .expect("initialize app from runtime control");
 
-        update_entered.notified().await;
+        update_after_control.await;
         update_release.notify_waiters();
 
         let response = request

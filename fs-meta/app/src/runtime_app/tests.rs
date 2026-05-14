@@ -2205,6 +2205,22 @@ fn selected_group_empty_materialized_reply_skips_missing_or_unselected_groups() 
 }
 
 #[test]
+fn sink_query_proxy_error_reply_uses_diagnostic_origin_not_selected_group() {
+    let event = sink_query_proxy_error_reply(&CnxError::Timeout, Some(71));
+
+    assert_eq!(
+        event.metadata().origin_id,
+        NodeId("sink-query-proxy".to_string())
+    );
+    assert_ne!(
+        event.metadata().origin_id,
+        NodeId("nfs2".to_string()),
+        "sink-query-proxy transport errors must not masquerade as selected-group materialized payloads"
+    );
+    assert_eq!(event.metadata().correlation_id, Some(71));
+}
+
+#[test]
 fn selected_group_tree_missing_local_payload_requires_sink_query_bridge() {
     let request = query::InternalQueryRequest::materialized(
         query::QueryOp::Tree,
@@ -2267,6 +2283,157 @@ fn selected_group_tree_nonempty_local_payload_skips_sink_query_bridge() {
         &[local_event],
         true,
     ));
+}
+
+#[test]
+fn selected_group_query_proxy_discards_empty_payload_when_bridged_data_exists() {
+    let request = query::InternalQueryRequest::materialized(
+        query::QueryOp::Tree,
+        query::QueryScope {
+            path: b"/force-find-stress".to_vec(),
+            recursive: true,
+            max_depth: None,
+            selected_group: Some("nfs2".to_string()),
+        },
+        Some(query::TreeQueryOptions {
+            read_class: query::ReadClass::Materialized,
+        }),
+    );
+    let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
+        .expect("build empty reply")
+        .expect("selected-group reply");
+    let payload = rmp_serde::to_vec_named(&query::MaterializedQueryPayload::Tree(
+        query::TreeGroupPayload {
+            reliability: query::GroupReliability {
+                reliable: true,
+                unreliable_reason: None,
+            },
+            stability: query::TreeStability::not_evaluated(),
+            root: query::TreePageRoot {
+                path: b"/force-find-stress".to_vec(),
+                size: 0,
+                modified_time_us: 1,
+                is_dir: true,
+                exists: true,
+                has_children: true,
+            },
+            entries: Vec::new(),
+        },
+    ))
+    .expect("encode non-empty tree payload");
+    let data_event = Event::new(
+        EventMetadata {
+            origin_id: NodeId("nfs2".to_string()),
+            timestamp_us: 1,
+            logical_ts: None,
+            correlation_id: Some(11),
+            ingress_auth: None,
+            trace: None,
+        },
+        Bytes::from(payload),
+    );
+    let mut events = vec![empty_event, data_event];
+
+    discard_selected_group_empty_tree_payloads_shadowed_by_data(&request, &mut events);
+
+    assert_eq!(
+        events.len(),
+        1,
+        "proxy must not return non-owner empty placeholders alongside bridged materialized data"
+    );
+    let query::MaterializedQueryPayload::Tree(payload) =
+        rmp_serde::from_slice(events[0].payload_bytes()).expect("decode retained payload")
+    else {
+        panic!("retained payload must be a tree");
+    };
+    assert!(payload.root.exists);
+    assert!(payload.root.has_children);
+}
+
+#[test]
+fn selected_group_query_proxy_keeps_real_empty_payload_when_data_also_exists() {
+    let request = query::InternalQueryRequest::materialized(
+        query::QueryOp::Tree,
+        query::QueryScope {
+            path: b"/force-find-stress".to_vec(),
+            recursive: true,
+            max_depth: None,
+            selected_group: Some("nfs2".to_string()),
+        },
+        Some(query::TreeQueryOptions {
+            read_class: query::ReadClass::Materialized,
+        }),
+    );
+    let real_empty_payload = rmp_serde::to_vec_named(&query::MaterializedQueryPayload::Tree(
+        query::TreeGroupPayload {
+            reliability: query::GroupReliability {
+                reliable: true,
+                unreliable_reason: None,
+            },
+            stability: query::TreeStability::not_evaluated(),
+            root: query::TreePageRoot {
+                path: b"/force-find-stress".to_vec(),
+                size: 0,
+                modified_time_us: 9,
+                is_dir: true,
+                exists: false,
+                has_children: false,
+            },
+            entries: Vec::new(),
+        },
+    ))
+    .expect("encode real empty tree payload");
+    let data_payload = rmp_serde::to_vec_named(&query::MaterializedQueryPayload::Tree(
+        query::TreeGroupPayload {
+            reliability: query::GroupReliability {
+                reliable: true,
+                unreliable_reason: None,
+            },
+            stability: query::TreeStability::not_evaluated(),
+            root: query::TreePageRoot {
+                path: b"/force-find-stress".to_vec(),
+                size: 0,
+                modified_time_us: 1,
+                is_dir: true,
+                exists: true,
+                has_children: true,
+            },
+            entries: Vec::new(),
+        },
+    ))
+    .expect("encode data tree payload");
+    let mut events = vec![
+        Event::new(
+            EventMetadata {
+                origin_id: NodeId("nfs2".to_string()),
+                timestamp_us: 9,
+                logical_ts: None,
+                correlation_id: Some(11),
+                ingress_auth: None,
+                trace: None,
+            },
+            Bytes::from(real_empty_payload),
+        ),
+        Event::new(
+            EventMetadata {
+                origin_id: NodeId("nfs2".to_string()),
+                timestamp_us: 1,
+                logical_ts: None,
+                correlation_id: Some(11),
+                ingress_auth: None,
+                trace: None,
+            },
+            Bytes::from(data_payload),
+        ),
+    ];
+
+    discard_selected_group_empty_tree_payloads_shadowed_by_data(&request, &mut events);
+
+    assert_eq!(
+        events.len(),
+        2,
+        "real empty materialized observations are delete-aware facts and must not be discarded as proxy placeholders"
+    );
 }
 
 #[test]
@@ -2340,7 +2507,7 @@ fn selected_group_stats_payload_resolves_bridge_without_sink_status() {
 }
 
 #[test]
-fn selected_group_tree_empty_payload_skips_sink_query_bridge_when_no_local_sink_groups() {
+fn selected_group_tree_empty_payload_requires_sink_query_bridge_when_local_group_not_ready() {
     let request = query::InternalQueryRequest::materialized(
         query::QueryOp::Tree,
         query::QueryScope {
@@ -2349,13 +2516,15 @@ fn selected_group_tree_empty_payload_skips_sink_query_bridge_when_no_local_sink_
             max_depth: None,
             selected_group: Some("nfs2".to_string()),
         },
-        Some(query::TreeQueryOptions::default()),
+        Some(query::TreeQueryOptions {
+            read_class: query::ReadClass::Materialized,
+        }),
     );
     let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
         .expect("build empty reply")
         .expect("selected-group reply");
 
-    assert!(!should_bridge_selected_group_sink_query(
+    assert!(should_bridge_selected_group_sink_query(
         &request,
         &[empty_event],
         false,
@@ -2363,7 +2532,7 @@ fn selected_group_tree_empty_payload_skips_sink_query_bridge_when_no_local_sink_
 }
 
 #[test]
-fn selected_group_tree_empty_payload_skips_sink_query_bridge_when_selected_group_missing_locally() {
+fn selected_group_tree_empty_payload_requires_sink_status_before_bridge_decision() {
     let request = query::InternalQueryRequest::materialized(
         query::QueryOp::Tree,
         query::QueryScope {
@@ -2372,17 +2541,19 @@ fn selected_group_tree_empty_payload_skips_sink_query_bridge_when_selected_group
             max_depth: None,
             selected_group: Some("nfs2".to_string()),
         },
-        Some(query::TreeQueryOptions::default()),
+        Some(query::TreeQueryOptions {
+            read_class: query::ReadClass::Materialized,
+        }),
     );
     let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
         .expect("build empty reply")
         .expect("selected-group reply");
 
-    assert!(!should_bridge_selected_group_sink_query(
-        &request,
-        &[empty_event],
-        false,
-    ));
+    assert_eq!(
+        selected_group_sink_query_bridge_decision_without_status(&request, &[empty_event]),
+        None,
+        "an empty selected-group materialized tree reply needs local sink-status to distinguish owner absence from a real empty tree"
+    );
 }
 
 #[test]
@@ -2724,6 +2895,52 @@ fn trusted_root_selected_group_ready_sink_status_uses_owner_scoped_sink_query_ro
         route.0,
         sink_query_request_route_for("node-a").0,
         "ready trusted-materialized selected-group sink query bridge should target the owner-scoped sink route instead of the broad internal route"
+    );
+}
+
+#[test]
+fn selected_group_bridge_routes_to_declared_owner_even_when_local_group_not_ready() {
+    let request = query::InternalQueryRequest::materialized(
+        query::QueryOp::Tree,
+        query::QueryScope {
+            path: b"/".to_vec(),
+            recursive: true,
+            max_depth: None,
+            selected_group: Some("nfs4".to_string()),
+        },
+        Some(query::TreeQueryOptions {
+            read_class: query::ReadClass::TrustedMaterialized,
+        }),
+    );
+    let snapshot = SinkStatusSnapshot {
+        groups: vec![SinkGroupStatusSnapshot {
+            group_id: "nfs4".to_string(),
+            primary_object_ref: "node-a::nfs4".to_string(),
+            total_nodes: 0,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+            materialized_revision: 0,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+
+    let route = selected_group_sink_query_bridge_bindings(&request, Some(&snapshot))
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY)
+        .expect("resolve selected-group sink query bridge route with declared owner");
+
+    assert_eq!(
+        route.0,
+        sink_query_request_route_for("node-a").0,
+        "selected-group bridge should target the declared owner instead of broadcasting when local status is not materialized yet"
     );
 }
 
@@ -22943,7 +23160,7 @@ async fn worker_backed_scoped_source_rescan_route_rejects_without_local_primary_
         scoped_events
             .iter()
             .all(|event| event.payload_bytes() != b"accepted"),
-        "scoped source-rescan must not accept on a target with no local source-primary scan root; got {scoped_events:?}"
+        "scoped source-rescan must not accept on a target with no local scheduled scan root; got {scoped_events:?}"
     );
 
     app.close().await.expect("close app");
@@ -23303,6 +23520,31 @@ async fn manual_rescan_source_status_rearms_worker_scoped_rescan_endpoint_after_
     assert!(
         !status_events.is_empty(),
         "manual-rescan source-status must emit delivery evidence even when live source observability is unavailable"
+    );
+    let status_snapshot = status_events
+        .iter()
+        .find(|event| event.metadata().origin_id == node_id)
+        .map(|event| {
+            rmp_serde::from_slice::<crate::workers::source::SourceObservabilitySnapshot>(
+                event.payload_bytes(),
+            )
+            .expect("decode source status snapshot")
+        })
+        .expect("status reply from target source node");
+    let status_signals = status_snapshot
+        .last_control_frame_signals_by_node
+        .get(&node_id.0)
+        .expect("source-owned status control signals");
+    assert!(
+        status_signals.iter().any(|signal| signal
+            == &format!(
+                "ready unit=runtime.exec.source route={scoped_route} generation={}",
+                app.facade_gate
+                    .route_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, &scoped_route)
+                    .expect("scoped source-rescan route generation lookup")
+                    .expect("scoped source-rescan route active after manual status")
+            )),
+        "manual-rescan source-status must reply with current scoped route-ready proof after rearm: {status_signals:?}"
     );
 
     let scoped_events = capanix_host_adapter_fs::HostAdapter::call_collect(

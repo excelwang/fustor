@@ -2590,7 +2590,7 @@ impl ChannelIoSubset for ForceFindProtocolRetryThenReplyBoundary {
             .copied()
             .unwrap_or(1);
         Ok(vec![mk_event_with_correlation(
-            "node-a::routed",
+            "node-a::nfs1",
             correlation,
             self.payload.clone(),
         )])
@@ -2675,7 +2675,7 @@ impl ChannelIoSubset for ForceFindGroupMissingThenReplyBoundary {
             .copied()
             .unwrap_or(1);
         Ok(vec![mk_event_with_correlation(
-            "node-b::routed",
+            "node-b::nfs1",
             correlation,
             self.payload.clone(),
         )])
@@ -2865,7 +2865,7 @@ impl ChannelIoSubset for ForceFindSingleCandidateGroupMissingThenFallbackBoundar
             return Err(CnxError::Timeout);
         }
         Ok(vec![mk_event_with_correlation(
-            "node-d::fallback",
+            "node-d::nfs2",
             correlation,
             self.payload.clone(),
         )])
@@ -3290,9 +3290,9 @@ impl ChannelIoSubset for ForceFindDelayedRunnerBindingBoundary {
             .copied()
             .unwrap_or(1);
         Ok(vec![mk_event_with_correlation(
-            "node-a::routed",
+            "node-a::nfs1",
             correlation,
-            vec![1, 2, 3],
+            force_find_tree_payload_for_route_test(),
         )])
     }
 }
@@ -3624,6 +3624,26 @@ fn mk_event_with_correlation(origin: &str, correlation: u64, payload: Vec<u8>) -
         },
         Bytes::from(payload),
     )
+}
+
+fn force_find_tree_payload_for_route_test() -> Vec<u8> {
+    rmp_serde::to_vec_named(&ForceFindQueryPayload::Tree(TreeGroupPayload {
+        reliability: GroupReliability {
+            reliable: true,
+            unreliable_reason: None,
+        },
+        stability: TreeStability::not_evaluated(),
+        root: TreePageRoot {
+            path: b"/force-find-stress".to_vec(),
+            size: 0,
+            modified_time_us: 1,
+            is_dir: true,
+            exists: true,
+            has_children: false,
+        },
+        entries: Vec::new(),
+    }))
+    .expect("encode force-find tree payload")
 }
 
 fn empty_materialized_tree_payload_for_test(path: &[u8]) -> Vec<u8> {
@@ -4330,6 +4350,158 @@ fn external_worker_root(id: &str, path: &Path) -> RootSpec {
 include!("tests/status_stats.rs");
 
 #[test]
+fn materialized_owner_node_for_group_does_not_guess_owner_from_published_source_object_ref() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a");
+    let node_b_root = tmp.path().join("node-b");
+    fs::create_dir_all(&node_a_root).expect("create node-a dir");
+    fs::create_dir_all(&node_b_root).expect("create node-b dir");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: BTreeMap::new(),
+            mount_point: node_a_root,
+            fs_source: "server:/nfs1".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-b::nfs1".to_string(),
+            host_ref: "node-b".to_string(),
+            host_ip: "10.0.0.2".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: BTreeMap::new(),
+            mount_point: node_b_root,
+            fs_source: "server:/nfs1".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let source = source_facade_with_group("nfs1", &grants);
+    let mut source_status = source_status_for_cache_key("nfs1");
+    source_status.concrete_roots[0].root_key = "nfs1@node-b::nfs1".to_string();
+    source_status.concrete_roots[0].object_ref = "node-b::nfs1".to_string();
+    source_status.concrete_roots[0].is_group_primary = true;
+    source_status.concrete_roots[0].emitted_event_count = 20;
+    source_status.concrete_roots[0].emitted_data_event_count = 20;
+    source_status.concrete_roots[0].forwarded_event_count = 20;
+    source_status.concrete_roots[0].last_forwarded_origins = vec!["node-b::nfs1=20".to_string()];
+
+    let mut pending_group = sink_group_status("nfs1", false);
+    pending_group.primary_object_ref = "node-a::nfs1".to_string();
+    pending_group.total_nodes = 0;
+    pending_group.live_nodes = 0;
+    pending_group.materialized_revision = 0;
+    pending_group.shadow_time_us = 0;
+    let sink_status = SinkStatusSnapshot {
+        groups: vec![pending_group],
+        ..SinkStatusSnapshot::default()
+    };
+
+    let owner = crate::runtime_app::shared_tokio_runtime()
+        .block_on(materialized_owner_node_for_group_with_source_status(
+            source.as_ref(),
+            Some(&sink_status),
+            Some(&source_status),
+            "nfs1",
+            MaterializedOwnerOmissionPolicy::TreatAsCollectionGap,
+        ))
+        .expect("resolve owner");
+
+    assert_eq!(
+        owner, None,
+        "materialized owner resolution must not guess among multiple host_ref candidates by parsing the source primary object_ref"
+    );
+}
+
+#[test]
+fn materialized_owner_node_for_group_ignores_non_primary_published_source_member() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a");
+    let node_b_root = tmp.path().join("node-b");
+    fs::create_dir_all(&node_a_root).expect("create node-a dir");
+    fs::create_dir_all(&node_b_root).expect("create node-b dir");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs1".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: BTreeMap::new(),
+            mount_point: node_a_root,
+            fs_source: "server:/nfs1".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-b::nfs1".to_string(),
+            host_ref: "node-b".to_string(),
+            host_ip: "10.0.0.2".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: BTreeMap::new(),
+            mount_point: node_b_root,
+            fs_source: "server:/nfs1".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let source = source_facade_with_group("nfs1", &grants);
+    let mut source_status = source_status_for_cache_key("nfs1");
+    source_status.concrete_roots[0].root_key = "nfs1@node-b::nfs1".to_string();
+    source_status.concrete_roots[0].object_ref = "node-b::nfs1".to_string();
+    source_status.concrete_roots[0].is_group_primary = false;
+    source_status.concrete_roots[0].emitted_event_count = 20;
+    source_status.concrete_roots[0].emitted_data_event_count = 20;
+    source_status.concrete_roots[0].forwarded_event_count = 20;
+    source_status.concrete_roots[0].last_forwarded_origins = vec!["node-b::nfs1=20".to_string()];
+
+    let mut pending_group = sink_group_status("nfs1", false);
+    pending_group.primary_object_ref = "node-a::nfs1".to_string();
+    pending_group.total_nodes = 0;
+    pending_group.live_nodes = 0;
+    pending_group.materialized_revision = 0;
+    pending_group.shadow_time_us = 0;
+    let sink_status = SinkStatusSnapshot {
+        groups: vec![pending_group],
+        ..SinkStatusSnapshot::default()
+    };
+
+    let owner = crate::runtime_app::shared_tokio_runtime()
+        .block_on(materialized_owner_node_for_group_with_source_status(
+            source.as_ref(),
+            Some(&sink_status),
+            Some(&source_status),
+            "nfs1",
+            MaterializedOwnerOmissionPolicy::TreatAsCollectionGap,
+        ))
+        .expect("resolve owner");
+
+    assert_eq!(
+        owner, None,
+        "non-primary published metadata and config-only object_ref primary must not become materialized owner authority without explicit host/schedule evidence"
+    );
+}
+
+#[test]
 fn mount_point_grouping_keeps_object_ref_opaque_outside_descriptor_match() {
     let policy = ProjectionPolicy {
         member_grouping: MemberGroupingStrategy::MountPoint,
@@ -4385,15 +4557,6 @@ fn normalized_record_path_for_query_rebases_prefixed_absolute_path() {
     let record_path = b"/tmp/capanix/data/nfs1/qf-e2e-job/file-a.txt";
     let normalized = normalized_path_for_query(record_path, query_path).expect("normalize path");
     assert_eq!(normalized, b"/qf-e2e-job/file-a.txt".to_vec());
-}
-
-#[test]
-fn node_id_from_object_ref_extracts_node_prefix() {
-    assert_eq!(
-        node_id_from_object_ref("node-a::nfs1").map(|id| id.0),
-        Some("node-a".to_string())
-    );
-    assert!(node_id_from_object_ref("nfs1").is_none());
 }
 
 #[test]
@@ -4710,8 +4873,7 @@ fn route_force_find_runner_selection_expands_partial_schedule_from_current_root_
 }
 
 #[test]
-fn route_force_find_runner_selection_expands_active_grants_from_root_health_when_root_snapshot_missing()
- {
+fn route_force_find_runner_selection_does_not_expand_grants_without_root_binding_evidence() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_a_root = tmp.path().join("node-a");
     let node_b_root = tmp.path().join("node-b");
@@ -4826,6 +4988,7 @@ fn route_force_find_runner_selection_expands_active_grants_from_root_health_when
         ))
         .expect("first selection")
         .expect("first node");
+    assert_eq!(first.0, "node-a");
     let second = crate::runtime_app::shared_tokio_runtime()
         .block_on(select_force_find_runner_node_for_group(
             &state,
@@ -4834,18 +4997,49 @@ fn route_force_find_runner_selection_expands_active_grants_from_root_health_when
         ))
         .expect("second selection")
         .expect("second node");
-    let third = crate::runtime_app::shared_tokio_runtime()
+    assert_eq!(
+        second.0, "node-a",
+        "current runner binding may reuse scheduled source evidence, but must not infer additional runners from root-health counters alone"
+    );
+}
+
+#[test]
+fn force_find_runner_node_selection_returns_not_ready_without_current_candidates() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let root = tmp.path().join("node-a");
+    fs::create_dir_all(&root).expect("create node-a dir");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-a::nfs1".to_string(),
+        host_ref: "node-a".to_string(),
+        host_ip: "10.0.0.1".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: root,
+        fs_source: "nfs".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: false,
+    }];
+    let source = source_facade_with_group("nfs1", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let state = test_api_state_for_source(source.clone(), sink);
+
+    let err = crate::runtime_app::shared_tokio_runtime()
         .block_on(select_force_find_runner_node_for_group(
             &state,
             source.as_ref(),
             "nfs1",
         ))
-        .expect("third selection")
-        .expect("third node");
+        .expect_err("missing current runner candidates must be explicit NOT_READY");
 
-    assert_eq!(first.0, "node-a");
-    assert_eq!(second.0, "node-b");
-    assert_eq!(third.0, "node-c");
+    assert!(
+        err.to_string()
+            .contains(FORCE_FIND_RUNNER_BINDING_NOT_READY_PREFIX),
+        "force-find must not substitute materialized ownership for missing current runner binding: {err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4914,7 +5108,7 @@ async fn selected_group_force_find_waits_for_current_runner_binding_evidence() {
             .iter()
             .map(|event| event.metadata().origin_id.0.as_str())
             .collect::<Vec<_>>(),
-        vec!["node-a::routed"]
+        vec!["node-a::nfs1"]
     );
 }
 
@@ -4994,11 +5188,11 @@ async fn selected_group_force_find_route_uses_source_find_endpoint_for_chosen_no
                     .map(|req| {
                         routed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         mk_event_with_correlation(
-                            "node-a::routed",
+                            "node-a::nfs1",
                             req.metadata()
                                 .correlation_id
                                 .expect("source-find request correlation"),
-                            vec![1, 2, 3],
+                            force_find_tree_payload_for_route_test(),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -5031,15 +5225,14 @@ async fn selected_group_force_find_route_uses_source_find_endpoint_for_chosen_no
             .iter()
             .map(|event| event.metadata().origin_id.0.as_str())
             .collect::<Vec<_>>(),
-        vec!["node-a::routed"]
+        vec!["node-a::nfs1"]
     );
 
     endpoint.shutdown(Duration::from_secs(2)).await;
 }
 
 #[test]
-fn force_find_runner_candidates_expand_from_active_grants_when_schedule_health_reports_only_primary()
- {
+fn force_find_runner_candidates_do_not_expand_from_health_only_active_grant_counts() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let grants = vec![
         GrantedMountRoot {
@@ -5100,12 +5293,8 @@ fn force_find_runner_candidates_expand_from_active_grants_when_schedule_health_r
 
     assert_eq!(
         candidates,
-        vec![
-            "node-a".to_string(),
-            "node-b".to_string(),
-            "node-c".to_string()
-        ],
-        "active same-epoch grants must expand force-find runner candidates even when schedule/active-member debug evidence only reports the current primary"
+        vec!["node-a".to_string()],
+        "force-find may use scheduled current runner evidence, but must not infer extra runners from health counters without current root binding evidence"
     );
 }
 
@@ -5135,7 +5324,7 @@ async fn selected_group_force_find_route_retries_protocol_violation_and_reaches_
     let source_status_payload =
         source_observability_payload_for_runner_nodes("nfs1", &grants, &["node-a"]);
     let boundary = Arc::new(ForceFindProtocolRetryThenReplyBoundary::new(
-        vec![1, 2, 3],
+        force_find_tree_payload_for_route_test(),
         source_status_payload,
     ));
     let state = test_api_state_for_route_source(
@@ -5178,7 +5367,7 @@ async fn selected_group_force_find_route_retries_protocol_violation_and_reaches_
             .iter()
             .map(|event| event.metadata().origin_id.0.as_str())
             .collect::<Vec<_>>(),
-        vec!["node-a::routed"]
+        vec!["node-a::nfs1"]
     );
 }
 
@@ -5229,7 +5418,7 @@ async fn selected_group_force_find_route_reroutes_when_chosen_runner_reports_sel
     let source_status_payload =
         source_observability_payload_for_runner_nodes("nfs1", &grants, &["node-a", "node-b"]);
     let boundary = Arc::new(ForceFindGroupMissingThenReplyBoundary::new(
-        vec![7, 8, 9],
+        force_find_tree_payload_for_route_test(),
         source_status_payload,
     ));
     let state = test_api_state_for_route_source(
@@ -5272,7 +5461,7 @@ async fn selected_group_force_find_route_reroutes_when_chosen_runner_reports_sel
             .iter()
             .map(|event| event.metadata().origin_id.0.as_str())
             .collect::<Vec<_>>(),
-        vec!["node-b::routed"]
+        vec!["node-b::nfs1"]
     );
 }
 
@@ -5322,7 +5511,7 @@ async fn selected_group_force_find_route_replans_same_group_runner_when_host_fs_
     let source_status_payload =
         source_observability_payload_for_runner_nodes("nfs1", &grants, &["node-a", "node-b"]);
     let boundary = Arc::new(ForceFindHostUnavailableThenNextRunnerBoundary::new(
-        vec![7, 8, 9],
+        force_find_tree_payload_for_route_test(),
         source_status_payload,
     ));
     let state = test_api_state_for_route_source(
@@ -5407,7 +5596,7 @@ async fn selected_group_force_find_route_falls_back_when_single_candidate_runner
         source_observability_payload_for_runner_nodes("nfs2", &grants, &["node-b"]);
     let boundary = Arc::new(
         ForceFindSingleCandidateGroupMissingThenFallbackBoundary::new(
-            vec![4, 5, 6],
+            force_find_tree_payload_for_route_test(),
             source_status_payload,
         ),
     );
@@ -5454,7 +5643,7 @@ async fn selected_group_force_find_route_falls_back_when_single_candidate_runner
             .iter()
             .map(|event| event.metadata().origin_id.0.as_str())
             .collect::<Vec<_>>(),
-        vec!["node-d::fallback"]
+        vec!["node-d::nfs2"]
     );
 }
 
@@ -5504,7 +5693,7 @@ async fn selected_group_force_find_fallback_collects_until_selected_group_payloa
     let source_status_payload =
         source_observability_payload_for_runner_nodes("nfs1", &grants, &["node-a"]);
     let boundary = Arc::new(ForceFindSelectedGroupFallbackCollectBoundary::new(
-        b"selected nfs1 payload".to_vec(),
+        force_find_tree_payload_for_route_test(),
         source_status_payload,
     ));
     let state = test_api_state_for_route_source(
@@ -5591,7 +5780,7 @@ async fn selected_group_force_find_route_reserves_fallback_budget_after_selected
         source_observability_payload_for_runner_nodes("nfs1", &grants, &["node-a"]);
     let boundary = Arc::new(
         ForceFindSelectedRouteTimeoutThenFallbackBudgetBoundary::new(
-            b"selected nfs1 payload".to_vec(),
+            force_find_tree_payload_for_route_test(),
             source_status_payload,
         ),
     );
@@ -6007,51 +6196,136 @@ fn decode_force_find_selected_group_response_fails_without_selected_group_payloa
 }
 
 #[test]
-fn decode_force_find_selected_group_response_prefers_non_empty_runner_payload() {
-    let empty_payload = rmp_serde::to_vec_named(&ForceFindQueryPayload::Tree(TreeGroupPayload {
-        reliability: GroupReliability {
-            reliable: true,
-            unreliable_reason: None,
-        },
-        stability: TreeStability::not_evaluated(),
-        root: TreePageRoot {
-            path: b"/force-find-stress".to_vec(),
-            size: 0,
-            modified_time_us: 0,
-            is_dir: true,
-            exists: false,
-            has_children: false,
-        },
-        entries: Vec::new(),
-    }))
-    .expect("encode empty force-find payload");
-    let rich_payload = rmp_serde::to_vec_named(&ForceFindQueryPayload::Tree(TreeGroupPayload {
-        reliability: GroupReliability {
-            reliable: true,
-            unreliable_reason: None,
-        },
-        stability: TreeStability::not_evaluated(),
-        root: TreePageRoot {
-            path: b"/force-find-stress".to_vec(),
-            size: 0,
-            modified_time_us: 7,
-            is_dir: true,
-            exists: true,
-            has_children: true,
-        },
-        entries: vec![TreePageEntry {
-            path: b"/force-find-stress/file.txt".to_vec(),
-            size: 4,
-            modified_time_us: 9,
-            is_dir: false,
-            has_children: false,
-            depth: 1,
-        }],
-    }))
-    .expect("encode rich force-find payload");
+fn force_find_route_payload_validation_accepts_selected_group_payload() {
+    let group_event = mk_event("nfs1", force_find_tree_payload_for_route_test());
+    let object_ref_event = mk_event("node-b::nfs1", force_find_tree_payload_for_route_test());
+    let kind = ForceFindRouteCollectKind::Tree {
+        recursive: true,
+        max_depth: None,
+        strict_conflict: true,
+    };
+
+    assert!(
+        selected_group_force_find_payload_error(&[group_event], "nfs1", kind).is_none(),
+        "group-origin payload must satisfy the selected-group route contract"
+    );
+    assert!(
+        selected_group_force_find_payload_error(&[object_ref_event], "nfs1", kind).is_none(),
+        "object-ref-origin payload must satisfy the selected-group route contract"
+    );
+}
+
+#[test]
+fn force_find_route_payload_validation_retries_missing_selected_group_payload() {
+    let unrelated_event = mk_event("nfs2", force_find_tree_payload_for_route_test());
+    let kind = ForceFindRouteCollectKind::Tree {
+        recursive: true,
+        max_depth: None,
+        strict_conflict: true,
+    };
+
+    let err = selected_group_force_find_payload_error(&[unrelated_event], "nfs1", kind)
+        .expect("missing selected-group payload should become a route gap");
+
+    assert!(
+        is_retryable_force_find_runner_gap(&err),
+        "missing selected-group payload must use the existing same-group retry lane: {err}"
+    );
+    assert!(
+        err.to_string().contains("selected_group matched no group"),
+        "missing selected-group payload should be reported in domain terms: {err}"
+    );
+}
+
+#[test]
+fn force_find_route_payload_validation_retries_selected_group_error_payload() {
+    let err_event = mk_event(
+        "node-b::nfs1",
+        b"force-find selected_group matched no group: nfs1".to_vec(),
+    );
+    let kind = ForceFindRouteCollectKind::Tree {
+        recursive: true,
+        max_depth: None,
+        strict_conflict: true,
+    };
+
+    let err = selected_group_force_find_payload_error(&[err_event], "nfs1", kind)
+        .expect("selected-group route error payload should become a route gap");
+
+    assert!(
+        is_retryable_force_find_runner_gap(&err),
+        "selected-group route error payload must use the existing retry lane: {err}"
+    );
+}
+
+#[test]
+fn decode_force_find_selected_group_response_prefers_newest_payload_even_when_empty() {
+    let older_rich_payload =
+        rmp_serde::to_vec_named(&ForceFindQueryPayload::Tree(TreeGroupPayload {
+            reliability: GroupReliability {
+                reliable: true,
+                unreliable_reason: None,
+            },
+            stability: TreeStability::not_evaluated(),
+            root: TreePageRoot {
+                path: b"/force-find-stress".to_vec(),
+                size: 0,
+                modified_time_us: 7,
+                is_dir: true,
+                exists: true,
+                has_children: true,
+            },
+            entries: vec![TreePageEntry {
+                path: b"/force-find-stress/file.txt".to_vec(),
+                size: 4,
+                modified_time_us: 9,
+                is_dir: false,
+                has_children: false,
+                depth: 1,
+            }],
+        }))
+        .expect("encode rich force-find payload");
+    let newer_empty_payload =
+        rmp_serde::to_vec_named(&ForceFindQueryPayload::Tree(TreeGroupPayload {
+            reliability: GroupReliability {
+                reliable: true,
+                unreliable_reason: None,
+            },
+            stability: TreeStability::not_evaluated(),
+            root: TreePageRoot {
+                path: b"/force-find-stress".to_vec(),
+                size: 0,
+                modified_time_us: 0,
+                is_dir: true,
+                exists: false,
+                has_children: false,
+            },
+            entries: Vec::new(),
+        }))
+        .expect("encode empty force-find payload");
     let events = vec![
-        mk_event("nfs1", empty_payload),
-        mk_event("nfs1", rich_payload),
+        Event::new(
+            EventMetadata {
+                origin_id: NodeId("nfs1".to_string()),
+                timestamp_us: 1,
+                logical_ts: None,
+                correlation_id: None,
+                ingress_auth: None,
+                trace: None,
+            },
+            Bytes::from(older_rich_payload),
+        ),
+        Event::new(
+            EventMetadata {
+                origin_id: NodeId("nfs1".to_string()),
+                timestamp_us: 2,
+                logical_ts: None,
+                correlation_id: None,
+                ingress_auth: None,
+                trace: None,
+            },
+            Bytes::from(newer_empty_payload),
+        ),
     ];
 
     let payload = decode_force_find_selected_group_response(
@@ -6063,10 +6337,10 @@ fn decode_force_find_selected_group_response_prefers_non_empty_runner_payload() 
     .expect("decode selected-group force-find response");
 
     assert!(
-        payload.root.exists,
-        "force-find fallback collect must not let an empty runner payload hide richer fresh evidence from another runner"
+        !payload.root.exists,
+        "force-find selected-group projection must not let older richer data beat a newer empty selected-runner outcome"
     );
-    assert_eq!(payload.entries.len(), 1);
+    assert!(payload.entries.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6120,6 +6394,7 @@ async fn selected_group_materialized_route_falls_back_to_generic_proxy_when_owne
             "node-b".to_string(),
             vec!["nfs4".to_string()],
         )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs4".to_string(), "node-b".to_string())]),
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs4".to_string(),
             primary_object_ref: "node-b::nfs4".to_string(),
@@ -6183,6 +6458,7 @@ async fn selected_group_materialized_route_falls_back_to_generic_proxy_when_owne
             "node-b".to_string(),
             vec!["nfs4".to_string()],
         )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs4".to_string(), "node-b".to_string())]),
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs4".to_string(),
             primary_object_ref: "node-b::nfs4".to_string(),
@@ -6292,6 +6568,7 @@ async fn selected_group_trusted_materialized_route_falls_back_to_generic_proxy_w
             "node-b".to_string(),
             vec!["nfs4".to_string()],
         )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs4".to_string(), "node-a".to_string())]),
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs4".to_string(),
             primary_object_ref: "node-b::nfs4".to_string(),
@@ -6355,6 +6632,7 @@ async fn selected_group_trusted_materialized_route_falls_back_to_generic_proxy_w
             "node-b".to_string(),
             vec!["nfs4".to_string()],
         )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs4".to_string(), "node-a".to_string())]),
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs4".to_string(),
             primary_object_ref: "node-b::nfs4".to_string(),
@@ -7721,6 +7999,7 @@ async fn selected_group_materialized_route_falls_back_to_generic_proxy_when_owne
             "node-b".to_string(),
             vec!["nfs4".to_string()],
         )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs4".to_string(), "node-a".to_string())]),
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs4".to_string(),
             primary_object_ref: "node-b::nfs4".to_string(),
@@ -7872,6 +8151,7 @@ async fn selected_group_trusted_materialized_route_reserves_proxy_budget_after_o
             "node-b".to_string(),
             vec!["nfs4".to_string()],
         )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs4".to_string(), "node-a".to_string())]),
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs4".to_string(),
             primary_object_ref: "node-b::nfs4".to_string(),
@@ -8594,6 +8874,7 @@ async fn selected_group_materialized_route_settles_request_scoped_omitted_ready_
                 Some("nfs4".to_string()),
             ),
             Duration::from_millis(1200),
+            None,
             Some(selected_group_sink_status),
             Some(&omitted_ready_groups),
             TreePitSessionPlan::new(Duration::from_millis(1200), 1).selected_group_stage_plan(
@@ -8936,6 +9217,7 @@ async fn selected_group_materialized_route_reroutes_to_sink_primary_object_ref_w
             "node-b".to_string(),
             vec!["nfs4".to_string()],
         )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs4".to_string(), "node-a".to_string())]),
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs4".to_string(),
             primary_object_ref: "node-a::nfs4".to_string(),
@@ -9157,6 +9439,7 @@ async fn selected_group_materialized_route_reroutes_to_sink_primary_object_ref_w
             "node-b".to_string(),
             vec!["nfs4".to_string()],
         )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs4".to_string(), "node-a".to_string())]),
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs4".to_string(),
             primary_object_ref: "node-a::nfs4".to_string(),

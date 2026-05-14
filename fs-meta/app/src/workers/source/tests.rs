@@ -2537,8 +2537,8 @@ async fn worker_targeted_rescan_request_rejects_without_local_primary_scan_root(
         );
     };
     assert!(
-        message.contains("no local source-primary scan root"),
-        "targeted rescan should explain missing local source-primary scan root: {message}"
+        message.contains("no local scheduled scan root"),
+        "targeted rescan should explain missing local scheduled scan root: {message}"
     );
 
     client.close().await.expect("close source worker");
@@ -2659,7 +2659,7 @@ async fn worker_targeted_rescan_delivery_check_reports_non_target_without_error(
         .expect("targeted source-rescan delivery check should return domain acceptance state");
     assert_eq!(
         acceptance,
-        SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary,
+        SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot,
         "delivery acceptance check should report a non-target without turning status collection into an error"
     );
 
@@ -15211,6 +15211,110 @@ async fn manual_rescan_scoped_accept_uses_rearm_ack_cache_without_live_probe() {
         accept_rpc_count.load(Ordering::Relaxed),
         0,
         "scoped manual-rescan acceptance must use current rearm-ack delivery proof instead of queueing another worker control RPC"
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_rescan_app_route_marks_local_scheduled_root_as_delivery_primary() {
+    let _observability_count_reset = SourceWorkerObservabilityCallCountHookReset;
+    let _observability_delay_reset = SourceWorkerObservabilityDelayHookReset;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs4 = tmp.path().join("nfs4");
+    std::fs::create_dir_all(&nfs4).expect("create nfs4 dir");
+
+    let node_id = NodeId("node-d".to_string());
+    let cfg = SourceConfig {
+        roots: vec![worker_watch_scan_root("nfs4", &nfs4)],
+        host_object_grants: vec![
+            worker_source_export("node-a::nfs4", "node-a", "10.0.0.11", nfs4.clone()),
+            worker_source_export("node-d::nfs4", "node-d", "10.0.0.24", nfs4.clone()),
+        ],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        node_id.clone(),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    let source_rescan_route = source_rescan_request_route_for(&node_id.0).0;
+    let envelopes = vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs4", &["node-d::nfs4"])],
+        }))
+        .expect("encode source activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs4", &["node-d::nfs4"])],
+        }))
+        .expect("encode source scan activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: source_rescan_route,
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs4", &["node-d::nfs4"])],
+        }))
+        .expect("encode source manual-rescan route activate"),
+    ];
+    let signals = crate::runtime::orchestration::source_control_signals_from_envelopes(&envelopes)
+        .expect("decode source control signals");
+    client.control_state.lock().await.retain_signals(&signals);
+
+    client.with_cache_mut(|cache| {
+        prime_cached_schedule_from_control_signals(
+            cache,
+            &node_id,
+            &signals,
+            &client.config.roots,
+            &client.config.host_object_grants,
+        );
+        prime_cached_control_summary_from_control_signals(
+            cache,
+            &node_id,
+            &signals,
+            &client.config.host_object_grants,
+        );
+    });
+
+    let snapshot = client
+        .manual_rescan_app_route_observability_snapshot_for_status_route()
+        .await
+        .expect("app-route manual-rescan delivery proof should be available from control cache");
+
+    assert_eq!(
+        snapshot.source_primary_by_group.get("nfs4"),
+        Some(&"node-d::nfs4".to_string()),
+        "manual-rescan delivery proof must treat the local scheduled root as the delivery primary instead of picking an unrelated lower-sort grant"
+    );
+    assert!(
+        snapshot.status.concrete_roots.iter().any(|root| {
+            root.logical_root_id == "nfs4"
+                && root.object_ref == "node-d::nfs4"
+                && root.is_group_primary
+                && root.status == "manual_rescan_delivery_ready"
+        }),
+        "app-route snapshot should mark the local scheduled concrete root as delivery primary: {:?}",
+        snapshot.status.concrete_roots
     );
 
     client.close().await.expect("close source worker");

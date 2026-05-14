@@ -525,6 +525,17 @@ impl SinkGroupStatusSnapshot {
     pub(crate) fn materialized_service_ready(&self) -> bool {
         self.is_ready() && !self.has_materialized_service_blocker()
     }
+
+    pub(crate) fn has_live_materialized_owner(&self) -> bool {
+        self.live_nodes > 0
+            && !self.primary_object_ref.trim().is_empty()
+            && self.primary_object_ref != "unassigned"
+            && self.primary_object_ref != self.group_id
+    }
+
+    pub(crate) fn materialized_service_live_ready(&self) -> bool {
+        self.materialized_service_ready() && self.has_live_materialized_owner()
+    }
 }
 
 impl<'de> serde::Deserialize<'de> for SinkGroupStatusSnapshot {
@@ -609,6 +620,8 @@ pub struct SinkStatusSnapshot {
     pub estimated_heap_bytes: u64,
     pub groups: Vec<SinkGroupStatusSnapshot>,
     pub scheduled_groups_by_node: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub primary_host_ref_by_group: BTreeMap<String, String>,
     pub last_control_frame_signals_by_node: BTreeMap<String, Vec<String>>,
     pub received_batches_by_node: BTreeMap<String, u64>,
     pub received_events_by_node: BTreeMap<String, u64>,
@@ -741,7 +754,7 @@ impl SinkStatusSnapshot {
                 continue;
             };
             match group.normalized_readiness() {
-                GroupReadinessState::Ready if group.live_nodes > 0 && group.total_nodes > 0 => {
+                GroupReadinessState::Ready if group.materialized_service_live_ready() => {
                     summary.ready_groups.insert(group_id.clone());
                 }
                 GroupReadinessState::WaitingForMaterializedRoot => {
@@ -991,6 +1004,7 @@ pub(crate) struct GroupSinkState {
     pub(crate) epoch_manager: EpochManager,
     pub(crate) tombstone_policy: TombstonePolicy,
     pub(crate) primary_object_ref: String,
+    pub(crate) primary_host_ref: String,
     pub(crate) overflow_pending_materialization: bool,
     pub(crate) readiness_state: GroupReadinessState,
     pub(crate) last_coverage_recovered_at: Option<Instant>,
@@ -999,13 +1013,18 @@ pub(crate) struct GroupSinkState {
 }
 
 impl GroupSinkState {
-    fn new(primary_object_ref: String, tombstone_policy: TombstonePolicy) -> Self {
+    fn new(
+        primary_object_ref: String,
+        primary_host_ref: String,
+        tombstone_policy: TombstonePolicy,
+    ) -> Self {
         Self {
             tree: MaterializedTree::new(),
             clock: SinkClock::new(),
             epoch_manager: EpochManager::new(),
             tombstone_policy,
             primary_object_ref,
+            primary_host_ref,
             overflow_pending_materialization: false,
             readiness_state: GroupReadinessState::PendingMaterialization,
             last_coverage_recovered_at: Some(Instant::now()),
@@ -1120,6 +1139,8 @@ impl PersistedFileMetaNode {
 struct PersistedGroupSinkState {
     group_id: String,
     primary_object_ref: String,
+    #[serde(default)]
+    primary_host_ref: String,
     overflow_pending_materialization: bool,
     readiness_state: GroupReadinessState,
     materialized_revision: u64,
@@ -1139,6 +1160,7 @@ impl PersistedGroupSinkState {
         Self {
             group_id: group_id.to_string(),
             primary_object_ref: group.primary_object_ref.clone(),
+            primary_host_ref: group.primary_host_ref.clone(),
             overflow_pending_materialization: group.overflow_pending_materialization,
             readiness_state: group.group_readiness_state(),
             materialized_revision: group.materialized_revision,
@@ -1186,6 +1208,7 @@ impl PersistedGroupSinkState {
             epoch_manager,
             tombstone_policy,
             primary_object_ref: self.primary_object_ref,
+            primary_host_ref: self.primary_host_ref,
             overflow_pending_materialization: self.overflow_pending_materialization,
             readiness_state: self.readiness_state,
             last_coverage_recovered_at: decode_instant_age_ms(self.last_coverage_recovered_age_ms),
@@ -1400,20 +1423,32 @@ impl SinkState {
             active_member_ids.sort();
             active_member_ids.dedup();
             let primary = select_primary_object_ref(&root.id, &active_member_ids, &member_ids);
+            let primary_host_ref = members
+                .iter()
+                .find(|grant| grant.object_ref == primary)
+                .map(|grant| grant.host_ref.clone())
+                .unwrap_or_default();
             let materialized_scope_changed = previous_roots_by_id
                 .get(root.id.as_str())
                 .is_some_and(|previous| !root_materialized_scope_matches(previous, root));
             let mut group = if materialized_scope_changed {
                 previous_groups.remove(&root.id);
                 retained_groups.remove(&root.id);
-                GroupSinkState::new(primary.clone(), tombstone_policy)
+                GroupSinkState::new(primary.clone(), primary_host_ref.clone(), tombstone_policy)
             } else {
                 previous_groups
                     .remove(&root.id)
                     .or_else(|| retained_groups.remove(&root.id))
-                    .unwrap_or_else(|| GroupSinkState::new(primary.clone(), tombstone_policy))
+                    .unwrap_or_else(|| {
+                        GroupSinkState::new(
+                            primary.clone(),
+                            primary_host_ref.clone(),
+                            tombstone_policy,
+                        )
+                    })
             };
             group.primary_object_ref = primary.clone();
+            group.primary_host_ref = primary_host_ref;
             if allowed_groups.is_some_and(|groups| !groups.contains(&root.id)) {
                 if group.preserves_materialized_state_for_omission_window() {
                     retained_groups.insert(root.id.clone(), group);
@@ -3695,6 +3730,11 @@ impl SinkFileMeta {
             let stats = query::get_health_stats(&group.tree, &group.clock);
             let estimated_heap_bytes = group.tree.estimated_heap_bytes();
             accumulate_status_snapshot(&mut snapshot, &stats, estimated_heap_bytes);
+            if !group.primary_host_ref.is_empty() {
+                snapshot
+                    .primary_host_ref_by_group
+                    .insert(group_id.clone(), group.primary_host_ref.clone());
+            }
             groups.push(SinkGroupStatusSnapshot::from_status_fields(
                 group_id.clone(),
                 group.primary_object_ref.clone(),

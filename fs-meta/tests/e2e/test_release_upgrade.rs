@@ -404,22 +404,36 @@ fn upgrade_to_generation_two(harness: &mut UpgradeHarness) -> Result<(), String>
     Ok(())
 }
 
-fn wait_for_primary_tree_materialization(
+fn wait_for_materialized_tree_observation(
     session: &mut OperatorSession,
     reason: &str,
 ) -> Result<(), String> {
     wait_until(Duration::from_secs(120), reason, || {
-        let tree =
-            match session.tree(&[("path", "/".to_string()), ("recursive", "true".to_string())]) {
-                Ok(tree) => tree,
-                Err(err) => {
-                    let status = session
-                        .status()
-                        .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
-                    return Err(format!("tree request failed: {err}; status={status}"));
-                }
-            };
-        if group_total_nodes(&tree, "nfs1") > 0 && group_total_nodes(&tree, "nfs2") > 0 {
+        let tree = match session.tree(&[
+            ("path", "/".to_string()),
+            ("recursive", "true".to_string()),
+            ("read_class", "materialized".to_string()),
+        ]) {
+            Ok(tree) => tree,
+            Err(err) => {
+                let status = session
+                    .status()
+                    .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+                return Err(format!("tree request failed: {err}; status={status}"));
+            }
+        };
+        let observation_state = tree
+            .get("observation_status")
+            .and_then(|status| status.get("state"))
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        if group_total_nodes(&tree, "nfs1") > 0
+            && group_total_nodes(&tree, "nfs2") > 0
+            && matches!(
+                observation_state,
+                "materialized-untrusted" | "trusted-materialized"
+            )
+        {
             Ok(true)
         } else {
             let status = session
@@ -428,6 +442,49 @@ fn wait_for_primary_tree_materialization(
             Err(format!("tree={tree}; status={status}"))
         }
     })
+}
+
+fn assert_trusted_tree_is_ready_or_fail_closed(session: &OperatorSession) -> Result<(), String> {
+    let response = session.client().tree_raw(
+        session.query_api_key(),
+        &[("path", "/".to_string()), ("recursive", "true".to_string())],
+    )?;
+    match response.status {
+        200..=299 => {
+            if group_total_nodes(&response.body, "nfs1") > 0
+                && group_total_nodes(&response.body, "nfs2") > 0
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "trusted-materialized tree succeeded without both groups: {}",
+                    response.body
+                ))
+            }
+        }
+        503 => {
+            let code = response.body.get("code").and_then(Value::as_str);
+            let error = response.body.get("error").and_then(Value::as_str);
+            if code == Some("NOT_READY")
+                && error.is_some_and(|value| {
+                    value.contains("trusted-materialized")
+                        || value.contains("initial audit incomplete")
+                        || value.contains("materialized")
+                })
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "trusted-materialized tree failed without explicit NOT_READY evidence: {}",
+                    response.body
+                ))
+            }
+        }
+        status => Err(format!(
+            "trusted-materialized tree returned unexpected http {status}: {}",
+            response.body
+        )),
+    }
 }
 
 fn wait_for_manual_rescan_acceptance(
@@ -569,10 +626,11 @@ fn scenario_tree_materialization_after_upgrade(harness: &mut UpgradeHarness) -> 
     )?;
     l5_progress(harness.mode, "03.03.manual-rescan", "ok");
     l5_progress(harness.mode, "03.04.tree-materialization", "begin");
-    wait_for_primary_tree_materialization(
+    wait_for_materialized_tree_observation(
         &mut harness.session,
         "tree materializes after generation-two upgrade",
     )?;
+    assert_trusted_tree_is_ready_or_fail_closed(&harness.session)?;
     l5_progress(harness.mode, "03.04.tree-materialization", "ok");
     Ok(())
 }
@@ -720,7 +778,8 @@ fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
     )?;
     l5_progress(harness.mode, "03.05.manual-rescan", "ok");
     l5_progress(harness.mode, "03.06.tree-materialization", "begin");
-    wait_for_primary_tree_materialization(&mut harness.session, "cpu-budget tree materializes")?;
+    wait_for_materialized_tree_observation(&mut harness.session, "cpu-budget tree materializes")?;
+    assert_trusted_tree_is_ready_or_fail_closed(&harness.session)?;
     l5_progress(harness.mode, "03.06.tree-materialization", "ok");
 
     l5_progress(harness.mode, "03.07.cpu-idle-baseline", "begin");

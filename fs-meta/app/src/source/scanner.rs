@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_scan_closes_epoch_with_budgeted_root_coverage_without_walking_full_tree() {
+    fn audit_scan_ignores_targeted_scan_budget_and_walks_full_tree() {
         let host_fs = WideTreeHostFs::new(128);
         let scanner = ParallelScanner::new(
             PathBuf::from("/root"),
@@ -235,17 +235,22 @@ mod tests {
         );
         assert_eq!(
             records.len(),
-            1,
-            "audit readiness budget should materialize bounded root coverage only"
-        );
-        assert_eq!(records[0].path, b"/");
-        assert!(
-            records[0].audit_skipped,
-            "root record must expose that the deep subtree was not synchronously audited"
+            129,
+            "audit scan must not reuse targeted query max_scan_events as a traversal cutoff"
         );
         assert!(
-            host_fs.read_dir_calls().is_empty(),
-            "budgeted root coverage must not read the wide subtree before closing the epoch"
+            records.iter().all(|record| !record.audit_skipped),
+            "initial full audit must not pretend unvisited subtrees are covered"
+        );
+        let paths = records
+            .iter()
+            .map(|record| record.path.clone())
+            .collect::<HashSet<_>>();
+        assert!(paths.contains(&b"/".to_vec()));
+        assert!(paths.contains(&b"/child-127".to_vec()));
+        assert!(
+            host_fs.read_dir_calls().len() >= 129,
+            "audit scan must visit the full directory tree before closing the epoch"
         );
     }
 }
@@ -278,43 +283,10 @@ struct DirAuditState {
 }
 
 #[derive(Debug, Default)]
-struct AuditWalkOutcome {
-    records: Vec<FileMetaRecord>,
-    truncated: bool,
-}
-
-#[derive(Debug, Default)]
 pub(crate) struct AuditScanResult {
-    pub(crate) batches: Vec<Vec<Event>>,
-    pub(crate) truncated: bool,
+    pub(crate) batch_count: usize,
     pub(crate) record_count: usize,
-    pub(crate) record_budget: usize,
-}
-
-fn claim_audit_record(record_count: &AtomicUsize, record_budget: usize) -> Option<usize> {
-    let mut current = record_count.load(Ordering::SeqCst);
-    loop {
-        if current >= record_budget {
-            return None;
-        }
-        match record_count.compare_exchange(
-            current,
-            current + 1,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) => return Some(current + 1),
-            Err(next) => current = next,
-        }
-    }
-}
-
-fn mark_truncated_audit_dirs(records: &mut [FileMetaRecord]) {
-    for record in records {
-        if record.unix_stat.is_dir {
-            record.audit_skipped = true;
-        }
-    }
+    pub(crate) completed: bool,
 }
 
 fn normalize_deep_interval_rounds(raw: u64) -> u64 {
@@ -533,27 +505,47 @@ impl ParallelScanner {
         logical_clock: &Arc<LogicalClock>,
         watch_scheduler: Option<Arc<Mutex<crate::source::watcher::WatchManager>>>,
     ) -> Vec<Vec<Event>> {
-        self.scan_audit_with_summary(
+        let mut batches = Vec::new();
+        let _ = self.scan_audit_streaming(
             epoch_id,
             mtime_cache,
             drift_estimator,
             logical_clock,
             watch_scheduler,
-        )
-        .batches
+            |batch| {
+                batches.push(batch);
+                true
+            },
+        );
+        batches
     }
 
-    /// Run an audit scan and return coverage evidence about bounded traversal.
-    pub(crate) fn scan_audit_with_summary(
+    /// Run an audit scan and stream batches as they are produced.
+    ///
+    /// Audit completeness is a business correctness boundary: this path never
+    /// applies `max_scan_events`. That limit remains only on targeted query
+    /// responses, where it protects a single request from returning an
+    /// unbounded payload.
+    pub(crate) fn scan_audit_streaming<F>(
         &self,
         epoch_id: u64,
         mtime_cache: &mut HashMap<PathBuf, f64>,
         drift_estimator: &Arc<Mutex<DriftEstimator>>,
         logical_clock: &Arc<LogicalClock>,
         watch_scheduler: Option<Arc<Mutex<crate::source::watcher::WatchManager>>>,
-    ) -> AuditScanResult {
-        let mut all_batches = Vec::new();
-        let record_budget = self.max_scan_events.max(1);
+        mut emit_batch: F,
+    ) -> AuditScanResult
+    where
+        F: FnMut(Vec<Event>) -> bool,
+    {
+        let mut batch_count = 0;
+        let mut emit = |batch: Vec<Event>| {
+            if batch.is_empty() {
+                return true;
+            }
+            batch_count += 1;
+            emit_batch(batch)
+        };
 
         // EpochStart signal
         let start_signal = ControlEvent::EpochStart {
@@ -561,26 +553,33 @@ impl ParallelScanner {
             epoch_type: EpochType::Audit,
         };
         if let Some(ev) = self.build_control_event(&start_signal, drift_estimator, logical_clock) {
-            all_batches.push(vec![ev]);
+            if !emit(vec![ev]) {
+                return AuditScanResult {
+                    batch_count,
+                    completed: false,
+                    ..AuditScanResult::default()
+                };
+            }
         }
 
         // Run parallel scan
         let round = self.audit_round.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut outcome = self.parallel_walk(
+        let (record_count, walk_completed) = self.parallel_walk(
             mtime_cache,
             drift_estimator,
+            logical_clock,
             watch_scheduler,
             round,
-            record_budget,
+            &mut emit,
         );
-        if outcome.truncated {
-            mark_truncated_audit_dirs(&mut outcome.records);
+        if !walk_completed {
+            return AuditScanResult {
+                batch_count,
+                record_count,
+                completed: false,
+                ..AuditScanResult::default()
+            };
         }
-        let record_count = outcome.records.len();
-
-        // Re-batch
-        let batches = self.rebatch_to_events(outcome.records, drift_estimator, logical_clock);
-        all_batches.extend(batches);
 
         // EpochEnd signal
         let end_signal = ControlEvent::EpochEnd {
@@ -588,14 +587,20 @@ impl ParallelScanner {
             epoch_type: EpochType::Audit,
         };
         if let Some(ev) = self.build_control_event(&end_signal, drift_estimator, logical_clock) {
-            all_batches.push(vec![ev]);
+            if !emit(vec![ev]) {
+                return AuditScanResult {
+                    batch_count,
+                    record_count,
+                    completed: false,
+                    ..AuditScanResult::default()
+                };
+            }
         }
 
         AuditScanResult {
-            batches: all_batches,
-            truncated: outcome.truncated,
+            batch_count,
             record_count,
-            record_budget,
+            completed: true,
         }
     }
 
@@ -667,35 +672,63 @@ impl ParallelScanner {
         .clear();
     }
 
+    fn emit_record_events<F>(
+        &self,
+        records: Vec<FileMetaRecord>,
+        drift_estimator: &Arc<Mutex<DriftEstimator>>,
+        logical_clock: &Arc<LogicalClock>,
+        current_batch: &mut Vec<Event>,
+        emit_batch: &mut F,
+    ) -> (usize, bool)
+    where
+        F: FnMut(Vec<Event>) -> bool,
+    {
+        let record_count = records.len();
+        let drift_us = lock_or_recover(drift_estimator, "scanner.audit_stream.drift").drift_us();
+        for record in records {
+            if let Some(ev) = watcher::build_event(&record, &self.node_id, drift_us, logical_clock)
+            {
+                current_batch.push(ev);
+                if current_batch.len() >= self.batch_size
+                    && !emit_batch(std::mem::take(current_batch))
+                {
+                    return (record_count, false);
+                }
+            }
+        }
+        (record_count, true)
+    }
+
     /// Parallel directory walk with work-stealing queue.
     fn parallel_walk(
         &self,
         mtime_cache_ref: &mut HashMap<PathBuf, f64>,
         drift_estimator: &Arc<Mutex<DriftEstimator>>,
+        logical_clock: &Arc<LogicalClock>,
         watch_scheduler: Option<Arc<Mutex<crate::source::watcher::WatchManager>>>,
         audit_round: u64,
-        record_budget: usize,
-    ) -> AuditWalkOutcome {
+        emit_batch: &mut impl FnMut(Vec<Event>) -> bool,
+    ) -> (usize, bool) {
         if self.scan_workers <= 1 {
             return self.parallel_walk_inline(
                 mtime_cache_ref,
                 drift_estimator,
+                logical_clock,
                 watch_scheduler,
                 audit_round,
-                record_budget,
+                emit_batch,
             );
         }
 
         let (work_tx, work_rx) = cb::unbounded::<PathBuf>();
         let (result_tx, result_rx) = cb::unbounded::<Vec<FileMetaRecord>>();
         let pending_dirs = Arc::new(AtomicUsize::new(1));
-        let record_count = Arc::new(AtomicUsize::new(0));
-        let truncated = Arc::new(AtomicBool::new(false));
+        let stop_requested = Arc::new(AtomicBool::new(false));
 
         // Seed with root
         if work_tx.send(self.root_path.clone()).is_err() {
             log::warn!("scanner.parallel_walk: work queue closed during seed");
-            return AuditWalkOutcome::default();
+            return (0, false);
         }
 
         let visited = Arc::new(Mutex::new(HashSet::<(u64, u64)>::new()));
@@ -711,8 +744,7 @@ impl ParallelScanner {
                 let work_tx = work_tx.clone();
                 let result_tx = result_tx.clone();
                 let pending = Arc::clone(&pending_dirs);
-                let record_count = Arc::clone(&record_count);
-                let truncated = Arc::clone(&truncated);
+                let stop_requested = Arc::clone(&stop_requested);
                 let visited = Arc::clone(&visited);
                 let mtime_cache = Arc::clone(&mtime_cache);
                 let dir_state_cache = Arc::clone(&dir_state_cache);
@@ -731,7 +763,7 @@ impl ParallelScanner {
                         // Instead, check pending_dirs to detect completion.
                         match work_rx.recv_timeout(std::time::Duration::from_millis(10)) {
                             Ok(dir_path) => {
-                                if truncated.load(Ordering::SeqCst) {
+                                if stop_requested.load(Ordering::SeqCst) {
                                     pending.fetch_sub(1, Ordering::SeqCst);
                                     continue;
                                 }
@@ -817,15 +849,6 @@ impl ParallelScanner {
                                         unchanged
                                     };
 
-                                    if claim_audit_record(record_count.as_ref(), record_budget)
-                                        .is_none()
-                                    {
-                                        truncated.store(true, Ordering::SeqCst);
-                                        pending.fetch_sub(1, Ordering::SeqCst);
-                                        continue;
-                                    }
-                                    let budget_exhausted_after_dir =
-                                        record_count.load(Ordering::SeqCst) >= record_budget;
                                     let relative = watcher::make_relative(&dir_path, &root);
                                     let file_name = dir_path
                                         .file_name()
@@ -848,15 +871,6 @@ impl ParallelScanner {
                                             audit_skipped,
                                         )
                                     };
-                                    if budget_exhausted_after_dir {
-                                        records.push(dir_record(true));
-                                        truncated.store(true, Ordering::SeqCst);
-                                        if !records.is_empty() {
-                                            let _ = result_tx.send(records);
-                                        }
-                                        pending.fetch_sub(1, Ordering::SeqCst);
-                                        continue;
-                                    }
 
                                     let entries = match read_dir_with_retry(Arc::clone(&host_fs), &dir_path)
                                     {
@@ -906,10 +920,7 @@ impl ParallelScanner {
                                     let parent_mtime_us = (current_mtime * 1_000_000.0) as u64;
 
                                     for entry in entries {
-                                        if truncated.load(Ordering::SeqCst)
-                                            || record_count.load(Ordering::SeqCst) >= record_budget
-                                        {
-                                            truncated.store(true, Ordering::SeqCst);
+                                        if stop_requested.load(Ordering::SeqCst) {
                                             break;
                                         }
                                         if entry.is_dir {
@@ -927,15 +938,6 @@ impl ParallelScanner {
                                         let relative = watcher::make_relative(&entry_path, &root);
                                         match metadata_with_retry(Arc::clone(&host_fs), &entry_path) {
                                             Ok(meta) => {
-                                                if claim_audit_record(
-                                                    record_count.as_ref(),
-                                                    record_budget,
-                                                )
-                                                .is_none()
-                                                {
-                                                    truncated.store(true, Ordering::SeqCst);
-                                                    break;
-                                                }
                                                 let mtime_us = to_epoch_us(meta.modified);
                                                 let ctime_us = to_epoch_us(meta.created);
                                                 records.push(FileMetaRecord::scan_update(
@@ -991,10 +993,33 @@ impl ParallelScanner {
         drop(work_tx);
         drop(result_tx);
 
-        // Collect results
-        let mut all_records = Vec::new();
-        for batch in result_rx {
-            all_records.extend(batch);
+        // Stream results while workers continue walking. This avoids retaining a
+        // full audit in memory and lets callers consume progress immediately.
+        let mut record_count = 0;
+        let mut current_batch = Vec::new();
+        let mut completed = true;
+        for records in result_rx {
+            if completed {
+                let (records_seen, still_open) = self.emit_record_events(
+                    records,
+                    drift_estimator,
+                    logical_clock,
+                    &mut current_batch,
+                    emit_batch,
+                );
+                record_count += records_seen;
+                if !still_open {
+                    completed = false;
+                    stop_requested.store(true, Ordering::SeqCst);
+                }
+            } else {
+                record_count += records.len();
+            }
+        }
+
+        if completed && !current_batch.is_empty() && !emit_batch(std::mem::take(&mut current_batch))
+        {
+            completed = false;
         }
 
         for handle in handles {
@@ -1012,28 +1037,25 @@ impl ParallelScanner {
             };
         }
 
-        AuditWalkOutcome {
-            records: all_records,
-            truncated: truncated.load(Ordering::SeqCst),
-        }
+        (record_count, completed)
     }
 
     fn parallel_walk_inline(
         &self,
         mtime_cache_ref: &mut HashMap<PathBuf, f64>,
         drift_estimator: &Arc<Mutex<DriftEstimator>>,
+        logical_clock: &Arc<LogicalClock>,
         watch_scheduler: Option<Arc<Mutex<crate::source::watcher::WatchManager>>>,
         audit_round: u64,
-        record_budget: usize,
-    ) -> AuditWalkOutcome {
+        emit_batch: &mut impl FnMut(Vec<Event>) -> bool,
+    ) -> (usize, bool) {
         let mut pending = vec![self.root_path.clone()];
-        let mut all_records = Vec::new();
+        let mut record_count = 0;
+        let mut current_batch = Vec::new();
         let mut visited = HashSet::<(u64, u64)>::new();
         let mut mtime_cache = std::mem::take(mtime_cache_ref);
         let root = self.root_path.clone();
         let schedule_audit_watches = audit_watch_schedule_enabled();
-        let record_count = AtomicUsize::new(0);
-        let mut truncated = false;
         while let Some(dir_path) = pending.pop() {
             let mut records = Vec::new();
 
@@ -1099,13 +1121,6 @@ impl ParallelScanner {
                     unchanged
                 };
 
-                if claim_audit_record(&record_count, record_budget).is_none() {
-                    truncated = true;
-                    break;
-                }
-                let budget_exhausted_after_dir =
-                    record_count.load(Ordering::SeqCst) >= record_budget;
-
                 let relative = watcher::make_relative(&dir_path, &root);
                 let dir_record = |audit_skipped| {
                     FileMetaRecord::scan_update(
@@ -1127,12 +1142,6 @@ impl ParallelScanner {
                         audit_skipped,
                     )
                 };
-                if budget_exhausted_after_dir {
-                    records.push(dir_record(true));
-                    all_records.extend(records);
-                    truncated = true;
-                    break;
-                }
 
                 let entries = match read_dir_with_retry(Arc::clone(&self.host_fs), &dir_path) {
                     Ok(entries) => entries,
@@ -1173,10 +1182,6 @@ impl ParallelScanner {
                 let parent_mtime_us = (current_mtime * 1_000_000.0) as u64;
 
                 for entry in entries {
-                    if record_count.load(Ordering::SeqCst) >= record_budget {
-                        truncated = true;
-                        break;
-                    }
                     if entry.is_dir {
                         pending.push(entry.path);
                         continue;
@@ -1190,10 +1195,6 @@ impl ParallelScanner {
                     let relative = watcher::make_relative(&entry_path, &root);
                     match metadata_with_retry(Arc::clone(&self.host_fs), &entry_path) {
                         Ok(meta) => {
-                            if claim_audit_record(&record_count, record_budget).is_none() {
-                                truncated = true;
-                                break;
-                            }
                             let mtime_us = to_epoch_us(meta.modified);
                             let ctime_us = to_epoch_us(meta.created);
                             records.push(FileMetaRecord::scan_update(
@@ -1222,17 +1223,23 @@ impl ParallelScanner {
                 }
             }
 
-            all_records.extend(records);
-            if truncated {
-                break;
+            let (records_seen, still_open) = self.emit_record_events(
+                records,
+                drift_estimator,
+                logical_clock,
+                &mut current_batch,
+                emit_batch,
+            );
+            record_count += records_seen;
+            if !still_open {
+                *mtime_cache_ref = mtime_cache;
+                return (record_count, false);
             }
         }
 
+        let completed = current_batch.is_empty() || emit_batch(std::mem::take(&mut current_batch));
         *mtime_cache_ref = mtime_cache;
-        AuditWalkOutcome {
-            records: all_records,
-            truncated,
-        }
+        (record_count, completed)
     }
 
     /// Walk dir for targeted scan (non-parallel, depth-limited).
@@ -1330,34 +1337,6 @@ impl ParallelScanner {
             parent_mtime_us,
             false,
         ))
-    }
-
-    /// Convert records to batched events.
-    fn rebatch_to_events(
-        &self,
-        records: Vec<FileMetaRecord>,
-        drift_estimator: &Arc<Mutex<DriftEstimator>>,
-        logical_clock: &Arc<LogicalClock>,
-    ) -> Vec<Vec<Event>> {
-        let drift_us = lock_or_recover(drift_estimator, "scanner.rebatch.drift").drift_us();
-        let mut batches = Vec::new();
-        let mut current_batch = Vec::new();
-
-        for record in records {
-            if let Some(ev) = watcher::build_event(&record, &self.node_id, drift_us, logical_clock)
-            {
-                current_batch.push(ev);
-                if current_batch.len() >= self.batch_size {
-                    batches.push(std::mem::take(&mut current_batch));
-                }
-            }
-        }
-
-        if !current_batch.is_empty() {
-            batches.push(current_batch);
-        }
-
-        batches
     }
 
     /// Build a control event (EpochStart/End).

@@ -68,7 +68,7 @@ use crate::runtime::routes::{
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
 use crate::source::drift::DriftEstimator;
-use crate::source::scanner::ParallelScanner;
+use crate::source::scanner::{AuditScanResult, ParallelScanner};
 use crate::source::sentinel::{HealthSignal, Sentinel, SentinelAction, SentinelConfig};
 use crate::source::watcher::WatchManager;
 use crate::state::cell::{AuthorityJournal, HostObjectGrantsCell, LogicalRootsCell, SignalCell};
@@ -557,7 +557,7 @@ pub struct SourceStatusSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SourceTargetedRescanDeliveryAcceptance {
     Accepted,
-    NotLocalSourcePrimary,
+    NotLocalScanRoot,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -798,6 +798,21 @@ enum ManualRescanSignalIntent {
     AlreadyCompleted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootAuditKind {
+    Initial,
+    Rescan,
+}
+
+#[derive(Debug)]
+struct RootAuditCompletion {
+    kind: RootAuditKind,
+    started_at_us: u64,
+    reason_label: &'static str,
+    manual_requested_target: Option<u64>,
+    result: std::result::Result<AuditScanResult, String>,
+}
+
 struct RootTaskHandle {
     cancel: CancellationToken,
     join: Option<std::thread::JoinHandle<()>>,
@@ -976,6 +991,90 @@ impl ConcreteRootHealthEntry {
             draining_stream_generation: None,
             draining_status: None,
         }
+    }
+
+    fn from_task_signature(
+        signature: &RootTaskSignature,
+        config: &SourceConfig,
+        active: bool,
+    ) -> Self {
+        Self {
+            logical_root_id: signature.logical_root_id.clone(),
+            object_ref: signature.object_ref.clone(),
+            status: "planned".to_string(),
+            coverage_mode: coverage_mode_for_root(
+                signature.watch,
+                signature.scan,
+                config.lru_capacity,
+            )
+            .to_string(),
+            watch_enabled: signature.watch,
+            scan_enabled: signature.scan,
+            is_group_primary: signature.is_group_primary,
+            active,
+            watch_lru_capacity: if signature.watch {
+                config.lru_capacity
+            } else {
+                0
+            },
+            audit_interval_ms: signature
+                .audit_interval_ms
+                .unwrap_or(config.audit_interval.as_millis() as u64),
+            overflow_count: 0,
+            overflow_pending: false,
+            rescan_pending: false,
+            last_rescan_requested_at_us: None,
+            last_rescan_reason: None,
+            last_error: None,
+            last_audit_started_at_us: None,
+            last_audit_completed_at_us: None,
+            last_audit_duration_ms: None,
+            emitted_batch_count: 0,
+            emitted_event_count: 0,
+            emitted_control_event_count: 0,
+            emitted_data_event_count: 0,
+            emitted_path_event_count: 0,
+            last_emitted_at_us: None,
+            last_emitted_origins: Vec::new(),
+            forwarded_batch_count: 0,
+            forwarded_event_count: 0,
+            forwarded_path_event_count: 0,
+            last_forwarded_at_us: None,
+            last_forwarded_origins: Vec::new(),
+            current_revision: None,
+            current_stream_generation: None,
+            candidate_revision: None,
+            candidate_stream_generation: None,
+            candidate_status: None,
+            draining_revision: None,
+            draining_stream_generation: None,
+            draining_status: None,
+        }
+    }
+
+    fn refresh_identity_from_task_signature(
+        &mut self,
+        signature: &RootTaskSignature,
+        config: &SourceConfig,
+        active: bool,
+    ) {
+        self.logical_root_id = signature.logical_root_id.clone();
+        self.object_ref = signature.object_ref.clone();
+        self.coverage_mode =
+            coverage_mode_for_root(signature.watch, signature.scan, config.lru_capacity)
+                .to_string();
+        self.watch_enabled = signature.watch;
+        self.scan_enabled = signature.scan;
+        self.is_group_primary = signature.is_group_primary;
+        self.active = active;
+        self.watch_lru_capacity = if signature.watch {
+            config.lru_capacity
+        } else {
+            0
+        };
+        self.audit_interval_ms = signature
+            .audit_interval_ms
+            .unwrap_or(config.audit_interval.as_millis() as u64);
     }
 }
 
@@ -1596,6 +1695,14 @@ impl FSMetaSource {
         if !self.unit_control.has_runtime_state() {
             return Ok(None);
         }
+        if self.boundary.is_none()
+            && self
+                .unit_control
+                .active_route_keys(unit.unit_id())?
+                .is_empty()
+        {
+            return Ok(None);
+        }
         let groups = match self.unit_control.unit_state(unit.unit_id())? {
             Some((true, rows)) => {
                 let logical_roots = self.logical_roots_snapshot();
@@ -2018,6 +2125,13 @@ impl FSMetaSource {
             .is_some_and(|root| root.active && root.is_group_primary)
     }
 
+    fn root_current_is_active(roots_handle: &Arc<Mutex<Vec<RootRuntime>>>, root_key: &str) -> bool {
+        lock_or_recover(roots_handle, "source.root.current_active")
+            .iter()
+            .find(|root| Self::root_runtime_key(root) == root_key)
+            .is_some_and(|root| root.active)
+    }
+
     fn root_current_is_group_primary_scan_enabled(
         roots_handle: &Arc<Mutex<Vec<RootRuntime>>>,
         root_key: &str,
@@ -2051,6 +2165,8 @@ impl FSMetaSource {
         fanout_health: &Arc<Mutex<FanoutHealthState>>,
         root_key: &str,
         slot: RootTaskSlot,
+        config: &SourceConfig,
+        active: bool,
         retired: bool,
     ) {
         Self::mark_root_task_draining(
@@ -2058,6 +2174,9 @@ impl FSMetaSource {
             root_key,
             slot.revision,
             slot.stream_generation,
+            &slot.signature,
+            config,
+            active,
             "draining",
         );
         slot.handle.cancel_and_join(Duration::from_secs(2)).await;
@@ -2166,13 +2285,16 @@ impl FSMetaSource {
     ) {
         let status = status.into();
         let mut health = lock_or_recover(fanout_health, "source.object_health");
+        if !health.object_ref_detail.contains_key(root_key) {
+            return;
+        }
         health
             .object_ref
             .insert(root_key.to_string(), status.clone());
         let detail = health
             .object_ref_detail
-            .entry(root_key.to_string())
-            .or_default();
+            .get_mut(root_key)
+            .expect("checked concrete root health detail exists");
         detail.status = status.clone();
         if status == "running" {
             detail.last_error = None;
@@ -2187,6 +2309,9 @@ impl FSMetaSource {
         revision: u64,
         stream_generation: u64,
         role: RootTaskRole,
+        signature: &RootTaskSignature,
+        config: &SourceConfig,
+        active: bool,
         status: impl Into<String>,
     ) {
         let status = status.into();
@@ -2199,7 +2324,10 @@ impl FSMetaSource {
                 let detail = health
                     .object_ref_detail
                     .entry(root_key.to_string())
-                    .or_default();
+                    .or_insert_with(|| {
+                        ConcreteRootHealthEntry::from_task_signature(signature, config, active)
+                    });
+                detail.refresh_identity_from_task_signature(signature, config, active);
                 detail.status = status.clone();
                 detail.current_revision = Some(revision);
                 detail.current_stream_generation = Some(stream_generation);
@@ -2213,7 +2341,10 @@ impl FSMetaSource {
                 let detail = health
                     .object_ref_detail
                     .entry(root_key.to_string())
-                    .or_default();
+                    .or_insert_with(|| {
+                        ConcreteRootHealthEntry::from_task_signature(signature, config, active)
+                    });
+                detail.refresh_identity_from_task_signature(signature, config, active);
                 detail.candidate_revision = Some(revision);
                 detail.candidate_stream_generation = Some(stream_generation);
                 detail.candidate_status = Some(status.clone());
@@ -2229,15 +2360,19 @@ impl FSMetaSource {
         root_key: &str,
         revision: u64,
         stream_generation: u64,
+        signature: &RootTaskSignature,
+        config: &SourceConfig,
+        active: bool,
         status: impl Into<String>,
     ) {
         let status = status.into();
         let mut health = lock_or_recover(fanout_health, "source.object_health.draining");
+        let had_detail = health.object_ref_detail.contains_key(root_key);
         let current_matches = health
             .object_ref_detail
             .get(root_key)
             .is_some_and(|detail| detail.current_revision == Some(revision));
-        if current_matches {
+        if current_matches || !had_detail {
             health
                 .object_ref
                 .insert(root_key.to_string(), status.clone());
@@ -2245,11 +2380,14 @@ impl FSMetaSource {
         let detail = health
             .object_ref_detail
             .entry(root_key.to_string())
-            .or_default();
+            .or_insert_with(|| {
+                ConcreteRootHealthEntry::from_task_signature(signature, config, active)
+            });
+        detail.refresh_identity_from_task_signature(signature, config, active);
         detail.draining_revision = Some(revision);
         detail.draining_stream_generation = Some(stream_generation);
         detail.draining_status = Some(status.clone());
-        if current_matches {
+        if current_matches || !had_detail {
             detail.status = status;
         }
     }
@@ -2271,6 +2409,9 @@ impl FSMetaSource {
         root_key: &str,
         revision: u64,
         stream_generation: u64,
+        signature: &RootTaskSignature,
+        config: &SourceConfig,
+        active: bool,
         status: impl Into<String>,
     ) {
         let status = status.into();
@@ -2278,7 +2419,10 @@ impl FSMetaSource {
         let detail = health
             .object_ref_detail
             .entry(root_key.to_string())
-            .or_default();
+            .or_insert_with(|| {
+                ConcreteRootHealthEntry::from_task_signature(signature, config, active)
+            });
+        detail.refresh_identity_from_task_signature(signature, config, active);
         detail.candidate_revision = Some(revision);
         detail.candidate_stream_generation = Some(stream_generation);
         detail.candidate_status = Some(status.clone());
@@ -2292,6 +2436,9 @@ impl FSMetaSource {
         root_key: &str,
         revision: u64,
         stream_generation: u64,
+        signature: &RootTaskSignature,
+        config: &SourceConfig,
+        active: bool,
     ) {
         let mut health = lock_or_recover(fanout_health, "source.object_health.promote");
         let promoted_status = health
@@ -2306,7 +2453,10 @@ impl FSMetaSource {
         let detail = health
             .object_ref_detail
             .entry(root_key.to_string())
-            .or_default();
+            .or_insert_with(|| {
+                ConcreteRootHealthEntry::from_task_signature(signature, config, active)
+            });
+        detail.refresh_identity_from_task_signature(signature, config, active);
         detail.current_revision = Some(revision);
         detail.current_stream_generation = Some(stream_generation);
         detail.candidate_revision = None;
@@ -2625,15 +2775,15 @@ impl FSMetaSource {
         let _ = wake.send(next);
     }
 
-    fn source_primary_scan_root_keys(roots: &[RootRuntime]) -> Vec<String> {
+    fn targeted_rescan_scan_root_keys(roots: &[RootRuntime]) -> Vec<String> {
         roots
             .iter()
-            .filter(|root| root.active && root.is_group_primary && root.spec.scan)
+            .filter(|root| root.active && root.spec.scan)
             .map(Self::root_runtime_key)
             .collect::<Vec<_>>()
     }
 
-    async fn wait_for_source_primary_scan_roots(
+    async fn wait_for_targeted_rescan_scan_roots(
         roots: Arc<Mutex<Vec<RootRuntime>>>,
         timeout: Option<Duration>,
     ) -> Vec<RootRuntime> {
@@ -2641,7 +2791,7 @@ impl FSMetaSource {
         loop {
             let snapshot =
                 lock_or_recover(&roots, "source.rescan.scoped_endpoint.roots.expected").clone();
-            if !Self::source_primary_scan_root_keys(&snapshot).is_empty() {
+            if !Self::targeted_rescan_scan_root_keys(&snapshot).is_empty() {
                 return snapshot;
             }
             let Some(deadline) = deadline else {
@@ -2688,6 +2838,57 @@ impl FSMetaSource {
             }
         }
         signal_root_keys
+    }
+
+    fn record_rescan_intent_on_targeted_scan_roots(
+        roots: &[RootRuntime],
+        fanout_health: Option<&Arc<Mutex<FanoutHealthState>>>,
+        manual_rescan_intents: Option<&Arc<Mutex<HashMap<String, ManualRescanIntent>>>>,
+        reason: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let mut signal_root_keys = std::collections::BTreeSet::new();
+        for root in roots {
+            if !root.active || !root.spec.scan {
+                continue;
+            }
+            let root_key = Self::root_runtime_key(root);
+            if let Some(health) = fanout_health {
+                Self::mark_root_rescan_requested(health, &root_key, reason);
+            }
+            if reason == "manual"
+                && let Some(intents) = manual_rescan_intents
+            {
+                let mut intents = lock_or_recover(intents, "source.manual_rescan_intents.queue");
+                let entry = intents.entry(root_key).or_default();
+                entry.requested = entry.requested.saturating_add(1);
+                signal_root_keys.insert(Self::root_runtime_key(root));
+            } else {
+                signal_root_keys.insert(Self::root_runtime_key(root));
+            }
+        }
+        signal_root_keys
+    }
+
+    fn request_rescan_on_targeted_scan_roots(
+        roots: &[RootRuntime],
+        root_tasks: Option<&Arc<Mutex<HashMap<String, RootTaskEntry>>>>,
+        fanout_health: Option<&Arc<Mutex<FanoutHealthState>>>,
+        manual_rescan_intents: Option<&Arc<Mutex<HashMap<String, ManualRescanIntent>>>>,
+        manual_rescan_intent_wake: Option<&watch::Sender<u64>>,
+        reason: &str,
+    ) {
+        let signal_root_keys = Self::record_rescan_intent_on_targeted_scan_roots(
+            roots,
+            fanout_health,
+            manual_rescan_intents,
+            reason,
+        );
+        if reason == "manual" && !signal_root_keys.is_empty() {
+            if let Some(wake) = manual_rescan_intent_wake {
+                Self::wake_manual_rescan_intents(wake);
+            }
+        }
+        Self::signal_rescan_on_primary_root_keys(roots, root_tasks, &signal_root_keys);
     }
 
     fn signal_rescan_on_primary_root_keys(
@@ -3282,22 +3483,23 @@ impl FSMetaSource {
                         );
                         let acceptance_timeout =
                             FSMetaSource::scoped_rescan_acceptance_timeout(&requests);
-                        let roots_snapshot = FSMetaSource::wait_for_source_primary_scan_roots(
+                        let roots_snapshot = FSMetaSource::wait_for_targeted_rescan_scan_roots(
                             rescan_roots_scoped.clone(),
                             acceptance_timeout,
                         )
                         .await;
-                        let expected = FSMetaSource::source_primary_scan_root_keys(&roots_snapshot);
+                        let expected =
+                            FSMetaSource::targeted_rescan_scan_root_keys(&roots_snapshot);
                         let payload = if expected.is_empty() {
                             eprintln!(
-                                "fs_meta_source: source.rescan scoped endpoint rejected node={} reason=no-local-source-primary-scan-root",
+                                "fs_meta_source: source.rescan scoped endpoint rejected node={} reason=no-local-scheduled-scan-root",
                                 node_id_rescan_scoped.0
                             );
                             bytes::Bytes::from_static(
-                                b"scoped source-rescan target has no local source-primary scan root",
+                                b"scoped source-rescan target has no local scheduled scan root",
                             )
                         } else {
-                            FSMetaSource::request_rescan_on_primary_roots(
+                            FSMetaSource::request_rescan_on_targeted_scan_roots(
                                 &roots_snapshot,
                                 Some(&rescan_root_tasks_scoped),
                                 Some(&rescan_fanout_health_scoped),
@@ -3352,7 +3554,12 @@ impl FSMetaSource {
         );
         self.retire_unproven_source_rescan_endpoint_tasks_for_manual_status(&boundary);
         self.start_source_rescan_request_endpoints_on_boundary(boundary)?;
-        self.record_source_rescan_route_receivable();
+        if matches!(
+            self.targeted_rescan_delivery_acceptance(),
+            SourceTargetedRescanDeliveryAcceptance::Accepted
+        ) {
+            self.record_source_rescan_route_receivable();
+        }
         Ok(())
     }
 
@@ -3400,7 +3607,7 @@ impl FSMetaSource {
                             )
                         })
                         .min();
-                    let snapshot = if current_owner_health_evidence {
+                    let mut snapshot = if current_owner_health_evidence {
                         let (snapshot, used_cached_fallback) = status_source
                             .current_owner_health_observability_snapshot_for_status_route_with_timeout(
                                 source_status_live_probe_timeout,
@@ -3448,6 +3655,17 @@ impl FSMetaSource {
                         }
                         snapshot
                     };
+                    if manual_rescan_delivery_evidence
+                        && matches!(
+                            status_source.targeted_rescan_delivery_acceptance(),
+                            SourceTargetedRescanDeliveryAcceptance::Accepted
+                        )
+                    {
+                        crate::workers::source::annotate_manual_rescan_route_receivable_evidence(
+                            &mut snapshot,
+                            &status_node_id,
+                        );
+                    }
                     let mut responses = Vec::with_capacity(requests.len());
                     for req in requests {
                         match rmp_serde::to_vec_named(&snapshot) {
@@ -3842,23 +4060,23 @@ impl FSMetaSource {
                             }
                             let acceptance_timeout =
                                 FSMetaSource::scoped_rescan_acceptance_timeout(&requests);
-                            let roots_snapshot = FSMetaSource::wait_for_source_primary_scan_roots(
+                            let roots_snapshot = FSMetaSource::wait_for_targeted_rescan_scan_roots(
                                 rescan_roots_scoped.clone(),
                                 acceptance_timeout,
                             )
                             .await;
                             let expected =
-                                FSMetaSource::source_primary_scan_root_keys(&roots_snapshot);
+                                FSMetaSource::targeted_rescan_scan_root_keys(&roots_snapshot);
                             let payload = if expected.is_empty() {
                                 eprintln!(
-                                    "fs_meta_source: source.rescan scoped endpoint rejected node={} route={} reason=no-local-source-primary-scan-root",
+                                    "fs_meta_source: source.rescan scoped endpoint rejected node={} route={} reason=no-local-scheduled-scan-root",
                                     node_id_rescan_scoped.0, route_key_for_handler,
                                 );
                                 Bytes::from_static(
-                                    b"scoped source-rescan target has no local source-primary scan root",
+                                    b"scoped source-rescan target has no local scheduled scan root",
                                 )
                             } else {
-                                FSMetaSource::request_rescan_on_primary_roots(
+                                FSMetaSource::request_rescan_on_targeted_scan_roots(
                                     &roots_snapshot,
                                     Some(&rescan_root_tasks),
                                     Some(&rescan_fanout_health),
@@ -3978,10 +4196,10 @@ impl FSMetaSource {
         epoch
     }
 
-    fn local_source_primary_scan_root_keys(&self, context: &'static str) -> Vec<String> {
+    fn local_targeted_rescan_scan_root_keys(&self, context: &'static str) -> Vec<String> {
         lock_or_recover(&self.state_cell.roots, context)
             .iter()
-            .filter(|root| root.active && root.is_group_primary && root.spec.scan)
+            .filter(|root| root.active && root.spec.scan)
             .map(Self::root_runtime_key)
             .collect()
     }
@@ -3990,9 +4208,9 @@ impl FSMetaSource {
         &self,
     ) -> SourceTargetedRescanDeliveryAcceptance {
         let target_roots =
-            self.local_source_primary_scan_root_keys("source.targeted_rescan_delivery.roots");
+            self.local_targeted_rescan_scan_root_keys("source.targeted_rescan_delivery.roots");
         if target_roots.is_empty() {
-            SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary
+            SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
         } else {
             SourceTargetedRescanDeliveryAcceptance::Accepted
         }
@@ -4001,9 +4219,9 @@ impl FSMetaSource {
     pub(crate) fn accept_targeted_rescan_delivery_with_failure(&self) -> Result<()> {
         match self.targeted_rescan_delivery_acceptance() {
             SourceTargetedRescanDeliveryAcceptance::Accepted => Ok(()),
-            SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary => {
+            SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot => {
                 Err(CnxError::InvalidInput(
-                    "scoped source-rescan target has no local source-primary scan root".into(),
+                    "scoped source-rescan target has no local scheduled scan root".into(),
                 ))
             }
         }
@@ -4032,7 +4250,7 @@ impl FSMetaSource {
             "source.begin_targeted_rescan_request_epoch.roots",
         )
         .clone();
-        let signal_root_keys = Self::record_rescan_intent_on_primary_roots(
+        let signal_root_keys = Self::record_rescan_intent_on_targeted_scan_roots(
             &roots,
             Some(&self.state_cell.fanout_health),
             Some(&self.state_cell.manual_rescan_intents),
@@ -4181,13 +4399,13 @@ impl FSMetaSource {
             &self.state_cell.logical_root_fanout,
             "source.apply.logical_root_fanout",
         ) = fanout;
-        self.refresh_runtime_roots(true).await?;
         if persist_authoritative {
             self.state_cell
                 .logical_roots_cell
                 .replace(root_specs.clone())
                 .await?;
         }
+        self.refresh_runtime_roots(true).await?;
         self.state_cell.record_authoritative_commit(
             commit_label,
             format!("roots={} host_object_grants={}", root_count, grant_count),
@@ -4770,6 +4988,7 @@ impl FSMetaSource {
         revision: u64,
     ) -> RootTaskHandle {
         let root_key = Self::root_runtime_key(&root);
+        let task_signature = Self::root_task_signature(&root);
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
@@ -4787,11 +5006,31 @@ impl FSMetaSource {
         let apply_startup_delay = self.boundary.is_some();
         let root_rescan_tx = root.rescan_tx.clone();
         let join = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
+            let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("build fs-meta source root task runtime")
-                .block_on(async move {
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    let status =
+                        format!("init_error: build fs-meta source root task runtime: {err}");
+                    log::error!("{status}");
+                    Self::update_root_task_slot_health(
+                        &fanout_health,
+                        &root_key,
+                        revision,
+                        stream_generation,
+                        role,
+                        &task_signature,
+                        &config,
+                        Self::root_current_is_active(&roots_handle, &root_key),
+                        status,
+                    );
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+            };
+            runtime.block_on(async move {
                     let mut backoff = Duration::from_secs(1);
                     let max_backoff = Duration::from_secs(60);
                     loop {
@@ -4804,6 +5043,9 @@ impl FSMetaSource {
                     revision,
                     stream_generation,
                     role,
+                    &task_signature,
+                    &config,
+                    Self::root_current_is_active(&roots_handle, &root_key),
                     "warming",
                 );
                 let stream = Self::root_stream(
@@ -4835,6 +5077,9 @@ impl FSMetaSource {
                             revision,
                             stream_generation,
                             role,
+                            &task_signature,
+                            &config,
+                            Self::root_current_is_active(&roots_handle, &root_key),
                             "running",
                         );
                         if Self::root_current_is_group_primary(&roots_handle, &root_key) {
@@ -4940,6 +5185,9 @@ impl FSMetaSource {
                             revision,
                             stream_generation,
                             role,
+                            &task_signature,
+                            &config,
+                            Self::root_current_is_active(&roots_handle, &root_key),
                             format!("error: {err}"),
                         );
                         Self::set_object_last_error(&fanout_health, &root_key, err.to_string());
@@ -4971,6 +5219,9 @@ impl FSMetaSource {
                         revision,
                         stream_generation,
                         role,
+                        &task_signature,
+                        &config,
+                        Self::root_current_is_active(&roots_handle, &root_key),
                         "stopped",
                     );
                 })
@@ -5164,6 +5415,8 @@ impl FSMetaSource {
                     &self.state_cell.fanout_health,
                     &key,
                     entry.active,
+                    &self.config,
+                    true,
                     true,
                 )
                 .await;
@@ -5183,6 +5436,9 @@ impl FSMetaSource {
                 &key,
                 stale.revision,
                 stale.stream_generation,
+                &stale.signature,
+                &self.config,
+                false,
                 "draining",
             );
             stale.handle.cancel_and_join(Duration::from_secs(2)).await;
@@ -5215,6 +5471,8 @@ impl FSMetaSource {
                 &self.state_cell.fanout_health,
                 &replacement.key,
                 entry.active,
+                &self.config,
+                true,
                 true,
             )
             .await;
@@ -5309,16 +5567,22 @@ impl FSMetaSource {
                 let candidate = entry.candidate.take().expect("candidate ready");
                 Self::promote_root_task_candidate_health(
                     &self.state_cell.fanout_health,
-                    &key,
+                    key,
                     candidate.revision,
                     candidate.stream_generation,
+                    &candidate.signature,
+                    &self.config,
+                    true,
                 );
                 let old_active = std::mem::replace(&mut entry.active, candidate);
                 Self::mark_root_task_draining(
                     &self.state_cell.fanout_health,
-                    &key,
+                    key,
                     old_active.revision,
                     old_active.stream_generation,
+                    &old_active.signature,
+                    &self.config,
+                    true,
                     "draining",
                 );
                 promoted_old.push((key.clone(), old_active));
@@ -5326,8 +5590,15 @@ impl FSMetaSource {
         }
 
         for (key, old_active) in promoted_old {
-            Self::cancel_root_task_slot(&self.state_cell.fanout_health, &key, old_active, true)
-                .await;
+            Self::cancel_root_task_slot(
+                &self.state_cell.fanout_health,
+                &key,
+                old_active,
+                &self.config,
+                true,
+                true,
+            )
+            .await;
         }
 
         let mut fallback_ready = Vec::<tokio::sync::watch::Receiver<bool>>::new();
@@ -5350,13 +5621,13 @@ impl FSMetaSource {
                     tasks.insert(fallback.key.clone(), entry);
                     continue;
                 }
-                let candidate = entry.candidate.as_ref().expect("candidate exists").revision;
+                let candidate_revision = candidate.revision;
                 let mut entry = entry;
                 let candidate_slot = entry
                     .candidate
                     .take()
                     .expect("candidate extracted for fallback");
-                debug_assert_eq!(candidate_slot.revision, candidate);
+                debug_assert_eq!(candidate_slot.revision, candidate_revision);
                 extracted_fallbacks.push((fallback, entry, candidate_slot));
             }
         }
@@ -5367,6 +5638,9 @@ impl FSMetaSource {
                 &fallback.key,
                 candidate.revision,
                 candidate.stream_generation,
+                &candidate.signature,
+                &self.config,
+                false,
                 "timed_out: overlap candidate did not become ready",
             );
             candidate
@@ -5378,6 +5652,8 @@ impl FSMetaSource {
                 &self.state_cell.fanout_health,
                 &fallback.key,
                 entry.active,
+                &self.config,
+                true,
                 true,
             )
             .await;
@@ -5420,6 +5696,8 @@ impl FSMetaSource {
                     &self.state_cell.fanout_health,
                     &key,
                     entry.active,
+                    &self.config,
+                    false,
                     true,
                 )
                 .await;
@@ -5701,6 +5979,8 @@ impl FSMetaSource {
 
         let (scan_tx, mut scan_rx) = mpsc::channel::<Vec<Event>>(256);
         let rescan_scan_tx = scan_tx.clone();
+        let initial_scan_tx = scan_tx.clone();
+        let (audit_done_tx, mut audit_done_rx) = mpsc::channel::<RootAuditCompletion>(8);
 
         let (watch_tx, mut watch_rx) = mpsc::channel::<Vec<Event>>(256);
         let mut rescan_rx = root.rescan_tx.subscribe();
@@ -5846,11 +6126,14 @@ impl FSMetaSource {
                 );
             }
             let mut initial_scan_pending = true;
+            let mut initial_scan_inflight = false;
+            let mut audit_inflight = false;
             let mut initial_scan_delay_elapsed = startup_delay.is_zero();
             let mut initial_scan_sleep = Box::pin(tokio::time::sleep(startup_delay));
             let mut initial_scan_wait_logged = false;
             let mut audit_tick = tokio::time::interval(audit_interval);
             let mut scan_channel_open = true;
+            let mut audit_completion_open = true;
             let mut periodic_channel_open = root.spec.scan && !audit_interval.is_zero();
             let mut periodic_first_tick_discarded = !periodic_channel_open;
             let mut watch_channel_open = watch_handle.is_some();
@@ -5894,13 +6177,16 @@ impl FSMetaSource {
                     Self::root_current_is_group_primary(&roots_handle, &root_key);
                 let current_is_group_primary_scan_enabled =
                     Self::root_current_is_group_primary_scan_enabled(&roots_handle, &root_key);
-                let rescan_open = rescan_channel_open;
-                let periodic_open = periodic_channel_open && current_is_group_primary;
+                let rescan_open = rescan_channel_open && !audit_inflight;
+                let periodic_open = periodic_channel_open && current_is_group_primary && !audit_inflight;
                 let initial_delay_open = initial_scan_pending && !initial_scan_delay_elapsed;
                 let initial_ready_open = initial_scan_pending
+                    && !initial_scan_inflight
+                    && !audit_inflight
                     && initial_scan_delay_elapsed
                     && current_is_group_primary_scan_enabled;
                 let initial_wait_open = initial_scan_pending
+                    && !initial_scan_inflight
                     && initial_scan_delay_elapsed
                     && !current_is_group_primary_scan_enabled;
                 if debug_root_task && !first_loop_state_logged {
@@ -5966,61 +6252,100 @@ impl FSMetaSource {
                         let cache = Arc::clone(&initial_mtime_cache);
                         let epoch = Arc::clone(&initial_epoch);
                         let wm = Self::current_watch_manager(&initial_watch_slot);
-                        let initial_scan_root_key_for_scan = root_key.clone();
-                        let scan_result = tokio::task::spawn_blocking(move || {
-                            let mut c = lock_or_recover(&cache, "source.root.scan_audit.mtime_cache");
-                            let mut ep = lock_or_recover(&epoch, "source.root.scan_audit.epoch_counter");
-                            let current_epoch = *ep;
-                            *ep += 1;
-                            scanner.scan_audit_with_summary(current_epoch, &mut c, &de, &clk, wm)
-                        }).await;
-                        Self::mark_root_audit_completed(
-                            &fanout_health,
-                            &root_key,
-                            audit_started_at_us,
-                            now_us(),
-                        );
-                        match scan_result {
-                            Ok(audit) => {
-                                if debug_root_task {
-                                    eprintln!(
-                                        "fs_meta_source: initial scan produced batches={} root_key={} records={}/{} truncated={}",
-                                        audit.batches.len(),
-                                        initial_scan_root_key_for_scan,
-                                        audit.record_count,
-                                        audit.record_budget,
-                                        audit.truncated
-                                    );
-                                }
-                                for (idx, batch) in audit.batches.into_iter().enumerate() {
-                                    if global_shutdown.is_cancelled() || task_shutdown.is_cancelled() {
-                                        break;
-                                    }
-                                    if debug_root_task {
-                                        eprintln!(
-                                            "fs_meta_source: initial scan enqueue batch_index={} len={} root_key={}",
-                                            idx,
-                                            batch.len(),
-                                            initial_scan_root_key_for_scan
-                                        );
-                                    }
-                                    yield batch;
-                                }
-                            }
-                            Err(err) => {
-                                Self::set_object_last_error(
-                                    &fanout_health,
-                                    &root_key,
-                                    format!("initial scan join failed: {err}"),
-                                );
-                            }
-                        }
-                        initial_scan_pending = false;
+                        let scan_sender = initial_scan_tx.clone();
+                        let done_tx = audit_done_tx.clone();
+                        tokio::spawn(async move {
+                            let scan_result = tokio::task::spawn_blocking(move || {
+                                let mut c = lock_or_recover(&cache, "source.root.scan_audit.mtime_cache");
+                                let mut ep = lock_or_recover(&epoch, "source.root.scan_audit.epoch_counter");
+                                let current_epoch = *ep;
+                                *ep += 1;
+                                scanner.scan_audit_streaming(current_epoch, &mut c, &de, &clk, wm, |batch| {
+                                    scan_sender.blocking_send(batch).is_ok()
+                                })
+                            }).await;
+                            let result = scan_result.map_err(|err| format!("initial scan join failed: {err}"));
+                            let _ = done_tx.send(RootAuditCompletion {
+                                kind: RootAuditKind::Initial,
+                                started_at_us: audit_started_at_us,
+                                reason_label: "initial_scan",
+                                manual_requested_target: None,
+                                result,
+                            }).await;
+                        });
+                        initial_scan_inflight = true;
+                        audit_inflight = true;
                     }
                     batch = scan_rx.recv(), if scan_channel_open => match batch {
                         Some(batch) => yield batch,
                         None => {
                             scan_channel_open = false;
+                        }
+                    },
+                    completion = audit_done_rx.recv(), if audit_completion_open => match completion {
+                        Some(completion) => {
+                            audit_inflight = false;
+                            match completion.result {
+                                Ok(audit) if audit.completed => {
+                                    Self::mark_root_audit_completed(
+                                        &fanout_health,
+                                        &root_key,
+                                        completion.started_at_us,
+                                        now_us(),
+                                    );
+                                    if debug_root_task || matches!(completion.kind, RootAuditKind::Rescan) {
+                                        eprintln!(
+                                            "fs_meta_source: {} completed batches={} root_key={} records={}",
+                                            completion.reason_label,
+                                            audit.batch_count,
+                                            root_key,
+                                            audit.record_count
+                                        );
+                                    }
+                                    if matches!(completion.kind, RootAuditKind::Initial) {
+                                        initial_scan_pending = false;
+                                        initial_scan_inflight = false;
+                                    }
+                                    if let Some(target) = completion.manual_requested_target {
+                                        let mut intents = lock_or_recover(
+                                            &manual_rescan_intents,
+                                            "source.root.manual_rescan_intents.mark_completed",
+                                        );
+                                        let entry = intents.entry(root_key.clone()).or_default();
+                                        entry.completed = entry.completed.max(target);
+                                        if entry.completed >= last_manual_dispatch_target {
+                                            last_manual_dispatch_target = entry.completed;
+                                        }
+                                    }
+                                }
+                                Ok(audit) => {
+                                    let message = format!(
+                                        "{} ended before full audit delivery (batches={} records={})",
+                                        completion.reason_label,
+                                        audit.batch_count,
+                                        audit.record_count
+                                    );
+                                    Self::set_object_last_error(&fanout_health, &root_key, message);
+                                    if matches!(completion.kind, RootAuditKind::Initial) {
+                                        initial_scan_inflight = false;
+                                    }
+                                    if completion.manual_requested_target.is_some() {
+                                        last_manual_dispatch_target = 0;
+                                    }
+                                }
+                                Err(err) => {
+                                    Self::set_object_last_error(&fanout_health, &root_key, err);
+                                    if matches!(completion.kind, RootAuditKind::Initial) {
+                                        initial_scan_inflight = false;
+                                    }
+                                    if completion.manual_requested_target.is_some() {
+                                        last_manual_dispatch_target = 0;
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            audit_completion_open = false;
                         }
                     },
                     batch = watch_rx.recv(), if watch_channel_open => match batch {
@@ -6098,58 +6423,32 @@ impl FSMetaSource {
                             let epoch = Arc::clone(&rescan_epoch);
                             let wm = Self::current_watch_manager(&rescan_watch_slot);
                             let manual_full_audit = matches!(reason, RescanReason::Manual);
-                            let rescan_batches = tokio::task::spawn_blocking(move || {
-                                let mut c = lock_or_recover(&cache, "source.root.rescan.mtime_cache");
-                                if manual_full_audit {
-                                    c.clear();
-                                    scanner.reset_audit_caches_for_manual_rescan();
-                                }
-                                let mut ep = lock_or_recover(&epoch, "source.root.rescan.epoch_counter");
-                                let current_epoch = *ep;
-                                *ep += 1;
-                                scanner.scan_audit_with_summary(current_epoch, &mut c, &de, &clk, wm)
-                            }).await;
-                            Self::mark_root_audit_completed(
-                                &fanout_health,
-                                &root_key,
-                                audit_started_at_us,
-                                now_us(),
-                            );
-                            match rescan_batches {
-                                Ok(audit) => {
-                                    eprintln!(
-                                        "fs_meta_source: rescan produced batches={} root_key={} records={}/{} truncated={}",
-                                        audit.batches.len(),
-                                        root_key,
-                                        audit.record_count,
-                                        audit.record_budget,
-                                        audit.truncated
-                                    );
-                                    for batch in audit.batches.into_iter() {
-                                        if rescan_scan_tx.send(batch).await.is_err() {
-                                            break;
-                                        }
+                            let scan_sender = rescan_scan_tx.clone();
+                            let done_tx = audit_done_tx.clone();
+                            tokio::spawn(async move {
+                                let scan_result = tokio::task::spawn_blocking(move || {
+                                    let mut c = lock_or_recover(&cache, "source.root.rescan.mtime_cache");
+                                    if manual_full_audit {
+                                        c.clear();
+                                        scanner.reset_audit_caches_for_manual_rescan();
                                     }
-                                    if let Some(target) = manual_requested_target {
-                                        let mut intents = lock_or_recover(
-                                            &manual_rescan_intents,
-                                            "source.root.manual_rescan_intents.mark_completed",
-                                        );
-                                        let entry = intents.entry(root_key.clone()).or_default();
-                                        entry.completed = entry.completed.max(target);
-                                        if entry.completed >= last_manual_dispatch_target {
-                                            last_manual_dispatch_target = entry.completed;
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    Self::set_object_last_error(
-                                        &fanout_health,
-                                        &root_key,
-                                        format!("rescan join failed: {err}"),
-                                    );
-                                }
-                            }
+                                    let mut ep = lock_or_recover(&epoch, "source.root.rescan.epoch_counter");
+                                    let current_epoch = *ep;
+                                    *ep += 1;
+                                    scanner.scan_audit_streaming(current_epoch, &mut c, &de, &clk, wm, |batch| {
+                                        scan_sender.blocking_send(batch).is_ok()
+                                    })
+                                }).await;
+                                let result = scan_result.map_err(|err| format!("rescan join failed: {err}"));
+                                let _ = done_tx.send(RootAuditCompletion {
+                                    kind: RootAuditKind::Rescan,
+                                    started_at_us: audit_started_at_us,
+                                    reason_label,
+                                    manual_requested_target,
+                                    result,
+                                }).await;
+                            });
+                            audit_inflight = true;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             Self::close_rescan_channels(

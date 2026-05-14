@@ -1783,6 +1783,30 @@ fn group_primary_prefers_lowest_active_process_member() {
     let state = SinkState::new(&cfg);
     let group = state.groups.get("nfs1").expect("group must exist");
     assert_eq!(group.primary_object_ref, "node-a::exp");
+    assert_eq!(group.primary_host_ref, "node-a");
+}
+
+#[test]
+fn status_snapshot_exposes_explicit_primary_host_ref_by_group() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![granted_mount_root(
+        "node-a::exp",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+
+    let sink =
+        SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("init sink");
+    let snapshot = sink.status_snapshot().expect("sink status snapshot");
+
+    assert_eq!(
+        snapshot.primary_host_ref_by_group.get("nfs1"),
+        Some(&"node-a".to_string()),
+        "sink status must expose node identity as explicit host_ref evidence instead of forcing query/status code to parse primary_object_ref: {snapshot:?}"
+    );
 }
 
 #[test]
@@ -1801,6 +1825,7 @@ fn group_primary_prefers_concrete_source_member_over_logical_group_placeholder()
         group.primary_object_ref, "node-b::nfs3",
         "the logical group id may only be a placeholder primary when no concrete source object is available"
     );
+    assert_eq!(group.primary_host_ref, "node-b");
 }
 
 #[test]
@@ -4044,8 +4069,11 @@ async fn update_logical_roots_drops_unrelated_pending_materialization_group_from
             .write()
             .expect("state lock before retained pending injection");
         state.groups.remove("nfs3");
-        let mut retained_nfs3 =
-            GroupSinkState::new("node-b::nfs3".to_string(), TombstonePolicy::default());
+        let mut retained_nfs3 = GroupSinkState::new(
+            "node-b::nfs3".to_string(),
+            "node-b".to_string(),
+            TombstonePolicy::default(),
+        );
         retained_nfs3.materialized_revision = 2;
         retained_nfs3.tree.insert(
             b"/pending-c.txt".to_vec(),
@@ -5876,7 +5904,11 @@ fn sink_group_status_snapshot_serialize_normalizes_zero_row_bound_primary_readin
 
 #[test]
 fn persisted_group_sink_state_serializes_readiness_state_without_legacy_audit_bit() {
-    let mut group = GroupSinkState::new("node-a::exp".to_string(), TombstonePolicy::default());
+    let mut group = GroupSinkState::new(
+        "node-a::exp".to_string(),
+        "node-a".to_string(),
+        TombstonePolicy::default(),
+    );
     group.mark_materialization_ready();
 
     let persisted = PersistedGroupSinkState::from_live("exp", &group);
@@ -5898,7 +5930,11 @@ fn persisted_group_sink_state_serializes_readiness_state_without_legacy_audit_bi
 #[test]
 fn group_readiness_state_distinguishes_pending_materialization_waiting_for_materialized_root_and_ready()
  {
-    let mut group = GroupSinkState::new("node-a::exp".to_string(), TombstonePolicy::default());
+    let mut group = GroupSinkState::new(
+        "node-a::exp".to_string(),
+        "node-a".to_string(),
+        TombstonePolicy::default(),
+    );
     assert_eq!(
         group.group_readiness_state(),
         GroupReadinessState::PendingMaterialization

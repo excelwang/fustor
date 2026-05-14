@@ -1196,6 +1196,14 @@ fn validate_status_sink_shape(
             return Err(format!("status.sink.{key} missing numeric value: {status}"));
         }
     }
+    if !sink
+        .get("primary_host_ref_by_group")
+        .is_some_and(Value::is_object)
+    {
+        return Err(format!(
+            "status.sink.primary_host_ref_by_group missing object value: {status}"
+        ));
+    }
     let groups = sink
         .get("groups")
         .and_then(Value::as_array)

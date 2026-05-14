@@ -309,6 +309,12 @@ fn assert_status_monitoring_shape(status: &HttpResponse) {
             status.body
         );
     }
+    assert!(
+        sink.get("primary_host_ref_by_group")
+            .is_some_and(Value::is_object),
+        "status.sink.primary_host_ref_by_group missing object value: {}",
+        status.body
+    );
     let groups = sink
         .get("groups")
         .and_then(Value::as_array)

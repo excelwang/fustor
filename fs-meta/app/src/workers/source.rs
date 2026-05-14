@@ -20,10 +20,8 @@ use crate::runtime::orchestration::{
     SourceControlSignal, SourceRuntimeUnit, source_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{ROUTE_KEY_EVENTS, source_rescan_route_key_for};
-#[cfg(test)]
-use crate::source::SourceTargetedRescanDeliveryAcceptance;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
-use crate::source::{FSMetaSource, SourceStatusSnapshot};
+use crate::source::{FSMetaSource, SourceStatusSnapshot, SourceTargetedRescanDeliveryAcceptance};
 use crate::workers::sink::SinkFacade;
 use crate::workers::source_ipc::{
     SourceWorkerRequest, SourceWorkerResponse, decode_request, decode_response, encode_request,
@@ -7137,6 +7135,7 @@ impl SourceWorkerClientHandle {
         .await
     }
 
+    #[cfg(test)]
     async fn source_primary_by_group_snapshot_with_failure(
         &self,
     ) -> std::result::Result<std::collections::BTreeMap<String, String>, SourceFailure> {
@@ -7991,14 +7990,9 @@ impl SourceWorkerClientHandle {
         }
     }
 
-    #[cfg(test)]
     async fn check_targeted_rescan_delivery_acceptance_with_failure(
         &self,
     ) -> std::result::Result<SourceTargetedRescanDeliveryAcceptance, SourceFailure> {
-        if self.manual_rescan_delivery_acceptance_already_ready().await {
-            self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
-            return Ok(SourceTargetedRescanDeliveryAcceptance::Accepted);
-        }
         self.ensure_targeted_rescan_delivery_acceptance_probe_ready()
             .await?;
         match self
@@ -8030,8 +8024,8 @@ impl SourceWorkerClientHandle {
                 Ok(SourceTargetedRescanDeliveryAcceptance::Accepted)
             }
             SourceWorkerResponse::TargetedRescanDeliveryAcceptance(
-                SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary,
-            ) => Ok(SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary),
+                SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot,
+            ) => Ok(SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot),
             other => unexpected_source_worker_response_result(
                 "for targeted rescan delivery acceptance",
                 other,
@@ -9212,6 +9206,7 @@ fn manual_rescan_delivery_local_scheduled_groups(
 fn manual_rescan_delivery_source_primary_by_group(
     roots: &[RootSpec],
     grants: &[GrantedMountRoot],
+    node_id: &NodeId,
     scheduled_groups: &std::collections::BTreeSet<String>,
 ) -> std::collections::BTreeMap<String, String> {
     let mut primary = std::collections::BTreeMap::new();
@@ -9219,24 +9214,30 @@ fn manual_rescan_delivery_source_primary_by_group(
         if !scheduled_groups.contains(&root.id) {
             continue;
         }
-        let mut active_member_ids = grants
+        let mut local_active_member_ids = grants
             .iter()
-            .filter(|grant| root.selector.matches(grant) && grant.active)
+            .filter(|grant| {
+                root.selector.matches(grant)
+                    && grant.active
+                    && host_ref_matches_node_id(&grant.host_ref, node_id)
+            })
             .map(|grant| grant.object_ref.clone())
             .collect::<Vec<_>>();
-        active_member_ids.sort();
-        active_member_ids.dedup();
-        let mut member_ids = grants
+        local_active_member_ids.sort();
+        local_active_member_ids.dedup();
+        let mut local_member_ids = grants
             .iter()
-            .filter(|grant| root.selector.matches(grant))
+            .filter(|grant| {
+                root.selector.matches(grant) && host_ref_matches_node_id(&grant.host_ref, node_id)
+            })
             .map(|grant| grant.object_ref.clone())
             .collect::<Vec<_>>();
-        member_ids.sort();
-        member_ids.dedup();
-        if let Some(primary_member) = active_member_ids
+        local_member_ids.sort();
+        local_member_ids.dedup();
+        if let Some(primary_member) = local_active_member_ids
             .first()
             .cloned()
-            .or_else(|| member_ids.first().cloned())
+            .or_else(|| local_member_ids.first().cloned())
         {
             primary.insert(root.id.clone(), primary_member);
         }
@@ -9269,18 +9270,16 @@ fn manual_rescan_delivery_status_from_cache(
     }
     let (scheduled_source, scheduled_scan) =
         manual_rescan_delivery_local_scheduled_groups(cache, node_id);
-    let mut scheduled_groups = scheduled_source.clone();
-    scheduled_groups.extend(scheduled_scan.iter().cloned());
-    if scheduled_groups.is_empty() {
+    if scheduled_scan.is_empty() {
         return None;
     }
     let source_primary_by_group =
-        manual_rescan_delivery_source_primary_by_group(&roots, &grants, &scheduled_groups);
+        manual_rescan_delivery_source_primary_by_group(&roots, &grants, node_id, &scheduled_scan);
     let mut logical_roots = Vec::new();
     let mut concrete_roots = Vec::new();
     for root in roots
         .iter()
-        .filter(|root| scheduled_groups.contains(&root.id))
+        .filter(|root| scheduled_scan.contains(&root.id))
     {
         let matching_grants = grants
             .iter()
@@ -10333,6 +10332,7 @@ impl SourceFacade {
             .map_err(SourceFailure::into_error)
     }
 
+    #[cfg(test)]
     pub(crate) async fn source_primary_by_group_snapshot_with_failure(
         &self,
     ) -> std::result::Result<std::collections::BTreeMap<String, String>, SourceFailure> {
@@ -10443,6 +10443,19 @@ impl SourceFacade {
             Self::Worker(client) => {
                 client
                     .rearm_source_rescan_request_endpoints_with_failure()
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn targeted_rescan_delivery_acceptance_with_failure(
+        &self,
+    ) -> std::result::Result<SourceTargetedRescanDeliveryAcceptance, SourceFailure> {
+        match self {
+            Self::Local(source) => Ok(source.targeted_rescan_delivery_acceptance()),
+            Self::Worker(client) => {
+                client
+                    .check_targeted_rescan_delivery_acceptance_with_failure()
                     .await
             }
         }

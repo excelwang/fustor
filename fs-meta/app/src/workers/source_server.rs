@@ -1274,7 +1274,7 @@ fn plan_worker_request(
             ),
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::TargetedRescanDeliveryAcceptance(
-                    SourceTargetedRescanDeliveryAcceptance::NotLocalSourcePrimary,
+                    SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot,
                 ),
                 false,
             ),
@@ -2865,7 +2865,7 @@ mod tests {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "targeted rescan must wait until local source-primary scan roots are active before testing acceptance: concrete_roots={statuses:?}"
+                "targeted rescan must wait until local scheduled scan roots are active before testing acceptance: concrete_roots={statuses:?}"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

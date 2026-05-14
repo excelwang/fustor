@@ -37,14 +37,8 @@ pub fn source_concrete_root_has_current_owner_evidence(
 pub fn source_concrete_root_needs_current_owner_evidence(
     root: &crate::source::SourceConcreteRootHealthSnapshot,
 ) -> bool {
-    let audit_inflight = root.last_audit_started_at_us.is_some_and(|started_at_us| {
-        !root
-            .last_audit_completed_at_us
-            .is_some_and(|completed_at_us| completed_at_us >= started_at_us)
-    });
     concrete_root_counts_as_materialized_candidate(root)
-        && ((root.rescan_pending && !source_concrete_root_completed_current_audit(root))
-            || audit_inflight)
+        && !source_concrete_root_completed_current_audit(root)
 }
 
 fn source_concrete_root_blocks_materialized_observation(
@@ -283,17 +277,12 @@ pub fn source_status_covers_readiness_groups(
     source_status: &SourceStatusSnapshot,
     readiness_groups: &BTreeSet<String>,
 ) -> bool {
-    let mut source_groups = source_status
-        .logical_roots
+    let source_groups = source_status
+        .concrete_roots
         .iter()
-        .map(|root| root.root_id.clone())
+        .filter(|root| source_concrete_root_has_current_owner_evidence(root))
+        .map(|root| root.logical_root_id.clone())
         .collect::<BTreeSet<_>>();
-    source_groups.extend(
-        source_status
-            .concrete_roots
-            .iter()
-            .map(|root| root.logical_root_id.clone()),
-    );
     readiness_groups.is_subset(&source_groups)
 }
 
@@ -310,7 +299,7 @@ pub fn materialized_scheduled_group_ids(snapshot: &SinkStatusSnapshot) -> BTreeS
 pub fn sink_group_readiness_reports_live_materialized_group(
     group: &crate::sink::SinkGroupStatusSnapshot,
 ) -> bool {
-    group.materialized_service_ready() && group.live_nodes > 0 && group.total_nodes > 0
+    group.materialized_service_live_ready()
 }
 
 pub fn sink_status_covers_ready_readiness_groups(
@@ -340,17 +329,12 @@ pub fn materialized_observation_status_for_readiness_groups(
     }
     let mut evidence =
         candidate_group_observation_evidence(source_status, sink_status, readiness_groups);
-    let mut source_groups = source_status
-        .logical_roots
+    let source_groups = source_status
+        .concrete_roots
         .iter()
-        .map(|root| root.root_id.clone())
+        .filter(|root| source_concrete_root_has_current_owner_evidence(root))
+        .map(|root| root.logical_root_id.clone())
         .collect::<BTreeSet<_>>();
-    source_groups.extend(
-        source_status
-            .concrete_roots
-            .iter()
-            .map(|root| root.logical_root_id.clone()),
-    );
     for missing_group in readiness_groups.difference(&source_groups) {
         evidence.initial_audit_groups.insert(missing_group.clone());
     }
@@ -438,9 +422,9 @@ mod tests {
             last_rescan_requested_at_us: None,
             last_rescan_reason: None,
             last_error: None,
-            last_audit_started_at_us: None,
-            last_audit_completed_at_us: None,
-            last_audit_duration_ms: None,
+            last_audit_started_at_us: Some(10),
+            last_audit_completed_at_us: Some(20),
+            last_audit_duration_ms: Some(10),
             emitted_batch_count: 0,
             emitted_event_count: 0,
             emitted_control_event_count: 0,
@@ -537,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn materialized_query_observation_evidence_keeps_ready_sink_group_with_blind_spots_available() {
+    fn materialized_query_observation_evidence_keeps_ready_sink_group_trusted_with_blind_spots() {
         let source_status = SourceStatusSnapshot {
             logical_roots: vec![SourceLogicalRootHealthSnapshot {
                 root_id: "nfs1".to_string(),
@@ -561,6 +545,7 @@ mod tests {
             evidence.candidate_groups,
             BTreeSet::from(["nfs1".to_string()])
         );
+        assert!(evidence.initial_audit_groups.is_empty());
         assert!(evidence.degraded_groups.is_empty());
         let status =
             evaluate_observation_status(&evidence, ObservationTrustPolicy::materialized_query());
@@ -956,6 +941,7 @@ mod tests {
     fn materialized_status_cache_is_not_ready_while_primary_rescan_is_pending() {
         let mut root = concrete_root("nfs1", true);
         root.rescan_pending = true;
+        root.last_rescan_requested_at_us = Some(30);
         let source_status = SourceStatusSnapshot {
             logical_roots: vec![SourceLogicalRootHealthSnapshot {
                 root_id: "nfs1".to_string(),
@@ -1048,6 +1034,86 @@ mod tests {
     }
 
     #[test]
+    fn readiness_group_observation_rejects_primary_without_completed_current_audit() {
+        let mut root = concrete_root("nfs1", true);
+        root.last_audit_started_at_us = None;
+        root.last_audit_completed_at_us = None;
+        root.last_audit_duration_ms = None;
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            }],
+            concrete_roots: vec![root],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![ready_sink_group("nfs1")],
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..SinkStatusSnapshot::default()
+        };
+        let readiness_groups = BTreeSet::from(["nfs1".to_string()]);
+
+        let status = materialized_observation_status_for_readiness_groups(
+            &source_status,
+            &sink_status,
+            &readiness_groups,
+        );
+
+        assert_eq!(status.state, ObservationState::MaterializedUntrusted);
+        assert!(!materialized_status_cache_is_ready(
+            &source_status,
+            &sink_status,
+            &readiness_groups,
+        ));
+    }
+
+    #[test]
+    fn readiness_group_observation_accepts_ready_empty_sink_coverage() {
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            }],
+            concrete_roots: vec![concrete_root("nfs1", true)],
+            ..SourceStatusSnapshot::default()
+        };
+        let mut group = ready_sink_group("nfs1");
+        group.total_nodes = 0;
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![group],
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..SinkStatusSnapshot::default()
+        };
+        let readiness_groups = BTreeSet::from(["nfs1".to_string()]);
+
+        let status = materialized_observation_status_for_readiness_groups(
+            &source_status,
+            &sink_status,
+            &readiness_groups,
+        );
+
+        assert_eq!(status.state, ObservationState::TrustedMaterialized);
+        assert!(materialized_status_cache_is_ready(
+            &source_status,
+            &sink_status,
+            &readiness_groups,
+        ));
+    }
+
+    #[test]
     fn completed_audit_satisfies_stale_rescan_pending_evidence() {
         let mut root = concrete_root("nfs1", true);
         root.rescan_pending = true;
@@ -1088,7 +1154,7 @@ mod tests {
     #[test]
     fn materialized_status_cache_is_not_ready_while_primary_audit_is_inflight() {
         let mut root = concrete_root("nfs1", true);
-        root.last_audit_started_at_us = Some(10);
+        root.last_audit_started_at_us = Some(30);
         root.last_audit_completed_at_us = None;
         let source_status = SourceStatusSnapshot {
             logical_roots: vec![SourceLogicalRootHealthSnapshot {
@@ -1124,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn non_primary_rescan_pending_does_not_block_materialized_readiness() {
+    fn non_primary_rescan_pending_does_not_satisfy_materialized_readiness() {
         let mut root = concrete_root("nfs1", false);
         root.rescan_pending = true;
         let source_status = SourceStatusSnapshot {
@@ -1148,7 +1214,7 @@ mod tests {
         };
         let readiness_groups = BTreeSet::from(["nfs1".to_string()]);
 
-        assert!(materialized_status_cache_is_ready(
+        assert!(!materialized_status_cache_is_ready(
             &source_status,
             &sink_status,
             &readiness_groups,

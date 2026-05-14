@@ -874,6 +874,7 @@ pub(crate) fn merge_sink_status_snapshots(
 
     let mut groups = BTreeMap::<String, crate::sink::SinkGroupStatusSnapshot>::new();
     let mut scheduled_groups_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut primary_host_ref_by_group = BTreeMap::<String, String>::new();
     let mut last_control_frame_signals_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut received_batches_by_node = BTreeMap::<String, u64>::new();
     let mut received_events_by_node = BTreeMap::<String, u64>::new();
@@ -895,6 +896,7 @@ pub(crate) fn merge_sink_status_snapshots(
     let mut stream_applied_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut stream_last_applied_at_us_by_node = BTreeMap::<String, u64>::new();
     for snapshot in snapshots {
+        let snapshot_primary_host_ref_by_group = snapshot.primary_host_ref_by_group;
         for (node_id, groups_for_node) in snapshot.scheduled_groups_by_node {
             let entry = scheduled_groups_by_node.entry(node_id).or_default();
             entry.extend(groups_for_node);
@@ -925,9 +927,16 @@ pub(crate) fn merge_sink_status_snapshots(
         stream_applied_origin_counts_by_node.extend(snapshot.stream_applied_origin_counts_by_node);
         stream_last_applied_at_us_by_node.extend(snapshot.stream_last_applied_at_us_by_node);
         for group in snapshot.groups {
-            groups
-                .entry(group.group_id.clone())
-                .and_modify(|current| {
+            let group_id = group.group_id.clone();
+            let incoming_score = (
+                u8::from(sink_group_readiness_reports_live_materialized_group(&group)),
+                group.total_nodes,
+                group.live_nodes,
+                group.shadow_time_us,
+            );
+            let should_replace = groups
+                .get(&group_id)
+                .map(|current| {
                     let current_score = (
                         u8::from(sink_group_readiness_reports_live_materialized_group(
                             current,
@@ -936,23 +945,35 @@ pub(crate) fn merge_sink_status_snapshots(
                         current.live_nodes,
                         current.shadow_time_us,
                     );
-                    let incoming_score = (
-                        u8::from(sink_group_readiness_reports_live_materialized_group(&group)),
-                        group.total_nodes,
-                        group.live_nodes,
-                        group.shadow_time_us,
-                    );
-                    if incoming_score > current_score {
-                        *current = group.clone();
-                    }
+                    incoming_score > current_score
                 })
-                .or_insert(group);
+                .unwrap_or(true);
+            if should_replace {
+                groups.insert(group_id.clone(), group);
+                if let Some(host_ref) = snapshot_primary_host_ref_by_group
+                    .get(&group_id)
+                    .map(|host_ref| host_ref.trim())
+                    .filter(|host_ref| !host_ref.is_empty())
+                {
+                    primary_host_ref_by_group.insert(group_id, host_ref.to_string());
+                } else {
+                    primary_host_ref_by_group.remove(&group_id);
+                }
+            } else if !primary_host_ref_by_group.contains_key(&group_id)
+                && let Some(host_ref) = snapshot_primary_host_ref_by_group
+                    .get(&group_id)
+                    .map(|host_ref| host_ref.trim())
+                    .filter(|host_ref| !host_ref.is_empty())
+            {
+                primary_host_ref_by_group.insert(group_id, host_ref.to_string());
+            }
         }
     }
 
     let mut merged = SinkStatusSnapshot::default();
     merged.groups = groups.into_values().collect();
     merged.scheduled_groups_by_node = scheduled_groups_by_node;
+    merged.primary_host_ref_by_group = primary_host_ref_by_group;
     merged.last_control_frame_signals_by_node = last_control_frame_signals_by_node;
     merged.received_batches_by_node = received_batches_by_node;
     merged.received_events_by_node = received_events_by_node;
@@ -2035,13 +2056,6 @@ fn current_owner_candidate_nodes_from_source_observability(
 ) -> Vec<NodeId> {
     let mut nodes = BTreeSet::<String>::new();
     for snapshot in snapshots {
-        for (group_id, source_primary) in &snapshot.source_primary_by_group {
-            if groups.contains(group_id)
-                && let Some(node_id) = node_id_from_object_ref(source_primary)
-            {
-                nodes.insert(node_id.0);
-            }
-        }
         collect_nodes_for_groups_from_schedule(
             &mut nodes,
             &snapshot.scheduled_source_groups_by_node,
@@ -2628,11 +2642,20 @@ fn preserve_request_scoped_ready_owner_across_equal_score_ties(
         .iter()
         .map(|group| group.group_id.clone())
         .collect::<BTreeSet<_>>();
+    let replacement_primary_host_ref_by_group = request_scoped_sink_status
+        .primary_host_ref_by_group
+        .iter()
+        .filter(|(group_id, _)| replacement_group_ids.contains(*group_id))
+        .map(|(group_id, host_ref)| (group_id.clone(), host_ref.clone()))
+        .collect::<BTreeMap<_, _>>();
     current
         .groups
         .retain(|group| !replacement_group_ids.contains(&group.group_id));
     current.scheduled_groups_by_node =
         remove_groups_from_scheduled_map(current.scheduled_groups_by_node, &replacement_group_ids);
+    for group_id in &replacement_group_ids {
+        current.primary_host_ref_by_group.remove(group_id);
+    }
     let replacement_scheduled_groups_by_node = request_scoped_sink_status
         .scheduled_groups_by_node
         .iter()
@@ -2650,6 +2673,7 @@ fn preserve_request_scoped_ready_owner_across_equal_score_ties(
         SinkStatusSnapshot {
             groups: replacement_groups,
             scheduled_groups_by_node: replacement_scheduled_groups_by_node,
+            primary_host_ref_by_group: replacement_primary_host_ref_by_group,
             ..SinkStatusSnapshot::default()
         },
     ])
@@ -3088,9 +3112,15 @@ fn filter_sink_status_snapshot(
             (!groups.is_empty()).then_some((node_id, groups))
         })
         .collect::<BTreeMap<_, _>>();
+    let primary_host_ref_by_group = snapshot
+        .primary_host_ref_by_group
+        .into_iter()
+        .filter(|(group_id, _)| allowed_groups.contains(group_id))
+        .collect::<BTreeMap<_, _>>();
     merge_sink_status_snapshots(vec![SinkStatusSnapshot {
         groups,
         scheduled_groups_by_node,
+        primary_host_ref_by_group,
         last_control_frame_signals_by_node,
         ..SinkStatusSnapshot::default()
     }])
@@ -3158,6 +3188,9 @@ fn remove_sink_status_groups(
         .retain(|group| !group_ids.contains(&group.group_id));
     snapshot.scheduled_groups_by_node =
         remove_groups_from_scheduled_map(snapshot.scheduled_groups_by_node, group_ids);
+    for group_id in group_ids {
+        snapshot.primary_host_ref_by_group.remove(group_id);
+    }
     recompute_sink_status_totals(snapshot)
 }
 
@@ -3202,6 +3235,9 @@ fn merge_with_cached_sink_status_snapshot(
                     cached.scheduled_groups_by_node,
                     &explicit_empty_groups,
                 );
+                for group_id in &explicit_empty_groups {
+                    cached.primary_host_ref_by_group.remove(group_id);
+                }
             }
             merge_sink_status_snapshots(vec![cached, fresh])
         }
@@ -3505,6 +3541,9 @@ fn merge_with_local_sink_status_snapshot(
         current.scheduled_groups_by_node,
         explicit_empty_groups_to_clear,
     );
+    for group_id in explicit_empty_groups_to_clear {
+        current.primary_host_ref_by_group.remove(group_id);
+    }
     merge_sink_status_snapshots(vec![current, candidate])
 }
 
@@ -4122,8 +4161,8 @@ async fn query_materialized_events_with_sink_status_snapshot(
         QueryBackend::Route {
             boundary,
             origin_id,
-            sink,
             source,
+            ..
         } => {
             let selected_group_sink_status = if params.scope.selected_group.is_some() {
                 if let Some(selected_group_sink_status) = selected_group_sink_status {
@@ -4144,24 +4183,13 @@ async fn query_materialized_events_with_sink_status_snapshot(
                 && let Some(node_id) = materialized_owner_node_for_group_with_failure(
                     source.as_ref(),
                     selected_group_sink_status.as_ref(),
+                    None,
                     group_id,
                     MaterializedOwnerOmissionPolicy::Authoritative,
                 )
                 .await
                 .map_err(QueryWorkerObservationFailure::into_error)?
             {
-                if node_id == origin_id {
-                    let result =
-                        query_local_materialized_events_with_failure(&sink, &params, timeout)
-                            .await
-                            .map_err(QueryWorkerObservationFailure::into_error);
-                    eprintln!(
-                        "fs_meta_query_api: query_materialized_events selected-group route owner_node={} local_owner=true ok={}",
-                        node_id.0,
-                        result.is_ok()
-                    );
-                    return result;
-                }
                 let result = route_materialized_events_via_node(
                     boundary.clone(),
                     node_id.clone(),
@@ -6056,19 +6084,12 @@ async fn rescue_trusted_materialized_empty_tree_response(
         .await
         {
             Ok(retry_events) => {
-                if let Ok(mut retry_response) = decode_materialized_selected_group_response(
+                if let Ok(retry_response) = decode_materialized_selected_group_response(
                     &retry_events,
                     input.policy,
                     input.group_key,
                     input.query_path,
                 ) {
-                    maybe_promote_richer_same_path_materialized_tree_response(
-                        &retry_events,
-                        input.policy,
-                        input.group_key,
-                        input.query_path,
-                        &mut retry_response,
-                    );
                     if !trusted_materialized_tree_payload_is_empty(&retry_response) {
                         *response = retry_response;
                     }
@@ -6122,14 +6143,7 @@ async fn rescue_trusted_materialized_empty_tree_response(
                     input.group_key,
                     input.query_path,
                 ) {
-                    Ok(mut proxy_response) => {
-                        maybe_promote_richer_same_path_materialized_tree_response(
-                            &proxy_events,
-                            input.policy,
-                            input.group_key,
-                            input.query_path,
-                            &mut proxy_response,
-                        );
+                    Ok(proxy_response) => {
                         if !trusted_materialized_tree_payload_is_empty(&proxy_response) {
                             *response = proxy_response;
                         }
@@ -6200,13 +6214,6 @@ async fn resolve_tree_pit_stage_execution_action(
             let empty_response_plan = input
                 .stage_timing
                 .empty_response_rescue_plan(input.group_plan, input.selected_group_owner_known);
-            maybe_promote_richer_same_path_materialized_tree_response(
-                input.events,
-                input.policy,
-                input.group_key,
-                input.query_path,
-                &mut response,
-            );
             if input.group_plan.stage_plan.requires_rescue
                 && trusted_materialized_tree_payload_is_empty(&response)
                 && let Err(err) = rescue_trusted_materialized_empty_tree_response(
@@ -6390,20 +6397,13 @@ async fn handle_retryable_tree_pit_stage_gap(
                 outer_owner_retry_timeout,
             )
             .await
-                && let Ok(mut retry_response) = decode_materialized_selected_group_response(
+                && let Ok(retry_response) = decode_materialized_selected_group_response(
                     &retry_events,
                     input.policy,
                     &input.group_key,
                     input.query_path,
                 )
             {
-                maybe_promote_richer_same_path_materialized_tree_response(
-                    &retry_events,
-                    input.policy,
-                    &input.group_key,
-                    input.query_path,
-                    &mut retry_response,
-                );
                 if !trusted_materialized_tree_payload_is_empty(&retry_response) {
                     push_materialized_tree_group_payload(
                         groups,
@@ -6448,14 +6448,7 @@ async fn handle_retryable_tree_pit_stage_gap(
                             &input.group_key,
                             input.query_path,
                         ) {
-                            Ok(mut proxy_response) => {
-                                maybe_promote_richer_same_path_materialized_tree_response(
-                                    &proxy_events,
-                                    input.policy,
-                                    &input.group_key,
-                                    input.query_path,
-                                    &mut proxy_response,
-                                );
+                            Ok(proxy_response) => {
                                 if debug_materialized_route_capture_enabled() {
                                     eprintln!(
                                         "fs_meta_query_api: pit_group_stage proxy_fallback_decode group={} root_exists={} entries={} has_children={}",
@@ -6580,6 +6573,7 @@ struct TreePitRankedGroupExecutionInput<'a> {
     state: &'a ApiState,
     policy: &'a ProjectionPolicy,
     params: &'a NormalizedApiParams,
+    request_source_status: Option<&'a SourceStatusSnapshot>,
     request_sink_status: Option<&'a SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<&'a BTreeSet<String>>,
     observation_state: ObservationState,
@@ -6593,14 +6587,19 @@ fn sink_primary_owner_node_for_group(
     sink_status: Option<&SinkStatusSnapshot>,
     group_id: &str,
 ) -> Option<NodeId> {
+    sink_status.and_then(|snapshot| sink_status_primary_host_node_for_group(snapshot, group_id))
+}
+
+fn sink_status_primary_host_node_for_group(
+    sink_status: &SinkStatusSnapshot,
+    group_id: &str,
+) -> Option<NodeId> {
     sink_status
-        .and_then(|snapshot| {
-            snapshot
-                .groups
-                .iter()
-                .find(|group| group.group_id == group_id)
-        })
-        .and_then(|group| node_id_from_object_ref(&group.primary_object_ref))
+        .primary_host_ref_by_group
+        .get(group_id)
+        .map(|host_ref| host_ref.trim())
+        .filter(|host_ref| !host_ref.is_empty())
+        .map(|host_ref| NodeId(host_ref.to_string()))
 }
 
 fn trusted_materialized_empty_selected_group_tree_error(group_id: &str) -> CnxError {
@@ -6622,7 +6621,7 @@ fn trusted_materialized_unavailable_selected_group_stats_error(group_id: &str) -
 }
 
 #[test]
-fn selected_group_sink_status_reports_live_materialized_group_requires_positive_total_nodes() {
+fn selected_group_sink_status_reports_live_materialized_group_accepts_zero_total_nodes() {
     let snapshot = SinkStatusSnapshot {
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs2".to_string(),
@@ -6645,8 +6644,8 @@ fn selected_group_sink_status_reports_live_materialized_group_requires_positive_
     };
 
     assert!(
-        !selected_group_sink_status_reports_live_materialized_group(Some(&snapshot), "nfs2"),
-        "live materialized selected-group status must not treat total_nodes=0 as ready even when live_nodes>0 and initial_audit_completed=true: {snapshot:?}"
+        selected_group_sink_status_reports_live_materialized_group(Some(&snapshot), "nfs2"),
+        "live materialized selected-group status must accept total_nodes=0 when the sink group is already ready and still has a live owner: {snapshot:?}"
     );
 }
 
@@ -6707,6 +6706,46 @@ fn selected_group_sink_status_is_unready_empty_prefers_exported_readiness_over_l
     assert!(
         selected_group_sink_status_is_unready_empty(Some(&snapshot), "nfs2"),
         "selected-group unready-empty classification must trust exported sink readiness over stale initial_audit_completed=true: {snapshot:?}"
+    );
+}
+
+#[test]
+fn sink_primary_owner_node_for_group_requires_explicit_primary_host_ref() {
+    let object_ref_only = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs2".to_string(),
+            primary_object_ref: "node-a::nfs2".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 1,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+
+    assert_eq!(
+        sink_primary_owner_node_for_group(Some(&object_ref_only), "nfs2"),
+        None,
+        "query routing must not infer node identity by parsing primary_object_ref"
+    );
+
+    let explicit_host = SinkStatusSnapshot {
+        primary_host_ref_by_group: BTreeMap::from([("nfs2".to_string(), "node-b".to_string())]),
+        ..object_ref_only
+    };
+
+    assert_eq!(
+        sink_primary_owner_node_for_group(Some(&explicit_host), "nfs2"),
+        Some(NodeId("node-b".to_string())),
+        "query routing must use explicit sink primary host evidence"
     );
 }
 
@@ -8139,8 +8178,8 @@ fn multi_group_force_find_dispatches_ranked_groups_as_independent_branches() {
 fn force_find_runner_selection_uses_binding_evidence_with_local_snapshot_fallback() {
     let source = include_str!("api.rs");
     let start = source
-        .find("\nasync fn force_find_candidate_object_refs_for_group_with_failure(")
-        .expect("force_find_candidate_object_refs_for_group_with_failure exists");
+        .find("\nasync fn force_find_candidate_nodes_for_group_with_failure(")
+        .expect("force_find_candidate_nodes_for_group_with_failure exists");
     let end = source[start..]
         .find("\nasync fn select_force_find_runner_node_for_group(")
         .map(|offset| start + offset)
@@ -8161,6 +8200,14 @@ fn force_find_runner_selection_uses_binding_evidence_with_local_snapshot_fallbac
     assert!(
         body.contains("cached_host_object_grants_snapshot_with_failure()"),
         "local force-find fallback may still use cached host-object grants",
+    );
+    assert!(
+        body.contains("FORCE_FIND_RUNNER_BINDING_NOT_READY_PREFIX"),
+        "missing current runner binding must become explicit force-find NOT_READY instead of borrowing materialized ownership",
+    );
+    assert!(
+        !body.contains("materialized_owner_node_for_group_with_failure("),
+        "force-find runner selection must not substitute materialized owner lookup for missing current runner binding",
     );
     assert!(
         !body.contains("logical_roots_snapshot().await"),
@@ -8211,6 +8258,113 @@ fn force_find_route_plan_tree_error_lane_routes_runner_gaps_through_canonical_fa
 }
 
 #[test]
+fn merge_sink_status_snapshots_carries_primary_host_ref_for_winning_group() {
+    let older = SinkStatusSnapshot {
+        primary_host_ref_by_group: BTreeMap::from([("nfs1".to_string(), "node-a".to_string())]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-a::nfs1".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 1,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+    let newer = SinkStatusSnapshot {
+        primary_host_ref_by_group: BTreeMap::from([("nfs1".to_string(), "node-b".to_string())]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-b::nfs1".to_string(),
+            total_nodes: 3,
+            live_nodes: 3,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 2,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 2,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+
+    let merged = merge_sink_status_snapshots(vec![older, newer]);
+
+    assert_eq!(
+        sink_primary_owner_node_for_group(Some(&merged), "nfs1"),
+        Some(NodeId("node-b".to_string())),
+        "merged sink status must carry explicit primary_host_ref for the winning group row: {merged:?}"
+    );
+}
+
+#[test]
+fn merge_sink_status_snapshots_does_not_keep_stale_primary_host_when_winner_lacks_host_ref() {
+    let older = SinkStatusSnapshot {
+        primary_host_ref_by_group: BTreeMap::from([("nfs1".to_string(), "node-a".to_string())]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-a::nfs1".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 1,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+    let newer_without_host = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-b::nfs1".to_string(),
+            total_nodes: 3,
+            live_nodes: 3,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 2,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 2,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+
+    let merged = merge_sink_status_snapshots(vec![older, newer_without_host]);
+
+    assert_eq!(
+        merged.groups[0].primary_object_ref, "node-b::nfs1",
+        "newer stronger group row should still win by materialized facts"
+    );
+    assert_eq!(
+        sink_primary_owner_node_for_group(Some(&merged), "nfs1"),
+        None,
+        "merged sink status must not keep a stale primary_host_ref when the winning group row has no explicit host evidence: {merged:?}"
+    );
+}
+
+#[test]
 fn merge_request_scoped_materialized_sink_status_snapshot_prefers_later_ready_owner_on_equal_score()
 {
     let loaded_sink_status = SinkStatusSnapshot {
@@ -8218,6 +8372,7 @@ fn merge_request_scoped_materialized_sink_status_snapshot_prefers_later_ready_ow
             "node-a".to_string(),
             vec!["nfs1".to_string()],
         )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs1".to_string(), "node-a".to_string())]),
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs1".to_string(),
             primary_object_ref: "node-a::nfs1".to_string(),
@@ -8242,6 +8397,7 @@ fn merge_request_scoped_materialized_sink_status_snapshot_prefers_later_ready_ow
             "node-b".to_string(),
             vec!["nfs1".to_string()],
         )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs1".to_string(), "node-b".to_string())]),
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs1".to_string(),
             primary_object_ref: "node-b::nfs1".to_string(),
@@ -8286,6 +8442,7 @@ fn merge_request_scoped_materialized_sink_status_snapshot_keeps_loaded_owner_whe
             "node-a".to_string(),
             vec!["nfs1".to_string()],
         )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs1".to_string(), "node-a".to_string())]),
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs1".to_string(),
             primary_object_ref: "node-a::nfs1".to_string(),
@@ -8306,6 +8463,7 @@ fn merge_request_scoped_materialized_sink_status_snapshot_keeps_loaded_owner_whe
         ..SinkStatusSnapshot::default()
     };
     let request_scoped_sink_status = SinkStatusSnapshot {
+        primary_host_ref_by_group: BTreeMap::from([("nfs1".to_string(), "node-b".to_string())]),
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs1".to_string(),
             primary_object_ref: "node-b::nfs1".to_string(),
@@ -8783,7 +8941,6 @@ async fn proxy_selected_group_empty_tree_rescue(
     deadline: tokio::time::Instant,
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
-    sink: &Arc<SinkFacade>,
     selected_group_sink_status: Option<&SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
     group_id: &str,
@@ -8835,7 +8992,6 @@ async fn proxy_selected_group_empty_tree_rescue(
         if !retry_owner_timeout.is_zero() {
             let retry_events = query_materialized_events_via_selected_group_owner_attempt(
                 owner_attempt,
-                sink,
                 boundary,
                 params,
                 retry_owner_timeout,
@@ -8866,7 +9022,6 @@ async fn execute_selected_group_owner_empty_tree_rescue(
     deadline: tokio::time::Instant,
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
-    sink: &Arc<SinkFacade>,
     selected_group_sink_status: Option<&SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
     group_id: &str,
@@ -8895,7 +9050,6 @@ async fn execute_selected_group_owner_empty_tree_rescue(
             }
             match query_materialized_events_via_selected_group_owner_attempt(
                 owner_attempt,
-                sink,
                 boundary.clone(),
                 params,
                 retry_owner_timeout,
@@ -8920,7 +9074,6 @@ async fn execute_selected_group_owner_empty_tree_rescue(
                         deadline,
                         boundary,
                         origin_id,
-                        sink,
                         selected_group_sink_status,
                         request_scoped_schedule_omitted_ready_groups,
                         group_id,
@@ -8954,7 +9107,6 @@ async fn execute_selected_group_owner_empty_tree_rescue(
                         deadline,
                         boundary,
                         origin_id,
-                        sink,
                         selected_group_sink_status,
                         request_scoped_schedule_omitted_ready_groups,
                         group_id,
@@ -8977,7 +9129,6 @@ async fn execute_selected_group_owner_empty_tree_rescue(
             deadline,
             boundary,
             origin_id,
-            sink,
             selected_group_sink_status,
             request_scoped_schedule_omitted_ready_groups,
             group_id,
@@ -9075,6 +9226,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
         policy,
         params,
         timeout,
+        None,
         selected_group_sink_status,
         None,
         group_plan,
@@ -9084,14 +9236,12 @@ async fn query_materialized_events_with_selected_group_owner_snapshot(
 
 #[derive(Clone, Debug)]
 enum SelectedGroupOwnerAttempt {
-    Local,
     Routed(NodeId),
 }
 
 impl SelectedGroupOwnerAttempt {
-    fn owner_node_id(&self, origin_id: &NodeId) -> NodeId {
+    fn owner_node_id(&self) -> NodeId {
         match self {
-            Self::Local => origin_id.clone(),
             Self::Routed(node_id) => node_id.clone(),
         }
     }
@@ -9099,15 +9249,11 @@ impl SelectedGroupOwnerAttempt {
 
 async fn query_materialized_events_via_selected_group_owner_attempt(
     owner_attempt: &SelectedGroupOwnerAttempt,
-    sink: &Arc<SinkFacade>,
     boundary: Arc<dyn ChannelIoSubset>,
     params: &InternalQueryRequest,
     timeout: Duration,
 ) -> Result<Vec<Event>, QueryWorkerObservationFailure> {
     match owner_attempt {
-        SelectedGroupOwnerAttempt::Local => {
-            query_local_materialized_events_with_failure(sink, params, timeout).await
-        }
         SelectedGroupOwnerAttempt::Routed(node_id) => route_materialized_events_via_node(
             boundary,
             node_id.clone(),
@@ -9125,7 +9271,6 @@ async fn finalize_selected_group_owner_success(
     deadline: tokio::time::Instant,
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
-    sink: &Arc<SinkFacade>,
     selected_group_sink_status: Option<&SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
     group_id: &str,
@@ -9197,7 +9342,7 @@ async fn finalize_selected_group_owner_success(
             requires_primary_owner_reroute,
             selected_group_sink_reports_live_materialized,
         });
-    let owner_node_id = owner_attempt.owner_node_id(&origin_id);
+    let owner_node_id = owner_attempt.owner_node_id();
 
     if let Some(primary_events) = maybe_reroute_selected_group_primary_owner(
         policy,
@@ -9221,7 +9366,6 @@ async fn finalize_selected_group_owner_success(
         deadline,
         boundary,
         origin_id,
-        sink,
         selected_group_sink_status,
         request_scoped_schedule_omitted_ready_groups,
         group_id,
@@ -9239,6 +9383,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
     policy: &ProjectionPolicy,
     params: InternalQueryRequest,
     timeout: Duration,
+    selected_group_source_status: Option<&SourceStatusSnapshot>,
     selected_group_sink_status: Option<SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
     group_plan: TreePitGroupPlan,
@@ -9247,8 +9392,8 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
         QueryBackend::Route {
             boundary,
             origin_id,
-            sink,
             source,
+            ..
         } => {
             let deadline = tokio::time::Instant::now() + timeout;
             if let Some(group_id) = params.scope.selected_group.as_deref()
@@ -9270,43 +9415,13 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                 && let Some(node_id) = materialized_owner_node_for_group_with_failure(
                     source.as_ref(),
                     selected_group_sink_status.as_ref(),
+                    selected_group_source_status,
                     group_id,
                     MaterializedOwnerOmissionPolicy::TreatAsCollectionGap,
                 )
                 .await
                 .map_err(QueryWorkerObservationFailure::into_error)?
             {
-                if node_id == *origin_id {
-                    let owner_attempt_timeout = group_plan.owner_attempt_timeout(
-                        deadline
-                            .checked_duration_since(tokio::time::Instant::now())
-                            .unwrap_or_default(),
-                    );
-                    let events = query_materialized_events_via_selected_group_owner_attempt(
-                        &SelectedGroupOwnerAttempt::Local,
-                        sink,
-                        boundary.clone(),
-                        &params,
-                        owner_attempt_timeout,
-                    )
-                    .await
-                    .map_err(QueryWorkerObservationFailure::into_error)?;
-                    return finalize_selected_group_owner_success(
-                        policy,
-                        &params,
-                        deadline,
-                        boundary.clone(),
-                        origin_id.clone(),
-                        sink,
-                        selected_group_sink_status.as_ref(),
-                        request_scoped_schedule_omitted_ready_groups,
-                        group_id,
-                        &SelectedGroupOwnerAttempt::Local,
-                        events,
-                        group_plan,
-                    )
-                    .await;
-                }
                 let owner_route_plan = group_plan.owner_route_plan(
                     deadline
                         .checked_duration_since(tokio::time::Instant::now())
@@ -9327,7 +9442,6 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                             deadline,
                             boundary.clone(),
                             origin_id.clone(),
-                            sink,
                             selected_group_sink_status.as_ref(),
                             request_scoped_schedule_omitted_ready_groups,
                             group_id,
@@ -9480,24 +9594,18 @@ async fn query_materialized_events_via_selected_group_owner_direct_with_failure(
 ) -> Result<Vec<Event>, QueryWorkerObservationFailure> {
     match &state.backend {
         QueryBackend::Route {
-            boundary,
-            origin_id,
-            sink,
-            source,
+            boundary, source, ..
         } => {
             if let Some(group_id) = params.scope.selected_group.as_deref()
                 && let Some(node_id) = materialized_owner_node_for_group_with_failure(
                     source.as_ref(),
                     selected_group_sink_status,
+                    None,
                     group_id,
                     MaterializedOwnerOmissionPolicy::Authoritative,
                 )
                 .await?
             {
-                if node_id == *origin_id {
-                    return query_local_materialized_events_with_failure(sink, &params, timeout)
-                        .await;
-                }
                 return route_materialized_events_via_node(
                     boundary.clone(),
                     node_id,
@@ -9626,7 +9734,7 @@ fn selected_group_force_find_route_error(
 ) -> Option<CnxError> {
     let selected_group = selected_group?;
     for event in events {
-        if event.metadata().origin_id.0 != selected_group {
+        if !force_find_event_matches_selected_group(event, selected_group) {
             continue;
         }
         let Ok(message) = std::str::from_utf8(event.payload_bytes()) else {
@@ -9640,6 +9748,81 @@ fn selected_group_force_find_route_error(
         }
     }
     None
+}
+
+fn force_find_event_matches_selected_group(event: &Event, selected_group: &str) -> bool {
+    let origin = &event.metadata().origin_id.0;
+    origin == selected_group || grant_object_ref_matches_group(origin, selected_group)
+}
+
+fn selected_group_force_find_payload_error(
+    events: &[Event],
+    selected_group: &str,
+    kind: ForceFindRouteCollectKind,
+) -> Option<CnxError> {
+    let mut saw_selected_group = false;
+    let mut selected_group_errors = Vec::<String>::new();
+    for event in events {
+        if !force_find_event_matches_selected_group(event, selected_group) {
+            continue;
+        }
+        saw_selected_group = true;
+        match rmp_serde::from_slice::<ForceFindQueryPayload>(event.payload_bytes()) {
+            Ok(ForceFindQueryPayload::Tree(_))
+                if matches!(kind, ForceFindRouteCollectKind::Tree { .. }) =>
+            {
+                return None;
+            }
+            Ok(ForceFindQueryPayload::Stats(_))
+                if matches!(kind, ForceFindRouteCollectKind::Stats { .. }) =>
+            {
+                return None;
+            }
+            Ok(ForceFindQueryPayload::Tree(_)) => {
+                return Some(CnxError::ProtocolViolation(format!(
+                    "force-find {} route returned tree payload for selected group {selected_group}",
+                    kind.label()
+                )));
+            }
+            Ok(ForceFindQueryPayload::Stats(_)) => {
+                return Some(CnxError::ProtocolViolation(format!(
+                    "force-find {} route returned stats payload for selected group {selected_group}",
+                    kind.label()
+                )));
+            }
+            Err(err) => {
+                let message = String::from_utf8(event.payload_bytes().to_vec())
+                    .ok()
+                    .map(|message| message.trim().to_string())
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "force-find {} route failed to decode selected group {selected_group} payload: {err}",
+                            kind.label()
+                        )
+                    });
+                selected_group_errors.push(message);
+            }
+        }
+    }
+    if !saw_selected_group {
+        return Some(CnxError::PeerError(format!(
+            "force-find selected_group matched no group: {selected_group}"
+        )));
+    }
+    let message = selected_group_errors.first().cloned().unwrap_or_else(|| {
+        format!(
+            "force-find {} route returned no selected group payload: {selected_group}",
+            kind.label()
+        )
+    });
+    if message.contains("selected_group matched no group")
+        || message.contains("HOST_FS_UNAVAILABLE")
+    {
+        Some(CnxError::PeerError(message))
+    } else {
+        Some(CnxError::Internal(message))
+    }
 }
 
 #[cfg(test)]
@@ -10009,12 +10192,6 @@ async fn materialized_target_groups(
     Ok(groups)
 }
 
-fn node_id_from_object_ref(object_ref: &str) -> Option<NodeId> {
-    object_ref
-        .split_once("::")
-        .map(|(node_id, _)| NodeId(node_id.to_string()))
-}
-
 fn origin_count_entry_group_and_count(entry: &str) -> Option<(&str, u64)> {
     let (origin, count) = entry.rsplit_once('=')?;
     let group_id = origin
@@ -10050,6 +10227,16 @@ fn applied_sink_owner_node_for_group(
         .map(|(_, node_id)| node_id)
 }
 
+fn sink_group_has_materialized_owner_evidence(
+    group: &crate::sink::SinkGroupStatusSnapshot,
+) -> bool {
+    sink_group_readiness_reports_live_materialized_group(group)
+        || group.live_nodes > 0
+        || group.total_nodes > 0
+        || group.materialized_revision > 0
+        || group.shadow_time_us > 0
+}
+
 fn scheduled_sink_owner_node_for_group(
     sink_status: &SinkStatusSnapshot,
     group_id: &str,
@@ -10063,17 +10250,22 @@ fn scheduled_sink_owner_node_for_group(
     scheduled_nodes.sort_by(|a, b| a.0.cmp(&b.0));
     scheduled_nodes.dedup_by(|a, b| a.0 == b.0);
 
-    let primary_node = sink_status
+    let group = sink_status
         .groups
         .iter()
-        .find(|group| group.group_id == group_id)
-        .and_then(|group| node_id_from_object_ref(&group.primary_object_ref));
-
-    let mut owner_candidates = scheduled_nodes.clone();
-    if let Some(primary_node) = primary_node.clone()
-        && !owner_candidates.iter().any(|node| node.0 == primary_node.0)
-    {
-        owner_candidates.push(primary_node);
+        .find(|group| group.group_id == group_id);
+    let primary_node = sink_status_primary_host_node_for_group(sink_status, group_id);
+    let mut owner_candidates = if scheduled_nodes.is_empty() {
+        sink_status
+            .stream_applied_origin_counts_by_node
+            .keys()
+            .map(|node_id| NodeId(node_id.clone()))
+            .collect::<Vec<_>>()
+    } else {
+        scheduled_nodes.clone()
+    };
+    if let Some(node_id) = primary_node.clone() {
+        owner_candidates.push(node_id);
     }
     owner_candidates.sort_by(|a, b| a.0.cmp(&b.0));
     owner_candidates.dedup_by(|a, b| a.0 == b.0);
@@ -10084,11 +10276,19 @@ fn scheduled_sink_owner_node_for_group(
         return Some(node_id);
     }
 
-    if let Some(primary_node) = primary_node {
-        if scheduled_nodes.is_empty() || scheduled_nodes.iter().any(|node| node.0 == primary_node.0)
-        {
-            return Some(primary_node);
+    if group.is_some_and(sink_group_has_materialized_owner_evidence) {
+        if let Some(node_id) = primary_node {
+            if scheduled_nodes.is_empty() || scheduled_nodes.iter().any(|node| node == &node_id) {
+                return Some(node_id);
+            }
         }
+        if scheduled_nodes.len() == 1 {
+            return scheduled_nodes.into_iter().next();
+        }
+    }
+
+    if scheduled_nodes.len() == 1 {
+        return scheduled_nodes.into_iter().next();
     }
 
     scheduled_nodes.into_iter().next()
@@ -10122,6 +10322,7 @@ enum MaterializedOwnerOmissionPolicy {
 async fn materialized_owner_node_for_group_with_failure(
     source: &SourceFacade,
     sink_status: Option<&SinkStatusSnapshot>,
+    _source_status: Option<&SourceStatusSnapshot>,
     group_id: &str,
     omission_policy: MaterializedOwnerOmissionPolicy,
 ) -> std::result::Result<Option<NodeId>, QueryWorkerObservationFailure> {
@@ -10135,12 +10336,10 @@ async fn materialized_owner_node_for_group_with_failure(
             return Ok(None);
         }
     }
-    Ok(source
-        .source_primary_by_group_snapshot_with_failure()
-        .await
-        .map_err(QueryWorkerObservationFailure::from)?
-        .get(group_id)
-        .and_then(|object_ref| node_id_from_object_ref(object_ref)))
+    let groups = BTreeSet::from([group_id.to_string()]);
+    let candidates = current_owner_candidate_nodes_for_groups(source, &groups)
+        .map_err(QueryWorkerObservationFailure::from)?;
+    Ok((candidates.len() == 1).then(|| candidates[0].clone()))
 }
 
 #[cfg(test)]
@@ -10150,15 +10349,40 @@ async fn materialized_owner_node_for_group(
     group_id: &str,
     omission_policy: MaterializedOwnerOmissionPolicy,
 ) -> Result<Option<NodeId>, CnxError> {
-    materialized_owner_node_for_group_with_failure(source, sink_status, group_id, omission_policy)
-        .await
-        .map_err(QueryWorkerObservationFailure::into_error)
+    materialized_owner_node_for_group_with_failure(
+        source,
+        sink_status,
+        None,
+        group_id,
+        omission_policy,
+    )
+    .await
+    .map_err(QueryWorkerObservationFailure::into_error)
 }
 
-async fn force_find_candidate_object_refs_for_group_with_failure(
+#[cfg(test)]
+async fn materialized_owner_node_for_group_with_source_status(
+    source: &SourceFacade,
+    sink_status: Option<&SinkStatusSnapshot>,
+    source_status: Option<&SourceStatusSnapshot>,
+    group_id: &str,
+    omission_policy: MaterializedOwnerOmissionPolicy,
+) -> Result<Option<NodeId>, CnxError> {
+    materialized_owner_node_for_group_with_failure(
+        source,
+        sink_status,
+        source_status,
+        group_id,
+        omission_policy,
+    )
+    .await
+    .map_err(QueryWorkerObservationFailure::into_error)
+}
+
+async fn force_find_candidate_nodes_for_group_with_failure(
     source: &SourceFacade,
     group_id: &str,
-) -> std::result::Result<Vec<String>, QueryWorkerObservationFailure> {
+) -> std::result::Result<Vec<NodeId>, QueryWorkerObservationFailure> {
     // `/on-demand-force-find` remains a freshness path while source workers are
     // still converging. Runner selection is cache-first, but failures still use
     // typed observation errors so callers can distinguish worker recovery gaps.
@@ -10173,11 +10397,11 @@ async fn force_find_candidate_object_refs_for_group_with_failure(
     };
     let mut candidates = grants
         .into_iter()
-        .filter(|grant| root.selector.matches(grant))
-        .map(|grant| grant.object_ref)
+        .filter(|grant| grant.active && root.selector.matches(grant))
+        .filter_map(|grant| force_find_candidate_node_from_grant(&grant))
         .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    candidates.dedup_by(|left, right| left.0 == right.0);
     Ok(candidates)
 }
 
@@ -10221,15 +10445,6 @@ fn force_find_candidate_nodes_from_current_root_grants(
         .logical_roots
         .iter()
         .find(|root| root.id == group_id);
-    let health_has_members = snapshot
-        .status
-        .logical_roots
-        .iter()
-        .find(|logical_root| logical_root.root_id == group_id)
-        .is_some_and(|logical_root| {
-            logical_root.matched_grants > 0 || logical_root.active_members > 0
-        });
-
     let mut candidates = BTreeSet::<String>::new();
     if let Some(root) = root {
         candidates.extend(
@@ -10237,18 +10452,6 @@ fn force_find_candidate_nodes_from_current_root_grants(
                 .grants
                 .iter()
                 .filter(|grant| grant.active && root.selector.matches(grant))
-                .filter_map(force_find_candidate_node_from_grant)
-                .map(|node| node.0),
-        );
-    }
-    if candidates.is_empty() && health_has_members {
-        candidates.extend(
-            snapshot
-                .grants
-                .iter()
-                .filter(|grant| {
-                    grant.active && grant_object_ref_matches_group(&grant.object_ref, group_id)
-                })
                 .filter_map(force_find_candidate_node_from_grant)
                 .map(|node| node.0),
         );
@@ -10289,8 +10492,8 @@ fn record_force_find_runner_response_evidence(
 }
 
 fn force_find_candidate_node_from_grant(grant: &GrantedMountRoot) -> Option<NodeId> {
-    node_id_from_object_ref(&grant.object_ref)
-        .or_else(|| (!grant.host_ref.trim().is_empty()).then(|| NodeId(grant.host_ref.clone())))
+    let host_ref = grant.host_ref.trim();
+    (!host_ref.is_empty()).then(|| NodeId(host_ref.to_string()))
 }
 
 async fn route_force_find_candidate_nodes_for_group_with_failure(
@@ -10403,22 +10606,18 @@ async fn select_force_find_runner_node_for_group_with_failure(
         );
     }
 
-    let candidates =
-        force_find_candidate_object_refs_for_group_with_failure(source, group_id).await?;
+    let candidates = force_find_candidate_nodes_for_group_with_failure(source, group_id).await?;
     if candidates.is_empty() {
-        return materialized_owner_node_for_group_with_failure(
-            source,
-            None,
-            group_id,
-            MaterializedOwnerOmissionPolicy::Authoritative,
-        )
-        .await;
+        return Err(QueryWorkerObservationFailure::Other(CnxError::NotReady(
+            format!("{FORCE_FIND_RUNNER_BINDING_NOT_READY_PREFIX} group {group_id}"),
+        )));
     }
-    let nodes = candidates
-        .into_iter()
-        .filter_map(|object_ref| node_id_from_object_ref(&object_ref))
-        .collect::<Vec<_>>();
-    select_force_find_runner_node_from_candidates(state, group_id, &nodes, excluded_runner_nodes)
+    select_force_find_runner_node_from_candidates(
+        state,
+        group_id,
+        &candidates,
+        excluded_runner_nodes,
+    )
 }
 
 #[cfg(test)]
@@ -10730,6 +10929,29 @@ async fn execute_force_find_group_route_collect(
                     )
                     .await
                 };
+                let attempt = match attempt {
+                    Ok(events) => {
+                        if let Some(err) =
+                            selected_group_force_find_payload_error(&events, group_id, kind)
+                        {
+                            if debug_force_find_route_capture_enabled() {
+                                eprintln!(
+                                    "fs_meta_query_api: force-find {} via_node payload_gap group={} node={} events={} origins={:?} err={}",
+                                    kind.label(),
+                                    group_id,
+                                    node_id.0,
+                                    events.len(),
+                                    summarize_event_counts_by_origin(&events),
+                                    err
+                                );
+                            }
+                            Err(err)
+                        } else {
+                            Ok(events)
+                        }
+                    }
+                    Err(err) => Err(err),
+                };
                 match attempt {
                     Ok(events) => {
                         record_force_find_runner_response_evidence(
@@ -10834,9 +11056,30 @@ async fn execute_force_find_group_route_collect(
                         after_runner_gap,
                     );
                 }
-                match query_force_find_events(state.backend.clone(), request.clone(), route_plan)
+                let fallback =
+                    query_force_find_events(state.backend.clone(), request.clone(), route_plan)
                     .await
-                {
+                    .and_then(|events| {
+                        if let Some(err) =
+                            selected_group_force_find_payload_error(&events, group_id, kind)
+                        {
+                            if debug_force_find_route_capture_enabled() {
+                                eprintln!(
+                                    "fs_meta_query_api: force-find {} route_fallback payload_gap group={} events={} origins={:?} err={} after_runner_gap={}",
+                                    kind.label(),
+                                    group_id,
+                                    events.len(),
+                                    summarize_event_counts_by_origin(&events),
+                                    err,
+                                    after_runner_gap
+                                );
+                            }
+                            Err(err)
+                        } else {
+                            Ok(events)
+                        }
+                    });
+                match fallback {
                     Ok(events) => {
                         record_force_find_runner_response_evidence(state, group_id, None, &events);
                         if debug_force_find_route_capture_enabled() {
@@ -11013,32 +11256,13 @@ fn decode_materialized_selected_group_response(
     selected_group: &str,
     query_path: &[u8],
 ) -> Result<TreeGroupPayload, CnxError> {
-    fn payload_score(payload: &TreeGroupPayload) -> (u8, usize, bool, u64) {
-        (
-            u8::from(payload.root.exists),
-            payload.entries.len(),
-            payload.root.has_children,
-            payload.root.modified_time_us,
-        )
-    }
-
-    fn payload_precedence(
-        event: &Event,
-        payload: &TreeGroupPayload,
-    ) -> (u64, u8, usize, bool, u64) {
-        let score = payload_score(payload);
-        (
-            event.metadata().timestamp_us,
-            score.0,
-            score.1,
-            score.2,
-            score.3,
-        )
+    fn payload_precedence(event: &Event) -> u64 {
+        event.metadata().timestamp_us
     }
 
     let mut last_decode_error = None::<String>;
     let mut best = None::<TreeGroupPayload>;
-    let mut best_precedence = None::<(u64, u8, usize, bool, u64)>;
+    let mut best_precedence = None::<u64>;
     for event in events {
         if event_group_key(policy, event) != selected_group {
             continue;
@@ -11056,7 +11280,7 @@ fn decode_materialized_selected_group_response(
                     payload.root.has_children,
                     payload.root.modified_time_us
                 );
-                let precedence = payload_precedence(event, &payload);
+                let precedence = payload_precedence(event);
                 let replace = best_precedence
                     .as_ref()
                     .is_none_or(|current| precedence > *current);
@@ -11077,54 +11301,6 @@ fn decode_materialized_selected_group_response(
     Err(CnxError::Internal(last_decode_error.unwrap_or_else(|| {
         format!("tree query returned no payload for requested group '{selected_group}'")
     })))
-}
-
-fn decode_richer_same_path_materialized_selected_group_response(
-    events: &[Event],
-    policy: &ProjectionPolicy,
-    selected_group: &str,
-    query_path: &[u8],
-) -> Option<TreeGroupPayload> {
-    fn payload_score(payload: &TreeGroupPayload) -> (u8, usize, bool, u64) {
-        (
-            u8::from(payload.root.exists),
-            payload.entries.len(),
-            payload.root.has_children,
-            payload.root.modified_time_us,
-        )
-    }
-
-    let mut best = None::<TreeGroupPayload>;
-    let mut best_precedence = None::<(u64, u8, usize, bool, u64)>;
-    for event in events {
-        if event_group_key(policy, event) != selected_group {
-            continue;
-        }
-        let Ok(MaterializedQueryPayload::Tree(payload)) =
-            rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes())
-        else {
-            continue;
-        };
-        if payload.root.path != query_path || trusted_materialized_tree_payload_is_empty(&payload) {
-            continue;
-        }
-        let score = payload_score(&payload);
-        let precedence = (
-            event.metadata().timestamp_us,
-            score.0,
-            score.1,
-            score.2,
-            score.3,
-        );
-        let replace = best_precedence
-            .as_ref()
-            .is_none_or(|current| precedence > *current);
-        if replace {
-            best_precedence = Some(precedence);
-            best = Some(payload);
-        }
-    }
-    best
 }
 
 fn empty_materialized_tree_group_payload(query_path: &[u8]) -> TreeGroupPayload {
@@ -11148,25 +11324,6 @@ fn empty_materialized_tree_group_payload(query_path: &[u8]) -> TreeGroupPayload 
 
 fn trusted_materialized_tree_payload_is_empty(payload: &TreeGroupPayload) -> bool {
     !payload.root.exists && payload.entries.is_empty() && !payload.root.has_children
-}
-
-fn maybe_promote_richer_same_path_materialized_tree_response(
-    events: &[Event],
-    policy: &ProjectionPolicy,
-    selected_group: &str,
-    query_path: &[u8],
-    response: &mut TreeGroupPayload,
-) {
-    if trusted_materialized_tree_payload_is_empty(response)
-        && let Some(richer_response) = decode_richer_same_path_materialized_selected_group_response(
-            events,
-            policy,
-            selected_group,
-            query_path,
-        )
-    {
-        *response = richer_response;
-    }
 }
 
 fn record_tree_group_snapshot_observed_rank(
@@ -11995,6 +12152,7 @@ impl TreePitGroupMachine<'_, '_> {
                         materialized_owner_node_for_group_with_failure(
                             source.as_ref(),
                             selected_group_sink_status.as_ref(),
+                            input.request_source_status,
                             &group_key,
                             MaterializedOwnerOmissionPolicy::Authoritative,
                         )
@@ -12059,6 +12217,7 @@ impl TreePitGroupMachine<'_, '_> {
                 input.policy,
                 tree_params.clone(),
                 stage_timeout,
+                input.request_source_status,
                 selected_group_sink_status.clone(),
                 input.request_scoped_schedule_omitted_ready_groups,
                 group_plan,
@@ -12213,6 +12372,7 @@ async fn prepare_tree_pit_session_machine<'a>(
             state,
             policy,
             params,
+            request_source_status,
             request_sink_status,
             request_scoped_schedule_omitted_ready_groups,
             observation_state: observation_status.state,
@@ -12630,33 +12790,12 @@ fn decode_force_find_selected_group_response(
     selected_group: &str,
     query_path: &[u8],
 ) -> Result<TreeGroupPayload, CnxError> {
-    fn payload_score(payload: &TreeGroupPayload) -> (u8, usize, u8, u64, u8) {
-        (
-            u8::from(payload.root.exists),
-            payload.entries.len(),
-            u8::from(payload.root.has_children),
-            payload.root.modified_time_us,
-            u8::from(payload.reliability.reliable),
-        )
-    }
-
-    fn payload_precedence(
-        event: &Event,
-        payload: &TreeGroupPayload,
-    ) -> (u8, usize, u8, u64, u8, u64) {
-        let score = payload_score(payload);
-        (
-            score.0,
-            score.1,
-            score.2,
-            score.3,
-            score.4,
-            event.metadata().timestamp_us,
-        )
+    fn payload_precedence(event: &Event) -> u64 {
+        event.metadata().timestamp_us
     }
 
     let mut best = None::<TreeGroupPayload>;
-    let mut best_precedence = None::<(u8, usize, u8, u64, u8, u64)>;
+    let mut best_precedence = None::<u64>;
     let mut saw_selected_group_payload = false;
     let mut errors = Vec::<String>::new();
     for event in events {
@@ -12666,7 +12805,7 @@ fn decode_force_find_selected_group_response(
         match rmp_serde::from_slice::<ForceFindQueryPayload>(event.payload_bytes()) {
             Ok(ForceFindQueryPayload::Tree(response)) => {
                 saw_selected_group_payload = true;
-                let precedence = payload_precedence(event, &response);
+                let precedence = payload_precedence(event);
                 let replace = best_precedence
                     .as_ref()
                     .is_none_or(|current| precedence > *current);
@@ -12700,7 +12839,12 @@ fn decode_force_find_selected_group_response(
             .unwrap_or_else(|| "force-find returned no payload for requested group".to_string());
         return Err(CnxError::Internal(detail));
     }
-    Ok(best.expect("best payload must exist after selected-group tree payload was seen"))
+    best.ok_or_else(|| {
+        CnxError::Internal(format!(
+            "force-find returned no selected group payload: {selected_group} path={}",
+            String::from_utf8_lossy(query_path)
+        ))
+    })
 }
 
 async fn query_force_find_page_response(
@@ -13052,6 +13196,7 @@ impl StatsGroupMachine<'_, '_> {
                         self.query.policy,
                         materialized_request.clone(),
                         self.query.policy.query_timeout(),
+                        self.query.request_source_status,
                         Some(snapshot.clone()),
                         None,
                         group_plan,

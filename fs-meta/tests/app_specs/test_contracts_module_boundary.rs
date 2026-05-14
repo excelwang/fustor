@@ -748,9 +748,9 @@ fn release_upgrade_harness_relogin_waits_for_http_readiness() {
         .find("fn upgrade_to_generation_two(")
         .expect("upgrade_to_generation_two helper");
     let end = release_upgrade[start..]
-        .find("fn wait_for_primary_tree_materialization(")
+        .find("fn wait_for_materialized_tree_observation(")
         .map(|offset| start + offset)
-        .expect("wait_for_primary_tree_materialization after upgrade helper");
+        .expect("wait_for_materialized_tree_observation after upgrade helper");
     let helper = &release_upgrade[start..end];
 
     let readiness = helper

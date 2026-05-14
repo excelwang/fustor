@@ -1451,6 +1451,164 @@ async fn source_status_manual_rescan_probe_serves_node_scoped_status_route() {
 }
 
 #[tokio::test]
+async fn source_status_manual_rescan_probe_returns_receivable_ready_evidence() {
+    let source = build_source(vec![test_export(
+        "node-a",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )]);
+    let boundary = Arc::new(SourceLoopbackBoundary::default());
+
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("start runtime endpoints");
+
+    let scoped_rescan_route = crate::runtime::routes::source_rescan_request_route_for("node-a").0;
+    source
+        .on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+            RuntimeExecActivate {
+                route_key: scoped_rescan_route.clone(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 1777506000456,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            },
+        ))
+        .expect("encode scoped source rescan activate")])
+        .await
+        .expect("activate scoped source rescan route");
+
+    let status_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary,
+        NodeId("node-d".to_string()),
+        source_status_route_bindings_for("node-a"),
+    );
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &status_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        crate::query::api::manual_rescan_source_status_request_payload(),
+        Duration::from_millis(750),
+        Duration::ZERO,
+    )
+    .await
+    .expect("node-scoped manual-rescan source-status probe should return source evidence");
+    let snapshot = events
+        .iter()
+        .find(|event| event.metadata().origin_id == NodeId("node-a".to_string()))
+        .map(|event| {
+            rmp_serde::from_slice::<crate::workers::source::SourceObservabilitySnapshot>(
+                event.payload_bytes(),
+            )
+            .expect("decode source status snapshot")
+        })
+        .expect("source-status reply from node-a");
+    let signals = snapshot
+        .last_control_frame_signals_by_node
+        .get("node-a")
+        .expect("source-owned control signals");
+    assert!(
+        signals.iter().any(|signal| signal
+            == &format!(
+                "ready unit=runtime.exec.source route={scoped_rescan_route} generation=1777506000456"
+            )),
+        "manual-rescan source-status reply must carry current scoped route-ready proof after successful rearm: {signals:?}"
+    );
+
+    source.close().await.expect("close source");
+}
+
+#[tokio::test]
+async fn source_status_manual_rescan_probe_withholds_ready_without_local_scan_root() {
+    let mut cfg = SourceConfig::default();
+    let mut root = root("nfs1", "/mnt/nfs1");
+    root.scan = false;
+    cfg.roots = vec![root];
+    cfg.host_object_grants = vec![test_export(
+        "node-a",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+        .expect("build source without scan root");
+    let boundary = Arc::new(SourceLoopbackBoundary::default());
+
+    source
+        .start_runtime_endpoints(boundary.clone())
+        .await
+        .expect("start runtime endpoints");
+
+    let scoped_rescan_route = crate::runtime::routes::source_rescan_request_route_for("node-a").0;
+    source
+        .on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+            RuntimeExecActivate {
+                route_key: scoped_rescan_route.clone(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 1777506000457,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            },
+        ))
+        .expect("encode scoped source rescan activate")])
+        .await
+        .expect("activate scoped source rescan route");
+
+    let status_adapter = crate::runtime::seam::exchange_host_adapter(
+        boundary,
+        NodeId("node-d".to_string()),
+        source_status_route_bindings_for("node-a"),
+    );
+    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+        &status_adapter,
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        crate::query::api::manual_rescan_source_status_request_payload(),
+        Duration::from_millis(750),
+        Duration::ZERO,
+    )
+    .await
+    .expect("node-scoped manual-rescan source-status probe should return source evidence");
+    let snapshot = events
+        .iter()
+        .find(|event| event.metadata().origin_id == NodeId("node-a".to_string()))
+        .map(|event| {
+            rmp_serde::from_slice::<crate::workers::source::SourceObservabilitySnapshot>(
+                event.payload_bytes(),
+            )
+            .expect("decode source status snapshot")
+        })
+        .expect("source-status reply from node-a");
+    let signals = snapshot
+        .last_control_frame_signals_by_node
+        .get("node-a")
+        .expect("source-owned control signals");
+    assert!(
+        !signals.iter().any(|signal| {
+            signal
+                == &format!(
+                    "ready unit=runtime.exec.source route={scoped_rescan_route} generation=1777506000457"
+                )
+        }),
+        "manual-rescan source-status must not publish route-ready proof when the node has no local scan root: {signals:?}"
+    );
+
+    source.close().await.expect("close source");
+}
+
+#[tokio::test]
 async fn manual_rescan_source_status_rearm_preserves_healthy_rescan_endpoints() {
     let source = build_source(vec![test_export(
         "node-a",
@@ -4875,7 +5033,7 @@ async fn source_to_sink_recovery_rescan_epoch_without_local_primary_scan_roots_i
     );
     assert!(
         source.current_rescan_observed_epoch() >= request_epoch,
-        "a node with no local source-primary scan roots must observe the recovery rescan epoch as a no-op instead of blocking sink/facade recovery"
+        "a node with no local scheduled scan roots must observe the recovery rescan epoch as a no-op instead of blocking sink/facade recovery"
     );
     assert!(matches!(
         local_rx.try_recv(),
@@ -5072,6 +5230,7 @@ fn status_snapshot_tracks_same_key_candidate_handoff() {
         .cloned()
         .expect("runtime exists");
     let root_key = FSMetaSource::root_runtime_key(&runtime);
+    let signature = FSMetaSource::root_task_signature(&runtime);
     let health = source.state_cell.fanout_health_handle();
 
     FSMetaSource::update_root_task_slot_health(
@@ -5080,6 +5239,9 @@ fn status_snapshot_tracks_same_key_candidate_handoff() {
         1,
         7,
         RootTaskRole::Active,
+        &signature,
+        &source.config,
+        true,
         "running",
     );
     FSMetaSource::update_root_task_slot_health(
@@ -5088,6 +5250,9 @@ fn status_snapshot_tracks_same_key_candidate_handoff() {
         2,
         8,
         RootTaskRole::Candidate,
+        &signature,
+        &source.config,
+        true,
         "warming",
     );
 
@@ -5103,8 +5268,25 @@ fn status_snapshot_tracks_same_key_candidate_handoff() {
     assert_eq!(entry.candidate_stream_generation, Some(8));
     assert_eq!(entry.candidate_status.as_deref(), Some("warming"));
 
-    FSMetaSource::promote_root_task_candidate_health(&health, &root_key, 2, 8);
-    FSMetaSource::mark_root_task_draining(&health, &root_key, 1, 7, "draining");
+    FSMetaSource::promote_root_task_candidate_health(
+        &health,
+        &root_key,
+        2,
+        8,
+        &signature,
+        &source.config,
+        true,
+    );
+    FSMetaSource::mark_root_task_draining(
+        &health,
+        &root_key,
+        1,
+        7,
+        &signature,
+        &source.config,
+        true,
+        "draining",
+    );
     FSMetaSource::finish_root_task_draining(&health, &root_key, 1, 7, true);
 
     let snapshot = source.status_snapshot();
@@ -6377,7 +6559,7 @@ async fn reconcile_root_tasks_falls_back_to_controlled_replace_when_candidate_ne
             active: RootTaskSlot {
                 revision: 1,
                 stream_generation: 3,
-                signature: stale_signature,
+                signature: stale_signature.clone(),
                 handle: pending_root_task_handle(),
             },
             candidate: Some(RootTaskSlot {
@@ -6394,6 +6576,9 @@ async fn reconcile_root_tasks_falls_back_to_controlled_replace_when_candidate_ne
         1,
         3,
         RootTaskRole::Active,
+        &stale_signature,
+        &source.config,
+        true,
         "running",
     );
     FSMetaSource::update_root_task_slot_health(
@@ -6402,6 +6587,9 @@ async fn reconcile_root_tasks_falls_back_to_controlled_replace_when_candidate_ne
         2,
         3,
         RootTaskRole::Candidate,
+        &desired_signature,
+        &source.config,
+        true,
         "warming",
     );
 
@@ -6435,6 +6623,61 @@ async fn reconcile_root_tasks_falls_back_to_controlled_replace_when_candidate_ne
     assert_eq!(detail.draining_status.as_deref(), Some("retired"));
 
     source.close().await.expect("close source");
+}
+
+#[test]
+fn source_status_preserves_identity_for_stopped_or_retiring_task_rows() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![test_export(
+        "node-a::exp1",
+        "node-a",
+        "10.0.0.11",
+        "/mnt/nfs1",
+        true,
+    )];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+        .expect("init source");
+    let runtime = lock_or_recover(&source.state_cell.roots, "test.status_retiring_identity")
+        .first()
+        .cloned()
+        .expect("runtime exists");
+    let root_key = FSMetaSource::root_runtime_key(&runtime);
+    let signature = FSMetaSource::root_task_signature(&runtime);
+    let health = source.state_cell.fanout_health_handle();
+
+    FSMetaSource::update_root_task_slot_health(
+        &health,
+        &root_key,
+        1,
+        7,
+        RootTaskRole::Active,
+        &signature,
+        &source.config,
+        true,
+        "stopped",
+    );
+    FSMetaSource::mark_root_task_draining(
+        &health,
+        &root_key,
+        1,
+        7,
+        &signature,
+        &source.config,
+        true,
+        "draining",
+    );
+
+    let entry = source
+        .status_snapshot()
+        .concrete_roots
+        .into_iter()
+        .find(|entry| entry.root_key == root_key)
+        .expect("retiring concrete root remains observable");
+    assert_eq!(entry.logical_root_id, "nfs1");
+    assert_eq!(entry.object_ref, "node-a::exp1");
+    assert_eq!(entry.coverage_mode, "realtime_hotset_plus_audit");
+    assert_eq!(entry.draining_status.as_deref(), Some("draining"));
 }
 
 #[tokio::test]

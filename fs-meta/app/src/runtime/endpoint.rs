@@ -478,11 +478,17 @@ impl ManagedEndpointTask {
             eprintln!("fs_meta_runtime_endpoint: spawn_join mode=dedicated-runtime-thread");
         }
         EndpointJoin::Thread(std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
+            let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("build dedicated fs-meta endpoint runtime")
-                .block_on(runner)
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    log::error!("fs-meta endpoint runtime init_error: {err}");
+                    return;
+                }
+            };
+            runtime.block_on(runner)
         }))
     }
 

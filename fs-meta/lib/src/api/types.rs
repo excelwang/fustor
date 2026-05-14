@@ -209,6 +209,7 @@ pub struct StatusSink {
     pub blind_spot_count: u64,
     pub shadow_time_us: u64,
     pub estimated_heap_bytes: u64,
+    pub primary_host_ref_by_group: BTreeMap<String, String>,
     pub groups: Vec<StatusSinkGroup>,
     pub debug: StatusSinkDebug,
 }
