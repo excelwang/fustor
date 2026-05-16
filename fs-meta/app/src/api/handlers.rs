@@ -745,6 +745,17 @@ fn derive_roots_put_control_target_node_ids_for_declaration_replacement(
     node_ids
 }
 
+fn roots_put_replacement_needs_routed_owner_discovery(
+    grants: &[GrantedMountRoot],
+    previous_source_roots: &[RootSpec],
+    previous_sink_roots: &[RootSpec],
+) -> bool {
+    previous_source_roots
+        .iter()
+        .chain(previous_sink_roots)
+        .any(|root| !grants.iter().any(|grant| root.selector.matches(grant)))
+}
+
 fn local_source_node_covers_current_roots(
     node_id: &NodeId,
     roots: &[RootSpec],
@@ -3337,6 +3348,54 @@ fn source_snapshot_has_published_activity(snapshot: &SourceObservabilitySnapshot
         || !snapshot.published_origin_counts_by_node.is_empty()
 }
 
+fn source_published_origin_count_mentions_group(entry: &str, group: &str) -> bool {
+    let origin = entry
+        .split_once('=')
+        .map(|(origin, _)| origin)
+        .unwrap_or(entry);
+    origin
+        .split_once("::")
+        .map(|(_, root_id)| root_id == group)
+        .unwrap_or(origin == group)
+}
+
+fn source_snapshot_has_publication_evidence_for_group(
+    snapshot: &SourceObservabilitySnapshot,
+    group: &str,
+) -> bool {
+    snapshot
+        .published_origin_counts_by_node
+        .values()
+        .flatten()
+        .any(|entry| source_published_origin_count_mentions_group(entry, group))
+        || snapshot
+            .last_published_origins_by_node
+            .values()
+            .flatten()
+            .any(|entry| source_published_origin_count_mentions_group(entry, group))
+        || snapshot.status.concrete_roots.iter().any(|root| {
+            root.logical_root_id == group
+                && root.active
+                && root.is_group_primary
+                && (root.forwarded_batch_count > 0
+                    || root.forwarded_event_count > 0
+                    || root.emitted_batch_count > 0
+                    || root.emitted_event_count > 0
+                    || root.last_forwarded_at_us.is_some()
+                    || root.last_emitted_at_us.is_some())
+        })
+}
+
+fn source_snapshot_has_publication_evidence_for_groups(
+    snapshot: &SourceObservabilitySnapshot,
+    groups: &BTreeSet<String>,
+) -> bool {
+    !groups.is_empty()
+        && groups
+            .iter()
+            .all(|group| source_snapshot_has_publication_evidence_for_group(snapshot, group))
+}
+
 fn sink_snapshot_advertised_groups(snapshot: &SinkStatusSnapshot) -> BTreeSet<String> {
     let mut groups = sink_snapshot_scheduled_groups(snapshot);
     groups.extend(snapshot.groups.iter().map(|group| group.group_id.clone()));
@@ -4525,13 +4584,19 @@ pub async fn roots_put(
             &previous_sink_roots,
             &previous_grants,
         );
-    initial_target_node_ids.extend(
-        discover_roots_put_control_target_node_ids_with_boundary(
-            state.query_runtime_boundary.clone(),
-            state.node_id.clone(),
-        )
-        .await,
-    );
+    if roots_put_replacement_needs_routed_owner_discovery(
+        &grants,
+        &previous_source_roots,
+        &previous_sink_roots,
+    ) {
+        initial_target_node_ids.extend(
+            discover_roots_put_control_target_node_ids_with_boundary(
+                state.query_runtime_boundary.clone(),
+                state.node_id.clone(),
+            )
+            .await,
+        );
+    }
     send_roots_put_control_second_wave(&second_wave_context, &roots, &initial_target_node_ids)
         .await?;
     refresh_policy_from_host_object_grants(&state.projection_policy, &grants);
@@ -6814,9 +6879,7 @@ fn trusted_observation_readiness_for_status(
     source: &SourceObservabilitySnapshot,
     sink_status: &SinkStatusSnapshot,
 ) -> bool {
-    if source_observability_snapshot_is_worker_status_cache(source)
-        || source_observability_snapshot_is_degraded_worker_cache(source)
-    {
+    if source_observability_snapshot_is_degraded_worker_cache(source) {
         return false;
     }
     let expected_materialized_groups = source
@@ -6825,6 +6888,14 @@ fn trusted_observation_readiness_for_status(
         .filter(|root| root.scan)
         .map(|root| root.id.clone())
         .collect::<BTreeSet<_>>();
+    if source_observability_snapshot_is_worker_status_cache(source)
+        && !source_snapshot_has_publication_evidence_for_groups(
+            source,
+            &expected_materialized_groups,
+        )
+    {
+        return false;
+    }
     crate::query::observation::materialized_status_cache_is_ready(
         &source.status,
         sink_status,
@@ -11696,6 +11767,41 @@ mod tests {
     }
 
     #[test]
+    fn roots_put_routed_owner_discovery_is_not_required_when_previous_roots_match_current_grants() {
+        let roots = vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+        ];
+        let grants = vec![
+            granted_mount_root("node-a::nfs1", Path::new("/mnt/nfs1")),
+            granted_mount_root("node-b::nfs2", Path::new("/mnt/nfs2")),
+        ];
+
+        assert!(
+            !roots_put_replacement_needs_routed_owner_discovery(&grants, &roots, &roots),
+            "roots-put should not synchronously wait on routed status discovery when current grants already identify every existing root owner"
+        );
+    }
+
+    #[test]
+    fn roots_put_routed_owner_discovery_is_required_after_grant_withdraw_for_previous_root() {
+        let previous_roots = vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+        ];
+        let grants = vec![granted_mount_root("node-a::nfs1", Path::new("/mnt/nfs1"))];
+
+        assert!(
+            roots_put_replacement_needs_routed_owner_discovery(
+                &grants,
+                &previous_roots,
+                &previous_roots,
+            ),
+            "roots-put must synchronously discover routed owner evidence when a previous root no longer maps to current grants"
+        );
+    }
+
+    #[test]
     fn roots_put_source_observability_targets_include_control_signal_nodes() {
         let mut node_ids = BTreeSet::from(["node-a".to_string()]);
         let mut snapshot = local_source_snapshot();
@@ -12714,6 +12820,25 @@ mod tests {
         assert!(
             !trusted_observation_readiness_for_status(&source, &sink),
             "cache-only source status remains explanation evidence, not trusted observation readiness"
+        );
+    }
+
+    #[test]
+    fn trusted_observation_readiness_accepts_cache_marker_after_group_publication_evidence() {
+        let mut source = local_source_snapshot();
+        let sink = local_sink_snapshot();
+        source.status.logical_roots[0].status = "ready".to_string();
+        source.status.degraded_roots.push((
+            SOURCE_WORKER_DEGRADED_ROOT_KEY.to_string(),
+            SOURCE_WORKER_STATUS_CACHE_REASON.to_string(),
+        ));
+        source
+            .published_origin_counts_by_node
+            .insert("node-a".to_string(), vec!["node-a::nfs1=1".to_string()]);
+
+        assert!(
+            trusted_observation_readiness_for_status(&source, &sink),
+            "a worker status cache marker is explanatory once the same root has source publication evidence and sink materialization is ready"
         );
     }
 
