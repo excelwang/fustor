@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -48,6 +48,7 @@ use crate::workers::sink::{SinkFacade, SinkFailure, SinkWorkerClientHandle};
 use crate::workers::source::{
     SourceFacade, SourceFailure, SourcePumpHandle, SourceWorkerClientHandle,
     annotate_manual_rescan_route_receivable_evidence,
+    annotate_manual_rescan_route_receivable_evidence_for_route_groups,
 };
 use crate::{FSMetaConfig, api, source};
 use async_trait::async_trait;
@@ -66,8 +67,9 @@ use capanix_runtime_entry_sdk::advanced::boundary::{
 };
 use capanix_runtime_entry_sdk::control::{
     RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate,
-    RuntimeUnitTick, decode_runtime_exec_control, decode_runtime_unit_exposure,
-    encode_runtime_exec_control, encode_runtime_unit_tick,
+    RuntimeHostGrantChange, RuntimeHostGrantState, RuntimeHostObjectType, RuntimeUnitTick,
+    decode_runtime_exec_control, decode_runtime_unit_exposure, encode_runtime_exec_control,
+    encode_runtime_unit_tick,
 };
 use capanix_runtime_entry_sdk::worker_runtime::RuntimeWorkerClientFactory;
 use capanix_runtime_entry_sdk::{RuntimeBootstrapContext, RuntimeLoadedServiceApp};
@@ -1512,7 +1514,7 @@ impl RuntimeScopeExpectedGroups {
         for group_id in sink_groups {
             match roots_by_id.get(group_id.as_str()) {
                 Some(root) => {
-                    if root.watch {
+                    if root.watch || root.scan {
                         source_groups.insert(group_id.clone());
                     }
                     if root.scan {
@@ -3456,6 +3458,8 @@ struct ManagementWriteRecoveryContext {
     sink_generation_cutover_replay_deferred: Arc<AtomicBool>,
     facade_gate: RuntimeUnitGate,
     source_rescan_proxy_ready_generation: Arc<AtomicU64>,
+    runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
+    runtime_endpoint_tasks: Arc<Mutex<Vec<ManagedEndpointTask>>>,
     control_frame_serial: Arc<Mutex<()>>,
     inflight: Arc<AtomicBool>,
 }
@@ -3495,7 +3499,6 @@ impl ManagementWriteRecoveryContext {
         self.update_runtime_control_state(|state| state.clear_source_replay());
         self.source_generation_cutover_replay_deferred
             .store(false, Ordering::Release);
-        self.mark_source_rescan_proxy_ready_for_current_generation();
     }
 
     fn clear_sink_replay_after_repair(&self) {
@@ -3550,26 +3553,6 @@ impl ManagementWriteRecoveryContext {
             .await
             .map_err(SinkFailure::into_error)?;
         Ok(true)
-    }
-
-    fn mark_source_rescan_proxy_ready_for_current_generation(&self) {
-        let route_key = source_rescan_request_route_for(&self.node_id.0).0;
-        let Ok(true) = self
-            .facade_gate
-            .route_active(execution_units::SOURCE_RUNTIME_UNIT_ID, &route_key)
-        else {
-            return;
-        };
-        let Ok(Some(generation)) = self
-            .facade_gate
-            .route_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, &route_key)
-        else {
-            return;
-        };
-        if generation != 0 {
-            self.source_rescan_proxy_ready_generation
-                .store(generation, Ordering::Release);
-        }
     }
 
     fn restore_control_after_retained_replay_recovery(&self) {
@@ -3632,6 +3615,56 @@ impl ManagementWriteRecoveryContext {
         Ok(())
     }
 
+    async fn ensure_source_rescan_proxy_ready_after_source_repair(&self) {
+        if self.runtime_control_state().source_state_replay_required() {
+            return;
+        }
+        let Some(boundary) = self.runtime_boundary.clone() else {
+            return;
+        };
+        let route_key = source_rescan_request_route_for(&self.node_id.0).0;
+        let deadline =
+            tokio::time::Instant::now() + MANUAL_RESCAN_SOURCE_STATUS_DEFAULT_PROBE_BUDGET;
+        let context = self.clone();
+        let source_repair_recovery: ManagementWriteRecovery = Arc::new(move || {
+            let context = context.clone();
+            Box::pin(async move { context.run_source_repair_without_proxy_ready().await })
+        });
+        let ready = ensure_worker_source_rescan_proxy_ready_until(
+            boundary,
+            self.source.clone(),
+            self.node_id.clone(),
+            &self.facade_gate,
+            &route_key,
+            self.source_rescan_proxy_ready_generation.clone(),
+            &self.runtime_endpoint_tasks,
+            source_repair_recovery,
+            deadline,
+        )
+        .await;
+        if !ready {
+            self.source_rescan_proxy_ready_generation
+                .store(0, Ordering::Release);
+        }
+    }
+
+    async fn run_source_repair_without_proxy_ready(&self) -> std::result::Result<(), CnxError> {
+        if !self.runtime_control_state().source_state_replay_required() {
+            if !self.api_control_gate.is_source_repair_ready() {
+                self.publish_recovered_facade_state().await;
+            }
+            return Ok(());
+        }
+        let Some(_inflight) = self.try_begin() else {
+            return Ok(());
+        };
+        let _serial = self.control_frame_serial.lock().await;
+        self.repair_source_replay_if_required().await?;
+        self.restore_control_after_retained_replay_recovery();
+        self.publish_recovered_facade_state().await;
+        Ok(())
+    }
+
     async fn repair_sink_replay_if_required(&self) -> std::result::Result<(), CnxError> {
         if self.runtime_control_state().sink_state_replay_required() {
             if self.replay_app_retained_sink_state_if_present().await? {
@@ -3665,6 +3698,8 @@ impl ManagementWriteRecoveryContext {
 
         if state_at_entry.source_state_replay_required() {
             self.repair_source_replay_if_required().await?;
+            self.ensure_source_rescan_proxy_ready_after_source_repair()
+                .await;
             if !self.runtime_control_state().source_state_replay_required()
                 && self.runtime_control_state().sink_state_replay_required()
             {
@@ -3680,19 +3715,9 @@ impl ManagementWriteRecoveryContext {
     }
 
     async fn run_source_repair(&self) -> std::result::Result<(), CnxError> {
-        if !self.runtime_control_state().source_state_replay_required() {
-            if !self.api_control_gate.is_source_repair_ready() {
-                self.publish_recovered_facade_state().await;
-            }
-            return Ok(());
-        }
-        let Some(_inflight) = self.try_begin() else {
-            return Ok(());
-        };
-        let _serial = self.control_frame_serial.lock().await;
-        self.repair_source_replay_if_required().await?;
-        self.restore_control_after_retained_replay_recovery();
-        self.publish_recovered_facade_state().await;
+        self.run_source_repair_without_proxy_ready().await?;
+        self.ensure_source_rescan_proxy_ready_after_source_repair()
+            .await;
         Ok(())
     }
 }
@@ -4830,10 +4855,9 @@ fn runtime_endpoint_task_route_still_active(
             .unwrap_or(false)
 }
 
-fn source_rescan_proxy_ready_for_current_generation(
+fn source_rescan_route_active_for_current_generation(
     facade_gate: &RuntimeUnitGate,
     route_key: &str,
-    ready_generation: &AtomicU64,
 ) -> bool {
     let Ok(true) = facade_gate.route_active(execution_units::SOURCE_RUNTIME_UNIT_ID, route_key)
     else {
@@ -4844,7 +4868,311 @@ fn source_rescan_proxy_ready_for_current_generation(
     else {
         return false;
     };
-    current_generation != 0 && ready_generation.load(Ordering::Acquire) == current_generation
+    current_generation != 0
+}
+
+fn source_rescan_route_groups_for_current_generation(
+    facade_gate: &RuntimeUnitGate,
+    route_key: &str,
+) -> Option<(u64, BTreeSet<String>)> {
+    let (generation, bound_scopes) = facade_gate
+        .active_route_state(execution_units::SOURCE_RUNTIME_UNIT_ID, route_key)
+        .ok()
+        .flatten()?;
+    if generation == 0 {
+        return None;
+    }
+    let groups = bound_scopes
+        .iter()
+        .filter_map(|scope| {
+            let scope_id = scope.scope_id.trim();
+            (!scope_id.is_empty()).then(|| scope_id.to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    if groups.is_empty() {
+        None
+    } else {
+        Some((generation, groups))
+    }
+}
+
+fn source_rescan_route_semantic_generation(facade_gate: &RuntimeUnitGate, route_key: &str) -> u64 {
+    facade_gate
+        .route_semantic_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, route_key)
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+}
+
+async fn worker_source_rescan_proxy_task_ready_for_current_generation(
+    facade_gate: &RuntimeUnitGate,
+    route_key: &str,
+    ready_generation: &AtomicU64,
+    runtime_endpoint_tasks: &Mutex<Vec<ManagedEndpointTask>>,
+) -> bool {
+    if !source_rescan_route_active_for_current_generation(facade_gate, route_key) {
+        ready_generation.store(0, Ordering::Release);
+        return false;
+    }
+    let current_generation = source_rescan_route_semantic_generation(facade_gate, route_key);
+    let tasks = runtime_endpoint_tasks.lock().await;
+    let task_ready = tasks.iter().any(|task| {
+        task.route_key() == route_key
+            && task
+                .route_generation()
+                .is_none_or(|generation| generation == current_generation)
+            && !task.is_finished()
+            && runtime_endpoint_task_route_still_active(facade_gate, task)
+            && task.is_receive_polling()
+    });
+    drop(tasks);
+    if task_ready {
+        ready_generation.store(current_generation, Ordering::Release);
+        true
+    } else {
+        ready_generation.store(0, Ordering::Release);
+        false
+    }
+}
+
+fn spawn_worker_source_rescan_proxy_endpoint(
+    boundary: Arc<dyn ChannelIoSubset>,
+    source: Arc<SourceFacade>,
+    node_id: NodeId,
+    source_rescan_route_key: String,
+    facade_gate: RuntimeUnitGate,
+    ready_generation: Arc<AtomicU64>,
+    source_repair_recovery: ManagementWriteRecovery,
+) -> ManagedEndpointTask {
+    let source_rescan_route = RouteKey(source_rescan_route_key.clone());
+    let route_generation =
+        source_rescan_route_semantic_generation(&facade_gate, &source_rescan_route_key);
+    let source_rescan_boundary = Arc::new(SourceRescanProxyReceiveReadyBoundary::new(
+        boundary,
+        source_rescan_route_key.clone(),
+        facade_gate,
+        ready_generation,
+    ));
+    eprintln!(
+        "fs_meta_runtime_app: spawning source rescan proxy endpoint route={}",
+        source_rescan_route_key
+    );
+    ManagedEndpointTask::spawn_with_unit_wait_receive_poll(
+        source_rescan_boundary,
+        source_rescan_route,
+        format!(
+            "app:{}:{}:scoped",
+            ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN
+        ),
+        execution_units::SOURCE_RUNTIME_UNIT_ID,
+        tokio_util::sync::CancellationToken::new(),
+        move |requests| {
+            let source = source.clone();
+            let node_id = node_id.clone();
+            let source_repair_recovery = source_repair_recovery.clone();
+            async move {
+                if requests.is_empty() {
+                    return Vec::new();
+                }
+                let scoped_target_acceptance_timeout = requests.iter().find_map(|request| {
+                    manual_rescan_scoped_target_acceptance_timeout_from_payload(
+                        request.payload_bytes(),
+                    )
+                });
+                let delivery_result = submit_worker_source_rescan_proxy_request_with_repair(
+                    source,
+                    source_repair_recovery,
+                    scoped_target_acceptance_timeout,
+                )
+                .await;
+                let mut responses = Vec::with_capacity(requests.len());
+                for req in requests {
+                    match &delivery_result {
+                        Ok(_) => responses.push(Event::new(
+                            EventMetadata {
+                                origin_id: node_id.clone(),
+                                timestamp_us: now_us(),
+                                logical_ts: None,
+                                correlation_id: req.metadata().correlation_id,
+                                ingress_auth: None,
+                                trace: None,
+                            },
+                            bytes::Bytes::from_static(b"accepted"),
+                        )),
+                        Err(err) => {
+                            let payload = if source_rescan_delivery_error_is_pending(err.as_error())
+                            {
+                                bytes::Bytes::from(format!("pending: {}", err.as_error()))
+                            } else {
+                                bytes::Bytes::from(err.as_error().to_string())
+                            };
+                            eprintln!(
+                                "fs_meta_runtime_app: source rescan proxy failed node={} err={}",
+                                node_id.0,
+                                err.as_error()
+                            );
+                            responses.push(Event::new(
+                                EventMetadata {
+                                    origin_id: node_id.clone(),
+                                    timestamp_us: now_us(),
+                                    logical_ts: None,
+                                    correlation_id: req.metadata().correlation_id,
+                                    ingress_auth: None,
+                                    trace: None,
+                                },
+                                payload,
+                            ));
+                        }
+                    }
+                }
+                responses
+            }
+        },
+    )
+    .with_route_generation(route_generation)
+}
+
+async fn submit_worker_source_rescan_proxy_request_with_repair(
+    source: Arc<SourceFacade>,
+    source_repair_recovery: ManagementWriteRecovery,
+    acceptance_timeout: Option<Duration>,
+) -> std::result::Result<u64, SourceFailure> {
+    let budget = acceptance_timeout.unwrap_or(MANUAL_RESCAN_SOURCE_STATUS_DEFAULT_PROBE_BUDGET);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(budget)
+        .unwrap_or_else(tokio::time::Instant::now);
+    let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let first_budget = remaining();
+    if first_budget.is_zero() {
+        return Err(SourceFailure::from(CnxError::Timeout));
+    }
+    let first_result = source
+        .submit_targeted_rescan_request_epoch_with_acceptance_timeout_with_failure(Some(
+            first_budget,
+        ))
+        .await;
+    let first_err = match first_result {
+        Ok(epoch) => return Ok(epoch),
+        Err(err) if source_rescan_delivery_error_is_pending(err.as_error()) => err,
+        Err(err) => return Err(err),
+    };
+    let repair_budget = remaining();
+    if repair_budget.is_zero() {
+        return Err(first_err);
+    }
+    match tokio::time::timeout(repair_budget, (source_repair_recovery)()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(SourceFailure::from(err)),
+        Err(_) => return Err(SourceFailure::from(CnxError::Timeout)),
+    }
+    let retry_budget = remaining();
+    if retry_budget.is_zero() {
+        return Err(first_err);
+    }
+    source
+        .submit_targeted_rescan_request_epoch_with_acceptance_timeout_with_failure(Some(
+            retry_budget,
+        ))
+        .await
+}
+
+async fn ensure_worker_source_rescan_proxy_endpoint_started(
+    boundary: Arc<dyn ChannelIoSubset>,
+    source: Arc<SourceFacade>,
+    node_id: NodeId,
+    facade_gate: &RuntimeUnitGate,
+    route_key: &str,
+    ready_generation: Arc<AtomicU64>,
+    runtime_endpoint_tasks: &Mutex<Vec<ManagedEndpointTask>>,
+    source_repair_recovery: ManagementWriteRecovery,
+) {
+    if !matches!(&*source, SourceFacade::Worker(_)) {
+        return;
+    }
+    if !source_rescan_route_active_for_current_generation(facade_gate, route_key) {
+        ready_generation.store(0, Ordering::Release);
+        return;
+    }
+    let current_generation = source_rescan_route_semantic_generation(facade_gate, route_key);
+    let mut tasks = runtime_endpoint_tasks.lock().await;
+    let mut route_present = false;
+    tasks.retain(|task| {
+        if task.route_key() != route_key {
+            return true;
+        }
+        let generation_stale = task
+            .route_generation()
+            .is_some_and(|generation| generation != current_generation);
+        if task.is_finished()
+            || generation_stale
+            || !runtime_endpoint_task_route_still_active(facade_gate, task)
+        {
+            eprintln!(
+                "fs_meta_runtime_app: retiring stale source rescan proxy endpoint route={} task_generation={:?} current_generation={}",
+                task.route_key(),
+                task.route_generation(),
+                current_generation
+            );
+            task.request_shutdown();
+            ready_generation.store(0, Ordering::Release);
+            false
+        } else {
+            route_present = true;
+            true
+        }
+    });
+    if !route_present {
+        tasks.push(spawn_worker_source_rescan_proxy_endpoint(
+            boundary,
+            source,
+            node_id,
+            route_key.to_string(),
+            facade_gate.clone(),
+            ready_generation,
+            source_repair_recovery,
+        ));
+    }
+}
+
+async fn ensure_worker_source_rescan_proxy_ready_until(
+    boundary: Arc<dyn ChannelIoSubset>,
+    source: Arc<SourceFacade>,
+    node_id: NodeId,
+    facade_gate: &RuntimeUnitGate,
+    route_key: &str,
+    ready_generation: Arc<AtomicU64>,
+    runtime_endpoint_tasks: &Mutex<Vec<ManagedEndpointTask>>,
+    source_repair_recovery: ManagementWriteRecovery,
+    deadline: tokio::time::Instant,
+) -> bool {
+    ensure_worker_source_rescan_proxy_endpoint_started(
+        boundary,
+        source,
+        node_id,
+        facade_gate,
+        route_key,
+        ready_generation.clone(),
+        runtime_endpoint_tasks,
+        source_repair_recovery,
+    )
+    .await;
+    loop {
+        if worker_source_rescan_proxy_task_ready_for_current_generation(
+            facade_gate,
+            route_key,
+            &ready_generation,
+            runtime_endpoint_tasks,
+        )
+        .await
+        {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
+    }
 }
 
 fn mark_source_rescan_proxy_ready_for_current_generation_if_receive_armed(
@@ -4860,11 +5188,7 @@ fn mark_source_rescan_proxy_ready_for_current_generation_if_receive_armed(
     else {
         return false;
     };
-    let Ok(Some(current_generation)) =
-        facade_gate.route_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, route_key)
-    else {
-        return false;
-    };
+    let current_generation = source_rescan_route_semantic_generation(facade_gate, route_key);
     if current_generation == 0 {
         return false;
     }
@@ -4928,13 +5252,13 @@ impl ChannelIoSubset for SourceRescanProxyReceiveReadyBoundary {
             && let Ok(true) = self
                 .facade_gate
                 .route_active(execution_units::SOURCE_RUNTIME_UNIT_ID, &self.route_key)
-            && let Ok(Some(current_generation)) = self
-                .facade_gate
-                .route_generation(execution_units::SOURCE_RUNTIME_UNIT_ID, &self.route_key)
-            && current_generation != 0
         {
-            self.ready_generation
-                .store(current_generation, Ordering::Release);
+            let current_generation =
+                source_rescan_route_semantic_generation(&self.facade_gate, &self.route_key);
+            if current_generation != 0 {
+                self.ready_generation
+                    .store(current_generation, Ordering::Release);
+            }
         }
         self.inner.channel_recv(ctx, request).await
     }
@@ -6600,7 +6924,7 @@ pub struct FSMetaApp {
     sink: Arc<SinkFacade>,
     query_sink: Arc<SinkFacade>,
     pump_task: Mutex<Option<SourcePumpHandle>>,
-    runtime_endpoint_tasks: Mutex<Vec<ManagedEndpointTask>>,
+    runtime_endpoint_tasks: Arc<Mutex<Vec<ManagedEndpointTask>>>,
     runtime_endpoint_routes: Mutex<std::collections::BTreeSet<String>>,
     api_task: Arc<Mutex<Option<FacadeActivation>>>,
     pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
@@ -6936,8 +7260,8 @@ impl From<CnxError> for RuntimeWorkerControlApplyFailure {
 }
 
 impl FSMetaApp {
-    fn management_write_recovery(&self) -> ManagementWriteRecovery {
-        let context = ManagementWriteRecoveryContext {
+    fn management_write_recovery_context(&self) -> ManagementWriteRecoveryContext {
+        ManagementWriteRecoveryContext {
             instance_id: self.instance_id,
             node_id: self.node_id.clone(),
             source: self.source.clone(),
@@ -6962,9 +7286,15 @@ impl FSMetaApp {
                 .clone(),
             facade_gate: self.facade_gate.clone(),
             source_rescan_proxy_ready_generation: self.source_rescan_proxy_ready_generation.clone(),
+            runtime_boundary: self.runtime_boundary.clone(),
+            runtime_endpoint_tasks: self.runtime_endpoint_tasks.clone(),
             control_frame_serial: self.control_frame_serial.clone(),
             inflight: self.management_write_recovery_inflight.clone(),
-        };
+        }
+    }
+
+    fn management_write_recovery(&self) -> ManagementWriteRecovery {
+        let context = self.management_write_recovery_context();
         Arc::new(move || {
             let context = context.clone();
             Box::pin(async move { context.run().await })
@@ -6972,37 +7302,18 @@ impl FSMetaApp {
     }
 
     fn source_repair_recovery(&self) -> ManagementWriteRecovery {
-        let context = ManagementWriteRecoveryContext {
-            instance_id: self.instance_id,
-            node_id: self.node_id.clone(),
-            source: self.source.clone(),
-            sink: self.sink.clone(),
-            api_task: self.api_task.clone(),
-            pending_facade: self.pending_facade.clone(),
-            facade_pending_status: self.facade_pending_status.clone(),
-            facade_service_state: self.facade_service_state.clone(),
-            api_control_gate: self.api_control_gate.clone(),
-            control_failure_uninitialized: self.control_failure_uninitialized.clone(),
-            runtime_gate_state: self.runtime_gate_state.clone(),
-            runtime_state_changed: self.runtime_state_changed.clone(),
-            retained_sink_control_state: self.retained_sink_control_state.clone(),
-            pending_fixed_bind_has_suppressed_dependent_routes: self
-                .pending_fixed_bind_has_suppressed_dependent_routes
-                .clone(),
-            source_generation_cutover_replay_deferred: self
-                .source_generation_cutover_replay_deferred
-                .clone(),
-            sink_generation_cutover_replay_deferred: self
-                .sink_generation_cutover_replay_deferred
-                .clone(),
-            facade_gate: self.facade_gate.clone(),
-            source_rescan_proxy_ready_generation: self.source_rescan_proxy_ready_generation.clone(),
-            control_frame_serial: self.control_frame_serial.clone(),
-            inflight: self.management_write_recovery_inflight.clone(),
-        };
+        let context = self.management_write_recovery_context();
         Arc::new(move || {
             let context = context.clone();
             Box::pin(async move { context.run_source_repair().await })
+        })
+    }
+
+    fn source_repair_recovery_without_proxy_ready(&self) -> ManagementWriteRecovery {
+        let context = self.management_write_recovery_context();
+        Arc::new(move || {
+            let context = context.clone();
+            Box::pin(async move { context.run_source_repair_without_proxy_ready().await })
         })
     }
 
@@ -8304,7 +8615,7 @@ impl FSMetaApp {
             sink,
             query_sink,
             pump_task: Mutex::new(None),
-            runtime_endpoint_tasks: Mutex::new(Vec::new()),
+            runtime_endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
             runtime_endpoint_routes: Mutex::new(std::collections::BTreeSet::new()),
             api_task: Arc::new(Mutex::new(None)),
             pending_facade: Arc::new(Mutex::new(None)),
@@ -9715,15 +10026,22 @@ impl FSMetaApp {
     async fn refresh_source_rescan_proxy_ready_from_retained_endpoint(&self) {
         let tasks = self.runtime_endpoint_tasks.lock().await;
         let scoped_source_rescan_route_key = source_rescan_request_route_for(&self.node_id.0).0;
+        let current_generation = source_rescan_route_semantic_generation(
+            &self.facade_gate,
+            &scoped_source_rescan_route_key,
+        );
         for task in tasks.iter() {
             if task.route_key() == scoped_source_rescan_route_key
                 && runtime_endpoint_task_route_still_active(&self.facade_gate, task)
+                && task
+                    .route_generation()
+                    .is_none_or(|generation| generation == current_generation)
             {
                 mark_source_rescan_proxy_ready_for_current_generation_if_receive_armed(
                     &self.facade_gate,
                     task.route_key(),
                     &self.source_rescan_proxy_ready_generation,
-                    task.is_receive_armed(),
+                    task.is_receive_polling(),
                 );
             }
         }
@@ -9754,6 +10072,11 @@ impl FSMetaApp {
         };
         let mut endpoint_tasks = std::mem::take(&mut *self.runtime_endpoint_tasks.lock().await);
         let mut retained_tasks = Vec::with_capacity(endpoint_tasks.len());
+        let scoped_source_rescan_route_key = source_rescan_request_route_for(&self.node_id.0).0;
+        let scoped_source_rescan_generation = source_rescan_route_semantic_generation(
+            &self.facade_gate,
+            &scoped_source_rescan_route_key,
+        );
         for task in endpoint_tasks.drain(..) {
             if task.is_finished() {
                 eprintln!(
@@ -9773,21 +10096,43 @@ impl FSMetaApp {
                 retained_tasks.push(task);
                 continue;
             }
+            if task.route_key() == scoped_source_rescan_route_key
+                && task
+                    .route_generation()
+                    .is_some_and(|generation| generation != scoped_source_rescan_generation)
+            {
+                eprintln!(
+                    "fs_meta_runtime_app: retiring generation-stale source rescan proxy endpoint route={} task_generation={:?} current_generation={}",
+                    task.route_key(),
+                    task.route_generation(),
+                    scoped_source_rescan_generation
+                );
+                task.request_shutdown();
+                self.source_rescan_proxy_ready_generation
+                    .store(0, Ordering::Release);
+                continue;
+            }
             retained_tasks.push(task);
         }
         let mut tasks = self.runtime_endpoint_tasks.lock().await;
         *tasks = retained_tasks;
         let mut spawned_routes = self.runtime_endpoint_routes.lock().await;
         spawned_routes.clear();
-        let scoped_source_rescan_route_key = source_rescan_request_route_for(&self.node_id.0).0;
         for task in tasks.iter() {
             if runtime_endpoint_task_route_still_active(&self.facade_gate, task) {
+                if task.route_key() == scoped_source_rescan_route_key
+                    && task
+                        .route_generation()
+                        .is_some_and(|generation| generation != scoped_source_rescan_generation)
+                {
+                    continue;
+                }
                 if task.route_key() == scoped_source_rescan_route_key {
                     mark_source_rescan_proxy_ready_for_current_generation_if_receive_armed(
                         &self.facade_gate,
                         task.route_key(),
                         &self.source_rescan_proxy_ready_generation,
-                        task.is_receive_armed(),
+                        task.is_receive_polling(),
                     );
                 }
                 spawned_routes.insert(task.route_key().to_string());
@@ -10182,10 +10527,13 @@ impl FSMetaApp {
                 let api_task = self.api_task.clone();
                 let source = self.source.clone();
                 let source_repair_recovery = self.source_repair_recovery();
+                let source_repair_recovery_without_proxy_ready =
+                    self.source_repair_recovery_without_proxy_ready();
                 let node_id = self.node_id.clone();
                 let boundary_for_source_status_rearm = boundary.clone();
                 let facade_gate_for_source_status = self.facade_gate.clone();
                 let runtime_gate_state_for_source_status = self.runtime_gate_state.clone();
+                let runtime_endpoint_tasks_for_source_status = self.runtime_endpoint_tasks.clone();
                 let source_rescan_proxy_ready_generation =
                     self.source_rescan_proxy_ready_generation.clone();
                 let source_rescan_proxy_route_key =
@@ -10211,12 +10559,16 @@ impl FSMetaApp {
                         let api_task = api_task.clone();
                         let source = source.clone();
                         let source_repair_recovery = source_repair_recovery.clone();
+                        let source_repair_recovery_without_proxy_ready =
+                            source_repair_recovery_without_proxy_ready.clone();
                         let node_id = node_id.clone();
                         let boundary_for_source_status_rearm =
                             boundary_for_source_status_rearm.clone();
                         let facade_gate_for_source_status = facade_gate_for_source_status.clone();
                         let runtime_gate_state_for_source_status =
                             runtime_gate_state_for_source_status.clone();
+                        let runtime_endpoint_tasks_for_source_status =
+                            runtime_endpoint_tasks_for_source_status.clone();
                         let source_rescan_proxy_ready_generation =
                             source_rescan_proxy_ready_generation.clone();
                         let source_rescan_proxy_route_key = source_rescan_proxy_route_key.clone();
@@ -10343,13 +10695,24 @@ impl FSMetaApp {
                                                 .saturating_duration_since(
                                                     tokio::time::Instant::now(),
                                                 );
-                                            let source_rescan_proxy_ready =
-                                                source_rescan_proxy_ready_for_current_generation(
-                                                    &facade_gate_for_source_status,
-                                                    &source_rescan_proxy_route_key,
-                                                    &source_rescan_proxy_ready_generation,
-                                                );
+                                            let mut source_rescan_proxy_route_groups =
+                                                None::<(u64, BTreeSet<String>)>;
                                             let non_target_status_snapshot = if source.is_worker() {
+                                                let source_rescan_proxy_ready =
+                                                    ensure_worker_source_rescan_proxy_ready_until(
+                                                        boundary_for_source_status_rearm.clone(),
+                                                        source.clone(),
+                                                        node_id.clone(),
+                                                        &facade_gate_for_source_status,
+                                                        &source_rescan_proxy_route_key,
+                                                        source_rescan_proxy_ready_generation
+                                                            .clone(),
+                                                        &runtime_endpoint_tasks_for_source_status,
+                                                        source_repair_recovery_without_proxy_ready
+                                                            .clone(),
+                                                        probe_deadline,
+                                                    )
+                                                    .await;
                                                 if !source_rescan_proxy_ready {
                                                     eprintln!(
                                                         "fs_meta_runtime_app: source status endpoint manual-rescan route not receive-armed node={} route={} correlation={:?} trace_id={}",
@@ -10359,6 +10722,17 @@ impl FSMetaApp {
                                                         trace_id
                                                     );
                                                 }
+                                                if source_rescan_proxy_ready {
+                                                    source_rescan_proxy_route_groups =
+                                                        source_rescan_route_groups_for_current_generation(
+                                                            &facade_gate_for_source_status,
+                                                            &source_rescan_proxy_route_key,
+                                                        );
+                                                }
+                                                let route_group_ids =
+                                                    source_rescan_proxy_route_groups
+                                                        .as_ref()
+                                                        .map(|(_, groups)| groups);
                                                 let delivery_acceptance =
                                                     if source_rescan_proxy_ready {
                                                         let acceptance_budget = probe_deadline
@@ -10369,35 +10743,35 @@ impl FSMetaApp {
                                                             SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
                                                         } else {
                                                             match tokio::time::timeout(
-                                                            acceptance_budget,
-                                                            source
-                                                                .targeted_rescan_delivery_acceptance_with_failure(),
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok(Ok(acceptance)) => acceptance,
-                                                            Ok(Err(err)) => {
-                                                                eprintln!(
-                                                                    "fs_meta_runtime_app: source status endpoint manual-rescan delivery acceptance check failed node={} correlation={:?} trace_id={} budget_ms={} err={}",
-                                                                    node_id.0,
-                                                                    req.metadata().correlation_id,
-                                                                    trace_id,
-                                                                    probe_budget.as_millis(),
-                                                                    err.as_error()
-                                                                );
-                                                                SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
+                                                                acceptance_budget,
+                                                                source
+                                                                    .targeted_rescan_delivery_acceptance_with_failure(),
+                                                            )
+                                                            .await
+                                                            {
+                                                                Ok(Ok(acceptance)) => acceptance,
+                                                                Ok(Err(err)) => {
+                                                                    eprintln!(
+                                                                        "fs_meta_runtime_app: source status endpoint manual-rescan worker delivery acceptance check failed node={} correlation={:?} trace_id={} budget_ms={} err={}",
+                                                                        node_id.0,
+                                                                        req.metadata().correlation_id,
+                                                                        trace_id,
+                                                                        probe_budget.as_millis(),
+                                                                        err.as_error()
+                                                                    );
+                                                                    SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
+                                                                }
+                                                                Err(_) => {
+                                                                    eprintln!(
+                                                                        "fs_meta_runtime_app: source status endpoint manual-rescan worker delivery acceptance check timed out node={} correlation={:?} trace_id={} budget_ms={}",
+                                                                        node_id.0,
+                                                                        req.metadata().correlation_id,
+                                                                        trace_id,
+                                                                        probe_budget.as_millis()
+                                                                    );
+                                                                    SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
+                                                                }
                                                             }
-                                                            Err(_) => {
-                                                                eprintln!(
-                                                                    "fs_meta_runtime_app: source status endpoint manual-rescan delivery acceptance check timed out node={} correlation={:?} trace_id={} budget_ms={}",
-                                                                    node_id.0,
-                                                                    req.metadata().correlation_id,
-                                                                    trace_id,
-                                                                    probe_budget.as_millis()
-                                                                );
-                                                                SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
-                                                            }
-                                                        }
                                                         }
                                                     } else {
                                                         SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
@@ -10406,12 +10780,17 @@ impl FSMetaApp {
                                                     delivery_acceptance,
                                                     SourceTargetedRescanDeliveryAcceptance::Accepted
                                                 );
+                                                let app_route_snapshot = if delivery_accepted {
+                                                    source
+                                                        .manual_rescan_app_route_observability_snapshot_for_status_route(
+                                                            route_group_ids,
+                                                        )
+                                                        .await
+                                                } else {
+                                                    None
+                                                };
                                                 let (mut snapshot, used_cached_fallback) =
-                                                    if delivery_accepted
-                                                        && let Some(snapshot) = source
-                                                            .manual_rescan_app_route_observability_snapshot_for_status_route()
-                                                            .await
-                                                    {
+                                                    if let Some(snapshot) = app_route_snapshot {
                                                         (snapshot, true)
                                                     } else {
                                                         source
@@ -10419,10 +10798,22 @@ impl FSMetaApp {
                                                             .await
                                                     };
                                                 if delivery_accepted {
-                                                    annotate_manual_rescan_route_receivable_evidence(
-                                                        &mut snapshot,
-                                                        &node_id,
-                                                    );
+                                                    if let Some((generation, groups)) =
+                                                        source_rescan_proxy_route_groups.as_ref()
+                                                    {
+                                                        annotate_manual_rescan_route_receivable_evidence_for_route_groups(
+                                                            &mut snapshot,
+                                                            &node_id,
+                                                            &source_rescan_proxy_route_key,
+                                                            Some(*generation),
+                                                            groups,
+                                                        );
+                                                    } else {
+                                                        annotate_manual_rescan_route_receivable_evidence(
+                                                            &mut snapshot,
+                                                            &node_id,
+                                                        );
+                                                    }
                                                 }
                                                 Some((snapshot, used_cached_fallback))
                                             } else {
@@ -10455,13 +10846,10 @@ impl FSMetaApp {
                                                     );
                                                     continue;
                                                 }
-                                                let source_rescan_proxy_ready =
-                                                    source_rescan_proxy_ready_for_current_generation(
-                                                        &facade_gate_for_source_status,
-                                                        &source_rescan_proxy_route_key,
-                                                        &source_rescan_proxy_ready_generation,
-                                                    );
-                                                if !source_rescan_proxy_ready {
+                                                if !source_rescan_route_active_for_current_generation(
+                                                    &facade_gate_for_source_status,
+                                                    &source_rescan_proxy_route_key,
+                                                ) {
                                                     continue;
                                                 }
                                                 let acceptance_budget = probe_deadline
@@ -10538,7 +10926,11 @@ impl FSMetaApp {
                                             if let Some(snapshot) = non_target_status_snapshot {
                                                 snapshot
                                             } else if let Some(snapshot) = source
-                                            .cached_manual_rescan_delivery_observability_snapshot_for_status_route()
+                                            .cached_manual_rescan_delivery_observability_snapshot_for_status_route(
+                                                source_rescan_proxy_route_groups
+                                                    .as_ref()
+                                                    .map(|(_, groups)| groups),
+                                            )
                                         {
                                             (snapshot, true)
                                         } else {
@@ -11019,102 +11411,15 @@ impl FSMetaApp {
                 if matches!(&*self.source, SourceFacade::Worker(_))
                     && spawned_routes.insert(source_rescan_route_key.clone())
                 {
-                    let source_rescan_route = RouteKey(source_rescan_route_key.clone());
-                    let source = self.source.clone();
-                    let node_id = self.node_id.clone();
-                    let source_rescan_boundary =
-                        Arc::new(SourceRescanProxyReceiveReadyBoundary::new(
-                            boundary.clone(),
-                            source_rescan_route_key.clone(),
-                            self.facade_gate.clone(),
-                            self.source_rescan_proxy_ready_generation.clone(),
-                        ));
-                    eprintln!(
-                        "fs_meta_runtime_app: spawning source rescan proxy endpoint route={}",
-                        source_rescan_route_key
-                    );
-                    let endpoint =
-                        ManagedEndpointTask::spawn_with_unit_wait_receivable_without_ready_wait(
-                            source_rescan_boundary,
-                            source_rescan_route,
-                            format!(
-                                "app:{}:{}:scoped",
-                                ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN
-                            ),
-                            execution_units::SOURCE_RUNTIME_UNIT_ID,
-                            tokio_util::sync::CancellationToken::new(),
-                            move |requests| {
-                                let source = source.clone();
-                                let node_id = node_id.clone();
-                                async move {
-                                    if requests.is_empty() {
-                                        return Vec::new();
-                                    }
-                                    let scoped_target_acceptance_timeout =
-                                    requests.iter().find_map(|request| {
-                                        manual_rescan_scoped_target_acceptance_timeout_from_payload(
-                                            request.payload_bytes(),
-                                        )
-                                    });
-                                    let delivery_result = source
-                                    .submit_targeted_rescan_request_epoch_with_acceptance_timeout_with_failure(
-                                        scoped_target_acceptance_timeout,
-                                    )
-                                    .await;
-                                    let mut responses = Vec::with_capacity(requests.len());
-                                    for req in requests {
-                                        match &delivery_result {
-                                            Ok(_) => responses.push(Event::new(
-                                                EventMetadata {
-                                                    origin_id: node_id.clone(),
-                                                    timestamp_us: now_us(),
-                                                    logical_ts: None,
-                                                    correlation_id: req.metadata().correlation_id,
-                                                    ingress_auth: None,
-                                                    trace: None,
-                                                },
-                                                bytes::Bytes::from_static(b"accepted"),
-                                            )),
-                                            Err(err) => {
-                                                let payload =
-                                                    if source_rescan_delivery_error_is_pending(
-                                                        err.as_error(),
-                                                    ) {
-                                                        bytes::Bytes::from(format!(
-                                                            "pending: {}",
-                                                            err.as_error()
-                                                        ))
-                                                    } else {
-                                                        bytes::Bytes::from(
-                                                            err.as_error().to_string(),
-                                                        )
-                                                    };
-                                                eprintln!(
-                                                    "fs_meta_runtime_app: source rescan proxy failed node={} err={}",
-                                                    node_id.0,
-                                                    err.as_error()
-                                                );
-                                                responses.push(Event::new(
-                                                    EventMetadata {
-                                                        origin_id: node_id.clone(),
-                                                        timestamp_us: now_us(),
-                                                        logical_ts: None,
-                                                        correlation_id: req
-                                                            .metadata()
-                                                            .correlation_id,
-                                                        ingress_auth: None,
-                                                        trace: None,
-                                                    },
-                                                    payload,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    responses
-                                }
-                            },
-                        );
-                    tasks.push(endpoint);
+                    tasks.push(spawn_worker_source_rescan_proxy_endpoint(
+                        boundary.clone(),
+                        self.source.clone(),
+                        self.node_id.clone(),
+                        source_rescan_route_key.clone(),
+                        self.facade_gate.clone(),
+                        self.source_rescan_proxy_ready_generation.clone(),
+                        self.source_repair_recovery_without_proxy_ready(),
+                    ));
                 }
                 continue;
             }
@@ -13756,6 +14061,219 @@ impl FSMetaApp {
         }
     }
 
+    fn source_route_state_key(signal: &SourceControlSignal) -> Option<(String, String)> {
+        match signal {
+            SourceControlSignal::Activate {
+                unit, route_key, ..
+            }
+            | SourceControlSignal::Deactivate {
+                unit, route_key, ..
+            } => Some((unit.unit_id().to_string(), route_key.clone())),
+            _ => None,
+        }
+    }
+
+    fn source_route_state_signal_matches(
+        incoming: &SourceControlSignal,
+        retained: &SourceControlSignal,
+        allow_forward_generation: bool,
+    ) -> bool {
+        match (incoming, retained) {
+            (
+                SourceControlSignal::Activate {
+                    unit,
+                    route_key,
+                    generation,
+                    bound_scopes,
+                    ..
+                },
+                SourceControlSignal::Activate {
+                    unit: retained_unit,
+                    route_key: retained_route_key,
+                    generation: retained_generation,
+                    bound_scopes: retained_bound_scopes,
+                    ..
+                },
+            ) => {
+                unit.unit_id() == retained_unit.unit_id()
+                    && route_key == retained_route_key
+                    && (*generation == *retained_generation
+                        || (allow_forward_generation && *generation >= *retained_generation))
+                    && bound_scopes == retained_bound_scopes
+            }
+            (
+                SourceControlSignal::Deactivate {
+                    unit,
+                    route_key,
+                    generation,
+                    ..
+                },
+                SourceControlSignal::Deactivate {
+                    unit: retained_unit,
+                    route_key: retained_route_key,
+                    generation: retained_generation,
+                    ..
+                },
+            ) => {
+                unit.unit_id() == retained_unit.unit_id()
+                    && route_key == retained_route_key
+                    && (*generation == *retained_generation
+                        || (allow_forward_generation && *generation >= *retained_generation))
+            }
+            _ => false,
+        }
+    }
+
+    fn source_host_grant_change_signal_matches(
+        incoming: &SourceControlSignal,
+        retained: &SourceControlSignal,
+    ) -> bool {
+        match (incoming, retained) {
+            (
+                SourceControlSignal::RuntimeHostGrantChange { changed, .. },
+                SourceControlSignal::RuntimeHostGrantChange {
+                    changed: retained_changed,
+                    ..
+                },
+            ) => {
+                changed.version >= retained_changed.version
+                    && changed.grants == retained_changed.grants
+            }
+            _ => false,
+        }
+    }
+
+    fn source_host_grant_change_matches_config(
+        changed: &RuntimeHostGrantChange,
+        config: &crate::source::config::SourceConfig,
+    ) -> bool {
+        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+        struct GrantFingerprint {
+            object_ref: String,
+            host_ref: String,
+            host_ip: String,
+            mount_point: String,
+            fs_source: String,
+            fs_type: String,
+            mount_options: Vec<String>,
+            interfaces: Vec<String>,
+            active: bool,
+        }
+
+        let incoming = changed
+            .grants
+            .iter()
+            .filter(|grant| matches!(grant.object_type, RuntimeHostObjectType::MountRoot))
+            .map(|grant| GrantFingerprint {
+                object_ref: grant.object_ref.clone(),
+                host_ref: grant.host.host_ref.clone(),
+                host_ip: grant.host.host_ip.clone(),
+                mount_point: grant.object.mount_point.clone(),
+                fs_source: grant.object.fs_source.clone(),
+                fs_type: grant.object.fs_type.clone(),
+                mount_options: grant.object.mount_options.clone(),
+                interfaces: grant.interfaces.clone(),
+                active: matches!(grant.grant_state, RuntimeHostGrantState::Active),
+            })
+            .collect::<BTreeSet<_>>();
+        let expected = config
+            .host_object_grants
+            .iter()
+            .map(|grant| GrantFingerprint {
+                object_ref: grant.object_ref.clone(),
+                host_ref: grant.host_ref.clone(),
+                host_ip: grant.host_ip.clone(),
+                mount_point: grant.mount_point.to_string_lossy().into_owned(),
+                fs_source: grant.fs_source.clone(),
+                fs_type: grant.fs_type.clone(),
+                mount_options: grant.mount_options.clone(),
+                interfaces: grant.interfaces.clone(),
+                active: grant.active,
+            })
+            .collect::<BTreeSet<_>>();
+        !incoming.is_empty() && incoming == expected
+    }
+
+    fn source_signal_is_route_semantics_candidate(signal: &SourceControlSignal) -> bool {
+        matches!(
+            signal,
+            SourceControlSignal::Activate { .. }
+                | SourceControlSignal::Deactivate { .. }
+                | SourceControlSignal::RuntimeHostGrantChange { .. }
+        )
+    }
+
+    async fn source_signals_match_retained_current_route_semantics(
+        &self,
+        source_signals: &[SourceControlSignal],
+    ) -> bool {
+        self.source_signals_match_retained_current_route_semantics_with_generation(
+            source_signals,
+            false,
+        )
+        .await
+    }
+
+    async fn source_signals_match_retained_current_or_forward_route_semantics(
+        &self,
+        source_signals: &[SourceControlSignal],
+    ) -> bool {
+        self.source_signals_match_retained_current_route_semantics_with_generation(
+            source_signals,
+            true,
+        )
+        .await
+    }
+
+    async fn source_signals_match_retained_current_route_semantics_with_generation(
+        &self,
+        source_signals: &[SourceControlSignal],
+        allow_forward_generation: bool,
+    ) -> bool {
+        if source_signals.is_empty()
+            || !source_signals
+                .iter()
+                .all(Self::source_signal_is_route_semantics_candidate)
+        {
+            return false;
+        }
+        let retained_signals = self.source.control_signals_with_replay(&[]).await;
+        let retained_by_route = retained_signals
+            .iter()
+            .filter_map(|signal| Self::source_route_state_key(signal).map(|key| (key, signal)))
+            .collect::<BTreeMap<_, _>>();
+        let retained_host_grant_change = retained_signals
+            .iter()
+            .find(|signal| matches!(signal, SourceControlSignal::RuntimeHostGrantChange { .. }));
+        let mut route_state_present = false;
+        for signal in source_signals {
+            if let Some(key) = Self::source_route_state_key(signal) {
+                route_state_present = true;
+                if !retained_by_route.get(&key).is_some_and(|retained| {
+                    Self::source_route_state_signal_matches(
+                        signal,
+                        retained,
+                        allow_forward_generation,
+                    )
+                }) {
+                    return false;
+                }
+            } else if matches!(signal, SourceControlSignal::RuntimeHostGrantChange { .. })
+                && !retained_host_grant_change.is_some_and(|retained| {
+                    Self::source_host_grant_change_signal_matches(signal, retained)
+                })
+                && !matches!(
+                    signal,
+                    SourceControlSignal::RuntimeHostGrantChange { changed, .. }
+                        if Self::source_host_grant_change_matches_config(changed, &self.config.source)
+                )
+            {
+                return false;
+            }
+        }
+        route_state_present
+    }
+
     async fn source_signals_match_retained_generation_ticks(
         &self,
         source_signals: &[SourceControlSignal],
@@ -14033,8 +14551,17 @@ impl FSMetaApp {
                     && unit.unit_id() == execution_units::SOURCE_RUNTIME_UNIT_ID
                     && route_key == &source_rescan_request_route_for(&self.node_id.0).0
                 {
-                    self.source_rescan_proxy_ready_generation
-                        .store(0, Ordering::Release);
+                    let current_generation =
+                        source_rescan_route_semantic_generation(&self.facade_gate, route_key);
+                    if current_generation == 0
+                        || self
+                            .source_rescan_proxy_ready_generation
+                            .load(Ordering::Acquire)
+                            != current_generation
+                    {
+                        self.source_rescan_proxy_ready_generation
+                            .store(0, Ordering::Release);
+                    }
                 }
             }
             SourceControlSignal::Deactivate {
@@ -14110,6 +14637,21 @@ impl FSMetaApp {
         source_signals: &[SourceControlSignal],
         generation_cutover_disposition: SourceGenerationCutoverDisposition,
     ) -> bool {
+        if !self.runtime_control_state().source_state_replay_required()
+            && self
+                .source_signals_match_retained_current_or_forward_route_semantics(source_signals)
+                .await
+        {
+            return false;
+        }
+        if !self.runtime_control_state().source_state_replay_required()
+            && !self.control_initialized()
+            && self
+                .source_signals_match_retained_current_or_forward_route_semantics(source_signals)
+                .await
+        {
+            return false;
+        }
         if matches!(
             generation_cutover_disposition,
             SourceGenerationCutoverDisposition::FailClosedRestartDeferredRetirePending
@@ -14154,6 +14696,40 @@ impl FSMetaApp {
         Ok(())
     }
 
+    async fn apply_current_source_route_semantics_without_worker(
+        &self,
+        source_signals: &[SourceControlSignal],
+    ) -> std::result::Result<bool, RuntimeWorkerControlApplyFailure> {
+        let filtered_source_signals = self
+            .filter_shared_source_route_deactivates(source_signals)
+            .await;
+        if self.runtime_control_state().source_state_replay_required() {
+            return Ok(false);
+        }
+        let retained_current = self
+            .source_signals_match_retained_current_route_semantics(&filtered_source_signals)
+            .await;
+        let retained_forward_after_repair = !retained_current
+            && !self.control_initialized()
+            && self
+                .source_signals_match_retained_current_or_forward_route_semantics(
+                    &filtered_source_signals,
+                )
+                .await;
+        if !retained_current && !retained_forward_after_repair {
+            return Ok(false);
+        }
+        self.record_retained_source_control_state(&filtered_source_signals)
+            .await;
+        self.record_shared_source_route_claims(&filtered_source_signals)
+            .await;
+        self.apply_source_signals_to_runtime_endpoint_gate(&filtered_source_signals)
+            .map_err(RuntimeWorkerControlApplyFailure::from)?;
+        self.refresh_source_rescan_proxy_ready_from_retained_endpoint()
+            .await;
+        Ok(true)
+    }
+
     async fn apply_source_signals_with_recovery(
         &self,
         fixed_bind_session: &FixedBindLifecycleSession,
@@ -14164,6 +14740,41 @@ impl FSMetaApp {
         let filtered_source_signals = self
             .filter_shared_source_route_deactivates(source_signals)
             .await;
+        if !self.runtime_control_state().source_state_replay_required()
+            && self
+                .source_signals_match_retained_current_route_semantics(&filtered_source_signals)
+                .await
+        {
+            self.record_retained_source_control_state(&filtered_source_signals)
+                .await;
+            self.record_shared_source_route_claims(&filtered_source_signals)
+                .await;
+            self.apply_source_signals_to_runtime_endpoint_gate(&filtered_source_signals)
+                .map_err(RuntimeWorkerControlApplyFailure::from)?;
+            self.refresh_source_rescan_proxy_ready_from_retained_endpoint()
+                .await;
+            return Ok(());
+        }
+        if !control_initialized_at_entry
+            && !self.control_initialized()
+            && !self.runtime_control_state().source_state_replay_required()
+            && self.runtime_control_state().sink_state_replay_required()
+            && self
+                .source_signals_match_retained_current_or_forward_route_semantics(
+                    &filtered_source_signals,
+                )
+                .await
+        {
+            self.record_retained_source_control_state(&filtered_source_signals)
+                .await;
+            self.record_shared_source_route_claims(&filtered_source_signals)
+                .await;
+            self.apply_source_signals_to_runtime_endpoint_gate(&filtered_source_signals)
+                .map_err(RuntimeWorkerControlApplyFailure::from)?;
+            self.refresh_source_rescan_proxy_ready_from_retained_endpoint()
+                .await;
+            return Ok(());
+        }
         if control_initialized_at_entry
             && self.control_initialized()
             && !self.runtime_control_state().source_state_replay_required()
@@ -15910,6 +16521,24 @@ impl FSMetaApp {
                     .map_err(RuntimeWorkerControlApplyFailure::from)?;
             }
             SourceControlWaveDisposition::ApplySignals => {
+                if (sink_signals.is_empty()
+                    || Self::sink_signals_are_host_grant_change_only(&sink_signals))
+                    && (facade_publication_signals.is_empty()
+                        || Self::facade_signals_are_host_grant_change_only(
+                            &facade_publication_signals,
+                        ))
+                    && !facade_claim_signals_present
+                    && self
+                        .apply_current_source_route_semantics_without_worker(&source_signals)
+                        .await?
+                {
+                    self.finish_source_control_apply_and_publish_source_repair(
+                        &mut source_control_apply_inflight,
+                        true,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 if self
                     .source_generation_cutover_apply_should_defer_inline(
                         &source_signals,

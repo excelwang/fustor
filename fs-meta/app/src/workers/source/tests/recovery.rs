@@ -8,7 +8,7 @@ macro_rules! define_recovery_tests {
         std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
 
         let cfg = SourceConfig {
-            roots: vec![worker_source_root("nfs1", &nfs1)],
+            roots: vec![worker_source_root("nfs1", &nfs1), worker_source_root("nfs2", &nfs2)],
             host_object_grants: vec![
                 worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
                 worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),

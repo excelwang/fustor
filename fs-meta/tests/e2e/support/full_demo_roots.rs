@@ -1,12 +1,10 @@
 use fs_meta::{RootSelector, RootSpec};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
 const FULL_NFS_ROOTS_FILE_ENV: &str = "FSMETA_FULL_NFS_ROOTS_FILE";
-const FULL_DEMO_MAX_SCAN_EVENTS: i64 = 512;
-
 #[derive(Clone, Debug)]
 pub struct FullDemoRoot {
     pub id: String,
@@ -69,34 +67,6 @@ pub fn logical_roots_from_env(logical_ids: &[&str]) -> Result<Option<Vec<FullDem
             })
             .collect(),
     ))
-}
-
-pub fn apply_bounded_audit_config(release: &mut Value) -> Result<(), String> {
-    let key = if release.get("workers").and_then(Value::as_array).is_some() {
-        "workers"
-    } else {
-        "units"
-    };
-    let entries = release
-        .get_mut(key)
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| format!("release doc missing {key}[] for full demo audit budget"))?;
-    let entry = entries
-        .first_mut()
-        .ok_or_else(|| format!("release doc {key}[] is empty for full demo audit budget"))?;
-    let entry_obj = entry
-        .as_object_mut()
-        .ok_or_else(|| format!("release doc {key}[0] is not an object"))?;
-    let config = entry_obj
-        .entry("config".to_string())
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| format!("release doc {key}[0].config is not an object"))?;
-    config.insert(
-        "max_scan_events".to_string(),
-        json!(FULL_DEMO_MAX_SCAN_EVENTS),
-    );
-    Ok(())
 }
 
 fn roots_file_from_env() -> Option<PathBuf> {

@@ -186,6 +186,7 @@ struct TestSourceStatusResponder {
     send_count: std::sync::atomic::AtomicUsize,
     delivered_send_count: std::sync::atomic::AtomicUsize,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    changed: Notify,
 }
 
 #[derive(Default)]
@@ -207,6 +208,7 @@ struct ReusableObservedRouteBoundary {
 
 struct MaterializedRouteRaceBoundary {
     state: std::sync::Mutex<MaterializedRouteRaceState>,
+    changed: Notify,
     proxy_call_channel: String,
     internal_call_channel: String,
     selected_group: String,
@@ -306,6 +308,9 @@ struct ForceFindProtocolRetryThenReplyBoundary {
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    changed: Notify,
+    reply_batches_sent_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    retry_gap_sent: std::sync::atomic::AtomicBool,
     source_reply_sent: std::sync::atomic::AtomicBool,
 }
 
@@ -315,6 +320,9 @@ struct ForceFindGroupMissingThenReplyBoundary {
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    changed: Notify,
+    reply_batches_sent_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    selected_group_gap_sent: std::sync::atomic::AtomicBool,
     source_reply_sent: std::sync::atomic::AtomicBool,
 }
 
@@ -327,6 +335,7 @@ struct ForceFindHostUnavailableThenNextRunnerBoundary {
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    changed: Notify,
     node_b_reply_sent: std::sync::atomic::AtomicBool,
 }
 
@@ -336,8 +345,11 @@ struct ForceFindSingleCandidateGroupMissingThenFallbackBoundary {
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    changed: Notify,
     first_retryable_gap_at: std::sync::Mutex<Option<std::time::Instant>>,
     second_send_at: std::sync::Mutex<Option<std::time::Instant>>,
+    reply_batches_sent_by_channel: std::sync::Mutex<HashMap<String, usize>>,
+    selected_group_gap_sent: std::sync::atomic::AtomicBool,
     source_reply_sent: std::sync::atomic::AtomicBool,
 }
 
@@ -349,6 +361,7 @@ struct ForceFindSelectedGroupFallbackCollectBoundary {
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    changed: Notify,
     generic_reply_count: std::sync::atomic::AtomicUsize,
 }
 
@@ -361,6 +374,7 @@ struct ForceFindSelectedRouteTimeoutThenFallbackBudgetBoundary {
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    changed: Notify,
     generic_reply_sent: std::sync::atomic::AtomicBool,
 }
 
@@ -370,6 +384,7 @@ struct ForceFindRunnerBindingStatusBoundary {
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    changed: Notify,
     delivered_send_count: std::sync::atomic::AtomicUsize,
 }
 
@@ -388,6 +403,7 @@ struct ForceFindDelayedRunnerBindingBoundary {
     send_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
+    changed: Notify,
     delivered_source_status_send_count: std::sync::atomic::AtomicUsize,
     source_find_reply_sent: std::sync::atomic::AtomicBool,
 }
@@ -476,7 +492,7 @@ impl ChannelIoSubset for LoopbackRouteBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        if let Some(result) = self.source_status.try_recv(&request) {
+        if let Some(result) = self.source_status.recv(&request).await {
             return result;
         }
         let deadline = request
@@ -533,6 +549,7 @@ impl MaterializedRouteRaceBoundary {
     ) -> Self {
         Self {
             state: std::sync::Mutex::new(MaterializedRouteRaceState::default()),
+            changed: Notify::new(),
             proxy_call_channel,
             internal_call_channel,
             selected_group: selected_group.into(),
@@ -556,6 +573,7 @@ impl TestSourceStatusResponder {
             send_count: std::sync::atomic::AtomicUsize::new(0),
             delivered_send_count: std::sync::atomic::AtomicUsize::new(0),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            changed: Notify::new(),
         }
     }
 
@@ -586,39 +604,102 @@ impl TestSourceStatusResponder {
         }
         self.send_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.changed.notify_waiters();
         true
     }
 
-    fn try_recv(
+    async fn recv(
         &self,
         request: &ChannelRecvRequest,
     ) -> Option<capanix_app_sdk::Result<Vec<Event>>> {
-        let payload = self.payload.as_ref()?;
+        let payload = self.payload.as_ref()?.clone();
         if request.channel_key.0 != Self::reply_channel() {
             return None;
         }
-        let send_count = self.send_count.load(std::sync::atomic::Ordering::SeqCst);
-        let delivered = self
-            .delivered_send_count
-            .load(std::sync::atomic::Ordering::SeqCst);
-        if send_count == 0 || delivered >= send_count {
-            return Some(Err(CnxError::Timeout));
+        loop {
+            let send_count = self.send_count.load(std::sync::atomic::Ordering::SeqCst);
+            let delivered = self
+                .delivered_send_count
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if send_count > delivered
+                && self
+                    .delivered_send_count
+                    .compare_exchange(
+                        delivered,
+                        send_count,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok()
+            {
+                let request_channel = Self::request_channel();
+                let correlation = self
+                    .correlations_by_channel
+                    .lock()
+                    .expect("test source-status correlations lock")
+                    .get(&request_channel)
+                    .copied()
+                    .unwrap_or(1);
+                return Some(Ok(vec![mk_event_with_correlation(
+                    "source-status",
+                    correlation,
+                    payload.clone(),
+                )]));
+            }
+            self.changed.notified().await;
         }
-        self.delivered_send_count
-            .store(send_count, std::sync::atomic::Ordering::SeqCst);
-        let request_channel = Self::request_channel();
-        let correlation = self
-            .correlations_by_channel
+    }
+}
+
+async fn wait_for_test_correlation(
+    correlations_by_channel: &std::sync::Mutex<HashMap<String, u64>>,
+    changed: &Notify,
+    request_channel: &str,
+    lock_name: &'static str,
+) -> capanix_app_sdk::Result<u64> {
+    loop {
+        if let Some(correlation) = correlations_by_channel
             .lock()
-            .expect("test source-status correlations lock")
-            .get(&request_channel)
+            .expect(lock_name)
+            .get(request_channel)
             .copied()
-            .unwrap_or(1);
-        Some(Ok(vec![mk_event_with_correlation(
-            "source-status",
-            correlation,
-            payload.clone(),
-        )]))
+        {
+            return Ok(correlation);
+        }
+        changed.notified().await;
+    }
+}
+
+fn next_test_reply_batch_for_channel(
+    reply_batches_sent_by_channel: &std::sync::Mutex<HashMap<String, usize>>,
+    request_channel: &str,
+    lock_name: &'static str,
+) -> usize {
+    let mut reply_batches = reply_batches_sent_by_channel.lock().expect(lock_name);
+    let reply_batch = reply_batches
+        .entry(request_channel.to_string())
+        .or_default();
+    *reply_batch += 1;
+    *reply_batch
+}
+
+async fn wait_for_test_channel_send_count(
+    send_batches_by_channel: &std::sync::Mutex<HashMap<String, usize>>,
+    changed: &Notify,
+    request_channel: &str,
+    min_send_count: usize,
+    lock_name: &'static str,
+) -> usize {
+    loop {
+        let send_count = *send_batches_by_channel
+            .lock()
+            .expect(lock_name)
+            .get(request_channel)
+            .unwrap_or(&0);
+        if send_count >= min_send_count {
+            return send_count;
+        }
+        changed.notified().await;
     }
 }
 
@@ -845,6 +926,7 @@ impl ForceFindRunnerBindingStatusBoundary {
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            changed: Notify::new(),
             delivered_send_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -896,6 +978,7 @@ impl ForceFindDelayedRunnerBindingBoundary {
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            changed: Notify::new(),
             delivered_source_status_send_count: std::sync::atomic::AtomicUsize::new(0),
             source_find_reply_sent: std::sync::atomic::AtomicBool::new(false),
         }
@@ -1018,6 +1101,9 @@ impl ForceFindProtocolRetryThenReplyBoundary {
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            changed: Notify::new(),
+            reply_batches_sent_by_channel: std::sync::Mutex::new(HashMap::new()),
+            retry_gap_sent: std::sync::atomic::AtomicBool::new(false),
             source_reply_sent: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1049,6 +1135,9 @@ impl ForceFindGroupMissingThenReplyBoundary {
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            changed: Notify::new(),
+            reply_batches_sent_by_channel: std::sync::Mutex::new(HashMap::new()),
+            selected_group_gap_sent: std::sync::atomic::AtomicBool::new(false),
             source_reply_sent: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1086,6 +1175,7 @@ impl ForceFindHostUnavailableThenNextRunnerBoundary {
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            changed: Notify::new(),
             node_b_reply_sent: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1108,8 +1198,11 @@ impl ForceFindSingleCandidateGroupMissingThenFallbackBoundary {
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            changed: Notify::new(),
             first_retryable_gap_at: std::sync::Mutex::new(None),
             second_send_at: std::sync::Mutex::new(None),
+            reply_batches_sent_by_channel: std::sync::Mutex::new(HashMap::new()),
+            selected_group_gap_sent: std::sync::atomic::AtomicBool::new(false),
             source_reply_sent: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1154,6 +1247,7 @@ impl ForceFindSelectedGroupFallbackCollectBoundary {
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            changed: Notify::new(),
             generic_reply_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -1182,6 +1276,7 @@ impl ForceFindSelectedRouteTimeoutThenFallbackBudgetBoundary {
             send_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
+            changed: Notify::new(),
             generic_reply_sent: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1454,6 +1549,7 @@ impl ChannelIoSubset for MaterializedRouteRaceBoundary {
         let mut state = self.state.lock().expect("route race state lock");
         state.sent_call_channel = Some(request.channel_key.0);
         state.sent_correlation = correlation;
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -1467,44 +1563,50 @@ impl ChannelIoSubset for MaterializedRouteRaceBoundary {
             Real,
         }
 
-        let (delay, reply_kind, correlation) = {
-            let mut state = self.state.lock().expect("route race state lock");
-            let sent_call_channel = state
-                .sent_call_channel
-                .clone()
-                .ok_or_else(|| CnxError::Internal("missing sent call channel".into()))?;
-            let correlation = state
-                .sent_correlation
-                .ok_or_else(|| CnxError::Internal("missing sent correlation".into()))?;
-            let recv_count = state
-                .recv_counts_by_channel
-                .entry(request.channel_key.0.clone())
-                .or_default();
-            let current_recv = *recv_count;
-            *recv_count += 1;
-            let proxy_reply_channel = format!("{}:reply", self.proxy_call_channel);
-            let internal_reply_channel = format!("{}:reply", self.internal_call_channel);
-            if request.channel_key.0 == proxy_reply_channel
-                && sent_call_channel == self.proxy_call_channel
-            {
-                match current_recv {
-                    0 => (Duration::ZERO, ReplyKind::Empty, correlation),
-                    1 => (
-                        MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE + Duration::from_millis(150),
-                        ReplyKind::Real,
-                        correlation,
-                    ),
-                    _ => return Err(CnxError::Timeout),
+        let (delay, reply_kind, correlation) = loop {
+            let notified = self.changed.notified();
+            let should_wait = {
+                let mut state = self.state.lock().expect("route race state lock");
+                if let Some(sent_call_channel) = state.sent_call_channel.clone() {
+                    let correlation = state
+                        .sent_correlation
+                        .ok_or_else(|| CnxError::Internal("missing sent correlation".into()))?;
+                    let recv_count = state
+                        .recv_counts_by_channel
+                        .entry(request.channel_key.0.clone())
+                        .or_default();
+                    let current_recv = *recv_count;
+                    *recv_count += 1;
+                    let proxy_reply_channel = format!("{}:reply", self.proxy_call_channel);
+                    let internal_reply_channel = format!("{}:reply", self.internal_call_channel);
+                    if request.channel_key.0 == proxy_reply_channel
+                        && sent_call_channel == self.proxy_call_channel
+                    {
+                        break match current_recv {
+                            0 => (Duration::ZERO, ReplyKind::Empty, correlation),
+                            1 => (
+                                MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE + Duration::from_millis(150),
+                                ReplyKind::Real,
+                                correlation,
+                            ),
+                            _ => return Err(CnxError::Timeout),
+                        };
+                    } else if request.channel_key.0 == internal_reply_channel
+                        && sent_call_channel == self.internal_call_channel
+                    {
+                        break match current_recv {
+                            0 => (Duration::from_millis(50), ReplyKind::Real, correlation),
+                            _ => return Err(CnxError::Timeout),
+                        };
+                    } else {
+                        return Err(CnxError::Timeout);
+                    }
+                } else {
+                    true
                 }
-            } else if request.channel_key.0 == internal_reply_channel
-                && sent_call_channel == self.internal_call_channel
-            {
-                match current_recv {
-                    0 => (Duration::from_millis(50), ReplyKind::Real, correlation),
-                    _ => return Err(CnxError::Timeout),
-                }
-            } else {
-                return Err(CnxError::Timeout);
+            };
+            if should_wait {
+                notified.await;
             }
         };
 
@@ -2537,6 +2639,7 @@ impl ChannelIoSubset for ForceFindProtocolRetryThenReplyBoundary {
             .lock()
             .expect("force-find retry boundary send batches lock");
         *send_batches.entry(request.channel_key.0).or_default() += 1;
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -2545,31 +2648,53 @@ impl ChannelIoSubset for ForceFindProtocolRetryThenReplyBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        if let Some(result) = self.source_status.try_recv(&request) {
+        if let Some(result) = self.source_status.recv(&request).await {
             return result;
         }
-        let mut recv_batches = self
-            .recv_batches_by_channel
-            .lock()
-            .expect("force-find retry boundary recv batches lock");
-        *recv_batches
-            .entry(request.channel_key.0.clone())
-            .or_default() += 1;
-        drop(recv_batches);
+        {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("force-find retry boundary recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+        }
 
         if !request.channel_key.0.ends_with(":reply") {
             return Err(CnxError::Timeout);
         }
         let request_channel = request.channel_key.0.trim_end_matches(":reply");
-        let send_count = self.total_send_batch_count();
-        if send_count < 2 {
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("force-find retry boundary correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
+        let reply_batch = next_test_reply_batch_for_channel(
+            &self.reply_batches_sent_by_channel,
+            request_channel,
+            "force-find retry boundary reply batches lock",
+        );
+        wait_for_test_channel_send_count(
+            &self.send_batches_by_channel,
+            &self.changed,
+            request_channel,
+            reply_batch,
+            "force-find retry boundary send batches lock",
+        )
+        .await;
+        if self
+            .source_reply_sent
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(CnxError::Timeout);
+        }
+        let correlation = wait_for_test_correlation(
+            &self.correlations_by_channel,
+            &self.changed,
+            request_channel,
+            "force-find retry boundary correlations lock",
+        )
+        .await?;
+        if !self
+            .retry_gap_sent
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             return Ok(vec![mk_event_with_correlation(
                 "node-a::routed",
                 correlation + 100,
@@ -2582,13 +2707,6 @@ impl ChannelIoSubset for ForceFindProtocolRetryThenReplyBoundary {
         {
             return Err(CnxError::Timeout);
         }
-        let correlation = self
-            .correlations_by_channel
-            .lock()
-            .expect("force-find retry boundary correlations lock")
-            .get(request_channel)
-            .copied()
-            .unwrap_or(1);
         Ok(vec![mk_event_with_correlation(
             "node-a::nfs1",
             correlation,
@@ -2622,6 +2740,7 @@ impl ChannelIoSubset for ForceFindGroupMissingThenReplyBoundary {
             .lock()
             .expect("force-find group-missing boundary send batches lock");
         *send_batches.entry(request.channel_key.0).or_default() += 1;
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -2630,31 +2749,53 @@ impl ChannelIoSubset for ForceFindGroupMissingThenReplyBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        if let Some(result) = self.source_status.try_recv(&request) {
+        if let Some(result) = self.source_status.recv(&request).await {
             return result;
         }
-        let mut recv_batches = self
-            .recv_batches_by_channel
-            .lock()
-            .expect("force-find group-missing boundary recv batches lock");
-        *recv_batches
-            .entry(request.channel_key.0.clone())
-            .or_default() += 1;
-        drop(recv_batches);
+        {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("force-find group-missing boundary recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+        }
 
         if !request.channel_key.0.ends_with(":reply") {
             return Err(CnxError::Timeout);
         }
         let request_channel = request.channel_key.0.trim_end_matches(":reply");
-        let send_count = self.total_send_batch_count();
-        if send_count < 2 {
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("force-find group-missing boundary correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
+        let reply_batch = next_test_reply_batch_for_channel(
+            &self.reply_batches_sent_by_channel,
+            request_channel,
+            "force-find group-missing boundary reply batches lock",
+        );
+        wait_for_test_channel_send_count(
+            &self.send_batches_by_channel,
+            &self.changed,
+            request_channel,
+            reply_batch,
+            "force-find group-missing boundary send batches lock",
+        )
+        .await;
+        if self
+            .source_reply_sent
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(CnxError::Timeout);
+        }
+        let correlation = wait_for_test_correlation(
+            &self.correlations_by_channel,
+            &self.changed,
+            request_channel,
+            "force-find group-missing boundary correlations lock",
+        )
+        .await?;
+        if !self
+            .selected_group_gap_sent
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             return Ok(vec![mk_event_with_correlation(
                 "nfs1",
                 correlation,
@@ -2667,13 +2808,6 @@ impl ChannelIoSubset for ForceFindGroupMissingThenReplyBoundary {
         {
             return Err(CnxError::Timeout);
         }
-        let correlation = self
-            .correlations_by_channel
-            .lock()
-            .expect("force-find group-missing boundary correlations lock")
-            .get(request_channel)
-            .copied()
-            .unwrap_or(1);
         Ok(vec![mk_event_with_correlation(
             "node-b::nfs1",
             correlation,
@@ -2706,6 +2840,7 @@ impl ChannelIoSubset for ForceFindHostUnavailableThenNextRunnerBoundary {
             .lock()
             .expect("force-find host-unavailable boundary send batches lock");
         *send_batches.entry(request.channel_key.0).or_default() += 1;
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -2714,29 +2849,30 @@ impl ChannelIoSubset for ForceFindHostUnavailableThenNextRunnerBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        if let Some(result) = self.source_status.try_recv(&request) {
+        if let Some(result) = self.source_status.recv(&request).await {
             return result;
         }
-        let mut recv_batches = self
-            .recv_batches_by_channel
-            .lock()
-            .expect("force-find host-unavailable boundary recv batches lock");
-        *recv_batches
-            .entry(request.channel_key.0.clone())
-            .or_default() += 1;
-        drop(recv_batches);
+        {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("force-find host-unavailable boundary recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+        }
 
         if !request.channel_key.0.ends_with(":reply") {
             return Err(CnxError::Timeout);
         }
         let request_channel = request.channel_key.0.trim_end_matches(":reply");
-        let correlation = self
-            .correlations_by_channel
-            .lock()
-            .expect("force-find host-unavailable boundary correlations lock")
-            .get(request_channel)
-            .copied()
-            .unwrap_or(1);
+        let correlation = wait_for_test_correlation(
+            &self.correlations_by_channel,
+            &self.changed,
+            request_channel,
+            "force-find host-unavailable boundary correlations lock",
+        )
+        .await?;
 
         if request.channel_key.0 == self.node_a_reply_channel {
             return Ok(vec![mk_event_with_correlation(
@@ -2801,6 +2937,7 @@ impl ChannelIoSubset for ForceFindSingleCandidateGroupMissingThenFallbackBoundar
                 .expect("force-find single-candidate boundary second send lock") =
                 Some(std::time::Instant::now());
         }
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -2809,36 +2946,58 @@ impl ChannelIoSubset for ForceFindSingleCandidateGroupMissingThenFallbackBoundar
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        if let Some(result) = self.source_status.try_recv(&request) {
+        if let Some(result) = self.source_status.recv(&request).await {
             return result;
         }
-        let mut recv_batches = self
-            .recv_batches_by_channel
-            .lock()
-            .expect("force-find single-candidate boundary recv batches lock");
-        *recv_batches
-            .entry(request.channel_key.0.clone())
-            .or_default() += 1;
-        drop(recv_batches);
+        {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("force-find single-candidate boundary recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+        }
 
         if !request.channel_key.0.ends_with(":reply") {
             return Err(CnxError::Timeout);
         }
         let request_channel = request.channel_key.0.trim_end_matches(":reply");
-        let send_count = self.total_send_batch_count();
-        if send_count < 2 {
+        let reply_batch = next_test_reply_batch_for_channel(
+            &self.reply_batches_sent_by_channel,
+            request_channel,
+            "force-find single-candidate boundary reply batches lock",
+        );
+        wait_for_test_channel_send_count(
+            &self.send_batches_by_channel,
+            &self.changed,
+            request_channel,
+            reply_batch,
+            "force-find single-candidate boundary send batches lock",
+        )
+        .await;
+        if self
+            .source_reply_sent
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(CnxError::Timeout);
+        }
+        let correlation = wait_for_test_correlation(
+            &self.correlations_by_channel,
+            &self.changed,
+            request_channel,
+            "force-find single-candidate boundary correlations lock",
+        )
+        .await?;
+        if !self
+            .selected_group_gap_sent
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             *self
                 .first_retryable_gap_at
                 .lock()
                 .expect("force-find single-candidate boundary first gap lock") =
                 Some(std::time::Instant::now());
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("force-find single-candidate boundary correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
             return Ok(vec![mk_event_with_correlation(
                 "nfs2",
                 correlation,
@@ -2851,13 +3010,6 @@ impl ChannelIoSubset for ForceFindSingleCandidateGroupMissingThenFallbackBoundar
                 "force-find selected_group matched no group: nfs2".to_string(),
             ));
         }
-        let correlation = self
-            .correlations_by_channel
-            .lock()
-            .expect("force-find single-candidate boundary correlations lock")
-            .get(request_channel)
-            .copied()
-            .unwrap_or(1);
         if self
             .source_reply_sent
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -2896,6 +3048,7 @@ impl ChannelIoSubset for ForceFindSelectedGroupFallbackCollectBoundary {
             .lock()
             .expect("force-find selected-group fallback collect send batches lock");
         *send_batches.entry(request.channel_key.0).or_default() += 1;
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -2904,27 +3057,28 @@ impl ChannelIoSubset for ForceFindSelectedGroupFallbackCollectBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        if let Some(result) = self.source_status.try_recv(&request) {
+        if let Some(result) = self.source_status.recv(&request).await {
             return result;
         }
-        let mut recv_batches = self
-            .recv_batches_by_channel
-            .lock()
-            .expect("force-find selected-group fallback collect recv batches lock");
-        *recv_batches
-            .entry(request.channel_key.0.clone())
-            .or_default() += 1;
-        drop(recv_batches);
+        {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("force-find selected-group fallback collect recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+        }
 
         if request.channel_key.0 == self.selected_reply_channel {
             let request_channel = request.channel_key.0.trim_end_matches(":reply");
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("force-find selected-group fallback collect correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
+            let correlation = wait_for_test_correlation(
+                &self.correlations_by_channel,
+                &self.changed,
+                request_channel,
+                "force-find selected-group fallback collect correlations lock",
+            )
+            .await?;
             return Ok(vec![mk_event_with_correlation(
                 "nfs1",
                 correlation,
@@ -2934,13 +3088,13 @@ impl ChannelIoSubset for ForceFindSelectedGroupFallbackCollectBoundary {
 
         if request.channel_key.0 == self.generic_reply_channel {
             let request_channel = request.channel_key.0.trim_end_matches(":reply");
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("force-find selected-group fallback collect correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
+            let correlation = wait_for_test_correlation(
+                &self.correlations_by_channel,
+                &self.changed,
+                request_channel,
+                "force-find selected-group fallback collect correlations lock",
+            )
+            .await?;
             let count = self
                 .generic_reply_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2988,6 +3142,7 @@ impl ChannelIoSubset for ForceFindSelectedRouteTimeoutThenFallbackBudgetBoundary
             .lock()
             .expect("force-find selected-route-timeout boundary send batches lock");
         *send_batches.entry(request.channel_key.0).or_default() += 1;
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -2996,7 +3151,7 @@ impl ChannelIoSubset for ForceFindSelectedRouteTimeoutThenFallbackBudgetBoundary
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        if let Some(result) = self.source_status.try_recv(&request) {
+        if let Some(result) = self.source_status.recv(&request).await {
             return result;
         }
         {
@@ -3010,6 +3165,14 @@ impl ChannelIoSubset for ForceFindSelectedRouteTimeoutThenFallbackBudgetBoundary
         }
 
         if request.channel_key.0 == self.selected_reply_channel {
+            let request_channel = request.channel_key.0.trim_end_matches(":reply");
+            let _ = wait_for_test_correlation(
+                &self.correlations_by_channel,
+                &self.changed,
+                request_channel,
+                "force-find selected-route-timeout boundary correlations lock",
+            )
+            .await?;
             tokio::time::sleep(Duration::from_secs(2)).await;
             return Err(CnxError::Timeout);
         }
@@ -3022,13 +3185,13 @@ impl ChannelIoSubset for ForceFindSelectedRouteTimeoutThenFallbackBudgetBoundary
                 return Err(CnxError::Timeout);
             }
             let request_channel = request.channel_key.0.trim_end_matches(":reply");
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("force-find selected-route-timeout boundary correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
+            let correlation = wait_for_test_correlation(
+                &self.correlations_by_channel,
+                &self.changed,
+                request_channel,
+                "force-find selected-route-timeout boundary correlations lock",
+            )
+            .await?;
             return Ok(vec![mk_event_with_correlation(
                 "node-b::nfs1",
                 correlation,
@@ -3062,6 +3225,7 @@ impl ChannelIoSubset for ForceFindRunnerBindingStatusBoundary {
             .lock()
             .expect("force-find runner binding boundary send batches lock");
         *send_batches.entry(request.channel_key.0).or_default() += 1;
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -3070,19 +3234,27 @@ impl ChannelIoSubset for ForceFindRunnerBindingStatusBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        let mut recv_batches = self
-            .recv_batches_by_channel
-            .lock()
-            .expect("force-find runner binding boundary recv batches lock");
-        *recv_batches
-            .entry(request.channel_key.0.clone())
-            .or_default() += 1;
-        drop(recv_batches);
+        {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("force-find runner binding boundary recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+        }
 
         if request.channel_key.0 != self.source_reply_channel {
             return Err(CnxError::Timeout);
         }
         let request_channel = self.source_reply_channel.trim_end_matches(":reply");
+        let correlation = wait_for_test_correlation(
+            &self.correlations_by_channel,
+            &self.changed,
+            request_channel,
+            "force-find runner binding boundary correlations lock",
+        )
+        .await?;
         let send_count = self
             .send_batches_by_channel
             .lock()
@@ -3098,13 +3270,6 @@ impl ChannelIoSubset for ForceFindRunnerBindingStatusBoundary {
         }
         self.delivered_send_count
             .store(send_count, std::sync::atomic::Ordering::SeqCst);
-        let correlation = self
-            .correlations_by_channel
-            .lock()
-            .expect("force-find runner binding boundary correlations lock")
-            .get(request_channel)
-            .copied()
-            .unwrap_or(1);
         Ok(vec![mk_event_with_correlation(
             "source-status",
             correlation,
@@ -3218,6 +3383,7 @@ impl ChannelIoSubset for ForceFindDelayedRunnerBindingBoundary {
             .lock()
             .expect("delayed runner binding boundary send batches lock");
         *send_batches.entry(request.channel_key.0).or_default() += 1;
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -3226,17 +3392,25 @@ impl ChannelIoSubset for ForceFindDelayedRunnerBindingBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        let mut recv_batches = self
-            .recv_batches_by_channel
-            .lock()
-            .expect("delayed runner binding boundary recv batches lock");
-        *recv_batches
-            .entry(request.channel_key.0.clone())
-            .or_default() += 1;
-        drop(recv_batches);
+        {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("delayed runner binding boundary recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+        }
 
         if request.channel_key.0 == self.source_status_reply_channel {
             let request_channel = self.source_status_reply_channel.trim_end_matches(":reply");
+            let correlation = wait_for_test_correlation(
+                &self.correlations_by_channel,
+                &self.changed,
+                request_channel,
+                "delayed runner binding boundary correlations lock",
+            )
+            .await?;
             let send_count = self
                 .send_batches_by_channel
                 .lock()
@@ -3258,13 +3432,6 @@ impl ChannelIoSubset for ForceFindDelayedRunnerBindingBoundary {
                 .expect("delayed runner binding boundary payload lock")
                 .pop_front()
                 .ok_or_else(|| CnxError::Timeout)?;
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("delayed runner binding boundary correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
             return Ok(vec![mk_event_with_correlation(
                 "source-status",
                 correlation,
@@ -3282,13 +3449,13 @@ impl ChannelIoSubset for ForceFindDelayedRunnerBindingBoundary {
             return Err(CnxError::Timeout);
         }
         let request_channel = request.channel_key.0.trim_end_matches(":reply");
-        let correlation = self
-            .correlations_by_channel
-            .lock()
-            .expect("delayed runner binding boundary correlations lock")
-            .get(request_channel)
-            .copied()
-            .unwrap_or(1);
+        let correlation = wait_for_test_correlation(
+            &self.correlations_by_channel,
+            &self.changed,
+            request_channel,
+            "delayed runner binding boundary correlations lock",
+        )
+        .await?;
         Ok(vec![mk_event_with_correlation(
             "node-a::nfs1",
             correlation,

@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,9 @@ const DEV_ADMIN_SIGNING_KEY_B64: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
 const E2E_TMP_ROOT_ENV: &str = "DATANIX_E2E_TMP_ROOT";
 const LEGACY_E2E_TMP_ROOT_ENV: &str = "CAPANIX_E2E_TMP_ROOT";
 const CLUSTER_ARTIFACT_COMPONENT: &str = "cluster5";
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
+const LONGEST_CLUSTER_NODE_DIR_COMPONENT: &str =
+    "dx-clustern-ffffffffffffffffffffffffffffffff-ffffffffffffffff";
 const FULL_NODE_DELEGATION_SCOPES: &[&str] = &[
     "cluster_read",
     "metrics_read",
@@ -1016,9 +1020,38 @@ fn e2e_tmp_root() -> PathBuf {
 }
 
 fn cluster_artifact_root() -> PathBuf {
-    let dir = e2e_tmp_root().join(CLUSTER_ARTIFACT_COMPONENT);
+    let e2e_root = e2e_tmp_root();
+    let configured = e2e_root.join(CLUSTER_ARTIFACT_COMPONENT);
+    let dir = if cluster_artifact_root_keeps_core_socket_path_safe(&configured) {
+        configured
+    } else {
+        short_cluster_artifact_root(&e2e_root)
+    };
     fs::create_dir_all(&dir).expect("create cluster artifact root");
     dir
+}
+
+fn cluster_artifact_root_keeps_core_socket_path_safe(root: &Path) -> bool {
+    root.join(LONGEST_CLUSTER_NODE_DIR_COMPONENT)
+        .join("core.sock")
+        .as_os_str()
+        .as_bytes()
+        .len()
+        <= UNIX_SOCKET_PATH_MAX_BYTES
+}
+
+fn short_cluster_artifact_root(e2e_root: &Path) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(e2e_root.as_os_str().as_bytes());
+    let digest = hasher.finalize();
+    let mut suffix = String::new();
+    for byte in digest.iter().take(8) {
+        suffix.push_str(&format!("{byte:02x}"));
+    }
+    std::env::temp_dir()
+        .join("fsm-e2e")
+        .join(suffix)
+        .join(CLUSTER_ARTIFACT_COMPONENT)
 }
 
 fn cleanup_stale_cluster_artifacts_before_start() -> Result<(), String> {
@@ -3060,6 +3093,34 @@ mod tests {
             let dir = tmp_dir("cluster-node");
             assert!(dir.starts_with(root.path().join(CLUSTER_ARTIFACT_COMPONENT)));
         });
+    }
+
+    #[test]
+    fn tmp_dir_uses_short_cluster_artifact_root_when_socket_path_would_exceed_unix_limit() {
+        let _lock = env_lock();
+        let root = tempfile::tempdir().expect("e2e temp root");
+        let long_root = root
+            .path()
+            .join("fsmeta-l4-full-after-rootdecl-20260516072054")
+            .join("artifacts");
+        fs::create_dir_all(&long_root).expect("create long e2e root");
+        let previous = std::env::var(E2E_TMP_ROOT_ENV).ok();
+        std::env::set_var(E2E_TMP_ROOT_ENV, &long_root);
+
+        let dir = tmp_dir("cluster-node");
+
+        match previous {
+            Some(value) => std::env::set_var(E2E_TMP_ROOT_ENV, value),
+            None => std::env::remove_var(E2E_TMP_ROOT_ENV),
+        }
+        assert!(
+            !dir.starts_with(long_root.join(CLUSTER_ARTIFACT_COMPONENT)),
+            "cluster node home must leave an overlong configured artifact root before it becomes an invalid Unix socket path"
+        );
+        assert!(
+            dir.join("core.sock").as_os_str().as_bytes().len() <= UNIX_SOCKET_PATH_MAX_BYTES,
+            "cluster node home path must keep core.sock bindable"
+        );
     }
 
     #[test]

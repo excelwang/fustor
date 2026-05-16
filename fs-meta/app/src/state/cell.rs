@@ -579,7 +579,7 @@ impl HostObjectGrantsCell {
                             ),
                         ));
                     }
-                    if decoded.grants != initial_grants {
+                    if decoded.grants != initial_grants && !initial_grants.is_empty() {
                         let snapshot = HostObjectGrantsSnapshot {
                             scope: scope.to_string(),
                             version: decoded.version.saturating_add(1),
@@ -1042,6 +1042,28 @@ mod tests {
         let (version, grants) = reopened.snapshot();
         assert_eq!(version, 1);
         assert_eq!(grants, new_grants);
+    }
+
+    #[test]
+    fn host_object_grants_statecell_preserves_runtime_grants_when_reopened_with_empty_bootstrap() {
+        let boundary = in_memory_state_boundary();
+        let runtime_grants = vec![granted_root("node-b::nfs1", "/mnt/node-b/nfs1")];
+        let cell = HostObjectGrantsCell::from_state_boundary(
+            "runtime.exec.source",
+            Vec::new(),
+            boundary.clone(),
+        )
+        .expect("seed empty grants");
+        crate::runtime_app::block_on_shared_runtime(cell.replace(7, runtime_grants.clone()))
+            .expect("publish runtime grants");
+
+        let reopened =
+            HostObjectGrantsCell::from_state_boundary("runtime.exec.source", Vec::new(), boundary)
+                .expect("reload runtime grants");
+
+        let (version, grants) = reopened.snapshot();
+        assert_eq!(version, 7);
+        assert_eq!(grants, runtime_grants);
     }
 
     #[test]

@@ -50,6 +50,21 @@ struct NoopBoundary;
 #[async_trait::async_trait]
 impl ChannelIoSubset for NoopBoundary {}
 
+struct FatalRecvBoundary;
+
+#[async_trait::async_trait]
+impl ChannelIoSubset for FatalRecvBoundary {
+    async fn channel_recv(
+        &self,
+        _ctx: BoundaryContext,
+        _request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+    ) -> Result<Vec<Event>> {
+        Err(CnxError::InvalidInput(
+            "test boundary closes endpoint deterministically".to_string(),
+        ))
+    }
+}
+
 #[derive(Default)]
 struct RouteCountingTimeoutBoundary {
     recv_counts: std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
@@ -359,9 +374,8 @@ fn build_source(initial_grants: Vec<GrantedMountRoot>) -> FSMetaSource {
 
 fn finished_endpoint_task_for_test(route_key: &str) -> ManagedEndpointTask {
     let shutdown = CancellationToken::new();
-    shutdown.cancel();
     let task = ManagedEndpointTask::spawn(
-        Arc::new(NoopBoundary),
+        Arc::new(FatalRecvBoundary),
         capanix_app_sdk::runtime::RouteKey(route_key.to_string()),
         format!("test-finished-{route_key}"),
         shutdown,
@@ -621,7 +635,7 @@ async fn start_runtime_endpoints_restarts_after_finished_endpoint_task() {
     ));
 
     source
-        .start_runtime_endpoints(Arc::new(NoopBoundary))
+        .start_runtime_endpoints(Arc::new(RouteCountingTimeoutBoundary::default()))
         .await
         .expect("start runtime endpoints");
 
@@ -1517,7 +1531,7 @@ async fn source_status_manual_rescan_probe_returns_receivable_ready_evidence() {
     assert!(
         signals.iter().any(|signal| signal
             == &format!(
-                "ready unit=runtime.exec.source route={scoped_rescan_route} generation=1777506000456"
+                "ready unit=runtime.exec.source route={scoped_rescan_route} generation=1777506000456 scopes=[\"nfs1=>nfs1\"]"
             )),
         "manual-rescan source-status reply must carry current scoped route-ready proof after successful rearm: {signals:?}"
     );
@@ -1599,7 +1613,7 @@ async fn source_status_manual_rescan_probe_withholds_ready_without_local_scan_ro
         !signals.iter().any(|signal| {
             signal
                 == &format!(
-                    "ready unit=runtime.exec.source route={scoped_rescan_route} generation=1777506000457"
+                    "ready unit=runtime.exec.source route={scoped_rescan_route} generation=1777506000457 scopes=[\"nfs1=>nfs1\"]"
                 )
         }),
         "manual-rescan source-status must not publish route-ready proof when the node has no local scan root: {signals:?}"
@@ -1716,7 +1730,7 @@ async fn manual_rescan_source_status_rearm_records_source_owned_receivable_evide
     assert!(
         signals.iter().any(|signal| signal
             == &format!(
-                "ready unit=runtime.exec.source route={scoped_rescan_route} generation=1777506000123"
+                "ready unit=runtime.exec.source route={scoped_rescan_route} generation=1777506000123 scopes=[\"nfs1=>nfs1\"]"
             )),
         "manual-rescan route-ready proof must come from source rearm, not from API/status response synthesis: {signals:?}"
     );
@@ -1789,7 +1803,7 @@ async fn manual_rescan_source_status_rearm_replaces_unproven_scoped_rescan_endpo
     assert!(
         signals.iter().any(|signal| signal
             == &format!(
-                "ready unit=runtime.exec.source route={scoped_rescan_route} generation=1777506000456"
+                "ready unit=runtime.exec.source route={scoped_rescan_route} generation=1777506000456 scopes=[\"nfs1=>nfs1\"]"
             )),
         "source must record ready only after current receive-armed proof: {signals:?}"
     );
@@ -3998,7 +4012,6 @@ async fn manual_rescan_publishes_baseline_for_each_split_primary_under_mixed_clu
     let expected_primaries = std::collections::BTreeMap::from([
         ("nfs1".to_string(), format!("{node_a_id}::nfs1")),
         ("nfs2".to_string(), format!("{node_a_id}::nfs2")),
-        ("nfs3".to_string(), format!("{node_b_id}::nfs3")),
     ]);
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -4998,6 +5011,130 @@ fn source_primary_snapshot_reports_cluster_primary_assignment() {
         snapshot.get("nfs1").map(String::as_str),
         Some("node-a::exp1"),
         "snapshot must report authoritative cluster primary, not local-only primary state"
+    );
+}
+
+#[test]
+fn targeted_rescan_rejects_local_scan_root_when_not_group_primary() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![
+        test_export("node-a::exp1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        test_export("node-z::exp2", "node-z", "10.0.0.12", "/mnt/nfs1", true),
+    ];
+    let source = FSMetaSource::with_boundaries(cfg, NodeId("node-z".to_string()), None)
+        .expect("init source");
+    let local_root = lock_or_recover(
+        &source.state_cell.roots,
+        "test.targeted_rescan_non_primary.roots",
+    )
+    .clone()
+    .into_iter()
+    .next()
+    .expect("local non-primary root exists");
+    assert!(
+        !local_root.is_group_primary,
+        "fixture must place only a non-primary local source member on node-z"
+    );
+    assert!(
+        local_root.spec.scan,
+        "fixture must keep local scan root enabled"
+    );
+    let mut local_rx = local_root.rescan_tx.subscribe();
+
+    let err = source
+        .submit_targeted_rescan_request_epoch_with_failure()
+        .expect_err("targeted rescan must reject non-primary local scan roots");
+    assert!(
+        err.to_string().contains("source-primary required"),
+        "targeted rescan should explain that source-primary ownership is required: {err}"
+    );
+    assert!(matches!(
+        local_rx.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn runtime_scan_owner_becomes_source_primary_when_static_grant_primary_is_elsewhere() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+    cfg.host_object_grants = vec![
+        test_export("node-a::exp1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        test_export("node-b::exp1", "node-b", "10.0.0.12", "/mnt/nfs1", true),
+    ];
+    let source = FSMetaSource::with_boundaries(
+        cfg,
+        NodeId("node-b-123".to_string()),
+        Some(Arc::new(NoopBoundary)),
+    )
+    .expect("init runtime-managed source");
+
+    let control = vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: METHOD_SOURCE_ROOTS_CONTROL.to_string(),
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: "nfs1".to_string(),
+                resource_ids: vec!["nfs1".to_string()],
+            }],
+        }))
+        .expect("encode source activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: METHOD_SOURCE_RESCAN.to_string(),
+            unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: "nfs1".to_string(),
+                resource_ids: vec!["nfs1".to_string()],
+            }],
+        }))
+        .expect("encode scan activate"),
+    ];
+    source
+        .on_control_frame(&control)
+        .await
+        .expect("apply runtime source/scan control");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let local_roots = loop {
+        let local_roots = lock_or_recover(
+            &source.state_cell.roots,
+            "test.runtime_scan_owner_primary.local_roots",
+        )
+        .clone();
+        if local_roots.iter().any(|root| root.is_group_primary) {
+            break local_roots;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "runtime source-primary did not converge: {:?}",
+            local_roots
+                .iter()
+                .map(|root| (
+                    root.logical_root_id.clone(),
+                    root.object_ref.clone(),
+                    root.is_group_primary,
+                    root.spec.scan,
+                ))
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(local_roots.len(), 1);
+    assert_eq!(local_roots[0].object_ref, "node-b::exp1");
+    assert!(
+        local_roots[0].is_group_primary,
+        "runtime scan owner must become the app source-primary even when the static grant primary is node-a"
+    );
+    assert_eq!(
+        source.source_primary_by_group_snapshot(),
+        BTreeMap::from([("nfs1".to_string(), "node-b::exp1".to_string())])
     );
 }
 

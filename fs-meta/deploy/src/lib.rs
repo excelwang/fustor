@@ -936,7 +936,7 @@ fn root_spec_app_scope_json(root: &RootSpec) -> serde_json::Value {
         unit_scopes.push(serde_json::json!({
             "unit_id": "runtime.exec.scan",
             "eligibility": "scope_members",
-            "cardinality": "all"
+            "cardinality": "one"
         }));
     }
     serde_json::json!({
@@ -979,6 +979,29 @@ mod tests {
         assert_eq!(
             query_peer.get("cardinality"),
             Some(&serde_json::json!("all"))
+        );
+    }
+
+    #[test]
+    fn watched_roots_bind_one_scan_owner_for_source_primary_authority() {
+        let scope = root_spec_app_scope_json(&RootSpec::new("nfs1", "/mnt/nfs1"));
+        let unit_scopes = scope
+            .get("unit_scopes")
+            .and_then(serde_json::Value::as_array)
+            .expect("unit_scopes array");
+        let scan = unit_scopes
+            .iter()
+            .find(|entry| entry.get("unit_id") == Some(&serde_json::json!("runtime.exec.scan")))
+            .expect("scan unit scope");
+        assert_eq!(
+            scan.get("eligibility"),
+            Some(&serde_json::json!("scope_members")),
+            "scan owner should still be selected from source group members"
+        );
+        assert_eq!(
+            scan.get("cardinality"),
+            Some(&serde_json::json!("one")),
+            "baseline/audit authority must have one source-primary scan owner per group"
         );
     }
 

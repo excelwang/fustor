@@ -81,7 +81,6 @@ struct UpgradeHarness {
     app_id: String,
     facade_resource_id: String,
     roots: Vec<RootSpec>,
-    uses_full_demo_roots: bool,
 }
 
 fn l5_progress(mode: UpgradeMode, step: &str, state: &str) {
@@ -281,12 +280,8 @@ fn build_upgrade_harness(
                 root_spec("nfs2", &lab.export_source("nfs2")),
             ]
         });
-    let uses_full_demo_roots = full_demo_roots.is_some();
-    let mut release_v1 =
+    let release_v1 =
         cluster.build_fs_meta_release(&app_id, &facade_resource_id, roots.clone(), 1, true)?;
-    if uses_full_demo_roots {
-        full_demo_roots::apply_bounded_audit_config(&mut release_v1)?;
-    }
     l5_progress(mode, "01.06.apply-generation-one", "begin");
     cluster.apply_release("node-a", release_v1)?;
     l5_progress(mode, "01.06.apply-generation-one", "ok");
@@ -315,22 +310,17 @@ fn build_upgrade_harness(
         app_id,
         facade_resource_id,
         roots,
-        uses_full_demo_roots,
     })
 }
 
 fn build_generation_two_release(harness: &UpgradeHarness) -> Result<Value, String> {
-    let mut release = harness.cluster.build_fs_meta_release(
+    harness.cluster.build_fs_meta_release(
         &harness.app_id,
         &harness.facade_resource_id,
         harness.roots.clone(),
         2,
         true,
-    )?;
-    if harness.uses_full_demo_roots {
-        full_demo_roots::apply_bounded_audit_config(&mut release)?;
-    }
-    Ok(release)
+    )
 }
 
 fn node_stderr_tail(

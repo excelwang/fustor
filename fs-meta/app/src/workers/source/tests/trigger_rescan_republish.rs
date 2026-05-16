@@ -2336,7 +2336,6 @@ macro_rules! define_trigger_rescan_republish_tests {
         let expected_primaries = std::collections::BTreeMap::from([
             ("nfs1".to_string(), format!("{node_a_id}::nfs1")),
             ("nfs2".to_string(), format!("{node_a_id}::nfs2")),
-            ("nfs3".to_string(), format!("{node_b_id}::nfs3")),
         ]);
         let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {

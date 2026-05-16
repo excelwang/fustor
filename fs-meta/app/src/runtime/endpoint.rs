@@ -432,6 +432,10 @@ impl EndpointReceiveState {
         self.inflight_recv_count.load(Ordering::Acquire) > 0
             && self.receivable_observation_count.load(Ordering::Acquire) > 0
     }
+
+    fn is_receive_polling(&self) -> bool {
+        self.inflight_recv_count.load(Ordering::Acquire) > 0
+    }
 }
 
 struct EndpointReceiveGuard {
@@ -449,6 +453,7 @@ impl Drop for EndpointReceiveGuard {
 pub(crate) struct ManagedEndpointTask {
     name: String,
     route_key: String,
+    route_generation: Option<u64>,
     boundary_id: usize,
     unit_ids: Vec<String>,
     shutdown: CancellationToken,
@@ -744,7 +749,7 @@ impl ManagedEndpointTask {
         )
     }
 
-    pub(crate) fn spawn_with_unit_wait_receivable_without_ready_wait<F, Fut>(
+    pub(crate) fn spawn_with_unit_wait_receive_poll<F, Fut>(
         boundary: Arc<dyn ChannelIoSubset>,
         route: RouteKey,
         name: impl Into<String>,
@@ -756,15 +761,14 @@ impl ManagedEndpointTask {
         F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
     {
-        Self::spawn_with_contexts_and_ready_mode(
+        Self::spawn_with_context(
             boundary,
             route,
             name,
-            vec![BoundaryContext::for_unit(unit_id)],
+            BoundaryContext::for_unit(unit_id),
             shutdown,
             handler,
-            EndpointReadyMode::FirstReceivable,
-            EndpointStartWait::Detached,
+            EndpointStartWait::UntilReady,
         )
     }
 
@@ -862,6 +866,7 @@ impl ManagedEndpointTask {
         Self {
             name: name_owned,
             route_key,
+            route_generation: None,
             boundary_id,
             unit_ids,
             shutdown: task_shutdown,
@@ -980,6 +985,7 @@ impl ManagedEndpointTask {
         Self {
             name: name_owned,
             route_key,
+            route_generation: None,
             boundary_id,
             unit_ids: vec![unit_id],
             shutdown: task_shutdown,
@@ -991,6 +997,15 @@ impl ManagedEndpointTask {
 
     pub(crate) fn route_key(&self) -> &str {
         &self.route_key
+    }
+
+    pub(crate) fn route_generation(&self) -> Option<u64> {
+        self.route_generation
+    }
+
+    pub(crate) fn with_route_generation(mut self, route_generation: u64) -> Self {
+        self.route_generation = Some(route_generation);
+        self
     }
 
     pub(crate) fn unit_ids(&self) -> &[String] {
@@ -1014,6 +1029,10 @@ impl ManagedEndpointTask {
 
     pub(crate) fn is_receive_armed(&self) -> bool {
         self.receive_state.is_receive_armed()
+    }
+
+    pub(crate) fn is_receive_polling(&self) -> bool {
+        self.receive_state.is_receive_polling()
     }
 
     pub(crate) fn request_shutdown(&self) {
@@ -1208,7 +1227,7 @@ async fn run_endpoint_loop_with_contexts_and_ready_signal<F, Fut>(
                         mark_endpoint_receivable(&receive_state, &receivable_ready);
                         stale_recv_gap_count = 0;
                         retryable_recv_gap_count = retryable_recv_gap_count.saturating_add(1);
-                        if retryable_recv_gap_count >= REQUEST_RETRYABLE_RECV_GAP_RETRY_LIMIT {
+                        if retryable_recv_gap_count > REQUEST_RETRYABLE_RECV_GAP_RETRY_LIMIT {
                             if fatal_err.is_none() {
                                 fatal_err = Some(err);
                             }
@@ -1271,7 +1290,7 @@ async fn run_endpoint_loop_with_contexts_and_ready_signal<F, Fut>(
                             route.0,
                             err
                         );
-                        if stale_recv_gap_count >= REQUEST_RETRYABLE_RECV_GAP_RETRY_LIMIT {
+                        if stale_recv_gap_count > REQUEST_RETRYABLE_RECV_GAP_RETRY_LIMIT {
                             if fatal_err.is_none() {
                                 let reason = format!(
                                     "stale grant-attachment recv gap retry exhausted after {} attempts",
@@ -2495,6 +2514,7 @@ mod tests {
         let mut endpoint = ManagedEndpointTask {
             name: "test-endpoint".to_string(),
             route_key: "sink-status:v1.req".to_string(),
+            route_generation: None,
             boundary_id: 0,
             unit_ids: Vec::new(),
             shutdown: CancellationToken::new(),

@@ -1,10 +1,10 @@
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn selected_group_materialized_route_uses_owner_scoped_route_when_owner_is_caller_node() {
+async fn selected_group_materialized_route_short_circuits_locally_when_owner_is_caller_node() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_a_root = tmp.path().join("node-a");
     fs::create_dir_all(node_a_root.join("layout-a")).expect("create node-a dir");
     let grants = vec![GrantedMountRoot {
-        object_ref: "node-a::nfs4".to_string(),
+        object_ref: "node-a::nfs1".to_string(),
         host_ref: "node-a".to_string(),
         host_ip: "10.0.0.1".to_string(),
         host_name: None,
@@ -18,7 +18,7 @@ async fn selected_group_materialized_route_uses_owner_scoped_route_when_owner_is
         interfaces: Vec::new(),
         active: true,
     }];
-    let source = source_facade_with_group("nfs4", &grants);
+    let source = source_facade_with_group("nfs1", &grants);
     let sink = sink_facade_with_group(&grants);
     let boundary = Arc::new(ReusableObservedRouteBoundary::default());
     let node_a_route = sink_query_request_route_for("node-a");
@@ -67,8 +67,8 @@ async fn selected_group_materialized_route_uses_owner_scoped_route_when_owner_is
     let policy = ProjectionPolicy {
         member_grouping: MemberGroupingStrategy::MountPoint,
         mount_point_by_object_ref: HashMap::from([(
-            "node-a::nfs4".to_string(),
-            "nfs4".to_string(),
+            "node-a::nfs1".to_string(),
+            "nfs1".to_string(),
         )]),
         ..ProjectionPolicy::default()
     };
@@ -81,7 +81,7 @@ async fn selected_group_materialized_route_uses_owner_scoped_route_when_owner_is
             true,
             None,
             ReadClass::Materialized,
-            Some("nfs4".to_string()),
+            Some("nfs1".to_string()),
         ),
         Duration::from_secs(1),
         None,
@@ -92,24 +92,24 @@ async fn selected_group_materialized_route_uses_owner_scoped_route_when_owner_is
 
     assert!(
         result.is_ok(),
-        "route backend must use the owner-scoped sink-query route even when owner node equals caller node; owner_calls={} err={:?}",
+        "route backend must query the local sink when owner node equals caller node; owner_route_calls={} err={:?}",
         boundary.send_batch_count(&node_a_route.0),
         result.as_ref().err(),
     );
     let payload = decode_materialized_selected_group_response(
         &result.expect("same-node owner route result"),
         &policy,
-        "nfs4",
+        "nfs1",
         b"/layout-a",
     )
     .expect("decode same-node owner route response");
-    assert!(payload.root.exists);
-    assert_eq!(boundary.send_batch_count(&node_a_route.0), 1);
+    assert!(!payload.root.exists);
     assert_eq!(
-        observed_groups.lock().expect("observed groups lock").as_slice(),
-        &["nfs4".to_string()],
-        "same-node owner must be reached through its owner-scoped route rather than the API facade's local sink cache"
+        boundary.send_batch_count(&node_a_route.0),
+        0,
+        "same-node owner must short-circuit to the local sink instead of fanouting through its own owner-scoped route"
     );
+    assert!(observed_groups.lock().expect("observed groups lock").is_empty());
 
     node_a_endpoint.shutdown(Duration::from_secs(2)).await;
 }

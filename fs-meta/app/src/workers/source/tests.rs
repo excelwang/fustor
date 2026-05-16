@@ -61,27 +61,6 @@ struct LoopbackWorkerBoundary {
     changed: Notify,
 }
 
-impl LoopbackWorkerBoundary {
-    fn closed_channels_snapshot(&self) -> Vec<String> {
-        let mut channels = self
-            .closed
-            .lock()
-            .expect("loopback closed lock")
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        channels.sort();
-        channels
-    }
-
-    fn close_history_snapshot(&self) -> Vec<String> {
-        self.close_history
-            .lock()
-            .expect("loopback close history lock")
-            .clone()
-    }
-}
-
 struct SourceWorkerUpdateRootsHookReset;
 
 impl Drop for SourceWorkerUpdateRootsHookReset {
@@ -219,12 +198,19 @@ fn source_control_frame_machine_owns_reconnect_retained_tick_replay_resume_lane(
 fn source_control_frame_machine_owns_generation_one_timeout_reset_retry_lane() {
     let mut machine = source_control_frame_test_machine();
     machine.timeout_reset_policy = SourceControlFrameTimeoutResetPolicy::GenerationOneActivateWave;
-    let action = machine.action_after_error(CnxError::Timeout, SourceProgressState::default());
+    let action = machine.action_after_error(
+        CnxError::Timeout,
+        SourceProgressState::default(),
+        SourceProgressState::default(),
+    );
     let retry_action = machine
         .advance(SourceControlFrameEvent::ReconnectCompleted)
         .expect("generation-one timeout-like reset should resume with another attempt");
-    let terminal_reconnect =
-        machine.action_after_error(CnxError::ChannelClosed, SourceProgressState::default());
+    let terminal_reconnect = machine.action_after_error(
+        CnxError::ChannelClosed,
+        SourceProgressState::default(),
+        SourceProgressState::default(),
+    );
     let terminal_action = machine
         .advance(SourceControlFrameEvent::ReconnectCompleted)
         .expect("bridge-reset fail-fast reconnect should resume into a terminal action");
@@ -250,7 +236,11 @@ fn source_control_frame_machine_owns_generation_one_timeout_reset_retry_lane() {
 #[test]
 fn source_control_frame_machine_owns_retry_resume_followup_lane() {
     let mut machine = source_control_frame_test_machine();
-    let reconnect = machine.action_after_error(CnxError::Timeout, SourceProgressState::default());
+    let reconnect = machine.action_after_error(
+        CnxError::Timeout,
+        SourceProgressState::default(),
+        SourceProgressState::default(),
+    );
     let wait = machine
         .advance(SourceControlFrameEvent::ReconnectCompleted)
         .expect("retry reconnect should resume into a wait-for-progress action");
@@ -283,6 +273,7 @@ fn source_control_frame_machine_fails_fast_restart_deferred_timeout_like_reset()
     let reconnect = machine.action_after_error(
         CnxError::Internal("operation timed out".to_string()),
         SourceProgressState::default(),
+        SourceProgressState::default(),
     );
     let terminal = machine
         .advance(SourceControlFrameEvent::ReconnectCompleted)
@@ -309,6 +300,7 @@ fn source_control_frame_machine_owns_non_retryable_terminal_lane() {
             machine.action_after_error(
                 CnxError::InvalidInput("bad request".into()),
                 SourceProgressState::default(),
+                SourceProgressState::default(),
             ),
             step if matches!(
                 step.terminal_error(),
@@ -330,6 +322,7 @@ fn source_control_frame_machine_owns_unexpected_response_protocol_failure_lane()
                     rpc_result: Ok(SourceWorkerResponse::ScheduledGroupIds(Some(vec![
                         "group-a".to_string(),
                     ]))),
+                    before: SourceProgressState::default(),
                     after: SourceProgressState::default(),
                 })
                 .expect("unexpected source worker response should still map into a terminal action"),
@@ -365,6 +358,7 @@ fn source_control_frame_machine_owns_post_ack_schedule_refresh_followup_lane() {
     let post_ack = machine
         .advance(SourceControlFrameEvent::RpcCompleted {
             rpc_result: Ok(SourceWorkerResponse::Ack),
+            before: SourceProgressState::default(),
             after: SourceProgressState::default(),
         })
         .expect("ack should produce a post-ack cache side-effects action");
@@ -430,6 +424,7 @@ fn source_control_frame_machine_skips_replay_recovery_cache_priming_without_refr
     let post_ack = machine
         .advance(SourceControlFrameEvent::RpcCompleted {
             rpc_result: Ok(SourceWorkerResponse::Ack),
+            before: SourceProgressState::default(),
             after: SourceProgressState::default(),
         })
         .expect("ack without refresh followup should still produce a post-ack cache action");
@@ -454,6 +449,7 @@ fn source_control_frame_machine_routes_decode_failed_ack_refresh_without_replay_
     let refresh = machine
         .advance(SourceControlFrameEvent::RpcCompleted {
             rpc_result: Ok(SourceWorkerResponse::Ack),
+            before: SourceProgressState::default(),
             after: SourceProgressState::default(),
         })
         .expect("decode-failed ack should still route into scheduled-groups refresh");
@@ -541,6 +537,7 @@ fn source_control_frame_test_machine() -> SourceControlFrameMachine {
         primed_local_schedule: None,
         post_ack_refresh_requirement: SourceControlFramePostAckRefreshRequirement::NotRequired,
         bootstrap_disposition: SourceControlFrameBootstrapDisposition::PostInitial,
+        replay_required_for_current_wave: false,
         existing_client_present: false,
         bridge_reset_policy: SourceControlFrameBridgeResetPolicy::RetryAfterReconnect,
         timeout_reset_policy: SourceControlFrameTimeoutResetPolicy::Standard,
@@ -1610,10 +1607,10 @@ fn source_retained_replay_control_rpc_uses_single_started_attempt() {
 
     assert!(
         executor.contains("SourceControlFrameRequestAttemptKind::ControlFrame => {")
-            && executor.contains("self.with_started_retry_with_failure(|client|")
+            && executor.contains("self.with_started_once_with_failure(|client|")
             && executor.contains("SourceControlFrameRequestAttemptKind::RetainedReplay => {")
             && executor.contains("self.with_started_once_with_failure(|client|"),
-        "source retained control replay must use one started worker attempt and leave retry/reconnect policy to the source replay state machine",
+        "source control-frame attempts must use one started worker RPC attempt and leave retry/reconnect policy to the source control-frame state machines",
     );
 }
 
@@ -3307,7 +3304,7 @@ fn worker_watch_scan_root(id: &str, path: &Path) -> RootSpec {
 }
 
 #[test]
-fn prime_cached_schedule_from_control_signals_respects_watch_and_scan_flags() {
+fn prime_cached_schedule_from_control_signals_treats_source_unit_as_source_side_owner() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     let nfs2 = tmp.path().join("nfs2");
@@ -3367,13 +3364,13 @@ fn prime_cached_schedule_from_control_signals_respects_watch_and_scan_flags() {
         summary.has_local_runnable_groups,
         "scan-enabled roots should still report local runnable groups"
     );
-    assert!(
-        cache
-            .scheduled_source_groups_by_node
-            .as_ref()
-            .is_none_or(|groups| groups.is_empty()),
-        "watch-disabled roots must not prime scheduled source groups from control signals: {:?}",
-        cache.scheduled_source_groups_by_node
+    assert_eq!(
+        cache.scheduled_source_groups_by_node,
+        Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )])),
+        "source-side runtime ownership covers roots that need scan/audit even when realtime watch is disabled"
     );
     assert_eq!(
         cache.scheduled_scan_groups_by_node,
@@ -3523,12 +3520,13 @@ fn replay_recovery_cached_schedule_primes_desired_local_groups_from_grants() {
         &grants,
     );
 
-    assert!(
-        cache
-            .scheduled_source_groups_by_node
-            .as_ref()
-            .is_none_or(|groups| groups.is_empty()),
-        "control-signal priming should still respect watch-disabled roots before replay recovery"
+    assert_eq!(
+        cache.scheduled_source_groups_by_node,
+        Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )])),
+        "source-side ownership priming must include scan-capable roots even when watch is disabled"
     );
 
     prime_cached_schedule_from_control_signals_for_replay_recovery(
@@ -3539,12 +3537,13 @@ fn replay_recovery_cached_schedule_primes_desired_local_groups_from_grants() {
         &grants,
     );
 
-    assert!(
-        cache
-            .replay_recovery_scheduled_source_groups_by_node
-            .as_ref()
-            .is_none_or(|groups| groups.is_empty()),
-        "replay-recovery bridge must keep watch-disabled roots out of source groups"
+    assert_eq!(
+        cache.replay_recovery_scheduled_source_groups_by_node,
+        Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )])),
+        "replay-recovery bridge must include local scan-capable roots in source-side groups"
     );
     assert_eq!(
         cache.replay_recovery_scheduled_scan_groups_by_node,
@@ -4614,37 +4613,13 @@ fn source_control_state_classifies_tick_only_replay_paths_from_canonical_state()
         "generation-advanced tick-only followups must replay retained control state when replay remains armed",
     );
     state.take_replay_state();
-    match state.classify_tick_only_wave(&[advanced_tick.clone()]) {
-        Some(SourceControlFrameTickOnlyDisposition::RetainedTickFastPath { signals }) => {
-            assert_eq!(signals.len(), 2);
-            assert!(
-                matches!(
-                    &signals[0],
-                    SourceControlSignal::Activate {
-                        unit: SourceRuntimeUnit::Source,
-                        route_key,
-                        generation: 2,
-                        ..
-                    } if route_key == "query.stream"
-                ),
-                "generation-advanced tick fast path must keep retained activate summary before appending the tick: {signals:?}"
-            );
-            match &signals[1] {
-                SourceControlSignal::Tick {
-                    unit,
-                    route_key,
-                    generation,
-                    ..
-                } => {
-                    assert_eq!(*unit, SourceRuntimeUnit::Source);
-                    assert_eq!(route_key, "query.stream");
-                    assert_eq!(*generation, 3);
-                }
-                other => panic!("expected retained generation-advanced tick, got {other:?}"),
-            }
-        }
-        other => panic!("expected generation-advanced source tick fast path, got {other:?}"),
-    }
+    assert!(
+        matches!(
+            state.classify_tick_only_wave(&[advanced_tick.clone()]),
+            Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay)
+        ),
+        "generation-advanced tick-only followups must replay through the worker path even when replay is clear so a stale worker cannot be hidden by cache-only fast path",
+    );
     match state.classify_tick_only_wave(&[stale_tick]) {
         Some(SourceControlFrameTickOnlyDisposition::RetainedTickFastPath { signals }) => {
             assert!(
@@ -4689,7 +4664,7 @@ fn source_control_state_tick_fast_path_carries_retained_scoped_source_route_acti
         vec![bound_scope_with_resources("nfs2", &["node-d::nfs2"])],
     );
     let scan_tick =
-        source_control_state_test_tick_signal(SourceRuntimeUnit::Scan, &scan_route, 1777494602653);
+        source_control_state_test_tick_signal(SourceRuntimeUnit::Scan, &scan_route, 1777494559668);
 
     let mut state = SourceControlState::default();
     state.retain_signals(&[source_activate, scan_activate]);
@@ -4904,8 +4879,9 @@ async fn rearm_source_rescan_endpoints_replays_retained_control_before_ready_pro
         .observability_snapshot_with_timeout_with_failure(Duration::from_secs(5))
         .await
         .expect("read source snapshot after replay-aware rearm");
-    let ready =
-        format!("ready unit=runtime.exec.source route={scoped_route} generation=1777519455077");
+    let ready = format!(
+        "ready unit=runtime.exec.source route={scoped_route} generation=1777519455077 scopes=[\"nfs1=>nfs1\"]"
+    );
     assert!(
         snapshot
             .last_control_frame_signals_by_node
@@ -6393,7 +6369,10 @@ async fn update_logical_roots_replays_start_after_runtime_reverts_to_initialized
     std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
 
     let cfg = SourceConfig {
-        roots: vec![worker_source_root("nfs1", &nfs1)],
+        roots: vec![
+            worker_source_root("nfs1", &nfs1),
+            worker_source_root("nfs2", &nfs2),
+        ],
         host_object_grants: vec![
             worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
             worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
@@ -6786,7 +6765,10 @@ async fn on_control_frame_enforces_total_timeout_when_worker_call_stalls_after_f
     std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
 
     let cfg = SourceConfig {
-        roots: vec![worker_source_root("nfs1", &nfs1)],
+        roots: vec![
+            worker_source_root("nfs1", &nfs1),
+            worker_source_root("nfs2", &nfs2),
+        ],
         host_object_grants: vec![
             worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
             worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
@@ -6888,7 +6870,10 @@ async fn on_control_frame_reacquires_worker_client_after_transport_closes_mid_ha
     std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
 
     let cfg = SourceConfig {
-        roots: vec![worker_source_root("nfs1", &nfs1)],
+        roots: vec![
+            worker_source_root("nfs1", &nfs1),
+            worker_source_root("nfs2", &nfs2),
+        ],
         host_object_grants: vec![
             worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
             worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
@@ -7011,7 +6996,10 @@ async fn second_on_control_frame_reacquires_worker_client_after_first_wave_succe
     std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
 
     let cfg = SourceConfig {
-        roots: vec![worker_source_root("nfs1", &nfs1)],
+        roots: vec![
+            worker_source_root("nfs1", &nfs1),
+            worker_source_root("nfs2", &nfs2),
+        ],
         host_object_grants: vec![
             worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
             worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
@@ -7148,7 +7136,10 @@ async fn third_on_control_frame_reacquires_worker_client_after_first_and_second_
     std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
 
     let cfg = SourceConfig {
-        roots: vec![worker_source_root("nfs1", &nfs1)],
+        roots: vec![
+            worker_source_root("nfs1", &nfs1),
+            worker_source_root("nfs2", &nfs2),
+        ],
         host_object_grants: vec![
             worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
             worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
@@ -7286,7 +7277,10 @@ async fn start_retries_retryable_bridge_errors_after_failed_followup_wave() {
     std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
 
     let cfg = SourceConfig {
-        roots: vec![worker_source_root("nfs1", &nfs1)],
+        roots: vec![
+            worker_source_root("nfs1", &nfs1),
+            worker_source_root("nfs2", &nfs2),
+        ],
         host_object_grants: vec![
             worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
             worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
@@ -7377,7 +7371,10 @@ async fn start_retries_after_hung_ensure_started_attempt_from_failed_followup_wa
     std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
 
     let cfg = SourceConfig {
-        roots: vec![worker_source_root("nfs1", &nfs1)],
+        roots: vec![
+            worker_source_root("nfs1", &nfs1),
+            worker_source_root("nfs2", &nfs2),
+        ],
         host_object_grants: vec![
             worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
             worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
@@ -8186,7 +8183,10 @@ async fn on_control_frame_retries_stale_drained_fenced_pid_errors() {
     std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
 
     let cfg = SourceConfig {
-        roots: vec![worker_source_root("nfs1", &nfs1)],
+        roots: vec![
+            worker_source_root("nfs1", &nfs1),
+            worker_source_root("nfs2", &nfs2),
+        ],
         host_object_grants: vec![
             worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
             worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
@@ -9123,7 +9123,7 @@ async fn generation_two_fs_source_selected_wave_reacquires_worker_client_after_c
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn generation_two_channel_closed_recovery_rearms_scoped_manual_rescan_endpoint() {
+async fn generation_two_channel_closed_recovery_keeps_scoped_manual_rescan_endpoint_worker_owned() {
     let tmp = tempdir().expect("create temp dir");
     let nfs1 = tmp.path().join("nfs1");
     std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -9231,37 +9231,31 @@ async fn generation_two_channel_closed_recovery_rearms_scoped_manual_rescan_endp
         "generation-two channel-closed recovery must reacquire a fresh shared source worker client instance"
     );
 
-    let adapter = crate::runtime::seam::exchange_host_adapter(
-        boundary.clone(),
-        NodeId("api-node".to_string()),
-        source_rescan_route_bindings_for(&node_id.0),
+    client
+        .rearm_source_rescan_request_endpoints_with_failure()
+        .await
+        .expect(
+            "generation-two recovery should record worker-owned manual-rescan delivery readiness",
+        );
+    let (snapshot, used_cached_fallback) = client
+        .manual_rescan_delivery_observability_snapshot_for_status_route_with_timeout(Some(
+            Duration::from_millis(20),
+        ))
+        .await;
+    assert!(
+        used_cached_fallback,
+        "worker-backed scoped manual-rescan readiness must be exposed through delivery cache"
+    );
+    let ready = format!(
+        "ready unit=runtime.exec.source route={local_rescan_route} generation=2 scopes=[\"nfs1=>nfs1\"]"
     );
     assert!(
-        !boundary
-            .closed_channels_snapshot()
-            .iter()
-            .any(|channel| channel == &local_rescan_route
-                || channel == &format!("{local_rescan_route}:reply")),
-        "generation-two recovery must not leave the scoped manual-rescan request/reply lanes closed before the first API rescan: closed={:?} history={:?}",
-        boundary.closed_channels_snapshot(),
-        boundary.close_history_snapshot()
-    );
-    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
-        &adapter,
-        ROUTE_TOKEN_FS_META_INTERNAL,
-        METHOD_SOURCE_RESCAN,
-        bytes::Bytes::from_static(b"manual-rescan"),
-        Duration::from_secs(2),
-        Duration::from_millis(50),
-    )
-    .await
-    .expect("scoped manual-rescan endpoint must be receive-armed after channel-closed replay");
-
-    assert!(
-        events.iter().any(|event| {
-            event.metadata().origin_id == node_id && event.payload_bytes() == b"accepted"
-        }),
-        "generation-two replay must rearm the source-owned scoped manual-rescan endpoint before the first management rescan: {events:?}"
+        snapshot
+            .last_control_frame_signals_by_node
+            .values()
+            .any(|signals| signals.iter().any(|signal| signal == &ready)),
+        "generation-two recovery must publish current worker-owned manual-rescan readiness: expected={ready} control={:?}",
+        snapshot.last_control_frame_signals_by_node
     );
 
     client.close().await.expect("close source worker");
@@ -12735,7 +12729,7 @@ async fn force_find_via_node_shares_runner_state_with_existing_target_worker_han
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rearm_source_rescan_endpoint_via_node_reaches_existing_target_worker_handle() {
+async fn rearm_source_rescan_endpoint_via_node_does_not_claim_app_proxy_route() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -12791,22 +12785,19 @@ async fn rearm_source_rescan_endpoint_via_node_reaches_existing_target_worker_ha
         NodeId("api-node".to_string()),
         source_rescan_route_bindings_for(&target_node.0),
     );
-    let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+    let direct_worker_route_result = capanix_host_adapter_fs::HostAdapter::call_collect(
         &adapter,
         ROUTE_TOKEN_FS_META_INTERNAL,
         METHOD_SOURCE_RESCAN,
         bytes::Bytes::from_static(b"manual-rescan"),
-        Duration::from_secs(2),
-        Duration::from_millis(50),
+        Duration::from_millis(100),
+        Duration::from_millis(20),
     )
-    .await
-    .expect("scoped manual-rescan endpoint must be receive-armed by routed target-node rearm");
+    .await;
 
     assert!(
-        events.iter().any(|event| {
-            event.metadata().origin_id == target_node && event.payload_bytes() == b"accepted"
-        }),
-        "routed target-node rearm must make the selected source-worker scoped manual-rescan route reachable: {events:?}"
+        direct_worker_route_result.is_err(),
+        "routed worker rearm must not expose the externally addressed scoped manual-rescan route from the source worker; app runtime owns that proxy route"
     );
 
     target_client
@@ -14471,7 +14462,9 @@ fn source_observability_override_preserves_live_scoped_rescan_route_evidence() {
             format!(
                 "activate unit=runtime.exec.source route={route} generation=1777508542667 scopes=[\"nfs2=>nfs2\"]"
             ),
-            format!("ready unit=runtime.exec.source route={route} generation=1777508542667"),
+            format!(
+                "ready unit=runtime.exec.source route={route} generation=1777508542667 scopes=[\"nfs2=>nfs2\"]"
+            ),
         ],
     )]);
 
@@ -14488,7 +14481,7 @@ fn source_observability_override_preserves_live_scoped_rescan_route_evidence() {
     );
     assert!(
         signals.iter().any(|signal| signal
-            == &format!("ready unit=runtime.exec.source route={route} generation=1777508542667")),
+            == &format!("ready unit=runtime.exec.source route={route} generation=1777508542667 scopes=[\"nfs2=>nfs2\"]")),
         "worker observability override must preserve the source-owned scoped manual-rescan ready proof: {signals:?}"
     );
 }
@@ -15065,7 +15058,7 @@ async fn manual_rescan_app_route_proof_uses_control_cache_without_live_probe() {
 
     let snapshot = tokio::time::timeout(
         Duration::from_millis(150),
-        client.manual_rescan_app_route_observability_snapshot_for_status_route(),
+        client.manual_rescan_app_route_observability_snapshot_for_status_route(None),
     )
     .await
     .expect("app-route manual-rescan status proof must not wait for live source observability")
@@ -15109,7 +15102,7 @@ async fn manual_rescan_app_route_proof_uses_control_cache_without_live_probe() {
     let inflight = client.begin_control_op();
     let applying_snapshot = tokio::time::timeout(
         Duration::from_millis(150),
-        client.manual_rescan_app_route_observability_snapshot_for_status_route(),
+        client.manual_rescan_app_route_observability_snapshot_for_status_route(None),
     )
     .await
     .expect("control-applying app-route observation must not wait for live source observability");
@@ -15118,6 +15111,258 @@ async fn manual_rescan_app_route_proof_uses_control_cache_without_live_probe() {
         "app-route cache is not manual-rescan target proof while source control state is applying"
     );
     drop(inflight);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_rescan_app_route_proof_declares_only_delivered_roots() {
+    let _observability_count_reset = SourceWorkerObservabilityCallCountHookReset;
+    let _observability_delay_reset = SourceWorkerObservabilityDelayHookReset;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let node_id = NodeId("node-b".to_string());
+    let nfs1_root = worker_watch_scan_root("nfs1", &nfs1);
+    let nfs2_root = worker_watch_scan_root("nfs2", &nfs2);
+    let nfs1_grant = worker_source_export("node-b::nfs1", "node-b", "10.0.0.21", nfs1.clone());
+    let nfs2_grant = worker_source_export("node-b::nfs2", "node-b", "10.0.0.21", nfs2.clone());
+    let cfg = SourceConfig {
+        roots: vec![nfs1_root.clone(), nfs2_root.clone()],
+        host_object_grants: vec![nfs1_grant.clone(), nfs2_grant.clone()],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        node_id.clone(),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    let source_rescan_route = source_rescan_request_route_for(&node_id.0).0;
+    let envelopes = vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])],
+        }))
+        .expect("encode source activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])],
+        }))
+        .expect("encode source scan activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: source_rescan_route,
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 1,
+            bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-b::nfs1"])],
+        }))
+        .expect("encode source manual-rescan route activate"),
+    ];
+    let signals = crate::runtime::orchestration::source_control_signals_from_envelopes(&envelopes)
+        .expect("decode source control signals");
+    client.control_state.lock().await.retain_signals(&signals);
+
+    client.with_cache_mut(|cache| {
+        cache.logical_roots = Some(vec![nfs1_root.clone(), nfs2_root.clone()]);
+        cache.grants = Some(vec![nfs1_grant.clone(), nfs2_grant.clone()]);
+        prime_cached_schedule_from_control_signals(
+            cache,
+            &node_id,
+            &signals,
+            &client.config.roots,
+            &client.config.host_object_grants,
+        );
+        cache.scheduled_source_groups_by_node = Some(std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]));
+        cache.scheduled_scan_groups_by_node = Some(std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]));
+        prime_cached_control_summary_from_control_signals(
+            cache,
+            &node_id,
+            &signals,
+            &client.config.host_object_grants,
+        );
+    });
+
+    let delivery_route_groups = std::collections::BTreeSet::from(["nfs1".to_string()]);
+    let snapshot = client
+        .manual_rescan_app_route_observability_snapshot_for_status_route(Some(
+            &delivery_route_groups,
+        ))
+        .await
+        .expect("app-route manual-rescan delivery proof should be available from control cache");
+
+    assert_eq!(
+        snapshot
+            .logical_roots
+            .iter()
+            .map(|root| root.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["nfs1"],
+        "manual-rescan delivery proof must not keep stale non-delivered roots in its root declaration"
+    );
+    assert_eq!(
+        snapshot
+            .status
+            .logical_roots
+            .iter()
+            .map(|root| root.root_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["nfs1"],
+        "manual-rescan delivery health must stay aligned with the declared delivered roots"
+    );
+    assert_eq!(
+        snapshot
+            .scheduled_source_groups_by_node
+            .get("node-b")
+            .cloned()
+            .unwrap_or_default(),
+        vec!["nfs1"],
+        "manual-rescan delivery proof must not keep stale source schedule groups"
+    );
+    assert_eq!(
+        snapshot
+            .scheduled_scan_groups_by_node
+            .get("node-b")
+            .cloned()
+            .unwrap_or_default(),
+        vec!["nfs1"],
+        "manual-rescan delivery proof must not keep stale scan schedule groups"
+    );
+
+    client.close().await.expect("close source worker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_rescan_app_route_proof_rebuilds_schedule_from_current_roots_after_restore() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+    let node_id = NodeId("node-b".to_string());
+    let nfs1_root = worker_watch_scan_root("nfs1", &nfs1);
+    let nfs2_root = worker_watch_scan_root("nfs2", &nfs2);
+    let nfs1_grant = worker_source_export("node-b::nfs1", "node-b", "10.0.0.21", nfs1.clone());
+    let nfs2_grant = worker_source_export("node-b::nfs2", "node-b", "10.0.0.21", nfs2.clone());
+    let cfg = SourceConfig {
+        roots: vec![nfs1_root.clone(), nfs2_root.clone()],
+        host_object_grants: vec![nfs1_grant.clone(), nfs2_grant.clone()],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        node_id.clone(),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    let scopes = vec![
+        bound_scope_with_resources("nfs1", &["node-b::nfs1"]),
+        bound_scope_with_resources("nfs2", &["node-b::nfs2"]),
+    ];
+    let source_rescan_route = source_rescan_request_route_for(&node_id.0).0;
+    let envelopes = vec![
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: scopes.clone(),
+        }))
+        .expect("encode source activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: ROUTE_KEY_QUERY.to_string(),
+            unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 2,
+            expires_at_ms: 1,
+            bound_scopes: scopes.clone(),
+        }))
+        .expect("encode source scan activate"),
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: source_rescan_route,
+            unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+            lease: None,
+            generation: 3,
+            expires_at_ms: 1,
+            bound_scopes: scopes,
+        }))
+        .expect("encode source manual-rescan route activate"),
+    ];
+    let signals = crate::runtime::orchestration::source_control_signals_from_envelopes(&envelopes)
+        .expect("decode source control signals");
+    client.control_state.lock().await.retain_signals(&signals);
+
+    client.with_cache_mut(|cache| {
+        cache.logical_roots = Some(vec![nfs1_root.clone()]);
+        cache.grants = Some(vec![nfs1_grant.clone()]);
+        cache.scheduled_source_groups_by_node = Some(std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string()],
+        )]));
+        cache.scheduled_scan_groups_by_node = Some(std::collections::BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["nfs1".to_string()],
+        )]));
+    });
+
+    let snapshot = client
+        .manual_rescan_app_route_observability_snapshot_for_status_route(None)
+        .await
+        .expect("app-route proof should rebuild from current config and retained control");
+
+    assert_eq!(
+        snapshot
+            .status
+            .logical_roots
+            .iter()
+            .map(|root| root.root_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["nfs1", "nfs2"],
+        "manual-rescan proof must use current app-authoritative roots after roots restore"
+    );
+    assert_eq!(
+        snapshot
+            .scheduled_scan_groups_by_node
+            .get("node-b")
+            .cloned()
+            .unwrap_or_default(),
+        vec!["nfs1".to_string(), "nfs2".to_string()],
+        "manual-rescan proof must not derive local schedule from stale cache roots"
+    );
+
+    client.close().await.expect("close source worker");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -15297,7 +15542,7 @@ async fn manual_rescan_app_route_marks_local_scheduled_root_as_delivery_primary(
     });
 
     let snapshot = client
-        .manual_rescan_app_route_observability_snapshot_for_status_route()
+        .manual_rescan_app_route_observability_snapshot_for_status_route(None)
         .await
         .expect("app-route manual-rescan delivery proof should be available from control cache");
 
@@ -17920,12 +18165,20 @@ async fn on_control_frame_does_not_exhaust_post_ack_schedule_refresh_when_mixed_
         .await
         .0;
     assert!(
-        observability.scheduled_source_groups_by_node.is_empty(),
-        "node-e should preserve an empty source schedule when the mixed-cluster wave carries only nfs1/nfs2 and all refreshed scheduled groups are legitimately empty for the local node"
+        observability
+            .scheduled_source_groups_by_node
+            .values()
+            .all(Vec::is_empty),
+        "node-e should preserve a source schedule with no runnable groups when the mixed-cluster wave carries only nfs1/nfs2 and all refreshed scheduled groups are legitimately empty for the local node: {:?}",
+        observability.scheduled_source_groups_by_node
     );
     assert!(
-        observability.scheduled_scan_groups_by_node.is_empty(),
-        "node-e should preserve an empty scan schedule when the mixed-cluster wave carries only nfs1/nfs2 and all refreshed scheduled groups are legitimately empty for the local node"
+        observability
+            .scheduled_scan_groups_by_node
+            .values()
+            .all(Vec::is_empty),
+        "node-e should preserve a scan schedule with no runnable groups when the mixed-cluster wave carries only nfs1/nfs2 and all refreshed scheduled groups are legitimately empty for the local node: {:?}",
+        observability.scheduled_scan_groups_by_node
     );
 
     clear_source_worker_scheduled_groups_refresh_queue_hook();

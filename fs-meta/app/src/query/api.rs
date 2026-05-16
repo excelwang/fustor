@@ -4159,6 +4159,7 @@ async fn query_materialized_events_with_sink_status_snapshot(
             result
         }
         QueryBackend::Route {
+            sink,
             boundary,
             origin_id,
             source,
@@ -4190,8 +4191,10 @@ async fn query_materialized_events_with_sink_status_snapshot(
                 .await
                 .map_err(QueryWorkerObservationFailure::into_error)?
             {
-                let result = route_materialized_events_via_node(
+                let result = query_materialized_events_via_selected_group_owner_node(
+                    &sink,
                     boundary.clone(),
+                    origin_id.clone(),
                     node_id.clone(),
                     params.clone(),
                     SelectedGroupOwnerRoutePlan::new(timeout),
@@ -4291,6 +4294,22 @@ async fn route_materialized_events_via_node(
         }
     }
     result
+}
+
+async fn query_materialized_events_via_selected_group_owner_node(
+    sink: &Arc<SinkFacade>,
+    boundary: Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    node_id: NodeId,
+    params: InternalQueryRequest,
+    plan: SelectedGroupOwnerRoutePlan,
+) -> Result<Vec<Event>, CnxError> {
+    if node_id == origin_id {
+        return query_local_materialized_events_with_failure(sink, &params, plan.route_timeout())
+            .await
+            .map_err(QueryWorkerObservationFailure::into_error);
+    }
+    route_materialized_events_via_node(boundary, node_id, params, plan).await
 }
 
 fn selected_group_sink_status_reports_live_materialized_group(
@@ -8893,7 +8912,9 @@ async fn maybe_reroute_selected_group_primary_owner(
     policy: &ProjectionPolicy,
     params: &InternalQueryRequest,
     deadline: tokio::time::Instant,
+    sink: &Arc<SinkFacade>,
     boundary: Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
     selected_group_sink_status: Option<&SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
     group_id: &str,
@@ -8915,8 +8936,10 @@ async fn maybe_reroute_selected_group_primary_owner(
     if remaining.is_zero() {
         return Ok(None);
     }
-    let primary_events = route_materialized_events_via_node(
+    let primary_events = query_materialized_events_via_selected_group_owner_node(
+        sink,
         boundary,
+        origin_id,
         primary_node_id,
         params.clone(),
         SelectedGroupOwnerRoutePlan::new(remaining),
@@ -8939,6 +8962,7 @@ async fn proxy_selected_group_empty_tree_rescue(
     policy: &ProjectionPolicy,
     params: &InternalQueryRequest,
     deadline: tokio::time::Instant,
+    sink: &Arc<SinkFacade>,
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
     selected_group_sink_status: Option<&SinkStatusSnapshot>,
@@ -8992,7 +9016,9 @@ async fn proxy_selected_group_empty_tree_rescue(
         if !retry_owner_timeout.is_zero() {
             let retry_events = query_materialized_events_via_selected_group_owner_attempt(
                 owner_attempt,
+                sink,
                 boundary,
+                origin_id.clone(),
                 params,
                 retry_owner_timeout,
             )
@@ -9020,6 +9046,7 @@ async fn execute_selected_group_owner_empty_tree_rescue(
     policy: &ProjectionPolicy,
     params: &InternalQueryRequest,
     deadline: tokio::time::Instant,
+    sink: &Arc<SinkFacade>,
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
     selected_group_sink_status: Option<&SinkStatusSnapshot>,
@@ -9050,7 +9077,9 @@ async fn execute_selected_group_owner_empty_tree_rescue(
             }
             match query_materialized_events_via_selected_group_owner_attempt(
                 owner_attempt,
+                sink,
                 boundary.clone(),
+                origin_id.clone(),
                 params,
                 retry_owner_timeout,
             )
@@ -9072,6 +9101,7 @@ async fn execute_selected_group_owner_empty_tree_rescue(
                         policy,
                         params,
                         deadline,
+                        sink,
                         boundary,
                         origin_id,
                         selected_group_sink_status,
@@ -9105,6 +9135,7 @@ async fn execute_selected_group_owner_empty_tree_rescue(
                         policy,
                         params,
                         deadline,
+                        sink,
                         boundary,
                         origin_id,
                         selected_group_sink_status,
@@ -9127,6 +9158,7 @@ async fn execute_selected_group_owner_empty_tree_rescue(
             policy,
             params,
             deadline,
+            sink,
             boundary,
             origin_id,
             selected_group_sink_status,
@@ -9249,19 +9281,25 @@ impl SelectedGroupOwnerAttempt {
 
 async fn query_materialized_events_via_selected_group_owner_attempt(
     owner_attempt: &SelectedGroupOwnerAttempt,
+    sink: &Arc<SinkFacade>,
     boundary: Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
     params: &InternalQueryRequest,
     timeout: Duration,
 ) -> Result<Vec<Event>, QueryWorkerObservationFailure> {
     match owner_attempt {
-        SelectedGroupOwnerAttempt::Routed(node_id) => route_materialized_events_via_node(
-            boundary,
-            node_id.clone(),
-            params.clone(),
-            SelectedGroupOwnerRoutePlan::new(timeout),
-        )
-        .await
-        .map_err(QueryWorkerObservationFailure::from),
+        SelectedGroupOwnerAttempt::Routed(node_id) => {
+            query_materialized_events_via_selected_group_owner_node(
+                sink,
+                boundary,
+                origin_id,
+                node_id.clone(),
+                params.clone(),
+                SelectedGroupOwnerRoutePlan::new(timeout),
+            )
+            .await
+            .map_err(QueryWorkerObservationFailure::from)
+        }
     }
 }
 
@@ -9269,6 +9307,7 @@ async fn finalize_selected_group_owner_success(
     policy: &ProjectionPolicy,
     params: &InternalQueryRequest,
     deadline: tokio::time::Instant,
+    sink: &Arc<SinkFacade>,
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
     selected_group_sink_status: Option<&SinkStatusSnapshot>,
@@ -9348,7 +9387,9 @@ async fn finalize_selected_group_owner_success(
         policy,
         params,
         deadline,
+        sink,
         boundary.clone(),
+        origin_id.clone(),
         selected_group_sink_status,
         request_scoped_schedule_omitted_ready_groups,
         group_id,
@@ -9364,6 +9405,7 @@ async fn finalize_selected_group_owner_success(
         policy,
         params,
         deadline,
+        sink,
         boundary,
         origin_id,
         selected_group_sink_status,
@@ -9390,6 +9432,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
 ) -> Result<Vec<Event>, CnxError> {
     match &state.backend {
         QueryBackend::Route {
+            sink,
             boundary,
             origin_id,
             source,
@@ -9427,8 +9470,10 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                         .checked_duration_since(tokio::time::Instant::now())
                         .unwrap_or_default(),
                 );
-                match route_materialized_events_via_node(
+                match query_materialized_events_via_selected_group_owner_node(
+                    sink,
                     boundary.clone(),
+                    origin_id.clone(),
                     node_id.clone(),
                     params.clone(),
                     owner_route_plan,
@@ -9440,6 +9485,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                             policy,
                             &params,
                             deadline,
+                            sink,
                             boundary.clone(),
                             origin_id.clone(),
                             selected_group_sink_status.as_ref(),
@@ -9519,13 +9565,16 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                             let primary_reroute_timeout =
                                 group_plan.owner_empty_tree_retry_timeout(remaining);
                             if !primary_reroute_timeout.is_zero() {
-                                let primary_events = route_materialized_events_via_node(
-                                    boundary.clone(),
-                                    primary_node_id,
-                                    params.clone(),
-                                    SelectedGroupOwnerRoutePlan::new(primary_reroute_timeout),
-                                )
-                                .await?;
+                                let primary_events =
+                                    query_materialized_events_via_selected_group_owner_node(
+                                        sink,
+                                        boundary.clone(),
+                                        origin_id.clone(),
+                                        primary_node_id,
+                                        params.clone(),
+                                        SelectedGroupOwnerRoutePlan::new(primary_reroute_timeout),
+                                    )
+                                    .await?;
                                 if !selected_group_materialized_tree_payload_is_empty(
                                     policy,
                                     &primary_events,
@@ -9594,7 +9643,11 @@ async fn query_materialized_events_via_selected_group_owner_direct_with_failure(
 ) -> Result<Vec<Event>, QueryWorkerObservationFailure> {
     match &state.backend {
         QueryBackend::Route {
-            boundary, source, ..
+            sink,
+            boundary,
+            origin_id,
+            source,
+            ..
         } => {
             if let Some(group_id) = params.scope.selected_group.as_deref()
                 && let Some(node_id) = materialized_owner_node_for_group_with_failure(
@@ -9606,8 +9659,10 @@ async fn query_materialized_events_via_selected_group_owner_direct_with_failure(
                 )
                 .await?
             {
-                return route_materialized_events_via_node(
+                return query_materialized_events_via_selected_group_owner_node(
+                    sink,
                     boundary.clone(),
+                    origin_id.clone(),
                     node_id,
                     params,
                     SelectedGroupOwnerRoutePlan::new(timeout),

@@ -7,6 +7,7 @@ use capanix_runtime_entry_sdk::control::RuntimeBoundScope;
 #[derive(Debug, Clone, Default)]
 struct RouteControlState {
     generation: u64,
+    semantic_generation: u64,
     active: bool,
     bound_scopes: Vec<RuntimeBoundScope>,
 }
@@ -40,10 +41,17 @@ impl UnitControlGate {
             && route.active
             && !route.bound_scopes.is_empty()
             && bound_scopes.is_empty();
+        let next_bound_scopes = if preserve_existing_scopes {
+            route.bound_scopes.clone()
+        } else {
+            bound_scopes.to_vec()
+        };
+        let semantic_changed = !route.active || route.bound_scopes != next_bound_scopes;
         route.generation = generation;
         route.active = true;
-        if !preserve_existing_scopes {
-            route.bound_scopes = bound_scopes.to_vec();
+        route.bound_scopes = next_bound_scopes;
+        if semantic_changed {
+            route.semantic_generation = generation;
         }
         true
     }
@@ -54,9 +62,13 @@ impl UnitControlGate {
         if generation < route.generation {
             return false;
         }
+        let semantic_changed = route.active || !route.bound_scopes.is_empty();
         route.generation = generation;
         route.active = false;
         route.bound_scopes.clear();
+        if semantic_changed {
+            route.semantic_generation = generation;
+        }
         true
     }
 
@@ -257,6 +269,23 @@ impl RuntimeUnitGate {
             .map(|route| route.generation))
     }
 
+    pub(crate) fn route_semantic_generation(
+        &self,
+        unit_id: &str,
+        route_key: &str,
+    ) -> Result<Option<u64>> {
+        self.validate_runtime_unit(unit_id)?;
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| CnxError::Internal("RuntimeUnitGate lock poisoned".into()))?;
+        Ok(gate
+            .units
+            .get(unit_id)
+            .and_then(|state| state.routes.get(route_key))
+            .map(|route| route.semantic_generation))
+    }
+
     pub(crate) fn route_active(&self, unit_id: &str, route_key: &str) -> Result<bool> {
         self.validate_runtime_unit(unit_id)?;
         let gate = self
@@ -268,6 +297,33 @@ impl RuntimeUnitGate {
             .get(unit_id)
             .and_then(|state| state.routes.get(route_key))
             .is_some_and(|route| route.active))
+    }
+
+    pub(crate) fn active_route_state(
+        &self,
+        unit_id: &str,
+        route_key: &str,
+    ) -> Result<Option<(u64, Vec<RuntimeBoundScope>)>> {
+        self.validate_runtime_unit(unit_id)?;
+        let gate = self
+            .gate
+            .lock()
+            .map_err(|_| CnxError::Internal("RuntimeUnitGate lock poisoned".into()))?;
+        Ok(gate.units.get(unit_id).and_then(|state| {
+            state
+                .routes
+                .get(route_key)
+                .filter(|route| route.active)
+                .map(|route| {
+                    (
+                        route.generation,
+                        effective_route_bound_scopes(
+                            &route.bound_scopes,
+                            state.authoritative_bound_scopes.as_deref(),
+                        ),
+                    )
+                })
+        }))
     }
 
     pub(crate) fn active_route_keys(&self, unit_id: &str) -> Result<BTreeSet<String>> {
@@ -452,6 +508,70 @@ mod tests {
             scope_ids,
             BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
             "runtime-managed empty followup activates must not erase previously active scopes",
+        );
+    }
+
+    #[test]
+    fn route_semantic_generation_changes_only_when_route_scope_changes() {
+        let gate = RuntimeUnitGate::new_runtime_managed("test-gate", &["runtime.exec.source"]);
+
+        gate.apply_activate(
+            "runtime.exec.source",
+            "source-manual-rescan.node-a:v1.req",
+            10,
+            &[bound_scope("nfs1", "node-a::nfs1")],
+        )
+        .expect("initial activate");
+        assert_eq!(
+            gate.route_generation("runtime.exec.source", "source-manual-rescan.node-a:v1.req")
+                .expect("route generation"),
+            Some(10)
+        );
+        assert_eq!(
+            gate.route_semantic_generation(
+                "runtime.exec.source",
+                "source-manual-rescan.node-a:v1.req"
+            )
+            .expect("route semantic generation"),
+            Some(10)
+        );
+
+        gate.apply_activate(
+            "runtime.exec.source",
+            "source-manual-rescan.node-a:v1.req",
+            11,
+            &[bound_scope("nfs1", "node-a::nfs1")],
+        )
+        .expect("repeated activate");
+        assert_eq!(
+            gate.route_generation("runtime.exec.source", "source-manual-rescan.node-a:v1.req")
+                .expect("route generation"),
+            Some(11)
+        );
+        assert_eq!(
+            gate.route_semantic_generation(
+                "runtime.exec.source",
+                "source-manual-rescan.node-a:v1.req"
+            )
+            .expect("route semantic generation"),
+            Some(10),
+            "identical activate refreshes fencing generation but must not invalidate receive-armed endpoints",
+        );
+
+        gate.apply_activate(
+            "runtime.exec.source",
+            "source-manual-rescan.node-a:v1.req",
+            12,
+            &[bound_scope("nfs2", "node-a::nfs2")],
+        )
+        .expect("scope-changing activate");
+        assert_eq!(
+            gate.route_semantic_generation(
+                "runtime.exec.source",
+                "source-manual-rescan.node-a:v1.req"
+            )
+            .expect("route semantic generation"),
+            Some(12)
         );
     }
 

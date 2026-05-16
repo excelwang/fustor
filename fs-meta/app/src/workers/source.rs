@@ -247,10 +247,15 @@ impl SourceControlFrameLane for AttemptLane {
         self: Box<Self>,
         handle: &SourceWorkerClientHandle,
     ) -> std::result::Result<SourceControlFrameEvent, SourceFailure> {
+        let before = handle.current_source_progress_state();
         let (rpc_result, after) = handle
             .perform_control_frame_attempt(&self.envelopes, self.timeout)
             .await;
-        Ok(SourceControlFrameEvent::RpcCompleted { rpc_result, after })
+        Ok(SourceControlFrameEvent::RpcCompleted {
+            rpc_result,
+            before,
+            after,
+        })
     }
 }
 
@@ -472,6 +477,7 @@ struct SourceControlFrameFacts {
     primed_local_schedule: Option<PrimedLocalScheduleSummary>,
     post_ack_refresh_requirement: SourceControlFramePostAckRefreshRequirement,
     bootstrap_disposition: SourceControlFrameBootstrapDisposition,
+    replay_required_for_current_wave: bool,
     initial_step: Option<SourceControlFrameInitialStep>,
     operation_deadline: std::time::Instant,
     rpc_timeout: Duration,
@@ -486,6 +492,7 @@ enum SourceControlFrameEvent {
     RetainedTickReplayCompleted,
     RpcCompleted {
         rpc_result: std::result::Result<SourceWorkerResponse, CnxError>,
+        before: SourceProgressState,
         after: SourceProgressState,
     },
     ReconnectCompleted,
@@ -762,6 +769,7 @@ struct SourceControlFrameMachine {
     primed_local_schedule: Option<PrimedLocalScheduleSummary>,
     post_ack_refresh_requirement: SourceControlFramePostAckRefreshRequirement,
     bootstrap_disposition: SourceControlFrameBootstrapDisposition,
+    replay_required_for_current_wave: bool,
     existing_client_present: bool,
     bridge_reset_policy: SourceControlFrameBridgeResetPolicy,
     timeout_reset_policy: SourceControlFrameTimeoutResetPolicy,
@@ -781,6 +789,7 @@ impl SourceControlFrameMachine {
             primed_local_schedule,
             post_ack_refresh_requirement,
             bootstrap_disposition,
+            replay_required_for_current_wave,
             initial_step,
             operation_deadline,
             rpc_timeout,
@@ -801,6 +810,7 @@ impl SourceControlFrameMachine {
             primed_local_schedule,
             post_ack_refresh_requirement,
             bootstrap_disposition,
+            replay_required_for_current_wave,
             existing_client_present,
             bridge_reset_policy,
             timeout_reset_policy,
@@ -967,18 +977,52 @@ impl SourceControlFrameMachine {
         &mut self,
         refresh_result: std::result::Result<(), SourceFailure>,
     ) -> std::result::Result<SourceControlFrameStep, SourceFailure> {
-        let _pending_refresh = self.pending_refresh.take().ok_or_else(|| {
+        let pending_refresh = self.pending_refresh.take().ok_or_else(|| {
             missing_control_frame_pending_refresh_state("scheduled-groups refresh completion")
         })?;
         Ok(match refresh_result {
             Ok(()) => SourceControlFrameStep::complete(),
+            Err(refresh_failure)
+                if self.can_complete_after_preexisting_replay_refresh_failure(
+                    &pending_refresh,
+                    &refresh_failure,
+                ) =>
+            {
+                SourceControlFrameStep::complete()
+            }
             Err(refresh_failure) => SourceControlFrameStep::fail(refresh_failure),
         })
+    }
+
+    fn can_complete_after_preexisting_replay_refresh_failure(
+        &self,
+        pending_refresh: &SourceControlFramePendingRefresh,
+        refresh_failure: &SourceFailure,
+    ) -> bool {
+        if !self.replay_required_for_current_wave
+            || !pending_refresh
+                .scheduled_groups_expectation
+                .expect_local_runnable_groups()
+            || !self
+                .primed_local_schedule
+                .is_some_and(|schedule| schedule.has_local_runnable_groups)
+        {
+            return false;
+        }
+        matches!(
+            refresh_failure.reason,
+            SourceFailureReason::RefreshExhausted(
+                SourceScheduledGroupsRefreshExhaustionReason::Timeout
+                    | SourceScheduledGroupsRefreshExhaustionReason::TransportClosed
+                    | SourceScheduledGroupsRefreshExhaustionReason::RetryableReset
+            )
+        )
     }
 
     fn action_after_error(
         &mut self,
         err: CnxError,
+        before: SourceProgressState,
         after: SourceProgressState,
     ) -> SourceControlFrameStep {
         let retryable_control_error_kind = classify_source_worker_control_reset(&err);
@@ -990,6 +1034,21 @@ impl SourceControlFrameMachine {
             None => SourceFailure::non_retryable(err),
         };
         let bridge_reset_policy = self.bridge_reset_policy_after_timeout_reset();
+        let worker_replaced_during_attempt =
+            after.worker_client_replaced_epoch > before.worker_client_replaced_epoch;
+        if retryable_control_error_kind.is_some() && worker_replaced_during_attempt {
+            self.replay_required_for_current_wave = true;
+            if matches!(
+                bridge_reset_policy,
+                SourceControlFrameBridgeResetPolicy::FailImmediately
+            ) {
+                self.pending_reconnect_resume = None;
+                return match self.rpc_attempt_plan() {
+                    Ok(step) => step,
+                    Err(failure) => SourceControlFrameStep::fail(failure),
+                };
+            }
+        }
         if retryable_control_error_kind
             .is_some_and(|kind| kind.should_follow_fail_closed_bridge_policy(bridge_reset_policy))
         {
@@ -1043,12 +1102,16 @@ impl SourceControlFrameMachine {
             SourceControlFrameEvent::RetainedTickReplayCompleted => {
                 Ok(SourceControlFrameStep::complete())
             }
-            SourceControlFrameEvent::RpcCompleted { rpc_result, after } => Ok(match rpc_result {
+            SourceControlFrameEvent::RpcCompleted {
+                rpc_result,
+                before,
+                after,
+            } => Ok(match rpc_result {
                 Ok(response) => match expect_source_worker_ack("for on_control_frame", response) {
                     Ok(()) => self.step_after_ack_success()?,
                     Err(failure) => SourceControlFrameStep::fail(failure),
                 },
-                Err(err) => self.action_after_error(err, after),
+                Err(err) => self.action_after_error(err, before, after),
             }),
             SourceControlFrameEvent::ReconnectCompleted => self.step_after_reconnect_completion(),
             SourceControlFrameEvent::WaitCompleted => self.rpc_attempt_plan(),
@@ -2368,13 +2431,13 @@ fn is_drained_retire_cleanup_deactivate_batch(envelopes: &[ControlEnvelope]) -> 
                             )
                         )) if matches!(
                             deactivate.reason.as_str(),
-                            "restart_deferred_retire_pending" | "deferred_retire"
-                        )
+                            "restart_deferred_retire_pending"
+                        ) || (deactivate.reason == "deferred_retire"
                             && deactivate
                                 .lease
                                 .as_ref()
                                 .and_then(|lease| lease.drain_started_at_ms)
-                                .is_some()
+                                .is_some())
                     )
             )
         })
@@ -2523,16 +2586,21 @@ fn normalize_node_groups_key(
     let Some(groups) = groups_by_node.remove(from_node_id) else {
         return;
     };
-    let entry = groups_by_node
-        .entry(stable_host_ref.to_string())
-        .or_default();
-    if groups.is_empty() || entry.is_empty() {
-        entry.clear();
+    if groups.is_empty() {
+        groups_by_node.insert(stable_host_ref.to_string(), Vec::new());
         return;
     }
-    entry.extend(groups);
-    entry.sort();
-    entry.dedup();
+    match groups_by_node.get_mut(stable_host_ref) {
+        Some(existing) if existing.is_empty() => return,
+        Some(existing) => {
+            existing.extend(groups);
+            existing.sort();
+            existing.dedup();
+        }
+        None => {
+            groups_by_node.insert(stable_host_ref.to_string(), groups);
+        }
+    }
 }
 
 fn normalize_observability_snapshot_scheduled_group_keys(
@@ -2798,7 +2866,7 @@ fn prime_cached_schedule_from_control_signals(
             let applies_locally = roots
                 .iter()
                 .filter(|root| match unit {
-                    SourceRuntimeUnit::Source => root.watch,
+                    SourceRuntimeUnit::Source => root.watch || root.scan,
                     SourceRuntimeUnit::Scan => root.scan,
                 })
                 .any(|root| bound_scope_applies_locally(scope, root, node_id, &grants));
@@ -2872,7 +2940,7 @@ fn prime_cached_schedule_from_control_signals_for_replay_recovery(
             let applies_locally = roots
                 .iter()
                 .filter(|root| match unit {
-                    SourceRuntimeUnit::Source => root.watch,
+                    SourceRuntimeUnit::Source => root.watch || root.scan,
                     SourceRuntimeUnit::Scan => root.scan,
                 })
                 .any(|root| bound_scope_applies_locally(scope, root, node_id, &grants));
@@ -3020,13 +3088,13 @@ fn replay_recovery_schedule_priming_respects_scan_only_roots() {
         &grants,
     );
 
-    assert!(
+    assert_eq!(
         cache
             .replay_recovery_scheduled_source_groups_by_node
             .as_ref()
-            .is_none_or(|groups| groups.is_empty()),
-        "scan-only roots must not prime replay-recovery source groups: {:?}",
-        cache.replay_recovery_scheduled_source_groups_by_node
+            .and_then(|groups| groups.get("node-a")),
+        Some(&vec!["nfs1".to_string()]),
+        "scan-only roots still belong to source-side runtime ownership because scan/audit is a source-worker unit",
     );
     assert_eq!(
         cache
@@ -3058,6 +3126,32 @@ fn prime_cached_control_summary_from_control_signals(
         stable_host_ref,
         summary,
     )]));
+}
+
+fn apply_retained_replay_control_state_to_cache(
+    cache: &mut SourceWorkerSnapshotCache,
+    node_id: &NodeId,
+    signals: &[SourceControlSignal],
+    fallback_roots: &[RootSpec],
+    fallback_grants: &[GrantedMountRoot],
+) {
+    let _ = prime_cached_schedule_from_control_signals(
+        cache,
+        node_id,
+        signals,
+        fallback_roots,
+        fallback_grants,
+    );
+    prime_cached_schedule_from_control_signals_for_replay_recovery(
+        cache,
+        node_id,
+        signals,
+        fallback_roots,
+        fallback_grants,
+    );
+    prime_cached_control_summary_from_control_signals(cache, node_id, signals, fallback_grants);
+    cache.observability_control_summary_override_by_node =
+        cache.last_control_frame_signals_by_node.clone();
 }
 
 fn source_control_signals_are_deactivate_only(signals: &[SourceControlSignal]) -> bool {
@@ -3423,7 +3517,7 @@ pub(crate) fn source_observability_recovery_projection(
         &stable_host_ref,
         status,
         explicit_scheduled_source_groups_by_node,
-        |entry| entry.watch_enabled,
+        |entry| entry.watch_enabled || entry.scan_enabled,
     );
     let scheduled_scan_groups_by_node = resolved_source_observability_schedule_groups_by_node(
         &stable_host_ref,
@@ -3524,11 +3618,16 @@ fn source_observability_publication_marker(snapshot: &SourceObservabilitySnapsho
 }
 
 fn cached_source_publication_marker(cache: &SourceWorkerSnapshotCache) -> (u64, u64) {
-    let (status_published_batches, status_last_published_at_us) = cache
-        .status
-        .as_ref()
-        .map(source_status_publication_marker)
-        .unwrap_or_default();
+    let (status_published_batches, status_last_published_at_us) =
+        if cache_has_explicit_zero_publication_counters(cache) {
+            (0, 0)
+        } else {
+            cache
+                .status
+                .as_ref()
+                .map(source_status_publication_marker)
+                .unwrap_or_default()
+        };
     let cached_published_batches = cache
         .published_batches_by_node
         .as_ref()
@@ -3543,6 +3642,27 @@ fn cached_source_publication_marker(cache: &SourceWorkerSnapshotCache) -> (u64, 
         std::cmp::max(status_published_batches, cached_published_batches),
         std::cmp::max(status_last_published_at_us, cached_last_published_at_us),
     )
+}
+
+fn cache_has_explicit_zero_publication_counters(cache: &SourceWorkerSnapshotCache) -> bool {
+    let mut saw_counter = false;
+    for counts in [
+        cache.published_batches_by_node.as_ref(),
+        cache.published_events_by_node.as_ref(),
+        cache.published_control_events_by_node.as_ref(),
+        cache.published_data_events_by_node.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for value in counts.values() {
+            saw_counter = true;
+            if *value != 0 {
+                return false;
+            }
+        }
+    }
+    saw_counter
 }
 
 fn source_observability_snapshot_can_preserve_cached_observability(
@@ -3790,6 +3910,12 @@ pub(crate) fn source_observability_signal_preserves_scoped_manual_rescan_route_e
     signal.contains("unit=runtime.exec.source")
         && signal.contains("route=source-manual-rescan.")
         && (signal.contains("activate ") || signal.contains("ready "))
+}
+
+fn source_observability_signal_is_scoped_manual_rescan_route_ready_evidence(signal: &str) -> bool {
+    signal.contains("ready ")
+        && signal.contains("unit=runtime.exec.source")
+        && signal.contains("route=source-manual-rescan.")
 }
 
 fn merge_source_owned_scoped_manual_rescan_route_evidence(
@@ -4160,7 +4286,10 @@ impl SourceControlState {
             else {
                 return None;
             };
-            if generation >= retained_generation {
+            if generation > retained_generation {
+                return Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay);
+            }
+            if generation == retained_generation {
                 current_or_forward_ticks.push(signal.clone());
             }
         }
@@ -5707,6 +5836,7 @@ impl SourceWorkerClientHandle {
         self.with_cache_mut(|cache| {
             cache.observability_control_summary_override_by_node = None;
         });
+        self.arm_control_frame_replay().await;
         self.replay_retained_control_state_if_needed_for_refresh_until(deadline)
             .await
     }
@@ -5812,6 +5942,7 @@ impl SourceWorkerClientHandle {
         if envelopes.is_empty() {
             return Ok(());
         }
+        let decoded_signals = source_control_signals_from_envelopes(&envelopes).ok();
 
         let mut machine = SourceReplayRetainedControlStateMachine::new(deadline, rpc_timeout);
         let replay_result = drive_source_machine_loop(
@@ -5865,6 +5996,17 @@ impl SourceWorkerClientHandle {
         if replay_result.is_err() {
             self.control_state.lock().await.arm_replay();
         } else {
+            if let Some(signals) = decoded_signals.as_ref() {
+                self.with_cache_mut(|cache| {
+                    apply_retained_replay_control_state_to_cache(
+                        cache,
+                        &self.node_id,
+                        signals,
+                        &self.config.roots,
+                        &self.config.host_object_grants,
+                    );
+                });
+            }
             self.control_state
                 .lock()
                 .await
@@ -7360,6 +7502,7 @@ impl SourceWorkerClientHandle {
                         cache,
                         &self.node_id,
                         &self.config.host_object_grants,
+                        None,
                     );
                 });
                 self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
@@ -7375,7 +7518,7 @@ impl SourceWorkerClientHandle {
         if self.control_op_inflight() || self.retained_replay_required_for_status().await {
             return false;
         }
-        self.manual_rescan_delivery_observability_snapshot()
+        self.manual_rescan_delivery_observability_snapshot(None)
             .is_some()
     }
 
@@ -7423,7 +7566,7 @@ impl SourceWorkerClientHandle {
             SourceControlFrameRequestAttemptKind::ControlFrame => {
                 tokio::time::timeout(
                     timeout,
-                    self.with_started_retry_with_failure(|client| {
+                    self.with_started_once_with_failure(|client| {
                         let envelopes = envelopes.to_vec();
                         async move {
                             #[cfg(test)]
@@ -7599,34 +7742,43 @@ impl SourceWorkerClientHandle {
         let decoded_signals = source_control_signals_from_envelopes(&control_envelopes)
             .map(SourceControlFrameDecodedSignals::Decoded)
             .unwrap_or(SourceControlFrameDecodedSignals::DecodeFailed);
-        let (fail_fast_generation_one_activate_replay, fresh_initial_bootstrap_apply, initial_step) =
-            match &decoded_signals {
-                SourceControlFrameDecodedSignals::Decoded(signals) => {
-                    let control_state = self.control_state.lock().await;
-                    let initial_step = match control_state.classify_tick_only_wave(signals) {
-                        Some(SourceControlFrameTickOnlyDisposition::RetainedTickFastPath {
-                            signals,
-                        }) => Some(SourceControlFrameInitialStep::run(
-                            RetainedTickFastPathLane { signals },
-                        )),
-                        Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay) => {
-                            Some(SourceControlFrameInitialStep::run(RetainedTickReplayLane {
-                                deadline: operation_deadline,
-                            }))
-                        }
-                        None => None,
-                    };
-                    (
-                        control_state.matches_generation_one_activate_wave(signals),
-                        source_control_signals_are_fresh_initial_bootstrap_apply(
-                            &control_state,
-                            signals,
-                        ),
-                        initial_step,
-                    )
-                }
-                SourceControlFrameDecodedSignals::DecodeFailed => (false, false, None),
-            };
+        let (
+            fail_fast_generation_one_activate_replay,
+            fresh_initial_bootstrap_apply,
+            replay_required_for_current_wave,
+            initial_step,
+        ) = match &decoded_signals {
+            SourceControlFrameDecodedSignals::Decoded(signals) => {
+                let control_state = self.control_state.lock().await;
+                let replay_required_for_current_wave = matches!(
+                    control_state.replay_state(),
+                    SourceControlReplayState::Required
+                );
+                let initial_step = match control_state.classify_tick_only_wave(signals) {
+                    Some(SourceControlFrameTickOnlyDisposition::RetainedTickFastPath {
+                        signals,
+                    }) => Some(SourceControlFrameInitialStep::run(
+                        RetainedTickFastPathLane { signals },
+                    )),
+                    Some(SourceControlFrameTickOnlyDisposition::RetainedTickReplay) => {
+                        Some(SourceControlFrameInitialStep::run(RetainedTickReplayLane {
+                            deadline: operation_deadline,
+                        }))
+                    }
+                    None => None,
+                };
+                (
+                    control_state.matches_generation_one_activate_wave(signals),
+                    source_control_signals_are_fresh_initial_bootstrap_apply(
+                        &control_state,
+                        signals,
+                    ),
+                    replay_required_for_current_wave,
+                    initial_step,
+                )
+            }
+            SourceControlFrameDecodedSignals::DecodeFailed => (false, false, false, None),
+        };
         let mut signal_policies = match &decoded_signals {
             SourceControlFrameDecodedSignals::Decoded(signals) => {
                 SourceControlFrameSignalPolicies::from_signals(signals)
@@ -7684,6 +7836,7 @@ impl SourceWorkerClientHandle {
             } else {
                 SourceControlFrameBootstrapDisposition::PostInitial
             },
+            replay_required_for_current_wave,
             initial_step,
             operation_deadline,
             rpc_timeout,
@@ -7864,6 +8017,7 @@ impl SourceWorkerClientHandle {
                 cache,
                 &self.node_id,
                 &self.config.host_object_grants,
+                None,
             );
         });
         self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
@@ -7942,6 +8096,7 @@ impl SourceWorkerClientHandle {
                 cache,
                 &self.node_id,
                 &self.config.host_object_grants,
+                None,
             );
         });
         self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
@@ -7979,6 +8134,7 @@ impl SourceWorkerClientHandle {
                         cache,
                         &self.node_id,
                         &self.config.host_object_grants,
+                        None,
                     );
                 });
                 self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
@@ -8018,6 +8174,7 @@ impl SourceWorkerClientHandle {
                         cache,
                         &self.node_id,
                         &self.config.host_object_grants,
+                        None,
                     );
                 });
                 self.bump_source_progress(SourceProgressReason::ObservabilityUpdated);
@@ -8056,7 +8213,7 @@ impl SourceWorkerClientHandle {
         if self.control_op_inflight() || self.retained_replay_required_for_status().await {
             return false;
         }
-        self.manual_rescan_delivery_observability_snapshot()
+        self.manual_rescan_delivery_observability_snapshot(None)
             .is_some()
     }
 
@@ -8201,7 +8358,8 @@ impl SourceWorkerClientHandle {
             return Ok((snapshot, true));
         }
         if read_mode.can_use_control_cache_before_live_probe()
-            && let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot()
+            && let Some(snapshot) =
+                self.runtime_scope_control_cache_observability_snapshot_before_live_probe()
         {
             self.log_observability_cache_fallback(
                 "runtime_scope_control_cache_for_status_control_scope",
@@ -8242,7 +8400,8 @@ impl SourceWorkerClientHandle {
             return Ok((snapshot, true));
         }
         if read_mode.can_use_control_cache_before_live_probe()
-            && let Some(snapshot) = self.runtime_scope_control_cache_observability_snapshot()
+            && let Some(snapshot) =
+                self.runtime_scope_control_cache_observability_snapshot_before_live_probe()
         {
             self.log_observability_cache_fallback(
                 "runtime_scope_control_cache_for_status_control_scope",
@@ -8326,6 +8485,16 @@ impl SourceWorkerClientHandle {
         self.with_cache_mut(|cache| build_runtime_scope_control_cache_observability_snapshot(cache))
     }
 
+    fn runtime_scope_control_cache_observability_snapshot_before_live_probe(
+        &self,
+    ) -> Option<SourceObservabilitySnapshot> {
+        self.with_cache_mut(|cache| {
+            runtime_scope_control_cache_can_skip_live_probe(cache)
+                .then(|| build_runtime_scope_control_cache_observability_snapshot(cache))
+                .flatten()
+        })
+    }
+
     async fn source_state_pending_observability_snapshot_for_status_route(
         &self,
     ) -> (SourceObservabilitySnapshot, bool) {
@@ -8371,22 +8540,32 @@ impl SourceWorkerClientHandle {
         })
     }
 
-    fn manual_rescan_delivery_observability_snapshot(&self) -> Option<SourceObservabilitySnapshot> {
+    fn manual_rescan_delivery_observability_snapshot(
+        &self,
+        delivery_root_ids: Option<&std::collections::BTreeSet<String>>,
+    ) -> Option<SourceObservabilitySnapshot> {
         self.with_cache_mut(|cache| {
-            build_manual_rescan_delivery_observability_snapshot(cache, &self.node_id, &self.config)
+            build_manual_rescan_delivery_observability_snapshot(
+                cache,
+                &self.node_id,
+                &self.config,
+                delivery_root_ids,
+            )
         })
     }
 
     fn cached_manual_rescan_delivery_observability_snapshot_for_status_route(
         &self,
+        delivery_root_ids: Option<&std::collections::BTreeSet<String>>,
     ) -> Option<SourceObservabilitySnapshot> {
-        let snapshot = self.manual_rescan_delivery_observability_snapshot()?;
+        let snapshot = self.manual_rescan_delivery_observability_snapshot(delivery_root_ids)?;
         self.log_observability_cache_fallback("manual_rescan_delivery_app_route", &snapshot);
         Some(snapshot)
     }
 
     async fn manual_rescan_app_route_observability_snapshot_for_status_route(
         &self,
+        delivery_root_ids: Option<&std::collections::BTreeSet<String>>,
     ) -> Option<SourceObservabilitySnapshot> {
         if self.control_op_inflight() {
             return None;
@@ -8402,6 +8581,8 @@ impl SourceWorkerClientHandle {
             control_state.replay_signals()
         };
         let snapshot = self.with_cache_mut(|cache| {
+            cache.logical_roots = Some(self.config.roots.clone());
+            cache.grants = Some(self.config.host_object_grants.clone());
             if !retained_signals.is_empty() {
                 let _ = prime_cached_schedule_from_control_signals(
                     cache,
@@ -8417,18 +8598,18 @@ impl SourceWorkerClientHandle {
                     &self.config.host_object_grants,
                 );
             }
-            if cache.logical_roots.is_none() {
-                cache.logical_roots = Some(self.config.roots.clone());
-            }
-            if cache.grants.is_none() {
-                cache.grants = Some(self.config.host_object_grants.clone());
-            }
             annotate_cached_manual_rescan_route_receivable_evidence(
                 cache,
                 &self.node_id,
                 &self.config.host_object_grants,
+                delivery_root_ids,
             );
-            build_manual_rescan_delivery_observability_snapshot(cache, &self.node_id, &self.config)
+            build_manual_rescan_delivery_observability_snapshot(
+                cache,
+                &self.node_id,
+                &self.config,
+                delivery_root_ids,
+            )
         })?;
         self.log_observability_cache_fallback("manual_rescan_delivery_app_route", &snapshot);
         Some(snapshot)
@@ -8534,7 +8715,7 @@ impl SourceWorkerClientHandle {
         live_probe_timeout: Option<Duration>,
     ) -> (SourceObservabilitySnapshot, bool) {
         if let Some(snapshot) =
-            self.cached_manual_rescan_delivery_observability_snapshot_for_status_route()
+            self.cached_manual_rescan_delivery_observability_snapshot_for_status_route(None)
         {
             return (snapshot, true);
         }
@@ -8600,10 +8781,55 @@ fn source_observability_signal_generation(signal: &str) -> Option<u64> {
         .flatten()
 }
 
+fn source_rescan_route_activation_generation_from_observability_signals<'a>(
+    signals: impl Iterator<Item = &'a String>,
+    route: &str,
+) -> Option<u64> {
+    signals
+        .filter(|signal| {
+            signal.contains("activate ")
+                && signal.contains("unit=runtime.exec.source")
+                && signal.contains(&format!("route={route}"))
+        })
+        .filter_map(|signal| source_observability_signal_generation(signal))
+        .max()
+}
+
+fn source_rescan_route_ready_generation_from_observability_signals<'a>(
+    signals: impl Iterator<Item = &'a String>,
+    route: &str,
+) -> Option<u64> {
+    signals
+        .filter(|signal| {
+            signal.contains("ready ")
+                && signal.contains("unit=runtime.exec.source")
+                && signal.contains(&format!("route={route}"))
+        })
+        .filter_map(|signal| source_observability_signal_generation(signal))
+        .max()
+}
+
+fn manual_rescan_ready_scopes_from_groups(
+    groups: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    if groups.is_empty() {
+        return None;
+    }
+    Some(format!(
+        " scopes=[{}]",
+        groups
+            .iter()
+            .map(|group| format!("\"{group}=>{group}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 fn annotate_manual_rescan_route_receivable_evidence_by_key(
     signals_by_node: &mut std::collections::BTreeMap<String, Vec<String>>,
     node_key: String,
     node_id: &NodeId,
+    scheduled_scan_groups: &std::collections::BTreeSet<String>,
 ) {
     let route = format!("{}.req", source_rescan_route_key_for(&node_id.0));
     let generation = signals_by_node
@@ -8616,11 +8842,30 @@ fn annotate_manual_rescan_route_receivable_evidence_by_key(
         })
         .filter_map(|signal| source_observability_signal_generation(signal))
         .max();
+    annotate_manual_rescan_route_receivable_evidence_by_key_and_route(
+        signals_by_node,
+        node_key,
+        &route,
+        generation,
+        scheduled_scan_groups,
+    );
+}
+
+fn annotate_manual_rescan_route_receivable_evidence_by_key_and_route(
+    signals_by_node: &mut std::collections::BTreeMap<String, Vec<String>>,
+    node_key: String,
+    route: &str,
+    generation: Option<u64>,
+    scheduled_scan_groups: &std::collections::BTreeSet<String>,
+) {
+    let Some(scopes) = manual_rescan_ready_scopes_from_groups(scheduled_scan_groups) else {
+        return;
+    };
     let signal = match generation {
         Some(generation) => {
-            format!("ready unit=runtime.exec.source route={route} generation={generation}")
+            format!("ready unit=runtime.exec.source route={route} generation={generation}{scopes}")
         }
-        None => format!("ready unit=runtime.exec.source route={route}"),
+        None => format!("ready unit=runtime.exec.source route={route}{scopes}"),
     };
     let signals = signals_by_node.entry(node_key).or_default();
     signals.retain(|existing| {
@@ -8633,14 +8878,59 @@ fn annotate_manual_rescan_route_receivable_evidence_by_key(
     }
 }
 
+fn observability_local_scheduled_scan_groups(
+    snapshot: &SourceObservabilitySnapshot,
+    node_id: &NodeId,
+) -> std::collections::BTreeSet<String> {
+    let mut groups = snapshot
+        .scheduled_scan_groups_by_node
+        .iter()
+        .filter(|(observed_node_id, _)| host_ref_matches_node_id(observed_node_id, node_id))
+        .flat_map(|(_, groups)| groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    groups.extend(
+        snapshot
+            .status
+            .concrete_roots
+            .iter()
+            .filter(|root| {
+                root.active
+                    && root.is_group_primary
+                    && root.scan_enabled
+                    && host_ref_from_resource_id(&root.object_ref)
+                        .is_some_and(|host_ref| host_ref_matches_node_id(host_ref, node_id))
+            })
+            .map(|root| root.logical_root_id.clone()),
+    );
+    groups
+}
+
 pub(crate) fn annotate_manual_rescan_route_receivable_evidence(
     snapshot: &mut SourceObservabilitySnapshot,
     node_id: &NodeId,
 ) {
+    let scheduled_scan_groups = observability_local_scheduled_scan_groups(snapshot, node_id);
     annotate_manual_rescan_route_receivable_evidence_by_key(
         &mut snapshot.last_control_frame_signals_by_node,
         node_id.0.clone(),
         node_id,
+        &scheduled_scan_groups,
+    );
+}
+
+pub(crate) fn annotate_manual_rescan_route_receivable_evidence_for_route_groups(
+    snapshot: &mut SourceObservabilitySnapshot,
+    node_id: &NodeId,
+    route: &str,
+    generation: Option<u64>,
+    scheduled_scan_groups: &std::collections::BTreeSet<String>,
+) {
+    annotate_manual_rescan_route_receivable_evidence_by_key_and_route(
+        &mut snapshot.last_control_frame_signals_by_node,
+        node_id.0.clone(),
+        route,
+        generation,
+        scheduled_scan_groups,
     );
 }
 
@@ -9174,6 +9464,7 @@ fn annotate_cached_manual_rescan_route_receivable_evidence(
     cache: &mut SourceWorkerSnapshotCache,
     node_id: &NodeId,
     fallback_grants: &[GrantedMountRoot],
+    delivery_root_ids: Option<&std::collections::BTreeSet<String>>,
 ) {
     let grants = cache
         .grants
@@ -9184,23 +9475,44 @@ fn annotate_cached_manual_rescan_route_receivable_evidence(
     let signals_by_node = cache
         .last_control_frame_signals_by_node
         .get_or_insert_with(std::collections::BTreeMap::new);
-    annotate_manual_rescan_route_receivable_evidence_by_key(signals_by_node, node_key, node_id);
+    let scheduled_scan_groups =
+        cached_local_scheduled_groups(node_id, &cache.scheduled_scan_groups_by_node)
+            .unwrap_or_default();
+    let scheduled_scan_groups = match delivery_root_ids {
+        Some(root_ids) => scheduled_scan_groups
+            .into_iter()
+            .filter(|group_id| root_ids.contains(group_id))
+            .collect::<std::collections::BTreeSet<_>>(),
+        None => scheduled_scan_groups,
+    };
+    annotate_manual_rescan_route_receivable_evidence_by_key(
+        signals_by_node,
+        node_key,
+        node_id,
+        &scheduled_scan_groups,
+    );
     cache.observability_control_summary_override_by_node = Some(signals_by_node.clone());
 }
 
 fn manual_rescan_delivery_local_scheduled_groups(
     cache: &SourceWorkerSnapshotCache,
     node_id: &NodeId,
+    delivery_root_ids: Option<&std::collections::BTreeSet<String>>,
 ) -> (
     std::collections::BTreeSet<String>,
     std::collections::BTreeSet<String>,
 ) {
-    (
+    let mut scheduled_source =
         cached_local_scheduled_groups(node_id, &cache.scheduled_source_groups_by_node)
-            .unwrap_or_default(),
+            .unwrap_or_default();
+    let mut scheduled_scan =
         cached_local_scheduled_groups(node_id, &cache.scheduled_scan_groups_by_node)
-            .unwrap_or_default(),
-    )
+            .unwrap_or_default();
+    if let Some(root_ids) = delivery_root_ids {
+        scheduled_source.retain(|group_id| root_ids.contains(group_id));
+        scheduled_scan.retain(|group_id| root_ids.contains(group_id));
+    }
+    (scheduled_source, scheduled_scan)
 }
 
 fn manual_rescan_delivery_source_primary_by_group(
@@ -9248,18 +9560,19 @@ fn manual_rescan_delivery_source_primary_by_group(
 fn manual_rescan_delivery_status_from_cache(
     cache: &SourceWorkerSnapshotCache,
     node_id: &NodeId,
-    fallback_roots: &[RootSpec],
+    current_roots: &[RootSpec],
     fallback_grants: &[GrantedMountRoot],
     fallback_audit_interval: Duration,
+    delivery_root_ids: Option<&std::collections::BTreeSet<String>>,
 ) -> Option<(
     SourceStatusSnapshot,
     std::collections::BTreeMap<String, String>,
 )> {
-    let roots = cache
-        .logical_roots
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| fallback_roots.to_vec());
+    let roots = if current_roots.is_empty() {
+        cache.logical_roots.as_ref().cloned().unwrap_or_default()
+    } else {
+        current_roots.to_vec()
+    };
     let grants = cache
         .grants
         .as_ref()
@@ -9269,7 +9582,7 @@ fn manual_rescan_delivery_status_from_cache(
         return None;
     }
     let (scheduled_source, scheduled_scan) =
-        manual_rescan_delivery_local_scheduled_groups(cache, node_id);
+        manual_rescan_delivery_local_scheduled_groups(cache, node_id, delivery_root_ids);
     if scheduled_scan.is_empty() {
         return None;
     }
@@ -9382,14 +9695,31 @@ fn cache_has_manual_rescan_route_receivable_evidence(
         .last_control_frame_signals_by_node
         .as_ref()
         .is_some_and(|signals_by_node| {
-            signals_by_node
+            let has_ready = signals_by_node
                 .values()
                 .flat_map(|signals| signals.iter())
                 .any(|signal| {
                     signal.contains("ready ")
                         && signal.contains("unit=runtime.exec.source")
                         && signal.contains(&format!("route={route}"))
-                })
+                });
+            if !has_ready {
+                return false;
+            }
+            let activation_generation =
+                source_rescan_route_activation_generation_from_observability_signals(
+                    signals_by_node.values().flat_map(|signals| signals.iter()),
+                    &route,
+                );
+            match activation_generation {
+                Some(activation_generation) => {
+                    source_rescan_route_ready_generation_from_observability_signals(
+                        signals_by_node.values().flat_map(|signals| signals.iter()),
+                        &route,
+                    ) == Some(activation_generation)
+                }
+                None => true,
+            }
         })
 }
 
@@ -9397,6 +9727,7 @@ fn build_manual_rescan_delivery_observability_snapshot(
     cache: &SourceWorkerSnapshotCache,
     node_id: &NodeId,
     config: &SourceConfig,
+    delivery_root_ids: Option<&std::collections::BTreeSet<String>>,
 ) -> Option<SourceObservabilitySnapshot> {
     if !cache_has_manual_rescan_route_receivable_evidence(cache, node_id) {
         return None;
@@ -9407,11 +9738,24 @@ fn build_manual_rescan_delivery_observability_snapshot(
         &config.roots,
         &config.host_object_grants,
         config.audit_interval,
+        delivery_root_ids,
     )?;
     let mut delivery_cache = cache.clone();
-    if delivery_cache.logical_roots.is_none() {
-        delivery_cache.logical_roots = Some(config.roots.clone());
-    }
+    delivery_cache.logical_roots =
+        Some(manual_rescan_delivery_logical_roots(cache, config, &status));
+    let delivery_root_ids = status
+        .logical_roots
+        .iter()
+        .map(|root| root.root_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    filter_cached_groups_to_root_ids(
+        &mut delivery_cache.scheduled_source_groups_by_node,
+        &delivery_root_ids,
+    );
+    filter_cached_groups_to_root_ids(
+        &mut delivery_cache.scheduled_scan_groups_by_node,
+        &delivery_root_ids,
+    );
     if delivery_cache.grants.is_none() {
         delivery_cache.grants = Some(config.host_object_grants.clone());
     }
@@ -9429,6 +9773,51 @@ fn build_manual_rescan_delivery_observability_snapshot(
         SOURCE_WORKER_MANUAL_RESCAN_DELIVERY_CACHE_REASON.to_string(),
     ));
     Some(snapshot)
+}
+
+fn manual_rescan_delivery_logical_roots(
+    cache: &SourceWorkerSnapshotCache,
+    config: &SourceConfig,
+    status: &SourceStatusSnapshot,
+) -> Vec<RootSpec> {
+    let delivery_root_ids = status
+        .logical_roots
+        .iter()
+        .map(|root| root.root_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if delivery_root_ids.is_empty() {
+        return Vec::new();
+    }
+    let authoritative_roots = if config.roots.is_empty() {
+        cache.logical_roots.as_ref()
+    } else {
+        Some(&config.roots)
+    };
+    let mut roots = authoritative_roots
+        .into_iter()
+        .flat_map(|roots| roots.iter())
+        .filter(|root| delivery_root_ids.contains(root.id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    roots.sort_by(|left, right| left.id.cmp(&right.id));
+    roots.dedup_by(|left, right| left.id == right.id);
+    roots
+}
+
+fn filter_cached_groups_to_root_ids(
+    groups_by_node: &mut Option<std::collections::BTreeMap<String, Vec<String>>>,
+    root_ids: &std::collections::BTreeSet<String>,
+) {
+    let Some(groups) = groups_by_node.as_mut() else {
+        return;
+    };
+    groups.retain(|_, groups| {
+        groups.retain(|group_id| root_ids.contains(group_id));
+        !groups.is_empty()
+    });
+    if groups.is_empty() {
+        *groups_by_node = None;
+    }
 }
 
 fn build_runtime_scope_control_cache_observability_snapshot(
@@ -9484,12 +9873,8 @@ fn build_pending_source_state_observability_snapshot_from_retained_control(
     retained_signals: &[SourceControlSignal],
 ) -> Option<SourceObservabilitySnapshot> {
     let mut projected_cache = cache.clone();
-    if projected_cache.logical_roots.is_none() {
-        projected_cache.logical_roots = Some(config.roots.clone());
-    }
-    if projected_cache.grants.is_none() {
-        projected_cache.grants = Some(config.host_object_grants.clone());
-    }
+    projected_cache.logical_roots = Some(config.roots.clone());
+    projected_cache.grants = Some(config.host_object_grants.clone());
     projected_cache.lifecycle_state = Some("source-state-pending-retained-control".to_string());
     prime_cached_schedule_from_control_signals(
         &mut projected_cache,
@@ -9512,6 +9897,11 @@ fn strip_delivery_truth_from_source_state_pending_observation(
 ) {
     snapshot.source_primary_by_group.clear();
     snapshot.status.concrete_roots.clear();
+    for signals in snapshot.last_control_frame_signals_by_node.values_mut() {
+        signals.retain(|signal| {
+            !source_observability_signal_is_scoped_manual_rescan_route_ready_evidence(signal)
+        });
+    }
     let pending_reason = SOURCE_WORKER_PENDING_SOURCE_STATE_OBSERVATION_REASON.to_string();
     if !snapshot
         .status
@@ -9555,6 +9945,10 @@ fn source_cache_has_pending_post_rescan_publication_refresh(
     cache.rescan_request_epoch > 0
         && cache.rescan_observed_epoch >= cache.rescan_request_epoch
         && cache.last_live_observability_snapshot_at.is_none()
+}
+
+fn runtime_scope_control_cache_can_skip_live_probe(cache: &SourceWorkerSnapshotCache) -> bool {
+    cache.status.is_some() && !source_cache_has_pending_post_rescan_publication_refresh(cache)
 }
 
 fn source_stable_status_cache_can_skip_live_refresh(cache: &SourceWorkerSnapshotCache) -> bool {
@@ -9826,6 +10220,22 @@ impl FSMetaSource {
             .map_err(SourceFailure::from)
     }
 
+    pub(crate) fn with_worker_runtime_boundaries_and_state_with_failure(
+        config: SourceConfig,
+        node_id: NodeId,
+        boundary: Option<Arc<dyn ChannelIoSubset>>,
+        state_boundary: Arc<dyn StateBoundary>,
+    ) -> std::result::Result<Self, SourceFailure> {
+        Self::with_worker_runtime_boundaries_and_state_internal(
+            config,
+            node_id,
+            boundary,
+            state_boundary,
+            false,
+        )
+        .map_err(SourceFailure::from)
+    }
+
     pub(crate) async fn pub_stream_with_failure(
         &self,
     ) -> std::result::Result<
@@ -9860,6 +10270,22 @@ impl FSMetaSource {
         self.perform_apply_orchestration_signals(signals)
             .await
             .map_err(SourceFailure::from)
+    }
+
+    pub(crate) async fn apply_orchestration_single_attempt_timeout(
+        &self,
+        signals: &[SourceControlSignal],
+        total_timeout: Duration,
+    ) -> Duration {
+        let control_state = self.retained_control_state_snapshot().await;
+        if source_control_signals_are_fresh_initial_bootstrap_apply(&control_state, signals) {
+            total_timeout
+        } else {
+            std::cmp::min(
+                total_timeout,
+                SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT,
+            )
+        }
     }
 
     pub(crate) async fn update_logical_roots_with_failure(
@@ -10092,28 +10518,15 @@ impl SourceFacade {
             ));
         }
         match self {
-            Self::Local(source) => {
-                let control_state = source.retained_control_state_snapshot().await;
-                let single_attempt_total_timeout =
-                    if source_control_signals_are_fresh_initial_bootstrap_apply(
-                        &control_state,
-                        signals,
-                    ) {
-                        total_timeout
-                    } else {
-                        std::cmp::min(
-                            total_timeout,
-                            SOURCE_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT,
-                        )
-                    };
-                map_source_failure_timeout_result(
-                    tokio::time::timeout(
-                        single_attempt_total_timeout,
-                        source.apply_orchestration_signals_with_failure(signals),
-                    )
-                    .await,
+            Self::Local(source) => map_source_failure_timeout_result(
+                tokio::time::timeout(
+                    source
+                        .apply_orchestration_single_attempt_timeout(signals, total_timeout)
+                        .await,
+                    source.apply_orchestration_signals_with_failure(signals),
                 )
-            }
+                .await,
+            ),
             Self::Worker(client) => {
                 // runtime_app owns the outer recovery loop for mixed recovery.
                 // Keep post-initial/replay/reset source-client attempts short so
@@ -10285,13 +10698,13 @@ impl SourceFacade {
     pub(crate) async fn status_snapshot_with_failure(
         &self,
     ) -> std::result::Result<SourceStatusSnapshot, SourceFailure> {
+        if let Self::Local(source) = self {
+            let _ = source
+                .sync_logical_roots_from_authoritative_cell_if_changed()
+                .await;
+        }
         match self {
-            Self::Local(source) => {
-                let _ = source
-                    .sync_logical_roots_from_authoritative_cell_if_changed()
-                    .await;
-                source.status_snapshot_with_failure()
-            }
+            Self::Local(source) => source.status_snapshot_with_failure(),
             Self::Worker(client) => client.status_snapshot_with_failure().await,
         }
     }
@@ -10578,13 +10991,13 @@ impl SourceFacade {
     pub(crate) async fn observability_snapshot_with_failure(
         &self,
     ) -> std::result::Result<SourceObservabilitySnapshot, SourceFailure> {
+        if let Self::Local(source) = self {
+            let _ = source
+                .sync_logical_roots_from_authoritative_cell_if_changed()
+                .await;
+        }
         match self {
-            Self::Local(source) => {
-                let _ = source
-                    .sync_logical_roots_from_authoritative_cell_if_changed()
-                    .await;
-                source.observability_snapshot_with_failure()
-            }
+            Self::Local(source) => source.observability_snapshot_with_failure(),
             Self::Worker(client) => {
                 client
                     .observability_snapshot_with_timeout_with_failure(
@@ -10606,13 +11019,13 @@ impl SourceFacade {
         &self,
         live_probe_timeout: Option<Duration>,
     ) -> (SourceObservabilitySnapshot, bool) {
+        if let Self::Local(source) = self {
+            let _ = source
+                .sync_logical_roots_from_authoritative_cell_if_changed()
+                .await;
+        }
         match self {
-            Self::Local(source) => {
-                let _ = source
-                    .sync_logical_roots_from_authoritative_cell_if_changed()
-                    .await;
-                source.observability_snapshot_nonblocking_for_status_route()
-            }
+            Self::Local(source) => source.observability_snapshot_nonblocking_for_status_route(),
             Self::Worker(client) => {
                 client
                     .observability_snapshot_nonblocking_for_status_route_with_timeout(
@@ -10627,13 +11040,13 @@ impl SourceFacade {
         &self,
         live_probe_timeout: Option<Duration>,
     ) -> (SourceObservabilitySnapshot, bool) {
+        if let Self::Local(source) = self {
+            let _ = source
+                .sync_logical_roots_from_authoritative_cell_if_changed()
+                .await;
+        }
         match self {
-            Self::Local(source) => {
-                let _ = source
-                    .sync_logical_roots_from_authoritative_cell_if_changed()
-                    .await;
-                source.observability_snapshot_nonblocking_for_status_route()
-            }
+            Self::Local(source) => source.observability_snapshot_nonblocking_for_status_route(),
             Self::Worker(client) => {
                 client
                     .current_owner_health_observability_snapshot_for_status_route_with_timeout(
@@ -10647,6 +11060,11 @@ impl SourceFacade {
     pub(crate) async fn source_state_pending_observability_snapshot_for_status_route(
         &self,
     ) -> (SourceObservabilitySnapshot, bool) {
+        if let Self::Local(source) = self {
+            let _ = source
+                .sync_logical_roots_from_authoritative_cell_if_changed()
+                .await;
+        }
         match self {
             Self::Local(source) => {
                 let (mut snapshot, _) =
@@ -10664,23 +11082,28 @@ impl SourceFacade {
 
     pub(crate) fn cached_manual_rescan_delivery_observability_snapshot_for_status_route(
         &self,
+        delivery_root_ids: Option<&std::collections::BTreeSet<String>>,
     ) -> Option<SourceObservabilitySnapshot> {
         match self {
             Self::Local(_) => None,
-            Self::Worker(client) => {
-                client.cached_manual_rescan_delivery_observability_snapshot_for_status_route()
-            }
+            Self::Worker(client) => client
+                .cached_manual_rescan_delivery_observability_snapshot_for_status_route(
+                    delivery_root_ids,
+                ),
         }
     }
 
     pub(crate) async fn manual_rescan_app_route_observability_snapshot_for_status_route(
         &self,
+        delivery_root_ids: Option<&std::collections::BTreeSet<String>>,
     ) -> Option<SourceObservabilitySnapshot> {
         match self {
             Self::Local(_) => None,
             Self::Worker(client) => {
                 client
-                    .manual_rescan_app_route_observability_snapshot_for_status_route()
+                    .manual_rescan_app_route_observability_snapshot_for_status_route(
+                        delivery_root_ids,
+                    )
                     .await
             }
         }

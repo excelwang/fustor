@@ -615,6 +615,7 @@ fn start_source_pump_with_stream<S>(
     stream: S,
     boundary: Arc<StdMutex<Arc<dyn ChannelIoSubset>>>,
     published_stats: Arc<StdMutex<PublishedBatchStats>>,
+    source: Option<Arc<FSMetaSource>>,
 ) -> JoinHandle<()>
 where
     S: futures_util::Stream<Item = Vec<Event>> + Send + 'static,
@@ -646,7 +647,17 @@ where
                     summarize_published_batch_path_counts(&batch, &target),
                 );
             }
-            publish_event_stream_batch(boundary.clone(), &batch, &origin).await;
+            if let Err(err) = publish_event_stream_batch(boundary.clone(), &batch, &origin).await {
+                log::error!(
+                    "source worker pump failed to publish source event stream origin={}: {:?}",
+                    origin,
+                    err
+                );
+                if let Some(source) = source.as_ref() {
+                    source.mark_publication_output_closed(err.to_string());
+                }
+                break;
+            }
             record_summarized_path_stats(&published_stats, &publish_update);
             update_published_stats(&published_stats, &publish_update);
             if let Some(summary) = &summary {
@@ -663,7 +674,7 @@ async fn publish_event_stream_batch(
     boundary: Arc<StdMutex<Arc<dyn ChannelIoSubset>>>,
     batch: &[Event],
     origin: &str,
-) {
+) -> Result<()> {
     let mut pending = std::collections::VecDeque::from([batch.to_vec()]);
     while let Some(window) = pending.pop_front() {
         let mut publish_attempt = 0u64;
@@ -692,6 +703,7 @@ async fn publish_event_stream_batch(
                     pending.push_front(left);
                     break;
                 }
+                Err(err) if source_worker_publish_error_is_terminal(&err) => return Err(err),
                 Err(err) => {
                     log::warn!(
                         "source worker pump retrying source event publication origin={} window_len={} attempt={} err={:?}",
@@ -706,6 +718,21 @@ async fn publish_event_stream_batch(
             }
         }
     }
+    Ok(())
+}
+
+fn source_worker_publish_error_is_terminal(err: &CnxError) -> bool {
+    matches!(err, CnxError::TransportClosed(_) | CnxError::ChannelClosed)
+        || matches!(
+            err,
+            CnxError::PeerError(message) | CnxError::Internal(message)
+                if message.contains("transport closed")
+                    && (message.contains("Connection reset by peer")
+                        || message.contains("early eof")
+                        || message.contains("Broken pipe")
+                        || message.contains("bridge stopped")
+                        || message.contains("bridge closed"))
+        )
 }
 
 fn bootstrap_not_ready() -> CnxError {
@@ -862,7 +889,7 @@ async fn bootstrap_start_source_runtime_with_failure(
                 config.roots.len(),
                 config.host_object_grants.len()
             );
-            match FSMetaSource::with_boundaries_and_state_with_failure(
+            match FSMetaSource::with_worker_runtime_boundaries_and_state_with_failure(
                 config.clone(),
                 node_id.clone(),
                 None,
@@ -914,6 +941,7 @@ async fn bootstrap_start_source_runtime_with_failure(
             stream,
             runtime_boundary,
             state.published_stats.clone(),
+            Some(source),
         ));
         eprintln!("fs_meta_source_worker_server: bootstrap_start pump ok");
     }
@@ -1333,11 +1361,10 @@ async fn execute_worker_action(
             )
             .await
         {
-            Ok(()) => (
-                SourceWorkerResponse::StatusSnapshot(source.status_snapshot()),
-                false,
-                None,
-            ),
+            Ok(()) => match source.status_snapshot_with_failure() {
+                Ok(snapshot) => (SourceWorkerResponse::StatusSnapshot(snapshot), false, None),
+                Err(err) => (classify_source_worker_failure(err), false, None),
+            },
             Err(err) => (classify_source_worker_error(err), false, None),
         },
         SourceWorkerAction::UpdateLogicalRoots { source, roots } => {
@@ -1391,12 +1418,10 @@ async fn execute_worker_action(
             )
         }
         SourceWorkerAction::TriggerRescanWhenReadyEpoch { source } => {
-            let (epoch, root_keys) = source.begin_rescan_request_epoch();
-            (
-                SourceWorkerResponse::RescanRequestEpoch(epoch),
-                false,
-                deferred_manual_rescan_signal(source, root_keys),
-            )
+            match source.submit_rescan_request_epoch_with_failure() {
+                Ok(epoch) => (SourceWorkerResponse::RescanRequestEpoch(epoch), false, None),
+                Err(err) => (classify_source_worker_failure(err), false, None),
+            }
         }
         SourceWorkerAction::SubmitTargetedRescanRequestEpoch { source } => {
             match source.begin_targeted_rescan_request_epoch_with_failure() {
@@ -1413,12 +1438,8 @@ async fn execute_worker_action(
             }
         }
         SourceWorkerAction::TriggerTargetedRescanWhenReadyEpoch { source } => {
-            match source.begin_targeted_rescan_request_epoch_with_failure() {
-                Ok((epoch, root_keys)) => (
-                    SourceWorkerResponse::RescanRequestEpoch(epoch),
-                    false,
-                    deferred_manual_rescan_signal(source, root_keys),
-                ),
+            match source.submit_targeted_rescan_request_epoch_with_failure() {
+                Ok(epoch) => (SourceWorkerResponse::RescanRequestEpoch(epoch), false, None),
                 Err(err) => (
                     classify_source_worker_failure(SourceFailure::from(err)),
                     false,
@@ -2095,6 +2116,7 @@ mod tests {
             futures_util::stream::iter(vec![events]),
             Arc::new(StdMutex::new(target)),
             published_stats,
+            None,
         );
 
         match tokio::time::timeout(Duration::from_millis(500), &mut handle).await {
@@ -3261,8 +3283,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_source_control_does_not_spawn_non_target_scoped_rescan_after_broad_activation()
-    {
+    async fn worker_source_control_spawns_owned_external_scoped_rescan_route() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -3362,16 +3383,12 @@ mod tests {
             .await
             .expect("send local scoped source rescan request");
 
-        let replies = boundary
+        let local_reply = boundary
             .recv_route(&format!("{local_route}:reply"), 1000)
-            .await
-            .expect("local scoped source rescan route must reply with target delivery proof");
+            .await;
         assert!(
-            replies.iter().any(|event| {
-                event.metadata().origin_id == NodeId("node-a-123".to_string())
-                    && event.metadata().correlation_id == Some(77)
-            }),
-            "local scoped source rescan route must reply from the local source lane: {replies:?}"
+            matches!(local_reply, Ok(ref events) if events.iter().any(|event| event.metadata().origin_id.0 == "node-a-123")),
+            "source worker runtime must own its externally addressed scoped source-rescan route: {local_reply:?}"
         );
 
         boundary
@@ -3400,7 +3417,7 @@ mod tests {
             .await;
         assert!(
             matches!(non_target_reply, Err(CnxError::Timeout)),
-            "non-target scoped source rescan route must not be drained by this source worker: {non_target_reply:?}"
+            "source worker runtime must not own peer scoped source-rescan drains: {non_target_reply:?}"
         );
 
         session
@@ -3410,7 +3427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_rearm_source_rescan_endpoints_surfaces_source_owned_ready_in_observability() {
+    async fn worker_rearm_source_rescan_endpoints_surfaces_owned_external_ready_proof() {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
@@ -3499,14 +3516,15 @@ mod tests {
             panic!("observability request should return live source snapshot");
         };
 
-        let ready =
-            format!("ready unit=runtime.exec.source route={scoped_route} generation=1777507000123");
+        let ready = format!(
+            "ready unit=runtime.exec.source route={scoped_route} generation=1777507000123 scopes=[\"nfs1=>nfs1\"]"
+        );
         assert!(
             snapshot
                 .last_control_frame_signals_by_node
                 .get("node-a")
                 .is_some_and(|signals| signals.iter().any(|signal| signal == &ready)),
-            "worker observability must surface the source-owned rearm ready proof; expected={ready} control={:?}",
+            "source worker observability must claim its owned scoped source-rescan readiness: expected={ready} control={:?}",
             snapshot.last_control_frame_signals_by_node
         );
 

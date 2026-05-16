@@ -47,6 +47,17 @@ fn source_concrete_root_blocks_materialized_observation(
     source_concrete_root_needs_current_owner_evidence(root)
 }
 
+fn source_groups_with_current_owner_evidence(
+    source_status: &SourceStatusSnapshot,
+) -> BTreeSet<String> {
+    source_status
+        .concrete_roots
+        .iter()
+        .filter(|root| source_concrete_root_has_current_owner_evidence(root))
+        .map(|root| root.logical_root_id.clone())
+        .collect()
+}
+
 fn group_has_local_sink_presence(
     group_id: &str,
     sink_groups: &BTreeMap<&str, &crate::sink::SinkGroupStatusSnapshot>,
@@ -148,11 +159,14 @@ pub fn materialized_query_observation_evidence(
             .filter(|root| source_logical_root_degrades_materialized_observation(root))
             .map(|root| root.root_id.clone()),
     );
+    let source_groups_with_current_owner_evidence =
+        source_groups_with_current_owner_evidence(source_status);
     let source_initial_audit_groups = source_status
         .concrete_roots
         .iter()
         .filter(|root| {
             source_concrete_root_blocks_materialized_observation(root)
+                && !source_groups_with_current_owner_evidence.contains(&root.logical_root_id)
                 && group_has_local_sink_presence(
                     &root.logical_root_id,
                     &sink_groups,
@@ -230,11 +244,14 @@ pub fn candidate_group_observation_evidence(
         })
         .map(|root| root.logical_root_id.clone())
         .collect::<BTreeSet<_>>();
+    let source_groups_with_current_owner_evidence =
+        source_groups_with_current_owner_evidence(source_status);
     let source_initial_audit_groups = source_status
         .concrete_roots
         .iter()
         .filter(|root| {
             source_concrete_root_blocks_materialized_observation(root)
+                && !source_groups_with_current_owner_evidence.contains(&root.logical_root_id)
                 && candidate_groups.contains(&root.logical_root_id)
                 && group_has_local_sink_presence(
                     &root.logical_root_id,
@@ -277,12 +294,7 @@ pub fn source_status_covers_readiness_groups(
     source_status: &SourceStatusSnapshot,
     readiness_groups: &BTreeSet<String>,
 ) -> bool {
-    let source_groups = source_status
-        .concrete_roots
-        .iter()
-        .filter(|root| source_concrete_root_has_current_owner_evidence(root))
-        .map(|root| root.logical_root_id.clone())
-        .collect::<BTreeSet<_>>();
+    let source_groups = source_groups_with_current_owner_evidence(source_status);
     readiness_groups.is_subset(&source_groups)
 }
 
@@ -329,12 +341,7 @@ pub fn materialized_observation_status_for_readiness_groups(
     }
     let mut evidence =
         candidate_group_observation_evidence(source_status, sink_status, readiness_groups);
-    let source_groups = source_status
-        .concrete_roots
-        .iter()
-        .filter(|root| source_concrete_root_has_current_owner_evidence(root))
-        .map(|root| root.logical_root_id.clone())
-        .collect::<BTreeSet<_>>();
+    let source_groups = source_groups_with_current_owner_evidence(source_status);
     for missing_group in readiness_groups.difference(&source_groups) {
         evidence.initial_audit_groups.insert(missing_group.clone());
     }
@@ -1144,6 +1151,66 @@ mod tests {
         let evidence =
             candidate_group_observation_evidence(&source_status, &sink_status, &readiness_groups);
         assert!(evidence.initial_audit_groups.is_empty());
+        assert!(materialized_status_cache_is_ready(
+            &source_status,
+            &sink_status,
+            &readiness_groups,
+        ));
+    }
+
+    #[test]
+    fn readiness_group_observation_uses_group_level_current_audit_evidence() {
+        let completed_primary = concrete_root("nfs1", true);
+        let mut redundant_pending_primary = concrete_root("nfs1", true);
+        redundant_pending_primary.root_key = "nfs1@node-b".to_string();
+        redundant_pending_primary.object_ref = "node-b::nfs1".to_string();
+        redundant_pending_primary.rescan_pending = true;
+        redundant_pending_primary.last_rescan_requested_at_us = Some(30);
+        redundant_pending_primary.last_audit_started_at_us = None;
+        redundant_pending_primary.last_audit_completed_at_us = None;
+        redundant_pending_primary.last_audit_duration_ms = None;
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".to_string(),
+                status: "ready".to_string(),
+                active_members: 3,
+                matched_grants: 3,
+                coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            }],
+            concrete_roots: vec![completed_primary, redundant_pending_primary],
+            ..SourceStatusSnapshot::default()
+        };
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![ready_sink_group("nfs1")],
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..SinkStatusSnapshot::default()
+        };
+        let readiness_groups = BTreeSet::from(["nfs1".to_string()]);
+
+        let candidate_evidence =
+            candidate_group_observation_evidence(&source_status, &sink_status, &readiness_groups);
+        assert!(
+            candidate_evidence.initial_audit_groups.is_empty(),
+            "a redundant pending concrete primary must not block a group that already has current owner audit evidence: {candidate_evidence:?}"
+        );
+        let materialized_evidence =
+            materialized_query_observation_evidence(&source_status, &sink_status);
+        assert!(
+            materialized_evidence.initial_audit_groups.is_empty(),
+            "materialized query observation must use the same group-level source evidence: {materialized_evidence:?}"
+        );
+        assert_eq!(
+            materialized_observation_status_for_readiness_groups(
+                &source_status,
+                &sink_status,
+                &readiness_groups,
+            )
+            .state,
+            ObservationState::TrustedMaterialized,
+        );
         assert!(materialized_status_cache_is_ready(
             &source_status,
             &sink_status,
