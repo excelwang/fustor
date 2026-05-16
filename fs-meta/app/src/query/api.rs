@@ -2084,6 +2084,39 @@ fn current_owner_candidate_nodes_from_source_observability(
     nodes.into_iter().map(NodeId).collect()
 }
 
+fn current_owner_candidate_nodes_from_source_status(
+    source_status: Option<&SourceStatusSnapshot>,
+    groups: &BTreeSet<String>,
+) -> Vec<NodeId> {
+    let mut nodes = BTreeSet::<String>::new();
+    let Some(source_status) = source_status else {
+        return Vec::new();
+    };
+    for root in source_status
+        .concrete_roots
+        .iter()
+        .filter(|root| root.active && root.scan_enabled && groups.contains(&root.logical_root_id))
+        .filter(|root| {
+            root.forwarded_batch_count > 0
+                || root.forwarded_event_count > 0
+                || root.forwarded_path_event_count > 0
+                || root.last_forwarded_at_us.is_some()
+                || root.emitted_batch_count > 0
+                || root.emitted_event_count > 0
+                || root.emitted_path_event_count > 0
+                || root.last_emitted_at_us.is_some()
+                || root.last_audit_completed_at_us.is_some()
+        })
+    {
+        if let Some((node_id, _group_id)) = root.object_ref.split_once("::")
+            && !node_id.is_empty()
+        {
+            nodes.insert(node_id.to_string());
+        }
+    }
+    nodes.into_iter().map(NodeId).collect()
+}
+
 fn merge_current_sink_owner_candidate_nodes(
     observed: Vec<NodeId>,
     configured: Vec<NodeId>,
@@ -2095,6 +2128,26 @@ fn merge_current_sink_owner_candidate_nodes(
         .filter(|node| !node.is_empty())
         .collect::<BTreeSet<_>>();
     nodes.into_iter().map(NodeId).collect()
+}
+
+fn current_owner_candidate_nodes_for_groups_and_source_status(
+    source: &SourceFacade,
+    source_status: Option<&SourceStatusSnapshot>,
+    groups: &BTreeSet<String>,
+) -> std::result::Result<Vec<NodeId>, QueryWorkerObservationFailure> {
+    let observed_candidate_nodes =
+        current_owner_candidate_nodes_from_source_status(source_status, groups);
+    let configured_candidate_nodes = match current_owner_candidate_nodes_for_groups(source, groups) {
+        Ok(nodes) => nodes,
+        Err(err) if observed_candidate_nodes.is_empty() => {
+            return Err(QueryWorkerObservationFailure::from(err));
+        }
+        Err(_) => Vec::new(),
+    };
+    Ok(merge_current_sink_owner_candidate_nodes(
+        observed_candidate_nodes,
+        configured_candidate_nodes,
+    ))
 }
 
 fn collect_nodes_for_groups_from_schedule(
@@ -9465,6 +9518,7 @@ fn selected_group_candidate_owner_events_have_data(
 async fn query_materialized_events_via_candidate_owner_nodes(
     policy: &ProjectionPolicy,
     source: &SourceFacade,
+    source_status: Option<&SourceStatusSnapshot>,
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
     params: &InternalQueryRequest,
@@ -9476,9 +9530,9 @@ async fn query_materialized_events_via_candidate_owner_nodes(
     }
 
     let groups = BTreeSet::from([group_id.to_string()]);
-    let candidate_nodes = current_owner_candidate_nodes_for_groups(source, &groups)
-        .map_err(QueryWorkerObservationFailure::from)
-        .map_err(QueryWorkerObservationFailure::into_error)?;
+    let candidate_nodes =
+        current_owner_candidate_nodes_for_groups_and_source_status(source, source_status, &groups)
+            .map_err(QueryWorkerObservationFailure::into_error)?;
     if candidate_nodes.is_empty() {
         return Ok(None);
     }
@@ -9543,6 +9597,33 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                     group_id,
                     params.scope.path.as_slice(),
                 ));
+            }
+            if let Some(group_id) = params.scope.selected_group.as_deref()
+                && selected_group_sink_status_is_owner_collection_gap(
+                    selected_group_sink_status.as_ref(),
+                    group_id,
+                )
+            {
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .unwrap_or_default();
+                if remaining.is_zero() {
+                    return Err(CnxError::Timeout);
+                }
+                if let Some(events) = query_materialized_events_via_candidate_owner_nodes(
+                    policy,
+                    source.as_ref(),
+                    selected_group_source_status,
+                    boundary.clone(),
+                    origin_id.clone(),
+                    &params,
+                    group_id,
+                    group_plan.owner_route_plan(remaining),
+                )
+                .await?
+                {
+                    return Ok(events);
+                }
             }
             if let Some(group_id) = params.scope.selected_group.as_deref()
                 && let Some(node_id) = materialized_owner_node_for_group_with_failure(
@@ -9678,32 +9759,6 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                         return Ok(proxy_events);
                     }
                     Err(err) => return Err(err),
-                }
-            }
-            if let Some(group_id) = params.scope.selected_group.as_deref()
-                && selected_group_sink_status_is_owner_collection_gap(
-                    selected_group_sink_status.as_ref(),
-                    group_id,
-                )
-            {
-                let remaining = deadline
-                    .checked_duration_since(tokio::time::Instant::now())
-                    .unwrap_or_default();
-                if remaining.is_zero() {
-                    return Err(CnxError::Timeout);
-                }
-                if let Some(events) = query_materialized_events_via_candidate_owner_nodes(
-                    policy,
-                    source.as_ref(),
-                    boundary.clone(),
-                    origin_id.clone(),
-                    &params,
-                    group_id,
-                    group_plan.owner_route_plan(remaining),
-                )
-                .await?
-                {
-                    return Ok(events);
                 }
             }
             if params.scope.selected_group.is_some() {
