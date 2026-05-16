@@ -435,6 +435,12 @@ impl From<&ApiState> for RootsPutSecondWaveFollowupContext {
     }
 }
 
+impl RootsPutSecondWaveFollowupContext {
+    fn has_status_collection_boundary(&self) -> bool {
+        self.query_runtime_boundary.is_some() || self.runtime_boundary.is_some()
+    }
+}
+
 async fn roots_put_second_wave_context_with_current_generation(
     state: &ApiState,
 ) -> Result<RootsPutSecondWaveFollowupContext, ApiError> {
@@ -2386,7 +2392,7 @@ fn spawn_roots_put_source_second_wave_followup(
     roots: Vec<RootSpec>,
     initial_target_node_ids: BTreeSet<String>,
 ) {
-    if roots.is_empty() || context.query_runtime_boundary.is_none() {
+    if roots.is_empty() || !context.has_status_collection_boundary() {
         return;
     }
 
@@ -6118,7 +6124,7 @@ async fn wait_manual_rescan_current_roots_runtime_scope_readiness(
     grants: &[GrantedMountRoot],
 ) -> Result<Option<BTreeSet<String>>, ApiError> {
     let context = roots_put_second_wave_context_with_current_generation(state).await?;
-    if roots.is_empty() || context.query_runtime_boundary.is_none() {
+    if roots.is_empty() || !context.has_status_collection_boundary() {
         return Ok(None);
     }
     let source_status_probe_seed_node_ids =
@@ -16300,7 +16306,7 @@ mod tests {
         let state = ApiState {
             node_id: NodeId("node-d".into()),
             runtime_boundary: Some(boundary.clone()),
-            query_runtime_boundary: Some(boundary.clone()),
+            query_runtime_boundary: None,
             force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
             force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
             source,
