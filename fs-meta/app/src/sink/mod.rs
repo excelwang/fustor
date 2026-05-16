@@ -1926,6 +1926,7 @@ impl SinkFileMeta {
             let query_stream_receive_enabled = stream_receive_enabled.clone();
             let query_unit_control = unit_control.clone();
             if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_QUERY) {
+                let route_key_for_request = route.0.clone();
                 log::info!(
                     "bound route listening on {}.{} for sink {}",
                     ROUTE_TOKEN_FS_META,
@@ -1951,6 +1952,7 @@ impl SinkFileMeta {
                             let query_stream_receive_enabled = query_stream_receive_enabled.clone();
                             let query_unit_control = query_unit_control.clone();
                             let query_node_id = query_node_id.clone();
+                            let route_key_for_request = route_key_for_request.clone();
                             async move {
                                 let mut responses = Vec::new();
                                 for req in requests {
@@ -1982,6 +1984,21 @@ impl SinkFileMeta {
                                             shutdown: CancellationToken::new(),
                                             endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
                                         };
+                                        match sink_impl.runtime_route_accepts_materialized_request(
+                                            &route_key_for_request,
+                                            &params,
+                                        ) {
+                                            Ok(true) => {}
+                                            Ok(false) => continue,
+                                            Err(err) => {
+                                                log::warn!(
+                                                    "sink query route scope check failed route={}: {:?}",
+                                                    route_key_for_request,
+                                                    err
+                                                );
+                                                continue;
+                                            }
+                                        }
                                         let mut events = sink_impl
                                             .materialized_query(&params)
                                             .unwrap_or_default();
@@ -2133,6 +2150,31 @@ impl SinkFileMeta {
                                             shutdown: CancellationToken::new(),
                                             endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
                                         };
+                                        match sink_impl.runtime_route_accepts_materialized_request(
+                                            &route_key_for_trace,
+                                            &params,
+                                        ) {
+                                            Ok(true) => {}
+                                            Ok(false) => {
+                                                if debug_sink_query_route_trace_enabled() {
+                                                    eprintln!(
+                                                        "fs_meta_sink: internal query route_suppressed route={} correlation={:?} selected_group={:?}",
+                                                        route_key_for_trace,
+                                                        req.metadata().correlation_id,
+                                                        params.scope.selected_group,
+                                                    );
+                                                }
+                                                continue;
+                                            }
+                                            Err(err) => {
+                                                log::warn!(
+                                                    "sink internal query route scope check failed route={}: {:?}",
+                                                    route_key_for_trace,
+                                                    err
+                                                );
+                                                continue;
+                                            }
+                                        }
                                         let mut events = sink_impl
                                             .materialized_query(&params)
                                             .unwrap_or_default();
@@ -2414,6 +2456,7 @@ impl SinkFileMeta {
                 &boundary,
                 "sink.start_runtime_endpoints.route_present.query",
             ) {
+                let route_key_for_request = route.0.clone();
                 eprintln!(
                     "fs_meta_sink: start_runtime_endpoints query spawn begin node={} route={} elapsed_ms={}",
                     node_id_cloned.0,
@@ -2445,6 +2488,7 @@ impl SinkFileMeta {
                             let query_stream_receive_enabled = query_stream_receive_enabled.clone();
                             let query_unit_control = query_unit_control.clone();
                             let query_node_id = query_node_id.clone();
+                            let route_key_for_request = route_key_for_request.clone();
                             async move {
                                 let mut responses = Vec::new();
                                 for req in requests {
@@ -2470,6 +2514,21 @@ impl SinkFileMeta {
                                             shutdown: CancellationToken::new(),
                                             endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
                                         };
+                                        match sink_impl.runtime_route_accepts_materialized_request(
+                                            &route_key_for_request,
+                                            &params,
+                                        ) {
+                                            Ok(true) => {}
+                                            Ok(false) => continue,
+                                            Err(err) => {
+                                                log::warn!(
+                                                    "sink query route scope check failed route={}: {:?}",
+                                                    route_key_for_request,
+                                                    err
+                                                );
+                                                continue;
+                                            }
+                                        }
                                         let mut events = sink_impl
                                             .materialized_query(&params)
                                             .unwrap_or_default();
@@ -2620,6 +2679,31 @@ impl SinkFileMeta {
                                         shutdown: CancellationToken::new(),
                                         endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
                                     };
+                                    match sink_impl.runtime_route_accepts_materialized_request(
+                                        &route_key_for_trace,
+                                        &params,
+                                    ) {
+                                        Ok(true) => {}
+                                        Ok(false) => {
+                                            if debug_sink_query_route_trace_enabled() {
+                                                eprintln!(
+                                                    "fs_meta_sink: internal query route_suppressed route={} correlation={:?} selected_group={:?}",
+                                                    route_key_for_trace,
+                                                    req.metadata().correlation_id,
+                                                    params.scope.selected_group,
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            log::warn!(
+                                                "sink internal query route scope check failed route={}: {:?}",
+                                                route_key_for_trace,
+                                                err
+                                            );
+                                            continue;
+                                        }
+                                    }
                                     let mut events =
                                         sink_impl.materialized_query(&params).unwrap_or_default();
                                     if debug_sink_query_route_trace_enabled() {
@@ -2743,6 +2827,20 @@ impl SinkFileMeta {
                                     shutdown: CancellationToken::new(),
                                     endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
                                 };
+                                match sink_impl
+                                    .runtime_route_accepts_status_request(&route_key_for_trace)
+                                {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(err) => {
+                                        log::warn!(
+                                            "sink status route scope check failed route={}: {:?}",
+                                            route_key_for_trace,
+                                            err
+                                        );
+                                        continue;
+                                    }
+                                }
                                 let snapshot = sink_impl.status_snapshot().unwrap_or_else(|err| {
                                     log::warn!(
                                         "sink status route snapshot failed route={}: {:?}",
@@ -3243,6 +3341,49 @@ impl SinkFileMeta {
                 .filter(|scope_id| !scope_id.trim().is_empty())
                 .collect(),
         ))
+    }
+
+    fn runtime_route_group_ids(&self, route_key: &str) -> Result<Option<BTreeSet<String>>> {
+        if !self.unit_control.has_runtime_state() {
+            return Ok(None);
+        }
+        let Some((_, bound_scopes)) = self
+            .unit_control
+            .active_route_state(SINK_RUNTIME_UNIT_ID, route_key)?
+        else {
+            return Ok(Some(BTreeSet::new()));
+        };
+        Ok(Some(
+            bound_scopes
+                .into_iter()
+                .map(|scope| scope.scope_id)
+                .filter(|scope_id| !scope_id.trim().is_empty())
+                .collect(),
+        ))
+    }
+
+    fn runtime_route_accepts_materialized_request(
+        &self,
+        route_key: &str,
+        request: &InternalQueryRequest,
+    ) -> Result<bool> {
+        let Some(groups) = self.runtime_route_group_ids(route_key)? else {
+            return Ok(true);
+        };
+        if groups.is_empty() {
+            return Ok(false);
+        }
+        Ok(request
+            .scope
+            .selected_group
+            .as_deref()
+            .is_none_or(|group_id| groups.contains(group_id)))
+    }
+
+    fn runtime_route_accepts_status_request(&self, route_key: &str) -> Result<bool> {
+        Ok(self
+            .runtime_route_group_ids(route_key)?
+            .is_none_or(|groups| !groups.is_empty()))
     }
 
     pub(crate) fn snapshot_scheduled_group_ids(&self) -> Result<Option<BTreeSet<String>>> {

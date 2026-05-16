@@ -4247,14 +4247,15 @@ async fn query_materialized_events_with_sink_status_snapshot(
 
 async fn route_materialized_events_via_node(
     boundary: Arc<dyn ChannelIoSubset>,
-    node_id: NodeId,
+    caller_node_id: NodeId,
+    owner_node_id: NodeId,
     params: InternalQueryRequest,
     plan: SelectedGroupOwnerRoutePlan,
 ) -> Result<Vec<Event>, CnxError> {
-    let owner_node = node_id.0.clone();
+    let owner_node = owner_node_id.0.clone();
     let adapter = exchange_host_adapter(
         boundary,
-        node_id,
+        caller_node_id,
         sink_query_route_bindings_for(&owner_node),
     );
     if debug_materialized_route_capture_enabled() {
@@ -4297,19 +4298,14 @@ async fn route_materialized_events_via_node(
 }
 
 async fn query_materialized_events_via_selected_group_owner_node(
-    sink: &Arc<SinkFacade>,
+    _sink: &Arc<SinkFacade>,
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
     node_id: NodeId,
     params: InternalQueryRequest,
     plan: SelectedGroupOwnerRoutePlan,
 ) -> Result<Vec<Event>, CnxError> {
-    if node_id == origin_id {
-        return query_local_materialized_events_with_failure(sink, &params, plan.route_timeout())
-            .await
-            .map_err(QueryWorkerObservationFailure::into_error);
-    }
-    route_materialized_events_via_node(boundary, node_id, params, plan).await
+    route_materialized_events_via_node(boundary, origin_id, node_id, params, plan).await
 }
 
 fn selected_group_sink_status_reports_live_materialized_group(

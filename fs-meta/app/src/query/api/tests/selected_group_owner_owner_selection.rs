@@ -1,5 +1,5 @@
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn selected_group_materialized_route_short_circuits_locally_when_owner_is_caller_node() {
+async fn selected_group_materialized_route_uses_owner_route_when_owner_is_caller_node() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_a_root = tmp.path().join("node-a");
     fs::create_dir_all(node_a_root.join("layout-a")).expect("create node-a dir");
@@ -92,7 +92,7 @@ async fn selected_group_materialized_route_short_circuits_locally_when_owner_is_
 
     assert!(
         result.is_ok(),
-        "route backend must query the local sink when owner node equals caller node; owner_route_calls={} err={:?}",
+        "route backend must query the owner-scoped sink route even when owner node equals caller node; owner_route_calls={} err={:?}",
         boundary.send_batch_count(&node_a_route.0),
         result.as_ref().err(),
     );
@@ -103,13 +103,16 @@ async fn selected_group_materialized_route_short_circuits_locally_when_owner_is_
         b"/layout-a",
     )
     .expect("decode same-node owner route response");
-    assert!(!payload.root.exists);
+    assert!(payload.root.exists);
     assert_eq!(
         boundary.send_batch_count(&node_a_route.0),
-        0,
-        "same-node owner must short-circuit to the local sink instead of fanouting through its own owner-scoped route"
+        1,
+        "same-node owner must still use the owner-scoped route because the route backend may use an external sink worker on the same host"
     );
-    assert!(observed_groups.lock().expect("observed groups lock").is_empty());
+    assert_eq!(
+        observed_groups.lock().expect("observed groups lock").as_slice(),
+        &["nfs1".to_string()]
+    );
 
     node_a_endpoint.shutdown(Duration::from_secs(2)).await;
 }

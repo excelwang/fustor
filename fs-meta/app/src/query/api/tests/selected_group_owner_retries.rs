@@ -38,6 +38,7 @@ async fn sequential_selected_group_materialized_route_reaches_owner_twice_for_sa
 
     let first = route_materialized_events_via_node(
         boundary.clone(),
+        NodeId("api-node".to_string()),
         NodeId("node-a".to_string()),
         build_materialized_tree_request(
             b"/force-find-stress",
@@ -51,6 +52,7 @@ async fn sequential_selected_group_materialized_route_reaches_owner_twice_for_sa
     .await;
     let second = route_materialized_events_via_node(
         boundary.clone(),
+        NodeId("api-node".to_string()),
         NodeId("node-a".to_string()),
         build_materialized_tree_request(
             b"/force-find-stress",

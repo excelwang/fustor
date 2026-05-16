@@ -6182,6 +6182,7 @@ async fn selected_group_materialized_route_targets_owner_scoped_internal_route()
 
     let result = route_materialized_events_via_node(
         boundary.clone(),
+        NodeId("api-node".to_string()),
         NodeId("node-a".to_string()),
         build_materialized_tree_request(
             b"/force-find-stress",
@@ -6247,6 +6248,7 @@ async fn selected_group_materialized_route_waits_for_owner_payload_instead_of_se
 
     let events = route_materialized_events_via_node(
         boundary.clone(),
+        NodeId("api-node".to_string()),
         NodeId("node-a".to_string()),
         build_materialized_tree_request(
             b"/force-find-stress",
@@ -7976,6 +7978,7 @@ async fn route_materialized_events_via_node_accepts_immediate_reply_with_timeout
 
     let result = route_materialized_events_via_node(
         boundary.clone(),
+        NodeId("api-node".to_string()),
         NodeId("node-a".to_string()),
         build_materialized_tree_request(
             b"/data",
@@ -8048,8 +8051,9 @@ async fn route_materialized_events_via_node_does_not_hold_immediate_reply_open_f
     let result = tokio::time::timeout(
         Duration::from_millis(250),
         route_materialized_events_via_node(
-            boundary.clone(),
-            NodeId("node-a".to_string()),
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+        NodeId("node-a".to_string()),
             build_materialized_tree_request(
                 b"/data",
                 false,

@@ -2168,6 +2168,92 @@ fn runtime_managed_sink_without_active_scope_preserves_groups_across_logical_roo
     );
 }
 
+#[test]
+fn runtime_managed_sink_routes_do_not_serve_groups_before_active_route_scope() {
+    let mut cfg = SourceConfig::default();
+    cfg.roots = vec![
+        RootSpec::new("nfs1", "/mnt/nfs1"),
+        RootSpec::new("nfs2", "/mnt/nfs2"),
+    ];
+    cfg.host_object_grants = vec![
+        granted_mount_root("node-a::exp-a", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+        granted_mount_root("node-b::exp-b", "node-b", "10.0.0.12", "/mnt/nfs2", true),
+    ];
+    let sink = SinkFileMeta::with_boundaries(
+        NodeId("node-a".to_string()),
+        Some(Arc::new(NoopBoundary)),
+        cfg,
+    )
+    .expect("init runtime-managed sink");
+    let query_route = sink_query_request_route_for("node-a").0;
+    let status_route = sink_status_request_route_for("node-a").0;
+    let request_nfs1 = InternalQueryRequest::materialized(
+        QueryOp::Tree,
+        QueryScope {
+            path: b"/".to_vec(),
+            recursive: true,
+            max_depth: None,
+            selected_group: Some("nfs1".to_string()),
+        },
+        Some(TreeQueryOptions::default()),
+    );
+    let request_nfs2 = InternalQueryRequest::materialized(
+        QueryOp::Tree,
+        QueryScope {
+            path: b"/".to_vec(),
+            recursive: true,
+            max_depth: None,
+            selected_group: Some("nfs2".to_string()),
+        },
+        Some(TreeQueryOptions::default()),
+    );
+
+    assert!(
+        !sink
+            .runtime_route_accepts_materialized_request(&query_route, &request_nfs1)
+            .expect("query route scope check"),
+        "a runtime-managed sink route without an active scope must not publish an empty materialized response for nfs1"
+    );
+    assert!(
+        !sink
+            .runtime_route_accepts_status_request(&status_route)
+            .expect("status route scope check"),
+        "a runtime-managed sink-status route without an active scope must not publish empty owner evidence"
+    );
+
+    sink.apply_activate_signal(
+        SinkRuntimeUnit::Sink,
+        &query_route,
+        1,
+        &[bound_scope_with_resources("nfs1", &["node-a::exp-a"])],
+    )
+    .expect("activate query route for nfs1");
+    sink.apply_activate_signal(
+        SinkRuntimeUnit::Sink,
+        &status_route,
+        1,
+        &[bound_scope_with_resources("nfs1", &["node-a::exp-a"])],
+    )
+    .expect("activate status route for nfs1");
+
+    assert!(
+        sink.runtime_route_accepts_materialized_request(&query_route, &request_nfs1)
+            .expect("active query route scope check"),
+        "an active sink owner route should serve its assigned group"
+    );
+    assert!(
+        !sink
+            .runtime_route_accepts_materialized_request(&query_route, &request_nfs2)
+            .expect("non-owner query route scope check"),
+        "an active sink owner route for nfs1 must not answer nfs2 with an empty tree"
+    );
+    assert!(
+        sink.runtime_route_accepts_status_request(&status_route)
+            .expect("active status route scope check"),
+        "an active sink-status owner route should publish owner evidence for its assigned group"
+    );
+}
+
 #[tokio::test]
 async fn activate_limits_sink_state_to_bound_scopes_only() {
     let mut cfg = SourceConfig::default();
