@@ -8581,16 +8581,14 @@ impl SourceWorkerClientHandle {
             control_state.replay_signals()
         };
         let snapshot = self.with_cache_mut(|cache| {
-            let current_roots = cache
-                .logical_roots
-                .clone()
-                .filter(|roots| !roots.is_empty())
-                .unwrap_or_else(|| self.config.roots.clone());
-            let current_grants = cache
-                .grants
-                .clone()
-                .filter(|grants| !grants.is_empty())
-                .unwrap_or_else(|| self.config.host_object_grants.clone());
+            let current_roots =
+                manual_rescan_app_route_current_roots(cache, &self.config, &retained_signals);
+            let current_grants = manual_rescan_app_route_current_grants(
+                cache,
+                &self.config,
+                &current_roots,
+                &retained_signals,
+            );
             cache.logical_roots = Some(current_roots.clone());
             cache.grants = Some(current_grants.clone());
             if !retained_signals.is_empty() {
@@ -9732,6 +9730,67 @@ fn manual_rescan_delivery_status_from_cache(
         },
         source_primary_by_group,
     ))
+}
+
+fn retained_source_control_scope_root_ids(
+    signals: &[SourceControlSignal],
+) -> std::collections::BTreeSet<String> {
+    signals
+        .iter()
+        .filter_map(|signal| match signal {
+            SourceControlSignal::Activate { bound_scopes, .. } => Some(bound_scopes),
+            _ => None,
+        })
+        .flat_map(|bound_scopes| bound_scopes.iter())
+        .map(|scope| scope.scope_id.clone())
+        .collect()
+}
+
+fn manual_rescan_app_route_current_roots(
+    cache: &SourceWorkerSnapshotCache,
+    config: &SourceConfig,
+    retained_signals: &[SourceControlSignal],
+) -> Vec<RootSpec> {
+    let retained_scope_root_ids = retained_source_control_scope_root_ids(retained_signals);
+    if !retained_scope_root_ids.is_empty() {
+        let retained_roots = config
+            .roots
+            .iter()
+            .filter(|root| retained_scope_root_ids.contains(&root.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !retained_roots.is_empty() {
+            return retained_roots;
+        }
+    }
+    cache
+        .logical_roots
+        .clone()
+        .filter(|roots| !roots.is_empty())
+        .unwrap_or_else(|| config.roots.clone())
+}
+
+fn grants_cover_roots(roots: &[RootSpec], grants: &[GrantedMountRoot]) -> bool {
+    roots.iter().all(|root| {
+        grants
+            .iter()
+            .any(|grant| grant.active && root.selector.matches(grant))
+    })
+}
+
+fn manual_rescan_app_route_current_grants(
+    cache: &SourceWorkerSnapshotCache,
+    config: &SourceConfig,
+    current_roots: &[RootSpec],
+    retained_signals: &[SourceControlSignal],
+) -> Vec<GrantedMountRoot> {
+    if let Some(grants) = cache.grants.clone().filter(|grants| !grants.is_empty())
+        && (retained_source_control_scope_root_ids(retained_signals).is_empty()
+            || grants_cover_roots(current_roots, &grants))
+    {
+        return grants;
+    }
+    config.host_object_grants.clone()
 }
 
 fn cache_has_manual_rescan_route_receivable_evidence(

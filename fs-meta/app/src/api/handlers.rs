@@ -1709,10 +1709,8 @@ where
     let mut source_status_probe_targets_are_discovery_seed = source_only_manual_rescan
         && source_status_probe_seed_is_discovery
         && source_status_probe_node_ids.len() > 1;
-    let mut discovery_seed_generic_probe_attempted = false;
-    let mut prefer_scoped_source_probe = source_only_manual_rescan
-        && !source_status_probe_node_ids.is_empty()
-        && !source_status_probe_targets_are_discovery_seed;
+    let mut prefer_scoped_source_probe =
+        source_only_manual_rescan && !source_status_probe_node_ids.is_empty();
     let mut allow_local_scoped_source_probe = false;
 
     loop {
@@ -1835,12 +1833,8 @@ where
                     .collect::<Vec<_>>();
                 let scoped_probe_due =
                     prefer_scoped_source_probe || !source_status_probe_node_ids.is_empty();
-                let scoped_probe_due =
-                    scoped_probe_due && !source_status_probe_targets_are_discovery_seed;
-                let discovery_scoped_probe_due = source_status_probe_targets_are_discovery_seed
-                    && discovery_seed_generic_probe_attempted;
-                let run_scoped_source_collect = (scoped_probe_due || discovery_scoped_probe_due)
-                    && !scoped_target_node_ids.is_empty();
+                let run_scoped_source_collect =
+                    scoped_probe_due && !scoped_target_node_ids.is_empty();
                 let run_generic_source_collect = source_status_probe_targets_are_discovery_seed
                     || source_status_probe_node_ids.is_empty();
                 let mut scoped_source_collects = FuturesUnordered::new();
@@ -1898,9 +1892,6 @@ where
                         result = &mut source_collect, if !source_collect_done => {
                             source_collect_done = true;
                             if let Some(result) = result {
-                                if source_status_probe_targets_are_discovery_seed {
-                                    discovery_seed_generic_probe_attempted = true;
-                                }
                                 match result {
                                     Ok((_source_snapshot, origin_snapshots, _per_origin, _runtime_scope)) => {
                                         let origin_snapshots =
@@ -2146,12 +2137,6 @@ where
                     ) {
                         if readiness.manual_rescan_delivery_target_node_ids.is_some()
                             || source_status_probe_node_ids.is_empty()
-                            || (source_status_probe_seed_is_discovery
-                                && manual_rescan_source_snapshot_ready_for_current_roots(
-                                    &expected_groups,
-                                    roots,
-                                    &readiness.source_snapshot,
-                                ))
                         {
                             return Ok(Some(readiness));
                         }
@@ -6183,7 +6168,7 @@ async fn wait_manual_rescan_current_roots_runtime_scope_readiness(
         false,
         local_fast_observation,
         local_merge_observation,
-        RootsPutControlReplayPolicy::AllowSingleRetry,
+        RootsPutControlReplayPolicy::ObserveOnly,
         manual_rescan_source_status_request_payload(),
         local_source_covers_current_roots,
     )
@@ -10645,15 +10630,6 @@ mod tests {
                 .lock()
                 .expect("sequenced source-status sent routes lock")
                 .clone()
-        }
-
-        fn generic_recv_count(&self) -> usize {
-            self.recv_batches_by_channel
-                .lock()
-                .expect("sequenced source-status recv batches lock")
-                .get(&format!("{}:reply", self.generic_request_channel))
-                .copied()
-                .unwrap_or(0)
         }
 
         fn with_generic_timeouts_before_replies(mut self, timeouts: usize) -> Self {
@@ -16502,15 +16478,16 @@ mod tests {
         .expect("current-roots readiness evidence");
 
         assert_eq!(
-            readiness.manual_rescan_delivery_target_node_ids, None,
-            "current-roots readiness must not claim scoped delivery proof before the outer target-proof phase"
+            readiness.manual_rescan_delivery_target_node_ids,
+            Some(BTreeSet::from(["node-b".to_string()])),
+            "current-roots fan-in must carry source-owned scoped delivery proof forward instead of discarding it for a second target probe"
         );
         let sent_routes = boundary.sent_routes();
         assert!(
-            !sent_routes
+            sent_routes
                 .iter()
                 .any(|route| route == &source_status_request_route_for("node-b").0),
-            "current-roots readiness should return runtime-scope evidence and leave scoped target proof to the outer rescan phase: {sent_routes:?}"
+            "current-roots readiness must probe the source-owned scoped status route before accepting delivery proof: {sent_routes:?}"
         );
         assert!(
             manual_rescan_source_snapshot_ready_for_current_roots(
@@ -16608,7 +16585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_rescan_current_roots_readiness_discovers_owner_before_scoped_probe_when_seed_has_multiple_members()
+    async fn manual_rescan_current_roots_readiness_probes_scoped_seed_when_seed_has_multiple_members()
      {
         let roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
         let node_a = "node-a-29844257657752633806422017";
@@ -16682,28 +16659,160 @@ mod tests {
         .expect("multi-member discovery seed readiness");
 
         assert_eq!(
-            readiness.manual_rescan_delivery_target_node_ids, None,
-            "manual-rescan discovery should return current-root owner evidence without claiming delivery proof"
+            readiness.manual_rescan_delivery_target_node_ids,
+            Some(BTreeSet::from([node_c.to_string()])),
+            "manual-rescan discovery must carry scoped source-owned delivery proof when the owner replies inside the fan-in window"
         );
-        let generic_route = default_route_bindings()
-            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
-            .expect("resolve generic source-status route")
-            .0;
         let node_c_route = source_status_request_route_for(node_c).0;
         let sent_routes = boundary.sent_routes();
-        assert_eq!(
-            sent_routes.first(),
-            Some(&generic_route),
-            "multi-member source-status seed is discovery input; generic status must run before scoped candidate probes: {sent_routes:?}"
-        );
         assert!(
-            !sent_routes.iter().any(|route| route == &node_c_route),
-            "generic discovery that already proves current roots should leave scoped delivery proof to the outer rescan phase: {sent_routes:?}"
+            sent_routes.iter().any(|route| route == &node_c_route),
+            "multi-member source-status seed must probe source-owned scoped routes instead of relying on generic aggregate status: {sent_routes:?}"
         );
     }
 
     #[tokio::test]
-    async fn manual_rescan_discovery_seed_survives_generic_timeout_without_candidate_failure() {
+    async fn manual_rescan_current_roots_readiness_fills_partial_generic_restore_with_scoped_seed()
+    {
+        let roots = vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+            RootSpec::new("nfs3", "/mnt/nfs3"),
+            RootSpec::new("nfs4", "/mnt/nfs4"),
+            RootSpec::new("nfs5", "/mnt/nfs5"),
+        ];
+        let grants = vec![
+            grant_for_node_root("node-a", "nfs1"),
+            grant_for_node_root("node-b", "nfs2"),
+            grant_for_node_root("node-c", "nfs3"),
+            grant_for_node_root("node-d", "nfs4"),
+            grant_for_node_root("node-e", "nfs5"),
+        ];
+        let ready_source = |node_id: &str, root_ids: &[&str]| {
+            let mut source = local_source_snapshot();
+            source.logical_roots = root_ids
+                .iter()
+                .map(|root_id| RootSpec::new(*root_id, format!("/mnt/{root_id}")))
+                .collect();
+            source.grants = grants.clone();
+            source.status.logical_roots.clear();
+            for root_id in root_ids {
+                set_live_group_primary_source_root(&mut source, root_id, node_id);
+            }
+            source
+                .status
+                .concrete_roots
+                .retain(|root| root_ids.contains(&root.logical_root_id.as_str()));
+            source.source_primary_by_group = root_ids
+                .iter()
+                .map(|root_id| ((*root_id).to_string(), format!("{node_id}::{root_id}")))
+                .collect();
+            source.scheduled_source_groups_by_node = BTreeMap::from([(
+                node_id.to_string(),
+                root_ids
+                    .iter()
+                    .map(|root_id| (*root_id).to_string())
+                    .collect(),
+            )]);
+            source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+            source.last_control_frame_signals_by_node = BTreeMap::from([(
+                node_id.to_string(),
+                root_ids
+                    .iter()
+                    .map(|root_id| {
+                        format!(
+                            "activate unit=runtime.exec.source route={}.req generation=1778860000001 scopes=[\"{}=>{}\"]",
+                            source_rescan_route_key_for(node_id),
+                            root_id,
+                            root_id
+                        )
+                    })
+                    .collect(),
+            )]);
+            annotate_manual_rescan_route_receivable_evidence(
+                &mut source,
+                &NodeId(node_id.to_string()),
+            );
+            source
+        };
+
+        let node_a_ready = ready_source("node-a", &["nfs1"]);
+        let node_d_ready = ready_source("node-d", &["nfs2", "nfs4"]);
+        let node_e_ready = ready_source("node-e", &["nfs3", "nfs5"]);
+        let generic_partial =
+            merge_source_observability_snapshots(vec![node_d_ready.clone(), node_e_ready.clone()]);
+        assert!(
+            !manual_rescan_source_snapshot_ready_for_current_roots(
+                &roots_put_second_wave_expected_groups(&roots),
+                &roots,
+                &generic_partial,
+            ),
+            "fixture must model a partial aggregate that is missing nfs1"
+        );
+
+        let boundary = Arc::new(NodeScopedSourceStatusCollectBoundary::new(
+            "node-e",
+            generic_partial,
+            vec![
+                ("node-a".to_string(), "node-a".to_string(), node_a_ready),
+                ("node-d".to_string(), "node-d".to_string(), node_d_ready),
+                ("node-e".to_string(), "node-e".to_string(), node_e_ready),
+            ],
+        ));
+        let context = RootsPutSecondWaveFollowupContext {
+            node_id: NodeId("api-node".into()),
+            runtime_boundary: Some(boundary.clone()),
+            query_runtime_boundary: Some(boundary.clone()),
+            roots_control_generation: 1,
+        };
+
+        let readiness = tokio::time::timeout(
+            Duration::from_secs(6),
+            wait_roots_put_second_wave_readiness_evidence_with_optional_local_source(
+                &context,
+                &roots,
+                BTreeSet::new(),
+                BTreeSet::from([
+                    "node-a".to_string(),
+                    "node-b".to_string(),
+                    "node-c".to_string(),
+                    "node-d".to_string(),
+                    "node-e".to_string(),
+                ]),
+                true,
+                false,
+                |_| std::future::ready(None::<SourceObservabilitySnapshot>),
+                |_| std::future::ready(None::<SourceObservabilitySnapshot>),
+                RootsPutControlReplayPolicy::ObserveOnly,
+                manual_rescan_source_status_request_payload(),
+                false,
+            ),
+        )
+        .await
+        .expect("partial generic restore fan-in must complete from scoped source-owned replies")
+        .expect("partial generic restore fan-in call")
+        .expect("partial generic restore fan-in readiness");
+
+        assert_eq!(
+            readiness.manual_rescan_delivery_target_node_ids,
+            Some(BTreeSet::from([
+                "node-a".to_string(),
+                "node-d".to_string(),
+                "node-e".to_string(),
+            ])),
+            "fan-in must combine source-owned scoped replies for all current roots"
+        );
+        let sent_routes = boundary.sent_routes();
+        assert!(
+            sent_routes
+                .iter()
+                .any(|route| route == &source_status_request_route_for("node-a").0),
+            "missing nfs1 must be proved through node-a source-owned status, not inferred from the partial generic aggregate: {sent_routes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_rescan_discovery_seed_uses_scoped_probe_without_waiting_for_generic_timeout() {
         let roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
         let node_a = "node-a-29844287386637722332430337";
         let node_b = "node-b-29844287386637722332430337";
@@ -16774,7 +16883,7 @@ mod tests {
             ),
         )
         .await
-        .expect("generic timeout must not promote discovery seed to broad scoped probing")
+        .expect("scoped source-status proof must not wait for generic aggregate timeout")
         .expect("manual-rescan discovery call")
         .expect("manual-rescan discovery readiness");
 
@@ -16783,22 +16892,11 @@ mod tests {
             Some(BTreeSet::from([node_c.to_string()])),
             "manual-rescan readiness should discover the runtime owner after a transient generic timeout"
         );
-        let node_a_route = source_status_request_route_for(node_a).0;
-        let node_b_route = source_status_request_route_for(node_b).0;
         let node_c_route = source_status_request_route_for(node_c).0;
         let sent_routes = boundary.sent_routes();
         assert!(
-            boundary.generic_recv_count() >= 2,
-            "generic discovery must continue receiving after the first timeout before scoped proof: {sent_routes:?}"
-        );
-        assert!(
             sent_routes.iter().any(|route| route == &node_c_route),
             "discovered owner should be scoped-probed for delivery proof: {sent_routes:?}"
-        );
-        assert!(
-            !sent_routes.iter().any(|route| route == &node_a_route)
-                && sent_routes.iter().any(|route| route == &node_b_route),
-            "local candidate stays on local observation, while remote candidate timeout is tolerated during discovery: {sent_routes:?}"
         );
     }
 
