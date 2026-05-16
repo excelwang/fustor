@@ -118,6 +118,202 @@ async fn selected_group_materialized_route_uses_owner_route_when_owner_is_caller
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_group_materialized_route_fans_out_candidate_owners_when_sink_status_is_fully_empty(
+) {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a");
+    let node_c_root = tmp.path().join("node-c");
+    fs::create_dir_all(node_a_root.join("layout")).expect("create node-a dir");
+    fs::create_dir_all(node_c_root.join("layout")).expect("create node-c dir");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs2".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_a_root,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-c::nfs2".to_string(),
+            host_ref: "node-c".to_string(),
+            host_ip: "10.0.0.3".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_c_root,
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let source = source_facade_with_group("nfs2", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let node_a_route = sink_query_request_route_for("node-a");
+    let node_c_route = sink_query_request_route_for("node-c");
+    let proxy_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
+        .expect("resolve sink-query-proxy route");
+
+    let mut node_a_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_a_route.clone(),
+        "test-empty-status-node-a-candidate-sink-query-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            requests
+                .into_iter()
+                .map(|req| {
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(
+                        req.payload_bytes(),
+                    )
+                    .expect("decode node-a candidate query request");
+                    let group_id = params
+                        .scope
+                        .selected_group
+                        .clone()
+                        .expect("selected group for node-a candidate request");
+                    mk_event_with_correlation(
+                        &group_id,
+                        req.metadata()
+                            .correlation_id
+                            .expect("node-a request correlation"),
+                        empty_materialized_tree_payload_for_test(&params.scope.path),
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+    let mut node_c_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_c_route.clone(),
+        "test-empty-status-node-c-candidate-sink-query-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            requests
+                .into_iter()
+                .map(|req| {
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(
+                        req.payload_bytes(),
+                    )
+                    .expect("decode node-c candidate query request");
+                    let group_id = params
+                        .scope
+                        .selected_group
+                        .clone()
+                        .expect("selected group for node-c candidate request");
+                    mk_event_with_correlation(
+                        &group_id,
+                        req.metadata()
+                            .correlation_id
+                            .expect("node-c request correlation"),
+                        real_materialized_tree_payload_for_test(&params.scope.path),
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+    let mut proxy_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        proxy_route.clone(),
+        "test-empty-status-generic-proxy-sink-query-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            requests
+                .into_iter()
+                .map(|req| {
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(
+                        req.payload_bytes(),
+                    )
+                    .expect("decode proxy query request");
+                    let group_id = params
+                        .scope
+                        .selected_group
+                        .clone()
+                        .expect("selected group for proxy request");
+                    mk_event_with_correlation(
+                        &group_id,
+                        req.metadata()
+                            .correlation_id
+                            .expect("proxy request correlation"),
+                        empty_materialized_tree_payload_for_test(&params.scope.path),
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+    );
+    let result = query_materialized_events_with_selected_group_owner_snapshot(
+        &state,
+        &ProjectionPolicy::default(),
+        build_materialized_tree_request(
+            b"/",
+            true,
+            None,
+            ReadClass::Materialized,
+            Some("nfs2".to_string()),
+        ),
+        Duration::from_secs(2),
+        Some(SinkStatusSnapshot::default()),
+        false,
+        false,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "selected-group materialized route should fan out to candidate owner routes when first sink status is fully empty; node_a_calls={} node_c_calls={} proxy_calls={} err={:?}",
+        boundary.send_batch_count(&node_a_route.0),
+        boundary.send_batch_count(&node_c_route.0),
+        boundary.send_batch_count(&proxy_route.0),
+        result.as_ref().err(),
+    );
+    let events = result.expect("empty-status candidate owner result");
+    let payload = decode_materialized_selected_group_response(
+        &events,
+        &ProjectionPolicy::default(),
+        "nfs2",
+        b"/",
+    )
+    .expect("decode empty-status candidate owner response");
+    assert!(
+        payload.root.exists,
+        "selected-group query must not settle empty while a candidate owner has materialized data"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&node_c_route.0),
+        1,
+        "candidate owner route with live materialized data should be queried"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&proxy_route.0),
+        0,
+        "fully empty sink status is a collection gap; generic proxy must not be the first selected-group answer"
+    );
+
+    node_a_endpoint.shutdown(Duration::from_secs(2)).await;
+    node_c_endpoint.shutdown(Duration::from_secs(2)).await;
+    proxy_endpoint.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_group_materialized_route_prefers_sink_scheduled_owner_over_stale_source_primary()
 {
     let tmp = tempfile::tempdir().expect("create tempdir");

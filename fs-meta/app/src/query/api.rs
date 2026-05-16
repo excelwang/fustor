@@ -4462,6 +4462,25 @@ fn selected_group_materialized_tree_payload_is_empty(
     saw_same_path_payload
 }
 
+fn selected_group_materialized_tree_payload_has_live_data(
+    policy: &ProjectionPolicy,
+    events: &[Event],
+    group_id: &str,
+    query_path: &[u8],
+) -> bool {
+    events.iter().any(|event| {
+        event_group_key(policy, event) == group_id
+            && matches!(
+                rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes()),
+                Ok(MaterializedQueryPayload::Tree(payload))
+                    if payload.root.path == query_path
+                        && (payload.root.exists
+                            || payload.root.has_children
+                            || !payload.entries.is_empty())
+            )
+    })
+}
+
 fn selected_group_materialized_tree_payload_omits_same_path(
     policy: &ProjectionPolicy,
     events: &[Event],
@@ -9416,6 +9435,73 @@ async fn finalize_selected_group_owner_success(
     .await
 }
 
+fn selected_group_candidate_owner_events_have_data(
+    policy: &ProjectionPolicy,
+    params: &InternalQueryRequest,
+    group_id: &str,
+    events: &[Event],
+) -> bool {
+    match params.op {
+        QueryOp::Tree => selected_group_materialized_tree_payload_has_live_data(
+            policy,
+            events,
+            group_id,
+            params.scope.path.as_slice(),
+        ),
+        QueryOp::Stats => events
+            .iter()
+            .any(|event| event_group_key(policy, event) == group_id),
+    }
+}
+
+async fn query_materialized_events_via_candidate_owner_nodes(
+    policy: &ProjectionPolicy,
+    source: &SourceFacade,
+    boundary: Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    params: &InternalQueryRequest,
+    group_id: &str,
+    plan: SelectedGroupOwnerRoutePlan,
+) -> Result<Option<Vec<Event>>, CnxError> {
+    if plan.route_timeout().is_zero() {
+        return Err(CnxError::Timeout);
+    }
+
+    let groups = BTreeSet::from([group_id.to_string()]);
+    let candidate_nodes = current_owner_candidate_nodes_for_groups(source, &groups)
+        .map_err(QueryWorkerObservationFailure::from)
+        .map_err(QueryWorkerObservationFailure::into_error)?;
+    if candidate_nodes.is_empty() {
+        return Ok(None);
+    }
+
+    let mut pending = candidate_nodes
+        .into_iter()
+        .map(|node_id| {
+            let boundary = boundary.clone();
+            let origin_id = origin_id.clone();
+            let params = params.clone();
+            async move {
+                let result =
+                    route_materialized_events_via_node(boundary, origin_id, node_id.clone(), params, plan)
+                        .await;
+                (node_id, result)
+            }
+        })
+        .collect::<FuturesUnordered<_>>();
+
+    while let Some((_node_id, result)) = pending.next().await {
+        let Ok(events) = result else {
+            continue;
+        };
+        if selected_group_candidate_owner_events_have_data(policy, params, group_id, &events) {
+            return Ok(Some(events));
+        }
+    }
+
+    Ok(None)
+}
+
 async fn query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
     state: &ApiState,
     policy: &ProjectionPolicy,
@@ -9584,6 +9670,31 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                         return Ok(proxy_events);
                     }
                     Err(err) => return Err(err),
+                }
+            }
+            if let Some(group_id) = params.scope.selected_group.as_deref()
+                && selected_group_sink_status
+                    .as_ref()
+                    .is_none_or(sink_status_snapshot_omits_all_groups_from_schedule)
+            {
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .unwrap_or_default();
+                if remaining.is_zero() {
+                    return Err(CnxError::Timeout);
+                }
+                if let Some(events) = query_materialized_events_via_candidate_owner_nodes(
+                    policy,
+                    source.as_ref(),
+                    boundary.clone(),
+                    origin_id.clone(),
+                    &params,
+                    group_id,
+                    group_plan.owner_route_plan(remaining),
+                )
+                .await?
+                {
+                    return Ok(events);
                 }
             }
             if params.scope.selected_group.is_some() {

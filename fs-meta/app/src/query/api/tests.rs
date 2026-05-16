@@ -6094,8 +6094,8 @@ async fn selected_group_materialized_route_uses_sink_query_on_chosen_node() {
             .lock()
             .expect("request nodes lock")
             .as_slice(),
-        &["node-a".to_string()],
-        "selected-group routed materialized query should call the internal sink-query endpoint as the chosen owner node"
+        &["node-d".to_string()],
+        "selected-group routed materialized query should target the chosen owner route while preserving the caller node in request metadata"
     );
     assert_eq!(
         result
