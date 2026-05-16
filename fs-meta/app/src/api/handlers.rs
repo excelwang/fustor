@@ -6120,6 +6120,7 @@ async fn wait_manual_rescan_current_roots_runtime_scope_readiness(
         derive_roots_put_control_target_node_ids_from_grants(&state.node_id, roots, grants);
     target_node_ids.extend(source_status_probe_seed_node_ids.iter().cloned());
     target_node_ids.extend(discover_roots_put_control_target_node_ids(state).await);
+    send_roots_put_control_second_wave(&context, roots, &target_node_ids).await?;
     let source = state.source.clone();
     let runtime_boundary = state.runtime_boundary.clone();
     let local_source_covers_current_roots =
@@ -16069,11 +16070,26 @@ mod tests {
             .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
             .expect("resolve source-status route")
             .0;
+        let source_roots_control_route = format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL);
+        let source_roots_control_index = sent_routes
+            .iter()
+            .position(|route| route == &source_roots_control_route)
+            .expect("manual rescan must publish current roots control before readiness fan-in");
         let node_b_rescan_route = format!("{}.req", source_rescan_route_key_for("node-b"));
         let node_b_rescan_index = sent_routes
             .iter()
             .position(|route| route == &node_b_rescan_route)
             .expect("manual rescan must deliver to node-b scoped route");
+        assert!(
+            source_roots_control_index < node_b_rescan_index,
+            "manual rescan must publish current roots control before scoped delivery: sent_routes={sent_routes:?}"
+        );
+        assert!(
+            sent_routes[source_roots_control_index + 1..node_b_rescan_index]
+                .iter()
+                .any(|route| route.as_str() == source_status_route),
+            "manual rescan must fan in source-status after current roots control and before scoped delivery: sent_routes={sent_routes:?}"
+        );
         let source_status_before_rescan = sent_routes[..node_b_rescan_index]
             .iter()
             .filter(|route| route.as_str() == source_status_route)
@@ -16306,11 +16322,15 @@ mod tests {
             "manual rescan must carry the origin-proven target set forward instead of recomputing from aggregate peer-observed readiness"
         );
         let sent_routes = boundary.sent_routes();
+        let first_roots_control_index = sent_routes
+            .iter()
+            .position(|route| route.contains("logical-roots-control"))
+            .expect("manual-rescan readiness must publish current roots control before fan-in");
         assert!(
-            !sent_routes
+            sent_routes[first_roots_control_index + 1..]
                 .iter()
-                .any(|route| route.contains("logical-roots-control")),
-            "manual-rescan readiness must observe first and leave control replay to bounded convergence repair: {sent_routes:?}"
+                .any(|route| route.contains("source-status")),
+            "manual-rescan readiness must observe source-status after publishing current roots control: {sent_routes:?}"
         );
     }
 
