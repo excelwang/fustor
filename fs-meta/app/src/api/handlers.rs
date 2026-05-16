@@ -1680,14 +1680,14 @@ where
     let mut last_summary = None::<String>;
     let mut last_per_origin = None::<String>;
     let mut last_runtime_scope = None::<String>;
-    let allow_control_resend = control_replay_policy
-        == RootsPutControlReplayPolicy::AllowSingleRetry
-        && !source_only_manual_rescan;
-    // roots_put already issued the initial logical-roots control wave before entering
-    // followup convergence. Delay the first resend so peer source/sink runtimes can
-    // materialize once before we consider another control replay. Keep this to a
-    // single retry: repeated full-wave logical-roots replays reset live peer
-    // source/sink realization and can prevent materialization from ever settling.
+    let allow_control_resend =
+        control_replay_policy == RootsPutControlReplayPolicy::AllowSingleRetry;
+    // roots_put and manual-rescan publish the initial logical-roots control wave
+    // before entering followup convergence. Delay the first resend so peer
+    // source/sink runtimes can materialize once before we consider another
+    // control replay. Keep this to a single retry: repeated full-wave
+    // logical-roots replays reset live peer source/sink realization and can
+    // prevent materialization from ever settling.
     let mut next_resend_at =
         tokio::time::Instant::now() + ROOTS_PUT_SOURCE_SECOND_WAVE_RESEND_INTERVAL;
     let mut resent_once = false;
@@ -2027,9 +2027,14 @@ where
                     && !source_status_probe_node_ids.is_empty()
                     && !run_generic_source_collect
                 {
-                    let fallback_budget = deadline
+                    let mut fallback_budget = deadline
                         .saturating_duration_since(tokio::time::Instant::now())
                         .min(status_route_timeout);
+                    if allow_control_resend && !resent_once {
+                        fallback_budget = fallback_budget.min(
+                            next_resend_at.saturating_duration_since(tokio::time::Instant::now()),
+                        );
+                    }
                     if !fallback_budget.is_zero() {
                         match collect_roots_put_source_second_wave_status_snapshot(
                             boundary.clone(),
@@ -2215,16 +2220,18 @@ where
 
         let now = tokio::time::Instant::now();
         if allow_control_resend && !resent_once && now >= next_resend_at {
-            control_target_node_ids.extend(
-                discover_roots_put_control_target_node_ids_with_boundary(
-                    context
-                        .query_runtime_boundary
-                        .clone()
-                        .or_else(|| context.runtime_boundary.clone()),
-                    context.node_id.clone(),
-                )
-                .await,
-            );
+            if !source_only_manual_rescan {
+                control_target_node_ids.extend(
+                    discover_roots_put_control_target_node_ids_with_boundary(
+                        context
+                            .query_runtime_boundary
+                            .clone()
+                            .or_else(|| context.runtime_boundary.clone()),
+                        context.node_id.clone(),
+                    )
+                    .await,
+                );
+            }
             send_roots_put_control_second_wave(context, roots, &control_target_node_ids).await?;
             if source_only_manual_rescan {
                 reset_manual_rescan_delivery_proof_after_roots_control_resend(
@@ -6170,7 +6177,7 @@ async fn wait_manual_rescan_current_roots_runtime_scope_readiness(
         false,
         local_fast_observation,
         local_merge_observation,
-        RootsPutControlReplayPolicy::ObserveOnly,
+        RootsPutControlReplayPolicy::AllowSingleRetry,
         manual_rescan_source_status_request_payload(),
         local_source_covers_current_roots,
     )
@@ -24233,7 +24240,7 @@ mod tests {
         };
 
         let wait_result = tokio::time::timeout(
-            ROOTS_PUT_SOURCE_SECOND_WAVE_RESEND_INTERVAL + Duration::from_millis(500),
+            ROOTS_PUT_SOURCE_SECOND_WAVE_RESEND_INTERVAL + Duration::from_secs(2),
             wait_roots_put_second_wave_readiness_evidence_with_optional_local_source(
                 &context,
                 &roots,
@@ -24269,6 +24276,61 @@ mod tests {
         assert!(
             roots_control_routes.is_empty(),
             "manual-rescan readiness must not replay roots-control while proving operation readiness: {roots_control_routes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_rescan_current_roots_readiness_allows_one_roots_control_retry_when_requested() {
+        let roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+        let node_a = "node-a-29861117325657588192239618";
+        let boundary = Arc::new(TimeoutSourceStatusCollectBoundary::default());
+        let context = RootsPutSecondWaveFollowupContext {
+            node_id: NodeId("api-node".into()),
+            runtime_boundary: Some(boundary.clone()),
+            query_runtime_boundary: Some(boundary.clone()),
+            roots_control_generation: 7,
+        };
+
+        let wait_result = tokio::time::timeout(
+            ROOTS_PUT_SOURCE_SECOND_WAVE_RESEND_INTERVAL + Duration::from_millis(500),
+            wait_roots_put_second_wave_readiness_evidence_with_optional_local_source(
+                &context,
+                &roots,
+                BTreeSet::from([node_a.to_string()]),
+                BTreeSet::from([node_a.to_string()]),
+                false,
+                false,
+                |_| std::future::ready(None::<SourceObservabilitySnapshot>),
+                |_| std::future::ready(None::<SourceObservabilitySnapshot>),
+                RootsPutControlReplayPolicy::AllowSingleRetry,
+                manual_rescan_source_status_request_payload(),
+                false,
+            ),
+        )
+        .await;
+
+        assert!(
+            wait_result.is_err(),
+            "fixture should keep manual-rescan readiness pending after the one roots-control retry"
+        );
+        let sent_routes = boundary.sent_routes();
+        let roots_control_routes = sent_routes
+            .iter()
+            .filter(|route| route.contains("logical-roots-control"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            roots_control_routes
+                .iter()
+                .any(|route| route == &format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL)),
+            "manual-rescan readiness must retry current source roots control once when requested: {sent_routes:?}"
+        );
+        assert!(
+            roots_control_routes
+                .iter()
+                .any(|route| route
+                    == &format!("{}.stream", source_roots_control_route_key_for(node_a))),
+            "manual-rescan readiness must retry node-scoped current source roots control once when requested: {sent_routes:?}"
         );
     }
 
