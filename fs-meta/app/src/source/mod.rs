@@ -777,7 +777,7 @@ impl SourceEndpointRuntime {
     }
 
     fn owns_source_status_routes(self) -> bool {
-        matches!(self, Self::Local)
+        matches!(self, Self::Local | Self::Worker)
     }
 }
 

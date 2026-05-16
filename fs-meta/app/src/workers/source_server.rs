@@ -1728,7 +1728,8 @@ mod tests {
     use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID};
     use crate::runtime::routes::{
         ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
-        ROUTE_KEY_SOURCE_ROOTS_CONTROL, source_rescan_request_route_for,
+        ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SOURCE_STATUS_INTERNAL,
+        source_rescan_request_route_for, source_status_request_route_for,
     };
     use crate::source::config::GrantedMountRoot;
     use crate::source::config::RootSpec;
@@ -3418,6 +3419,155 @@ mod tests {
         assert!(
             matches!(non_target_reply, Err(CnxError::Timeout)),
             "source worker runtime must not own peer scoped source-rescan drains: {non_target_reply:?}"
+        );
+
+        session
+            .on_close(&context)
+            .await
+            .expect("close source worker session");
+    }
+
+    #[tokio::test]
+    async fn worker_source_control_spawns_owned_external_scoped_status_route() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_watch_scan_root("nfs1", nfs1.clone())],
+            host_object_grants: vec![test_export("node-a::nfs1", nfs1)],
+            ..SourceConfig::default()
+        };
+
+        let boundary = Arc::new(LoopbackPublishBoundary::default());
+        let context = WorkerSessionContext::new(
+            boundary.clone(),
+            boundary.clone(),
+            in_memory_state_boundary(),
+        );
+        let state = Arc::new(Mutex::new(SourceWorkerState {
+            source: None,
+            pending_init: None,
+            pump_task: None,
+            pump_boundary: None,
+            runtime_endpoint_boundary: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        }));
+        let mut session = SourceWorkerSession {
+            state,
+            deferred_after_reply: Vec::new(),
+        };
+
+        session
+            .on_init(NodeId("node-a-123".to_string()), cfg, &context)
+            .await
+            .expect("init source worker session");
+        session
+            .on_start(&context)
+            .await
+            .expect("start source worker session");
+
+        let local_status_route = source_status_request_route_for("node-a-123").0;
+        let peer_status_route = source_status_request_route_for("node-b-456").0;
+        let scoped_wave = [
+            local_status_route.clone(),
+            peer_status_route.clone(),
+            format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+        ]
+        .into_iter()
+        .map(|route_key| {
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key,
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: vec!["node-a::nfs1".to_string()],
+                }],
+            }))
+            .expect("encode source scoped status route activate")
+        })
+        .collect::<Vec<_>>();
+
+        let response = session
+            .handle_request(
+                SourceWorkerRequest::OnControlFrame {
+                    envelopes: scoped_wave,
+                },
+                &context,
+            )
+            .await
+            .expect("handle source scoped status control frame");
+        assert!(matches!(
+            response,
+            WorkerLoopControl::Continue(SourceWorkerResponse::Ack)
+        ));
+
+        boundary
+            .channel_send(
+                BoundaryContext::default(),
+                ChannelSendRequest {
+                    channel_key: ChannelKey(local_status_route.clone()),
+                    events: vec![Event::new(
+                        EventMetadata {
+                            origin_id: NodeId("api-node".to_string()),
+                            timestamp_us: 0,
+                            logical_ts: None,
+                            correlation_id: Some(77),
+                            ingress_auth: None,
+                            trace: None,
+                        },
+                        crate::query::api::manual_rescan_source_status_request_payload(),
+                    )],
+                    timeout_ms: Some(100),
+                },
+            )
+            .await
+            .expect("send local scoped source status request");
+
+        let local_reply = boundary
+            .recv_route(&format!("{local_status_route}:reply"), 1000)
+            .await
+            .expect("source worker runtime should reply on its scoped source-status route");
+        assert!(
+            local_reply.iter().any(|event| {
+                event.metadata().origin_id.0 == "node-a-123"
+                    && rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes())
+                        .is_ok()
+            }),
+            "source worker runtime must own its externally addressed scoped source-status route: {local_reply:?}"
+        );
+
+        boundary
+            .channel_send(
+                BoundaryContext::default(),
+                ChannelSendRequest {
+                    channel_key: ChannelKey(peer_status_route.clone()),
+                    events: vec![Event::new(
+                        EventMetadata {
+                            origin_id: NodeId("api-node".to_string()),
+                            timestamp_us: 0,
+                            logical_ts: None,
+                            correlation_id: Some(78),
+                            ingress_auth: None,
+                            trace: None,
+                        },
+                        crate::query::api::manual_rescan_source_status_request_payload(),
+                    )],
+                    timeout_ms: Some(100),
+                },
+            )
+            .await
+            .expect("send non-target scoped source status request");
+        let non_target_reply = boundary
+            .recv_route(&format!("{peer_status_route}:reply"), 100)
+            .await;
+        assert!(
+            matches!(non_target_reply, Err(CnxError::Timeout)),
+            "source worker runtime must not own peer scoped source-status drains: {non_target_reply:?}"
         );
 
         session
