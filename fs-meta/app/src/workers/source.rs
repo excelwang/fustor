@@ -8581,27 +8581,37 @@ impl SourceWorkerClientHandle {
             control_state.replay_signals()
         };
         let snapshot = self.with_cache_mut(|cache| {
-            cache.logical_roots = Some(self.config.roots.clone());
-            cache.grants = Some(self.config.host_object_grants.clone());
+            let current_roots = cache
+                .logical_roots
+                .clone()
+                .filter(|roots| !roots.is_empty())
+                .unwrap_or_else(|| self.config.roots.clone());
+            let current_grants = cache
+                .grants
+                .clone()
+                .filter(|grants| !grants.is_empty())
+                .unwrap_or_else(|| self.config.host_object_grants.clone());
+            cache.logical_roots = Some(current_roots.clone());
+            cache.grants = Some(current_grants.clone());
             if !retained_signals.is_empty() {
                 let _ = prime_cached_schedule_from_control_signals(
                     cache,
                     &self.node_id,
                     &retained_signals,
-                    &self.config.roots,
-                    &self.config.host_object_grants,
+                    &current_roots,
+                    &current_grants,
                 );
                 prime_cached_control_summary_from_control_signals(
                     cache,
                     &self.node_id,
                     &retained_signals,
-                    &self.config.host_object_grants,
+                    &current_grants,
                 );
             }
             annotate_cached_manual_rescan_route_receivable_evidence(
                 cache,
                 &self.node_id,
-                &self.config.host_object_grants,
+                &current_grants,
                 delivery_root_ids,
             );
             build_manual_rescan_delivery_observability_snapshot(
@@ -9475,15 +9485,13 @@ fn annotate_cached_manual_rescan_route_receivable_evidence(
     let signals_by_node = cache
         .last_control_frame_signals_by_node
         .get_or_insert_with(std::collections::BTreeMap::new);
-    let scheduled_scan_groups =
-        cached_local_scheduled_groups(node_id, &cache.scheduled_scan_groups_by_node)
-            .unwrap_or_default();
     let scheduled_scan_groups = match delivery_root_ids {
-        Some(root_ids) => scheduled_scan_groups
-            .into_iter()
-            .filter(|group_id| root_ids.contains(group_id))
+        Some(root_ids) => root_ids
+            .iter()
+            .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        None => scheduled_scan_groups,
+        None => cached_local_scheduled_groups(node_id, &cache.scheduled_scan_groups_by_node)
+            .unwrap_or_default(),
     };
     annotate_manual_rescan_route_receivable_evidence_by_key(
         signals_by_node,
@@ -9511,6 +9519,39 @@ fn manual_rescan_delivery_local_scheduled_groups(
     if let Some(root_ids) = delivery_root_ids {
         scheduled_source.retain(|group_id| root_ids.contains(group_id));
         scheduled_scan.retain(|group_id| root_ids.contains(group_id));
+    }
+    (scheduled_source, scheduled_scan)
+}
+
+fn manual_rescan_delivery_scheduled_groups_from_current_roots(
+    node_id: &NodeId,
+    current_roots: &[RootSpec],
+    grants: &[GrantedMountRoot],
+    delivery_root_ids: &std::collections::BTreeSet<String>,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut scheduled_source = std::collections::BTreeSet::new();
+    let mut scheduled_scan = std::collections::BTreeSet::new();
+    for root in current_roots {
+        if !delivery_root_ids.contains(&root.id) {
+            continue;
+        }
+        let local_active_grant = grants.iter().any(|grant| {
+            root.selector.matches(grant)
+                && grant.active
+                && host_ref_matches_node_id(&grant.host_ref, node_id)
+        });
+        if !local_active_grant {
+            continue;
+        }
+        if root.watch || root.scan {
+            scheduled_source.insert(root.id.clone());
+        }
+        if root.scan {
+            scheduled_scan.insert(root.id.clone());
+        }
     }
     (scheduled_source, scheduled_scan)
 }
@@ -9581,8 +9622,15 @@ fn manual_rescan_delivery_status_from_cache(
     if roots.is_empty() {
         return None;
     }
-    let (scheduled_source, scheduled_scan) =
-        manual_rescan_delivery_local_scheduled_groups(cache, node_id, delivery_root_ids);
+    let (scheduled_source, scheduled_scan) = match delivery_root_ids {
+        Some(delivery_root_ids) => manual_rescan_delivery_scheduled_groups_from_current_roots(
+            node_id,
+            &roots,
+            &grants,
+            delivery_root_ids,
+        ),
+        None => manual_rescan_delivery_local_scheduled_groups(cache, node_id, None),
+    };
     if scheduled_scan.is_empty() {
         return None;
     }
@@ -9732,17 +9780,32 @@ fn build_manual_rescan_delivery_observability_snapshot(
     if !cache_has_manual_rescan_route_receivable_evidence(cache, node_id) {
         return None;
     }
+    let current_roots = cache
+        .logical_roots
+        .as_ref()
+        .filter(|roots| !roots.is_empty())
+        .cloned()
+        .unwrap_or_else(|| config.roots.clone());
+    let current_grants = cache
+        .grants
+        .as_ref()
+        .filter(|grants| !grants.is_empty())
+        .cloned()
+        .unwrap_or_else(|| config.host_object_grants.clone());
     let (status, source_primary_by_group) = manual_rescan_delivery_status_from_cache(
         cache,
         node_id,
-        &config.roots,
-        &config.host_object_grants,
+        &current_roots,
+        &current_grants,
         config.audit_interval,
         delivery_root_ids,
     )?;
     let mut delivery_cache = cache.clone();
-    delivery_cache.logical_roots =
-        Some(manual_rescan_delivery_logical_roots(cache, config, &status));
+    delivery_cache.logical_roots = Some(manual_rescan_delivery_logical_roots(
+        cache,
+        &current_roots,
+        &status,
+    ));
     let delivery_root_ids = status
         .logical_roots
         .iter()
@@ -9756,9 +9819,7 @@ fn build_manual_rescan_delivery_observability_snapshot(
         &mut delivery_cache.scheduled_scan_groups_by_node,
         &delivery_root_ids,
     );
-    if delivery_cache.grants.is_none() {
-        delivery_cache.grants = Some(config.host_object_grants.clone());
-    }
+    delivery_cache.grants = Some(current_grants);
     delivery_cache.source_primary_by_group = Some(source_primary_by_group);
     let mut snapshot = build_source_observability_snapshot_from_cache(
         &delivery_cache,
@@ -9777,7 +9838,7 @@ fn build_manual_rescan_delivery_observability_snapshot(
 
 fn manual_rescan_delivery_logical_roots(
     cache: &SourceWorkerSnapshotCache,
-    config: &SourceConfig,
+    current_roots: &[RootSpec],
     status: &SourceStatusSnapshot,
 ) -> Vec<RootSpec> {
     let delivery_root_ids = status
@@ -9788,14 +9849,13 @@ fn manual_rescan_delivery_logical_roots(
     if delivery_root_ids.is_empty() {
         return Vec::new();
     }
-    let authoritative_roots = if config.roots.is_empty() {
-        cache.logical_roots.as_ref()
+    let authoritative_roots: &[RootSpec] = if current_roots.is_empty() {
+        cache.logical_roots.as_deref().unwrap_or_default()
     } else {
-        Some(&config.roots)
+        current_roots
     };
     let mut roots = authoritative_roots
-        .into_iter()
-        .flat_map(|roots| roots.iter())
+        .iter()
         .filter(|root| delivery_root_ids.contains(root.id.as_str()))
         .cloned()
         .collect::<Vec<_>>();
@@ -9873,21 +9933,31 @@ fn build_pending_source_state_observability_snapshot_from_retained_control(
     retained_signals: &[SourceControlSignal],
 ) -> Option<SourceObservabilitySnapshot> {
     let mut projected_cache = cache.clone();
-    projected_cache.logical_roots = Some(config.roots.clone());
-    projected_cache.grants = Some(config.host_object_grants.clone());
+    let current_roots = projected_cache
+        .logical_roots
+        .clone()
+        .filter(|roots| !roots.is_empty())
+        .unwrap_or_else(|| config.roots.clone());
+    let current_grants = projected_cache
+        .grants
+        .clone()
+        .filter(|grants| !grants.is_empty())
+        .unwrap_or_else(|| config.host_object_grants.clone());
+    projected_cache.logical_roots = Some(current_roots.clone());
+    projected_cache.grants = Some(current_grants.clone());
     projected_cache.lifecycle_state = Some("source-state-pending-retained-control".to_string());
     prime_cached_schedule_from_control_signals(
         &mut projected_cache,
         node_id,
         retained_signals,
-        &config.roots,
-        &config.host_object_grants,
+        &current_roots,
+        &current_grants,
     );
     prime_cached_control_summary_from_control_signals(
         &mut projected_cache,
         node_id,
         retained_signals,
-        &config.host_object_grants,
+        &current_grants,
     );
     build_runtime_scope_control_cache_observability_snapshot(&projected_cache)
 }

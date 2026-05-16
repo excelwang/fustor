@@ -14447,6 +14447,79 @@ fn runtime_scope_control_cache_snapshot_preserves_scheduled_groups_without_live_
 }
 
 #[test]
+fn manual_rescan_delivery_snapshot_uses_cached_current_roots_over_release_roots() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs5 = tmp.path().join("nfs5");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    std::fs::create_dir_all(&nfs5).expect("create nfs5 dir");
+    let release_roots = vec![
+        worker_watch_scan_root("nfs1", &nfs1),
+        worker_watch_scan_root("nfs5", &nfs5),
+    ];
+    let current_roots = vec![worker_watch_scan_root("nfs1", &nfs1)];
+    let grants = vec![
+        worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1),
+        worker_source_export("node-a::nfs5", "node-a", "10.0.0.15", nfs5),
+    ];
+    let config = SourceConfig {
+        roots: release_roots,
+        host_object_grants: grants.clone(),
+        ..SourceConfig::default()
+    };
+    let node_id = NodeId("node-a".to_string());
+    let delivery_roots = std::collections::BTreeSet::from(["nfs1".to_string()]);
+    let mut cache = SourceWorkerSnapshotCache {
+        logical_roots: Some(current_roots),
+        grants: Some(grants),
+        scheduled_source_groups_by_node: Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs5".to_string()],
+        )])),
+        scheduled_scan_groups_by_node: Some(std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs5".to_string()],
+        )])),
+        last_control_frame_signals_by_node: Some(std::collections::BTreeMap::new()),
+        ..SourceWorkerSnapshotCache::default()
+    };
+    annotate_cached_manual_rescan_route_receivable_evidence(
+        &mut cache,
+        &node_id,
+        &config.host_object_grants,
+        Some(&delivery_roots),
+    );
+
+    let snapshot = build_manual_rescan_delivery_observability_snapshot(
+        &cache,
+        &node_id,
+        &config,
+        Some(&delivery_roots),
+    )
+    .expect("manual-rescan snapshot should be derived from current roots and route scopes");
+
+    assert_eq!(
+        snapshot
+            .logical_roots
+            .iter()
+            .map(|root| root.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["nfs1"],
+        "manual-rescan delivery snapshot must not reintroduce release roots after roots-put narrowed the current roots"
+    );
+    assert_eq!(
+        snapshot
+            .status
+            .concrete_roots
+            .iter()
+            .map(|root| root.logical_root_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["nfs1"],
+        "manual-rescan delivery proof should be scoped to the current route root, not stale cached groups"
+    );
+}
+
+#[test]
 fn source_observability_override_preserves_live_scoped_rescan_route_evidence() {
     let node_id = "node-d-29821640722556522502029313";
     let route = format!("{}.req", source_rescan_route_key_for(node_id));
