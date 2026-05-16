@@ -7292,11 +7292,11 @@ fn merge_source_observability(
     merged.status.concrete_roots = concrete_root_map.into_values().collect();
 
     let merged_has_live_data = has_live_data(&merged);
-    let mut degraded_root_map = merged
+    let mut degraded_roots = merged
         .status
         .degraded_roots
         .into_iter()
-        .collect::<BTreeMap<_, _>>();
+        .collect::<BTreeSet<_>>();
     for (root_key, reason) in fallback.status.degraded_roots {
         if merged_has_live_data
             && root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY
@@ -7304,9 +7304,9 @@ fn merge_source_observability(
         {
             continue;
         }
-        degraded_root_map.entry(root_key).or_insert(reason);
+        degraded_roots.insert((root_key, reason));
     }
-    merged.status.degraded_roots = degraded_root_map.into_iter().collect();
+    merged.status.degraded_roots = degraded_roots.into_iter().collect();
 
     for (group, object_ref) in fallback.source_primary_by_group {
         if aggregate_not_live_roots.contains(&group) {
@@ -8017,6 +8017,41 @@ mod tests {
             ),
             BTreeSet::from(["node-b".to_string()]),
             "missing root owner discovery must use app-authoritative grants"
+        );
+    }
+
+    #[test]
+    fn source_status_merge_preserves_distinct_provenance_reasons_for_same_root_key() {
+        let merged = merge_source_status_snapshots(vec![
+            SourceStatusSnapshot {
+                degraded_roots: vec![(
+                    SOURCE_WORKER_DEGRADED_ROOT_KEY.to_string(),
+                    SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON.to_string(),
+                )],
+                ..SourceStatusSnapshot::default()
+            },
+            SourceStatusSnapshot {
+                degraded_roots: vec![(
+                    SOURCE_WORKER_DEGRADED_ROOT_KEY.to_string(),
+                    SOURCE_WORKER_MANUAL_RESCAN_DELIVERY_CACHE_REASON.to_string(),
+                )],
+                ..SourceStatusSnapshot::default()
+            },
+        ]);
+
+        assert!(
+            merged.degraded_roots.iter().any(|(root_key, reason)| {
+                root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY
+                    && reason == SOURCE_WORKER_RUNTIME_SCOPE_CACHE_REASON
+            }),
+            "runtime-scope cache provenance must survive status merge"
+        );
+        assert!(
+            merged.degraded_roots.iter().any(|(root_key, reason)| {
+                root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY
+                    && reason == SOURCE_WORKER_MANUAL_RESCAN_DELIVERY_CACHE_REASON
+            }),
+            "manual-rescan delivery provenance must not be deduplicated away by the shared root key"
         );
     }
 

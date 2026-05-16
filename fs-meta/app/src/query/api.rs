@@ -1116,7 +1116,7 @@ pub(crate) fn merge_source_status_snapshots(
         BTreeMap::<String, crate::source::SourceLogicalRootHealthSnapshot>::new();
     let mut concrete_root_map =
         BTreeMap::<String, crate::source::SourceConcreteRootHealthSnapshot>::new();
-    let mut degraded_root_map = BTreeMap::<String, String>::new();
+    let mut degraded_roots = BTreeSet::<(String, String)>::new();
     let mut current_stream_generation = None;
     for snapshot in snapshots {
         current_stream_generation = std::cmp::max(
@@ -1155,7 +1155,7 @@ pub(crate) fn merge_source_status_snapshots(
                 });
         }
         for (root_key, reason) in snapshot.degraded_roots {
-            degraded_root_map.entry(root_key).or_insert(reason);
+            degraded_roots.insert((root_key, reason));
         }
     }
 
@@ -1163,7 +1163,7 @@ pub(crate) fn merge_source_status_snapshots(
         current_stream_generation,
         logical_roots: logical_root_map.into_values().collect(),
         concrete_roots: concrete_root_map.into_values().collect(),
-        degraded_roots: degraded_root_map.into_iter().collect(),
+        degraded_roots: degraded_roots.into_iter().collect(),
     }
 }
 
