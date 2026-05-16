@@ -77,7 +77,6 @@ const RANKING_QUERY_MIN_BUDGET: Duration = Duration::from_millis(1000);
 const SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET: Duration = Duration::from_millis(2000);
 const TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET: Duration = Duration::from_millis(400);
 const TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET: Duration = Duration::from_millis(100);
-const UNREADY_SELECTED_GROUP_ROUTE_BUDGET: Duration = Duration::from_millis(1200);
 const EXPLICIT_EMPTY_SINK_STATUS_RECOLLECT_BUDGET: Duration = Duration::from_millis(250);
 const REQUEST_SCOPED_SINK_STATUS_LOAD_BUDGET: Duration = Duration::from_millis(500);
 const REQUEST_SCOPED_READY_SINK_STATUS_LOAD_GRACE: Duration = Duration::from_millis(100);
@@ -4835,7 +4834,6 @@ enum TreePitStageTimeoutPolicy {
     UseRemainingForLastNonTrustedAfterPriorDecode,
     FirstRankedTrustedReadyBudget,
     LaterRankedTrustedGroupBudget,
-    UnreadySelectedGroupRouteBudget,
     DefaultCollectIdleGraceCap,
 }
 
@@ -4848,9 +4846,6 @@ impl TreePitStageTimeoutPolicy {
             }
             Self::LaterRankedTrustedGroupBudget => {
                 std::cmp::min(remaining, LATER_RANKED_TRUSTED_GROUP_STAGE_BUDGET)
-            }
-            Self::UnreadySelectedGroupRouteBudget => {
-                std::cmp::min(remaining, UNREADY_SELECTED_GROUP_ROUTE_BUDGET)
             }
             Self::DefaultCollectIdleGraceCap => std::cmp::min(
                 caller_timeout + MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
@@ -4902,10 +4897,6 @@ impl SelectedGroupTreePitPlan {
             TreePitStageTimeoutPolicy::FirstRankedTrustedReadyBudget
         } else if input.read_class == ReadClass::TrustedMaterialized && requires_rescue {
             TreePitStageTimeoutPolicy::LaterRankedTrustedGroupBudget
-        } else if input.read_class != ReadClass::TrustedMaterialized
-            && input.selected_group_sink_unready_empty
-        {
-            TreePitStageTimeoutPolicy::UnreadySelectedGroupRouteBudget
         } else {
             TreePitStageTimeoutPolicy::DefaultCollectIdleGraceCap
         };
@@ -6926,6 +6917,30 @@ fn selected_group_tree_pit_plan_disables_non_root_rescue_when_empty_root_must_fa
             reserve_proxy_budget: true,
         },
         "empty-root fail-closed paths must not inherit the later-ranked non-root rescue lane"
+    );
+}
+
+#[test]
+fn selected_group_tree_pit_plan_keeps_caller_budget_for_materialized_untrusted_pending_group() {
+    let plan = SelectedGroupTreePitPlan::new(SelectedGroupTreePitPlanInput {
+        read_class: ReadClass::Materialized,
+        observation_state: ObservationState::MaterializedUntrusted,
+        selected_group_sink_reports_live_materialized: false,
+        prior_materialized_group_decoded: false,
+        is_last_ranked_group: false,
+        selected_group_sink_unready_empty: true,
+        empty_root_requires_fail_closed: false,
+    });
+
+    assert_eq!(
+        plan.stage_timeout_policy,
+        TreePitStageTimeoutPolicy::DefaultCollectIdleGraceCap,
+        "pending sink-status placeholders are not absence proof for materialized-untrusted reads; the selected-group route must keep the caller-owned budget to observe readable materialized data"
+    );
+    assert_eq!(
+        plan.stage_timeout(Duration::from_secs(30), Duration::from_secs(60)),
+        Duration::from_secs(30),
+        "materialized-untrusted selected-group reads should be bounded by the caller/session deadline, not by an artificial unready placeholder cap"
     );
 }
 
