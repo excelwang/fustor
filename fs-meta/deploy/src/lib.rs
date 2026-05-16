@@ -8,7 +8,7 @@ use fs_meta::RootSpec;
 pub use fs_meta::api::types::RootEntry;
 pub use fs_meta::api::{ApiAuthConfig, BootstrapAdminConfig, BootstrapManagementConfig};
 use fs_meta::product_model::execution_units::{
-    QUERY_PEER_RUNTIME_UNIT_ID, QUERY_RUNTIME_UNIT_ID, SINK_RUNTIME_UNIT_ID,
+    FACADE_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID, QUERY_RUNTIME_UNIT_ID, SINK_RUNTIME_UNIT_ID,
     SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
 };
 use fs_meta::product_model::routes::{
@@ -711,15 +711,72 @@ fn send_recv_stream_route_units_json(unit_id: &str) -> serde_json::Value {
     })
 }
 
+fn request_reply_route_units_json(
+    send_units: &[&str],
+    recv_units: &[&str],
+) -> serde_json::Value {
+    serde_json::json!({
+        "send": send_units,
+        "recv": recv_units
+    })
+}
+
+fn source_owner_request_route_units_json() -> serde_json::Value {
+    request_reply_route_units_json(
+        &[
+            FACADE_RUNTIME_UNIT_ID,
+            QUERY_RUNTIME_UNIT_ID,
+            QUERY_PEER_RUNTIME_UNIT_ID,
+            SOURCE_RUNTIME_UNIT_ID,
+        ],
+        &[SOURCE_RUNTIME_UNIT_ID],
+    )
+}
+
+fn source_rescan_request_route_units_json(recv_units: &[&str]) -> serde_json::Value {
+    request_reply_route_units_json(
+        &[
+            FACADE_RUNTIME_UNIT_ID,
+            QUERY_RUNTIME_UNIT_ID,
+            QUERY_PEER_RUNTIME_UNIT_ID,
+            SOURCE_RUNTIME_UNIT_ID,
+        ],
+        recv_units,
+    )
+}
+
+fn sink_owner_request_route_units_json() -> serde_json::Value {
+    request_reply_route_units_json(
+        &[
+            FACADE_RUNTIME_UNIT_ID,
+            QUERY_RUNTIME_UNIT_ID,
+            QUERY_PEER_RUNTIME_UNIT_ID,
+            SINK_RUNTIME_UNIT_ID,
+        ],
+        &[SINK_RUNTIME_UNIT_ID],
+    )
+}
+
+fn query_request_route_units_json(recv_units: &[&str]) -> serde_json::Value {
+    request_reply_route_units_json(
+        &[
+            FACADE_RUNTIME_UNIT_ID,
+            QUERY_RUNTIME_UNIT_ID,
+            QUERY_PEER_RUNTIME_UNIT_ID,
+        ],
+        recv_units,
+    )
+}
+
 fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
     let mut route_units = serde_json::Map::new();
     route_units.insert(
         stream_activation_route_key(ROUTE_KEY_FACADE_CONTROL),
-        send_stream_route_units_json("runtime.exec.facade"),
+        send_stream_route_units_json(FACADE_RUNTIME_UNIT_ID),
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SOURCE_FIND_INTERNAL),
-        serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
+        source_owner_request_route_units_json(),
     );
     for node_id in spec
         .route_plan_node_ids
@@ -729,20 +786,23 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
     {
         route_units.insert(
             source_find_request_route_for(&node_id).0,
-            serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
+            source_owner_request_route_units_json(),
         );
         route_units.insert(
             source_rescan_request_route_for(&node_id).0,
-            serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
+            source_rescan_request_route_units_json(&[SOURCE_RUNTIME_UNIT_ID]),
         );
         route_units.insert(
             source_status_request_route_for(&node_id).0,
-            serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
+            source_owner_request_route_units_json(),
         );
     }
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
-        serde_json::json!([SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID]),
+        source_rescan_request_route_units_json(&[
+            SOURCE_RUNTIME_UNIT_ID,
+            SOURCE_SCAN_RUNTIME_UNIT_ID,
+        ]),
     );
     route_units.insert(
         stream_activation_route_key(ROUTE_KEY_SOURCE_RESCAN_CONTROL),
@@ -758,11 +818,11 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_QUERY),
-        serde_json::json!([QUERY_RUNTIME_UNIT_ID]),
+        query_request_route_units_json(&[QUERY_RUNTIME_UNIT_ID]),
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SINK_QUERY_INTERNAL),
-        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+        sink_owner_request_route_units_json(),
     );
     for node_id in spec
         .route_plan_node_ids
@@ -780,28 +840,28 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
         );
         route_units.insert(
             sink_query_request_route_for(&node_id).0,
-            serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+            sink_owner_request_route_units_json(),
         );
         route_units.insert(
             sink_status_request_route_for(&node_id).0,
-            serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+            sink_owner_request_route_units_json(),
         );
     }
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SINK_QUERY_PROXY),
-        serde_json::json!([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
+        query_request_route_units_json(&[QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SINK_STATUS_INTERNAL),
-        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+        sink_owner_request_route_units_json(),
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SOURCE_STATUS_INTERNAL),
-        serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
+        source_owner_request_route_units_json(),
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_FORCE_FIND),
-        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+        sink_owner_request_route_units_json(),
     );
     route_units.insert(
         stream_activation_route_key(ROUTE_KEY_EVENTS),
@@ -958,6 +1018,46 @@ fn generation_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_request_reply_route_units(
+        route_units: &serde_json::Map<String, serde_json::Value>,
+        route_key: &str,
+        send: &[&str],
+        recv: &[&str],
+    ) {
+        let directional_units = route_units
+            .get(route_key)
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| panic!("directional route_units for {route_key}"));
+        let actual_send = directional_units
+            .get("send")
+            .and_then(serde_json::Value::as_array)
+            .expect("send units")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let actual_recv = directional_units
+            .get("recv")
+            .and_then(serde_json::Value::as_array)
+            .expect("recv units")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            actual_send,
+            send.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "route {route_key} must keep request sender units explicit"
+        );
+        assert_eq!(
+            actual_recv,
+            recv.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "route {route_key} must keep request owner units explicit"
+        );
+    }
 
     #[test]
     fn watched_roots_bind_query_peer_on_all_scope_members() {
@@ -1499,19 +1599,17 @@ mod tests {
             .as_object()
             .expect("route_units object");
         let sink_status_route = request_reply_activation_route_key(ROUTE_KEY_SINK_STATUS_INTERNAL);
-        let units = route_units
-            .get(&sink_status_route)
-            .and_then(serde_json::Value::as_array)
-            .expect("sink-status route units");
-        let unit_ids = units
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
 
-        assert_eq!(
-            unit_ids,
-            std::collections::BTreeSet::from([SINK_RUNTIME_UNIT_ID]),
-            "sink-status readiness evidence must be published by the sink runtime owner, not by query/query-peer local facade units"
+        assert_request_reply_route_units(
+            route_units,
+            &sink_status_route,
+            &[
+                FACADE_RUNTIME_UNIT_ID,
+                QUERY_RUNTIME_UNIT_ID,
+                QUERY_PEER_RUNTIME_UNIT_ID,
+                SINK_RUNTIME_UNIT_ID,
+            ],
+            &[SINK_RUNTIME_UNIT_ID],
         );
     }
 
@@ -1572,12 +1670,16 @@ mod tests {
             .iter()
             .map(|node_id| sink_query_request_route_for(node_id).0)
         {
-            let scoped_units = route_units_map
-                .get(&expected_route)
-                .and_then(serde_json::Value::as_array);
-            assert!(
-                scoped_units.is_some(),
-                "release route_units must include owner-scoped internal sink-query route {expected_route} when runtime node ids are known"
+            assert_request_reply_route_units(
+                route_units_map,
+                &expected_route,
+                &[
+                    FACADE_RUNTIME_UNIT_ID,
+                    QUERY_RUNTIME_UNIT_ID,
+                    QUERY_PEER_RUNTIME_UNIT_ID,
+                    SINK_RUNTIME_UNIT_ID,
+                ],
+                &[SINK_RUNTIME_UNIT_ID],
             );
         }
     }
@@ -1606,18 +1708,16 @@ mod tests {
             .iter()
             .map(|node_id| source_find_request_route_for(node_id).0)
         {
-            let scoped_units = route_units_map
-                .get(&expected_route)
-                .and_then(serde_json::Value::as_array);
-            let units = scoped_units
-                .unwrap_or_else(|| panic!("release route_units must include owner-scoped internal source-find route {expected_route} when runtime node ids are known"))
-                .iter()
-                .map(|unit| unit.as_str().expect("route unit string"))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                units,
-                vec![SOURCE_RUNTIME_UNIT_ID],
-                "source-find executes fresh source scans, so scoped source-find routes must be owned by source runtime units"
+            assert_request_reply_route_units(
+                route_units_map,
+                &expected_route,
+                &[
+                    FACADE_RUNTIME_UNIT_ID,
+                    QUERY_RUNTIME_UNIT_ID,
+                    QUERY_PEER_RUNTIME_UNIT_ID,
+                    SOURCE_RUNTIME_UNIT_ID,
+                ],
+                &[SOURCE_RUNTIME_UNIT_ID],
             );
         }
     }
@@ -1639,18 +1739,17 @@ mod tests {
             .as_object()
             .expect("route_units object");
         let route_key = request_reply_activation_route_key(ROUTE_KEY_SOURCE_FIND_INTERNAL);
-        let units = route_units
-            .get(&route_key)
-            .and_then(serde_json::Value::as_array)
-            .expect("generic source-find route units")
-            .iter()
-            .map(|unit| unit.as_str().expect("route unit string"))
-            .collect::<Vec<_>>();
 
-        assert_eq!(
-            units,
-            vec![SOURCE_RUNTIME_UNIT_ID],
-            "generic source-find route must target source runtime units instead of query/query-peer proxy units"
+        assert_request_reply_route_units(
+            route_units,
+            &route_key,
+            &[
+                FACADE_RUNTIME_UNIT_ID,
+                QUERY_RUNTIME_UNIT_ID,
+                QUERY_PEER_RUNTIME_UNIT_ID,
+                SOURCE_RUNTIME_UNIT_ID,
+            ],
+            &[SOURCE_RUNTIME_UNIT_ID],
         );
     }
 
@@ -1732,34 +1831,29 @@ mod tests {
             .as_object()
             .expect("route_units object");
         let rescan_route = request_reply_activation_route_key(ROUTE_KEY_SOURCE_RESCAN_INTERNAL);
-        let units = route_units
-            .get(&rescan_route)
-            .and_then(serde_json::Value::as_array)
-            .expect("source-rescan route units");
-        let unit_ids = units
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
-
-        assert_eq!(
-            unit_ids,
-            std::collections::BTreeSet::from([SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID]),
-            "source-rescan request route must bind the source lanes that own explicit rescan delivery"
+        assert_request_reply_route_units(
+            route_units,
+            &rescan_route,
+            &[
+                FACADE_RUNTIME_UNIT_ID,
+                QUERY_RUNTIME_UNIT_ID,
+                QUERY_PEER_RUNTIME_UNIT_ID,
+                SOURCE_RUNTIME_UNIT_ID,
+            ],
+            &[SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID],
         );
         let scoped_rescan_route = source_rescan_request_route_for("node-b-987654321").0;
-        let scoped_units = route_units
-            .get(&scoped_rescan_route)
-            .and_then(serde_json::Value::as_array)
-            .expect("scoped source-rescan route units");
-        let scoped_unit_ids = scoped_units
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
 
-        assert_eq!(
-            scoped_unit_ids,
-            std::collections::BTreeSet::from([SOURCE_RUNTIME_UNIT_ID]),
-            "node-scoped source-rescan request routes must bind the source unit that returns explicit delivery evidence"
+        assert_request_reply_route_units(
+            route_units,
+            &scoped_rescan_route,
+            &[
+                FACADE_RUNTIME_UNIT_ID,
+                QUERY_RUNTIME_UNIT_ID,
+                QUERY_PEER_RUNTIME_UNIT_ID,
+                SOURCE_RUNTIME_UNIT_ID,
+            ],
+            &[SOURCE_RUNTIME_UNIT_ID],
         );
     }
 
@@ -2707,19 +2801,16 @@ mod tests {
             .iter()
             .map(|node_id| sink_status_request_route_for(node_id).0)
         {
-            let units = route_units
-                .get(&expected_route)
-                .and_then(serde_json::Value::as_array)
-                .unwrap_or_else(|| {
-                    panic!("release route_units must include owner-scoped sink-status route {expected_route}")
-                })
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .collect::<std::collections::BTreeSet<_>>();
-            assert_eq!(
-                units,
-                std::collections::BTreeSet::from([SINK_RUNTIME_UNIT_ID]),
-                "owner-scoped sink-status route must be published by the sink runtime owner"
+            assert_request_reply_route_units(
+                route_units,
+                &expected_route,
+                &[
+                    FACADE_RUNTIME_UNIT_ID,
+                    QUERY_RUNTIME_UNIT_ID,
+                    QUERY_PEER_RUNTIME_UNIT_ID,
+                    SINK_RUNTIME_UNIT_ID,
+                ],
+                &[SINK_RUNTIME_UNIT_ID],
             );
         }
     }
