@@ -4392,6 +4392,14 @@ fn sink_status_snapshot_has_materialized_schedule(snapshot: &SinkStatusSnapshot)
     !sink_status_snapshot_omits_all_groups_from_schedule(snapshot)
 }
 
+fn selected_group_sink_status_is_owner_collection_gap(
+    snapshot: Option<&SinkStatusSnapshot>,
+    group_id: &str,
+) -> bool {
+    snapshot.is_none_or(sink_status_snapshot_omits_all_groups_from_schedule)
+        || selected_group_sink_status_is_unready_empty(snapshot, group_id)
+}
+
 fn trusted_materialized_root_tree_should_fail_closed_without_sink_schedule(
     path: &[u8],
     request_sink_status: &SinkStatusSnapshot,
@@ -9673,9 +9681,10 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                 }
             }
             if let Some(group_id) = params.scope.selected_group.as_deref()
-                && selected_group_sink_status
-                    .as_ref()
-                    .is_none_or(sink_status_snapshot_omits_all_groups_from_schedule)
+                && selected_group_sink_status_is_owner_collection_gap(
+                    selected_group_sink_status.as_ref(),
+                    group_id,
+                )
             {
                 let remaining = deadline
                     .checked_duration_since(tokio::time::Instant::now())
