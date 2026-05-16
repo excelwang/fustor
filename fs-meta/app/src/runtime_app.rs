@@ -10733,62 +10733,18 @@ impl FSMetaApp {
                                                     source_rescan_proxy_route_groups
                                                         .as_ref()
                                                         .map(|(_, groups)| groups);
-                                                let delivery_acceptance =
+                                                let app_route_snapshot =
                                                     if source_rescan_proxy_ready {
-                                                        let acceptance_budget = probe_deadline
-                                                            .saturating_duration_since(
-                                                                tokio::time::Instant::now(),
-                                                            );
-                                                        if acceptance_budget.is_zero() {
-                                                            SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
-                                                        } else {
-                                                            match tokio::time::timeout(
-                                                                acceptance_budget,
-                                                                source
-                                                                    .targeted_rescan_delivery_acceptance_with_failure(),
-                                                            )
-                                                            .await
-                                                            {
-                                                                Ok(Ok(acceptance)) => acceptance,
-                                                                Ok(Err(err)) => {
-                                                                    eprintln!(
-                                                                        "fs_meta_runtime_app: source status endpoint manual-rescan worker delivery acceptance check failed node={} correlation={:?} trace_id={} budget_ms={} err={}",
-                                                                        node_id.0,
-                                                                        req.metadata().correlation_id,
-                                                                        trace_id,
-                                                                        probe_budget.as_millis(),
-                                                                        err.as_error()
-                                                                    );
-                                                                    SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
-                                                                }
-                                                                Err(_) => {
-                                                                    eprintln!(
-                                                                        "fs_meta_runtime_app: source status endpoint manual-rescan worker delivery acceptance check timed out node={} correlation={:?} trace_id={} budget_ms={}",
-                                                                        node_id.0,
-                                                                        req.metadata().correlation_id,
-                                                                        trace_id,
-                                                                        probe_budget.as_millis()
-                                                                    );
-                                                                    SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
-                                                                }
-                                                            }
-                                                        }
-                                                    } else {
-                                                        SourceTargetedRescanDeliveryAcceptance::NotLocalScanRoot
-                                                    };
-                                                let delivery_accepted = matches!(
-                                                    delivery_acceptance,
-                                                    SourceTargetedRescanDeliveryAcceptance::Accepted
-                                                );
-                                                let app_route_snapshot = if delivery_accepted {
-                                                    source
+                                                        source
                                                         .manual_rescan_app_route_observability_snapshot_for_status_route(
                                                             route_group_ids,
                                                         )
                                                         .await
-                                                } else {
-                                                    None
-                                                };
+                                                    } else {
+                                                        None
+                                                    };
+                                                let app_route_snapshot_ready =
+                                                    app_route_snapshot.is_some();
                                                 let (mut snapshot, used_cached_fallback) =
                                                     if let Some(snapshot) = app_route_snapshot {
                                                         (snapshot, true)
@@ -10797,7 +10753,9 @@ impl FSMetaApp {
                                                             .source_state_pending_observability_snapshot_for_status_route()
                                                             .await
                                                     };
-                                                if delivery_accepted {
+                                                if source_rescan_proxy_ready
+                                                    && app_route_snapshot_ready
+                                                {
                                                     if let Some((generation, groups)) =
                                                         source_rescan_proxy_route_groups.as_ref()
                                                     {

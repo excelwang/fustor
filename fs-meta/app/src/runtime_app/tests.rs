@@ -23847,7 +23847,7 @@ async fn manual_rescan_source_status_rearms_worker_scoped_rescan_endpoint_after_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn worker_manual_rescan_status_verifies_worker_delivery_and_keeps_scoped_route_callable() {
+async fn worker_manual_rescan_status_opens_app_proxy_without_worker_delivery_precheck() {
     struct SourceWorkerDeliveryHookReset;
 
     impl Drop for SourceWorkerDeliveryHookReset {
@@ -24021,9 +24021,10 @@ async fn worker_manual_rescan_status_verifies_worker_delivery_and_keeps_scoped_r
         0,
         "worker-backed manual-rescan source-status must not wait for worker-owned external route rearm"
     );
-    assert!(
-        accept_count.load(AtomicOrdering::SeqCst) > 0,
-        "worker-backed manual-rescan source-status must verify worker delivery acceptance before exposing route proof"
+    assert_eq!(
+        accept_count.load(AtomicOrdering::SeqCst),
+        0,
+        "worker-backed manual-rescan source-status must not run worker delivery acceptance as a hidden pre-check"
     );
     let accept_count_after_status = accept_count.load(AtomicOrdering::SeqCst);
     assert_eq!(
@@ -24057,7 +24058,7 @@ async fn worker_manual_rescan_status_verifies_worker_delivery_and_keeps_scoped_r
     assert_eq!(
         accept_count.load(AtomicOrdering::SeqCst),
         accept_count_after_status,
-        "scoped delivery must use the scoped route itself rather than adding another source-status acceptance probe"
+        "scoped delivery must use the scoped source-rescan request path rather than adding a source-status acceptance probe"
     );
 
     app.close().await.expect("close app");
@@ -24376,7 +24377,7 @@ async fn worker_scoped_rescan_proxy_rearms_after_route_generation_refresh() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn worker_manual_rescan_status_requires_worker_delivery_before_route_proof() {
+async fn worker_manual_rescan_status_exposes_route_proof_without_worker_delivery_precheck() {
     struct SourceWorkerDeliveryHookReset;
 
     impl Drop for SourceWorkerDeliveryHookReset {
@@ -24540,19 +24541,20 @@ async fn worker_manual_rescan_status_requires_worker_delivery_before_route_proof
         Duration::from_millis(25),
     )
     .await
-    .expect("target manual-rescan source-status should return route evidence after worker delivery proof");
+    .expect("target manual-rescan source-status should return route evidence after app proxy receive-arm");
     assert!(
         !status_events.is_empty(),
         "target source-status must reply with status evidence instead of black-holing the request"
     );
-    assert!(
-        accept_count.load(AtomicOrdering::SeqCst) > 0,
-        "target source-status must verify worker delivery acceptance before exposing scoped route-ready proof"
+    assert_eq!(
+        accept_count.load(AtomicOrdering::SeqCst),
+        0,
+        "target source-status must not verify worker delivery acceptance before exposing scoped route-ready proof"
     );
     assert_eq!(
         observability_count.load(AtomicOrdering::SeqCst),
         0,
-        "target source-status must not wait for worker live observability/audit while checking delivery acceptance"
+        "target source-status must not wait for worker live observability/audit while exposing app-route proof"
     );
     let status_snapshot = status_events
         .iter()
@@ -24573,7 +24575,7 @@ async fn worker_manual_rescan_status_requires_worker_delivery_before_route_proof
             == &format!(
                 "ready unit=runtime.exec.source route={scoped_route} generation={route_generation} scopes=[\"nfs1=>nfs1\"]"
             )),
-        "manual-rescan source-status must expose route-ready proof only after worker delivery acceptance: {status_signals:?}"
+        "manual-rescan source-status must expose route-ready proof after app proxy receive-arm: {status_signals:?}"
     );
     assert!(
         app.source_rescan_proxy_ready_generation
