@@ -411,6 +411,7 @@ async fn maybe_pause_roots_put_before_response() {
 const ROOTS_PUT_SOURCE_SECOND_WAVE_TIMEOUT: Duration = Duration::from_secs(5);
 const MANUAL_RESCAN_SOURCE_SECOND_WAVE_TIMEOUT: Duration = Duration::from_secs(25);
 const MANUAL_RESCAN_SOURCE_STATUS_ROUTE_TIMEOUT: Duration = Duration::from_secs(20);
+const MANUAL_RESCAN_SCOPED_SOURCE_STATUS_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(2500);
 const ROOTS_PUT_SOURCE_SECOND_WAVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ROOTS_PUT_SOURCE_SECOND_WAVE_RESEND_INTERVAL: Duration = Duration::from_secs(2);
 const ROOTS_PUT_SOURCE_SECOND_WAVE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1166,6 +1167,7 @@ async fn collect_node_scoped_manual_rescan_source_status_origin_snapshot(
     node_id: &str,
 ) -> Result<Vec<(String, SourceObservabilitySnapshot)>, CnxError> {
     let requested_node_id = node_id.to_string();
+    let attempt_timeout = scoped_manual_rescan_source_status_attempt_timeout(timeout);
     let adapter = exchange_host_adapter(
         boundary,
         origin_id,
@@ -1176,7 +1178,7 @@ async fn collect_node_scoped_manual_rescan_source_status_origin_snapshot(
             ROUTE_TOKEN_FS_META_INTERNAL,
             METHOD_SOURCE_STATUS,
             manual_rescan_source_status_request_payload_with_live_probe_timeout(timeout),
-            timeout,
+            attempt_timeout,
             Duration::ZERO,
         )
         .await?;
@@ -1191,6 +1193,16 @@ async fn collect_node_scoped_manual_rescan_source_status_origin_snapshot(
             Ok::<_, CnxError>((requested_node_id.clone(), snapshot))
         })
         .collect()
+}
+
+fn scoped_manual_rescan_source_status_attempt_timeout(remaining: Duration) -> Duration {
+    remaining.min(MANUAL_RESCAN_SCOPED_SOURCE_STATUS_ATTEMPT_TIMEOUT)
+}
+
+fn manual_rescan_targeted_source_status_complete_after_events(
+    target_node_ids: &BTreeSet<String>,
+) -> Option<usize> {
+    (!target_node_ids.is_empty()).then_some(target_node_ids.len())
 }
 
 async fn collect_node_scoped_status_source_observability_origin_snapshot(
@@ -1836,7 +1848,16 @@ where
                 let run_scoped_source_collect =
                     scoped_probe_due && !scoped_target_node_ids.is_empty();
                 let run_generic_source_collect = source_status_probe_targets_are_discovery_seed
-                    || source_status_probe_node_ids.is_empty();
+                    || source_status_probe_node_ids.is_empty()
+                    || !scoped_target_node_ids.is_empty();
+                let generic_complete_after_events =
+                    if source_status_probe_targets_are_discovery_seed {
+                        None
+                    } else {
+                        manual_rescan_targeted_source_status_complete_after_events(
+                            &source_status_probe_node_ids,
+                        )
+                    };
                 let mut scoped_source_collects = FuturesUnordered::new();
                 if run_scoped_source_collect {
                     prefer_scoped_source_probe = true;
@@ -1866,7 +1887,7 @@ where
                                 route_budget,
                                 STATUS_ROUTE_COLLECT_IDLE_GRACE,
                                 generic_source_status_payload,
-                                None,
+                                generic_complete_after_events,
                             )
                             .await,
                         )
@@ -2039,7 +2060,9 @@ where
                             fallback_budget,
                             STATUS_ROUTE_COLLECT_IDLE_GRACE,
                             manual_rescan_source_status_request_payload(),
-                            None,
+                            manual_rescan_targeted_source_status_complete_after_events(
+                                &source_status_probe_node_ids,
+                            ),
                         )
                         .await
                         {
@@ -16916,6 +16939,99 @@ mod tests {
         assert!(
             sent_routes.iter().any(|route| route == &node_c_route),
             "discovered owner should be scoped-probed for delivery proof: {sent_routes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_rescan_readiness_uses_generic_proof_when_scoped_owner_probe_times_out() {
+        let roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+        let api_node = "node-a-29861202625758017708400641";
+        let owner_node = "node-b-29861202625758017708400641";
+        let mut owner = local_source_snapshot();
+        let mut grant = granted_mount_root(
+            &format!("{owner_node}::nfs1"),
+            std::path::Path::new("/mnt/nfs1"),
+        );
+        grant.host_ref = owner_node.to_string();
+        owner.grants = vec![grant];
+        owner.logical_roots = roots.clone();
+        owner.status.logical_roots.clear();
+        set_live_group_primary_source_root(&mut owner, "nfs1", owner_node);
+        owner.source_primary_by_group =
+            BTreeMap::from([("nfs1".to_string(), format!("{owner_node}::nfs1"))]);
+        owner.scheduled_source_groups_by_node =
+            BTreeMap::from([(owner_node.to_string(), vec!["nfs1".to_string()])]);
+        owner.scheduled_scan_groups_by_node = owner.scheduled_source_groups_by_node.clone();
+        owner.last_control_frame_signals_by_node = BTreeMap::from([(
+            owner_node.to_string(),
+            vec![format!(
+                "activate unit=runtime.exec.source route={}.req generation=1778861200001 scopes=[\"nfs1=>nfs1\"]",
+                source_rescan_route_key_for(owner_node)
+            )],
+        )]);
+        annotate_manual_rescan_route_receivable_evidence(
+            &mut owner,
+            &NodeId(owner_node.to_string()),
+        );
+        assert_eq!(
+            manual_rescan_target_node_ids_from_receivable_source_snapshot(&roots, &owner),
+            Some(BTreeSet::from([owner_node.to_string()])),
+            "fixture must carry complete generic delivery proof"
+        );
+
+        let boundary = Arc::new(SequencedGenericSourceStatusCollectBoundary::new(
+            vec![(owner_node.to_string(), owner.clone())],
+            Vec::new(),
+        ));
+        let context = RootsPutSecondWaveFollowupContext {
+            node_id: NodeId(api_node.to_string()),
+            runtime_boundary: Some(boundary.clone()),
+            query_runtime_boundary: Some(boundary.clone()),
+            roots_control_generation: 1,
+        };
+
+        let readiness = tokio::time::timeout(
+            Duration::from_secs(6),
+            wait_roots_put_second_wave_readiness_evidence_with_optional_local_source(
+                &context,
+                &roots,
+                BTreeSet::from([owner_node.to_string()]),
+                BTreeSet::from([owner_node.to_string()]),
+                false,
+                false,
+                |_| std::future::ready(None::<SourceObservabilitySnapshot>),
+                |_| std::future::ready(None::<SourceObservabilitySnapshot>),
+                RootsPutControlReplayPolicy::ObserveOnly,
+                manual_rescan_source_status_request_payload(),
+                false,
+            ),
+        )
+        .await
+        .expect("scoped source-status timeout must leave enough budget for generic proof")
+        .expect("manual-rescan readiness should accept generic source-status proof")
+        .expect("manual-rescan readiness evidence");
+
+        assert_eq!(
+            readiness.manual_rescan_delivery_target_node_ids,
+            Some(BTreeSet::from([owner_node.to_string()])),
+            "generic source-status proof must be eligible after a scoped owner probe timeout"
+        );
+        let sent_routes = boundary.sent_routes();
+        assert!(
+            sent_routes
+                .iter()
+                .any(|route| route == &source_status_request_route_for(owner_node).0),
+            "readiness should try the explicit owner-scoped route first: {sent_routes:?}"
+        );
+        let generic_source_status_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+            .expect("resolve generic source-status route")
+            .0;
+        assert!(
+            sent_routes
+                .iter()
+                .any(|route| route == &generic_source_status_route),
+            "readiness must fall back to generic source-status proof instead of exhausting the whole proof window on scoped route: {sent_routes:?}"
         );
     }
 
