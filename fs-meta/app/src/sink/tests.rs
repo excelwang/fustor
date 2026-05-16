@@ -2103,6 +2103,58 @@ fn subpath_scope_materializes_root_relative_paths() {
 }
 
 #[test]
+fn materialized_tree_query_applies_entry_window_before_serializing_payload() {
+    let sink = build_single_group_sink();
+    let mut events = vec![mk_control_event(
+        "node-a::exp",
+        ControlEvent::EpochStart {
+            epoch_id: 0,
+            epoch_type: EpochType::Audit,
+        },
+        1,
+    )];
+    for (idx, name) in ["a.txt", "b.txt", "c.txt", "d.txt"].into_iter().enumerate() {
+        let path = format!("/{name}");
+        events.push(mk_source_event(
+            "node-a::exp",
+            mk_record(path.as_bytes(), name, (idx + 2) as u64, EventKind::Update),
+        ));
+    }
+    events.push(mk_control_event(
+        "node-a::exp",
+        ControlEvent::EpochEnd {
+            epoch_id: 0,
+            epoch_type: EpochType::Audit,
+        },
+        10,
+    ));
+    sink.ingest_stream_events(&events)
+        .expect("materialize windowed entries");
+
+    let mut request = materialized_tree_request(b"/", true, None);
+    request.tree_options = Some(TreeQueryOptions {
+        read_class: crate::query::ReadClass::Materialized,
+        entry_offset: 1,
+        entry_limit: Some(2),
+    });
+    let response = sink
+        .materialized_query(&request)
+        .expect("windowed materialized query");
+    let payload = decode_tree_payload(&response[0]);
+    let paths = payload
+        .entries
+        .iter()
+        .map(|entry| String::from_utf8_lossy(&entry.path).to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        paths,
+        vec!["/b.txt".to_string(), "/c.txt".to_string()],
+        "internal materialized tree queries must apply the entry window before serializing the route payload"
+    );
+}
+
+#[test]
 fn runtime_managed_sink_without_active_scope_preserves_groups_across_logical_root_update() {
     let mut cfg = SourceConfig::default();
     cfg.roots = vec![

@@ -143,6 +143,215 @@ async fn trusted_root_tree_reuses_same_authority_pit_session_without_rerouting_s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_tree_pit_extends_entry_window_without_full_subtree_payload() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a-nfs2");
+    fs::create_dir_all(&node_a_root).expect("create node-a nfs2 dir");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-a::nfs2".to_string(),
+        host_ref: "node-a".to_string(),
+        host_ip: "10.0.0.1".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: node_a_root,
+        fs_source: "nfs2".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let source = source_facade_with_roots(vec![root_spec_with_fs_source("nfs2")], &grants);
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let node_a_route = sink_query_request_route_for("node-a");
+    let observed_windows = Arc::new(std::sync::Mutex::new(Vec::<(usize, Option<usize>)>::new()));
+    let observed_windows_for_handler = observed_windows.clone();
+    let all_entries = Arc::new(vec![
+        b"/a.txt".to_vec(),
+        b"/b.txt".to_vec(),
+        b"/c.txt".to_vec(),
+        b"/d.txt".to_vec(),
+        b"/e.txt".to_vec(),
+    ]);
+    let all_entries_for_handler = all_entries.clone();
+    let mut owner_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_a_route.clone(),
+        "test-materialized-tree-pit-entry-window-owner-endpoint",
+        CancellationToken::new(),
+        move |requests| {
+            let observed_windows = observed_windows_for_handler.clone();
+            let all_entries = all_entries_for_handler.clone();
+            async move {
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        let params = rmp_serde::from_slice::<InternalQueryRequest>(
+                            req.payload_bytes(),
+                        )
+                        .expect("decode node-a tree request");
+                        let options = params
+                            .tree_options
+                            .clone()
+                            .expect("tree request should carry entry window options");
+                        observed_windows
+                            .lock()
+                            .expect("observed windows lock")
+                            .push((options.entry_offset, options.entry_limit));
+                        let limit = options.entry_limit.unwrap_or(all_entries.len());
+                        let window = all_entries
+                            .iter()
+                            .skip(options.entry_offset)
+                            .take(limit)
+                            .map(Vec::as_slice)
+                            .collect::<Vec<_>>();
+                        mk_event_with_correlation(
+                            params
+                                .scope
+                                .selected_group
+                                .as_deref()
+                                .expect("selected group"),
+                            req.metadata()
+                                .correlation_id
+                                .expect("node-a tree request correlation"),
+                            real_materialized_tree_payload_with_entries_for_test(
+                                &params.scope.path,
+                                &window,
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        },
+    );
+
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+    );
+    let request_source_status = SourceStatusSnapshot {
+        current_stream_generation: Some(1),
+        ..SourceStatusSnapshot::default()
+    };
+    let request_sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs2".to_string()],
+        )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs2".to_string(), "node-a".to_string())]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            primary_object_ref: "node-a::nfs2".to_string(),
+            ..sink_group_status("nfs2", true)
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+    let params = NormalizedApiParams {
+        path: b"/".to_vec(),
+        group: None,
+        recursive: true,
+        max_depth: None,
+        pit_id: None,
+        group_order: GroupOrder::GroupKey,
+        group_page_size: Some(GROUP_PAGE_SIZE_DEFAULT),
+        group_after: None,
+        entry_page_size: Some(2),
+        entry_after: None,
+        read_class: Some(ReadClass::Materialized),
+    };
+
+    let first = query_tree_page_response(
+        &state,
+        &ProjectionPolicy::default(),
+        &params,
+        Duration::from_secs(2),
+        ObservationStatus { state: ObservationState::MaterializedUntrusted, reasons: Vec::new() },
+        Some(request_source_status.clone()),
+        Some(request_sink_status.clone()),
+        None,
+    )
+    .await
+    .expect("first materialized tree response");
+    let first_paths = first["groups"][0]["entries"]
+        .as_array()
+        .expect("first entries")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("entry path"))
+        .collect::<Vec<_>>();
+    assert_eq!(first_paths, vec!["/a.txt", "/b.txt"]);
+    assert_eq!(first["groups"][0]["entry_page"]["has_more_entries"], true);
+
+    let mut next_params = params.clone();
+    next_params.pit_id = Some(first["pit"]["id"].as_str().expect("pit id").to_string());
+    next_params.entry_after = Some(
+        first["group_page"]["next_entry_after"]
+            .as_str()
+            .expect("entry cursor bundle")
+            .to_string(),
+    );
+    let second = query_tree_page_response(
+        &state,
+        &ProjectionPolicy::default(),
+        &next_params,
+        Duration::from_secs(2),
+        ObservationStatus { state: ObservationState::MaterializedUntrusted, reasons: Vec::new() },
+        Some(request_source_status.clone()),
+        Some(request_sink_status.clone()),
+        None,
+    )
+    .await
+    .expect("second materialized tree response");
+    let second_paths = second["groups"][0]["entries"]
+        .as_array()
+        .expect("second entries")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("entry path"))
+        .collect::<Vec<_>>();
+    assert_eq!(second_paths, vec!["/c.txt", "/d.txt"]);
+    assert_eq!(second["groups"][0]["entry_page"]["has_more_entries"], true);
+    assert_eq!(
+        observed_windows.lock().expect("observed windows lock").as_slice(),
+        &[(0, Some(3)), (2, Some(3))],
+        "PIT creation and continuation must issue bounded materialized tree windows, not full subtree payloads"
+    );
+
+    let mut wider_first_page_params = params.clone();
+    wider_first_page_params.entry_page_size = Some(4);
+    let wider_first_page = query_tree_page_response(
+        &state,
+        &ProjectionPolicy::default(),
+        &wider_first_page_params,
+        Duration::from_secs(2),
+        ObservationStatus {
+            state: ObservationState::MaterializedUntrusted,
+            reasons: Vec::new(),
+        },
+        Some(request_source_status),
+        Some(request_sink_status),
+        None,
+    )
+    .await
+    .expect("wider cached materialized tree first page");
+    let wider_paths = wider_first_page["groups"][0]["entries"]
+        .as_array()
+        .expect("wider entries")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("entry path"))
+        .collect::<Vec<_>>();
+    assert_eq!(wider_paths, vec!["/a.txt", "/b.txt", "/c.txt", "/d.txt"]);
+    assert_eq!(
+        observed_windows.lock().expect("observed windows lock").as_slice(),
+        &[(0, Some(3)), (2, Some(3)), (0, Some(5))],
+        "wider cached first-page reuse must extend the PIT with a bounded materialized tree window"
+    );
+
+    owner_endpoint.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trusted_tree_empty_pit_session_is_not_cached_without_materialized_content() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_a_root = tmp.path().join("node-a-nfs2");

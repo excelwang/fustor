@@ -39,12 +39,18 @@ impl Default for QueryScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeQueryOptions {
     pub read_class: ReadClass,
+    #[serde(default)]
+    pub entry_offset: usize,
+    #[serde(default)]
+    pub entry_limit: Option<usize>,
 }
 
 impl Default for TreeQueryOptions {
     fn default() -> Self {
         Self {
             read_class: ReadClass::TrustedMaterialized,
+            entry_offset: 0,
+            entry_limit: None,
         }
     }
 }
@@ -137,6 +143,7 @@ mod tests {
             },
             Some(TreeQueryOptions {
                 read_class: ReadClass::TrustedMaterialized,
+                ..TreeQueryOptions::default()
             }),
         );
 

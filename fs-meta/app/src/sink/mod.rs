@@ -4590,6 +4590,8 @@ impl SinkFileMeta {
                         request.scope.recursive,
                         request.scope.max_depth,
                         tree_options.read_class,
+                        tree_options.entry_offset,
+                        tree_options.entry_limit,
                         group.last_coverage_recovered_at,
                     );
                     if debug_materialized_query {

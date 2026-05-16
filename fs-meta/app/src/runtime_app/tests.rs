@@ -2296,6 +2296,7 @@ fn selected_group_query_proxy_discards_empty_payload_when_bridged_data_exists() 
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::Materialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
@@ -2361,6 +2362,7 @@ fn selected_group_query_proxy_keeps_real_empty_payload_when_data_also_exists() {
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::Materialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let real_empty_payload = rmp_serde::to_vec_named(&query::MaterializedQueryPayload::Tree(
@@ -2517,6 +2519,7 @@ fn selected_group_tree_empty_payload_requires_sink_query_bridge_when_local_group
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::Materialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
@@ -2542,6 +2545,7 @@ fn selected_group_tree_empty_payload_requires_sink_status_before_bridge_decision
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::Materialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
@@ -2567,6 +2571,7 @@ fn selected_group_tree_empty_local_payload_skips_bridge_when_selected_group_payl
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::Materialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
@@ -2592,6 +2597,7 @@ fn trusted_root_selected_group_empty_local_payload_still_requires_bridge() {
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let payload = rmp_serde::to_vec_named(&query::MaterializedQueryPayload::Tree(
@@ -2644,6 +2650,7 @@ fn trusted_non_root_selected_group_empty_local_payload_still_requires_bridge() {
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let payload = rmp_serde::to_vec_named(&query::MaterializedQueryPayload::Tree(
@@ -2697,6 +2704,7 @@ fn trusted_exact_file_selected_group_empty_local_payload_skips_bridge_for_recurs
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let empty_event = selected_group_empty_materialized_reply(&request, Some(13))
@@ -2721,6 +2729,7 @@ fn trusted_non_recursive_selected_group_empty_local_payload_on_non_owner_still_r
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
 
@@ -2819,6 +2828,7 @@ fn trusted_root_selected_group_bridge_eligibility_accepts_ready_root_with_only_t
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let snapshot = SinkStatusSnapshot {
@@ -2859,6 +2869,7 @@ fn trusted_root_selected_group_ready_sink_status_uses_owner_scoped_sink_query_ro
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let snapshot = SinkStatusSnapshot {
@@ -2909,6 +2920,7 @@ fn selected_group_bridge_routes_to_declared_owner_even_when_local_group_not_read
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let snapshot = SinkStatusSnapshot {
@@ -2960,6 +2972,7 @@ fn trusted_root_selected_group_surviving_ready_cached_sink_status_outranks_regre
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let live_snapshot = SinkStatusSnapshot {
@@ -3080,6 +3093,7 @@ fn trusted_root_selected_group_ready_cached_sink_status_outranks_live_stale_owne
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let live_snapshot = SinkStatusSnapshot {
@@ -3161,6 +3175,7 @@ fn selected_group_sink_query_bridge_bindings_fall_back_to_generic_route_when_own
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
 
@@ -3188,6 +3203,7 @@ fn trusted_root_selected_group_empty_local_payload_fail_closes_when_bridge_retur
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
@@ -3220,6 +3236,7 @@ fn trusted_non_root_non_recursive_selected_group_without_local_payload_fail_clos
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
 
@@ -3249,6 +3266,7 @@ fn trusted_non_root_selected_group_empty_local_payload_does_not_fail_close_after
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
@@ -3278,6 +3296,7 @@ fn trusted_non_root_selected_group_empty_local_payload_fail_closes_after_bridge_
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
@@ -3307,6 +3326,7 @@ fn trusted_non_root_selected_group_empty_local_payload_emits_explicit_empty_repl
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::TrustedMaterialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
@@ -3351,6 +3371,7 @@ fn materialized_selected_group_empty_local_payload_does_not_fail_closed_after_br
         },
         Some(query::TreeQueryOptions {
             read_class: query::ReadClass::Materialized,
+            ..query::TreeQueryOptions::default()
         }),
     );
     let empty_event = selected_group_empty_materialized_reply(&request, Some(11))

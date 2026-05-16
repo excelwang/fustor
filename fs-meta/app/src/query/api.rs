@@ -729,6 +729,23 @@ fn store_materialized_tree_session(
     Ok(())
 }
 
+fn replace_cached_materialized_tree_session_if_matches(
+    state: &ApiState,
+    pit_id: &str,
+    session: &Arc<PitSession>,
+) -> Result<(), CnxError> {
+    let mut cache = state
+        .materialized_tree_cache
+        .lock()
+        .map_err(|_| CnxError::Internal("materialized tree cache lock poisoned".into()))?;
+    if let Some(cached) = cache.as_mut()
+        && cached.pit_id == pit_id
+    {
+        cached.session = session.clone();
+    }
+    Ok(())
+}
+
 fn pit_session_has_cacheable_materialized_content(session: &PitSession) -> bool {
     !session.groups.is_empty()
         && session.groups.iter().all(|group| {
@@ -800,6 +817,7 @@ struct GroupPitSnapshot {
     meta: PitMetadata,
     root: Option<TreePageRoot>,
     entries: Vec<TreePageEntry>,
+    entry_window_complete: bool,
     errors: Vec<String>,
 }
 
@@ -830,6 +848,20 @@ fn build_pit_session(
         observation_status,
         groups,
         expires_at_ms: unix_now_ms() + PIT_TTL_MS_DEFAULT,
+        estimated_bytes,
+    }
+}
+
+fn rebuild_pit_session_with_groups(session: &PitSession, groups: Vec<GroupPitSnapshot>) -> PitSession {
+    let estimated_bytes =
+        groups.iter().map(estimated_group_bytes).sum::<usize>() + std::mem::size_of::<PitSession>();
+    PitSession {
+        mode: session.mode,
+        scope: session.scope.clone(),
+        read_class: session.read_class,
+        observation_status: session.observation_status.clone(),
+        groups,
+        expires_at_ms: session.expires_at_ms,
         estimated_bytes,
     }
 }
@@ -3708,6 +3740,27 @@ impl QueryPitStore {
         Ok(())
     }
 
+    fn replace(&mut self, pit_id: &str, session: Arc<PitSession>) -> Result<(), CnxError> {
+        self.cleanup_expired(unix_now_ms());
+        let old_bytes = self
+            .sessions
+            .get(pit_id)
+            .map(|old| old.estimated_bytes)
+            .ok_or_else(|| CnxError::InvalidInput(format!("pit expired: {pit_id}")))?;
+        let projected_total = self
+            .total_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(session.estimated_bytes);
+        if projected_total > PIT_MAX_TOTAL_BYTES {
+            return Err(CnxError::NotReady(
+                "pit capacity exceeded; retry after existing queries expire".into(),
+            ));
+        }
+        self.total_bytes = projected_total;
+        self.sessions.insert(pit_id.to_string(), session);
+        Ok(())
+    }
+
     fn get(&mut self, pit_id: &str) -> Result<Arc<PitSession>, CnxError> {
         let now_ms = unix_now_ms();
         self.cleanup_expired(now_ms);
@@ -4034,12 +4087,33 @@ fn build_materialized_stats_request(
     )
 }
 
+#[cfg(test)]
 fn build_materialized_tree_request(
     path: &[u8],
     recursive: bool,
     max_depth: Option<usize>,
     read_class: ReadClass,
     selected_group: Option<String>,
+) -> InternalQueryRequest {
+    build_materialized_tree_request_with_entry_window(
+        path,
+        recursive,
+        max_depth,
+        read_class,
+        selected_group,
+        0,
+        None,
+    )
+}
+
+fn build_materialized_tree_request_with_entry_window(
+    path: &[u8],
+    recursive: bool,
+    max_depth: Option<usize>,
+    read_class: ReadClass,
+    selected_group: Option<String>,
+    entry_offset: usize,
+    entry_limit: Option<usize>,
 ) -> InternalQueryRequest {
     InternalQueryRequest::materialized(
         QueryOp::Tree,
@@ -4049,8 +4123,43 @@ fn build_materialized_tree_request(
             max_depth,
             selected_group,
         },
-        Some(TreeQueryOptions { read_class }),
+        Some(TreeQueryOptions {
+            read_class,
+            entry_offset,
+            entry_limit,
+        }),
     )
+}
+
+fn tree_pit_entry_window_limit(params: &NormalizedApiParams) -> Result<usize, CnxError> {
+    Ok(normalize_entry_page_size(params)?
+        .unwrap_or(ENTRY_PAGE_SIZE_DEFAULT)
+        .saturating_add(1))
+}
+
+fn entry_window_is_complete(returned_entries: usize, entry_limit: Option<usize>) -> bool {
+    entry_limit.is_none_or(|limit| returned_entries < limit)
+}
+
+fn selected_group_sink_status_snapshot_for_group(
+    state: &ApiState,
+    request_sink_status: Option<&SinkStatusSnapshot>,
+    group_key: &str,
+) -> Result<Option<SinkStatusSnapshot>, CnxError> {
+    let allowed_groups = BTreeSet::from([group_key.to_string()]);
+    if let Some(snapshot) = request_sink_status {
+        return Ok(Some(filter_sink_status_snapshot(
+            snapshot.clone(),
+            &allowed_groups,
+        )));
+    }
+    let cache = state
+        .materialized_sink_status_cache
+        .lock()
+        .map_err(|_| CnxError::Internal("materialized sink status cache lock poisoned".into()))?;
+    Ok(cache
+        .as_ref()
+        .map(|cached| filter_sink_status_snapshot(cached.snapshot.clone(), &allowed_groups)))
 }
 
 fn build_force_find_stats_request(
@@ -5026,6 +5135,7 @@ enum TreePitStageDecodeErrorAction {
 enum TreePitStageExecutionAction {
     PushPayload {
         response: TreeGroupPayload,
+        entry_limit: Option<usize>,
         empty_response_plan: TrustedMaterializedEmptyResponseRescuePlan,
     },
     PushEmptySnapshot,
@@ -6297,6 +6407,11 @@ async fn resolve_tree_pit_stage_execution_action(
         input.query_path,
     ) {
         Ok(mut response) => {
+            let entry_limit = input
+                .tree_params
+                .tree_options
+                .as_ref()
+                .and_then(|options| options.entry_limit);
             let empty_response_plan = input
                 .stage_timing
                 .empty_response_rescue_plan(input.group_plan, input.selected_group_owner_known);
@@ -6322,6 +6437,7 @@ async fn resolve_tree_pit_stage_execution_action(
             }
             TreePitStageExecutionAction::PushPayload {
                 response,
+                entry_limit,
                 empty_response_plan,
             }
         }
@@ -6352,6 +6468,7 @@ fn finalize_trusted_materialized_tree_group_response(
     read_class: ReadClass,
     group_key: String,
     response: TreeGroupPayload,
+    entry_limit: Option<usize>,
     empty_response_plan: TrustedMaterializedEmptyResponseRescuePlan,
     rank_index: usize,
     deferred_first_ranked_empty_trusted_non_root_group: &mut Option<String>,
@@ -6391,6 +6508,7 @@ fn finalize_trusted_materialized_tree_group_response(
         read_class,
         group_key,
         response,
+        entry_limit,
     );
     Ok(())
 }
@@ -6409,6 +6527,7 @@ fn apply_tree_pit_stage_execution_action(
     match action {
         TreePitStageExecutionAction::PushPayload {
             response,
+            entry_limit,
             empty_response_plan,
         } => finalize_trusted_materialized_tree_group_response(
             groups,
@@ -6417,6 +6536,7 @@ fn apply_tree_pit_stage_execution_action(
             read_class,
             group_key,
             response,
+            entry_limit,
             empty_response_plan,
             rank_index,
             deferred_first_ranked_empty_trusted_non_root_group,
@@ -6498,6 +6618,11 @@ async fn handle_retryable_tree_pit_stage_gap(
                         input.read_class,
                         input.group_key,
                         retry_response,
+                        input
+                            .tree_params
+                            .tree_options
+                            .as_ref()
+                            .and_then(|options| options.entry_limit),
                     );
                     return Ok(());
                 }
@@ -6554,6 +6679,11 @@ async fn handle_retryable_tree_pit_stage_gap(
                                         input.read_class,
                                         input.group_key,
                                         proxy_response,
+                                        input
+                                            .tree_params
+                                            .tree_options
+                                            .as_ref()
+                                            .and_then(|options| options.entry_limit),
                                     );
                                     return Ok(());
                                 }
@@ -11479,6 +11609,7 @@ fn build_force_find_group_error_snapshot(group_key: String, err: CnxError) -> Gr
         },
         root: None,
         entries: Vec::new(),
+        entry_window_complete: true,
         errors: vec![err.to_string()],
     }
 }
@@ -11587,8 +11718,10 @@ fn push_materialized_tree_group_payload(
     read_class: ReadClass,
     group_key: String,
     response: TreeGroupPayload,
+    entry_limit: Option<usize>,
 ) {
     let (metadata_available, _meta_json) = tree_metadata_json(read_class);
+    let entry_window_complete = entry_window_is_complete(response.entries.len(), entry_limit);
     groups.push(GroupPitSnapshot {
         group: group_key,
         status: "ok",
@@ -11606,6 +11739,7 @@ fn push_materialized_tree_group_payload(
         } else {
             Vec::new()
         },
+        entry_window_complete,
         errors: Vec::new(),
     });
     if let Some(last) = groups.last() {
@@ -11628,6 +11762,7 @@ fn push_empty_materialized_tree_group_snapshot(
         read_class,
         group_key,
         empty_materialized_tree_group_payload(query_path),
+        None,
     );
 }
 
@@ -11653,6 +11788,7 @@ fn push_materialized_tree_group_error_snapshot(
         },
         root: None,
         entries: Vec::new(),
+        entry_window_complete: true,
         errors: vec![err.to_string()],
     });
 }
@@ -12263,6 +12399,164 @@ fn render_pit_response(
     Ok(serde_json::Value::Object(body))
 }
 
+fn tree_pit_snapshot_needs_entry_window(
+    snapshot: &GroupPitSnapshot,
+    entry_offset: usize,
+    entry_page_size: usize,
+) -> bool {
+    snapshot.meta.metadata_available
+        && !snapshot.entry_window_complete
+        && entry_offset <= snapshot.entries.len()
+        && snapshot.entries.len() <= entry_offset.saturating_add(entry_page_size)
+}
+
+fn merge_tree_pit_entry_window(
+    snapshot: &mut GroupPitSnapshot,
+    payload: TreeGroupPayload,
+    entry_offset: usize,
+    entry_limit: Option<usize>,
+) -> Result<(), CnxError> {
+    if entry_offset > snapshot.entries.len() {
+        return Err(CnxError::InvalidInput(format!(
+            "entry_after cursor exceeds group '{}' page bounds",
+            snapshot.group
+        )));
+    }
+    snapshot.reliable = snapshot.reliable && payload.reliability.reliable;
+    if snapshot.unreliable_reason.is_none() {
+        snapshot.unreliable_reason = payload.reliability.unreliable_reason;
+    }
+    if snapshot.root.is_none() {
+        snapshot.root = Some(payload.root);
+    }
+    snapshot.entries.truncate(entry_offset);
+    let returned_entries = payload.entries.len();
+    snapshot.entries.extend(payload.entries);
+    snapshot.entry_window_complete = entry_window_is_complete(returned_entries, entry_limit);
+    Ok(())
+}
+
+async fn query_tree_pit_entry_window(
+    state: &ApiState,
+    policy: &ProjectionPolicy,
+    session: &PitSession,
+    scope: &TreePitScope,
+    group_key: &str,
+    entry_offset: usize,
+    entry_limit: usize,
+    timeout: Duration,
+    request_source_status: Option<&SourceStatusSnapshot>,
+    request_sink_status: Option<&SinkStatusSnapshot>,
+) -> Result<TreeGroupPayload, CnxError> {
+    let selected_group_sink_status =
+        selected_group_sink_status_snapshot_for_group(state, request_sink_status, group_key)?;
+    let group_plan = TreePitSessionPlan::new(timeout, 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: scope.read_class,
+            observation_state: session.observation_status.state,
+            selected_group_sink_reports_live_materialized:
+                selected_group_sink_status_reports_live_materialized_group(
+                    selected_group_sink_status.as_ref(),
+                    group_key,
+                ),
+            prior_materialized_group_decoded: true,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: selected_group_sink_status_is_unready_empty(
+                selected_group_sink_status.as_ref(),
+                group_key,
+            ),
+            empty_root_requires_fail_closed: trusted_materialized_empty_group_root_requires_fail_closed(
+                &scope.path,
+            ),
+        },
+    );
+    let tree_params = build_materialized_tree_request_with_entry_window(
+        &scope.path,
+        scope.recursive,
+        scope.max_depth,
+        scope.read_class,
+        Some(group_key.to_string()),
+        entry_offset,
+        Some(entry_limit),
+    );
+    let events = query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
+        state,
+        policy,
+        tree_params,
+        timeout,
+        request_source_status,
+        selected_group_sink_status,
+        None,
+        group_plan,
+    )
+    .await?;
+    decode_materialized_selected_group_response(&events, policy, group_key, &scope.path)
+}
+
+async fn extend_tree_pit_session_entry_windows(
+    state: &ApiState,
+    policy: &ProjectionPolicy,
+    pit_id: &str,
+    session: Arc<PitSession>,
+    group_offset: usize,
+    group_page_size: usize,
+    entry_offsets: &BTreeMap<String, usize>,
+    entry_page_size: usize,
+    timeout: Duration,
+    request_source_status: Option<&SourceStatusSnapshot>,
+    request_sink_status: Option<&SinkStatusSnapshot>,
+) -> Result<Arc<PitSession>, CnxError> {
+    let PitScope::Tree(scope) = &session.scope else {
+        return Ok(session);
+    };
+    let selected_end = session
+        .groups
+        .len()
+        .min(group_offset.saturating_add(group_page_size));
+    let entry_limit = entry_page_size.saturating_add(1);
+    let mut groups = session.groups.clone();
+    let mut changed = false;
+
+    for index in group_offset..selected_end {
+        let group_key = groups[index].group.clone();
+        let entry_offset = entry_offsets.get(&group_key).copied().unwrap_or(0);
+        if !tree_pit_snapshot_needs_entry_window(&groups[index], entry_offset, entry_page_size) {
+            continue;
+        }
+        let payload = query_tree_pit_entry_window(
+            state,
+            policy,
+            &session,
+            scope,
+            &group_key,
+            entry_offset,
+            entry_limit,
+            timeout,
+            request_source_status,
+            request_sink_status,
+        )
+        .await?;
+        merge_tree_pit_entry_window(&mut groups[index], payload, entry_offset, Some(entry_limit))?;
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(session);
+    }
+    let replacement = Arc::new(rebuild_pit_session_with_groups(&session, groups));
+    {
+        let mut guard = state
+            .pit_store
+            .lock()
+            .map_err(|_| CnxError::Internal("pit store lock poisoned".into()))?;
+        guard.replace(pit_id, replacement.clone())?;
+    }
+    replace_cached_materialized_tree_session_if_matches(state, pit_id, &replacement)?;
+    Ok(replacement)
+}
+
 #[cfg(test)]
 async fn build_tree_pit_session(
     state: &ApiState,
@@ -12331,31 +12625,20 @@ impl TreePitGroupMachine<'_, '_> {
             group_key,
             state,
         } = self;
-        let tree_params = build_materialized_tree_request(
+        let tree_params = build_materialized_tree_request_with_entry_window(
             &input.params.path,
             input.params.recursive,
             input.params.max_depth,
             input.read_class,
             Some(group_key.clone()),
+            0,
+            Some(tree_pit_entry_window_limit(input.params)?),
         );
-        let selected_group_sink_status = if let Some(snapshot) = input.request_sink_status {
-            Some(filter_sink_status_snapshot(
-                snapshot.clone(),
-                &BTreeSet::from([group_key.clone()]),
-            ))
-        } else {
-            let allowed_groups = BTreeSet::from([group_key.clone()]);
-            let cache = input
-                .state
-                .materialized_sink_status_cache
-                .lock()
-                .map_err(|_| {
-                    CnxError::Internal("materialized sink status cache lock poisoned".into())
-                })?;
-            cache
-                .as_ref()
-                .map(|cached| filter_sink_status_snapshot(cached.snapshot.clone(), &allowed_groups))
-        };
+        let selected_group_sink_status = selected_group_sink_status_snapshot_for_group(
+            input.state,
+            input.request_sink_status,
+            &group_key,
+        )?;
         let prior_materialized_group_decoded = state
             .groups
             .iter()
@@ -12721,6 +13004,7 @@ impl ForceFindPitGroupMachine<'_, '_> {
                     },
                     root: Some(payload.root),
                     entries: payload.entries,
+                    entry_window_complete: true,
                     errors: Vec::new(),
                 })
             }
@@ -12922,11 +13206,26 @@ async fn query_tree_page_response(
                 "pit_id does not match the requested tree scope".into(),
             ));
         }
+        let group_offset = group_page_start_index(group_cursor.as_ref());
+        let session = extend_tree_pit_session_entry_windows(
+            state,
+            policy,
+            pit_id,
+            session,
+            group_offset,
+            group_page_size,
+            &entry_offsets,
+            entry_page_size,
+            timeout,
+            request_source_status.as_ref(),
+            request_sink_status.as_ref(),
+        )
+        .await?;
         return render_pit_response(
             &session,
             pit_id,
             group_page_size,
-            group_page_start_index(group_cursor.as_ref()),
+            group_offset,
             &entry_offsets,
             entry_page_size,
         );
@@ -12942,6 +13241,20 @@ async fn query_tree_page_response(
     if let Some(key) = tree_cache_key.as_ref()
         && let Some((pit_id, session)) = cached_materialized_tree_session(state, key)?
     {
+        let session = extend_tree_pit_session_entry_windows(
+            state,
+            policy,
+            &pit_id,
+            session,
+            0,
+            group_page_size,
+            &entry_offsets,
+            entry_page_size,
+            timeout,
+            request_source_status.as_ref(),
+            request_sink_status.as_ref(),
+        )
+        .await?;
         return render_pit_response(
             &session,
             &pit_id,
@@ -12956,6 +13269,20 @@ async fn query_tree_page_response(
     if let Some(key) = tree_cache_key.as_ref()
         && let Some((pit_id, session)) = cached_materialized_tree_session(state, key)?
     {
+        let session = extend_tree_pit_session_entry_windows(
+            state,
+            policy,
+            &pit_id,
+            session,
+            0,
+            group_page_size,
+            &entry_offsets,
+            entry_page_size,
+            timeout,
+            request_source_status.as_ref(),
+            request_sink_status.as_ref(),
+        )
+        .await?;
         return render_pit_response(
             &session,
             &pit_id,

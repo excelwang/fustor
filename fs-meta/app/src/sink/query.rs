@@ -332,6 +332,8 @@ fn page_entries_from_tree(
     dir_path: &[u8],
     recursive: bool,
     max_depth: Option<usize>,
+    entry_offset: usize,
+    entry_limit: Option<usize>,
 ) -> Vec<TreePageEntry> {
     let mut entries = Vec::<TreePageEntry>::new();
     let depth_limit = if recursive {
@@ -339,6 +341,8 @@ fn page_entries_from_tree(
     } else {
         1usize
     };
+    let entry_limit = entry_limit.unwrap_or(usize::MAX);
+    let mut skipped = 0usize;
 
     if recursive {
         for (path, node) in tree.descendant_iter(dir_path) {
@@ -351,12 +355,26 @@ fn page_entries_from_tree(
             if depth == 0 || depth > depth_limit {
                 continue;
             }
+            if skipped < entry_offset {
+                skipped += 1;
+                continue;
+            }
+            if entries.len() >= entry_limit {
+                break;
+            }
             entries.push(entry_from_node(dir_path, path, node, tree));
         }
     } else {
         for (path, node) in tree.child_iter(dir_path) {
             if node.is_tombstoned {
                 continue;
+            }
+            if skipped < entry_offset {
+                skipped += 1;
+                continue;
+            }
+            if entries.len() >= entry_limit {
+                break;
             }
             entries.push(entry_from_node(dir_path, path, node, tree));
         }
@@ -370,6 +388,8 @@ fn page_entries_from_rebased_nodes(
     dir_path: &[u8],
     recursive: bool,
     max_depth: Option<usize>,
+    entry_offset: usize,
+    entry_limit: Option<usize>,
 ) -> Vec<TreePageEntry> {
     let depth_limit = if recursive {
         max_depth.unwrap_or(usize::MAX)
@@ -381,6 +401,8 @@ fn page_entries_from_rebased_nodes(
         .filter_map(|mapped| parent_path_bytes(&mapped.path))
         .collect::<HashSet<_>>();
     let mut entries = Vec::<TreePageEntry>::new();
+    let entry_limit = entry_limit.unwrap_or(usize::MAX);
+    let mut skipped = 0usize;
 
     for mapped in nodes {
         if mapped.path.as_slice() == dir_path {
@@ -391,6 +413,13 @@ fn page_entries_from_rebased_nodes(
         };
         if depth == 0 || depth > depth_limit {
             continue;
+        }
+        if skipped < entry_offset {
+            skipped += 1;
+            continue;
+        }
+        if entries.len() >= entry_limit {
+            break;
         }
         let mut entry = entry_from_rebased_node(dir_path, &mapped.path, mapped.node);
         entry.has_children = has_children_by_path.contains(&mapped.path);
@@ -465,6 +494,8 @@ pub fn get_materialized_tree_payload(
     recursive: bool,
     max_depth: Option<usize>,
     read_class: ReadClass,
+    entry_offset: usize,
+    entry_limit: Option<usize>,
     last_coverage_recovered_at: Option<Instant>,
 ) -> TreeGroupPayload {
     let (stability_mode, quiet_window_ms) = match read_class {
@@ -493,7 +524,14 @@ pub fn get_materialized_tree_payload(
             last_coverage_recovered_at,
         );
         let root = page_root_from_tree(tree, dir_path);
-        let entries = page_entries_from_tree(tree, dir_path, recursive, max_depth);
+        let entries = page_entries_from_tree(
+            tree,
+            dir_path,
+            recursive,
+            max_depth,
+            entry_offset,
+            entry_limit,
+        );
         let reliability = GroupReliability {
             reliable: direct.reliable,
             unreliable_reason: direct.unreliable_reason.clone(),
@@ -523,7 +561,14 @@ pub fn get_materialized_tree_payload(
         last_coverage_recovered_at,
     );
     let root = page_root_from_rebased_nodes(&rebased, dir_path);
-    let entries = page_entries_from_rebased_nodes(&rebased, dir_path, recursive, max_depth);
+    let entries = page_entries_from_rebased_nodes(
+        &rebased,
+        dir_path,
+        recursive,
+        max_depth,
+        entry_offset,
+        entry_limit,
+    );
     let reliability = GroupReliability {
         reliable: query.reliable,
         unreliable_reason: query.unreliable_reason.clone(),
@@ -750,6 +795,8 @@ mod tests {
             true,
             None,
             ReadClass::Materialized,
+            0,
+            None,
             None,
         );
         let mut paths = Vec::new();
@@ -782,6 +829,8 @@ mod tests {
             true,
             Some(1),
             ReadClass::Materialized,
+            0,
+            None,
             None,
         );
 
@@ -815,6 +864,8 @@ mod tests {
             true,
             Some(1),
             ReadClass::Materialized,
+            0,
+            None,
             None,
         );
 

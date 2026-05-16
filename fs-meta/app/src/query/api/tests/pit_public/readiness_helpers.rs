@@ -440,6 +440,7 @@ fn group_counts_as_prior_materialized_tree_decode_ignores_exact_file_hits() {
             has_children: false,
         }),
         entries: Vec::new(),
+        entry_window_complete: true,
         errors: Vec::new(),
     };
 
@@ -471,6 +472,7 @@ fn group_counts_as_prior_materialized_exact_file_decode_tracks_exact_file_hits()
             has_children: false,
         }),
         entries: Vec::new(),
+        entry_window_complete: true,
         errors: Vec::new(),
     };
 
@@ -502,6 +504,7 @@ fn group_counts_as_prior_materialized_tree_decode_keeps_directory_truth() {
             has_children: false,
         }),
         entries: Vec::new(),
+        entry_window_complete: true,
         errors: Vec::new(),
     };
 

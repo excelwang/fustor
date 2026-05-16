@@ -581,6 +581,7 @@
                     },
                     Some(query::TreeQueryOptions {
                         read_class: query::ReadClass::TrustedMaterialized,
+                        ..query::TreeQueryOptions::default()
                     }),
                 );
                 if let Ok(grouped) = selected_group_proxy_tree(
@@ -671,6 +672,7 @@
                 },
                 Some(query::TreeQueryOptions {
                     read_class: query::ReadClass::TrustedMaterialized,
+                    ..query::TreeQueryOptions::default()
                 }),
             );
             let grouped = selected_group_proxy_tree(

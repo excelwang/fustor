@@ -200,8 +200,9 @@ GET /bound-route-metrics  -> BoundRouteMetricsResponse
    9. `entries` is present only when a group's `meta.metadata_available=true`; each entry uses `{ path, depth, size, modified_time_us, is_dir, has_children }`, plus optional `path_b64` when the authoritative raw bytes are not valid UTF-8.
    10. `entry_page` is present only when a group's `meta.metadata_available=true`; it uses `{ order:"path-lex", page_size, returned_entries, has_more_entries, next_cursor }`.
    11. `group_after` and `entry_after` cursors MUST be treated as opaque by clients; any continuation using them MUST also send `pit_id`. Expired PIT returns explicit `PIT_EXPIRED`; the server does not expose materialized-revision stale cursors on the public contract.
-   12. `path_b64` is the authoritative bytes-safe path field and appears only when the underlying raw bytes are not valid UTF-8. `path` remains the default display-only UTF-8/lossy rendering for convenience.
-   13. `read_class=materialized` MAY return while `observation_status.state=materialized-untrusted`; `read_class=trusted-materialized` returns explicit `NOT_READY` until the same package-local observation evidence reaches trusted state.
+   12. materialized `/tree` PIT continuation may fetch bounded per-group entry windows from the sink for the same PIT scope and group; this preserves PIT-owned group selection while avoiding unbounded internal tree payloads.
+   13. `path_b64` is the authoritative bytes-safe path field and appears only when the underlying raw bytes are not valid UTF-8. `path` remains the default display-only UTF-8/lossy rendering for convenience.
+   14. `read_class=materialized` MAY return while `observation_status.state=materialized-untrusted`; `read_class=trusted-materialized` returns explicit `NOT_READY` until the same package-local observation evidence reaches trusted state.
 6. `GET /on-demand-force-find` payload details
    1. `observation_status.state` MUST stay `fresh-only`, which is the live/fresh member of `QueryObservationState` in `STATE_MODEL.md`.
    2. `stability` keys use the same object shape as `/tree`, but `state` MUST stay `not-evaluated` and `mode` MUST stay `none`.
