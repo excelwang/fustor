@@ -5391,9 +5391,28 @@ fn source_observability_snapshot_has_manual_rescan_delivery_cache(
         })
 }
 
+fn source_observability_snapshot_has_pending_source_state_observation(
+    source: &SourceObservabilitySnapshot,
+) -> bool {
+    source
+        .status
+        .degraded_roots
+        .iter()
+        .any(|(root_key, reason)| {
+            root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY
+                && reason == SOURCE_WORKER_PENDING_SOURCE_STATE_OBSERVATION_REASON
+        })
+}
+
 fn source_snapshot_for_manual_rescan_delivery_proof(
     source: &SourceObservabilitySnapshot,
 ) -> Option<SourceObservabilitySnapshot> {
+    if source_observability_snapshot_is_worker_status_cache(source)
+        || source_observability_snapshot_is_degraded_worker_cache(source)
+        || source_observability_snapshot_has_pending_source_state_observation(source)
+    {
+        return None;
+    }
     if !source_observability_snapshot_has_runtime_scope_control_cache(source) {
         return Some(source_snapshot_without_stale_runtime_scope_generation(
             source.clone(),
@@ -18441,6 +18460,59 @@ mod tests {
         assert!(
             target_node_ids.is_none(),
             "runtime-scope control cache is not same-target live source-status proof for scoped manual-rescan delivery"
+        );
+    }
+
+    #[test]
+    fn manual_rescan_pre_delivery_rejects_pending_source_state_observation() {
+        let roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+        let node_c = "node-c-29845883642613303666016257";
+        let mut source = local_source_snapshot();
+        let mut grant = granted_mount_root(
+            &format!("{node_c}::nfs1"),
+            std::path::Path::new("/mnt/nfs1"),
+        );
+        grant.host_ref = node_c.to_string();
+        source.grants = vec![grant];
+        source.logical_roots = roots.clone();
+        source.status.degraded_roots = vec![(
+            SOURCE_WORKER_DEGRADED_ROOT_KEY.to_string(),
+            SOURCE_WORKER_PENDING_SOURCE_STATE_OBSERVATION_REASON.to_string(),
+        )];
+        source.status.logical_roots = vec![SourceLogicalRootHealthSnapshot {
+            root_id: "nfs1".to_string(),
+            status: "running".to_string(),
+            matched_grants: 1,
+            active_members: 1,
+            coverage_mode: "realtime_hotset_plus_audit".to_string(),
+        }];
+        set_live_group_primary_source_root(&mut source, "nfs1", node_c);
+        source.source_primary_by_group =
+            BTreeMap::from([("nfs1".to_string(), format!("{node_c}::nfs1"))]);
+        source.scheduled_source_groups_by_node =
+            BTreeMap::from([(node_c.to_string(), vec!["nfs1".to_string()])]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+        source.last_control_frame_signals_by_node = BTreeMap::from([(
+            node_c.to_string(),
+            vec![format!(
+                "activate unit=runtime.exec.source route={}.req generation=1778870653271 scopes=[\"nfs1=>nfs1\"]",
+                source_rescan_route_key_for(node_c)
+            )],
+        )]);
+        annotate_manual_rescan_route_receivable_evidence(&mut source, &NodeId(node_c.to_string()));
+
+        assert_eq!(
+            manual_rescan_delivery_target_node_ids_from_accumulated_source_status(
+                &roots,
+                &BTreeMap::from([(node_c.to_string(), source.clone())]),
+            ),
+            None,
+            "source-state-pending snapshots are probe evidence only; they must not become scoped manual-rescan delivery proof"
+        );
+        assert_eq!(
+            manual_rescan_target_node_ids_from_receivable_source_snapshot(&roots, &source),
+            None,
+            "single-snapshot delivery readiness must also reject source-state-pending observations"
         );
     }
 
