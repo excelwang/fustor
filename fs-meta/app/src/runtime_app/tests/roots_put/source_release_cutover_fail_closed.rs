@@ -1579,3 +1579,162 @@ async fn host_grant_wakeup_of_retained_source_cutover_replay_fails_closed_withou
 
     app.close().await.expect("close app");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_deferred_events_cleanup_stays_local_and_does_not_arm_replay() {
+    let _hook_guard = source_release_cutover_hook_guard().await;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    let nfs2 = tmp.path().join("nfs2");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+    let nfs1_source = nfs1.display().to_string();
+    let nfs2_source = nfs2.display().to_string();
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+
+    let app = Arc::new(
+        FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![
+                        worker_fs_watch_scan_root("nfs1", &nfs1_source),
+                        worker_fs_watch_scan_root("nfs2", &nfs2_source),
+                    ],
+                    host_object_grants: vec![
+                        worker_export_with_fs_source(
+                            "node-a::nfs1",
+                            "node-a",
+                            "127.0.0.11",
+                            &nfs1_source,
+                            nfs1.clone(),
+                        ),
+                        worker_export_with_fs_source(
+                            "node-a::nfs2",
+                            "node-a",
+                            "127.0.0.12",
+                            &nfs2_source,
+                            nfs2.clone(),
+                        ),
+                    ],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".into()),
+            Some(boundary.clone()),
+            Some(boundary),
+            state_boundary,
+        )
+        .expect("init external-worker app"),
+    );
+
+    let source_scopes = &[
+        ("nfs1", &["node-a::nfs1"][..]),
+        ("nfs2", &["node-a::nfs2"][..]),
+    ];
+    app.on_control_frame(&[
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            source_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            source_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+            source_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            source_scopes,
+            2,
+        ),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+            format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+            source_scopes,
+            2,
+        ),
+        activate_envelope_with_scope_rows(execution_units::SINK_RUNTIME_UNIT_ID, source_scopes, 2),
+        activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            source_scopes,
+            2,
+        ),
+    ])
+    .await
+    .expect("initial source/sink events wave should apply");
+
+    app.on_control_frame(&[
+        deactivate_envelope_with_route_key_reason_and_lease(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            3,
+            "restart_deferred_retire_pending",
+            2,
+            10,
+            60_000,
+        ),
+        deactivate_envelope_with_route_key_reason_and_lease(
+            execution_units::SINK_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_EVENTS),
+            3,
+            "restart_deferred_retire_pending",
+            2,
+            10,
+            60_000,
+        ),
+    ])
+    .await
+    .expect("restart-deferred events cleanup should stay local");
+
+    assert!(
+        !app.control_initialized(),
+        "retiring events cleanup should fail-close the retiring app instance"
+    );
+    assert!(
+        !app.source_state_replay_required(),
+        "retiring events cleanup must not arm stale source retained replay against the shared successor worker"
+    );
+    assert!(
+        !app.sink_state_replay_required(),
+        "retiring events cleanup must not arm stale sink retained replay against the shared successor worker"
+    );
+    assert!(
+        !app.source.retained_replay_required().await,
+        "worker source replay flag must stay clear for retiring events cleanup"
+    );
+    assert!(
+        !app.sink.retained_replay_required(),
+        "worker sink replay flag must stay clear for retiring events cleanup"
+    );
+    assert!(
+        !app
+            .source_generation_cutover_replay_deferred
+            .load(AtomicOrdering::Acquire),
+        "retiring events cleanup must not schedule source generation-cutover replay"
+    );
+    assert!(
+        !app
+            .sink_generation_cutover_replay_deferred
+            .load(AtomicOrdering::Acquire),
+        "retiring events cleanup must not schedule sink generation-cutover replay"
+    );
+
+    app.close().await.expect("close app");
+}

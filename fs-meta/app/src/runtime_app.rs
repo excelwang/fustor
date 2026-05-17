@@ -28,7 +28,8 @@ use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::execution_units;
 use crate::runtime::orchestration::{
     FacadeControlSignal, FacadeRuntimeUnit, SinkControlSignal, SinkRuntimeUnit,
-    SourceControlSignal, manual_rescan_scoped_target_acceptance_timeout_from_payload,
+    SourceControlSignal, SourceRuntimeUnit,
+    manual_rescan_scoped_target_acceptance_timeout_from_payload,
     split_app_control_signals,
 };
 #[cfg(test)]
@@ -1303,6 +1304,7 @@ enum ControlFailureRecoveryLanePolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ControlFailureReplayRequirement {
+    None,
     Full,
     Source,
     SourceAndSink,
@@ -9758,6 +9760,27 @@ impl FSMetaApp {
         )
     }
 
+    fn source_signal_is_restart_deferred_events_cleanup(signal: &SourceControlSignal) -> bool {
+        matches!(
+            signal,
+            SourceControlSignal::Deactivate {
+                unit: SourceRuntimeUnit::Source,
+                route_key,
+                ..
+            } if route_key == &format!("{}.stream", ROUTE_KEY_EVENTS)
+                && Self::source_signal_is_drained_retire_cleanup(signal)
+        )
+    }
+
+    fn source_signals_are_restart_deferred_events_cleanup_only(
+        source_signals: &[SourceControlSignal],
+    ) -> bool {
+        !source_signals.is_empty()
+            && source_signals
+                .iter()
+                .all(Self::source_signal_is_restart_deferred_events_cleanup)
+    }
+
     fn source_signal_is_post_initial_activate(signal: &SourceControlSignal) -> bool {
         matches!(
             signal,
@@ -9804,6 +9827,27 @@ impl FSMetaApp {
                         .and_then(|lease| lease.drain_started_at_ms)
                         .is_some()
         )
+    }
+
+    fn sink_signal_is_restart_deferred_events_cleanup(signal: &SinkControlSignal) -> bool {
+        matches!(
+            signal,
+            SinkControlSignal::Deactivate {
+                unit: SinkRuntimeUnit::Sink,
+                route_key,
+                ..
+            } if route_key == &format!("{}.stream", ROUTE_KEY_EVENTS)
+                && Self::sink_signal_is_restart_deferred_retire_pending(signal)
+        )
+    }
+
+    fn sink_signals_are_restart_deferred_events_cleanup_or_tick_only(
+        sink_signals: &[SinkControlSignal],
+    ) -> bool {
+        sink_signals.iter().all(|signal| {
+            Self::sink_signal_is_restart_deferred_events_cleanup(signal)
+                || matches!(signal, SinkControlSignal::Tick { .. })
+        })
     }
 
     fn sink_signal_requires_fail_closed_retry_after_generation_cutover(
@@ -13775,6 +13819,24 @@ impl FSMetaApp {
         self.schedule_deferred_sink_repair_recovery("sink-generation-cutover");
     }
 
+    async fn mark_control_uninitialized_after_generation_cutover_cleanup_with_session(
+        &self,
+        fixed_bind_session: &FixedBindLifecycleSession,
+        preserve_source_status: bool,
+    ) {
+        self.mark_control_uninitialized_after_failure_with_session_and_policy_and_replay(
+            fixed_bind_session,
+            if preserve_source_status {
+                ControlFailureRecoveryLanePolicy::PreserveSourceStatus
+            } else {
+                ControlFailureRecoveryLanePolicy::PreserveInternalStatus
+            },
+            ControlFailureReplayRequirement::None,
+            true,
+        )
+        .await;
+    }
+
     async fn mark_control_uninitialized_after_failure_preserving_internal_status_with_session(
         &self,
         fixed_bind_session: &FixedBindLifecycleSession,
@@ -13808,6 +13870,7 @@ impl FSMetaApp {
         preserve_core_business_read_routes: bool,
     ) {
         self.update_runtime_control_state(|state| match replay_requirement {
+            ControlFailureReplayRequirement::None => state.mark_uninitialized_preserving_replay(),
             ControlFailureReplayRequirement::Full => state.mark_uninitialized_with_full_replay(),
             ControlFailureReplayRequirement::Source => {
                 state.mark_uninitialized_preserving_replay();
@@ -14827,6 +14890,44 @@ impl FSMetaApp {
             .map_err(RuntimeWorkerControlApplyFailure::from)?;
         self.refresh_source_rescan_proxy_ready_from_retained_endpoint()
             .await;
+        Ok(())
+    }
+
+    async fn apply_restart_deferred_events_cleanup_locally(
+        &self,
+        fixed_bind_session: &FixedBindLifecycleSession,
+        source_signals: &[SourceControlSignal],
+        sink_signals: &[SinkControlSignal],
+    ) -> std::result::Result<(), RuntimeWorkerControlApplyFailure> {
+        let filtered_source_signals = self
+            .filter_shared_source_route_deactivates(source_signals)
+            .await;
+        self.source
+            .record_retained_control_signals(&filtered_source_signals)
+            .await;
+        self.record_shared_source_route_claims(&filtered_source_signals)
+            .await;
+        self.apply_source_signals_to_runtime_endpoint_gate(&filtered_source_signals)
+            .map_err(RuntimeWorkerControlApplyFailure::from)?;
+        self.refresh_source_rescan_proxy_ready_from_retained_endpoint()
+            .await;
+
+        let filtered_sink_signals = self
+            .filter_sink_facade_dependent_route_activates_during_pending_fixed_bind_claim_with_session(
+                &self
+                    .filter_shared_sink_route_deactivates(
+                        &self.filter_stale_sink_ticks(sink_signals).await,
+                    )
+                    .await,
+                fixed_bind_session,
+            )
+            .await;
+        self.record_retained_sink_control_state(&filtered_sink_signals)
+            .await;
+        self.record_shared_sink_route_claims(&filtered_sink_signals)
+            .await;
+        self.apply_sink_signals_to_runtime_endpoint_gate(&filtered_sink_signals)
+            .map_err(RuntimeWorkerControlApplyFailure::from)?;
         Ok(())
     }
 
@@ -16680,6 +16781,30 @@ impl FSMetaApp {
                     )
                     .await
                 {
+                    if matches!(
+                        source_generation_cutover_disposition,
+                        SourceGenerationCutoverDisposition::FailClosedRestartDeferredRetirePending
+                    ) && Self::source_signals_are_restart_deferred_events_cleanup_only(
+                        &source_signals,
+                    ) && Self::sink_signals_are_restart_deferred_events_cleanup_or_tick_only(
+                        &sink_signals,
+                    ) {
+                        self.apply_restart_deferred_events_cleanup_locally(
+                            &fixed_bind_session,
+                            &source_signals,
+                            &sink_signals,
+                        )
+                        .await?;
+                        self.mark_control_uninitialized_after_generation_cutover_cleanup_with_session(
+                            &fixed_bind_session,
+                            !sink_signals.is_empty(),
+                        )
+                        .await;
+                        eprintln!(
+                            "fs_meta_runtime_app: on_control_frame kept restart-deferred events cleanup local after fail-closed generation cutover"
+                        );
+                        return Ok(());
+                    }
                     self.defer_source_generation_cutover_replay_inline(&source_signals)
                         .await?;
                     let require_sink_replay = retained_sink_state_present_at_entry
