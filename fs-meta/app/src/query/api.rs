@@ -5120,6 +5120,7 @@ impl SelectedGroupTreePitPlan {
             && input.selected_group_sink_reports_live_materialized;
         let settle_unready_empty_after_prior_decode = input.read_class
             == ReadClass::TrustedMaterialized
+            && input.observation_state != ObservationState::TrustedMaterialized
             && input.selected_group_sink_unready_empty
             && input.prior_materialized_group_decoded
             && !input.empty_root_requires_fail_closed;
@@ -7322,6 +7323,35 @@ fn selected_group_tree_pit_plan_keeps_root_fail_closed_for_later_unready_empty_g
     assert!(
         !plan.settle_unready_empty_after_prior_decode,
         "trusted-materialized root reads must keep fail-closed readiness semantics instead of settling pending materialization as an empty catch-up snapshot"
+    );
+}
+
+#[test]
+fn selected_group_tree_pit_plan_keeps_trusted_observation_proxy_rescue_for_unready_empty_group() {
+    let plan = SelectedGroupTreePitPlan::new(SelectedGroupTreePitPlanInput {
+        read_class: ReadClass::TrustedMaterialized,
+        observation_state: ObservationState::TrustedMaterialized,
+        selected_group_sink_reports_live_materialized: false,
+        prior_materialized_group_decoded: true,
+        is_last_ranked_group: false,
+        selected_group_sink_unready_empty: true,
+        empty_root_requires_fail_closed: false,
+    });
+
+    assert_eq!(
+        plan,
+        SelectedGroupTreePitPlan {
+            prior_materialized_group_decoded: true,
+            trusted_materialized_ready_group: false,
+            requires_rescue: true,
+            settle_unready_empty_after_prior_decode: false,
+            allow_empty_owner_retry: false,
+            should_resolve_selected_group_owner: true,
+            empty_root_requires_fail_closed: false,
+            stage_timeout_policy: TreePitStageTimeoutPolicy::LaterRankedTrustedGroupBudget,
+            reserve_proxy_budget: true,
+        },
+        "trusted observation state must keep owner/proxy rescue for zeroish selected-group status instead of treating it as unrelated catch-up"
     );
 }
 
