@@ -28,9 +28,7 @@ use capanix_host_adapter_fs::HostAdapter;
 use capanix_runtime_entry_sdk::advanced::boundary::{
     BoundaryContext, ChannelIoSubset, StateBoundary,
 };
-use capanix_runtime_entry_sdk::control::{
-    RuntimeBoundScope, RuntimeExecControl, RuntimeHostGrantState, decode_runtime_exec_control,
-};
+use capanix_runtime_entry_sdk::control::{RuntimeBoundScope, RuntimeHostGrantState};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -52,6 +50,7 @@ use crate::runtime::execution_units::{
 use crate::runtime::orchestration::{
     SinkControlSignal, SinkRuntimeUnit, decode_logical_roots_control_payload,
     sink_control_signals_from_envelopes,
+    sink_signal_has_restart_deferred_events_stream_deactivate_reason,
 };
 use crate::runtime::routes::{
     METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SINK_STATUS,
@@ -225,20 +224,9 @@ fn sink_events_stream_route_key() -> String {
 }
 
 fn sink_signal_is_restart_deferred_events_stream_deactivate(signal: &SinkControlSignal) -> bool {
-    matches!(
+    sink_signal_has_restart_deferred_events_stream_deactivate_reason(
         signal,
-        SinkControlSignal::Deactivate {
-            unit: SinkRuntimeUnit::Sink,
-            route_key,
-            envelope,
-            ..
-        } if route_key == &sink_events_stream_route_key()
-            && matches!(
-                decode_runtime_exec_control(envelope),
-                Ok(Some(RuntimeExecControl::Deactivate(deactivate)))
-                    if deactivate.reason == "restart_deferred_retire_pending"
-                        || deactivate.reason == "deferred_retire"
-            )
+        &sink_events_stream_route_key(),
     )
 }
 

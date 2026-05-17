@@ -456,6 +456,27 @@ pub(crate) fn sink_control_signals_from_envelopes(
     Ok(signals)
 }
 
+pub(crate) fn sink_signal_has_restart_deferred_events_stream_deactivate_reason(
+    signal: &SinkControlSignal,
+    events_stream_route_key: &str,
+) -> bool {
+    matches!(
+        signal,
+        SinkControlSignal::Deactivate {
+            unit: SinkRuntimeUnit::Sink,
+            route_key,
+            envelope,
+            ..
+        } if route_key == events_stream_route_key
+            && matches!(
+                decode_runtime_exec_control(envelope),
+                Ok(Some(RuntimeExecControl::Deactivate(deactivate)))
+                    if deactivate.reason == "restart_deferred_retire_pending"
+                        || deactivate.reason == "deferred_retire"
+            )
+    )
+}
+
 pub(crate) fn split_app_control_signals(
     envelopes: &[ControlEnvelope],
 ) -> Result<(
