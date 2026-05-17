@@ -53,7 +53,7 @@ use crate::runtime::orchestration::{
 };
 use crate::runtime::routes::{
     METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SINK_STATUS,
-    METHOD_SOURCE_FIND, METHOD_STREAM, ROUTE_KEY_EVENTS, ROUTE_TOKEN_FS_META,
+    METHOD_SOURCE_FIND, METHOD_STREAM, ROUTE_KEY_EVENTS, ROUTE_KEY_QUERY, ROUTE_TOKEN_FS_META,
     ROUTE_TOKEN_FS_META_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
     sink_query_request_route_for, sink_query_route_bindings_for,
     sink_roots_control_stream_route_for, sink_status_request_route_for,
@@ -69,9 +69,6 @@ use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
 use crate::state::cell::{AuthorityJournal, LogicalRootsCell};
 use crate::state::commit_boundary::CommitBoundary;
 use crate::{ControlEvent, FileMetaRecord};
-
-#[cfg(test)]
-use crate::runtime::routes::ROUTE_KEY_QUERY;
 
 fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -191,6 +188,20 @@ fn is_per_peer_sink_query_request_route(route_key: &str) -> bool {
         return false;
     };
     route_stem.starts_with(&format!("{stem}."))
+}
+
+fn legacy_public_query_sink_route_aliases(node_id: &NodeId, route_key: &str) -> Vec<String> {
+    if route_key != ROUTE_KEY_QUERY {
+        return Vec::new();
+    }
+    let mut aliases = vec![format!(
+        "{}.req",
+        crate::runtime::routes::ROUTE_KEY_SINK_QUERY_INTERNAL
+    )];
+    aliases.push(sink_query_request_route_for(&node_id.0).0);
+    aliases.sort();
+    aliases.dedup();
+    aliases
 }
 
 fn matching_endpoint_task_states(tasks: &[ManagedEndpointTask], route_key: &str) -> Vec<String> {
@@ -3371,6 +3382,24 @@ impl SinkFileMeta {
                 generation
             );
         }
+        if unit == SinkRuntimeUnit::Sink {
+            for alias_route_key in legacy_public_query_sink_route_aliases(&self.node_id, route_key) {
+                let accepted = self.unit_control.apply_activate(
+                    unit_id,
+                    &alias_route_key,
+                    generation,
+                    bound_scopes,
+                )?;
+                if !accepted {
+                    log::debug!(
+                        "sink-file-meta: ignore stale activate unit={} generation={} alias_route={}",
+                        unit_id,
+                        generation,
+                        alias_route_key
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3561,6 +3590,21 @@ impl SinkFileMeta {
                 unit_id,
                 generation
             );
+        }
+        if unit == SinkRuntimeUnit::Sink {
+            for alias_route_key in legacy_public_query_sink_route_aliases(&self.node_id, route_key) {
+                let accepted =
+                    self.unit_control
+                        .apply_deactivate(unit_id, &alias_route_key, generation)?;
+                if !accepted {
+                    log::debug!(
+                        "sink-file-meta: ignore stale deactivate unit={} generation={} alias_route={}",
+                        unit_id,
+                        generation,
+                        alias_route_key
+                    );
+                }
+            }
         }
         Ok(())
     }
