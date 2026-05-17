@@ -6281,6 +6281,63 @@ async fn selected_group_materialized_route_waits_for_owner_payload_instead_of_se
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_collection_gap_proxy_waits_past_fast_empty_partial_reply_for_late_data() {
+    let proxy_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
+        .expect("resolve sink-query-proxy route");
+    let internal_route = sink_query_request_route_for("node-a");
+    let boundary = Arc::new(MaterializedRouteRaceBoundary::new(
+        proxy_route.0.clone(),
+        internal_route.0.clone(),
+        "nfs1",
+        b"/force-find-stress".to_vec(),
+    ));
+    let timeout = Duration::from_millis(900);
+    let group_plan = TreePitSessionPlan::new(timeout, 2).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::Materialized,
+            observation_state: ObservationState::MaterializedUntrusted,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: false,
+            selected_group_sink_unready_empty: true,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    let events = query_materialized_events_via_generic_proxy(
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+        build_materialized_tree_request(
+            b"/force-find-stress",
+            true,
+            None,
+            ReadClass::Materialized,
+            Some("nfs1".to_string()),
+        ),
+        group_plan
+            .owner_collection_gap_proxy_route_plan(timeout)
+            .machine(),
+    )
+    .await
+    .expect("collection-gap proxy route should collect late data before its bounded deadline");
+
+    let payload = decode_materialized_selected_group_response(
+        &events,
+        &ProjectionPolicy::default(),
+        "nfs1",
+        b"/force-find-stress",
+    )
+    .expect("decode collection-gap proxy response");
+    assert!(
+        payload.root.exists,
+        "collection-gap proxy fallback must not settle on fast empty partial replies while bounded time remains for a later data reply"
+    );
+}
+
 #[test]
 fn decode_materialized_selected_group_response_prefers_newer_empty_same_path_payload_over_older_richer_payload()
  {

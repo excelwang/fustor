@@ -5899,12 +5899,13 @@ impl SelectedGroupOwnerRoutePlan {
 
 impl TreePitProxyRoutePlan {
     fn new(route_timeout: Duration) -> Self {
+        Self::new_with_collect_idle_grace(route_timeout, SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE)
+    }
+
+    fn new_with_collect_idle_grace(route_timeout: Duration, collect_idle_grace: Duration) -> Self {
         Self {
             route_timeout,
-            collect_idle_grace: std::cmp::min(
-                SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE,
-                route_timeout,
-            ),
+            collect_idle_grace: std::cmp::min(collect_idle_grace, route_timeout),
             retry_backoff: std::cmp::min(SELECTED_GROUP_PROXY_ROUTE_RETRY_BACKOFF, route_timeout),
         }
     }
@@ -6089,6 +6090,17 @@ impl TreePitGroupPlan {
             remaining_session,
             SELECTED_GROUP_OWNER_COLLECTION_GAP_ROUTE_BUDGET,
         ))
+    }
+
+    fn owner_collection_gap_proxy_route_plan(
+        self,
+        remaining_session: Duration,
+    ) -> TreePitProxyRoutePlan {
+        let route_timeout = std::cmp::min(
+            remaining_session,
+            SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET,
+        );
+        TreePitProxyRoutePlan::new_with_collect_idle_grace(route_timeout, route_timeout)
     }
 
     fn owner_empty_tree_rescue_plan(
@@ -9834,11 +9846,15 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                     params.scope.path.as_slice(),
                 ));
             }
+            let selected_group_owner_collection_gap =
+                params.scope.selected_group.as_deref().is_some_and(|group_id| {
+                    selected_group_sink_status_is_owner_collection_gap(
+                        selected_group_sink_status.as_ref(),
+                        group_id,
+                    )
+                });
             if let Some(group_id) = params.scope.selected_group.as_deref()
-                && selected_group_sink_status_is_owner_collection_gap(
-                    selected_group_sink_status.as_ref(),
-                    group_id,
-                )
+                && selected_group_owner_collection_gap
             {
                 let remaining = deadline
                     .checked_duration_since(tokio::time::Instant::now())
@@ -9860,8 +9876,23 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                 {
                     return Ok(events);
                 }
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .unwrap_or_default();
+                if remaining.is_zero() {
+                    return Err(CnxError::Timeout);
+                }
+                let proxy_route_plan = group_plan.owner_collection_gap_proxy_route_plan(remaining);
+                return query_materialized_events_via_generic_proxy(
+                    boundary.clone(),
+                    origin_id.clone(),
+                    params,
+                    proxy_route_plan.machine(),
+                )
+                .await;
             }
             if let Some(group_id) = params.scope.selected_group.as_deref()
+                && !selected_group_owner_collection_gap
                 && let Some(node_id) = materialized_owner_node_for_group_with_failure(
                     source.as_ref(),
                     selected_group_sink_status.as_ref(),
@@ -11723,6 +11754,10 @@ fn decode_materialized_selected_group_response(
         event.metadata().timestamp_us
     }
 
+    fn payload_has_live_data(payload: &TreeGroupPayload) -> bool {
+        payload.root.exists || payload.root.has_children || !payload.entries.is_empty()
+    }
+
     let mut last_decode_error = None::<String>;
     let mut best = None::<TreeGroupPayload>;
     let mut best_precedence = None::<u64>;
@@ -11744,9 +11779,18 @@ fn decode_materialized_selected_group_response(
                     payload.root.modified_time_us
                 );
                 let precedence = payload_precedence(event);
-                let replace = best_precedence
-                    .as_ref()
-                    .is_none_or(|current| precedence > *current);
+                let replace = match (best_precedence, best.as_ref()) {
+                    (None, _) => true,
+                    (Some(current), _) if precedence > current => true,
+                    (Some(current), Some(current_best))
+                        if precedence == current
+                            && !payload_has_live_data(current_best)
+                            && payload_has_live_data(&payload) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
                 if replace {
                     best_precedence = Some(precedence);
                     best = Some(payload);

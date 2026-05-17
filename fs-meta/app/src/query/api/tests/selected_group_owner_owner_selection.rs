@@ -1046,13 +1046,18 @@ async fn selected_group_pending_gap_caps_slow_candidate_and_preserves_proxy_budg
     .expect("decode pending-gap proxy-backed response");
     assert!(payload.root.exists);
     assert!(
-        elapsed < Duration::from_millis(1800),
-        "slow candidate should be capped near the collection-gap budget, elapsed={elapsed:?}"
+        elapsed < Duration::from_millis(3400),
+        "slow candidate plus bounded collection-gap proxy fallback should not fall back to a full owner retry, elapsed={elapsed:?}"
     );
     assert_eq!(
         boundary.send_batch_count(&proxy_route.0),
         1,
         "proxy fallback must retain enough budget after a slow heuristic candidate"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&node_a_route.0),
+        1,
+        "collection-gap recovery must not retry the configured primary with a full owner budget after its bounded candidate probe already timed out"
     );
 
     node_a_endpoint.shutdown(Duration::from_secs(3)).await;
