@@ -2140,6 +2140,20 @@ impl SinkRecoveryMachine {
                         ) {
                             return Ok(None);
                         }
+                        if FSMetaApp::sink_status_snapshot_should_defer_republish_after_retained_replay_timeout(&snapshot)
+                        {
+                            if self
+                                .maybe_schedule_post_recovery_sink_timeout_retry(
+                                    source,
+                                    tokio::time::Instant::now() < sink_readiness_deadline,
+                                )
+                                .await
+                                .map_err(RuntimeWorkerObservationFailure::from_cause)?
+                            {
+                                break;
+                            }
+                            return Ok(Some(converged_groups));
+                        }
                         if tokio::time::Instant::now() >= sink_readiness_deadline {
                             return Err(RuntimeWorkerObservationFailure::from_cause(
                                 CnxError::Internal(format!(
@@ -3152,6 +3166,95 @@ fn post_recovery_sink_timeout_defers_pending_materialization_state() {
 }
 
 #[test]
+fn post_recovery_sink_timeout_defers_stale_pending_group_rows() {
+    let snapshot = crate::sink::SinkStatusSnapshot {
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: String::from("g1"),
+                primary_object_ref: String::from("node-a::g1"),
+                total_nodes: 0,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: String::from("g2"),
+                primary_object_ref: String::from("node-a::g2"),
+                total_nodes: 0,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            },
+        ],
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        FSMetaApp::sink_status_snapshot_should_defer_republish_after_retained_replay_timeout(
+            &snapshot
+        ),
+        "stale zero-live group rows after retained replay are catch-up evidence and must defer republish instead of reopening the gate as if sink status were terminally restored"
+    );
+}
+
+#[test]
+fn post_recovery_sink_timeout_defers_scheduled_ready_rows_without_live_materialized_owner() {
+    let snapshot = crate::sink::SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: String::from("g1"),
+            primary_object_ref: String::from("g1"),
+            total_nodes: 2,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            String::from("node-a"),
+            vec![String::from("g1")],
+        )]),
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        !sink_status_snapshot_ready_for_expected_groups(
+            &snapshot,
+            &std::collections::BTreeSet::from([String::from("g1")])
+        ),
+        "precondition: scheduled Ready rows without a live materialized owner are not query-service ready"
+    );
+    assert!(
+        FSMetaApp::sink_status_snapshot_should_defer_republish_after_retained_replay_timeout(
+            &snapshot
+        ),
+        "post-replay scheduled rows that are normalized Ready but not service-live-ready are catch-up evidence for local republish, not terminal replay failure"
+    );
+}
+
+#[test]
 fn local_sink_status_republish_timeout_defers_scheduled_only_zero_state() {
     let snapshot = crate::sink::SinkStatusSnapshot {
         scheduled_groups_by_node: std::collections::BTreeMap::from([(
@@ -3546,6 +3649,8 @@ impl ManagementWriteRecoveryContext {
         if signals.is_empty() {
             return Ok(false);
         }
+        #[cfg(test)]
+        note_sink_apply_entry_for_tests(self.instance_id);
         self.sink
             .apply_orchestration_signals_with_total_timeout_with_failure(
                 &signals,
@@ -3554,6 +3659,73 @@ impl ManagementWriteRecoveryContext {
             .await
             .map_err(SinkFailure::into_error)?;
         Ok(true)
+    }
+
+    async fn retained_sink_replay_signals_for_local_republish(&self) -> Vec<SinkControlSignal> {
+        let retained_sink_generation = self
+            .retained_sink_control_state
+            .lock()
+            .await
+            .active_by_route
+            .values()
+            .filter_map(|signal| match signal {
+                SinkControlSignal::Activate { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .max();
+        let retained_source_generation = self
+            .source
+            .control_signals_with_replay(&[])
+            .await
+            .iter()
+            .map(source_signal_generation)
+            .max();
+        let generation = retained_sink_generation
+            .into_iter()
+            .chain(retained_source_generation)
+            .max();
+        let Some(generation) = generation else {
+            return Vec::new();
+        };
+        let route_key = format!("{}.stream", ROUTE_KEY_EVENTS);
+        let tick = SinkControlSignal::Tick {
+            unit: SinkRuntimeUnit::Sink,
+            route_key: route_key.clone(),
+            generation,
+            envelope: encode_runtime_unit_tick(&RuntimeUnitTick {
+                route_key,
+                unit_id: execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                generation,
+                at_ms: 1,
+            })
+            .expect("encode deferred repair sink-status replay tick"),
+        };
+        let mut replayed = self.app_retained_sink_replay_signals().await;
+        replayed.push(tick);
+        replayed
+    }
+
+    async fn wait_for_sink_replay_readiness_after_repair(
+        &self,
+    ) -> std::result::Result<(), CnxError> {
+        let expected_groups = SinkRecoveryMachine::new_post_recovery(None)
+            .run_post_recovery_readiness(&self.source, &self.sink, &self.runtime_state_changed)
+            .await
+            .map_err(RuntimeWorkerObservationFailure::into_error)?;
+        if let Some(expected_groups) = expected_groups {
+            let post_return_sink_replay_signals = self
+                .retained_sink_replay_signals_for_local_republish()
+                .await;
+            FSMetaApp::wait_for_local_sink_status_republish_after_recovery_requiring_probe_from_parts(
+                self.source.clone(),
+                self.sink.clone(),
+                self.runtime_state_changed.clone(),
+                &expected_groups,
+                &post_return_sink_replay_signals,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     fn restore_control_after_retained_replay_recovery(&self) {
@@ -3670,6 +3842,7 @@ impl ManagementWriteRecoveryContext {
         if self.runtime_control_state().sink_state_replay_required() {
             if self.replay_app_retained_sink_state_if_present().await? {
                 if !self.sink.retained_replay_required() {
+                    self.wait_for_sink_replay_readiness_after_repair().await?;
                     self.clear_sink_replay_after_repair();
                 }
             } else if !self.sink.retained_replay_required() {
@@ -3680,6 +3853,7 @@ impl ManagementWriteRecoveryContext {
                     .await
                     .map_err(SinkFailure::into_error)?;
                 if !self.sink.retained_replay_required() {
+                    self.wait_for_sink_replay_readiness_after_repair().await?;
                     self.clear_sink_replay_after_repair();
                 }
             }
@@ -7725,12 +7899,36 @@ impl FSMetaApp {
         )
     }
 
+    fn sink_status_snapshot_has_stale_group_republish_evidence(
+        snapshot: &crate::sink::SinkStatusSnapshot,
+    ) -> bool {
+        !snapshot.groups.is_empty()
+            && matches!(
+                snapshot.concern_projection().concern,
+                Some(crate::sink::SinkStatusConcern::StaleEmpty)
+            )
+    }
+
+    fn sink_status_snapshot_has_incomplete_scheduled_group_republish_evidence(
+        snapshot: &crate::sink::SinkStatusSnapshot,
+    ) -> bool {
+        let projection = snapshot.concern_projection();
+        !snapshot.groups.is_empty()
+            && !projection.summary.scheduled_groups.is_empty()
+            && projection.summary.missing_scheduled_groups.is_empty()
+            && projection.summary.ready_groups != projection.summary.scheduled_groups
+    }
+
     fn sink_status_snapshot_should_defer_republish_after_retained_replay_timeout(
         snapshot: &crate::sink::SinkStatusSnapshot,
     ) -> bool {
         FSMetaApp::sink_status_snapshot_summary_is_empty(snapshot)
             || FSMetaApp::sink_status_snapshot_has_scheduled_only_republish_evidence(snapshot)
             || FSMetaApp::sink_status_snapshot_has_pending_republish_evidence(snapshot)
+            || FSMetaApp::sink_status_snapshot_has_stale_group_republish_evidence(snapshot)
+            || FSMetaApp::sink_status_snapshot_has_incomplete_scheduled_group_republish_evidence(
+                snapshot,
+            )
     }
 
     fn sink_status_snapshot_should_defer_local_republish_after_retained_replay(
