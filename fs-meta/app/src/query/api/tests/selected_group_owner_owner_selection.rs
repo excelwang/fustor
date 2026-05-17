@@ -117,6 +117,37 @@ async fn selected_group_materialized_route_uses_owner_route_when_owner_is_caller
     node_a_endpoint.shutdown(Duration::from_secs(2)).await;
 }
 
+#[test]
+fn decode_selected_group_response_prefers_live_payload_over_newer_empty_peer_payload() {
+    let events = vec![
+        mk_event_with_correlation_and_timestamp(
+            "nfs1",
+            42,
+            10,
+            real_materialized_tree_payload_for_test(b"/"),
+        ),
+        mk_event_with_correlation_and_timestamp(
+            "nfs1",
+            42,
+            20,
+            empty_materialized_tree_payload_for_test(b"/"),
+        ),
+    ];
+
+    let payload = decode_materialized_selected_group_response(
+        &events,
+        &ProjectionPolicy::default(),
+        "nfs1",
+        b"/",
+    )
+    .expect("decode selected-group materialized response with mixed live and empty replies");
+
+    assert!(
+        payload.root.exists || payload.root.has_children || !payload.entries.is_empty(),
+        "selected-group materialized decode must not let a newer empty fanout reply mask an older live same-group reply"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_group_materialized_route_fans_out_candidate_owners_when_sink_status_is_fully_empty(
 ) {

@@ -3793,6 +3793,25 @@ fn mk_event_with_correlation(origin: &str, correlation: u64, payload: Vec<u8>) -
     )
 }
 
+fn mk_event_with_correlation_and_timestamp(
+    origin: &str,
+    correlation: u64,
+    timestamp_us: u64,
+    payload: Vec<u8>,
+) -> Event {
+    Event::new(
+        EventMetadata {
+            origin_id: NodeId(origin.to_string()),
+            timestamp_us,
+            logical_ts: None,
+            correlation_id: Some(correlation),
+            ingress_auth: None,
+            trace: None,
+        },
+        Bytes::from(payload),
+    )
+}
+
 fn force_find_tree_payload_for_route_test() -> Vec<u8> {
     rmp_serde::to_vec_named(&ForceFindQueryPayload::Tree(TreeGroupPayload {
         reliability: GroupReliability {

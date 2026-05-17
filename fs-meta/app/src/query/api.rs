@@ -11781,15 +11781,16 @@ fn decode_materialized_selected_group_response(
                 let precedence = payload_precedence(event);
                 let replace = match (best_precedence, best.as_ref()) {
                     (None, _) => true,
-                    (Some(current), _) if precedence > current => true,
-                    (Some(current), Some(current_best))
-                        if precedence == current
-                            && !payload_has_live_data(current_best)
-                            && payload_has_live_data(&payload) =>
-                    {
-                        true
+                    (Some(_), None) => true,
+                    (Some(current), Some(current_best)) => {
+                        let current_has_live_data = payload_has_live_data(current_best);
+                        let payload_has_live_data = payload_has_live_data(&payload);
+                        match (current_has_live_data, payload_has_live_data) {
+                            (false, true) => true,
+                            (true, false) => false,
+                            _ => precedence > current,
+                        }
                     }
-                    _ => false,
                 };
                 if replace {
                     best_precedence = Some(precedence);
