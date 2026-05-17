@@ -11009,6 +11009,155 @@ impl FSMetaApp {
                 tasks.push(endpoint);
             }
         }
+        if internal_query_active && matches!(&*self.sink, SinkFacade::Worker(_)) {
+            let mut sink_query_route_keys = BTreeSet::new();
+            if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY) {
+                sink_query_route_keys.insert(route.0);
+            }
+            let local_owner_sink_query_route = crate::runtime::routes::sink_query_request_route_for(
+                &self.node_id.0,
+            )
+            .0;
+            for unit_id in [
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            ] {
+                for route_key in self.facade_gate.active_route_keys(unit_id)? {
+                    if route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL)
+                        || route_key == local_owner_sink_query_route
+                    {
+                        sink_query_route_keys.insert(route_key);
+                    }
+                }
+            }
+            for route_key in sink_query_route_keys {
+                let prefer_query_peer_first = self
+                    .mirrored_query_peer_routes
+                    .lock()
+                    .await
+                    .contains_key(&route_key);
+                let endpoint_unit_ids = preferred_internal_query_endpoint_units(
+                    query_active,
+                    query_peer_active,
+                    prefer_query_peer_first,
+                );
+                if endpoint_unit_ids.is_empty()
+                    || !route_still_active_for_units(
+                        &self.facade_gate,
+                        &route_key,
+                        &endpoint_unit_ids,
+                    )
+                    || !spawned_routes.insert(route_key.clone())
+                {
+                    // Not currently selected as query/query-peer sink-query owner, route inactive, or already running.
+                    continue;
+                }
+                eprintln!(
+                    "fs_meta_runtime_app: spawning worker-backed sink query endpoint route={}",
+                    route_key
+                );
+                let active_unit_ids = endpoint_unit_ids.clone();
+                let facade_gate = self.facade_gate.clone();
+                let sink = self.sink.clone();
+                let endpoint = ManagedEndpointTask::spawn_with_units_without_ready_wait(
+                    boundary.clone(),
+                    RouteKey(route_key.clone()),
+                    format!(
+                        "app:{}:{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY
+                    ),
+                    endpoint_unit_ids,
+                    tokio_util::sync::CancellationToken::new(),
+                    move |requests| {
+                        let facade_gate = facade_gate.clone();
+                        let route_key = route_key.clone();
+                        let active_unit_ids = active_unit_ids.clone();
+                        let sink = sink.clone();
+                        async move {
+                            let mut responses = Vec::new();
+                            for req in requests {
+                                let Ok(params) =
+                                    rmp_serde::from_slice::<InternalQueryRequest>(
+                                        req.payload_bytes(),
+                                    )
+                                else {
+                                    continue;
+                                };
+                                let trace_sink_query_route =
+                                    debug_sink_query_route_trace_enabled();
+                                if trace_sink_query_route {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: worker-backed sink query request route={} selected_group={:?} recursive={} path={}",
+                                        route_key,
+                                        params.scope.selected_group,
+                                        params.scope.recursive,
+                                        String::from_utf8_lossy(&params.scope.path)
+                                    );
+                                }
+                                if !route_still_active_for_units(
+                                    &facade_gate,
+                                    &route_key,
+                                    &active_unit_ids,
+                                ) {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: worker-backed sink query unavailable reason=route_deactivated_after_recv route={}",
+                                        route_key
+                                    );
+                                    match selected_group_empty_materialized_reply(
+                                        &params,
+                                        req.metadata().correlation_id,
+                                    ) {
+                                        Ok(Some(event)) => responses.push(event),
+                                        Ok(None) => {}
+                                        Err(err) => eprintln!(
+                                            "fs_meta_runtime_app: worker-backed sink query deactivated empty reply encode failed: {err}"
+                                        ),
+                                    }
+                                    continue;
+                                }
+                                match sink
+                                    .materialized_query_nonblocking_with_failure(&params)
+                                    .await
+                                {
+                                    Ok(mut events) => {
+                                        if trace_sink_query_route {
+                                            eprintln!(
+                                                "fs_meta_runtime_app: worker-backed sink query response route={} events={}",
+                                                route_key,
+                                                events.len()
+                                            );
+                                        }
+                                        for event in &mut events {
+                                            let mut meta = event.metadata().clone();
+                                            meta.correlation_id = req.metadata().correlation_id;
+                                            responses.push(Event::new(
+                                                meta,
+                                                bytes::Bytes::copy_from_slice(
+                                                    event.payload_bytes(),
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let err = err.into_error();
+                                        eprintln!(
+                                            "fs_meta_runtime_app: worker-backed sink query failed route={} err={}",
+                                            route_key, err
+                                        );
+                                        responses.push(sink_query_proxy_error_reply(
+                                            &err,
+                                            req.metadata().correlation_id,
+                                        ));
+                                    }
+                                }
+                            }
+                            responses
+                        }
+                    },
+                );
+                tasks.push(endpoint);
+            }
+        }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY) {
             if internal_query_active {
                 let prefer_query_peer_first = self

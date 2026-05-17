@@ -772,6 +772,79 @@ fn selected_group_full_materialization_wave(
     wave
 }
 
+#[tokio::test]
+async fn worker_backed_sink_starts_internal_materialized_owner_query_routes() {
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1_dir = tmp.path().join("nfs1");
+    fs::create_dir_all(&nfs1_dir).expect("create nfs1 dir");
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_root = worker_socket_tempdir();
+    let source_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "source");
+    let sink_socket_dir = worker_role_socket_dir(worker_socket_root.path(), "sink");
+    fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+    fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+    let app = FSMetaApp::with_boundaries_and_state(
+        FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![worker_watch_scan_root("nfs1", &nfs1_dir)],
+                host_object_grants: vec![worker_export(
+                    "node-a::nfs1",
+                    "node-a",
+                    "127.0.0.1",
+                    nfs1_dir,
+                )],
+                ..SourceConfig::default()
+            },
+            ..FSMetaConfig::default()
+        },
+        external_runtime_worker_binding("source", &source_socket_dir),
+        external_runtime_worker_binding("sink", &sink_socket_dir),
+        NodeId("node-a".into()),
+        Some(boundary.clone()),
+        Some(boundary.clone()),
+        state_boundary,
+    )
+    .expect("init app");
+
+    let generic_query_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL);
+    let owner_query_route = sink_query_request_route_for("node-a").0;
+    let scope_rows = &[("nfs1", &["node-a::nfs1"][..])];
+    for route_key in [&generic_query_route, &owner_query_route] {
+        app.facade_gate
+            .apply_activate(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                route_key,
+                2,
+                &scope_rows
+                    .iter()
+                    .map(|(scope_id, resource_ids)| RuntimeBoundScope {
+                        scope_id: (*scope_id).to_string(),
+                        resource_ids: resource_ids.iter().map(|id| (*id).to_string()).collect(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .expect("activate query-peer materialized route");
+    }
+
+    app.ensure_runtime_proxy_endpoints_started()
+        .await
+        .expect("start runtime proxy endpoints");
+
+    let endpoint_routes = app.runtime_endpoint_routes.lock().await.clone();
+    assert!(
+        endpoint_routes.contains(&generic_query_route),
+        "worker-backed sink must expose the generic internal materialized query route through the app proxy layer; routes={endpoint_routes:?}"
+    );
+    assert!(
+        endpoint_routes.contains(&owner_query_route),
+        "worker-backed sink must expose owner-scoped internal materialized query routes through the app proxy layer; routes={endpoint_routes:?}"
+    );
+
+    app.close().await.expect("close app");
+}
+
 fn worker_export(
     object_ref: &str,
     host_ref: &str,
