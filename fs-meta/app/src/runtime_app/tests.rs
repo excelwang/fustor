@@ -23,6 +23,7 @@ use capanix_app_sdk::runtime::{
     EventMetadata, LogLevel, RuntimeWorkerBinding, RuntimeWorkerBindings,
     RuntimeWorkerLauncherKind, in_memory_state_boundary,
 };
+use capanix_app_sdk::runtime::TraceContext;
 use capanix_host_fs_types::UnixStat;
 use capanix_runtime_entry_sdk::control::{
     RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate,
@@ -2085,6 +2086,33 @@ fn mk_source_event(origin: &str, path: &[u8], file_name: &[u8], ts: u64) -> Even
         },
         Bytes::from(payload),
     )
+}
+
+#[test]
+fn sink_query_reply_event_strips_transport_trace_from_materialized_payload() {
+    let materialized_event = Event::new(
+        EventMetadata {
+            origin_id: NodeId("nfs1".to_string()),
+            timestamp_us: 7,
+            logical_ts: Some(11),
+            correlation_id: Some(3),
+            ingress_auth: None,
+            trace: Some(TraceContext {
+                hop_list: vec![NodeId("node-a".to_string())],
+            }),
+        },
+        Bytes::from_static(b"tree-payload"),
+    );
+
+    let reply =
+        sink_query_reply_event_from_materialized_event(&materialized_event, Some(42));
+
+    assert_eq!(reply.metadata().correlation_id, Some(42));
+    assert!(
+        reply.metadata().trace.is_none(),
+        "query replies must start a fresh transport trace; preserving a materialized event trace makes capanix loop detection drop authoritative replies"
+    );
+    assert_eq!(reply.payload_bytes(), b"tree-payload");
 }
 
 fn mk_control_event(origin: &str, control: ControlEvent, ts: u64) -> Event {

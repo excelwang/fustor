@@ -4299,6 +4299,16 @@ fn sink_query_proxy_error_reply(err: &CnxError, correlation_id: Option<u64>) -> 
     )
 }
 
+fn sink_query_reply_event_from_materialized_event(
+    event: &Event,
+    correlation_id: Option<u64>,
+) -> Event {
+    let mut meta = event.metadata().clone();
+    meta.correlation_id = correlation_id;
+    meta.trace = None;
+    Event::new(meta, bytes::Bytes::copy_from_slice(event.payload_bytes()))
+}
+
 fn explicit_empty_sink_status_reply(
     origin_id: &NodeId,
     correlation_id: Option<u64>,
@@ -11149,14 +11159,12 @@ impl FSMetaApp {
                                             );
                                         }
                                         for event in &mut events {
-                                            let mut meta = event.metadata().clone();
-                                            meta.correlation_id = req.metadata().correlation_id;
-                                            responses.push(Event::new(
-                                                meta,
-                                                bytes::Bytes::copy_from_slice(
-                                                    event.payload_bytes(),
+                                            responses.push(
+                                                sink_query_reply_event_from_materialized_event(
+                                                    event,
+                                                    req.metadata().correlation_id,
                                                 ),
-                                            ));
+                                            );
                                         }
                                     }
                                     Err(err) => {
@@ -11495,14 +11503,12 @@ impl FSMetaApp {
                                                 }
                                             }
                                             for event in &mut events {
-                                                let mut meta = event.metadata().clone();
-                                                meta.correlation_id = req.metadata().correlation_id;
-                                                responses.push(Event::new(
-                                                    meta,
-                                                    bytes::Bytes::copy_from_slice(
-                                                        event.payload_bytes(),
+                                                responses.push(
+                                                    sink_query_reply_event_from_materialized_event(
+                                                        event,
+                                                        req.metadata().correlation_id,
                                                     ),
-                                                ));
+                                                );
                                             }
                                         }
                                         Err(err) => {
