@@ -14183,6 +14183,105 @@ async fn current_owner_health_observability_reads_live_worker_before_control_cac
     client.close().await.expect("close source worker");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_owner_health_observability_reuses_recent_complete_live_cache() {
+    let _observability_hook_guard = source_worker_observability_hook_test_guard().await;
+    let _count_hook_reset = SourceWorkerObservabilityCallCountHookReset;
+    let tmp = tempdir().expect("create temp dir");
+    let nfs1 = tmp.path().join("nfs1");
+    std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+    let cfg = SourceConfig {
+        roots: vec![worker_watch_scan_root("nfs1", &nfs1)],
+        host_object_grants: vec![worker_source_export(
+            "node-a::nfs1",
+            "node-a",
+            "10.0.0.11",
+            nfs1.clone(),
+        )],
+        ..SourceConfig::default()
+    };
+    let boundary = Arc::new(LoopbackWorkerBoundary::default());
+    let state_boundary = in_memory_state_boundary();
+    let worker_socket_dir = worker_socket_tempdir();
+    let factory =
+        RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+    let client = SourceWorkerClientHandle::new(
+        NodeId("node-a".to_string()),
+        cfg,
+        external_source_worker_binding(worker_socket_dir.path()),
+        factory,
+    )
+    .expect("construct source worker client");
+
+    tokio::time::timeout(Duration::from_secs(8), client.start())
+        .await
+        .expect("source worker start timed out")
+        .expect("start source worker");
+
+    client
+        .on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope_with_resources("nfs1", &["node-a::nfs1"])],
+            }))
+            .expect("encode source scan activate"),
+        ])
+        .await
+        .expect("apply source+scan control");
+
+    let live = client
+        .observability_snapshot_with_timeout(SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+        .await
+        .expect("prime complete live observability snapshot");
+    client.update_cached_observability_snapshot(&live);
+
+    let observability_rpc_count = Arc::new(AtomicUsize::new(0));
+    install_source_worker_observability_call_count_hook(SourceWorkerObservabilityCallCountHook {
+        count: observability_rpc_count.clone(),
+    });
+
+    let (owner_health, used_cached_fallback) = client
+        .current_owner_health_observability_snapshot_for_status_route_with_timeout(Some(
+            Duration::from_secs(2),
+        ))
+        .await;
+
+    assert!(
+        used_cached_fallback,
+        "recent complete live status should be reused as bounded current-owner evidence"
+    );
+    assert_eq!(
+        observability_rpc_count.load(Ordering::Relaxed),
+        0,
+        "a second current-owner health probe should not issue another live worker read while a complete live snapshot is still fresh"
+    );
+    assert_eq!(
+        owner_health.scheduled_source_groups_by_node.get("node-a"),
+        Some(&vec!["nfs1".to_string()])
+    );
+    assert!(
+        !source_observability_snapshot_is_degraded_worker_cache(&owner_health),
+        "recent live cache reuse must not surface as degraded worker evidence: {:?}",
+        owner_health.status.degraded_roots
+    );
+
+    client.close().await.expect("close source worker");
+}
+
 #[test]
 fn stable_status_root_health_cache_can_skip_live_refresh_after_publication() {
     let worker_socket_dir = worker_socket_tempdir();

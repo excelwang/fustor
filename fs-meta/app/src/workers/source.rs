@@ -65,6 +65,10 @@ impl SourceObservabilityStatusReadMode {
     fn can_use_status_cache_before_live_probe(self) -> bool {
         matches!(self, Self::OwnershipFast)
     }
+
+    fn can_use_recent_live_cache_before_live_probe(self) -> bool {
+        matches!(self, Self::OwnershipFast | Self::CurrentOwnerHealth)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8345,7 +8349,7 @@ impl SourceWorkerClientHandle {
             }
             return Ok((snapshot, true));
         };
-        if read_mode.can_use_status_cache_before_live_probe()
+        if read_mode.can_use_recent_live_cache_before_live_probe()
             && let Some(snapshot) = self.recent_nonblocking_observability_cache_snapshot()
         {
             self.log_observability_cache_fallback("recent_live_cache", &snapshot);
@@ -8387,7 +8391,7 @@ impl SourceWorkerClientHandle {
             }
             return Ok((snapshot, true));
         }
-        if read_mode.can_use_status_cache_before_live_probe()
+        if read_mode.can_use_recent_live_cache_before_live_probe()
             && let Some(snapshot) = self.recent_nonblocking_observability_cache_snapshot()
         {
             self.log_observability_cache_fallback("recent_live_cache", &snapshot);
