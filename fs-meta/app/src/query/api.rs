@@ -9898,6 +9898,11 @@ fn selected_group_candidate_owner_events_have_data(
     }
 }
 
+struct CandidateOwnerRouteOutcome {
+    events: Option<Vec<Event>>,
+    attempted_nodes: BTreeSet<String>,
+}
+
 async fn query_materialized_events_via_candidate_owner_nodes(
     policy: &ProjectionPolicy,
     source: &SourceFacade,
@@ -9907,7 +9912,7 @@ async fn query_materialized_events_via_candidate_owner_nodes(
     params: &InternalQueryRequest,
     group_id: &str,
     plan: SelectedGroupOwnerRoutePlan,
-) -> Result<Option<Vec<Event>>, CnxError> {
+) -> Result<CandidateOwnerRouteOutcome, CnxError> {
     if plan.route_timeout().is_zero() {
         return Err(CnxError::Timeout);
     }
@@ -9917,8 +9922,15 @@ async fn query_materialized_events_via_candidate_owner_nodes(
         current_owner_candidate_nodes_for_groups_and_source_status(source, source_status, &groups)
             .map_err(QueryWorkerObservationFailure::into_error)?;
     if candidate_nodes.is_empty() {
-        return Ok(None);
+        return Ok(CandidateOwnerRouteOutcome {
+            events: None,
+            attempted_nodes: BTreeSet::new(),
+        });
     }
+    let attempted_nodes = candidate_nodes
+        .iter()
+        .map(|node_id| node_id.0.clone())
+        .collect::<BTreeSet<_>>();
 
     let mut pending = candidate_nodes
         .into_iter()
@@ -9945,11 +9957,17 @@ async fn query_materialized_events_via_candidate_owner_nodes(
             continue;
         };
         if selected_group_candidate_owner_events_have_data(policy, params, group_id, &events) {
-            return Ok(Some(events));
+            return Ok(CandidateOwnerRouteOutcome {
+                events: Some(events),
+                attempted_nodes,
+            });
         }
     }
 
-    Ok(None)
+    Ok(CandidateOwnerRouteOutcome {
+        events: None,
+        attempted_nodes,
+    })
 }
 
 async fn query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
@@ -10005,7 +10023,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                 if remaining.is_zero() {
                     return Err(CnxError::Timeout);
                 }
-                if let Some(events) = query_materialized_events_via_candidate_owner_nodes(
+                let candidate_owner_outcome = query_materialized_events_via_candidate_owner_nodes(
                     policy,
                     source.as_ref(),
                     selected_group_source_status,
@@ -10015,8 +10033,8 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                     group_id,
                     group_plan.owner_collection_gap_route_plan(remaining),
                 )
-                .await?
-                {
+                .await?;
+                if let Some(events) = candidate_owner_outcome.events {
                     return Ok(events);
                 }
                 let remaining = deadline
@@ -10027,6 +10045,11 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                 }
                 if let Some(primary_node_id) =
                     sink_primary_owner_node_for_group(selected_group_sink_status.as_ref(), group_id)
+                        .filter(|primary_node_id| {
+                            !candidate_owner_outcome
+                                .attempted_nodes
+                                .contains(&primary_node_id.0)
+                        })
                 {
                     let primary_retry_plan = group_plan.owner_collection_gap_route_plan(remaining);
                     if !primary_retry_plan.route_timeout().is_zero()
@@ -11935,6 +11958,7 @@ fn decode_materialized_selected_group_response(
     let mut last_decode_error = None::<String>;
     let mut best = None::<TreeGroupPayload>;
     let mut best_precedence = None::<u64>;
+    let prefer_live_root_payload = query_path.is_empty() || query_path == b"/";
     for event in events {
         if event_group_key(policy, event) != selected_group {
             continue;
@@ -11957,12 +11981,16 @@ fn decode_materialized_selected_group_response(
                     (None, _) => true,
                     (Some(_), None) => true,
                     (Some(current), Some(current_best)) => {
-                        let current_has_live_data = payload_has_live_data(current_best);
-                        let payload_has_live_data = payload_has_live_data(&payload);
-                        match (current_has_live_data, payload_has_live_data) {
-                            (false, true) => true,
-                            (true, false) => false,
-                            _ => precedence > current,
+                        if prefer_live_root_payload {
+                            let current_has_live_data = payload_has_live_data(current_best);
+                            let payload_has_live_data = payload_has_live_data(&payload);
+                            match (current_has_live_data, payload_has_live_data) {
+                                (false, true) => true,
+                                (true, false) => false,
+                                _ => precedence > current,
+                            }
+                        } else {
+                            precedence > current
                         }
                     }
                 };
