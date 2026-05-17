@@ -28,7 +28,9 @@ use capanix_host_adapter_fs::HostAdapter;
 use capanix_runtime_entry_sdk::advanced::boundary::{
     BoundaryContext, ChannelIoSubset, StateBoundary,
 };
-use capanix_runtime_entry_sdk::control::{RuntimeBoundScope, RuntimeHostGrantState};
+use capanix_runtime_entry_sdk::control::{
+    RuntimeBoundScope, RuntimeExecControl, RuntimeHostGrantState, decode_runtime_exec_control,
+};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -216,6 +218,28 @@ fn matching_endpoint_task_states(tasks: &[ManagedEndpointTask], route_key: &str)
             )
         })
         .collect()
+}
+
+fn sink_events_stream_route_key() -> String {
+    format!("{}.{}", ROUTE_KEY_EVENTS, METHOD_STREAM)
+}
+
+fn sink_signal_is_restart_deferred_events_stream_deactivate(signal: &SinkControlSignal) -> bool {
+    matches!(
+        signal,
+        SinkControlSignal::Deactivate {
+            unit: SinkRuntimeUnit::Sink,
+            route_key,
+            envelope,
+            ..
+        } if route_key == &sink_events_stream_route_key()
+            && matches!(
+                decode_runtime_exec_control(envelope),
+                Ok(Some(RuntimeExecControl::Deactivate(deactivate)))
+                    if deactivate.reason == "restart_deferred_retire_pending"
+                        || deactivate.reason == "deferred_retire"
+            )
+    )
 }
 
 fn per_peer_sink_query_route_locality(node_id: &NodeId, route_key: &str) -> &'static str {
@@ -3664,8 +3688,7 @@ impl SinkFileMeta {
                         );
                     }
                     self.apply_activate_signal(*unit, route_key, *generation, bound_scopes)?;
-                    if *unit == SinkRuntimeUnit::Sink
-                        && route_key == &format!("{}.{}", ROUTE_KEY_EVENTS, METHOD_STREAM)
+                    if *unit == SinkRuntimeUnit::Sink && route_key == &sink_events_stream_route_key()
                     {
                         activated_events_stream_route = true;
                     }
@@ -3678,9 +3701,13 @@ impl SinkFileMeta {
                     generation,
                     ..
                 } => {
+                    let is_restart_deferred_events_stream_deactivate =
+                        sink_signal_is_restart_deferred_events_stream_deactivate(signal);
                     self.apply_deactivate_signal(*unit, route_key, *generation)?;
                     validated += 1;
-                    refresh_runtime_groups = true;
+                    if !is_restart_deferred_events_stream_deactivate {
+                        refresh_runtime_groups = true;
+                    }
                 }
                 SinkControlSignal::Tick {
                     unit,
