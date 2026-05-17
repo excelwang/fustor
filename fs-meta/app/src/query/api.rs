@@ -4582,13 +4582,18 @@ async fn route_materialized_events_via_node(
 }
 
 async fn query_materialized_events_via_selected_group_owner_node(
-    _sink: &Arc<SinkFacade>,
+    sink: &Arc<SinkFacade>,
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
     node_id: NodeId,
     params: InternalQueryRequest,
     plan: SelectedGroupOwnerRoutePlan,
 ) -> Result<Vec<Event>, CnxError> {
+    if node_id == origin_id {
+        return query_local_materialized_events_with_failure(sink, &params, plan.route_timeout())
+            .await
+            .map_err(QueryWorkerObservationFailure::into_error);
+    }
     route_materialized_events_via_node(boundary, origin_id, node_id, params, plan).await
 }
 

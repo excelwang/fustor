@@ -4941,18 +4941,19 @@ const SINK_QUERY_PROXY_BRIDGE_TIMEOUT: Duration = Duration::from_millis(750);
 const SINK_QUERY_PROXY_BRIDGE_IDLE_GRACE: Duration = Duration::from_millis(150);
 
 fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
+    let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
     match unit {
         FacadeRuntimeUnit::Facade => route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
         FacadeRuntimeUnit::Query => {
             route_key == format!("{}.req", ROUTE_KEY_QUERY)
                 || is_materialized_query_request_route(route_key)
                 || is_sink_status_query_request_route(route_key)
-                || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
+                || route_key == source_status_route
         }
         FacadeRuntimeUnit::QueryPeer => {
             is_materialized_query_request_route(route_key)
                 || is_sink_status_query_request_route(route_key)
-                || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
+                || route_key == source_status_route
         }
     }
 }
