@@ -10018,6 +10018,37 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                 if remaining.is_zero() {
                     return Err(CnxError::Timeout);
                 }
+                if let Some(primary_node_id) =
+                    sink_primary_owner_node_for_group(selected_group_sink_status.as_ref(), group_id)
+                {
+                    let primary_retry_plan = group_plan.owner_collection_gap_route_plan(remaining);
+                    if !primary_retry_plan.route_timeout().is_zero()
+                        && let Ok(primary_events) =
+                            query_materialized_events_via_selected_group_owner_node(
+                                sink,
+                                boundary.clone(),
+                                origin_id.clone(),
+                                primary_node_id,
+                                params.clone(),
+                                primary_retry_plan,
+                            )
+                            .await
+                        && selected_group_candidate_owner_events_have_data(
+                            policy,
+                            &params,
+                            group_id,
+                            &primary_events,
+                        )
+                    {
+                        return Ok(primary_events);
+                    }
+                }
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .unwrap_or_default();
+                if remaining.is_zero() {
+                    return Err(CnxError::Timeout);
+                }
                 let proxy_route_plan = group_plan.owner_collection_gap_proxy_route_plan(remaining);
                 return query_materialized_events_via_generic_proxy(
                     boundary.clone(),

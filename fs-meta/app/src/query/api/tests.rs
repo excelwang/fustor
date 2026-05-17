@@ -9846,6 +9846,298 @@ async fn selected_group_materialized_route_reroutes_to_sink_primary_object_ref_w
     proxy_endpoint.shutdown(Duration::from_secs(2)).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_untrusted_owner_collection_gap_retries_bound_primary_before_settling_empty_proxy()
+ {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a");
+    let node_b_root = tmp.path().join("node-b");
+    fs::create_dir_all(node_a_root.join("layout-a")).expect("create node-a dir");
+    fs::create_dir_all(node_b_root.join("layout-b")).expect("create node-b dir");
+    let grants = vec![
+        GrantedMountRoot {
+            object_ref: "node-a::nfs4".to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.1".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_a_root.clone(),
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+        GrantedMountRoot {
+            object_ref: "node-b::nfs4".to_string(),
+            host_ref: "node-b".to_string(),
+            host_ip: "10.0.0.2".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: std::collections::BTreeMap::new(),
+            mount_point: node_b_root.clone(),
+            fs_source: "nfs".to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: Vec::new(),
+            active: true,
+        },
+    ];
+    let source = source_facade_with_group("nfs4", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let proxy_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
+        .expect("resolve sink-query-proxy route");
+    let node_a_route = sink_query_request_route_for("node-a");
+    let node_b_route = sink_query_request_route_for("node-b");
+    let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let primary_calls_for_endpoint = primary_calls.clone();
+
+    let mut primary_owner_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_a_route.clone(),
+        "test-primary-owner-collection-gap-sink-query-endpoint",
+        CancellationToken::new(),
+        move |requests| {
+            let primary_calls = primary_calls_for_endpoint.clone();
+            async move {
+                let mut responses = Vec::new();
+                for req in requests {
+                    let call_index =
+                        primary_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if call_index == 0 {
+                        continue;
+                    }
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                        .expect("decode node-a query request");
+                    let group_id = params
+                        .scope
+                        .selected_group
+                        .clone()
+                        .expect("selected group for node-a request");
+                    responses.push(mk_event_with_correlation(
+                        &group_id,
+                        req.metadata()
+                            .correlation_id
+                            .expect("node-a request correlation"),
+                        real_materialized_tree_payload_for_test(&params.scope.path),
+                    ));
+                }
+                responses
+            }
+        },
+    );
+    let mut source_owner_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_b_route.clone(),
+        "test-source-owner-collection-gap-sink-query-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            let mut responses = Vec::new();
+            for req in requests {
+                let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                    .expect("decode node-b query request");
+                let group_id = params
+                    .scope
+                    .selected_group
+                    .clone()
+                    .expect("selected group for node-b request");
+                responses.push(mk_event_with_correlation(
+                    &group_id,
+                    req.metadata()
+                        .correlation_id
+                        .expect("node-b request correlation"),
+                    empty_materialized_tree_payload_for_test(&params.scope.path),
+                ));
+            }
+            responses
+        },
+    );
+    let mut proxy_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        proxy_route.clone(),
+        "test-empty-collection-gap-proxy-sink-query-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            let mut responses = Vec::new();
+            for req in requests {
+                let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                    .expect("decode proxy query request");
+                let group_id = params
+                    .scope
+                    .selected_group
+                    .clone()
+                    .expect("selected group for proxy request");
+                responses.push(mk_event_with_correlation(
+                    &group_id,
+                    req.metadata()
+                        .correlation_id
+                        .expect("proxy request correlation"),
+                    empty_materialized_tree_payload_for_test(&params.scope.path),
+                ));
+            }
+            responses
+        },
+    );
+
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+    );
+    let selected_group_sink_status = SinkStatusSnapshot {
+        primary_host_ref_by_group: BTreeMap::from([("nfs4".to_string(), "node-a".to_string())]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs4".to_string(),
+            primary_object_ref: "node-a::nfs4".to_string(),
+            total_nodes: 0,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+            materialized_revision: 0,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+    let selected_group_source_status = SourceStatusSnapshot {
+        current_stream_generation: Some(1),
+        logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
+            root_id: "nfs4".into(),
+            status: "ok".into(),
+            matched_grants: 1,
+            active_members: 1,
+            coverage_mode: "realtime_hotset_plus_audit".into(),
+        }],
+        concrete_roots: vec![crate::source::SourceConcreteRootHealthSnapshot {
+            root_key: "nfs4@node-b::nfs4@/unused".to_string(),
+            logical_root_id: "nfs4".to_string(),
+            object_ref: "node-b::nfs4".to_string(),
+            status: "serving".to_string(),
+            coverage_mode: "realtime_hotset_plus_audit".to_string(),
+            watch_enabled: true,
+            scan_enabled: true,
+            is_group_primary: true,
+            active: true,
+            watch_lru_capacity: 65536,
+            audit_interval_ms: 300_000,
+            overflow_count: 0,
+            overflow_pending: false,
+            rescan_pending: true,
+            last_rescan_requested_at_us: Some(10),
+            last_rescan_reason: Some("manual".to_string()),
+            last_error: None,
+            last_audit_started_at_us: None,
+            last_audit_completed_at_us: None,
+            last_audit_duration_ms: None,
+            emitted_batch_count: 2,
+            emitted_event_count: 20,
+            emitted_control_event_count: 1,
+            emitted_data_event_count: 19,
+            emitted_path_capture_target: None,
+            emitted_path_event_count: 0,
+            last_emitted_at_us: Some(20),
+            last_emitted_origins: vec!["node-b::nfs4=19".to_string()],
+            forwarded_batch_count: 2,
+            forwarded_event_count: 20,
+            forwarded_path_event_count: 0,
+            last_forwarded_at_us: Some(21),
+            last_forwarded_origins: vec!["node-b::nfs4=19".to_string()],
+            current_revision: Some(1),
+            current_stream_generation: Some(1),
+            candidate_revision: None,
+            candidate_stream_generation: None,
+            candidate_status: None,
+            draining_revision: None,
+            draining_stream_generation: None,
+            draining_status: None,
+        }],
+        degraded_roots: Vec::new(),
+    };
+    let group_plan = TreePitSessionPlan::new(Duration::from_secs(6), 1).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::Materialized,
+            observation_state: ObservationState::MaterializedUntrusted,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: true,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    let result =
+        query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
+            &state,
+            &ProjectionPolicy::default(),
+            build_materialized_tree_request(
+                b"/",
+                true,
+                None,
+                ReadClass::Materialized,
+                Some("nfs4".to_string()),
+            ),
+            Duration::from_secs(6),
+            Some(&selected_group_source_status),
+            Some(selected_group_sink_status),
+            None,
+            group_plan,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "materialized-untrusted owner-collection gap should retry the bound primary before settling an empty proxy when source evidence shows current data; node_a_calls={} proxy_calls={} err={:?}",
+        primary_calls.load(std::sync::atomic::Ordering::SeqCst),
+        boundary.send_batch_count(&proxy_route.0),
+        result.as_ref().err(),
+    );
+    let payload = decode_materialized_selected_group_response(
+        &result.expect("selected-group collection-gap result"),
+        &ProjectionPolicy::default(),
+        "nfs4",
+        b"/",
+    )
+    .expect("decode selected-group collection-gap response");
+    assert!(
+        payload.root.exists,
+        "empty proxy data must not mask the bound primary owner's materialized tree"
+    );
+    assert_eq!(
+        primary_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "bound sink primary should be retried even when source data-owner evidence points at another current source owner"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&node_b_route.0),
+        1,
+        "source data-owner candidate should still be attempted during collection-gap discovery"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&proxy_route.0),
+        0,
+        "generic proxy should not settle empty before the bound primary retry"
+    );
+
+    primary_owner_endpoint
+        .shutdown(Duration::from_secs(2))
+        .await;
+    source_owner_endpoint.shutdown(Duration::from_secs(2)).await;
+    proxy_endpoint.shutdown(Duration::from_secs(2)).await;
+}
+
 include!("tests/selected_group_owner.rs");
 
 include!("tests/pit_public.rs");
