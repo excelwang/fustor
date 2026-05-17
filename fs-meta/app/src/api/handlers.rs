@@ -1698,6 +1698,8 @@ where
     let mut last_summary = None::<String>;
     let mut last_per_origin = None::<String>;
     let mut last_runtime_scope = None::<String>;
+    let mut last_manual_rescan_current_roots_readiness =
+        None::<SourceRuntimeScopeReadinessEvidence>;
     let allow_control_resend =
         control_replay_policy == RootsPutControlReplayPolicy::AllowSingleRetry;
     // roots_put and manual-rescan publish the initial logical-roots control wave
@@ -1728,6 +1730,9 @@ where
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            if let Some(readiness) = last_manual_rescan_current_roots_readiness {
+                return Ok(Some(readiness));
+            }
             let last_err = last_err
                 .map(|err| err.to_string())
                 .unwrap_or_else(|| "none".to_string());
@@ -1910,49 +1915,7 @@ where
 
                 while !(source_collect_done && scoped_source_collect_done && local_source_done) {
                     tokio::select! {
-                        result = &mut source_collect, if !source_collect_done => {
-                            source_collect_done = true;
-                            if let Some(result) = result {
-                                match result {
-                                    Ok((_source_snapshot, origin_snapshots, _per_origin, _runtime_scope)) => {
-                                        let origin_snapshots =
-                                            filter_manual_rescan_source_status_origin_snapshots_to_probe_targets(
-                                                origin_snapshots,
-                                                &source_status_probe_node_ids,
-                                            );
-                                        observed_per_origin.extend(origin_snapshots.iter().map(|(origin, snapshot)| {
-                                            format!(
-                                                "{origin}=>{}",
-                                                summarize_source_status_route_snapshot(snapshot)
-                                            )
-                                        }));
-                                        if origin_snapshots.is_empty() {
-                                            continue;
-                                        }
-                                        let merged = merge_manual_rescan_source_status_origin_snapshots(
-                                            roots,
-                                            &mut accumulated_manual_rescan_source_status,
-                                            origin_snapshots,
-                                        );
-                                        if let Some(target_node_ids) =
-                                            manual_rescan_delivery_target_node_ids_from_accumulated_source_status(
-                                                roots,
-                                                &accumulated_manual_rescan_source_status,
-                                            )
-                                        {
-                                            return Ok(Some(
-                                                SourceRuntimeScopeReadinessEvidence::manual_rescan_from_origin_targets(
-                                                    merged,
-                                                    target_node_ids,
-                                                ),
-                                            ));
-                                        }
-                                        observed_source_snapshot = Some(merged);
-                                    }
-                                    Err(err) => observed_err = Some(err),
-                                }
-                            }
-                        }
+                        biased;
                         result = scoped_source_collects.next(), if !scoped_source_collect_done => {
                             match result {
                                 Some((_node_id, Ok(origin_snapshots))) => {
@@ -1997,6 +1960,49 @@ where
                                 scoped_source_collect_done = true;
                             }
                         }
+                        result = &mut source_collect, if !source_collect_done => {
+                            source_collect_done = true;
+                            if let Some(result) = result {
+                                match result {
+                                    Ok((_source_snapshot, origin_snapshots, _per_origin, _runtime_scope)) => {
+                                        let origin_snapshots =
+                                            filter_manual_rescan_source_status_origin_snapshots_to_probe_targets(
+                                                origin_snapshots,
+                                                &source_status_probe_node_ids,
+                                            );
+                                        observed_per_origin.extend(origin_snapshots.iter().map(|(origin, snapshot)| {
+                                            format!(
+                                                "{origin}=>{}",
+                                                summarize_source_status_route_snapshot(snapshot)
+                                            )
+                                        }));
+                                        if origin_snapshots.is_empty() {
+                                            continue;
+                                        }
+                                        let merged = merge_manual_rescan_source_status_origin_snapshots(
+                                            roots,
+                                            &mut accumulated_manual_rescan_source_status,
+                                            origin_snapshots,
+                                        );
+                                        if let Some(target_node_ids) =
+                                            manual_rescan_delivery_target_node_ids_from_accumulated_source_status(
+                                                roots,
+                                                &accumulated_manual_rescan_source_status,
+                                            )
+                                        {
+                                            return Ok(Some(
+                                                SourceRuntimeScopeReadinessEvidence::manual_rescan_from_origin_targets(
+                                                    merged,
+                                                    target_node_ids,
+                                                ),
+                                            ));
+                                        }
+                                        observed_source_snapshot = Some(merged);
+                                    }
+                                    Err(err) => observed_err = Some(err),
+                                }
+                            }
+                        }
                         local = &mut local_source, if !local_source_done => {
                             local_source_done = true;
                             if let Some(local_source) = local {
@@ -2023,6 +2029,21 @@ where
                                         ),
                                     ));
                                 }
+                                if !source_status_probe_targets_are_discovery_seed
+                                    && source_status_probe_node_ids
+                                        .iter()
+                                        .any(|node_id| runtime_node_identity_matches(node_id, &context.node_id.0))
+                                    && !manual_rescan_accumulated_source_status_has_delivery_target_node_id(
+                                        roots,
+                                        &accumulated_manual_rescan_source_status,
+                                        &context.node_id.0,
+                                    )
+                                {
+                                    allow_local_scoped_source_probe = true;
+                                    prefer_scoped_source_probe = true;
+                                    local_scoped_source_probe_unblocked = true;
+                                    source_collect_done = true;
+                                }
                                 observed_source_snapshot = Some(merged);
                             } else if !source_status_probe_targets_are_discovery_seed
                                 && source_status_probe_node_ids
@@ -2032,12 +2053,13 @@ where
                                 allow_local_scoped_source_probe = true;
                                 prefer_scoped_source_probe = true;
                                 local_scoped_source_probe_unblocked = true;
+                                source_collect_done = true;
                             }
                         }
                     }
                 }
 
-                if observed_source_snapshot.is_none() && local_scoped_source_probe_unblocked {
+                if local_scoped_source_probe_unblocked {
                     continue;
                 }
 
@@ -2151,6 +2173,7 @@ where
                         )
                     {
                         allow_local_scoped_source_probe = true;
+                        prefer_scoped_source_probe = true;
                     }
                     if let Some(readiness) = manual_rescan_readiness_from_origin_fan_in_snapshot(
                         &expected_groups,
@@ -2163,6 +2186,7 @@ where
                         {
                             return Ok(Some(readiness));
                         }
+                        last_manual_rescan_current_roots_readiness = Some(readiness);
                     }
                     last_err = None;
                     last_summary = Some(summarize_source_status_route_snapshot(&source_snapshot));
@@ -2257,6 +2281,7 @@ where
                     Some("manual-rescan delivery proof reset after roots control resend".into());
                 last_per_origin = None;
                 last_runtime_scope = None;
+                last_manual_rescan_current_roots_readiness = None;
             }
             resent_once = true;
             next_resend_at = deadline;
@@ -16538,6 +16563,111 @@ mod tests {
                 &readiness.source_snapshot,
             ),
             "returned readiness snapshot must prove current roots before target delivery proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_rescan_current_roots_readiness_returns_current_scope_when_scoped_owner_proof_times_out()
+     {
+        tokio::time::pause();
+
+        let roots = vec![RootSpec::new("nfs2", "/mnt/nfs2")];
+        let expected = roots_put_second_wave_expected_groups(&roots);
+        let mut current_roots_source = local_source_snapshot();
+        current_roots_source.logical_roots = roots.clone();
+        set_live_group_primary_source_root(&mut current_roots_source, "nfs2", "node-b");
+        current_roots_source.source_primary_by_group =
+            BTreeMap::from([("nfs2".to_string(), "node-b::nfs2".to_string())]);
+        current_roots_source.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-b".to_string(), vec!["nfs2".to_string()])]);
+        current_roots_source.scheduled_scan_groups_by_node =
+            current_roots_source.scheduled_source_groups_by_node.clone();
+        current_roots_source.last_control_frame_signals_by_node = BTreeMap::from([(
+            "node-b".to_string(),
+            vec![format!(
+                "activate unit=runtime.exec.source route={}.req generation=1777635000001 scopes=[\"nfs2=>nfs2\"]",
+                source_rescan_route_key_for("node-b")
+            )],
+        )]);
+
+        assert!(
+            manual_rescan_source_snapshot_ready_for_current_roots(
+                &expected,
+                &roots,
+                &current_roots_source,
+            ),
+            "fixture must have current-root runtime-scope readiness"
+        );
+        assert!(
+            !manual_rescan_source_snapshot_ready_for_delivery(
+                &expected,
+                &roots,
+                &current_roots_source,
+            ),
+            "fixture must leave scoped delivery proof incomplete"
+        );
+        let boundary = Arc::new(SequencedGenericSourceStatusCollectBoundary::new(
+            Vec::new(),
+            Vec::new(),
+        ));
+        let context = RootsPutSecondWaveFollowupContext {
+            node_id: NodeId("api-node".into()),
+            runtime_boundary: Some(boundary.clone()),
+            query_runtime_boundary: Some(boundary.clone()),
+            roots_control_generation: 1,
+        };
+
+        let task_roots = roots.clone();
+        let local_observation = current_roots_source.clone();
+        let task = tokio::spawn(async move {
+            wait_roots_put_second_wave_readiness_evidence_with_optional_local_source(
+                &context,
+                &task_roots,
+                BTreeSet::new(),
+                BTreeSet::from(["node-b".to_string()]),
+                false,
+                false,
+                |_| std::future::ready(None::<SourceObservabilitySnapshot>),
+                move |_| {
+                    let local_observation = local_observation.clone();
+                    std::future::ready(Some(local_observation))
+                },
+                RootsPutControlReplayPolicy::ObserveOnly,
+                manual_rescan_source_status_request_payload(),
+                false,
+            )
+            .await
+        });
+
+        for _ in 0..300 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            task.is_finished(),
+            "manual-rescan current-roots fallback should finish at the virtual deadline"
+        );
+
+        let readiness = task
+            .await
+            .expect("manual-rescan current-roots readiness join")
+            .expect("scoped owner proof timeout must not erase current-root readiness")
+            .expect("manual-rescan current-root evidence");
+
+        assert!(
+            readiness.manual_rescan_delivery_target_node_ids.is_none(),
+            "current-root readiness is not scoped delivery proof"
+        );
+        assert!(
+            manual_rescan_source_snapshot_ready_for_current_roots(
+                &expected,
+                &roots,
+                &readiness.source_snapshot,
+            ),
+            "returned fallback evidence must still prove current roots"
         );
     }
 
