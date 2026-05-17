@@ -76,6 +76,7 @@ const SELECTED_GROUP_OWNER_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_m
 const SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_millis(100);
 const RANKING_QUERY_MIN_BUDGET: Duration = Duration::from_millis(1000);
 const SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET: Duration = Duration::from_millis(2000);
+const SELECTED_GROUP_OWNER_COLLECTION_GAP_ROUTE_BUDGET: Duration = Duration::from_millis(1000);
 const TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET: Duration = Duration::from_millis(400);
 const TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET: Duration = Duration::from_millis(100);
 const EXPLICIT_EMPTY_SINK_STATUS_RECOLLECT_BUDGET: Duration = Duration::from_millis(250);
@@ -6080,6 +6081,16 @@ impl TreePitGroupPlan {
         SelectedGroupOwnerRoutePlan::new(self.owner_attempt_timeout(remaining_session))
     }
 
+    fn owner_collection_gap_route_plan(
+        self,
+        remaining_session: Duration,
+    ) -> SelectedGroupOwnerRoutePlan {
+        SelectedGroupOwnerRoutePlan::new(std::cmp::min(
+            remaining_session,
+            SELECTED_GROUP_OWNER_COLLECTION_GAP_ROUTE_BUDGET,
+        ))
+    }
+
     fn owner_empty_tree_rescue_plan(
         self,
         facts: SelectedGroupOwnerEmptyTreeRescueFacts,
@@ -8113,6 +8124,40 @@ fn tree_pit_group_plan_owner_route_plan_owns_owner_route_collect_idle_grace() {
 }
 
 #[test]
+fn tree_pit_group_plan_caps_owner_collection_gap_route_budget() {
+    let plan = TreePitSessionPlan::new(Duration::from_secs(60), 2).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::TrustedMaterialized,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: false,
+            selected_group_sink_unready_empty: true,
+            empty_root_requires_fail_closed: true,
+        },
+    );
+
+    assert_eq!(
+        plan.owner_collection_gap_route_plan(Duration::from_secs(60)),
+        SelectedGroupOwnerRoutePlan {
+            route_timeout: SELECTED_GROUP_OWNER_COLLECTION_GAP_ROUTE_BUDGET,
+            collect_idle_grace: SELECTED_GROUP_OWNER_ROUTE_COLLECT_IDLE_GRACE,
+        },
+        "owner-collection gaps are heuristic discovery, not readiness proof; one stale candidate must not consume the PIT session budget"
+    );
+    assert_eq!(
+        plan.owner_collection_gap_route_plan(Duration::from_millis(80)),
+        SelectedGroupOwnerRoutePlan {
+            route_timeout: Duration::from_millis(80),
+            collect_idle_grace: Duration::from_millis(80),
+        },
+        "collection-gap route planning must still preserve genuinely small remaining budgets"
+    );
+}
+
+#[test]
 fn tree_pit_group_plan_owner_empty_tree_retry_timeout_caps_to_selected_group_budget() {
     let plan = TreePitSessionPlan::new(Duration::from_secs(5), 1).selected_group_stage_plan(
         TreePitGroupPlanInput {
@@ -9809,7 +9854,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                     origin_id.clone(),
                     &params,
                     group_id,
-                    group_plan.owner_route_plan(remaining),
+                    group_plan.owner_collection_gap_route_plan(remaining),
                 )
                 .await?
                 {
