@@ -63,6 +63,7 @@ const GROUP_PAGE_SIZE_DEFAULT: usize = 64;
 const GROUP_PAGE_SIZE_MAX: usize = 1_000;
 const ENTRY_PAGE_SIZE_DEFAULT: usize = 1_000;
 const ENTRY_PAGE_SIZE_MAX: usize = 10_000;
+const MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX: usize = 128;
 const PIT_TTL_MS_DEFAULT: u64 = 900_000;
 const PIT_MAX_SESSIONS: usize = 128;
 const PIT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
@@ -4137,8 +4138,21 @@ fn tree_pit_entry_window_limit(params: &NormalizedApiParams) -> Result<usize, Cn
         .saturating_add(1))
 }
 
+fn materialized_tree_route_entry_window_limit(requested: usize) -> usize {
+    requested.min(MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX)
+}
+
 fn entry_window_is_complete(returned_entries: usize, entry_limit: Option<usize>) -> bool {
     entry_limit.is_none_or(|limit| returned_entries < limit)
+}
+
+fn remaining_timeout_from(started_at: Instant, timeout: Duration) -> Result<Duration, CnxError> {
+    let remaining = timeout.saturating_sub(started_at.elapsed());
+    if remaining.is_zero() {
+        Err(CnxError::Timeout)
+    } else {
+        Ok(remaining)
+    }
 }
 
 fn selected_group_sink_status_snapshot_for_group(
@@ -4420,12 +4434,19 @@ async fn route_materialized_events_via_node(
         sink_query_route_bindings_for(&owner_node),
     );
     if debug_materialized_route_capture_enabled() {
+        let (entry_offset, entry_limit) = params
+            .tree_options
+            .as_ref()
+            .map(|options| (options.entry_offset, options.entry_limit))
+            .unwrap_or((0, None));
         eprintln!(
-            "fs_meta_query_api: materialized_route_capture begin owner_node={} selected_group={:?} recursive={} path={} timeout_ms={}",
+            "fs_meta_query_api: materialized_route_capture begin owner_node={} selected_group={:?} recursive={} path={} entry_offset={} entry_limit={:?} timeout_ms={}",
             owner_node,
             params.scope.selected_group,
             params.scope.recursive,
             String::from_utf8_lossy(&params.scope.path),
+            entry_offset,
+            entry_limit,
             plan.route_timeout().as_millis()
         );
     }
@@ -12407,7 +12428,10 @@ fn tree_pit_snapshot_needs_entry_window(
     snapshot.meta.metadata_available
         && !snapshot.entry_window_complete
         && entry_offset <= snapshot.entries.len()
-        && snapshot.entries.len() <= entry_offset.saturating_add(entry_page_size)
+        && snapshot.entries.len()
+            < entry_offset
+                .saturating_add(entry_page_size)
+                .saturating_add(1)
 }
 
 fn merge_tree_pit_entry_window(
@@ -12515,31 +12539,45 @@ async fn extend_tree_pit_session_entry_windows(
         .groups
         .len()
         .min(group_offset.saturating_add(group_page_size));
-    let entry_limit = entry_page_size.saturating_add(1);
+    let started_at = Instant::now();
     let mut groups = session.groups.clone();
     let mut changed = false;
 
     for index in group_offset..selected_end {
         let group_key = groups[index].group.clone();
         let entry_offset = entry_offsets.get(&group_key).copied().unwrap_or(0);
-        if !tree_pit_snapshot_needs_entry_window(&groups[index], entry_offset, entry_page_size) {
-            continue;
+        while tree_pit_snapshot_needs_entry_window(&groups[index], entry_offset, entry_page_size) {
+            let chunk_offset = groups[index].entries.len();
+            let target_len = entry_offset
+                .saturating_add(entry_page_size)
+                .saturating_add(1);
+            let remaining_entries = target_len.saturating_sub(chunk_offset);
+            if remaining_entries == 0 {
+                break;
+            }
+            let entry_limit = materialized_tree_route_entry_window_limit(remaining_entries);
+            let remaining_timeout = remaining_timeout_from(started_at, timeout)?;
+            let payload = query_tree_pit_entry_window(
+                state,
+                policy,
+                &session,
+                scope,
+                &group_key,
+                chunk_offset,
+                entry_limit,
+                remaining_timeout,
+                request_source_status,
+                request_sink_status,
+            )
+            .await?;
+            merge_tree_pit_entry_window(
+                &mut groups[index],
+                payload,
+                chunk_offset,
+                Some(entry_limit),
+            )?;
+            changed = true;
         }
-        let payload = query_tree_pit_entry_window(
-            state,
-            policy,
-            &session,
-            scope,
-            &group_key,
-            entry_offset,
-            entry_limit,
-            timeout,
-            request_source_status,
-            request_sink_status,
-        )
-        .await?;
-        merge_tree_pit_entry_window(&mut groups[index], payload, entry_offset, Some(entry_limit))?;
-        changed = true;
     }
 
     if !changed {
@@ -12632,7 +12670,9 @@ impl TreePitGroupMachine<'_, '_> {
             input.read_class,
             Some(group_key.clone()),
             0,
-            Some(tree_pit_entry_window_limit(input.params)?),
+            Some(materialized_tree_route_entry_window_limit(
+                tree_pit_entry_window_limit(input.params)?,
+            )),
         );
         let selected_group_sink_status = selected_group_sink_status_snapshot_for_group(
             input.state,
@@ -13165,6 +13205,7 @@ async fn query_tree_page_response(
     request_sink_status: Option<SinkStatusSnapshot>,
     request_scoped_schedule_omitted_ready_groups: Option<BTreeSet<String>>,
 ) -> Result<serde_json::Value, CnxError> {
+    let request_started_at = Instant::now();
     let group_page_size = normalize_group_page_size(params)?;
     let entry_page_size = normalize_entry_page_size(params)?.unwrap_or(0);
     let entry_bundle = params
@@ -13314,6 +13355,20 @@ async fn query_tree_page_response(
             .map_err(|_| CnxError::Internal("pit store lock poisoned".into()))?;
         guard.insert(pit_id.clone(), session.clone())?;
     }
+    let session = extend_tree_pit_session_entry_windows(
+        state,
+        policy,
+        &pit_id,
+        session,
+        0,
+        group_page_size,
+        &entry_offsets,
+        entry_page_size,
+        remaining_timeout_from(request_started_at, timeout)?,
+        request_source_status.as_ref(),
+        request_sink_status.as_ref(),
+    )
+    .await?;
     if let Some(key) = tree_cache_key
         && pit_session_has_cacheable_materialized_content(&session)
     {

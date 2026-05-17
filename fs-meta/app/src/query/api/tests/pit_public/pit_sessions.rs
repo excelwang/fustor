@@ -314,8 +314,8 @@ async fn materialized_tree_pit_extends_entry_window_without_full_subtree_payload
     assert_eq!(second["groups"][0]["entry_page"]["has_more_entries"], true);
     assert_eq!(
         observed_windows.lock().expect("observed windows lock").as_slice(),
-        &[(0, Some(3)), (2, Some(3))],
-        "PIT creation and continuation must issue bounded materialized tree windows, not full subtree payloads"
+        &[(0, Some(3)), (3, Some(2))],
+        "continuation should reuse the PIT-owned cached window when it already contains the requested page plus sentinel"
     );
 
     let mut wider_first_page_params = params.clone();
@@ -334,7 +334,7 @@ async fn materialized_tree_pit_extends_entry_window_without_full_subtree_payload
         None,
     )
     .await
-    .expect("wider cached materialized tree first page");
+    .expect("wider materialized tree first page");
     let wider_paths = wider_first_page["groups"][0]["entries"]
         .as_array()
         .expect("wider entries")
@@ -344,8 +344,169 @@ async fn materialized_tree_pit_extends_entry_window_without_full_subtree_payload
     assert_eq!(wider_paths, vec!["/a.txt", "/b.txt", "/c.txt", "/d.txt"]);
     assert_eq!(
         observed_windows.lock().expect("observed windows lock").as_slice(),
-        &[(0, Some(3)), (2, Some(3)), (0, Some(5))],
-        "wider cached first-page reuse must extend the PIT with a bounded materialized tree window"
+        &[(0, Some(3)), (3, Some(2)), (0, Some(5))],
+        "independent wider first-page reads still request only the public page plus sentinel"
+    );
+
+    owner_endpoint.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_tree_pit_assembles_public_page_from_route_safe_entry_windows() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a-nfs2");
+    fs::create_dir_all(&node_a_root).expect("create node-a nfs2 dir");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-a::nfs2".to_string(),
+        host_ref: "node-a".to_string(),
+        host_ip: "10.0.0.1".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: node_a_root,
+        fs_source: "nfs2".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let source = source_facade_with_roots(vec![root_spec_with_fs_source("nfs2")], &grants);
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let node_a_route = sink_query_request_route_for("node-a");
+    let observed_windows = Arc::new(std::sync::Mutex::new(Vec::<(usize, Option<usize>)>::new()));
+    let observed_windows_for_handler = observed_windows.clone();
+    let all_entries = Arc::new(
+        (0..MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX + 4)
+            .map(|idx| format!("/file-{idx:03}.txt").into_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let all_entries_for_handler = all_entries.clone();
+    let mut owner_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_a_route.clone(),
+        "test-materialized-tree-pit-route-safe-entry-windows-owner-endpoint",
+        CancellationToken::new(),
+        move |requests| {
+            let observed_windows = observed_windows_for_handler.clone();
+            let all_entries = all_entries_for_handler.clone();
+            async move {
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        let params = rmp_serde::from_slice::<InternalQueryRequest>(
+                            req.payload_bytes(),
+                        )
+                        .expect("decode node-a tree request");
+                        let options = params
+                            .tree_options
+                            .clone()
+                            .expect("tree request should carry entry window options");
+                        observed_windows
+                            .lock()
+                            .expect("observed windows lock")
+                            .push((options.entry_offset, options.entry_limit));
+                        let limit = options.entry_limit.unwrap_or(all_entries.len());
+                        let window = all_entries
+                            .iter()
+                            .skip(options.entry_offset)
+                            .take(limit)
+                            .map(Vec::as_slice)
+                            .collect::<Vec<_>>();
+                        mk_event_with_correlation(
+                            params
+                                .scope
+                                .selected_group
+                                .as_deref()
+                                .expect("selected group"),
+                            req.metadata()
+                                .correlation_id
+                                .expect("node-a tree request correlation"),
+                            real_materialized_tree_payload_with_entries_for_test(
+                                &params.scope.path,
+                                &window,
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        },
+    );
+
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+    );
+    let request_source_status = SourceStatusSnapshot {
+        current_stream_generation: Some(1),
+        ..SourceStatusSnapshot::default()
+    };
+    let request_sink_status = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs2".to_string()],
+        )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs2".to_string(), "node-a".to_string())]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            primary_object_ref: "node-a::nfs2".to_string(),
+            ..sink_group_status("nfs2", true)
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+    let entry_page_size = MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX + 2;
+    let params = NormalizedApiParams {
+        path: b"/".to_vec(),
+        group: None,
+        recursive: true,
+        max_depth: None,
+        pit_id: None,
+        group_order: GroupOrder::GroupKey,
+        group_page_size: Some(GROUP_PAGE_SIZE_DEFAULT),
+        group_after: None,
+        entry_page_size: Some(entry_page_size),
+        entry_after: None,
+        read_class: Some(ReadClass::Materialized),
+    };
+
+    let first = query_tree_page_response(
+        &state,
+        &ProjectionPolicy::default(),
+        &params,
+        Duration::from_secs(2),
+        ObservationStatus {
+            state: ObservationState::MaterializedUntrusted,
+            reasons: Vec::new(),
+        },
+        Some(request_source_status),
+        Some(request_sink_status),
+        None,
+    )
+    .await
+    .expect("materialized tree response");
+    let first_paths = first["groups"][0]["entries"]
+        .as_array()
+        .expect("first entries")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("entry path"))
+        .collect::<Vec<_>>();
+    let expected_last = format!("/file-{:03}.txt", entry_page_size - 1);
+    assert_eq!(first_paths.len(), entry_page_size);
+    assert_eq!(first_paths.first().copied(), Some("/file-000.txt"));
+    assert_eq!(first_paths.last().copied(), Some(expected_last.as_str()));
+    assert_eq!(first["groups"][0]["entry_page"]["has_more_entries"], true);
+    assert_eq!(
+        observed_windows.lock().expect("observed windows lock").as_slice(),
+        &[
+            (0, Some(MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX)),
+            (
+                MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX,
+                Some(entry_page_size + 1 - MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX),
+            )
+        ],
+        "first public tree page must be assembled from route-safe internal entry windows"
     );
 
     owner_endpoint.shutdown(Duration::from_secs(2)).await;
