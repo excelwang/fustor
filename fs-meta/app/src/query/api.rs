@@ -854,7 +854,10 @@ fn build_pit_session(
     }
 }
 
-fn rebuild_pit_session_with_groups(session: &PitSession, groups: Vec<GroupPitSnapshot>) -> PitSession {
+fn rebuild_pit_session_with_groups(
+    session: &PitSession,
+    groups: Vec<GroupPitSnapshot>,
+) -> PitSession {
     let estimated_bytes =
         groups.iter().map(estimated_group_bytes).sum::<usize>() + std::mem::size_of::<PitSession>();
     PitSession {
@@ -2187,7 +2190,8 @@ fn current_owner_candidate_nodes_for_groups_and_source_status(
 ) -> std::result::Result<Vec<NodeId>, QueryWorkerObservationFailure> {
     let observed_candidate_nodes =
         current_owner_candidate_nodes_from_source_status(source_status, groups);
-    let configured_candidate_nodes = match current_owner_candidate_nodes_for_groups(source, groups) {
+    let configured_candidate_nodes = match current_owner_candidate_nodes_for_groups(source, groups)
+    {
         Ok(nodes) => nodes,
         Err(err) if observed_candidate_nodes.is_empty() => {
             return Err(QueryWorkerObservationFailure::from(err));
@@ -3214,9 +3218,8 @@ fn filter_sink_status_snapshot(
                 let entries = entries
                     .into_iter()
                     .filter(|entry| {
-                        allowed_groups.contains(crate::sink::sink_status_origin_entry_group_id(
-                            entry,
-                        ))
+                        allowed_groups
+                            .contains(crate::sink::sink_status_origin_entry_group_id(entry))
                     })
                     .collect::<Vec<_>>();
                 (!entries.is_empty()).then_some((node_id, entries))
@@ -5991,7 +5994,10 @@ impl SelectedGroupOwnerRoutePlan {
 
 impl TreePitProxyRoutePlan {
     fn new(route_timeout: Duration) -> Self {
-        Self::new_with_collect_idle_grace(route_timeout, SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE)
+        Self::new_with_collect_idle_grace(
+            route_timeout,
+            SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE,
+        )
     }
 
     fn new_with_collect_idle_grace(route_timeout: Duration, collect_idle_grace: Duration) -> Self {
@@ -6184,20 +6190,23 @@ impl TreePitGroupPlan {
         self,
         remaining_session: Duration,
     ) -> SelectedGroupOwnerRoutePlan {
-        SelectedGroupOwnerRoutePlan::new(std::cmp::min(
-            remaining_session,
-            SELECTED_GROUP_OWNER_COLLECTION_GAP_ROUTE_BUDGET,
-        ))
+        let route_budget = if self.read_class == ReadClass::TrustedMaterialized {
+            SELECTED_GROUP_OWNER_COLLECTION_GAP_ROUTE_BUDGET
+        } else {
+            std::cmp::max(
+                SELECTED_GROUP_OWNER_COLLECTION_GAP_ROUTE_BUDGET,
+                SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET,
+            )
+        };
+        SelectedGroupOwnerRoutePlan::new(std::cmp::min(remaining_session, route_budget))
     }
 
     fn owner_collection_gap_proxy_route_plan(
         self,
         remaining_session: Duration,
     ) -> TreePitProxyRoutePlan {
-        let route_timeout = std::cmp::min(
-            remaining_session,
-            SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET,
-        );
+        let route_timeout =
+            std::cmp::min(remaining_session, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET);
         TreePitProxyRoutePlan::new_with_collect_idle_grace(route_timeout, route_timeout)
     }
 
@@ -8255,7 +8264,7 @@ fn tree_pit_group_plan_caps_owner_collection_gap_route_budget() {
             route_timeout: SELECTED_GROUP_OWNER_COLLECTION_GAP_ROUTE_BUDGET,
             collect_idle_grace: SELECTED_GROUP_OWNER_ROUTE_COLLECT_IDLE_GRACE,
         },
-        "owner-collection gaps are heuristic discovery, not readiness proof; one stale candidate must not consume the PIT session budget"
+        "trusted owner-collection gaps are heuristic discovery, not readiness proof; one stale candidate must not consume the PIT session budget"
     );
     assert_eq!(
         plan.owner_collection_gap_route_plan(Duration::from_millis(80)),
@@ -8264,6 +8273,27 @@ fn tree_pit_group_plan_caps_owner_collection_gap_route_budget() {
             collect_idle_grace: Duration::from_millis(80),
         },
         "collection-gap route planning must still preserve genuinely small remaining budgets"
+    );
+
+    let materialized_plan = TreePitSessionPlan::new(Duration::from_secs(60), 2)
+        .selected_group_stage_plan(TreePitGroupPlanInput {
+            read_class: ReadClass::Materialized,
+            observation_state: ObservationState::MaterializedUntrusted,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: false,
+            selected_group_sink_unready_empty: true,
+            empty_root_requires_fail_closed: false,
+        });
+    assert_eq!(
+        materialized_plan.owner_collection_gap_route_plan(Duration::from_secs(60)),
+        SelectedGroupOwnerRoutePlan {
+            route_timeout: SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET,
+            collect_idle_grace: SELECTED_GROUP_OWNER_ROUTE_COLLECT_IDLE_GRACE,
+        },
+        "materialized-untrusted owner-collection gaps should give a current owner the same bounded rescue window as the generic proxy before settling empty"
     );
 }
 
@@ -9890,9 +9920,14 @@ async fn query_materialized_events_via_candidate_owner_nodes(
             let origin_id = origin_id.clone();
             let params = params.clone();
             async move {
-                let result =
-                    route_materialized_events_via_node(boundary, origin_id, node_id.clone(), params, plan)
-                        .await;
+                let result = route_materialized_events_via_node(
+                    boundary,
+                    origin_id,
+                    node_id.clone(),
+                    params,
+                    plan,
+                )
+                .await;
                 (node_id, result)
             }
         })
@@ -9944,8 +9979,11 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                     params.scope.path.as_slice(),
                 ));
             }
-            let selected_group_owner_collection_gap =
-                params.scope.selected_group.as_deref().is_some_and(|group_id| {
+            let selected_group_owner_collection_gap = params
+                .scope
+                .selected_group
+                .as_deref()
+                .is_some_and(|group_id| {
                     selected_group_sink_status_is_owner_collection_gap(
                         selected_group_sink_status.as_ref(),
                         group_id,
@@ -12692,8 +12730,8 @@ async fn query_tree_pit_entry_window(
 ) -> Result<TreeGroupPayload, CnxError> {
     let selected_group_sink_status =
         selected_group_sink_status_snapshot_for_group(state, request_sink_status, group_key)?;
-    let group_plan = TreePitSessionPlan::new(timeout, 1).selected_group_stage_plan(
-        TreePitGroupPlanInput {
+    let group_plan =
+        TreePitSessionPlan::new(timeout, 1).selected_group_stage_plan(TreePitGroupPlanInput {
             read_class: scope.read_class,
             observation_state: session.observation_status.state,
             selected_group_sink_reports_live_materialized:
@@ -12709,11 +12747,9 @@ async fn query_tree_pit_entry_window(
                 selected_group_sink_status.as_ref(),
                 group_key,
             ),
-            empty_root_requires_fail_closed: trusted_materialized_empty_group_root_requires_fail_closed(
-                &scope.path,
-            ),
-        },
-    );
+            empty_root_requires_fail_closed:
+                trusted_materialized_empty_group_root_requires_fail_closed(&scope.path),
+        });
     let tree_params = build_materialized_tree_request_with_entry_window(
         &scope.path,
         scope.recursive,
@@ -12723,17 +12759,18 @@ async fn query_tree_pit_entry_window(
         entry_offset,
         Some(entry_limit),
     );
-    let events = query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
-        state,
-        policy,
-        tree_params,
-        timeout,
-        request_source_status,
-        selected_group_sink_status,
-        None,
-        group_plan,
-    )
-    .await?;
+    let events =
+        query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
+            state,
+            policy,
+            tree_params,
+            timeout,
+            request_source_status,
+            selected_group_sink_status,
+            None,
+            group_plan,
+        )
+        .await?;
     decode_materialized_selected_group_response(&events, policy, group_key, &scope.path)
 }
 

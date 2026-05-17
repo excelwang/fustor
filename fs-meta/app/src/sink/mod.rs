@@ -3407,7 +3407,8 @@ impl SinkFileMeta {
             );
         }
         if unit == SinkRuntimeUnit::Sink {
-            for alias_route_key in legacy_public_query_sink_route_aliases(&self.node_id, route_key) {
+            for alias_route_key in legacy_public_query_sink_route_aliases(&self.node_id, route_key)
+            {
                 let accepted = self.unit_control.apply_activate(
                     unit_id,
                     &alias_route_key,
@@ -3616,7 +3617,8 @@ impl SinkFileMeta {
             );
         }
         if unit == SinkRuntimeUnit::Sink {
-            for alias_route_key in legacy_public_query_sink_route_aliases(&self.node_id, route_key) {
+            for alias_route_key in legacy_public_query_sink_route_aliases(&self.node_id, route_key)
+            {
                 let accepted =
                     self.unit_control
                         .apply_deactivate(unit_id, &alias_route_key, generation)?;
@@ -3688,7 +3690,8 @@ impl SinkFileMeta {
                         );
                     }
                     self.apply_activate_signal(*unit, route_key, *generation, bound_scopes)?;
-                    if *unit == SinkRuntimeUnit::Sink && route_key == &sink_events_stream_route_key()
+                    if *unit == SinkRuntimeUnit::Sink
+                        && route_key == &sink_events_stream_route_key()
                     {
                         activated_events_stream_route = true;
                     }

@@ -2171,12 +2171,7 @@ fn materialized_tree_query_bounds_route_payload_by_encoded_bytes() {
         let path = format!("/{name}.txt");
         events.push(mk_source_event(
             "node-a::exp",
-            mk_record(
-                path.as_bytes(),
-                &name,
-                (idx + 2) as u64,
-                EventKind::Update,
-            ),
+            mk_record(path.as_bytes(), &name, (idx + 2) as u64, EventKind::Update),
         ));
     }
     events.push(mk_control_event(

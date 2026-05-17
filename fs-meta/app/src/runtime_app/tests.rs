@@ -19,11 +19,11 @@ use capanix_app_sdk::raw::{
     StateBoundary,
 };
 use capanix_app_sdk::route_proto::ExecLeaseMetadata;
+use capanix_app_sdk::runtime::TraceContext;
 use capanix_app_sdk::runtime::{
     EventMetadata, LogLevel, RuntimeWorkerBinding, RuntimeWorkerBindings,
     RuntimeWorkerLauncherKind, in_memory_state_boundary,
 };
-use capanix_app_sdk::runtime::TraceContext;
 use capanix_host_fs_types::UnixStat;
 use capanix_runtime_entry_sdk::control::{
     RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate,
@@ -2104,8 +2104,7 @@ fn sink_query_reply_event_strips_transport_trace_from_materialized_payload() {
         Bytes::from_static(b"tree-payload"),
     );
 
-    let reply =
-        sink_query_reply_event_from_materialized_event(&materialized_event, Some(42));
+    let reply = sink_query_reply_event_from_materialized_event(&materialized_event, Some(42));
 
     assert_eq!(reply.metadata().correlation_id, Some(42));
     assert!(

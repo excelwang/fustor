@@ -8,8 +8,8 @@ use fs_meta::RootSpec;
 pub use fs_meta::api::types::RootEntry;
 pub use fs_meta::api::{ApiAuthConfig, BootstrapAdminConfig, BootstrapManagementConfig};
 use fs_meta::product_model::execution_units::{
-    FACADE_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID, QUERY_RUNTIME_UNIT_ID, SINK_RUNTIME_UNIT_ID,
-    SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
+    FACADE_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID, QUERY_RUNTIME_UNIT_ID,
+    SINK_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
 };
 use fs_meta::product_model::routes::{
     ROUTE_KEY_EVENTS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY,
@@ -711,10 +711,7 @@ fn send_recv_stream_route_units_json(unit_id: &str) -> serde_json::Value {
     })
 }
 
-fn request_reply_route_units_json(
-    send_units: &[&str],
-    recv_units: &[&str],
-) -> serde_json::Value {
+fn request_reply_route_units_json(send_units: &[&str], recv_units: &[&str]) -> serde_json::Value {
     serde_json::json!({
         "send": send_units,
         "recv": recv_units

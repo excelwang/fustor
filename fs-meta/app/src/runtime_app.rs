@@ -29,8 +29,7 @@ use crate::runtime::execution_units;
 use crate::runtime::orchestration::{
     FacadeControlSignal, FacadeRuntimeUnit, SinkControlSignal, SinkRuntimeUnit,
     SourceControlSignal, SourceRuntimeUnit,
-    manual_rescan_scoped_target_acceptance_timeout_from_payload,
-    split_app_control_signals,
+    manual_rescan_scoped_target_acceptance_timeout_from_payload, split_app_control_signals,
 };
 #[cfg(test)]
 use crate::runtime::routes::ROUTE_KEY_SOURCE_FIND_INTERNAL;
@@ -10274,11 +10273,12 @@ impl FSMetaApp {
                                     crate::runtime::routes::default_route_bindings(),
                                 );
                                 let result: Result<Vec<Event>> = async {
-                                    let payload = rmp_serde::to_vec_named(&params).map_err(|err| {
-                                        CnxError::Internal(format!(
-                                            "encode public query request failed: {err}"
-                                        ))
-                                    })?;
+                                    let payload =
+                                        rmp_serde::to_vec_named(&params).map_err(|err| {
+                                            CnxError::Internal(format!(
+                                                "encode public query request failed: {err}"
+                                            ))
+                                        })?;
                                     capanix_host_adapter_fs::HostAdapter::call_collect(
                                         &adapter,
                                         ROUTE_TOKEN_FS_META_INTERNAL,
@@ -11089,10 +11089,8 @@ impl FSMetaApp {
             if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY) {
                 sink_query_route_keys.insert(route.0);
             }
-            let local_owner_sink_query_route = crate::runtime::routes::sink_query_request_route_for(
-                &self.node_id.0,
-            )
-            .0;
+            let local_owner_sink_query_route =
+                crate::runtime::routes::sink_query_request_route_for(&self.node_id.0).0;
             for unit_id in [
                 execution_units::QUERY_RUNTIME_UNIT_ID,
                 execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
@@ -11137,10 +11135,7 @@ impl FSMetaApp {
                 let endpoint = ManagedEndpointTask::spawn_with_units_without_ready_wait(
                     boundary.clone(),
                     RouteKey(route_key.clone()),
-                    format!(
-                        "app:{}:{}",
-                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY
-                    ),
+                    format!("app:{}:{}", ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY),
                     endpoint_unit_ids,
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
@@ -11151,15 +11146,12 @@ impl FSMetaApp {
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
-                                let Ok(params) =
-                                    rmp_serde::from_slice::<InternalQueryRequest>(
-                                        req.payload_bytes(),
-                                    )
-                                else {
+                                let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
+                                    req.payload_bytes(),
+                                ) else {
                                     continue;
                                 };
-                                let trace_sink_query_route =
-                                    debug_sink_query_route_trace_enabled();
+                                let trace_sink_query_route = debug_sink_query_route_trace_enabled();
                                 if trace_sink_query_route {
                                     eprintln!(
                                         "fs_meta_runtime_app: worker-backed sink query request route={} selected_group={:?} recursive={} path={}",
