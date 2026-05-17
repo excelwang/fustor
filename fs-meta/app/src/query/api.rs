@@ -4995,6 +4995,7 @@ struct SelectedGroupTreePitPlan {
     prior_materialized_group_decoded: bool,
     trusted_materialized_ready_group: bool,
     requires_rescue: bool,
+    settle_unready_empty_after_prior_decode: bool,
     allow_empty_owner_retry: bool,
     should_resolve_selected_group_owner: bool,
     empty_root_requires_fail_closed: bool,
@@ -5117,11 +5118,17 @@ impl SelectedGroupTreePitPlan {
     fn new(input: SelectedGroupTreePitPlanInput) -> Self {
         let trusted_materialized_ready_group = input.read_class == ReadClass::TrustedMaterialized
             && input.selected_group_sink_reports_live_materialized;
-        let requires_rescue = trusted_materialized_ready_group
-            || (input.read_class == ReadClass::TrustedMaterialized
-                && input.observation_state == ObservationState::TrustedMaterialized
-                && input.prior_materialized_group_decoded
-                && !input.empty_root_requires_fail_closed);
+        let settle_unready_empty_after_prior_decode = input.read_class
+            == ReadClass::TrustedMaterialized
+            && input.selected_group_sink_unready_empty
+            && input.prior_materialized_group_decoded
+            && !input.empty_root_requires_fail_closed;
+        let requires_rescue = !settle_unready_empty_after_prior_decode
+            && (trusted_materialized_ready_group
+                || (input.read_class == ReadClass::TrustedMaterialized
+                    && input.observation_state == ObservationState::TrustedMaterialized
+                    && input.prior_materialized_group_decoded
+                    && !input.empty_root_requires_fail_closed));
         let stage_timeout_policy = if input.read_class != ReadClass::TrustedMaterialized
             && input.is_last_ranked_group
             && input.prior_materialized_group_decoded
@@ -5142,6 +5149,8 @@ impl SelectedGroupTreePitPlan {
             && !input.prior_materialized_group_decoded
         {
             true
+        } else if settle_unready_empty_after_prior_decode {
+            false
         } else {
             !(input.read_class != ReadClass::TrustedMaterialized
                 && input.is_last_ranked_group
@@ -5152,6 +5161,7 @@ impl SelectedGroupTreePitPlan {
             prior_materialized_group_decoded: input.prior_materialized_group_decoded,
             trusted_materialized_ready_group,
             requires_rescue,
+            settle_unready_empty_after_prior_decode,
             allow_empty_owner_retry: trusted_materialized_ready_group
                 && !input.prior_materialized_group_decoded,
             should_resolve_selected_group_owner: requires_rescue,
@@ -5558,6 +5568,14 @@ impl TreePitSessionTiming {
         group_plan: TreePitGroupPlan,
         now: tokio::time::Instant,
     ) -> TreePitStagePreparation {
+        if group_plan
+            .stage_plan
+            .settle_unready_empty_after_prior_decode
+        {
+            return TreePitStagePreparation::Unavailable(
+                TreePitUnavailableStageLane::PushEmptySnapshot,
+            );
+        }
         self.stage_timing_for_at(group_plan, now)
             .map(TreePitStagePreparation::Ready)
             .unwrap_or_else(|| {
@@ -7166,6 +7184,7 @@ fn selected_group_tree_pit_plan_allows_empty_owner_retry_only_for_first_ready_gr
             prior_materialized_group_decoded: false,
             trusted_materialized_ready_group: true,
             requires_rescue: true,
+            settle_unready_empty_after_prior_decode: false,
             allow_empty_owner_retry: true,
             should_resolve_selected_group_owner: true,
             empty_root_requires_fail_closed: false,
@@ -7195,6 +7214,7 @@ fn selected_group_tree_pit_plan_keeps_owner_resolution_for_later_non_root_rescue
             prior_materialized_group_decoded: true,
             trusted_materialized_ready_group: false,
             requires_rescue: true,
+            settle_unready_empty_after_prior_decode: false,
             allow_empty_owner_retry: false,
             should_resolve_selected_group_owner: true,
             empty_root_requires_fail_closed: false,
@@ -7223,6 +7243,7 @@ fn selected_group_tree_pit_plan_disables_non_root_rescue_when_empty_root_must_fa
             prior_materialized_group_decoded: true,
             trusted_materialized_ready_group: false,
             requires_rescue: false,
+            settle_unready_empty_after_prior_decode: false,
             allow_empty_owner_retry: false,
             should_resolve_selected_group_owner: false,
             empty_root_requires_fail_closed: true,
@@ -7254,6 +7275,53 @@ fn selected_group_tree_pit_plan_keeps_caller_budget_for_materialized_untrusted_p
         plan.stage_timeout(Duration::from_secs(30), Duration::from_secs(60)),
         Duration::from_secs(30),
         "materialized-untrusted selected-group reads should be bounded by the caller/session deadline, not by an artificial unready placeholder cap"
+    );
+}
+
+#[test]
+fn selected_group_tree_pit_plan_settles_later_trusted_non_root_unready_empty_group() {
+    let plan = SelectedGroupTreePitPlan::new(SelectedGroupTreePitPlanInput {
+        read_class: ReadClass::TrustedMaterialized,
+        observation_state: ObservationState::MaterializedUntrusted,
+        selected_group_sink_reports_live_materialized: false,
+        prior_materialized_group_decoded: true,
+        is_last_ranked_group: true,
+        selected_group_sink_unready_empty: true,
+        empty_root_requires_fail_closed: false,
+    });
+
+    assert_eq!(
+        plan,
+        SelectedGroupTreePitPlan {
+            prior_materialized_group_decoded: true,
+            trusted_materialized_ready_group: false,
+            requires_rescue: false,
+            settle_unready_empty_after_prior_decode: true,
+            allow_empty_owner_retry: false,
+            should_resolve_selected_group_owner: false,
+            empty_root_requires_fail_closed: false,
+            stage_timeout_policy: TreePitStageTimeoutPolicy::DefaultCollectIdleGraceCap,
+            reserve_proxy_budget: false,
+        },
+        "later trusted-materialized non-root groups with explicit unready-empty sink evidence should settle as catch-up evidence after an earlier group decoded instead of reopening owner/proxy work"
+    );
+}
+
+#[test]
+fn selected_group_tree_pit_plan_keeps_root_fail_closed_for_later_unready_empty_group() {
+    let plan = SelectedGroupTreePitPlan::new(SelectedGroupTreePitPlanInput {
+        read_class: ReadClass::TrustedMaterialized,
+        observation_state: ObservationState::MaterializedUntrusted,
+        selected_group_sink_reports_live_materialized: false,
+        prior_materialized_group_decoded: true,
+        is_last_ranked_group: true,
+        selected_group_sink_unready_empty: true,
+        empty_root_requires_fail_closed: true,
+    });
+
+    assert!(
+        !plan.settle_unready_empty_after_prior_decode,
+        "trusted-materialized root reads must keep fail-closed readiness semantics instead of settling pending materialization as an empty catch-up snapshot"
     );
 }
 
@@ -7562,6 +7630,7 @@ fn tree_pit_group_plan_owner_snapshot_override_stays_inside_planner() {
             prior_materialized_group_decoded: false,
             trusted_materialized_ready_group: false,
             requires_rescue: true,
+            settle_unready_empty_after_prior_decode: false,
             allow_empty_owner_retry: true,
             should_resolve_selected_group_owner: true,
             empty_root_requires_fail_closed: false,
@@ -7702,6 +7771,34 @@ fn tree_pit_session_runtime_prepares_unavailable_untrusted_group_as_empty_snapsh
         runtime.prepare_stage_for_at(group_plan, now + Duration::from_millis(20)),
         TreePitStagePreparation::Unavailable(TreePitUnavailableStageLane::PushEmptySnapshot),
         "tree PIT runtime should own the untrusted empty-snapshot lane instead of leaving the main loop to special-case a missing stage runtime",
+    );
+}
+
+#[test]
+fn tree_pit_session_runtime_pushes_empty_for_later_trusted_unready_non_root_group() {
+    let now = tokio::time::Instant::now();
+    let runtime =
+        TreePitSessionPlan::new(Duration::from_secs(5), 3).session_timing_from_now(now, false, now);
+    let group_plan = TreePitSessionPlan::new(Duration::from_secs(5), 3).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::TrustedMaterialized,
+            observation_state: ObservationState::MaterializedUntrusted,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: true,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 2,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: true,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    assert!(
+        matches!(
+            runtime.entry_action_for_at(group_plan, "nfs3", now + Duration::from_millis(200)),
+            TreePitStageEntryAction::PushEmptySnapshot
+        ),
+        "later pending-materialization groups on trusted non-root reads should not consume the PIT route/proxy budget after a prior group already decoded"
     );
 }
 
