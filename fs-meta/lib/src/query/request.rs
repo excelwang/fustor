@@ -43,6 +43,8 @@ pub struct TreeQueryOptions {
     pub entry_offset: usize,
     #[serde(default)]
     pub entry_limit: Option<usize>,
+    #[serde(default)]
+    pub payload_limit_bytes: Option<usize>,
 }
 
 impl Default for TreeQueryOptions {
@@ -51,6 +53,7 @@ impl Default for TreeQueryOptions {
             read_class: ReadClass::TrustedMaterialized,
             entry_offset: 0,
             entry_limit: None,
+            payload_limit_bytes: None,
         }
     }
 }
@@ -129,6 +132,7 @@ pub enum ForceFindQueryPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
 
     #[test]
     fn internal_query_request_msgpack_roundtrip_preserves_utf8_selected_group() {
@@ -159,5 +163,51 @@ mod tests {
             restored.tree_options.expect("tree options").read_class,
             ReadClass::TrustedMaterialized
         );
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LegacyTreeQueryOptions {
+        read_class: ReadClass,
+        entry_offset: usize,
+        entry_limit: Option<usize>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LegacyInternalQueryRequest {
+        transport: QueryTransport,
+        op: QueryOp,
+        scope: QueryScope,
+        tree_options: Option<LegacyTreeQueryOptions>,
+    }
+
+    #[test]
+    fn internal_query_request_named_msgpack_ignores_new_tree_option_for_legacy_decoders() {
+        let request = InternalQueryRequest::materialized(
+            QueryOp::Tree,
+            QueryScope {
+                path: b"/".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some("nfs1".to_string()),
+            },
+            Some(TreeQueryOptions {
+                read_class: ReadClass::Materialized,
+                entry_offset: 7,
+                entry_limit: Some(11),
+                payload_limit_bytes: Some(32 * 1024),
+            }),
+        );
+
+        let encoded = rmp_serde::to_vec_named(&request).expect("encode named request");
+        let restored: LegacyInternalQueryRequest =
+            rmp_serde::from_slice(&encoded).expect("legacy decoder must ignore unknown fields");
+        let options = restored.tree_options.expect("legacy tree options");
+
+        assert_eq!(restored.transport, QueryTransport::Materialized);
+        assert_eq!(restored.op, QueryOp::Tree);
+        assert_eq!(restored.scope.selected_group.as_deref(), Some("nfs1"));
+        assert_eq!(options.read_class, ReadClass::Materialized);
+        assert_eq!(options.entry_offset, 7);
+        assert_eq!(options.entry_limit, Some(11));
     }
 }

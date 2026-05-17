@@ -88,6 +88,11 @@ version: 3.0.0
    > Verification: grouped tree responses keep explicit `meta.metadata_available`; withheld metadata uses explicit `withheld_reason` instead of silently dropping a returned group bucket from the response.
    > Verification: grouped query paths keep explicit per-group `ok`/`error` envelopes and `partial_failure/errors` visibility instead of silently dropping failed groups.
 
+4. **ROUTE_SAFE_MATERIALIZED_TREE_WINDOWS**: **fs-meta System** MUST keep internal materialized `/tree` route replies bounded by encoded payload bytes while preserving public PIT paging correctness.
+   > Responsibility: the app-owned query protocol slices large materialized tree reads into byte-budgeted same-PIT/same-group windows instead of relying on transport/kernel layers to split opaque fs-meta payloads.
+   > Verification: a short positive internal tree reply caused by the encoded payload budget is not treated as end-of-group; the facade continues fetching bounded windows until the requested public page plus sentinel is available, a zero-entry continuation proves completion, or the caller deadline expires.
+   > Verification: if one tree entry cannot fit the route byte budget, fs-meta MUST fail the internal materialized query closed instead of publishing an over-budget opaque route event or silently dropping that entry.
+
 4. **CORRELATION_ID_CONTINUITY**: **fs-meta System** MUST preserve request-response correlation metadata on query paths.
    > Covers L0: VISION.QUERY_OUTCOME.QUERY_TRANSPORT_DIAGNOSTICS
 

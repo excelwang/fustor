@@ -42,7 +42,6 @@ use crate::query::result_ops::{
     RawQueryResult, merge_query_responses, raw_query_results_by_origin_from_source_events,
     subtree_stats_from_query_response,
 };
-#[cfg(test)]
 use crate::query::tree::TreeGroupPayload;
 use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::execution_units::{
@@ -79,6 +78,63 @@ fn now_us() -> u64 {
         Ok(d) => d.as_micros() as u64,
         Err(_) => 0,
     }
+}
+
+fn encode_materialized_tree_payload(response: &TreeGroupPayload) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(&MaterializedQueryPayload::Tree(response.clone()))
+        .map_err(|err| CnxError::Internal(format!("serialize query response failed: {err}")))
+}
+
+fn encode_materialized_tree_payload_with_budget(
+    mut response: TreeGroupPayload,
+    payload_limit_bytes: Option<usize>,
+) -> Result<(Vec<u8>, TreeGroupPayload, bool)> {
+    let Some(payload_limit_bytes) = payload_limit_bytes else {
+        let payload = encode_materialized_tree_payload(&response)?;
+        return Ok((payload, response, false));
+    };
+    let payload = encode_materialized_tree_payload(&response)?;
+    if payload.len() <= payload_limit_bytes {
+        return Ok((payload, response, false));
+    }
+    if response.entries.is_empty() {
+        return Err(CnxError::Internal(format!(
+            "materialized tree root payload exceeds route byte budget: payload_bytes={} limit_bytes={}",
+            payload.len(),
+            payload_limit_bytes
+        )));
+    }
+
+    let original_entries = std::mem::take(&mut response.entries);
+    let original_len = original_entries.len();
+    let mut low = 1usize;
+    let mut high = original_len;
+    let mut best_len = 1usize;
+    let mut best_payload = None;
+
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        response.entries = original_entries[..mid].to_vec();
+        let candidate = encode_materialized_tree_payload(&response)?;
+        if candidate.len() <= payload_limit_bytes {
+            best_len = mid;
+            best_payload = Some(candidate);
+            low = mid.saturating_add(1);
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+
+    response.entries = original_entries[..best_len].to_vec();
+    let payload = match best_payload {
+        Some(payload) => payload,
+        None => {
+            return Err(CnxError::Internal(format!(
+                "materialized tree entry payload exceeds route byte budget: limit_bytes={payload_limit_bytes}"
+            )));
+        }
+    };
+    Ok((payload, response, best_len < original_len))
 }
 
 fn sink_status_reply(
@@ -4594,6 +4650,11 @@ impl SinkFileMeta {
                         tree_options.entry_limit,
                         group.last_coverage_recovered_at,
                     );
+                    let (payload, response, payload_limited) =
+                        encode_materialized_tree_payload_with_budget(
+                            response,
+                            tree_options.payload_limit_bytes,
+                        )?;
                     if debug_materialized_query {
                         let live_nodes = group
                             .tree
@@ -4601,7 +4662,7 @@ impl SinkFileMeta {
                             .map(|aggregate| aggregate.total_nodes)
                             .unwrap_or(0);
                         eprintln!(
-                            "fs_meta_sink: materialized_query group={} selected={:?} path={} recursive={} node_count={} live_nodes={} readiness={:?} root_exists={} entries={} has_children={}",
+                            "fs_meta_sink: materialized_query group={} selected={:?} path={} recursive={} node_count={} live_nodes={} readiness={:?} root_exists={} entries={} has_children={} payload_bytes={} payload_limit_bytes={:?} payload_limited={}",
                             group_id,
                             selected_group,
                             String::from_utf8_lossy(&dir_path),
@@ -4611,10 +4672,13 @@ impl SinkFileMeta {
                             group.group_readiness_state(),
                             response.root.exists,
                             response.entries.len(),
-                            response.root.has_children
+                            response.root.has_children,
+                            payload.len(),
+                            tree_options.payload_limit_bytes,
+                            payload_limited
                         );
                     }
-                    rmp_serde::to_vec_named(&MaterializedQueryPayload::Tree(response))
+                    Ok(payload)
                 }
                 QueryOp::Stats => {
                     let stats = query::get_subtree_stats_for_query(&group.tree, &dir_path);

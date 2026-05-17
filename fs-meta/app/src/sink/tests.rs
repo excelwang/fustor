@@ -2136,6 +2136,7 @@ fn materialized_tree_query_applies_entry_window_before_serializing_payload() {
         read_class: crate::query::ReadClass::Materialized,
         entry_offset: 1,
         entry_limit: Some(2),
+        ..TreeQueryOptions::default()
     });
     let response = sink
         .materialized_query(&request)
@@ -2151,6 +2152,117 @@ fn materialized_tree_query_applies_entry_window_before_serializing_payload() {
         paths,
         vec!["/b.txt".to_string(), "/c.txt".to_string()],
         "internal materialized tree queries must apply the entry window before serializing the route payload"
+    );
+}
+
+#[test]
+fn materialized_tree_query_bounds_route_payload_by_encoded_bytes() {
+    let sink = build_single_group_sink();
+    let mut events = vec![mk_control_event(
+        "node-a::exp",
+        ControlEvent::EpochStart {
+            epoch_id: 0,
+            epoch_type: EpochType::Audit,
+        },
+        1,
+    )];
+    for idx in 0..80 {
+        let name = format!("file-{idx:03}-{}", "x".repeat(96));
+        let path = format!("/{name}.txt");
+        events.push(mk_source_event(
+            "node-a::exp",
+            mk_record(
+                path.as_bytes(),
+                &name,
+                (idx + 2) as u64,
+                EventKind::Update,
+            ),
+        ));
+    }
+    events.push(mk_control_event(
+        "node-a::exp",
+        ControlEvent::EpochEnd {
+            epoch_id: 0,
+            epoch_type: EpochType::Audit,
+        },
+        100,
+    ));
+    sink.ingest_stream_events(&events)
+        .expect("materialize byte-budgeted entries");
+
+    let payload_limit_bytes = 2048usize;
+    let mut request = materialized_tree_request(b"/", true, None);
+    request.tree_options = Some(TreeQueryOptions {
+        read_class: crate::query::ReadClass::Materialized,
+        entry_offset: 0,
+        entry_limit: Some(80),
+        payload_limit_bytes: Some(payload_limit_bytes),
+    });
+
+    let response = sink
+        .materialized_query(&request)
+        .expect("byte-budgeted materialized query");
+    let event = response.first().expect("single group response");
+    assert!(
+        event.payload_bytes().len() <= payload_limit_bytes,
+        "encoded route payload must fit the requested byte budget: len={} limit={payload_limit_bytes}",
+        event.payload_bytes().len()
+    );
+    let payload = decode_tree_payload(event);
+    assert!(
+        !payload.entries.is_empty(),
+        "byte budget must still make forward progress"
+    );
+    assert!(
+        payload.entries.len() < 80,
+        "byte budget must trim the requested entry window before route serialization"
+    );
+}
+
+#[test]
+fn materialized_tree_query_fails_closed_when_one_entry_exceeds_route_payload_budget() {
+    let sink = build_single_group_sink();
+    let long_name = format!("oversized-{}", "x".repeat(256));
+    let long_path = format!("/{long_name}.txt");
+    let events = vec![
+        mk_control_event(
+            "node-a::exp",
+            ControlEvent::EpochStart {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            1,
+        ),
+        mk_source_event(
+            "node-a::exp",
+            mk_record(long_path.as_bytes(), &long_name, 2, EventKind::Update),
+        ),
+        mk_control_event(
+            "node-a::exp",
+            ControlEvent::EpochEnd {
+                epoch_id: 0,
+                epoch_type: EpochType::Audit,
+            },
+            3,
+        ),
+    ];
+    sink.ingest_stream_events(&events)
+        .expect("materialize oversized entry");
+
+    let mut request = materialized_tree_request(b"/", true, None);
+    request.tree_options = Some(TreeQueryOptions {
+        read_class: crate::query::ReadClass::Materialized,
+        entry_offset: 0,
+        entry_limit: Some(1),
+        payload_limit_bytes: Some(64),
+    });
+
+    let err = sink
+        .materialized_query(&request)
+        .expect_err("oversized single entry must fail closed");
+    assert!(
+        err.to_string().contains("route byte budget"),
+        "oversized single-entry payload must not be published as an over-budget route event: {err}"
     );
 }
 

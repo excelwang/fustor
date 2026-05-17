@@ -63,7 +63,7 @@ const GROUP_PAGE_SIZE_DEFAULT: usize = 64;
 const GROUP_PAGE_SIZE_MAX: usize = 1_000;
 const ENTRY_PAGE_SIZE_DEFAULT: usize = 1_000;
 const ENTRY_PAGE_SIZE_MAX: usize = 10_000;
-const MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX: usize = 128;
+const MATERIALIZED_TREE_ROUTE_PAYLOAD_BYTES_MAX: usize = 32 * 1024;
 const PIT_TTL_MS_DEFAULT: u64 = 900_000;
 const PIT_MAX_SESSIONS: usize = 128;
 const PIT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
@@ -4128,6 +4128,7 @@ fn build_materialized_tree_request_with_entry_window(
             read_class,
             entry_offset,
             entry_limit,
+            payload_limit_bytes: Some(MATERIALIZED_TREE_ROUTE_PAYLOAD_BYTES_MAX),
         }),
     )
 }
@@ -4138,11 +4139,14 @@ fn tree_pit_entry_window_limit(params: &NormalizedApiParams) -> Result<usize, Cn
         .saturating_add(1))
 }
 
-fn materialized_tree_route_entry_window_limit(requested: usize) -> usize {
-    requested.min(MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX)
-}
-
-fn entry_window_is_complete(returned_entries: usize, entry_limit: Option<usize>) -> bool {
+fn entry_window_is_complete(
+    returned_entries: usize,
+    entry_limit: Option<usize>,
+    payload_limit_bytes: Option<usize>,
+) -> bool {
+    if payload_limit_bytes.is_some() {
+        return returned_entries == 0;
+    }
     entry_limit.is_none_or(|limit| returned_entries < limit)
 }
 
@@ -4383,7 +4387,7 @@ async fn query_materialized_events_with_sink_status_snapshot(
                 return result;
             }
             let adapter = exchange_host_adapter(boundary, origin_id, default_route_bindings());
-            let payload = rmp_serde::to_vec(&params).map_err(|err| {
+            let payload = rmp_serde::to_vec_named(&params).map_err(|err| {
                 CnxError::Internal(format!("encode materialized query failed: {err}"))
             })?;
             eprintln!("fs_meta_query_api: query_materialized_events route call_collect begin");
@@ -4450,7 +4454,7 @@ async fn route_materialized_events_via_node(
             plan.route_timeout().as_millis()
         );
     }
-    let payload = rmp_serde::to_vec(&params)
+    let payload = rmp_serde::to_vec_named(&params)
         .map_err(|err| CnxError::Internal(format!("encode materialized query failed: {err}")))?;
     let result = adapter
         .call_collect(
@@ -5157,6 +5161,7 @@ enum TreePitStageExecutionAction {
     PushPayload {
         response: TreeGroupPayload,
         entry_limit: Option<usize>,
+        payload_limit_bytes: Option<usize>,
         empty_response_plan: TrustedMaterializedEmptyResponseRescuePlan,
     },
     PushEmptySnapshot,
@@ -6433,6 +6438,11 @@ async fn resolve_tree_pit_stage_execution_action(
                 .tree_options
                 .as_ref()
                 .and_then(|options| options.entry_limit);
+            let payload_limit_bytes = input
+                .tree_params
+                .tree_options
+                .as_ref()
+                .and_then(|options| options.payload_limit_bytes);
             let empty_response_plan = input
                 .stage_timing
                 .empty_response_rescue_plan(input.group_plan, input.selected_group_owner_known);
@@ -6459,6 +6469,7 @@ async fn resolve_tree_pit_stage_execution_action(
             TreePitStageExecutionAction::PushPayload {
                 response,
                 entry_limit,
+                payload_limit_bytes,
                 empty_response_plan,
             }
         }
@@ -6490,6 +6501,7 @@ fn finalize_trusted_materialized_tree_group_response(
     group_key: String,
     response: TreeGroupPayload,
     entry_limit: Option<usize>,
+    payload_limit_bytes: Option<usize>,
     empty_response_plan: TrustedMaterializedEmptyResponseRescuePlan,
     rank_index: usize,
     deferred_first_ranked_empty_trusted_non_root_group: &mut Option<String>,
@@ -6530,6 +6542,7 @@ fn finalize_trusted_materialized_tree_group_response(
         group_key,
         response,
         entry_limit,
+        payload_limit_bytes,
     );
     Ok(())
 }
@@ -6549,6 +6562,7 @@ fn apply_tree_pit_stage_execution_action(
         TreePitStageExecutionAction::PushPayload {
             response,
             entry_limit,
+            payload_limit_bytes,
             empty_response_plan,
         } => finalize_trusted_materialized_tree_group_response(
             groups,
@@ -6558,6 +6572,7 @@ fn apply_tree_pit_stage_execution_action(
             group_key,
             response,
             entry_limit,
+            payload_limit_bytes,
             empty_response_plan,
             rank_index,
             deferred_first_ranked_empty_trusted_non_root_group,
@@ -6644,6 +6659,11 @@ async fn handle_retryable_tree_pit_stage_gap(
                             .tree_options
                             .as_ref()
                             .and_then(|options| options.entry_limit),
+                        input
+                            .tree_params
+                            .tree_options
+                            .as_ref()
+                            .and_then(|options| options.payload_limit_bytes),
                     );
                     return Ok(());
                 }
@@ -6705,6 +6725,11 @@ async fn handle_retryable_tree_pit_stage_gap(
                                             .tree_options
                                             .as_ref()
                                             .and_then(|options| options.entry_limit),
+                                        input
+                                            .tree_params
+                                            .tree_options
+                                            .as_ref()
+                                            .and_then(|options| options.payload_limit_bytes),
                                     );
                                     return Ok(());
                                 }
@@ -9431,7 +9456,7 @@ async fn query_materialized_events_via_generic_proxy(
             machine.route_timeout().as_millis()
         );
     }
-    let payload = rmp_serde::to_vec(&params)
+    let payload = rmp_serde::to_vec_named(&params)
         .map_err(|err| CnxError::Internal(format!("encode materialized query failed: {err}")))?;
     let result = machine
         .collect_proxy_events(boundary, origin_id, Bytes::from(payload))
@@ -11740,9 +11765,11 @@ fn push_materialized_tree_group_payload(
     group_key: String,
     response: TreeGroupPayload,
     entry_limit: Option<usize>,
+    payload_limit_bytes: Option<usize>,
 ) {
     let (metadata_available, _meta_json) = tree_metadata_json(read_class);
-    let entry_window_complete = entry_window_is_complete(response.entries.len(), entry_limit);
+    let entry_window_complete =
+        entry_window_is_complete(response.entries.len(), entry_limit, payload_limit_bytes);
     groups.push(GroupPitSnapshot {
         group: group_key,
         status: "ok",
@@ -11783,6 +11810,7 @@ fn push_empty_materialized_tree_group_snapshot(
         read_class,
         group_key,
         empty_materialized_tree_group_payload(query_path),
+        None,
         None,
     );
 }
@@ -12439,6 +12467,7 @@ fn merge_tree_pit_entry_window(
     payload: TreeGroupPayload,
     entry_offset: usize,
     entry_limit: Option<usize>,
+    payload_limit_bytes: Option<usize>,
 ) -> Result<(), CnxError> {
     if entry_offset > snapshot.entries.len() {
         return Err(CnxError::InvalidInput(format!(
@@ -12456,7 +12485,8 @@ fn merge_tree_pit_entry_window(
     snapshot.entries.truncate(entry_offset);
     let returned_entries = payload.entries.len();
     snapshot.entries.extend(payload.entries);
-    snapshot.entry_window_complete = entry_window_is_complete(returned_entries, entry_limit);
+    snapshot.entry_window_complete =
+        entry_window_is_complete(returned_entries, entry_limit, payload_limit_bytes);
     Ok(())
 }
 
@@ -12555,7 +12585,7 @@ async fn extend_tree_pit_session_entry_windows(
             if remaining_entries == 0 {
                 break;
             }
-            let entry_limit = materialized_tree_route_entry_window_limit(remaining_entries);
+            let entry_limit = remaining_entries;
             let remaining_timeout = remaining_timeout_from(started_at, timeout)?;
             let payload = query_tree_pit_entry_window(
                 state,
@@ -12575,6 +12605,7 @@ async fn extend_tree_pit_session_entry_windows(
                 payload,
                 chunk_offset,
                 Some(entry_limit),
+                Some(MATERIALIZED_TREE_ROUTE_PAYLOAD_BYTES_MAX),
             )?;
             changed = true;
         }
@@ -12670,9 +12701,7 @@ impl TreePitGroupMachine<'_, '_> {
             input.read_class,
             Some(group_key.clone()),
             0,
-            Some(materialized_tree_route_entry_window_limit(
-                tree_pit_entry_window_limit(input.params)?,
-            )),
+            Some(tree_pit_entry_window_limit(input.params)?),
         );
         let selected_group_sink_status = selected_group_sink_status_snapshot_for_group(
             input.state,

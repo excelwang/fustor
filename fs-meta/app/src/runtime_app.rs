@@ -10199,7 +10199,7 @@ impl FSMetaApp {
                                     crate::runtime::routes::default_route_bindings(),
                                 );
                                 let result: Result<Vec<Event>> = async {
-                                    let payload = rmp_serde::to_vec(&params).map_err(|err| {
+                                    let payload = rmp_serde::to_vec_named(&params).map_err(|err| {
                                         CnxError::Internal(format!(
                                             "encode public query request failed: {err}"
                                         ))
@@ -11213,7 +11213,7 @@ impl FSMetaApp {
                                             }
                                             let mut fail_closed_after_bridge_gap = false;
                                             if should_bridge {
-                                                match rmp_serde::to_vec(&params) {
+                                                match rmp_serde::to_vec_named(&params) {
                                                     Ok(payload) => {
                                                         let bridge_adapter = crate::runtime::seam::exchange_host_adapter(
                                                         boundary_for_calls.clone(),

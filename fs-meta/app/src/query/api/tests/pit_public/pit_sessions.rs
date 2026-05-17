@@ -352,7 +352,7 @@ async fn materialized_tree_pit_extends_entry_window_without_full_subtree_payload
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn materialized_tree_pit_assembles_public_page_from_route_safe_entry_windows() {
+async fn materialized_tree_pit_assembles_public_page_from_payload_limited_entry_windows() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let node_a_root = tmp.path().join("node-a-nfs2");
     fs::create_dir_all(&node_a_root).expect("create node-a nfs2 dir");
@@ -375,10 +375,11 @@ async fn materialized_tree_pit_assembles_public_page_from_route_safe_entry_windo
     let sink = sink_facade_with_group(&grants);
     let boundary = Arc::new(ReusableObservedRouteBoundary::default());
     let node_a_route = sink_query_request_route_for("node-a");
-    let observed_windows = Arc::new(std::sync::Mutex::new(Vec::<(usize, Option<usize>)>::new()));
+    let observed_windows =
+        Arc::new(std::sync::Mutex::new(Vec::<(usize, Option<usize>, Option<usize>)>::new()));
     let observed_windows_for_handler = observed_windows.clone();
     let all_entries = Arc::new(
-        (0..MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX + 4)
+        (0..8)
             .map(|idx| format!("/file-{idx:03}.txt").into_bytes())
             .collect::<Vec<_>>(),
     );
@@ -406,12 +407,16 @@ async fn materialized_tree_pit_assembles_public_page_from_route_safe_entry_windo
                         observed_windows
                             .lock()
                             .expect("observed windows lock")
-                            .push((options.entry_offset, options.entry_limit));
+                            .push((
+                                options.entry_offset,
+                                options.entry_limit,
+                                options.payload_limit_bytes,
+                            ));
                         let limit = options.entry_limit.unwrap_or(all_entries.len());
                         let window = all_entries
                             .iter()
                             .skip(options.entry_offset)
-                            .take(limit)
+                            .take(limit.min(2))
                             .map(Vec::as_slice)
                             .collect::<Vec<_>>();
                         mk_event_with_correlation(
@@ -456,7 +461,7 @@ async fn materialized_tree_pit_assembles_public_page_from_route_safe_entry_windo
         }],
         ..SinkStatusSnapshot::default()
     };
-    let entry_page_size = MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX + 2;
+    let entry_page_size = 4;
     let params = NormalizedApiParams {
         path: b"/".to_vec(),
         group: None,
@@ -500,13 +505,11 @@ async fn materialized_tree_pit_assembles_public_page_from_route_safe_entry_windo
     assert_eq!(
         observed_windows.lock().expect("observed windows lock").as_slice(),
         &[
-            (0, Some(MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX)),
-            (
-                MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX,
-                Some(entry_page_size + 1 - MATERIALIZED_TREE_ROUTE_ENTRY_WINDOW_MAX),
-            )
+            (0, Some(5), Some(MATERIALIZED_TREE_ROUTE_PAYLOAD_BYTES_MAX)),
+            (2, Some(3), Some(MATERIALIZED_TREE_ROUTE_PAYLOAD_BYTES_MAX)),
+            (4, Some(1), Some(MATERIALIZED_TREE_ROUTE_PAYLOAD_BYTES_MAX)),
         ],
-        "first public tree page must be assembled from route-safe internal entry windows"
+        "first public tree page must keep extending the same PIT group when byte-limited route replies return short positive chunks"
     );
 
     owner_endpoint.shutdown(Duration::from_secs(2)).await;
