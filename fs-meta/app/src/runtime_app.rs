@@ -4756,17 +4756,18 @@ const SINK_QUERY_PROXY_BRIDGE_TIMEOUT: Duration = Duration::from_millis(750);
 const SINK_QUERY_PROXY_BRIDGE_IDLE_GRACE: Duration = Duration::from_millis(150);
 
 fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
-    let sink_query_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
-    let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
     match unit {
         FacadeRuntimeUnit::Facade => route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
         FacadeRuntimeUnit::Query => {
             route_key == format!("{}.req", ROUTE_KEY_QUERY)
-                || route_key == sink_query_proxy_route
-                || route_key == source_status_route
+                || is_materialized_query_request_route(route_key)
+                || is_sink_status_query_request_route(route_key)
+                || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
         }
         FacadeRuntimeUnit::QueryPeer => {
-            route_key == sink_query_proxy_route || route_key == source_status_route
+            is_materialized_query_request_route(route_key)
+                || is_sink_status_query_request_route(route_key)
+                || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
         }
     }
 }
@@ -4795,7 +4796,7 @@ fn preferred_internal_query_endpoint_units(
 }
 
 fn is_dual_lane_internal_query_route(route_key: &str) -> bool {
-    route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
+    is_materialized_query_request_route(route_key)
         || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
 }
 
@@ -5269,19 +5270,45 @@ impl ChannelIoSubset for SourceRescanProxyReceiveReadyBoundary {
 }
 
 fn is_internal_status_route(route_key: &str) -> bool {
-    route_key == format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
+    is_sink_status_query_request_route(route_key)
         || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
+}
+
+fn is_sink_status_query_request_route(route_key: &str) -> bool {
+    route_key == format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
+        || is_per_peer_sink_status_request_route(route_key)
+}
+
+fn is_per_peer_sink_status_request_route(route_key: &str) -> bool {
+    let Some(request_route) = route_key.strip_suffix(".req") else {
+        return false;
+    };
+    let Some((stem, version)) = ROUTE_KEY_SINK_STATUS_INTERNAL.rsplit_once(':') else {
+        return request_route.starts_with(&format!("{ROUTE_KEY_SINK_STATUS_INTERNAL}."));
+    };
+    let Some(route_stem) = request_route.strip_suffix(&format!(":{version}")) else {
+        return false;
+    };
+    route_stem.starts_with(&format!("{stem}."))
+}
+
+fn is_materialized_query_request_route(route_key: &str) -> bool {
+    route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
+        || route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL)
+        || is_per_peer_sink_query_request_route(route_key)
 }
 
 fn is_facade_dependent_query_route(route_key: &str) -> bool {
     route_key == format!("{}.req", ROUTE_KEY_QUERY)
-        || route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
+        || is_materialized_query_request_route(route_key)
+        || is_sink_status_query_request_route(route_key)
         || route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
 }
 
 fn is_serving_facade_business_read_route(route_key: &str) -> bool {
     route_key == format!("{}.req", ROUTE_KEY_QUERY)
-        || route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
+        || is_materialized_query_request_route(route_key)
+        || is_sink_status_query_request_route(route_key)
 }
 
 fn is_uninitialized_cleanup_query_route_with_policy(
@@ -5290,13 +5317,7 @@ fn is_uninitialized_cleanup_query_route_with_policy(
 ) -> bool {
     route_key == format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)
         && recovery_lane_policy == ControlFailureRecoveryLanePolicy::WithdrawInternalStatus
-        || route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
-            && matches!(
-                recovery_lane_policy,
-                ControlFailureRecoveryLanePolicy::WithdrawInternalStatus
-                    | ControlFailureRecoveryLanePolicy::PreserveSourceStatus
-            )
-        || is_per_peer_sink_query_request_route(route_key)
+        || is_materialized_query_request_route(route_key)
             && matches!(
                 recovery_lane_policy,
                 ControlFailureRecoveryLanePolicy::WithdrawInternalStatus

@@ -810,21 +810,13 @@ async fn worker_backed_sink_starts_internal_materialized_owner_query_routes() {
 
     let generic_query_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL);
     let owner_query_route = sink_query_request_route_for("node-a").0;
-    let scope_rows = &[("nfs1", &["node-a::nfs1"][..])];
+    let scope_rows = [RuntimeBoundScope {
+        scope_id: "nfs1".to_string(),
+        resource_ids: vec!["node-a::nfs1".to_string()],
+    }];
     for route_key in [&generic_query_route, &owner_query_route] {
-        app.facade_gate
-            .apply_activate(
-                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-                route_key,
-                2,
-                &scope_rows
-                    .iter()
-                    .map(|(scope_id, resource_ids)| RuntimeBoundScope {
-                        scope_id: (*scope_id).to_string(),
-                        resource_ids: resource_ids.iter().map(|id| (*id).to_string()).collect(),
-                    })
-                    .collect::<Vec<_>>(),
-            )
+        app.apply_facade_activate(FacadeRuntimeUnit::QueryPeer, route_key, 2, &scope_rows)
+            .await
             .expect("activate query-peer materialized route");
     }
 
