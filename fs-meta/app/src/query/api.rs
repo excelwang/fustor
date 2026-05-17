@@ -919,7 +919,9 @@ pub(crate) fn merge_sink_status_snapshots(
     let mut stream_received_batches_by_node = BTreeMap::<String, u64>::new();
     let mut stream_received_events_by_node = BTreeMap::<String, u64>::new();
     let mut stream_received_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut stream_received_path_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut stream_ready_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut stream_ready_path_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut stream_deferred_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut stream_dropped_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut stream_applied_batches_by_node = BTreeMap::<String, u64>::new();
@@ -927,7 +929,9 @@ pub(crate) fn merge_sink_status_snapshots(
     let mut stream_applied_control_events_by_node = BTreeMap::<String, u64>::new();
     let mut stream_applied_data_events_by_node = BTreeMap::<String, u64>::new();
     let mut stream_applied_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut stream_applied_path_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut stream_last_applied_at_us_by_node = BTreeMap::<String, u64>::new();
+    let mut stream_path_capture_target = None::<String>;
     for snapshot in snapshots {
         let snapshot_primary_host_ref_by_group = snapshot.primary_host_ref_by_group;
         for (node_id, groups_for_node) in snapshot.scheduled_groups_by_node {
@@ -948,7 +952,11 @@ pub(crate) fn merge_sink_status_snapshots(
         stream_received_events_by_node.extend(snapshot.stream_received_events_by_node);
         stream_received_origin_counts_by_node
             .extend(snapshot.stream_received_origin_counts_by_node);
+        stream_received_path_origin_counts_by_node
+            .extend(snapshot.stream_received_path_origin_counts_by_node);
         stream_ready_origin_counts_by_node.extend(snapshot.stream_ready_origin_counts_by_node);
+        stream_ready_path_origin_counts_by_node
+            .extend(snapshot.stream_ready_path_origin_counts_by_node);
         stream_deferred_origin_counts_by_node
             .extend(snapshot.stream_deferred_origin_counts_by_node);
         stream_dropped_origin_counts_by_node.extend(snapshot.stream_dropped_origin_counts_by_node);
@@ -958,7 +966,12 @@ pub(crate) fn merge_sink_status_snapshots(
             .extend(snapshot.stream_applied_control_events_by_node);
         stream_applied_data_events_by_node.extend(snapshot.stream_applied_data_events_by_node);
         stream_applied_origin_counts_by_node.extend(snapshot.stream_applied_origin_counts_by_node);
+        stream_applied_path_origin_counts_by_node
+            .extend(snapshot.stream_applied_path_origin_counts_by_node);
         stream_last_applied_at_us_by_node.extend(snapshot.stream_last_applied_at_us_by_node);
+        if stream_path_capture_target.is_none() {
+            stream_path_capture_target = snapshot.stream_path_capture_target;
+        }
         for group in snapshot.groups {
             let group_id = group.group_id.clone();
             let incoming_score = (
@@ -1018,7 +1031,10 @@ pub(crate) fn merge_sink_status_snapshots(
     merged.stream_received_batches_by_node = stream_received_batches_by_node;
     merged.stream_received_events_by_node = stream_received_events_by_node;
     merged.stream_received_origin_counts_by_node = stream_received_origin_counts_by_node;
+    merged.stream_path_capture_target = stream_path_capture_target;
+    merged.stream_received_path_origin_counts_by_node = stream_received_path_origin_counts_by_node;
     merged.stream_ready_origin_counts_by_node = stream_ready_origin_counts_by_node;
+    merged.stream_ready_path_origin_counts_by_node = stream_ready_path_origin_counts_by_node;
     merged.stream_deferred_origin_counts_by_node = stream_deferred_origin_counts_by_node;
     merged.stream_dropped_origin_counts_by_node = stream_dropped_origin_counts_by_node;
     merged.stream_applied_batches_by_node = stream_applied_batches_by_node;
@@ -1026,6 +1042,7 @@ pub(crate) fn merge_sink_status_snapshots(
     merged.stream_applied_control_events_by_node = stream_applied_control_events_by_node;
     merged.stream_applied_data_events_by_node = stream_applied_data_events_by_node;
     merged.stream_applied_origin_counts_by_node = stream_applied_origin_counts_by_node;
+    merged.stream_applied_path_origin_counts_by_node = stream_applied_path_origin_counts_by_node;
     merged.stream_last_applied_at_us_by_node = stream_last_applied_at_us_by_node;
     merged.groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
     for group in &merged.groups {
@@ -3171,33 +3188,67 @@ fn filter_sink_status_snapshot(
     if allowed_groups.is_empty() {
         return snapshot;
     }
+    fn filter_group_ids_by_node(
+        groups_by_node: BTreeMap<String, Vec<String>>,
+        allowed_groups: &BTreeSet<String>,
+    ) -> BTreeMap<String, Vec<String>> {
+        groups_by_node
+            .into_iter()
+            .filter_map(|(node_id, groups)| {
+                let groups = groups
+                    .into_iter()
+                    .filter(|group| allowed_groups.contains(group))
+                    .collect::<Vec<_>>();
+                (!groups.is_empty()).then_some((node_id, groups))
+            })
+            .collect()
+    }
+
+    fn filter_origin_entries_by_node(
+        entries_by_node: BTreeMap<String, Vec<String>>,
+        allowed_groups: &BTreeSet<String>,
+    ) -> BTreeMap<String, Vec<String>> {
+        entries_by_node
+            .into_iter()
+            .filter_map(|(node_id, entries)| {
+                let entries = entries
+                    .into_iter()
+                    .filter(|entry| {
+                        allowed_groups.contains(crate::sink::sink_status_origin_entry_group_id(
+                            entry,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                (!entries.is_empty()).then_some((node_id, entries))
+            })
+            .collect()
+    }
+
+    fn filter_control_signals_by_node(
+        signals_by_node: BTreeMap<String, Vec<String>>,
+        allowed_groups: &BTreeSet<String>,
+    ) -> BTreeMap<String, Vec<String>> {
+        signals_by_node
+            .into_iter()
+            .filter_map(|(node_id, signals)| {
+                let signals = signals
+                    .into_iter()
+                    .filter(|signal| allowed_groups.iter().any(|group| signal.contains(group)))
+                    .collect::<Vec<_>>();
+                (!signals.is_empty()).then_some((node_id, signals))
+            })
+            .collect()
+    }
+
     let groups = snapshot
         .groups
         .into_iter()
         .filter(|group| allowed_groups.contains(&group.group_id))
         .collect::<Vec<_>>();
-    let scheduled_groups_by_node = snapshot
-        .scheduled_groups_by_node
-        .into_iter()
-        .filter_map(|(node_id, groups)| {
-            let groups = groups
-                .into_iter()
-                .filter(|group| allowed_groups.contains(group))
-                .collect::<Vec<_>>();
-            (!groups.is_empty()).then_some((node_id, groups))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let last_control_frame_signals_by_node = snapshot
-        .last_control_frame_signals_by_node
-        .into_iter()
-        .filter_map(|(node_id, groups)| {
-            let groups = groups
-                .into_iter()
-                .filter(|group| allowed_groups.contains(group))
-                .collect::<Vec<_>>();
-            (!groups.is_empty()).then_some((node_id, groups))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let scheduled_groups_by_node =
+        filter_group_ids_by_node(snapshot.scheduled_groups_by_node, allowed_groups);
+    let last_control_frame_signals_by_node =
+        filter_control_signals_by_node(snapshot.last_control_frame_signals_by_node, allowed_groups);
     let primary_host_ref_by_group = snapshot
         .primary_host_ref_by_group
         .into_iter()
@@ -3208,6 +3259,47 @@ fn filter_sink_status_snapshot(
         scheduled_groups_by_node,
         primary_host_ref_by_group,
         last_control_frame_signals_by_node,
+        last_received_origins_by_node: filter_origin_entries_by_node(
+            snapshot.last_received_origins_by_node,
+            allowed_groups,
+        ),
+        received_origin_counts_by_node: filter_origin_entries_by_node(
+            snapshot.received_origin_counts_by_node,
+            allowed_groups,
+        ),
+        stream_received_origin_counts_by_node: filter_origin_entries_by_node(
+            snapshot.stream_received_origin_counts_by_node,
+            allowed_groups,
+        ),
+        stream_path_capture_target: snapshot.stream_path_capture_target,
+        stream_received_path_origin_counts_by_node: filter_origin_entries_by_node(
+            snapshot.stream_received_path_origin_counts_by_node,
+            allowed_groups,
+        ),
+        stream_ready_origin_counts_by_node: filter_origin_entries_by_node(
+            snapshot.stream_ready_origin_counts_by_node,
+            allowed_groups,
+        ),
+        stream_ready_path_origin_counts_by_node: filter_origin_entries_by_node(
+            snapshot.stream_ready_path_origin_counts_by_node,
+            allowed_groups,
+        ),
+        stream_deferred_origin_counts_by_node: filter_origin_entries_by_node(
+            snapshot.stream_deferred_origin_counts_by_node,
+            allowed_groups,
+        ),
+        stream_dropped_origin_counts_by_node: filter_origin_entries_by_node(
+            snapshot.stream_dropped_origin_counts_by_node,
+            allowed_groups,
+        ),
+        stream_applied_origin_counts_by_node: filter_origin_entries_by_node(
+            snapshot.stream_applied_origin_counts_by_node,
+            allowed_groups,
+        ),
+        stream_applied_path_origin_counts_by_node: filter_origin_entries_by_node(
+            snapshot.stream_applied_path_origin_counts_by_node,
+            allowed_groups,
+        ),
         ..SinkStatusSnapshot::default()
     }])
 }

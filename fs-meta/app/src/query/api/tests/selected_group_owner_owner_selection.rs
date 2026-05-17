@@ -148,6 +148,105 @@ fn decode_selected_group_response_prefers_live_payload_over_newer_empty_peer_pay
     );
 }
 
+#[test]
+fn filter_sink_status_snapshot_preserves_same_group_stream_owner_evidence() {
+    let snapshot = SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]),
+        primary_host_ref_by_group: BTreeMap::from([
+            ("nfs1".to_string(), "node-a".to_string()),
+            ("nfs2".to_string(), "node-a".to_string()),
+        ]),
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs1".to_string(),
+                primary_object_ref: "node-a::nfs1".to_string(),
+                total_nodes: 0,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 0,
+                estimated_heap_bytes: 0,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs2".to_string(),
+                primary_object_ref: "node-a::nfs2".to_string(),
+                total_nodes: 0,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 0,
+                estimated_heap_bytes: 0,
+            },
+        ],
+        stream_applied_origin_counts_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec![
+                "node-a::nfs1=11001".to_string(),
+                "node-a::nfs2=11001".to_string(),
+            ],
+        )]),
+        stream_ready_origin_counts_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec![
+                "node-a::nfs1=11001".to_string(),
+                "node-a::nfs2=11001".to_string(),
+            ],
+        )]),
+        stream_received_origin_counts_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec![
+                "node-a::nfs1=11001".to_string(),
+                "node-a::nfs2=11001".to_string(),
+            ],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    let filtered = filter_sink_status_snapshot(snapshot, &BTreeSet::from(["nfs1".to_string()]));
+
+    assert_eq!(
+        filtered.scheduled_groups_by_node,
+        BTreeMap::from([("node-a".to_string(), vec!["nfs1".to_string()])])
+    );
+    assert_eq!(
+        filtered.stream_applied_origin_counts_by_node,
+        BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["node-a::nfs1=11001".to_string()]
+        )]),
+        "request-scoped sink-status filtering must preserve same-group stream-applied evidence; owner selection and readiness recovery depend on it"
+    );
+    assert_eq!(
+        filtered.stream_ready_origin_counts_by_node,
+        BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["node-a::nfs1=11001".to_string()]
+        )])
+    );
+    assert_eq!(
+        filtered.stream_received_origin_counts_by_node,
+        BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["node-a::nfs1=11001".to_string()]
+        )])
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_group_materialized_route_fans_out_candidate_owners_when_sink_status_is_fully_empty(
 ) {
