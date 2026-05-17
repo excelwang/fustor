@@ -6143,6 +6143,12 @@ impl TreePitGroupPlan {
         if remaining_session.is_zero() {
             return Duration::ZERO;
         }
+        if self.read_class != ReadClass::TrustedMaterialized {
+            return std::cmp::min(
+                remaining_session,
+                SELECTED_GROUP_OWNER_COLLECTION_GAP_ROUTE_BUDGET,
+            );
+        }
         if !self.stage_plan.reserve_proxy_budget {
             return remaining_session;
         }

@@ -1196,6 +1196,191 @@ async fn selected_group_pending_gap_caps_slow_candidate_and_preserves_proxy_budg
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_untrusted_live_owner_timeout_keeps_proxy_budget() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_a_root = tmp.path().join("node-a");
+    fs::create_dir_all(node_a_root.join("layout")).expect("create node-a dir");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-a::nfs2".to_string(),
+        host_ref: "node-a".to_string(),
+        host_ip: "10.0.0.1".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: node_a_root,
+        fs_source: "nfs".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let source = source_facade_with_group("nfs2", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let node_a_route = sink_query_request_route_for("node-a");
+    let proxy_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
+        .expect("resolve sink-query-proxy route");
+
+    let mut node_a_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_a_route.clone(),
+        "test-materialized-untrusted-slow-live-owner-sink-query-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            tokio::time::sleep(Duration::from_millis(4500)).await;
+            requests
+                .into_iter()
+                .map(|req| {
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(
+                        req.payload_bytes(),
+                    )
+                    .expect("decode slow live-owner query request");
+                    let group_id = params
+                        .scope
+                        .selected_group
+                        .clone()
+                        .expect("selected group for slow live-owner request");
+                    mk_event_with_correlation(
+                        &group_id,
+                        req.metadata()
+                            .correlation_id
+                            .expect("slow live-owner request correlation"),
+                        real_materialized_tree_payload_for_test(&params.scope.path),
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+    let mut proxy_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        proxy_route.clone(),
+        "test-materialized-untrusted-proxy-sink-query-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            requests
+                .into_iter()
+                .map(|req| {
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(
+                        req.payload_bytes(),
+                    )
+                    .expect("decode materialized-untrusted proxy query request");
+                    let group_id = params
+                        .scope
+                        .selected_group
+                        .clone()
+                        .expect("selected group for proxy request");
+                    mk_event_with_correlation(
+                        &group_id,
+                        req.metadata()
+                            .correlation_id
+                            .expect("proxy request correlation"),
+                        real_materialized_tree_payload_for_test(&params.scope.path),
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+    );
+    let selected_group_sink_status = SinkStatusSnapshot {
+        primary_host_ref_by_group: BTreeMap::from([("nfs2".to_string(), "node-a".to_string())]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs2".to_string(),
+            primary_object_ref: "node-a::nfs2".to_string(),
+            total_nodes: 1,
+            live_nodes: 1,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 1,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::Ready,
+            materialized_revision: 1,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+    let timeout = Duration::from_secs(5);
+    let group_plan = TreePitSessionPlan::new(timeout, 2).selected_group_stage_plan(
+        TreePitGroupPlanInput {
+            read_class: ReadClass::Materialized,
+            observation_state: ObservationState::MaterializedUntrusted,
+            selected_group_sink_reports_live_materialized: true,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: false,
+            selected_group_sink_unready_empty: false,
+            empty_root_requires_fail_closed: false,
+        },
+    );
+
+    let started_at = Instant::now();
+    let result =
+        query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
+            &state,
+            &ProjectionPolicy::default(),
+            build_materialized_tree_request(
+                b"/",
+                true,
+                None,
+                ReadClass::Materialized,
+                Some("nfs2".to_string()),
+            ),
+            timeout,
+            None,
+            Some(selected_group_sink_status),
+            None,
+            group_plan,
+        )
+        .await;
+    let elapsed = started_at.elapsed();
+
+    assert!(
+        result.is_ok(),
+        "materialized-untrusted live-owner route gap should fall back to same-group proxy instead of spending the whole group stage; node_a_calls={} proxy_calls={} elapsed_ms={} err={:?}",
+        boundary.send_batch_count(&node_a_route.0),
+        boundary.send_batch_count(&proxy_route.0),
+        elapsed.as_millis(),
+        result.as_ref().err(),
+    );
+    let payload = decode_materialized_selected_group_response(
+        &result.expect("materialized-untrusted proxy-backed result"),
+        &ProjectionPolicy::default(),
+        "nfs2",
+        b"/",
+    )
+    .expect("decode materialized-untrusted proxy-backed response");
+    assert!(payload.root.exists);
+    assert!(
+        elapsed < Duration::from_millis(2200),
+        "a single live-owner route gap must not consume the multi-group materialized-untrusted query window, elapsed={elapsed:?}"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&node_a_route.0),
+        1,
+        "slow live owner should be attempted once before proxy recovery"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&proxy_route.0),
+        1,
+        "same-group proxy recovery should retain enough budget after the bounded owner route gap"
+    );
+
+    node_a_endpoint.shutdown(Duration::from_secs(5)).await;
+    proxy_endpoint.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_group_materialized_route_prefers_sink_scheduled_owner_over_stale_source_primary()
 {
     let tmp = tempfile::tempdir().expect("create tempdir");
