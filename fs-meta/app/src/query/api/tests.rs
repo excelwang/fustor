@@ -6432,6 +6432,64 @@ async fn owner_collection_gap_route_waits_for_slow_live_owner_before_proxy_fallb
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_collection_gap_route_waits_for_l5_upgrade_primary_under_event_replay_load() {
+    let proxy_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
+        .expect("resolve sink-query-proxy route");
+    let internal_route = sink_query_request_route_for("node-a");
+    let boundary = Arc::new(
+        MaterializedRouteRaceBoundary::new_with_internal_reply_delay(
+            proxy_route.0.clone(),
+            internal_route.0.clone(),
+            "nfs1",
+            b"/force-find-stress".to_vec(),
+            Duration::from_millis(2500),
+        ),
+    );
+    let timeout = Duration::from_secs(6);
+    let group_plan =
+        TreePitSessionPlan::new(timeout, 2).selected_group_stage_plan(TreePitGroupPlanInput {
+            read_class: ReadClass::Materialized,
+            observation_state: ObservationState::MaterializedUntrusted,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: false,
+            selected_group_sink_unready_empty: true,
+            empty_root_requires_fail_closed: false,
+        });
+
+    let events = route_materialized_events_via_node(
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+        NodeId("node-a".to_string()),
+        build_materialized_tree_request(
+            b"/force-find-stress",
+            true,
+            None,
+            ReadClass::Materialized,
+            Some("nfs1".to_string()),
+        ),
+        group_plan.owner_collection_gap_route_plan(timeout),
+    )
+    .await
+    .expect("collection-gap owner route should keep enough budget for replay-loaded primary");
+
+    let payload = decode_materialized_selected_group_response(
+        &events,
+        &ProjectionPolicy::default(),
+        "nfs1",
+        b"/force-find-stress",
+    )
+    .expect("decode replay-loaded collection-gap owner response");
+    assert!(
+        payload.root.exists,
+        "release-upgrade collection-gap owner route must not time out before a replay-loaded primary can return materialized data"
+    );
+}
+
 #[test]
 fn decode_materialized_selected_group_response_prefers_newer_empty_same_path_payload_over_older_richer_payload()
  {

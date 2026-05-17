@@ -77,6 +77,8 @@ const SELECTED_GROUP_PROXY_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_m
 const RANKING_QUERY_MIN_BUDGET: Duration = Duration::from_millis(1000);
 const SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET: Duration = Duration::from_millis(2000);
 const SELECTED_GROUP_OWNER_COLLECTION_GAP_ROUTE_BUDGET: Duration = Duration::from_millis(1000);
+const SELECTED_GROUP_MATERIALIZED_OWNER_COLLECTION_GAP_ROUTE_BUDGET: Duration =
+    Duration::from_millis(3000);
 const TRUSTED_READY_SELECTED_GROUP_RETRY_BUDGET: Duration = Duration::from_millis(400);
 const TRUSTED_READY_LATER_RANKED_NON_ROOT_RETRY_BUDGET: Duration = Duration::from_millis(100);
 const EXPLICIT_EMPTY_SINK_STATUS_RECOLLECT_BUDGET: Duration = Duration::from_millis(250);
@@ -6194,7 +6196,7 @@ impl TreePitGroupPlan {
             SELECTED_GROUP_OWNER_COLLECTION_GAP_ROUTE_BUDGET
         } else {
             std::cmp::max(
-                SELECTED_GROUP_OWNER_COLLECTION_GAP_ROUTE_BUDGET,
+                SELECTED_GROUP_MATERIALIZED_OWNER_COLLECTION_GAP_ROUTE_BUDGET,
                 SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET,
             )
         };
@@ -8290,10 +8292,10 @@ fn tree_pit_group_plan_caps_owner_collection_gap_route_budget() {
     assert_eq!(
         materialized_plan.owner_collection_gap_route_plan(Duration::from_secs(60)),
         SelectedGroupOwnerRoutePlan {
-            route_timeout: SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET,
+            route_timeout: SELECTED_GROUP_MATERIALIZED_OWNER_COLLECTION_GAP_ROUTE_BUDGET,
             collect_idle_grace: SELECTED_GROUP_OWNER_ROUTE_COLLECT_IDLE_GRACE,
         },
-        "materialized-untrusted owner-collection gaps should give a current owner the same bounded rescue window as the generic proxy before settling empty"
+        "materialized-untrusted owner-collection gaps should give a replay-loaded primary owner a bounded rescue window before settling empty"
     );
 }
 
