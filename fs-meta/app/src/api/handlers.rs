@@ -207,6 +207,7 @@ fn summarize_sink_status_route_snapshot(snapshot: &SinkStatusSnapshot) -> String
 pub(crate) struct RootsPutPauseHook {
     pub entered: std::sync::Arc<Notify>,
     pub release: std::sync::Arc<Notify>,
+    pub selector_token: Option<String>,
 }
 
 #[cfg(test)]
@@ -214,6 +215,7 @@ pub(crate) struct RootsPutPauseHook {
 pub(crate) struct RootsPutBeforeResponseHook {
     pub entered: std::sync::Arc<Notify>,
     pub release: std::sync::Arc<Notify>,
+    pub selector_token: Option<String>,
 }
 
 #[cfg(test)]
@@ -282,6 +284,14 @@ pub(crate) fn install_roots_put_before_response_hook(hook: RootsPutBeforeRespons
         Err(poisoned) => poisoned.into_inner(),
     };
     *guard = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) async fn roots_put_hook_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static CELL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    CELL.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
 }
 
 #[cfg(test)]
@@ -367,13 +377,33 @@ pub(crate) fn clear_status_route_trace_capture() {
 }
 
 #[cfg(test)]
-async fn maybe_pause_roots_put_after_previous_source_roots() {
+fn roots_put_hook_matches_selector(selector_token: Option<&str>, roots: &[RootSpec]) -> bool {
+    let Some(selector_token) = selector_token else {
+        return true;
+    };
+    roots.iter().any(|root| {
+        root.selector
+            .mount_point
+            .as_ref()
+            .is_some_and(|value| value.to_string_lossy() == selector_token)
+            || root.selector.fs_source.as_deref() == Some(selector_token)
+            || root.selector.fs_type.as_deref() == Some(selector_token)
+            || root.selector.host_ip.as_deref() == Some(selector_token)
+            || root.selector.host_ref.as_deref() == Some(selector_token)
+    })
+}
+
+#[cfg(test)]
+async fn maybe_pause_roots_put_after_previous_source_roots(roots: &[RootSpec]) {
     let hook = {
         let guard = match roots_put_pause_hook_cell().lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.clone()
+        guard
+            .as_ref()
+            .filter(|hook| roots_put_hook_matches_selector(hook.selector_token.as_deref(), roots))
+            .cloned()
     };
     if let Some(hook) = hook {
         let mut release = std::pin::pin!(hook.release.notified());
@@ -388,13 +418,16 @@ async fn maybe_pause_roots_put_after_previous_source_roots() {
 }
 
 #[cfg(test)]
-async fn maybe_pause_roots_put_before_response() {
+async fn maybe_pause_roots_put_before_response(roots: &[RootSpec]) {
     let hook = {
         let guard = match roots_put_before_response_hook_cell().lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.clone()
+        guard
+            .as_ref()
+            .filter(|hook| roots_put_hook_matches_selector(hook.selector_token.as_deref(), roots))
+            .cloned()
     };
     if let Some(hook) = hook {
         let mut release = std::pin::pin!(hook.release.notified());
@@ -1253,7 +1286,7 @@ async fn collect_node_scoped_status_sink_snapshot(
             METHOD_SINK_STATUS,
             internal_status_request_payload_with_live_probe_timeout(timeout),
             timeout,
-            Duration::ZERO,
+            STATUS_ROUTE_COLLECT_IDLE_GRACE.min(timeout),
         )
         .await?;
     let snapshots = events
@@ -2625,6 +2658,7 @@ pub async fn status(
     if local_source_used_cached_fallback && state.source.is_worker() {
         log::warn!("status using cached/degraded source observability snapshot");
     }
+    let mut local_cached_sink_not_ready_message = None::<String>;
     if state.source.is_worker() || state.sink.is_worker() {
         let active_candidate_groups =
             status_local_observation_candidate_groups(&local_source, &local_sink);
@@ -2683,17 +2717,20 @@ pub async fn status(
                 }
             ),
         );
-        if local_sink_used_cached_fallback
-            && let Some(local_observation_status) = local_observation_status.as_ref()
-            && local_observation_status.state != ObservationState::TrustedMaterialized
-        {
-            return Err(ApiError::service_unavailable(
-                trusted_materialized_not_ready_message(local_observation_status),
-            ));
-        }
+        local_cached_sink_not_ready_message = if local_sink_used_cached_fallback {
+            local_observation_status
+                .as_ref()
+                .filter(|status| status.state != ObservationState::TrustedMaterialized)
+                .map(trusted_materialized_not_ready_message)
+        } else {
+            None
+        };
         // Management /status remains available while active facade observation is still converging.
         // Facade readiness is reported via published facade state and pending diagnostics rather than
         // by fail-closing the management surface on observation trust.
+        if local_cached_sink_not_ready_message.is_some() {
+            record_status_route_trace(trace_id, "status.local.cached_sink_not_ready");
+        }
     }
     let authoritative_source_for_status_fanin = source_snapshot_with_status_authority(
         local_source.clone(),
@@ -2706,6 +2743,11 @@ pub async fn status(
             .cached_host_object_grants_snapshot_with_failure()
             .ok(),
     );
+    let published_facade_status = state.published_facade_status.snapshot();
+    let published_rollout_status = state.published_rollout_status.snapshot();
+    let published_facade_state = published_facade_status.state;
+    let use_short_status_route_budget =
+        management_status_uses_short_observation_budget(published_facade_state);
     #[cfg(test)]
     maybe_pause_status_before_remote_collection().await;
     record_status_route_trace(trace_id, "status.remote.begin");
@@ -2733,6 +2775,7 @@ pub async fn status(
                     boundary,
                     origin_id,
                     trace_id,
+                    use_short_status_route_budget,
                 )
             };
             // Management /status should prefer the management/runtime boundary when present.
@@ -2783,7 +2826,16 @@ pub async fn status(
             }
         };
     sink_status = apply_status_ready_sink_evidence_cache(sink_status);
-    let preferred_owner_scoped_boundary = state
+    let source_short_budget_owner_fanin_needed = use_short_status_route_budget
+        && management_status_should_attempt_short_budget_source_owner_scoped_fanin(
+            source_outcome,
+            &source,
+            &authoritative_source_for_status_fanin,
+        );
+    if source_short_budget_owner_fanin_needed {
+        record_status_route_trace(trace_id, "source.owner_scoped.short_budget_needed");
+    }
+    let primary_owner_scoped_boundary = state
         .runtime_boundary
         .clone()
         .or_else(|| state.query_runtime_boundary.clone());
@@ -2796,17 +2848,38 @@ pub async fn status(
             }
             _ => None,
         };
+    let preferred_source_owner_scoped_boundary =
+        if use_short_status_route_budget && !source_short_budget_owner_fanin_needed {
+            None
+        } else {
+            primary_owner_scoped_boundary.clone()
+        };
+    let fallback_source_owner_scoped_boundary = if use_short_status_route_budget {
+        None
+    } else {
+        fallback_owner_scoped_boundary.clone()
+    };
+    let preferred_sink_owner_scoped_boundary = if use_short_status_route_budget {
+        None
+    } else {
+        primary_owner_scoped_boundary
+    };
+    let fallback_sink_owner_scoped_boundary = if use_short_status_route_budget {
+        None
+    } else {
+        fallback_owner_scoped_boundary
+    };
     source = augment_management_status_source_with_owner_scoped_evidence(
         source,
         &authoritative_source_for_status_fanin,
-        preferred_owner_scoped_boundary.clone(),
+        preferred_source_owner_scoped_boundary,
         state.node_id.clone(),
     )
     .await;
     source = augment_management_status_source_with_owner_scoped_evidence(
         source,
         &authoritative_source_for_status_fanin,
-        fallback_owner_scoped_boundary.clone(),
+        fallback_source_owner_scoped_boundary,
         state.node_id.clone(),
     )
     .await;
@@ -2814,7 +2887,7 @@ pub async fn status(
         sink_status,
         &source,
         &authoritative_source_for_status_fanin,
-        preferred_owner_scoped_boundary,
+        preferred_sink_owner_scoped_boundary,
         state.node_id.clone(),
     )
     .await;
@@ -2822,7 +2895,7 @@ pub async fn status(
         sink_status,
         &source,
         &authoritative_source_for_status_fanin,
-        fallback_owner_scoped_boundary,
+        fallback_sink_owner_scoped_boundary,
         state.node_id.clone(),
     )
     .await;
@@ -2835,9 +2908,6 @@ pub async fn status(
             source_outcome.as_str()
         ),
     );
-    let published_facade_status = state.published_facade_status.snapshot();
-    let published_rollout_status = state.published_rollout_status.snapshot();
-    let published_facade_state = published_facade_status.state;
     let live_source_nodes = active_source_node_count(&source);
     let gate_inflight = state
         .force_find_inflight
@@ -2878,11 +2948,23 @@ pub async fn status(
         &sink_status,
         &source,
     ) {
+        if local_cached_sink_not_ready_message.is_some()
+            && !status_observation_is_trusted_materialized(&source, &sink_status)
+            && let Some(message) = local_cached_sink_not_ready_message.as_ref()
+        {
+            return Err(ApiError::service_unavailable(message.clone()));
+        }
         return Err(ApiError::service_unavailable(format!(
             "status remote route collection incomplete: sink_route={} source_route={}",
             sink_outcome.as_str(),
             source_outcome.as_str()
         )));
+    }
+    if local_cached_sink_not_ready_message.is_some()
+        && !status_observation_is_trusted_materialized(&source, &sink_status)
+        && let Some(message) = local_cached_sink_not_ready_message
+    {
+        return Err(ApiError::service_unavailable(message));
     }
     if debug_force_find_runner_capture_enabled() {
         eprintln!(
@@ -3466,6 +3548,64 @@ fn local_sink_covers_active_source_groups(
         && active_source_groups.is_subset(&sink_snapshot_live_materialized_groups(local_sink))
 }
 
+fn local_sink_has_schedule_evidence_for_active_source_groups(
+    local_sink: &SinkStatusSnapshot,
+    source: &SourceObservabilitySnapshot,
+) -> bool {
+    let active_source_groups = source_snapshot_status_readiness_groups(source);
+    !active_source_groups.is_empty()
+        && active_source_groups.is_subset(&sink_snapshot_scheduled_groups(local_sink))
+}
+
+fn source_runtime_scope_scheduled_groups_by_node(
+    source: &SourceObservabilitySnapshot,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut groups_by_node = BTreeMap::<String, BTreeSet<String>>::new();
+    for (node_id, groups) in source
+        .scheduled_source_groups_by_node
+        .iter()
+        .chain(source.scheduled_scan_groups_by_node.iter())
+    {
+        let entry = groups_by_node.entry(node_id.clone()).or_default();
+        entry.extend(groups.iter().filter(|group| !group.is_empty()).cloned());
+    }
+    groups_by_node.retain(|_, groups| !groups.is_empty());
+    groups_by_node
+}
+
+fn source_runtime_scope_scheduled_group_ids(
+    source: &SourceObservabilitySnapshot,
+) -> BTreeSet<String> {
+    source_runtime_scope_scheduled_groups_by_node(source)
+        .into_values()
+        .flatten()
+        .collect()
+}
+
+fn local_sink_schedule_covers_source_runtime_scope(
+    local_sink: &SinkStatusSnapshot,
+    source: &SourceObservabilitySnapshot,
+) -> bool {
+    let source_groups_by_node = source_runtime_scope_scheduled_groups_by_node(source);
+    if source_groups_by_node.is_empty() {
+        return true;
+    }
+
+    source_groups_by_node
+        .into_iter()
+        .all(|(node_id, source_groups)| {
+            let sink_groups = local_sink
+                .scheduled_groups_by_node
+                .get(&node_id)
+                .into_iter()
+                .flat_map(|groups| groups.iter())
+                .filter(|group| !group.is_empty())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            source_groups.is_subset(&sink_groups)
+        })
+}
+
 fn status_local_ready_evidence_completes_management_status(
     local_sink: &SinkStatusSnapshot,
     source: &SourceObservabilitySnapshot,
@@ -3475,6 +3615,24 @@ fn status_local_ready_evidence_completes_management_status(
         && source.status.degraded_roots.is_empty()
         && source_observability_snapshot_has_active_state(source)
         && local_sink_covers_active_source_groups(local_sink, source)
+        && local_sink_has_schedule_evidence_for_active_source_groups(local_sink, source)
+        && local_sink_schedule_covers_source_runtime_scope(local_sink, source)
+}
+
+fn status_observation_is_trusted_materialized(
+    source: &SourceObservabilitySnapshot,
+    sink: &SinkStatusSnapshot,
+) -> bool {
+    let candidate_groups = status_local_observation_candidate_groups(source, sink);
+    if candidate_groups.is_empty() {
+        return false;
+    }
+    evaluate_observation_status(
+        &candidate_group_observation_evidence(&source.status, sink, &candidate_groups),
+        ObservationTrustPolicy::candidate_generation(),
+    )
+    .state
+        == ObservationState::TrustedMaterialized
 }
 
 fn sink_status_snapshot_omits_active_source_groups(
@@ -3515,6 +3673,12 @@ const STATUS_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(2);
 const STATUS_ROUTE_READY_FALLBACK_GRACE: Duration = Duration::from_millis(200);
 const STATUS_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const STATUS_SINK_ROUTE_RECOLLECT_BUDGET: Duration = Duration::from_secs(3);
+
+fn management_status_uses_short_observation_budget(
+    published_facade_state: FacadeServiceState,
+) -> bool {
+    matches!(published_facade_state, FacadeServiceState::Pending)
+}
 
 fn status_ready_sink_evidence_cache() -> &'static StdMutex<BTreeMap<String, SinkGroupStatusSnapshot>>
 {
@@ -3665,14 +3829,17 @@ async fn collect_shared_status_routes_once(
     local_source: &SourceObservabilitySnapshot,
     boundary: std::sync::Arc<dyn ChannelIoSubset>,
     node_id: NodeId,
+    use_short_observation_budget: bool,
 ) -> (StatusSinkRouteResult, StatusSourceRouteResult) {
-    let local_ready_summary = local_sink_covers_active_source_groups(local_sink, local_source);
-    let route_timeout = if local_ready_summary {
+    let local_ready_summary =
+        status_local_ready_evidence_completes_management_status(local_sink, local_source, false);
+    let use_short_route_budget = local_ready_summary || use_short_observation_budget;
+    let route_timeout = if use_short_route_budget {
         STATUS_ROUTE_READY_FALLBACK_GRACE
     } else {
         STATUS_ROUTE_TIMEOUT
     };
-    let collect_idle_grace = if local_ready_summary {
+    let collect_idle_grace = if use_short_route_budget {
         STATUS_ROUTE_READY_FALLBACK_GRACE
     } else {
         STATUS_ROUTE_COLLECT_IDLE_GRACE
@@ -3682,8 +3849,27 @@ async fn collect_shared_status_routes_once(
         node_id.clone(),
         crate::query::api::StatusRoutePlan::new(route_timeout, collect_idle_grace),
     );
-    let source_future =
-        route_source_observability_snapshot(boundary, node_id, route_timeout, collect_idle_grace);
+    let source_future = {
+        let source_node_id = node_id;
+        async move {
+            if local_ready_summary {
+                route_source_observability_snapshot_until_first(
+                    boundary,
+                    source_node_id,
+                    route_timeout,
+                )
+                .await
+            } else {
+                route_source_observability_snapshot(
+                    boundary,
+                    source_node_id,
+                    route_timeout,
+                    collect_idle_grace,
+                )
+                .await
+            }
+        }
+    };
     tokio::pin!(sink_future);
     tokio::pin!(source_future);
 
@@ -3695,7 +3881,11 @@ async fn collect_shared_status_routes_once(
         }
         if sink_result.is_none()
             && let Some(Ok((source_snapshot, _))) = source_result.as_ref()
-            && local_sink_covers_active_source_groups(local_sink, source_snapshot)
+            && status_local_ready_evidence_completes_management_status(
+                local_sink,
+                source_snapshot,
+                false,
+            )
         {
             sink_result = Some(
                 match tokio::time::timeout(STATUS_ROUTE_READY_FALLBACK_GRACE, sink_future.as_mut())
@@ -3708,6 +3898,7 @@ async fn collect_shared_status_routes_once(
             break;
         }
         tokio::select! {
+            biased;
             result = sink_future.as_mut(), if sink_result.is_none() => {
                 sink_result = Some(result);
             }
@@ -3823,6 +4014,7 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
     boundary: std::sync::Arc<dyn ChannelIoSubset>,
     node_id: NodeId,
     trace_id: Option<u64>,
+    use_short_observation_budget: bool,
 ) -> (
     SinkStatusSnapshot,
     SourceObservabilitySnapshot,
@@ -3836,8 +4028,14 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
     let sink_retry_node_id = node_id.clone();
     record_status_route_trace(trace_id, "sink.collect.begin");
     record_status_route_trace(trace_id, "source.collect.begin");
-    let (mut sink_result, mut source_result) =
-        collect_shared_status_routes_once(&local_sink, &local_source, boundary, node_id).await;
+    let (mut sink_result, mut source_result) = collect_shared_status_routes_once(
+        &local_sink,
+        &local_source,
+        boundary,
+        node_id,
+        use_short_observation_budget,
+    )
+    .await;
     let both_internal = matches!(sink_result, Err(CnxError::Internal(_)))
         && matches!(source_result, Err(CnxError::Internal(_)));
     let both_transport = sink_result
@@ -3849,20 +4047,27 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
             .err()
             .is_some_and(|err| classify_status_route_error(err) == StatusRouteOutcome::Transport);
     if both_internal || both_transport {
+        let route_timeout = if use_short_observation_budget {
+            STATUS_ROUTE_READY_FALLBACK_GRACE
+        } else {
+            STATUS_ROUTE_TIMEOUT
+        };
+        let collect_idle_grace = if use_short_observation_budget {
+            STATUS_ROUTE_READY_FALLBACK_GRACE
+        } else {
+            STATUS_ROUTE_COLLECT_IDLE_GRACE
+        };
         sink_result = route_sink_status_snapshot(
             retry_boundary.clone(),
             retry_node_id.clone(),
-            crate::query::api::StatusRoutePlan::new(
-                STATUS_ROUTE_TIMEOUT,
-                STATUS_ROUTE_COLLECT_IDLE_GRACE,
-            ),
+            crate::query::api::StatusRoutePlan::new(route_timeout, collect_idle_grace),
         )
         .await;
         source_result = route_source_observability_snapshot(
             retry_boundary,
             retry_node_id,
-            STATUS_ROUTE_TIMEOUT,
-            STATUS_ROUTE_COLLECT_IDLE_GRACE,
+            route_timeout,
+            collect_idle_grace,
         )
         .await;
     }
@@ -3870,6 +4075,7 @@ async fn collect_remote_status_snapshots_on_shared_boundary(
         && sink_status_snapshot_omits_active_source_groups(source_snapshot, sink_snapshot)
         && !source_snapshot_active_groups(source_snapshot)
             .is_subset(&sink_snapshot_live_materialized_groups(&local_sink))
+        && !use_short_observation_budget
     {
         if let Ok(retry_snapshot) = route_sink_status_snapshot(
             sink_retry_boundary,
@@ -4048,6 +4254,31 @@ fn clear_worker_status_cache_marker_after_live_merge_when_source_health_complete
     }
 }
 
+fn management_status_should_attempt_short_budget_source_owner_scoped_fanin(
+    source_outcome: StatusRouteOutcome,
+    source: &SourceObservabilitySnapshot,
+    authoritative_source: &SourceObservabilitySnapshot,
+) -> bool {
+    if !matches!(source_outcome, StatusRouteOutcome::Ok) {
+        return false;
+    }
+    let expected_root_ids = management_status_authoritative_source_root_ids(authoritative_source);
+    if expected_root_ids.is_empty() {
+        return false;
+    }
+    let root_ids_needing_owner_evidence =
+        source_status_root_ids_needing_current_owner_evidence(source, &expected_root_ids);
+    if root_ids_needing_owner_evidence.is_empty() {
+        return false;
+    }
+    !management_status_source_owner_candidate_node_ids(
+        source,
+        authoritative_source,
+        &root_ids_needing_owner_evidence,
+    )
+    .is_empty()
+}
+
 fn collect_source_owner_candidate_nodes_from_snapshot(
     nodes: &mut BTreeSet<String>,
     source: &SourceObservabilitySnapshot,
@@ -4094,9 +4325,7 @@ fn collect_source_owner_candidate_nodes_from_snapshot(
             .iter()
             .filter(|grant| grant.active && root.selector.matches(grant))
         {
-            if let Some(node_id) = source_node_id_from_grant(grant) {
-                nodes.insert(node_id);
-            }
+            collect_source_grant_runtime_candidate_nodes(nodes, grant);
         }
     }
 }
@@ -4114,6 +4343,47 @@ fn management_status_source_owner_candidate_node_ids(
         missing_root_ids,
     );
     nodes
+}
+
+fn collect_source_grant_candidate_nodes_for_roots(
+    nodes: &mut BTreeSet<String>,
+    source: &SourceObservabilitySnapshot,
+    root_ids: &BTreeSet<String>,
+) {
+    for root in source
+        .logical_roots
+        .iter()
+        .filter(|root| root_ids.contains(&root.id))
+    {
+        for grant in source
+            .grants
+            .iter()
+            .filter(|grant| grant.active && root.selector.matches(grant))
+        {
+            collect_source_grant_runtime_candidate_nodes(nodes, grant);
+        }
+    }
+}
+
+fn collect_active_source_grant_candidate_nodes(
+    nodes: &mut BTreeSet<String>,
+    source: &SourceObservabilitySnapshot,
+) {
+    for grant in source.grants.iter().filter(|grant| grant.active) {
+        collect_source_grant_runtime_candidate_nodes(nodes, grant);
+    }
+}
+
+fn collect_source_grant_runtime_candidate_nodes(
+    nodes: &mut BTreeSet<String>,
+    grant: &GrantedMountRoot,
+) {
+    if let Some(node_id) = source_node_id_from_grant(grant) {
+        nodes.insert(node_id);
+    }
+    if let Some(node_id) = roots_put_control_target_node_id_for_grant(grant) {
+        nodes.insert(node_id);
+    }
 }
 
 async fn augment_management_status_source_with_owner_scoped_evidence(
@@ -4210,6 +4480,86 @@ fn sink_status_missing_authoritative_group_ids(
         .collect()
 }
 
+fn sink_status_has_scheduled_group_evidence(sink: &SinkStatusSnapshot, group_id: &str) -> bool {
+    sink.scheduled_groups_by_node
+        .values()
+        .flatten()
+        .any(|scheduled_group| scheduled_group == group_id)
+}
+
+fn sink_status_group_needs_owner_scoped_evidence(
+    sink: &SinkStatusSnapshot,
+    group_id: &str,
+    source_runtime_scope_group_ids: &BTreeSet<String>,
+) -> bool {
+    let lacks_scheduled_group = !sink_status_has_scheduled_group_evidence(sink, group_id);
+    let Some(group) = sink.groups.iter().find(|group| group.group_id == group_id) else {
+        return true;
+    };
+    if lacks_scheduled_group
+        && (!group.materialized_service_live_ready()
+            || source_runtime_scope_group_ids.contains(group_id))
+    {
+        return true;
+    }
+    if group.materialized_service_live_ready() {
+        return lacks_scheduled_group && sink_status_snapshot_lacks_ingress_evidence(sink);
+    }
+    sink_group_is_unready_zero_for_same_primary(group)
+        || (lacks_scheduled_group && sink_status_snapshot_lacks_ingress_evidence(sink))
+}
+
+fn sink_status_groups_needing_owner_scoped_evidence(
+    sink: &SinkStatusSnapshot,
+    expected_group_ids: &BTreeSet<String>,
+    source_runtime_scope_group_ids: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut group_ids = sink_status_missing_authoritative_group_ids(sink, expected_group_ids);
+    group_ids.extend(
+        expected_group_ids
+            .iter()
+            .filter(|group_id| {
+                sink_status_group_needs_owner_scoped_evidence(
+                    sink,
+                    group_id,
+                    source_runtime_scope_group_ids,
+                )
+            })
+            .cloned(),
+    );
+    group_ids
+}
+
+fn collect_sink_owner_candidate_nodes_from_snapshot(
+    nodes: &mut BTreeSet<String>,
+    sink: &SinkStatusSnapshot,
+    group_ids: &BTreeSet<String>,
+) {
+    for (group_id, host_ref) in &sink.primary_host_ref_by_group {
+        if group_ids.contains(group_id)
+            && let Some(node_id) = roots_put_control_target_node_id_for_ref_or_node(host_ref)
+        {
+            nodes.insert(node_id);
+        }
+    }
+    for (node_id, groups) in &sink.scheduled_groups_by_node {
+        if groups.iter().any(|group| group_ids.contains(group))
+            && let Some(node_id) = roots_put_control_target_node_id_for_ref_or_node(node_id)
+        {
+            nodes.insert(node_id);
+        }
+    }
+    for (node_id, signals) in &sink.last_control_frame_signals_by_node {
+        if signals
+            .iter()
+            .any(|signal| group_ids.iter().any(|group_id| signal.contains(group_id)))
+            && let Some(node_id) = roots_put_control_target_node_id_for_ref_or_node(node_id)
+        {
+            nodes.insert(node_id);
+        }
+    }
+}
+
 async fn augment_management_status_sink_with_owner_scoped_evidence(
     mut sink: SinkStatusSnapshot,
     source: &SourceObservabilitySnapshot,
@@ -4217,22 +4567,56 @@ async fn augment_management_status_sink_with_owner_scoped_evidence(
     boundary: Option<std::sync::Arc<dyn ChannelIoSubset>>,
     origin_id: NodeId,
 ) -> SinkStatusSnapshot {
-    let expected_group_ids = management_status_authoritative_source_root_ids(authoritative_source);
+    let mut expected_group_ids =
+        management_status_authoritative_source_root_ids(authoritative_source);
+    if expected_group_ids.is_empty() {
+        expected_group_ids = sink_snapshot_advertised_groups(&sink);
+    }
     if expected_group_ids.is_empty() {
         return sink;
     }
-    let missing_group_ids = sink_status_missing_authoritative_group_ids(&sink, &expected_group_ids);
-    if missing_group_ids.is_empty() {
+    let source_runtime_scope_group_ids = source_runtime_scope_scheduled_group_ids(source)
+        .into_iter()
+        .chain(source_runtime_scope_scheduled_group_ids(
+            authoritative_source,
+        ))
+        .collect::<BTreeSet<_>>();
+    let groups_needing_owner_evidence = sink_status_groups_needing_owner_scoped_evidence(
+        &sink,
+        &expected_group_ids,
+        &source_runtime_scope_group_ids,
+    );
+    if groups_needing_owner_evidence.is_empty() {
         return sink;
     }
     let Some(boundary) = boundary else {
         return sink;
     };
-    let candidate_node_ids = management_status_source_owner_candidate_node_ids(
+    let mut candidate_node_ids = management_status_source_owner_candidate_node_ids(
         source,
         authoritative_source,
-        &missing_group_ids,
+        &groups_needing_owner_evidence,
     );
+    collect_source_grant_candidate_nodes_for_roots(
+        &mut candidate_node_ids,
+        source,
+        &groups_needing_owner_evidence,
+    );
+    collect_source_grant_candidate_nodes_for_roots(
+        &mut candidate_node_ids,
+        authoritative_source,
+        &groups_needing_owner_evidence,
+    );
+    collect_active_source_grant_candidate_nodes(&mut candidate_node_ids, source);
+    collect_active_source_grant_candidate_nodes(&mut candidate_node_ids, authoritative_source);
+    collect_sink_owner_candidate_nodes_from_snapshot(
+        &mut candidate_node_ids,
+        &sink,
+        &groups_needing_owner_evidence,
+    );
+    if let Some(node_id) = roots_put_control_target_node_id_for_ref_or_node(&origin_id.0) {
+        candidate_node_ids.insert(node_id);
+    }
     if candidate_node_ids.is_empty() {
         return sink;
     }
@@ -4266,7 +4650,13 @@ async fn augment_management_status_sink_with_owner_scoped_evidence(
                 summarize_sink_status_route_snapshot(&sink)
             );
         }
-        if sink_status_missing_authoritative_group_ids(&sink, &expected_group_ids).is_empty() {
+        if sink_status_groups_needing_owner_scoped_evidence(
+            &sink,
+            &expected_group_ids,
+            &source_runtime_scope_group_ids,
+        )
+        .is_empty()
+        {
             break;
         }
     }
@@ -4535,7 +4925,7 @@ pub async fn roots_put(
         previous_source_roots.len()
     );
     #[cfg(test)]
-    maybe_pause_roots_put_after_previous_source_roots().await;
+    maybe_pause_roots_put_after_previous_source_roots(&roots).await;
     let previous_grants = grants.clone();
     let previous_sink_roots = state
         .sink
@@ -4653,7 +5043,7 @@ pub async fn roots_put(
         initial_target_node_ids,
     );
     #[cfg(test)]
-    maybe_pause_roots_put_before_response().await;
+    maybe_pause_roots_put_before_response(&roots).await;
 
     Ok(Json(RootsUpdateResponse {
         roots_count: roots.len(),
@@ -7007,6 +7397,24 @@ async fn route_source_observability_snapshot(
     Ok((snapshot, runner_sets))
 }
 
+async fn route_source_observability_snapshot_until_first(
+    boundary: std::sync::Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    timeout: Duration,
+) -> Result<(SourceObservabilitySnapshot, BTreeMap<String, Vec<String>>), CnxError> {
+    let (snapshot, runner_sets, _per_origin, _origin_snapshots) =
+        route_source_observability_origin_snapshots_with_per_origin_debug_and_payload(
+            boundary,
+            origin_id,
+            timeout,
+            Duration::ZERO,
+            internal_status_request_payload(),
+            Some(1),
+        )
+        .await?;
+    Ok((snapshot, runner_sets))
+}
+
 async fn route_source_observability_snapshot_with_per_origin_debug(
     boundary: std::sync::Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
@@ -7960,7 +8368,7 @@ mod tests {
     use crate::api::rollout_status::{PublishedRolloutStatusReader, shared_rollout_status_cell};
     use crate::domain_state::FacadeServiceState;
     use crate::query::api::ProjectionPolicy;
-    use crate::runtime::routes::METHOD_SINK_STATUS;
+    use crate::runtime::routes::{METHOD_SINK_STATUS, sink_status_route_key_for};
     use crate::sink::SinkFileMeta;
     use crate::source::FSMetaSource;
     use crate::source::SourceStatusSnapshot;
@@ -7968,15 +8376,20 @@ mod tests {
     use crate::source::config::SourceConfig;
     use crate::source::{SourceConcreteRootHealthSnapshot, SourceLogicalRootHealthSnapshot};
     use crate::state::cell::SignalCell;
-    use crate::workers::sink::{SinkFacade, SinkFailure};
+    use crate::workers::sink::{SinkFacade, SinkFailure, SinkWorkerClientHandle};
     use crate::workers::source::SourceFacade;
     use crate::workers::source::SourceObservabilitySnapshot;
     use axum::Json;
     use axum::extract::State;
     use axum::http::{HeaderValue, StatusCode};
     use capanix_app_sdk::CnxError;
-    use capanix_app_sdk::runtime::{NodeId, in_memory_state_boundary};
+    use capanix_app_sdk::raw::{ChannelBoundary, StateBoundary};
+    use capanix_app_sdk::runtime::{
+        NodeId, RuntimeWorkerBinding, RuntimeWorkerLauncherKind, in_memory_state_boundary,
+    };
+    use capanix_app_sdk::worker::WorkerMode;
     use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
+    use capanix_runtime_entry_sdk::worker_runtime::RuntimeWorkerClientFactory;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex as StdMutex, RwLock};
     use tempfile::tempdir;
@@ -8041,6 +8454,33 @@ mod tests {
     struct NoopBoundary;
 
     impl ChannelIoSubset for NoopBoundary {}
+
+    struct WorkerUnavailableBoundary;
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for WorkerUnavailableBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            _request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            _request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            Err(CnxError::TransportClosed(
+                "synthetic worker unavailable".to_string(),
+            ))
+        }
+    }
+
+    impl ChannelBoundary for WorkerUnavailableBoundary {}
+
+    impl StateBoundary for WorkerUnavailableBoundary {}
 
     fn status_test_sink_group(
         group_id: &str,
@@ -8205,6 +8645,8 @@ mod tests {
     struct ManualRescanRouteBoundary {
         sent_routes: Arc<StdMutex<Vec<String>>>,
         denied_routes: BTreeSet<String>,
+        source_status_snapshot: Option<SourceObservabilitySnapshot>,
+        correlations_by_channel: StdMutex<BTreeMap<String, u64>>,
         last_correlation: StdMutex<Option<u64>>,
         reply_sent: StdMutex<bool>,
     }
@@ -8323,6 +8765,15 @@ mod tests {
     struct NodeScopedSinkStatusCollectBoundary {
         snapshots_by_request_channel: BTreeMap<String, (String, SinkStatusSnapshot)>,
         correlations_by_channel: StdMutex<std::collections::HashMap<String, u64>>,
+        correlation_notify: Notify,
+        recv_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
+        sent_routes: StdMutex<Vec<String>>,
+    }
+
+    struct SequencedNodeScopedSinkStatusCollectBoundary {
+        snapshots_by_request_channel: BTreeMap<String, Vec<(String, SinkStatusSnapshot)>>,
+        correlations_by_channel: StdMutex<std::collections::HashMap<String, u64>>,
+        correlation_notify: Notify,
         recv_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
         sent_routes: StdMutex<Vec<String>>,
     }
@@ -8417,6 +8868,7 @@ mod tests {
         source_status_payloads: Vec<(String, Vec<u8>)>,
         sink_status_payloads: Vec<(String, Vec<u8>)>,
         correlations_by_channel: StdMutex<std::collections::HashMap<String, u64>>,
+        correlation_notify: Notify,
         recv_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
     }
 
@@ -8428,6 +8880,7 @@ mod tests {
         source_status_payloads: Vec<(String, Vec<u8>)>,
         sink_status_payloads: Vec<(String, Vec<u8>)>,
         correlations_by_channel: StdMutex<std::collections::HashMap<String, u64>>,
+        correlation_notify: Notify,
         recv_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
         sequence: std::sync::atomic::AtomicUsize,
         source_recv_started_order: std::sync::atomic::AtomicUsize,
@@ -8596,6 +9049,10 @@ mod tests {
                 .first()
                 .and_then(|event| event.metadata().correlation_id)
             {
+                self.correlations_by_channel
+                    .lock()
+                    .expect("manual rescan correlations lock")
+                    .insert(route, correlation);
                 *self
                     .last_correlation
                     .lock()
@@ -8611,8 +9068,47 @@ mod tests {
         async fn channel_recv(
             &self,
             _ctx: BoundaryContext,
-            _request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
         ) -> capanix_app_sdk::Result<Vec<Event>> {
+            let request_channel = request
+                .channel_key
+                .0
+                .strip_suffix(":reply")
+                .unwrap_or(request.channel_key.0.as_str());
+            if request_channel.contains("source-status") {
+                let Some(snapshot) = self.source_status_snapshot.clone() else {
+                    return Err(CnxError::Timeout);
+                };
+                let correlation = self
+                    .correlations_by_channel
+                    .lock()
+                    .expect("manual rescan correlations lock")
+                    .get(request_channel)
+                    .copied()
+                    .or(*self
+                        .last_correlation
+                        .lock()
+                        .expect("manual rescan correlation lock"));
+                let Some(correlation) = correlation else {
+                    return Err(CnxError::Timeout);
+                };
+                return Ok(vec![source_status_event("node-a", correlation, snapshot)]);
+            }
+
+            let correlation = self
+                .correlations_by_channel
+                .lock()
+                .expect("manual rescan correlations lock")
+                .get(request_channel)
+                .copied()
+                .or(*self
+                    .last_correlation
+                    .lock()
+                    .expect("manual rescan correlation lock"));
+            let Some(correlation) = correlation else {
+                return Err(CnxError::Timeout);
+            };
+
             let mut reply_sent = self
                 .reply_sent
                 .lock()
@@ -8620,13 +9116,6 @@ mod tests {
             if *reply_sent {
                 return Err(CnxError::Timeout);
             }
-            let correlation = *self
-                .last_correlation
-                .lock()
-                .expect("manual rescan correlation lock");
-            let Some(correlation) = correlation else {
-                return Err(CnxError::Timeout);
-            };
             *reply_sent = true;
             Ok(vec![Event::new(
                 EventMetadata {
@@ -9487,6 +9976,7 @@ mod tests {
                     .lock()
                     .expect("node scoped sink-status correlations lock")
                     .insert(route, correlation);
+                self.correlation_notify.notify_waiters();
             }
             Ok(())
         }
@@ -9507,6 +9997,9 @@ mod tests {
             {
                 return Err(CnxError::Timeout);
             }
+            let correlation = self
+                .wait_for_sink_status_correlation(&request_channel)
+                .await;
             let first_recv = {
                 let mut recv_batches = self
                     .recv_batches_by_channel
@@ -9519,18 +10012,71 @@ mod tests {
             if !first_recv {
                 return Err(CnxError::Timeout);
             }
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("node scoped sink-status correlations lock")
-                .get(&request_channel)
-                .copied()
-                .unwrap_or(1);
             let (origin, snapshot) = self
                 .snapshots_by_request_channel
                 .get(&request_channel)
                 .expect("node scoped sink-status snapshot")
                 .clone();
+            Ok(vec![sink_status_event(&origin, correlation, snapshot)])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for SequencedNodeScopedSinkStatusCollectBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            let route = request.channel_key.0.clone();
+            self.sent_routes
+                .lock()
+                .expect("sequenced node scoped sink-status sent routes lock")
+                .push(route.clone());
+            if self.snapshots_by_request_channel.contains_key(&route)
+                && let Some(correlation) = request
+                    .events
+                    .first()
+                    .and_then(|event| event.metadata().correlation_id)
+            {
+                self.correlations_by_channel
+                    .lock()
+                    .expect("sequenced node scoped sink-status correlations lock")
+                    .insert(route, correlation);
+                self.correlation_notify.notify_waiters();
+            }
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            let reply_channel = request.channel_key.0;
+            let request_channel = reply_channel
+                .strip_suffix(":reply")
+                .unwrap_or(reply_channel.as_str())
+                .to_string();
+            let recv_count = {
+                let mut recv_batches = self
+                    .recv_batches_by_channel
+                    .lock()
+                    .expect("sequenced node scoped sink-status recv batches lock");
+                let recv_count = recv_batches.entry(reply_channel).or_default();
+                *recv_count += 1;
+                *recv_count
+            };
+            let Some(snapshots) = self.snapshots_by_request_channel.get(&request_channel) else {
+                return Err(CnxError::Timeout);
+            };
+            let Some((origin, snapshot)) = snapshots.get(recv_count.saturating_sub(1)).cloned()
+            else {
+                return Err(CnxError::Timeout);
+            };
+            let correlation = self
+                .wait_for_sink_status_correlation(&request_channel)
+                .await;
             Ok(vec![sink_status_event(&origin, correlation, snapshot)])
         }
     }
@@ -10239,7 +10785,23 @@ mod tests {
                     })
                     .collect(),
                 correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+                correlation_notify: Notify::new(),
                 recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        async fn wait_for_correlation(&self, request_channel: &str) -> u64 {
+            loop {
+                if let Some(correlation) = self
+                    .correlations_by_channel
+                    .lock()
+                    .expect("status remote reply correlations lock")
+                    .get(request_channel)
+                    .copied()
+                {
+                    return correlation;
+                }
+                self.correlation_notify.notified().await;
             }
         }
     }
@@ -10518,10 +11080,26 @@ mod tests {
                     })
                     .collect(),
                 correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+                correlation_notify: Notify::new(),
                 recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
                 sequence: std::sync::atomic::AtomicUsize::new(0),
                 source_recv_started_order: std::sync::atomic::AtomicUsize::new(0),
                 sink_recv_finished_order: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        async fn wait_for_correlation(&self, request_channel: &str) -> u64 {
+            loop {
+                if let Some(correlation) = self
+                    .correlations_by_channel
+                    .lock()
+                    .expect("status concurrent collect correlations lock")
+                    .get(request_channel)
+                    .copied()
+                {
+                    return correlation;
+                }
+                self.correlation_notify.notified().await;
             }
         }
     }
@@ -10554,6 +11132,40 @@ mod tests {
                     .correlations_by_channel
                     .lock()
                     .expect("status source-ready sink-stalled correlations lock")
+                    .get(request_channel)
+                    .copied()
+                {
+                    return correlation;
+                }
+                self.correlation_notify.notified().await;
+            }
+        }
+    }
+
+    impl NodeScopedSinkStatusCollectBoundary {
+        async fn wait_for_sink_status_correlation(&self, request_channel: &str) -> u64 {
+            loop {
+                if let Some(correlation) = self
+                    .correlations_by_channel
+                    .lock()
+                    .expect("node scoped sink-status correlations lock")
+                    .get(request_channel)
+                    .copied()
+                {
+                    return correlation;
+                }
+                self.correlation_notify.notified().await;
+            }
+        }
+    }
+
+    impl SequencedNodeScopedSinkStatusCollectBoundary {
+        async fn wait_for_sink_status_correlation(&self, request_channel: &str) -> u64 {
+            loop {
+                if let Some(correlation) = self
+                    .correlations_by_channel
+                    .lock()
+                    .expect("sequenced node scoped sink-status correlations lock")
                     .get(request_channel)
                     .copied()
                 {
@@ -10820,6 +11432,7 @@ mod tests {
                     .lock()
                     .expect("status remote reply correlations lock")
                     .insert(request.channel_key.0.clone(), correlation);
+                self.correlation_notify.notify_waiters();
             }
             Ok(())
         }
@@ -10829,28 +11442,25 @@ mod tests {
             _ctx: BoundaryContext,
             request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
         ) -> capanix_app_sdk::Result<Vec<Event>> {
-            let mut recv_batches = self
-                .recv_batches_by_channel
-                .lock()
-                .expect("status remote reply recv batches lock");
-            let recv_count = recv_batches
-                .entry(request.channel_key.0.clone())
-                .or_default();
-            *recv_count += 1;
-            let first_recv = *recv_count == 1;
-            drop(recv_batches);
+            let first_recv = {
+                let mut recv_batches = self
+                    .recv_batches_by_channel
+                    .lock()
+                    .expect("status remote reply recv batches lock");
+                let recv_count = recv_batches
+                    .entry(request.channel_key.0.clone())
+                    .or_default();
+                *recv_count += 1;
+                *recv_count == 1
+            };
 
             if request.channel_key.0 == self.source_reply_channel {
                 if !first_recv {
                     return Err(CnxError::Timeout);
                 }
                 let correlation = self
-                    .correlations_by_channel
-                    .lock()
-                    .expect("status remote reply correlations lock")
-                    .get(&self.source_request_channel)
-                    .copied()
-                    .unwrap_or(1);
+                    .wait_for_correlation(&self.source_request_channel)
+                    .await;
                 return Ok(self
                     .source_status_payloads
                     .iter()
@@ -10873,13 +11483,7 @@ mod tests {
                 if !first_recv {
                     return Err(CnxError::Timeout);
                 }
-                let correlation = self
-                    .correlations_by_channel
-                    .lock()
-                    .expect("status remote reply correlations lock")
-                    .get(&self.sink_request_channel)
-                    .copied()
-                    .unwrap_or(1);
+                let correlation = self.wait_for_correlation(&self.sink_request_channel).await;
                 return Ok(self
                     .sink_status_payloads
                     .iter()
@@ -10918,6 +11522,7 @@ mod tests {
                     .lock()
                     .expect("status concurrent collect correlations lock")
                     .insert(request.channel_key.0.clone(), correlation);
+                self.correlation_notify.notify_waiters();
             }
             Ok(())
         }
@@ -10950,13 +11555,7 @@ mod tests {
                     + 1;
                 self.sink_recv_finished_order
                     .store(finish_order, std::sync::atomic::Ordering::SeqCst);
-                let correlation = self
-                    .correlations_by_channel
-                    .lock()
-                    .expect("status concurrent collect correlations lock")
-                    .get(&self.sink_request_channel)
-                    .copied()
-                    .unwrap_or(1);
+                let correlation = self.wait_for_correlation(&self.sink_request_channel).await;
                 return Ok(self
                     .sink_status_payloads
                     .iter()
@@ -10987,12 +11586,8 @@ mod tests {
                 self.source_recv_started_order
                     .store(start_order, std::sync::atomic::Ordering::SeqCst);
                 let correlation = self
-                    .correlations_by_channel
-                    .lock()
-                    .expect("status concurrent collect correlations lock")
-                    .get(&self.source_request_channel)
-                    .copied()
-                    .unwrap_or(1);
+                    .wait_for_correlation(&self.source_request_channel)
+                    .await;
                 return Ok(self
                     .source_status_payloads
                     .iter()
@@ -12182,6 +12777,74 @@ mod tests {
         grant
     }
 
+    #[test]
+    fn short_budget_source_owner_fanin_only_opens_for_successful_partial_source_route() {
+        let roots = vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+        ];
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = roots;
+        authoritative.grants = vec![
+            grant_for_node_root("node-a", "nfs1"),
+            grant_for_node_root("node-b", "nfs2"),
+        ];
+        set_live_group_primary_source_root(&mut authoritative, "nfs1", "node-a");
+        set_live_group_primary_source_root(&mut authoritative, "nfs2", "node-b");
+        authoritative.source_primary_by_group = BTreeMap::from([
+            ("nfs1".to_string(), "node-a::nfs1".to_string()),
+            ("nfs2".to_string(), "node-b::nfs2".to_string()),
+        ]);
+        authoritative.scheduled_source_groups_by_node = BTreeMap::from([
+            ("node-a".to_string(), vec!["nfs1".to_string()]),
+            ("node-b".to_string(), vec!["nfs2".to_string()]),
+        ]);
+        authoritative.scheduled_scan_groups_by_node =
+            authoritative.scheduled_source_groups_by_node.clone();
+
+        let mut generic_partial = authoritative.clone();
+        generic_partial
+            .status
+            .logical_roots
+            .retain(|root| root.root_id == "nfs1");
+        generic_partial
+            .status
+            .concrete_roots
+            .retain(|root| root.logical_root_id == "nfs1");
+        generic_partial
+            .source_primary_by_group
+            .retain(|root_id, _| root_id == "nfs1");
+        generic_partial.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-a".to_string(), vec!["nfs1".to_string()])]);
+        generic_partial.scheduled_scan_groups_by_node =
+            generic_partial.scheduled_source_groups_by_node.clone();
+
+        assert!(
+            management_status_should_attempt_short_budget_source_owner_scoped_fanin(
+                StatusRouteOutcome::Ok,
+                &generic_partial,
+                &authoritative,
+            ),
+            "a successful but partial source-status route should permit source owner-scoped completion during Pending"
+        );
+        assert!(
+            !management_status_should_attempt_short_budget_source_owner_scoped_fanin(
+                StatusRouteOutcome::Timeout,
+                &generic_partial,
+                &authoritative,
+            ),
+            "timed-out source-status must keep Pending /status on the local route budget"
+        );
+        assert!(
+            !management_status_should_attempt_short_budget_source_owner_scoped_fanin(
+                StatusRouteOutcome::Ok,
+                &authoritative,
+                &authoritative,
+            ),
+            "complete source-status evidence must not trigger extra owner-scoped routes"
+        );
+    }
+
     #[tokio::test]
     async fn management_status_source_fanin_queries_owner_scoped_routes_when_generic_reply_is_partial()
      {
@@ -12648,6 +13311,7 @@ mod tests {
                 ("node-b".to_string(), node_b_sink),
             )]),
             correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlation_notify: Notify::new(),
             recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
             sent_routes: StdMutex::new(Vec::new()),
         });
@@ -12678,6 +13342,850 @@ mod tests {
                 .expect("sent sink routes lock")
                 .contains(&node_b_route),
             "missing nfs2 sink status must be requested from the current owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_status_sink_fanin_queries_owner_scoped_routes_when_generic_reply_has_zero_pending_primary_rows()
+     {
+        let roots = vec![
+            RootSpec::new("nfs1", "/mnt/nfs1"),
+            RootSpec::new("nfs2", "/mnt/nfs2"),
+        ];
+        let mut authoritative = local_source_snapshot();
+        authoritative.logical_roots = roots;
+        authoritative.grants = vec![
+            grant_for_node_root("node-c", "nfs1"),
+            grant_for_node_root("node-c", "nfs2"),
+        ];
+        set_live_group_primary_source_root(&mut authoritative, "nfs1", "node-c");
+        set_live_group_primary_source_root(&mut authoritative, "nfs2", "node-c");
+
+        let generic_zero_pending_sink = SinkStatusSnapshot {
+            primary_host_ref_by_group: BTreeMap::from([
+                ("nfs1".to_string(), "node-a".to_string()),
+                ("nfs2".to_string(), "node-a".to_string()),
+            ]),
+            groups: vec![
+                status_test_sink_group(
+                    "nfs1",
+                    "node-a::nfs1",
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+                status_test_sink_group(
+                    "nfs2",
+                    "node-a::nfs2",
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+        let node_a_sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            groups: vec![
+                status_test_sink_group("nfs1", "node-a::nfs1", GroupReadinessState::Ready, 1, 1),
+                status_test_sink_group("nfs2", "node-a::nfs2", GroupReadinessState::Ready, 1, 1),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let node_a_route = sink_status_route_bindings_for("node-a")
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("node-a sink-status route")
+            .0;
+        let boundary = Arc::new(NodeScopedSinkStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                node_a_route.clone(),
+                ("node-a".to_string(), node_a_sink),
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlation_notify: Notify::new(),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let augmented = augment_management_status_sink_with_owner_scoped_evidence(
+            generic_zero_pending_sink,
+            &authoritative,
+            &authoritative,
+            Some(boundary.clone()),
+            NodeId("node-c".to_string()),
+        )
+        .await;
+
+        let sent_routes = boundary
+            .sent_routes
+            .lock()
+            .expect("sent sink routes lock")
+            .clone();
+        assert!(
+            sent_routes.contains(&node_a_route),
+            "zero pending sink rows with primary refs must be requested from the sink owner; sent_routes={sent_routes:?}"
+        );
+        assert_eq!(
+            augmented.scheduled_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
+            "management /status must recover owner-scoped sink scheduling when deployment-scoped sink-status only has zero pending primary rows; sent_routes={sent_routes:?}"
+        );
+        assert!(
+            augmented
+                .groups
+                .iter()
+                .all(|group| matches!(group.readiness, GroupReadinessState::Ready)),
+            "owner-scoped sink-status must replace zero pending primary rows with materialized owner evidence"
+        );
+        assert!(
+            boundary
+                .sent_routes
+                .lock()
+                .expect("sent sink routes lock")
+                .contains(&node_a_route),
+            "zero pending sink rows with primary refs must be requested from the sink owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_status_sink_fanin_recovers_schedule_debug_for_pending_runtime_scope_with_stream_receipts()
+     {
+        let mut authoritative = local_source_snapshot();
+        authoritative.scheduled_source_groups_by_node.clear();
+        authoritative.scheduled_scan_groups_by_node.clear();
+        let generic_pending_sink_with_receipts = SinkStatusSnapshot {
+            received_events_by_node: BTreeMap::from([("node-a".to_string(), 6002)]),
+            received_control_events_by_node: BTreeMap::from([("node-a".to_string(), 2)]),
+            received_data_events_by_node: BTreeMap::from([("node-a".to_string(), 6000)]),
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::PendingMaterialization,
+                3000,
+                2999,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let node_a_sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            received_events_by_node: BTreeMap::from([("node-a".to_string(), 6002)]),
+            received_control_events_by_node: BTreeMap::from([("node-a".to_string(), 2)]),
+            received_data_events_by_node: BTreeMap::from([("node-a".to_string(), 6000)]),
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::PendingMaterialization,
+                3000,
+                2999,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let node_a_route = sink_status_route_bindings_for("node-a")
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("node-a sink-status route")
+            .0;
+        let boundary = Arc::new(NodeScopedSinkStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                node_a_route.clone(),
+                ("node-a".to_string(), node_a_sink),
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlation_notify: Notify::new(),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let augmented = augment_management_status_sink_with_owner_scoped_evidence(
+            generic_pending_sink_with_receipts,
+            &authoritative,
+            &authoritative,
+            Some(boundary.clone()),
+            NodeId("node-d".to_string()),
+        )
+        .await;
+
+        let sent_routes = boundary
+            .sent_routes
+            .lock()
+            .expect("sent sink routes lock")
+            .clone();
+        assert!(
+            sent_routes.contains(&node_a_route),
+            "pending materialization rows with stream receipts but missing schedule debug must still probe the runtime-scope sink owner; sent_routes={sent_routes:?}"
+        );
+        assert_eq!(
+            augmented.scheduled_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string()]),
+            "owner-scoped sink-status must recover scheduled_groups_by_node for control convergence diagnostics"
+        );
+        assert!(
+            augmented.groups.iter().all(|group| matches!(
+                group.readiness,
+                GroupReadinessState::PendingMaterialization
+            )),
+            "schedule debug fan-in must not promote pending materialization to ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_status_sink_fanin_uses_sink_reported_groups_when_source_authority_is_empty()
+    {
+        let mut source_without_root_authority = local_source_snapshot();
+        source_without_root_authority.logical_roots.clear();
+        source_without_root_authority.status.logical_roots.clear();
+        source_without_root_authority.status.concrete_roots.clear();
+        source_without_root_authority.grants = vec![grant_for_node_root("node-a", "nfs1")];
+
+        let generic_zero_pending_sink = SinkStatusSnapshot {
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::PendingMaterialization,
+                0,
+                0,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let node_a_sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::PendingMaterialization,
+                0,
+                0,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let node_a_route = sink_status_route_bindings_for("node-a")
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("node-a sink-status route")
+            .0;
+        let boundary = Arc::new(NodeScopedSinkStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                node_a_route.clone(),
+                ("node-a".to_string(), node_a_sink),
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlation_notify: Notify::new(),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let augmented = augment_management_status_sink_with_owner_scoped_evidence(
+            generic_zero_pending_sink,
+            &source_without_root_authority,
+            &source_without_root_authority,
+            Some(boundary.clone()),
+            NodeId("node-d".to_string()),
+        )
+        .await;
+
+        let sent_routes = boundary
+            .sent_routes
+            .lock()
+            .expect("sent sink routes lock")
+            .clone();
+        assert!(
+            sent_routes.contains(&node_a_route),
+            "management /status must use sink-reported group primary refs when source root authority has not populated yet; sent_routes={sent_routes:?}"
+        );
+        assert_eq!(
+            augmented.scheduled_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string()]),
+            "owner-scoped sink-status must recover sink scheduling from sink-reported groups while source authority is empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_status_sink_fanin_queries_owner_scoped_route_when_ready_local_sink_lacks_schedule_debug()
+     {
+        let authoritative = local_source_snapshot();
+        let ready_without_schedule = SinkStatusSnapshot {
+            live_nodes: 1,
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::Ready,
+                1,
+                1,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let node_a_sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::Ready,
+                1,
+                1,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let node_a_route = sink_status_route_bindings_for("node-a")
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("node-a sink-status route")
+            .0;
+        let boundary = Arc::new(NodeScopedSinkStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                node_a_route.clone(),
+                ("node-a".to_string(), node_a_sink),
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlation_notify: Notify::new(),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let augmented = augment_management_status_sink_with_owner_scoped_evidence(
+            ready_without_schedule,
+            &authoritative,
+            &authoritative,
+            Some(boundary.clone()),
+            NodeId("node-d".to_string()),
+        )
+        .await;
+
+        let sent_routes = boundary
+            .sent_routes
+            .lock()
+            .expect("sent sink routes lock")
+            .clone();
+        assert!(
+            sent_routes.contains(&node_a_route),
+            "ready local sink rows without schedule debug must still collect owner-scoped sink-status; sent_routes={sent_routes:?}"
+        );
+        assert_eq!(
+            augmented.scheduled_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string()]),
+            "owner-scoped sink-status must recover schedule debug for ready local sink rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_status_sink_fanin_queries_owner_scoped_route_when_ready_sink_lacks_all_debug_without_source_runtime_scope()
+     {
+        let mut authoritative = local_source_snapshot();
+        authoritative.scheduled_source_groups_by_node.clear();
+        authoritative.scheduled_scan_groups_by_node.clear();
+        authoritative.last_control_frame_signals_by_node.clear();
+        let ready_without_debug = SinkStatusSnapshot {
+            live_nodes: 1,
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::Ready,
+                1,
+                1,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let node_a_sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::Ready,
+                1,
+                1,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let node_a_route = sink_status_route_bindings_for("node-a")
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("node-a sink-status route")
+            .0;
+        let boundary = Arc::new(NodeScopedSinkStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                node_a_route.clone(),
+                ("node-a".to_string(), node_a_sink),
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlation_notify: Notify::new(),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let augmented = augment_management_status_sink_with_owner_scoped_evidence(
+            ready_without_debug,
+            &authoritative,
+            &authoritative,
+            Some(boundary.clone()),
+            NodeId("node-d".to_string()),
+        )
+        .await;
+
+        let sent_routes = boundary
+            .sent_routes
+            .lock()
+            .expect("sent sink routes lock")
+            .clone();
+        assert!(
+            sent_routes.contains(&node_a_route),
+            "ready sink rows without any ingress debug must collect owner-scoped sink-status even when source runtime-scope debug is absent; sent_routes={sent_routes:?}"
+        );
+        assert_eq!(
+            augmented.scheduled_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string()]),
+            "owner-scoped sink-status must recover schedule debug for ready sink rows whose facade status lost all ingress debug"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_status_sink_fanin_queries_origin_route_when_source_owner_is_not_sink_owner()
+    {
+        let mut authoritative = local_source_snapshot();
+        authoritative.source_primary_by_group =
+            BTreeMap::from([("nfs1".to_string(), "node-c".to_string())]);
+        authoritative.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-c".to_string(), vec!["nfs1".to_string()])]);
+        authoritative.scheduled_scan_groups_by_node =
+            authoritative.scheduled_source_groups_by_node.clone();
+        authoritative.logical_roots.clear();
+        let ready_without_debug = SinkStatusSnapshot {
+            live_nodes: 1,
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::Ready,
+                1,
+                1,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let node_a_sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::Ready,
+                1,
+                1,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let node_a_route = sink_status_route_bindings_for("node-a")
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("node-a sink-status route")
+            .0;
+        let boundary = Arc::new(NodeScopedSinkStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                node_a_route.clone(),
+                ("node-a".to_string(), node_a_sink),
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlation_notify: Notify::new(),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let augmented = augment_management_status_sink_with_owner_scoped_evidence(
+            ready_without_debug,
+            &authoritative,
+            &authoritative,
+            Some(boundary.clone()),
+            NodeId("node-a".to_string()),
+        )
+        .await;
+
+        let sent_routes = boundary
+            .sent_routes
+            .lock()
+            .expect("sent sink routes lock")
+            .clone();
+        assert!(
+            sent_routes.contains(&node_a_route),
+            "missing sink schedule debug must probe the serving node's sink-status route when source owner evidence points elsewhere; sent_routes={sent_routes:?}"
+        );
+        assert_eq!(
+            augmented.scheduled_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string()]),
+            "origin-scoped sink-status must recover sink scheduling when source owner is not the sink owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_status_sink_fanin_does_not_parse_group_primary_ref_when_debug_primary_map_is_missing()
+     {
+        let mut source = local_source_snapshot();
+        source.logical_roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+        source.grants = vec![grant_for_node_root("node-c", "nfs1")];
+        source.source_primary_by_group =
+            BTreeMap::from([("nfs1".to_string(), "node-c".to_string())]);
+        source.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-c".to_string(), vec!["nfs1".to_string()])]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+        source.status.concrete_roots.clear();
+
+        let generic_sink_without_debug_primary = SinkStatusSnapshot {
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::PendingMaterialization,
+                0,
+                0,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let node_a_sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::Ready,
+                1,
+                1,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let node_a_route = sink_status_route_bindings_for("node-a")
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("node-a sink-status route")
+            .0;
+        let boundary = Arc::new(NodeScopedSinkStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                node_a_route.clone(),
+                ("node-a".to_string(), node_a_sink),
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlation_notify: Notify::new(),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let augmented = augment_management_status_sink_with_owner_scoped_evidence(
+            generic_sink_without_debug_primary,
+            &source,
+            &source,
+            Some(boundary.clone()),
+            NodeId("node-d".to_string()),
+        )
+        .await;
+
+        let sent_routes = boundary
+            .sent_routes
+            .lock()
+            .expect("sent sink routes lock")
+            .clone();
+        assert!(
+            !sent_routes.contains(&node_a_route),
+            "management /status must not infer sink owner routing by parsing group primary_object_ref; sent_routes={sent_routes:?}"
+        );
+        assert_eq!(
+            augmented.scheduled_groups_by_node.get("node-a"),
+            None,
+            "owner-scoped sink-status requires explicit primary_host_ref_by_group or schedule evidence, not object-ref parsing"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_status_sink_fanin_uses_grant_object_ref_route_owner_when_host_ref_is_stable()
+     {
+        let route_node_a = "node-a-29848035259058472045510657";
+        let mut source = local_source_snapshot();
+        source.logical_roots = vec![RootSpec::new("nfs1", "/mnt/nfs1")];
+        let mut node_a_grant = granted_mount_root(
+            &format!("{route_node_a}::nfs1"),
+            std::path::Path::new("/mnt/nfs1"),
+        );
+        node_a_grant.host_ref = "node-a".to_string();
+        source.grants = vec![node_a_grant];
+        source.source_primary_by_group =
+            BTreeMap::from([("nfs1".to_string(), "node-c::nfs1".to_string())]);
+        source.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-c".to_string(), vec!["nfs1".to_string()])]);
+        source.scheduled_scan_groups_by_node = source.scheduled_source_groups_by_node.clone();
+
+        let generic_sink_with_stable_domain_primary = SinkStatusSnapshot {
+            primary_host_ref_by_group: BTreeMap::from([("nfs1".to_string(), "node-a".to_string())]),
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                "node-a::nfs1",
+                GroupReadinessState::PendingMaterialization,
+                0,
+                0,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+        let node_a_sink = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                route_node_a.to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                route_node_a.to_string(),
+                vec![format!(
+                    "activate unit=runtime.exec.sink route={}.req generation=1779081548622 scopes=[\"nfs1=>nfs1\"]",
+                    sink_status_route_key_for(route_node_a)
+                )],
+            )]),
+            groups: vec![status_test_sink_group(
+                "nfs1",
+                &format!("{route_node_a}::nfs1"),
+                GroupReadinessState::PendingMaterialization,
+                0,
+                0,
+            )],
+            ..SinkStatusSnapshot::default()
+        };
+
+        let route_node_a_route = sink_status_route_bindings_for(route_node_a)
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("route-scoped node-a sink-status route")
+            .0;
+        let boundary = Arc::new(NodeScopedSinkStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                route_node_a_route.clone(),
+                (route_node_a.to_string(), node_a_sink),
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlation_notify: Notify::new(),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let augmented = augment_management_status_sink_with_owner_scoped_evidence(
+            generic_sink_with_stable_domain_primary,
+            &source,
+            &source,
+            Some(boundary.clone()),
+            NodeId("node-d".to_string()),
+        )
+        .await;
+
+        let sent_routes = boundary
+            .sent_routes
+            .lock()
+            .expect("sent sink routes lock")
+            .clone();
+        assert!(
+            sent_routes.contains(&route_node_a_route),
+            "stable host_ref node-a must not hide the actual route owner from object_ref; sent_routes={sent_routes:?}"
+        );
+        assert_eq!(
+            augmented.scheduled_groups_by_node.get(route_node_a),
+            Some(&vec!["nfs1".to_string()]),
+            "owner-scoped sink-status must recover real schedule evidence from the actual route-scoped owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_scoped_sink_status_collect_merges_late_owner_reply_after_empty_facade_reply() {
+        let empty_facade_reply = SinkStatusSnapshot::default();
+        let owner_reply = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            groups: vec![
+                status_test_sink_group("nfs1", "node-a::nfs1", GroupReadinessState::Ready, 1, 1),
+                status_test_sink_group("nfs2", "node-a::nfs2", GroupReadinessState::Ready, 1, 1),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+        let node_a_route = sink_status_route_bindings_for("node-a")
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("node-a sink-status route")
+            .0;
+        let boundary = Arc::new(SequencedNodeScopedSinkStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                node_a_route.clone(),
+                vec![
+                    ("node-a".to_string(), empty_facade_reply),
+                    ("node-a".to_string(), owner_reply),
+                ],
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlation_notify: Notify::new(),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let snapshot = collect_node_scoped_status_sink_snapshot(
+            boundary.clone(),
+            NodeId("node-c".to_string()),
+            STATUS_ROUTE_TIMEOUT,
+            "node-a",
+        )
+        .await
+        .expect("node-scoped sink-status collection");
+
+        assert!(
+            boundary
+                .sent_routes
+                .lock()
+                .expect("sequenced sent routes lock")
+                .contains(&node_a_route),
+            "owner-scoped sink-status must be requested from the node-a route"
+        );
+        assert_eq!(
+            snapshot.scheduled_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
+            "node-scoped sink-status collection must not settle on the first empty facade reply when a same-route worker owner reply follows: {snapshot:?}"
+        );
+        assert!(
+            snapshot
+                .groups
+                .iter()
+                .all(|group| matches!(group.readiness, GroupReadinessState::Ready)),
+            "late owner reply must provide the materialized sink group rows: {snapshot:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_scoped_sink_status_collect_merges_late_owner_reply_after_scheduleless_group_reply()
+     {
+        let scheduleless_group_reply = SinkStatusSnapshot {
+            groups: vec![
+                status_test_sink_group(
+                    "nfs1",
+                    "node-a::nfs1",
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+                status_test_sink_group(
+                    "nfs2",
+                    "node-a::nfs2",
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+        let owner_reply = SinkStatusSnapshot {
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            groups: vec![
+                status_test_sink_group(
+                    "nfs1",
+                    "node-a::nfs1",
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+                status_test_sink_group(
+                    "nfs2",
+                    "node-a::nfs2",
+                    GroupReadinessState::PendingMaterialization,
+                    0,
+                    0,
+                ),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+        let node_a_route = sink_status_route_bindings_for("node-a")
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+            .expect("node-a sink-status route")
+            .0;
+        let boundary = Arc::new(SequencedNodeScopedSinkStatusCollectBoundary {
+            snapshots_by_request_channel: BTreeMap::from([(
+                node_a_route.clone(),
+                vec![
+                    ("node-a".to_string(), scheduleless_group_reply),
+                    ("node-a".to_string(), owner_reply),
+                ],
+            )]),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlation_notify: Notify::new(),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            sent_routes: StdMutex::new(Vec::new()),
+        });
+
+        let snapshot = collect_node_scoped_status_sink_snapshot(
+            boundary.clone(),
+            NodeId("node-c".to_string()),
+            STATUS_ROUTE_TIMEOUT,
+            "node-a",
+        )
+        .await
+        .expect("node-scoped sink-status collection");
+
+        assert!(
+            boundary
+                .sent_routes
+                .lock()
+                .expect("sequenced sent routes lock")
+                .contains(&node_a_route),
+            "owner-scoped sink-status must be requested from the node-a route"
+        );
+        assert_eq!(
+            snapshot.scheduled_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
+            "node-scoped sink-status collection must not settle on an early scheduleless group reply when a same-route owner reply follows: {snapshot:?}"
+        );
+        assert_eq!(
+            snapshot.last_control_frame_signals_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
+            "late owner reply must provide real control-frame evidence instead of deriving readiness from group rows: {snapshot:?}"
         );
     }
 
@@ -12818,6 +14326,113 @@ mod tests {
             summarized_path_origin_counts_by_node: BTreeMap::new(),
             published_path_origin_counts_by_node: BTreeMap::new(),
         }
+    }
+
+    fn manual_rescan_source_status_snapshot_for_current_active_grants(
+        roots: &[RootSpec],
+        grants: &[GrantedMountRoot],
+    ) -> SourceObservabilitySnapshot {
+        let target_node_ids = active_source_rescan_node_ids_from_current_roots(roots, grants);
+        let mut source = local_source_snapshot();
+        let concrete_root_template = source
+            .status
+            .concrete_roots
+            .first()
+            .cloned()
+            .expect("source fixture concrete root");
+        source.grants = grants.to_vec();
+        source.logical_roots = roots.to_vec();
+        source.status.logical_roots = roots
+            .iter()
+            .map(|root| {
+                let active_members = grants
+                    .iter()
+                    .filter(|grant| grant.active && root.selector.matches(grant))
+                    .count();
+                SourceLogicalRootHealthSnapshot {
+                    root_id: root.id.clone(),
+                    status: "healthy".to_string(),
+                    matched_grants: active_members,
+                    active_members,
+                    coverage_mode: "realtime_hotset_plus_audit".to_string(),
+                }
+            })
+            .collect();
+        source.status.concrete_roots.clear();
+        source.source_primary_by_group.clear();
+        source.scheduled_source_groups_by_node.clear();
+        source.scheduled_scan_groups_by_node.clear();
+        source.last_control_frame_signals_by_node.clear();
+
+        for root in roots {
+            for grant in grants
+                .iter()
+                .filter(|grant| grant.active && root.selector.matches(grant))
+            {
+                let Some(node_id) = source_node_id_from_grant(grant) else {
+                    continue;
+                };
+                if !target_node_ids.contains(&node_id) {
+                    continue;
+                }
+                let mut concrete_root = concrete_root_template.clone();
+                concrete_root.root_key = format!("{}@{}", root.id, node_id);
+                concrete_root.logical_root_id = root.id.clone();
+                concrete_root.object_ref = grant.object_ref.clone();
+                concrete_root.status = "healthy".to_string();
+                concrete_root.coverage_mode = "realtime_hotset_plus_audit".to_string();
+                concrete_root.watch_enabled = true;
+                concrete_root.scan_enabled = true;
+                concrete_root.is_group_primary = true;
+                concrete_root.active = true;
+                concrete_root.last_error = None;
+                source.status.concrete_roots.push(concrete_root);
+                source
+                    .source_primary_by_group
+                    .entry(root.id.clone())
+                    .or_insert_with(|| grant.object_ref.clone());
+                source
+                    .scheduled_source_groups_by_node
+                    .entry(node_id.clone())
+                    .or_default()
+                    .push(root.id.clone());
+                source
+                    .scheduled_scan_groups_by_node
+                    .entry(node_id)
+                    .or_default()
+                    .push(root.id.clone());
+            }
+        }
+
+        for groups in source
+            .scheduled_source_groups_by_node
+            .values_mut()
+            .chain(source.scheduled_scan_groups_by_node.values_mut())
+        {
+            groups.sort();
+            groups.dedup();
+        }
+
+        let scheduled_scan_groups_by_node = source.scheduled_scan_groups_by_node.clone();
+        for (node_id, groups) in scheduled_scan_groups_by_node {
+            let scopes = groups
+                .iter()
+                .map(|group| format!("\"{group}=>{group}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            source
+                .last_control_frame_signals_by_node
+                .entry(node_id.clone())
+                .or_default()
+                .push(format!(
+                    "activate unit=runtime.exec.source route={}.req generation=1777500012000 scopes=[{}]",
+                    source_rescan_route_key_for(&node_id),
+                    scopes
+                ));
+            annotate_manual_rescan_route_receivable_evidence(&mut source, &NodeId(node_id));
+        }
+
+        source
     }
 
     fn local_sink_snapshot() -> SinkStatusSnapshot {
@@ -13025,12 +14640,8 @@ mod tests {
     #[test]
     fn status_local_ready_evidence_completes_management_status_without_route_debug_maps() {
         let mut local_source = local_source_snapshot();
-        local_source.scheduled_source_groups_by_node = BTreeMap::from([(
-            "node-a".to_string(),
-            vec!["nfs1".to_string(), "nfs2".to_string()],
-        )]);
-        local_source.scheduled_scan_groups_by_node =
-            local_source.scheduled_source_groups_by_node.clone();
+        local_source.scheduled_source_groups_by_node.clear();
+        local_source.scheduled_scan_groups_by_node.clear();
         local_source.last_control_frame_signals_by_node.clear();
         let local_sink = local_sink_snapshot();
 
@@ -13045,6 +14656,67 @@ mod tests {
                 false
             ),
             "complete source root-health plus ready/live sink groups should let steady /status skip optional remote route debug fan-in"
+        );
+    }
+
+    #[test]
+    fn status_local_ready_evidence_keeps_remote_fanin_open_when_sink_schedule_is_absent() {
+        let mut local_source = local_source_snapshot();
+        local_source.scheduled_source_groups_by_node.clear();
+        local_source.scheduled_scan_groups_by_node.clear();
+        local_source.last_control_frame_signals_by_node.clear();
+        let mut local_sink = local_sink_snapshot();
+        local_sink.scheduled_groups_by_node.clear();
+
+        assert!(
+            source_observability_snapshot_debug_maps_absent(&local_source),
+            "fixture must keep source runtime route-debug maps absent"
+        );
+        assert!(
+            local_sink_covers_active_source_groups(&local_sink, &local_source),
+            "fixture must keep source health and live sink groups complete"
+        );
+        assert!(
+            !local_sink_has_schedule_evidence_for_active_source_groups(&local_sink, &local_source),
+            "fixture must expose missing sink schedule evidence for ready groups"
+        );
+        assert!(
+            !status_local_ready_evidence_completes_management_status(
+                &local_sink,
+                &local_source,
+                false
+            ),
+            "management /status must keep remote fan-in open until sink schedule debug covers ready source groups"
+        );
+    }
+
+    #[test]
+    fn status_local_ready_evidence_keeps_remote_fanin_open_when_runtime_scope_lacks_sink_schedule()
+    {
+        let mut local_source = local_source_snapshot();
+        local_source.scheduled_source_groups_by_node =
+            BTreeMap::from([("node-a".to_string(), vec!["nfs1".to_string()])]);
+        local_source.scheduled_scan_groups_by_node =
+            local_source.scheduled_source_groups_by_node.clone();
+        let mut local_sink = local_sink_snapshot();
+        local_sink.scheduled_groups_by_node =
+            BTreeMap::from([("node-d".to_string(), vec!["nfs1".to_string()])]);
+
+        assert!(
+            local_sink_covers_active_source_groups(&local_sink, &local_source),
+            "fixture must keep domain root-health and live sink coverage complete"
+        );
+        assert!(
+            !local_sink_schedule_covers_source_runtime_scope(&local_sink, &local_source),
+            "fixture must expose missing node-a sink scheduling evidence"
+        );
+        assert!(
+            !status_local_ready_evidence_completes_management_status(
+                &local_sink,
+                &local_source,
+                false
+            ),
+            "management /status must keep remote fan-in open until sink scheduling evidence covers source runtime scope by node"
         );
     }
 
@@ -13429,17 +15101,17 @@ mod tests {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        assert_eq!(
-            sent_routes,
-            vec![
-                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
-                format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
-                format!("{}.stream", source_roots_control_route_key_for("node-a")),
-                format!("{}.stream", sink_roots_control_route_key_for("node-a")),
-                format!("{}.stream", source_roots_control_route_key_for("node-b")),
-                format!("{}.stream", sink_roots_control_route_key_for("node-b")),
-            ],
-            "roots_put must broadcast the generic logical-roots control second wave, replay it onto the local scoped control routes, and include grant-derived peer scoped routes so distributed empty-roots apply reaches remote source/sink realizations before source-status discovery catches up"
+        let expected_roots_control_routes = vec![
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+            format!("{}.stream", source_roots_control_route_key_for("node-a")),
+            format!("{}.stream", sink_roots_control_route_key_for("node-a")),
+            format!("{}.stream", source_roots_control_route_key_for("node-b")),
+            format!("{}.stream", sink_roots_control_route_key_for("node-b")),
+        ];
+        assert!(
+            sent_routes.starts_with(&expected_roots_control_routes),
+            "roots_put must broadcast the generic logical-roots control second wave, replay it onto the local scoped control routes, and include grant-derived peer scoped routes before source-status followup; expected prefix={expected_roots_control_routes:?} actual={sent_routes:?}"
         );
         let sent_unit_ids = match sent_unit_ids.lock() {
             Ok(guard) => guard.clone(),
@@ -13942,11 +15614,13 @@ mod tests {
         };
         let headers = management_headers(auth.as_ref());
 
+        let _roots_put_hook_serial = roots_put_hook_test_guard().await;
         let response_entered = Arc::new(Notify::new());
         let response_release = Arc::new(Notify::new());
         install_roots_put_before_response_hook(RootsPutBeforeResponseHook {
             entered: response_entered.clone(),
             release: response_release.clone(),
+            selector_token: Some(nfs1.display().to_string()),
         });
         struct RootsPutBeforeResponseHookReset;
         impl Drop for RootsPutBeforeResponseHookReset {
@@ -15677,6 +17351,13 @@ mod tests {
         let boundary = Arc::new(ManualRescanRouteBoundary {
             sent_routes: sent_routes.clone(),
             denied_routes: BTreeSet::new(),
+            source_status_snapshot: Some(
+                manual_rescan_source_status_snapshot_for_current_active_grants(
+                    &source_cfg.roots,
+                    &source_cfg.host_object_grants,
+                ),
+            ),
+            correlations_by_channel: StdMutex::new(BTreeMap::new()),
             last_correlation: StdMutex::new(None),
             reply_sent: StdMutex::new(false),
         });
@@ -15719,9 +17400,13 @@ mod tests {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        assert_eq!(
-            sent_routes,
-            vec![format!("{}.req", source_rescan_route_key_for("node-a"))]
+        assert!(
+            sent_routes.contains(&format!("{}.req", source_rescan_route_key_for("node-a"))),
+            "runtime-boundary rescan must deliver on the scoped source route: sent_routes={sent_routes:?}"
+        );
+        assert!(
+            !sent_routes.contains(&format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)),
+            "scoped runtime delivery must not publish a duplicate generic manual-rescan control stream: sent_routes={sent_routes:?}"
         );
     }
 
@@ -15774,6 +17459,13 @@ mod tests {
         let boundary = Arc::new(ManualRescanRouteBoundary {
             sent_routes: sent_routes.clone(),
             denied_routes: BTreeSet::from([generic_source_rescan_route.clone()]),
+            source_status_snapshot: Some(
+                manual_rescan_source_status_snapshot_for_current_active_grants(
+                    &source_cfg.roots,
+                    &source_cfg.host_object_grants,
+                ),
+            ),
+            correlations_by_channel: StdMutex::new(BTreeMap::new()),
             last_correlation: StdMutex::new(None),
             reply_sent: StdMutex::new(false),
         });
@@ -15878,6 +17570,14 @@ mod tests {
             .expect("source"),
         );
         let source = Arc::new(SourceFacade::local(source_runtime.clone()));
+        let mut source_status_snapshot =
+            manual_rescan_source_status_snapshot_for_current_active_grants(
+                &source_cfg.roots,
+                &source_cfg.host_object_grants,
+            );
+        set_live_group_primary_source_root(&mut source_status_snapshot, "nfs1", "node-b");
+        source_status_snapshot.source_primary_by_group =
+            BTreeMap::from([("nfs1".to_string(), "node-b::nfs1".to_string())]);
         let sink = Arc::new(SinkFacade::local(Arc::new(
             SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg).expect("sink"),
         )));
@@ -15886,6 +17586,8 @@ mod tests {
         let boundary = Arc::new(ManualRescanRouteBoundary {
             sent_routes: sent_routes.clone(),
             denied_routes: BTreeSet::from([stale_node_b_route.clone()]),
+            source_status_snapshot: Some(source_status_snapshot),
+            correlations_by_channel: StdMutex::new(BTreeMap::new()),
             last_correlation: StdMutex::new(None),
             reply_sent: StdMutex::new(false),
         });
@@ -17210,6 +18912,8 @@ mod tests {
         let boundary = Arc::new(ManualRescanRouteBoundary {
             sent_routes: sent_routes.clone(),
             denied_routes: BTreeSet::new(),
+            source_status_snapshot: None,
+            correlations_by_channel: StdMutex::new(BTreeMap::new()),
             last_correlation: StdMutex::new(None),
             reply_sent: StdMutex::new(false),
         });
@@ -17694,7 +19398,7 @@ mod tests {
         node_b_grant.host_name = Some("node-b".to_string());
         let source_cfg = SourceConfig {
             roots: vec![root],
-            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1), node_b_grant],
+            host_object_grants: vec![node_b_grant],
             ..SourceConfig::default()
         };
         let state_boundary = in_memory_state_boundary();
@@ -17708,6 +19412,10 @@ mod tests {
             .expect("source"),
         );
         let source = Arc::new(SourceFacade::local(source_runtime.clone()));
+        let source_status_snapshot = manual_rescan_source_status_snapshot_for_current_active_grants(
+            &source_cfg.roots,
+            &source_cfg.host_object_grants,
+        );
         let sink = Arc::new(SinkFacade::local(Arc::new(
             SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg).expect("sink"),
         )));
@@ -17716,6 +19424,8 @@ mod tests {
         let boundary = Arc::new(ManualRescanRouteBoundary {
             sent_routes: sent_routes.clone(),
             denied_routes: BTreeSet::from([node_b_scoped_rescan_route.clone()]),
+            source_status_snapshot: Some(source_status_snapshot),
+            correlations_by_channel: StdMutex::new(BTreeMap::new()),
             last_correlation: StdMutex::new(None),
             reply_sent: StdMutex::new(false),
         });
@@ -17842,6 +19552,8 @@ mod tests {
         let runtime_boundary = Arc::new(ManualRescanRouteBoundary {
             sent_routes: sent_routes.clone(),
             denied_routes: BTreeSet::from([node_e_scoped_rescan_route.clone()]),
+            source_status_snapshot: None,
+            correlations_by_channel: StdMutex::new(BTreeMap::new()),
             last_correlation: StdMutex::new(None),
             reply_sent: StdMutex::new(false),
         });
@@ -22605,6 +24317,8 @@ mod tests {
         let boundary = Arc::new(ManualRescanRouteBoundary {
             sent_routes: sent_routes.clone(),
             denied_routes: BTreeSet::from([format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)]),
+            source_status_snapshot: None,
+            correlations_by_channel: StdMutex::new(BTreeMap::new()),
             last_correlation: StdMutex::new(None),
             reply_sent: StdMutex::new(false),
         });
@@ -23087,6 +24801,7 @@ mod tests {
                 boundary.clone(),
                 NodeId("node-a".into()),
                 None,
+                false,
             )
             .await;
 
@@ -23111,35 +24826,27 @@ mod tests {
     #[tokio::test]
     async fn status_shared_boundary_does_not_wait_full_sink_timeout_after_source_ready_and_local_sink_covers()
      {
-        tokio::time::pause();
-
         let boundary = Arc::new(StatusSourceReadySinkStalledBoundary::new(
             local_source_snapshot(),
         ));
-        let task_boundary = boundary.clone();
-        let task = tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        let (sink, source, _runner_sets, sink_outcome, source_outcome) =
             collect_remote_status_snapshots_on_shared_boundary(
                 local_sink_snapshot(),
                 local_source_snapshot(),
-                task_boundary,
+                boundary.clone(),
                 NodeId("node-a".into()),
                 None,
+                false,
             )
-            .await
-        });
-
-        tokio::task::yield_now().await;
-        tokio::time::advance(STATUS_ROUTE_READY_FALLBACK_GRACE + Duration::from_millis(50)).await;
-        tokio::task::yield_now().await;
-
+            .await;
+        let elapsed = started.elapsed();
         assert!(
-            task.is_finished(),
-            "source-ready status fan-in should use local ready sink evidence for a stalled sink route instead of waiting for the full sink route timeout"
+            elapsed < STATUS_ROUTE_TIMEOUT,
+            "source-ready status fan-in should use local ready sink evidence for a stalled sink route instead of waiting for the full sink route timeout: elapsed={elapsed:?}"
         );
-        let (sink, source, _runner_sets, sink_outcome, source_outcome) =
-            task.await.expect("status fan-in join");
 
-        assert_eq!(source_outcome, StatusRouteOutcome::Timeout);
+        assert_eq!(source_outcome, StatusRouteOutcome::Ok);
         assert_eq!(sink_outcome, StatusRouteOutcome::Timeout);
         assert_eq!(sink.groups.len(), 1);
         assert_eq!(
@@ -23148,10 +24855,10 @@ mod tests {
         );
         assert!(
             boundary
-                .sink_send_count
+                .sink_recv_count
                 .load(std::sync::atomic::Ordering::SeqCst)
                 > 0,
-            "fixture must prove the sink route was attempted before local fallback"
+            "fixture must prove the sink route collection was attempted before local fallback"
         );
     }
 
@@ -23171,6 +24878,7 @@ mod tests {
                 boundary,
                 NodeId("node-a".into()),
                 None,
+                false,
             )
             .await
         });
@@ -26123,6 +27831,145 @@ mod tests {
         assert_eq!(
             response.sink.debug.scheduled_groups_by_node.get("node-b"),
             Some(&vec!["nfs1".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn status_worker_sink_cached_fallback_still_uses_remote_fanin_before_not_ready() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let roots = vec![RootSpec::new("nfs1", &nfs1), RootSpec::new("nfs2", &nfs2)];
+        let grants = vec![
+            granted_mount_root("node-a::nfs1", &nfs1),
+            granted_mount_root("node-a::nfs2", &nfs2),
+        ];
+        let source_cfg = SourceConfig {
+            roots: roots.clone(),
+            host_object_grants: grants.clone(),
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let worker_boundary = Arc::new(WorkerUnavailableBoundary);
+        let worker_socket_dir = tmp.path().join("worker-sockets");
+        std::fs::create_dir_all(&worker_socket_dir).expect("create worker socket dir");
+        let worker_binding = RuntimeWorkerBinding {
+            role_id: "sink".to_string(),
+            mode: WorkerMode::External,
+            launcher_kind: RuntimeWorkerLauncherKind::WorkerHost,
+            module_path: Some(tmp.path().join("missing-worker-module.so")),
+            socket_dir: Some(worker_socket_dir),
+        };
+        let worker_factory = RuntimeWorkerClientFactory::new(
+            worker_boundary.clone(),
+            worker_boundary,
+            in_memory_state_boundary(),
+        );
+        let sink = Arc::new(SinkFacade::worker(Arc::new(
+            SinkWorkerClientHandle::new(
+                NodeId("node-a".to_string()),
+                source_cfg,
+                worker_binding,
+                worker_factory,
+            )
+            .expect("construct sink worker client"),
+        )));
+
+        let mut remote_source = local_source_snapshot();
+        remote_source.logical_roots = roots;
+        remote_source.grants = vec![
+            grant_for_node_root("node-a", "nfs1"),
+            grant_for_node_root("node-a", "nfs2"),
+        ];
+        remote_source.source_primary_by_group = BTreeMap::from([
+            ("nfs1".to_string(), "node-a::nfs1".to_string()),
+            ("nfs2".to_string(), "node-a::nfs2".to_string()),
+        ]);
+        remote_source.scheduled_source_groups_by_node = BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]);
+        remote_source.scheduled_scan_groups_by_node =
+            remote_source.scheduled_source_groups_by_node.clone();
+        set_live_group_primary_source_root(&mut remote_source, "nfs1", "node-a");
+        set_live_group_primary_source_root(&mut remote_source, "nfs2", "node-a");
+
+        let remote_sink = SinkStatusSnapshot {
+            live_nodes: 2,
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            groups: vec![
+                status_test_sink_group("nfs1", "node-a::nfs1", GroupReadinessState::Ready, 1, 1),
+                status_test_sink_group("nfs2", "node-a::nfs2", GroupReadinessState::Ready, 1, 1),
+            ],
+            ..SinkStatusSnapshot::default()
+        };
+        let runtime_boundary = Arc::new(StatusRemoteReplyBoundary::new(
+            vec![(
+                "node-a-29776275144172679041384449".to_string(),
+                remote_source,
+            )],
+            vec![("node-a-29776275144172679041384449".to_string(), remote_sink)],
+        ));
+        let headers = management_headers(auth.as_ref());
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(runtime_boundary),
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            published_facade_status: PublishedFacadeStatusReader::new(
+                shared_facade_service_state_cell(),
+                shared_facade_pending_status_cell(),
+            ),
+            published_rollout_status: test_published_rollout_status_reader(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
+        };
+
+        let response = status(State(state), headers)
+            .await
+            .expect("cached worker sink fallback must not fail before remote status fan-in")
+            .0;
+
+        assert_eq!(
+            response.sink.debug.scheduled_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
+            "management /status must surface remote sink schedule evidence when local worker fallback is cached"
+        );
+        assert_eq!(
+            response
+                .sink
+                .debug
+                .last_control_frame_signals_by_node
+                .get("node-a"),
+            Some(&vec!["nfs1".to_string(), "nfs2".to_string()]),
+            "remote fan-in must preserve sink control evidence instead of returning local cached not-ready"
         );
     }
 

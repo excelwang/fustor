@@ -6296,13 +6296,24 @@ async fn status_route_snapshot_does_not_execute_retained_replay_recovery() {
         );
     }
 
-    let (_snapshot, used_cached_fallback) = tokio::time::timeout(Duration::from_secs(2), status_route)
+    let (snapshot, used_cached_fallback) = tokio::time::timeout(Duration::from_secs(2), status_route)
         .await
         .expect("status-route snapshot should settle without retained replay")
         .expect("join status-route snapshot task");
     assert!(
         used_cached_fallback,
         "status-route snapshot should report cached fallback while retained replay recovery is pending"
+    );
+    let scheduled_groups = snapshot
+        .scheduled_groups_by_node
+        .get("node-d")
+        .into_iter()
+        .flat_map(|groups| groups.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        scheduled_groups,
+        std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        "status-route cached fallback must republish retained scheduled groups while leaving replay recovery to the blocking path: {snapshot:?}"
     );
     assert_eq!(
         sink.control_state_replay_required.load(Ordering::Acquire),

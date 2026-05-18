@@ -1,5 +1,6 @@
     #[tokio::test]
     async fn facade_reactivation_waits_for_inflight_roots_put_after_source_update_begins() {
+        let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -210,6 +211,7 @@
 
     #[tokio::test]
     async fn facade_reactivation_waits_for_inflight_roots_put_after_sink_update_begins() {
+        let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);

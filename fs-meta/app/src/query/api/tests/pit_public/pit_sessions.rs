@@ -1546,6 +1546,10 @@ async fn build_tree_pit_session_prefers_cached_sink_primary_when_later_sink_stat
             ("node-a".to_string(), vec!["nfs4".to_string()]),
             ("node-b".to_string(), vec!["nfs4".to_string()]),
         ]),
+        primary_host_ref_by_group: BTreeMap::from([(
+            "nfs4".to_string(),
+            "node-b".to_string(),
+        )]),
         groups: vec![crate::sink::SinkGroupStatusSnapshot {
             group_id: "nfs4".to_string(),
             primary_object_ref: "node-b::nfs4".to_string(),

@@ -17,9 +17,13 @@ use std::sync::{
 };
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RELEASE_UPGRADE_CLUSTER_NODES: [&str; 5] = ["node-a", "node-b", "node-c", "node-d", "node-e"];
+const RELEASE_UPGRADE_CONTROL_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
+const RELEASE_UPGRADE_TREE_MATERIALIZATION_TIMEOUT: Duration = Duration::from_secs(300);
+const RELEASE_UPGRADE_MANUAL_RESCAN_ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(120);
+const RELEASE_UPGRADE_MANAGEMENT_STATUS_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UpgradeMode {
@@ -398,7 +402,7 @@ fn wait_for_materialized_tree_observation(
     session: &mut OperatorSession,
     reason: &str,
 ) -> Result<(), String> {
-    wait_until(Duration::from_secs(120), reason, || {
+    wait_until(RELEASE_UPGRADE_TREE_MATERIALIZATION_TIMEOUT, reason, || {
         let tree = match session.tree(&[
             ("path", "/".to_string()),
             ("recursive", "true".to_string()),
@@ -481,8 +485,10 @@ fn wait_for_manual_rescan_acceptance(
     session: &mut OperatorSession,
     reason: &str,
 ) -> Result<(), String> {
-    wait_until(Duration::from_secs(120), reason, || {
-        match session.rescan() {
+    wait_until(
+        RELEASE_UPGRADE_MANUAL_RESCAN_ACCEPTANCE_TIMEOUT,
+        reason,
+        || match session.rescan() {
             Ok(_) => Ok(true),
             Err(err) => {
                 let status = session
@@ -492,8 +498,8 @@ fn wait_for_manual_rescan_acceptance(
                     "manual rescan not accepted yet: {err}; status={status}"
                 ))
             }
-        }
-    })
+        },
+    )
 }
 
 fn current_root_ids(session: &mut OperatorSession) -> Result<Vec<String>, String> {
@@ -529,7 +535,7 @@ fn scenario_facade_claim_continuity_after_upgrade(
         &harness.cluster,
         &harness.candidate_base_urls,
         &harness.app_id,
-        Duration::from_secs(15),
+        RELEASE_UPGRADE_CONTROL_CONVERGENCE_TIMEOUT,
     );
     l5_progress(
         harness.mode,
@@ -574,7 +580,7 @@ fn scenario_tree_stats_stable_across_upgrade(harness: &mut UpgradeHarness) -> Re
         &harness.candidate_base_urls,
         "operator",
         "operator123",
-        Duration::from_secs(120),
+        RELEASE_UPGRADE_CONTROL_CONVERGENCE_TIMEOUT,
     )?;
     harness.session = OperatorSession::login_many(
         harness.candidate_base_urls.clone(),
@@ -600,28 +606,35 @@ fn scenario_tree_materialization_after_upgrade(harness: &mut UpgradeHarness) -> 
         "operator123",
     )?;
     l5_progress(harness.mode, "03.01.tree-login", "ok");
-    l5_progress(harness.mode, "03.02.peer-source-control", "begin");
+    l5_progress(harness.mode, "03.02.sink-status-visibility", "begin");
+    wait_for_sink_status_groups_visibility(
+        &harness.candidate_base_urls,
+        &expected_source_runtime_scope_groups(&harness.roots),
+        RELEASE_UPGRADE_CONTROL_CONVERGENCE_TIMEOUT,
+    )?;
+    l5_progress(harness.mode, "03.02.sink-status-visibility", "ok");
+    l5_progress(harness.mode, "03.03.peer-source-control", "begin");
     wait_for_peer_source_control_convergence(
         &harness.cluster,
         &harness.candidate_base_urls,
         &harness.app_id,
         &harness.roots,
-        Duration::from_secs(30),
+        RELEASE_UPGRADE_CONTROL_CONVERGENCE_TIMEOUT,
     )?;
-    l5_progress(harness.mode, "03.02.peer-source-control", "ok");
-    l5_progress(harness.mode, "03.03.manual-rescan", "begin");
+    l5_progress(harness.mode, "03.03.peer-source-control", "ok");
+    l5_progress(harness.mode, "03.04.manual-rescan", "begin");
     wait_for_manual_rescan_acceptance(
         &mut harness.session,
         "manual rescan accepted after release-upgrade source scope convergence",
     )?;
-    l5_progress(harness.mode, "03.03.manual-rescan", "ok");
-    l5_progress(harness.mode, "03.04.tree-materialization", "begin");
+    l5_progress(harness.mode, "03.04.manual-rescan", "ok");
+    l5_progress(harness.mode, "03.05.tree-materialization", "begin");
     wait_for_materialized_tree_observation(
         &mut harness.session,
         "tree materializes after generation-two upgrade",
     )?;
     assert_trusted_tree_is_ready_or_fail_closed(&harness.session)?;
-    l5_progress(harness.mode, "03.04.tree-materialization", "ok");
+    l5_progress(harness.mode, "03.05.tree-materialization", "ok");
     Ok(())
 }
 
@@ -632,7 +645,7 @@ fn scenario_sink_control_roles_after_upgrade(harness: &mut UpgradeHarness) -> Re
         &harness.cluster,
         &harness.candidate_base_urls,
         &harness.app_id,
-        Duration::from_secs(15),
+        RELEASE_UPGRADE_CONTROL_CONVERGENCE_TIMEOUT,
     );
     l5_progress(
         harness.mode,
@@ -661,7 +674,7 @@ fn scenario_source_control_roles_after_upgrade(harness: &mut UpgradeHarness) -> 
         &harness.candidate_base_urls,
         &harness.app_id,
         &harness.roots,
-        Duration::from_secs(15),
+        RELEASE_UPGRADE_CONTROL_CONVERGENCE_TIMEOUT,
     );
     l5_progress(
         harness.mode,
@@ -728,7 +741,7 @@ fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
         &harness.cluster,
         &harness.candidate_base_urls,
         &harness.app_id,
-        Duration::from_secs(15),
+        RELEASE_UPGRADE_CONTROL_CONVERGENCE_TIMEOUT,
     )?;
     l5_progress(harness.mode, "03.01.facade-claim-convergence", "ok");
     l5_progress(harness.mode, "03.02.sink-control-convergence", "begin");
@@ -736,7 +749,7 @@ fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
         &harness.cluster,
         &harness.candidate_base_urls,
         &harness.app_id,
-        Duration::from_secs(15),
+        RELEASE_UPGRADE_CONTROL_CONVERGENCE_TIMEOUT,
     )?;
     l5_progress(harness.mode, "03.02.sink-control-convergence", "ok");
     l5_progress(harness.mode, "03.03.source-control-convergence", "begin");
@@ -745,7 +758,7 @@ fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
         &harness.candidate_base_urls,
         &harness.app_id,
         &harness.roots,
-        Duration::from_secs(15),
+        RELEASE_UPGRADE_CONTROL_CONVERGENCE_TIMEOUT,
     )?;
     l5_progress(harness.mode, "03.03.source-control-convergence", "ok");
     l5_progress(harness.mode, "03.04.cpu-login", "begin");
@@ -835,6 +848,8 @@ fn wait_for_node_a_sink_control_convergence(
     app_id: &str,
     timeout: Duration,
 ) -> Result<(), String> {
+    let mut last_app_status_probe_at: Option<Instant> = None;
+    let mut last_app_status_result: Option<Result<Vec<Value>, String>> = None;
     wait_until(
         timeout,
         "node-a sink control converges after generation-two upgrade",
@@ -842,35 +857,100 @@ fn wait_for_node_a_sink_control_convergence(
             let sink_active =
                 cluster.unit_active_pids_for_instance("node-a", app_id, "runtime.exec.sink")?;
             let node_status = cluster.status("node-a")?;
-            let app_status = probe_management_status(candidate_base_urls).ok();
-            let status_view = app_status.as_ref().unwrap_or(&node_status);
-            let scheduled_sink = status_debug_groups_by_node(
-                status_view,
-                "sink",
-                "scheduled_groups_by_node",
-                "node-a",
-            );
             let expected = BTreeMap::from([(
                 "node-a".to_string(),
                 vec!["nfs1".to_string(), "nfs2".to_string()],
             )]);
-            let route_summaries = activation_route_summaries(&node_status);
-            let sink_routes_active = [
-                "sink-logical-roots-control:v1.stream:activated",
-                "on-demand-force-find:v1.on-demand-force-find.req:activated",
-                "materialized-find:v1.req:activated",
-                "fs-meta.events:v1.stream:activated",
-            ]
-            .iter()
-            .all(|needle| route_summaries.iter().any(|route| route.contains(needle)));
             if !sink_active.is_empty()
-                && (scheduled_sink == expected || (scheduled_sink.is_empty() && sink_routes_active))
+                && last_app_status_probe_at.is_none_or(|last_probe| {
+                    last_probe.elapsed() >= RELEASE_UPGRADE_MANAGEMENT_STATUS_PROBE_INTERVAL
+                })
             {
+                last_app_status_probe_at = Some(Instant::now());
+                last_app_status_result = Some(probe_management_statuses(candidate_base_urls));
+            }
+            let app_statuses = last_app_status_result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .cloned()
+                .unwrap_or_default();
+            let scheduled_sink = app_statuses
+                .iter()
+                .map(|status| {
+                    status_debug_groups_by_node(
+                        status,
+                        "sink",
+                        "scheduled_groups_by_node",
+                        "node-a",
+                    )
+                })
+                .find(|scheduled| scheduled == &expected)
+                .unwrap_or_default();
+            if !sink_active.is_empty() && scheduled_sink == expected {
                 Ok(true)
             } else {
+                let route_summaries = activation_route_summaries(&node_status);
+                let app_status_summaries = app_statuses
+                    .iter()
+                    .map(sink_control_status_probe_summary)
+                    .collect::<Vec<_>>();
+                let app_status_error = last_app_status_result
+                    .as_ref()
+                    .and_then(|result| result.as_ref().err())
+                    .cloned();
                 Err(format!(
-                "node-a sink not converged: active_pids={sink_active:?}; scheduled_sink={scheduled_sink:?}; routes={route_summaries:?}",
+                "node-a sink not converged: active_pids={sink_active:?}; scheduled_sink={scheduled_sink:?}; app_status_error={:?}; app_statuses={app_status_summaries:?}; routes={route_summaries:?}",
+                app_status_error
             ))
+            }
+        },
+    )
+}
+
+fn wait_for_sink_status_groups_visibility(
+    candidate_base_urls: &[String],
+    expected_groups: &[String],
+    timeout: Duration,
+) -> Result<(), String> {
+    let expected = expected_groups
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<String>>();
+    let mut last_app_status_probe_at: Option<Instant> = None;
+    let mut last_app_status_result: Option<Result<Vec<Value>, String>> = None;
+    wait_until(
+        timeout,
+        "sink status exposes expected groups after generation-two upgrade",
+        || {
+            if last_app_status_probe_at.is_none_or(|last_probe| {
+                last_probe.elapsed() >= RELEASE_UPGRADE_MANAGEMENT_STATUS_PROBE_INTERVAL
+            }) {
+                last_app_status_probe_at = Some(Instant::now());
+                last_app_status_result = Some(probe_management_statuses(candidate_base_urls));
+            }
+            let app_statuses = last_app_status_result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .cloned()
+                .unwrap_or_default();
+            let visible_groups = app_statuses
+                .iter()
+                .flat_map(sink_status_group_ids)
+                .collect::<BTreeSet<_>>();
+            if expected.is_subset(&visible_groups) {
+                Ok(true)
+            } else {
+                let app_status_summaries = app_statuses
+                    .iter()
+                    .map(sink_control_status_probe_summary)
+                    .collect::<Vec<_>>();
+                let app_status_error = last_app_status_result
+                    .as_ref()
+                    .and_then(|result| result.as_ref().err())
+                    .cloned();
+                Err(format!(
+                    "sink status groups not visible: expected={expected:?}; visible={visible_groups:?}; app_status_error={app_status_error:?}; app_statuses={app_status_summaries:?}"
+                ))
             }
         },
     )
@@ -885,13 +965,22 @@ fn wait_for_node_d_facade_claim_convergence(
     let Some(node_d_url) = candidate_base_urls.first().cloned() else {
         return Err("missing node-d candidate facade url".to_string());
     };
+    let mut last_management_probe_at: Option<Instant> = None;
+    let mut last_management_probe_result: Option<Result<Value, String>> = None;
     wait_until(
         timeout,
         "node-d fixed-bind facade continuity converges after generation-two upgrade",
         || {
             let facade_active = cluster.facade_pids_for_instance("node-d", app_id)?;
             let node_status = cluster.status("node-d")?;
-            let _ = probe_management_status(&[node_d_url.clone()])?;
+            if facade_active.is_empty()
+                && last_management_probe_at.is_none_or(|last_probe| {
+                    last_probe.elapsed() >= RELEASE_UPGRADE_MANAGEMENT_STATUS_PROBE_INTERVAL
+                })
+            {
+                last_management_probe_at = Some(Instant::now());
+                last_management_probe_result = Some(probe_management_status(&[node_d_url.clone()]));
+            }
             let source_status_active =
                 activation_route_has_active_pids(&node_status, "source-status:v1.req");
             let sink_status_active =
@@ -903,8 +992,12 @@ fn wait_for_node_d_facade_claim_convergence(
             {
                 Ok(true)
             } else {
+                let management_probe_error = last_management_probe_result
+                    .as_ref()
+                    .and_then(|result| result.as_ref().err())
+                    .cloned();
                 Err(format!(
-                    "node-d facade not converged: facade_active={facade_active:?} source_status_active={source_status_active} sink_status_active={sink_status_active} materialized_proxy_active={materialized_proxy_active} routes={:?}",
+                    "node-d facade not converged: facade_active={facade_active:?} source_status_active={source_status_active} sink_status_active={sink_status_active} materialized_proxy_active={materialized_proxy_active} management_probe_error={management_probe_error:?} routes={:?}",
                     activation_route_summaries(&node_status),
                 ))
             }
@@ -1262,17 +1355,24 @@ fn wait_for_peer_source_control_convergence(
     timeout: Duration,
 ) -> Result<(), String> {
     let expected_groups = expected_source_runtime_scope_groups(roots);
+    let mut last_app_status_probe_at: Option<Instant> = None;
+    let mut last_app_status_result: Option<Result<Value, String>> = None;
     wait_until(
         timeout,
         "current-root source runtime-scope converges after generation-two upgrade",
         || {
-            let app_status_result = probe_management_status(candidate_base_urls);
             let mut statuses_by_node = BTreeMap::new();
             for node_name in RELEASE_UPGRADE_CLUSTER_NODES {
                 statuses_by_node.insert(node_name.to_string(), cluster.status(node_name)?);
             }
+            if last_app_status_probe_at.is_none_or(|last_probe| {
+                last_probe.elapsed() >= RELEASE_UPGRADE_MANAGEMENT_STATUS_PROBE_INTERVAL
+            }) {
+                last_app_status_probe_at = Some(Instant::now());
+                last_app_status_result = Some(probe_management_status(candidate_base_urls));
+            }
             let mut status_refs = Vec::new();
-            if let Ok(status) = app_status_result.as_ref() {
+            if let Some(Ok(status)) = last_app_status_result.as_ref() {
                 status_refs.push(status);
             }
             status_refs.extend(statuses_by_node.values());
@@ -1287,9 +1387,13 @@ fn wait_for_peer_source_control_convergence(
             {
                 Ok(true)
             } else {
+                let app_status_summary = last_app_status_result
+                    .as_ref()
+                    .map(source_runtime_scope_app_status_probe_summary)
+                    .unwrap_or_else(|| "not_probed".to_string());
                 Err(format!(
                     "current-root source runtime-scope not converged: expected_groups={expected_groups:?} owner_nodes_by_group={owners_by_group:?} inactive_owner_nodes={inactive_owner_nodes:?} app_status={} node_debug={:?}",
-                    source_runtime_scope_app_status_probe_summary(&app_status_result),
+                    app_status_summary,
                     source_runtime_scope_debug_summary_by_node(&statuses_by_node)
                 ))
             }
@@ -1299,6 +1403,12 @@ fn wait_for_peer_source_control_convergence(
 
 fn probe_management_status(candidate_base_urls: &[String]) -> Result<Value, String> {
     OperatorSession::management_status_many(candidate_base_urls, "operator", "operator123")
+}
+
+fn probe_management_statuses(candidate_base_urls: &[String]) -> Result<Vec<Value>, String> {
+    let mut session =
+        OperatorSession::login_many(candidate_base_urls.to_vec(), "operator", "operator123")?;
+    session.status_all()
 }
 
 fn measure_baseline_cpu(cluster: &Cluster5) -> Result<BTreeMap<String, Vec<u32>>, String> {
@@ -1545,6 +1655,52 @@ fn status_debug_groups_field(status: &Value, section: &str, field: &str) -> Valu
         .and_then(|v| v.get(field))
         .cloned()
         .unwrap_or(Value::Null)
+}
+
+fn sink_control_status_probe_summary(status: &Value) -> String {
+    let scheduled =
+        status_debug_groups_by_node(status, "sink", "scheduled_groups_by_node", "node-a");
+    let control = status_debug_groups_by_node(
+        status,
+        "sink",
+        "last_control_frame_signals_by_node",
+        "node-a",
+    );
+    let primary = status_debug_groups_field(status, "sink", "primary_host_ref_by_group");
+    let groups = status
+        .get("sink")
+        .and_then(|value| value.get("groups"))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|group| {
+                    group
+                        .get("group_id")
+                        .or_else(|| group.get("group"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    format!("scheduled={scheduled:?}; control={control:?}; primary={primary}; groups={groups:?}")
+}
+
+fn sink_status_group_ids(status: &Value) -> Vec<String> {
+    status
+        .get("sink")
+        .and_then(|value| value.get("groups"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| {
+            group
+                .get("group_id")
+                .or_else(|| group.get("group"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 fn activation_route_summaries(status: &Value) -> Vec<String> {

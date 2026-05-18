@@ -1672,6 +1672,7 @@ struct MaterializedStatusLoadPlan {
     source_route: StatusRoutePlan,
     sink_route: StatusRoutePlan,
     explicit_empty_sink_recollect: StatusRoutePlan,
+    owner_scoped_sink_route: StatusRoutePlan,
 }
 
 impl Default for MaterializedStatusLoadPlan {
@@ -1688,6 +1689,10 @@ impl Default for MaterializedStatusLoadPlan {
             explicit_empty_sink_recollect: StatusRoutePlan::new(
                 EXPLICIT_EMPTY_SINK_STATUS_RECOLLECT_BUDGET,
                 LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE,
+            ),
+            owner_scoped_sink_route: StatusRoutePlan::new(
+                Duration::from_secs(30),
+                STATUS_ROUTE_COLLECT_IDLE_GRACE,
             ),
         }
     }
@@ -2188,10 +2193,17 @@ fn merge_current_sink_owner_candidate_nodes(
 fn current_owner_candidate_nodes_for_groups_and_source_status(
     source: &SourceFacade,
     source_status: Option<&SourceStatusSnapshot>,
+    sink_status: Option<&SinkStatusSnapshot>,
     groups: &BTreeSet<String>,
 ) -> std::result::Result<Vec<NodeId>, QueryWorkerObservationFailure> {
-    let observed_candidate_nodes =
+    let mut observed_candidate_nodes =
         current_owner_candidate_nodes_from_source_status(source_status, groups);
+    if let Some(sink_status) = sink_status {
+        observed_candidate_nodes.extend(current_owner_candidate_nodes_from_sink_status(
+            sink_status,
+            groups,
+        ));
+    }
     let configured_candidate_nodes = match current_owner_candidate_nodes_for_groups(source, groups)
     {
         Ok(nodes) => nodes,
@@ -2216,6 +2228,61 @@ fn collect_nodes_for_groups_from_schedule(
             nodes.insert(node_id.clone());
         }
     }
+}
+
+fn sink_status_origin_count_entry_is_positive(entry: &str) -> bool {
+    entry
+        .rsplit_once('=')
+        .and_then(|(_, count)| count.parse::<u64>().ok())
+        .is_none_or(|count| count > 0)
+}
+
+fn collect_nodes_for_groups_from_origin_counts(
+    nodes: &mut BTreeSet<String>,
+    origin_counts_by_node: &BTreeMap<String, Vec<String>>,
+    groups: &BTreeSet<String>,
+) {
+    for (node_id, origin_counts) in origin_counts_by_node {
+        if node_id.trim().is_empty() {
+            continue;
+        }
+        if origin_counts.iter().any(|entry| {
+            groups.contains(crate::sink::sink_status_origin_entry_group_id(entry))
+                && sink_status_origin_count_entry_is_positive(entry)
+        }) {
+            nodes.insert(node_id.clone());
+        }
+    }
+}
+
+fn current_owner_candidate_nodes_from_sink_status(
+    sink_status: &SinkStatusSnapshot,
+    groups: &BTreeSet<String>,
+) -> Vec<NodeId> {
+    let mut nodes = BTreeSet::<String>::new();
+    collect_nodes_for_groups_from_schedule(
+        &mut nodes,
+        &sink_status.scheduled_groups_by_node,
+        groups,
+    );
+    for (group_id, host_ref) in &sink_status.primary_host_ref_by_group {
+        let host_ref = host_ref.trim();
+        if groups.contains(group_id) && !host_ref.is_empty() {
+            nodes.insert(host_ref.to_string());
+        }
+    }
+    for origin_counts_by_node in [
+        &sink_status.stream_applied_origin_counts_by_node,
+        &sink_status.stream_applied_path_origin_counts_by_node,
+        &sink_status.stream_ready_origin_counts_by_node,
+        &sink_status.stream_ready_path_origin_counts_by_node,
+        &sink_status.stream_received_origin_counts_by_node,
+        &sink_status.stream_received_path_origin_counts_by_node,
+        &sink_status.received_origin_counts_by_node,
+    ] {
+        collect_nodes_for_groups_from_origin_counts(&mut nodes, origin_counts_by_node, groups);
+    }
+    nodes.into_iter().map(NodeId).collect()
 }
 
 fn source_status_readiness_groups_needing_current_owner_evidence(
@@ -2374,16 +2441,21 @@ async fn augment_routed_sink_status_with_current_owner_evidence(
         source_observability_snapshots,
         &missing_groups,
     );
+    let sink_candidate_nodes =
+        current_owner_candidate_nodes_from_sink_status(&sink_status, &missing_groups);
     let configured_candidate_nodes =
         match current_owner_candidate_nodes_for_groups(source, &missing_groups) {
             Ok(nodes) => nodes,
-            Err(err) if observed_candidate_nodes.is_empty() => {
+            Err(err) if observed_candidate_nodes.is_empty() && sink_candidate_nodes.is_empty() => {
                 return Err(QueryWorkerObservationFailure::from(err));
             }
             Err(_) => Vec::new(),
         };
     let candidate_nodes = merge_current_sink_owner_candidate_nodes(
-        observed_candidate_nodes,
+        observed_candidate_nodes
+            .into_iter()
+            .chain(sink_candidate_nodes)
+            .collect(),
         configured_candidate_nodes,
     );
     if candidate_nodes.is_empty() {
@@ -2438,7 +2510,7 @@ async fn load_materialized_status_snapshots_with_failure(
         return Ok(cached);
     }
     let mut routed_source_observability_snapshots = Vec::<SourceObservabilitySnapshot>::new();
-    let (source_status, mut sink_status) = match &state.backend {
+    let (mut source_status, mut sink_status) = match &state.backend {
         QueryBackend::Route {
             boundary,
             origin_id,
@@ -2495,36 +2567,6 @@ async fn load_materialized_status_snapshots_with_failure(
     };
     let readiness_groups =
         materialized_readiness_groups_for_loaded_source(&fallback_readiness_groups, &source_status);
-    let source_status = if matches!(&state.backend, QueryBackend::Route { .. }) {
-        augment_routed_source_status_with_current_owner_evidence(
-            state,
-            source_status,
-            &readiness_groups,
-            status_load_plan.source_route,
-            &routed_source_observability_snapshots,
-        )
-        .await?
-    } else {
-        source_status
-    };
-    let source_status = {
-        let fresh = filter_source_status_snapshot(source_status, &readiness_groups);
-        let mut cache = state.materialized_source_status_cache.lock().map_err(|_| {
-            CnxError::Internal("materialized source status cache lock poisoned".into())
-        })?;
-        let merged = match cache.as_ref() {
-            Some(cached) => merge_source_status_snapshots(vec![
-                filter_source_status_snapshot(cached.snapshot.clone(), &readiness_groups),
-                fresh,
-            ]),
-            None => fresh,
-        };
-        *cache = Some(CachedSourceStatusSnapshot {
-            snapshot: merged.clone(),
-            signature: cache_signature.clone(),
-        });
-        merged
-    };
     let mut explicit_empty_all_active_recollect_attempted = false;
     if let QueryBackend::Route {
         boundary,
@@ -2553,10 +2595,13 @@ async fn load_materialized_status_snapshots_with_failure(
             &source_status,
             &sink_status,
             &readiness_groups,
-        ) {
+        )
+        && current_owner_candidate_nodes_from_sink_status(&sink_status, &readiness_groups)
+            .is_empty()
+    {
         status_load_plan.explicit_empty_sink_recollect
     } else {
-        status_load_plan.sink_route
+        status_load_plan.owner_scoped_sink_route
     };
     sink_status = augment_routed_sink_status_with_current_owner_evidence(
         state,
@@ -2566,6 +2611,36 @@ async fn load_materialized_status_snapshots_with_failure(
         &routed_source_observability_snapshots,
     )
     .await?;
+    if matches!(&state.backend, QueryBackend::Route { .. })
+        && sink_status_covers_ready_readiness_groups(&sink_status, &readiness_groups)
+    {
+        source_status = augment_routed_source_status_with_current_owner_evidence(
+            state,
+            source_status,
+            &readiness_groups,
+            status_load_plan.source_route,
+            &routed_source_observability_snapshots,
+        )
+        .await?;
+    }
+    let source_status = {
+        let fresh = filter_source_status_snapshot(source_status, &readiness_groups);
+        let mut cache = state.materialized_source_status_cache.lock().map_err(|_| {
+            CnxError::Internal("materialized source status cache lock poisoned".into())
+        })?;
+        let merged = match cache.as_ref() {
+            Some(cached) => merge_source_status_snapshots(vec![
+                filter_source_status_snapshot(cached.snapshot.clone(), &readiness_groups),
+                fresh,
+            ]),
+            None => fresh,
+        };
+        *cache = Some(CachedSourceStatusSnapshot {
+            snapshot: merged.clone(),
+            signature: cache_signature.clone(),
+        });
+        merged
+    };
     let route_explicit_empty_groups = sink_status
         .groups
         .iter()
@@ -6158,14 +6233,6 @@ impl TreePitGroupPlan {
         }
     }
 
-    fn remaining_ranked_groups(self) -> usize {
-        self.total_ranked_groups.saturating_sub(self.rank_index)
-    }
-
-    fn is_last_ranked_group(self) -> bool {
-        self.rank_index + 1 == self.total_ranked_groups
-    }
-
     fn stage_timeout(self, remaining_session: Duration) -> Duration {
         self.stage_plan
             .stage_timeout(remaining_session, self.caller_timeout)
@@ -6194,7 +6261,10 @@ impl TreePitGroupPlan {
             },
         );
         let proxy_reserve = std::cmp::min(
-            remaining_session.checked_div(2).unwrap_or_default(),
+            remaining_session
+                .saturating_mul(3)
+                .checked_div(5)
+                .unwrap_or_default(),
             std::cmp::min(remaining_session, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET),
         );
         let capped_proxy_reserve = std::cmp::min(
@@ -6325,17 +6395,7 @@ impl TreePitGroupPlan {
     }
 
     fn empty_response_proxy_retry_timeout(self, remaining_session: Duration) -> Duration {
-        if self.is_last_ranked_group() {
-            std::cmp::min(remaining_session, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET)
-        } else {
-            let shared_budget_ceiling = remaining_session
-                .checked_div(self.remaining_ranked_groups().max(1) as u32)
-                .unwrap_or_default();
-            std::cmp::min(
-                std::cmp::min(remaining_session, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET),
-                shared_budget_ceiling,
-            )
-        }
+        std::cmp::min(remaining_session, SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET)
     }
 
     fn retryable_gap_owner_retry_timeout(self, remaining_session: Duration) -> Duration {
@@ -6570,6 +6630,7 @@ struct TreePitStageExecutionInput<'a> {
     policy: &'a ProjectionPolicy,
     tree_params: InternalQueryRequest,
     events: &'a [Event],
+    events_from_generic_proxy_fallback: bool,
     selected_group_sink_status: Option<&'a SinkStatusSnapshot>,
     group_plan: TreePitGroupPlan,
     stage_timing: TreePitStageTiming,
@@ -6602,8 +6663,21 @@ async fn resolve_tree_pit_stage_execution_action(
             let empty_response_plan = input
                 .stage_timing
                 .empty_response_rescue_plan(input.group_plan, input.selected_group_owner_known);
+            let settle_empty_after_prior_exact_file_decode =
+                trusted_materialized_exact_file_lane_settles_empty_after_prior_decode(
+                    &input.tree_params,
+                    input.selected_group_sink_status,
+                    input.group_key,
+                    input.group_plan.prior_materialized_exact_file_decoded,
+                );
+            let settle_empty_after_prior_proxy_fallback = input.events_from_generic_proxy_fallback
+                && input.group_plan.read_class == ReadClass::TrustedMaterialized
+                && input.group_plan.stage_plan.prior_materialized_group_decoded
+                && !input.group_plan.stage_plan.empty_root_requires_fail_closed;
             if input.group_plan.stage_plan.requires_rescue
                 && trusted_materialized_tree_payload_is_empty(&response)
+                && !settle_empty_after_prior_exact_file_decode
+                && !settle_empty_after_prior_proxy_fallback
                 && let Err(err) = rescue_trusted_materialized_empty_tree_response(
                     TrustedMaterializedEmptyTreeResponseRescueInput {
                         state: input.state,
@@ -7407,7 +7481,7 @@ fn selected_group_tree_pit_plan_uses_remaining_budget_for_non_fail_closed_route_
 }
 
 #[test]
-fn tree_pit_group_plan_splits_proxy_budget_across_remaining_groups() {
+fn tree_pit_group_plan_preserves_proxy_fallback_min_budget_for_middle_groups() {
     let plan = TreePitSessionPlan::new(Duration::from_secs(5), 3).selected_group_stage_plan(
         TreePitGroupPlanInput {
             read_class: ReadClass::TrustedMaterialized,
@@ -7424,8 +7498,8 @@ fn tree_pit_group_plan_splits_proxy_budget_across_remaining_groups() {
 
     assert_eq!(
         plan.empty_response_proxy_retry_timeout(Duration::from_millis(1800)),
-        Duration::from_millis(900),
-        "middle-ranked PIT groups should share the remaining proxy budget instead of each reopening the full fallback lane"
+        SELECTED_GROUP_PROXY_FALLBACK_MIN_BUDGET,
+        "middle-ranked PIT groups should preserve enough proxy budget for delayed selected-group fallback replies"
     );
 }
 
@@ -8176,6 +8250,11 @@ fn materialized_status_load_plan_owns_canonical_route_timing() {
             LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE,
         ),
         "explicit-empty sink-status recollect should stay inside the planner instead of helper-local timing constants",
+    );
+    assert_eq!(
+        plan.owner_scoped_sink_route,
+        StatusRoutePlan::new(Duration::from_secs(30), STATUS_ROUTE_COLLECT_IDLE_GRACE),
+        "owner-scoped sink-status fan-in must keep the correlation open long enough for same-route worker owner replies after facade replies",
     );
 }
 
@@ -9889,6 +9968,28 @@ async fn query_materialized_events_via_selected_group_owner_attempt(
     }
 }
 
+#[derive(Debug)]
+struct SelectedGroupMaterializedEvents {
+    events: Vec<Event>,
+    from_generic_proxy_fallback: bool,
+}
+
+impl SelectedGroupMaterializedEvents {
+    fn direct(events: Vec<Event>) -> Self {
+        Self {
+            events,
+            from_generic_proxy_fallback: false,
+        }
+    }
+
+    fn generic_proxy_fallback(events: Vec<Event>) -> Self {
+        Self {
+            events,
+            from_generic_proxy_fallback: true,
+        }
+    }
+}
+
 async fn finalize_selected_group_owner_success(
     policy: &ProjectionPolicy,
     params: &InternalQueryRequest,
@@ -10034,6 +10135,7 @@ async fn query_materialized_events_via_candidate_owner_nodes(
     policy: &ProjectionPolicy,
     source: &SourceFacade,
     source_status: Option<&SourceStatusSnapshot>,
+    sink_status: Option<&SinkStatusSnapshot>,
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
     params: &InternalQueryRequest,
@@ -10045,9 +10147,13 @@ async fn query_materialized_events_via_candidate_owner_nodes(
     }
 
     let groups = BTreeSet::from([group_id.to_string()]);
-    let candidate_nodes =
-        current_owner_candidate_nodes_for_groups_and_source_status(source, source_status, &groups)
-            .map_err(QueryWorkerObservationFailure::into_error)?;
+    let candidate_nodes = current_owner_candidate_nodes_for_groups_and_source_status(
+        source,
+        source_status,
+        sink_status,
+        &groups,
+    )
+    .map_err(QueryWorkerObservationFailure::into_error)?;
     if candidate_nodes.is_empty() {
         return Ok(CandidateOwnerRouteOutcome {
             events: None,
@@ -10107,6 +10213,30 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
     request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
     group_plan: TreePitGroupPlan,
 ) -> Result<Vec<Event>, CnxError> {
+    Ok(query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions_with_route_info(
+        state,
+        policy,
+        params,
+        timeout,
+        selected_group_source_status,
+        selected_group_sink_status,
+        request_scoped_schedule_omitted_ready_groups,
+        group_plan,
+    )
+    .await?
+    .events)
+}
+
+async fn query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions_with_route_info(
+    state: &ApiState,
+    policy: &ProjectionPolicy,
+    params: InternalQueryRequest,
+    timeout: Duration,
+    selected_group_source_status: Option<&SourceStatusSnapshot>,
+    selected_group_sink_status: Option<SinkStatusSnapshot>,
+    request_scoped_schedule_omitted_ready_groups: Option<&BTreeSet<String>>,
+    group_plan: TreePitGroupPlan,
+) -> Result<SelectedGroupMaterializedEvents, CnxError> {
     match &state.backend {
         QueryBackend::Route {
             sink,
@@ -10124,11 +10254,13 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                     group_id,
                 )
             {
-                return Ok(synthesize_empty_selected_group_tree_events(
-                    &[],
-                    policy,
-                    group_id,
-                    params.scope.path.as_slice(),
+                return Ok(SelectedGroupMaterializedEvents::direct(
+                    synthesize_empty_selected_group_tree_events(
+                        &[],
+                        policy,
+                        group_id,
+                        params.scope.path.as_slice(),
+                    ),
                 ));
             }
             let selected_group_owner_collection_gap = params
@@ -10154,6 +10286,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                     policy,
                     source.as_ref(),
                     selected_group_source_status,
+                    selected_group_sink_status.as_ref(),
                     boundary.clone(),
                     origin_id.clone(),
                     &params,
@@ -10162,7 +10295,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                 )
                 .await?;
                 if let Some(events) = candidate_owner_outcome.events {
-                    return Ok(events);
+                    return Ok(SelectedGroupMaterializedEvents::direct(events));
                 }
                 let remaining = deadline
                     .checked_duration_since(tokio::time::Instant::now())
@@ -10173,9 +10306,10 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                 if let Some(primary_node_id) =
                     sink_primary_owner_node_for_group(selected_group_sink_status.as_ref(), group_id)
                         .filter(|primary_node_id| {
-                            !candidate_owner_outcome
-                                .attempted_nodes
-                                .contains(&primary_node_id.0)
+                            group_plan.read_class != ReadClass::TrustedMaterialized
+                                || !candidate_owner_outcome
+                                    .attempted_nodes
+                                    .contains(&primary_node_id.0)
                         })
                 {
                     let primary_retry_plan = group_plan.owner_collection_gap_route_plan(remaining);
@@ -10197,7 +10331,7 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                             &primary_events,
                         )
                     {
-                        return Ok(primary_events);
+                        return Ok(SelectedGroupMaterializedEvents::direct(primary_events));
                     }
                 }
                 let remaining = deadline
@@ -10207,13 +10341,15 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                     return Err(CnxError::Timeout);
                 }
                 let proxy_route_plan = group_plan.owner_collection_gap_proxy_route_plan(remaining);
-                return query_materialized_events_via_generic_proxy(
-                    boundary.clone(),
-                    origin_id.clone(),
-                    params,
-                    proxy_route_plan.machine(),
-                )
-                .await;
+                return Ok(SelectedGroupMaterializedEvents::generic_proxy_fallback(
+                    query_materialized_events_via_generic_proxy(
+                        boundary.clone(),
+                        origin_id.clone(),
+                        params,
+                        proxy_route_plan.machine(),
+                    )
+                    .await?,
+                ));
             }
             if let Some(group_id) = params.scope.selected_group.as_deref()
                 && !selected_group_owner_collection_gap
@@ -10243,21 +10379,23 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                 .await
                 {
                     Ok(events) => {
-                        return finalize_selected_group_owner_success(
-                            policy,
-                            &params,
-                            deadline,
-                            sink,
-                            boundary.clone(),
-                            origin_id.clone(),
-                            selected_group_sink_status.as_ref(),
-                            request_scoped_schedule_omitted_ready_groups,
-                            group_id,
-                            &SelectedGroupOwnerAttempt::Routed(node_id.clone()),
-                            events,
-                            group_plan,
-                        )
-                        .await;
+                        return Ok(SelectedGroupMaterializedEvents::direct(
+                            finalize_selected_group_owner_success(
+                                policy,
+                                &params,
+                                deadline,
+                                sink,
+                                boundary.clone(),
+                                origin_id.clone(),
+                                selected_group_sink_status.as_ref(),
+                                request_scoped_schedule_omitted_ready_groups,
+                                group_id,
+                                &SelectedGroupOwnerAttempt::Routed(node_id.clone()),
+                                events,
+                                group_plan,
+                            )
+                            .await?,
+                        ));
                     }
                     Err(CnxError::Timeout)
                     | Err(CnxError::TransportClosed(_))
@@ -10343,11 +10481,15 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                                     group_id,
                                     params.scope.path.as_slice(),
                                 ) {
-                                    return Ok(primary_events);
+                                    return Ok(SelectedGroupMaterializedEvents::direct(
+                                        primary_events,
+                                    ));
                                 }
                             }
                         }
-                        return Ok(proxy_events);
+                        return Ok(SelectedGroupMaterializedEvents::generic_proxy_fallback(
+                            proxy_events,
+                        ));
                     }
                     Err(err) => return Err(err),
                 }
@@ -10365,14 +10507,16 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                         request_scoped_schedule_omitted_ready_groups,
                         group_id,
                     ) {
-                        return Ok(synthesize_empty_selected_group_tree_events(
-                            &[],
-                            policy,
-                            group_id,
-                            params.scope.path.as_slice(),
+                        return Ok(SelectedGroupMaterializedEvents::direct(
+                            synthesize_empty_selected_group_tree_events(
+                                &[],
+                                policy,
+                                group_id,
+                                params.scope.path.as_slice(),
+                            ),
                         ));
                     }
-                    return Ok(Vec::new());
+                    return Ok(SelectedGroupMaterializedEvents::direct(Vec::new()));
                 }
                 let remaining = deadline
                     .checked_duration_since(tokio::time::Instant::now())
@@ -10381,19 +10525,23 @@ async fn query_materialized_events_with_selected_group_owner_snapshot_and_reques
                     return Err(CnxError::Timeout);
                 }
                 let proxy_route_plan = group_plan.direct_proxy_route_plan(remaining);
-                return query_materialized_events_via_generic_proxy(
-                    boundary.clone(),
-                    origin_id.clone(),
-                    params,
-                    proxy_route_plan.machine(),
-                )
-                .await;
+                return Ok(SelectedGroupMaterializedEvents::generic_proxy_fallback(
+                    query_materialized_events_via_generic_proxy(
+                        boundary.clone(),
+                        origin_id.clone(),
+                        params,
+                        proxy_route_plan.machine(),
+                    )
+                    .await?,
+                ));
             }
-            query_materialized_events(state.backend.clone(), params, timeout).await
+            Ok(SelectedGroupMaterializedEvents::direct(
+                query_materialized_events(state.backend.clone(), params, timeout).await?,
+            ))
         }
-        QueryBackend::Local { .. } => {
-            query_materialized_events(state.backend.clone(), params, timeout).await
-        }
+        QueryBackend::Local { .. } => Ok(SelectedGroupMaterializedEvents::direct(
+            query_materialized_events(state.backend.clone(), params, timeout).await?,
+        )),
     }
 }
 
@@ -12085,7 +12233,6 @@ fn decode_materialized_selected_group_response(
     let mut last_decode_error = None::<String>;
     let mut best = None::<TreeGroupPayload>;
     let mut best_precedence = None::<u64>;
-    let prefer_live_root_payload = query_path.is_empty() || query_path == b"/";
     for event in events {
         if event_group_key(policy, event) != selected_group {
             continue;
@@ -12095,29 +12242,17 @@ fn decode_materialized_selected_group_response(
                 if payload.root.path != query_path {
                     continue;
                 }
-                eprintln!(
-                    "fs_meta_query_api: decode group={} root_exists={} entries={} has_children={} modified_time_us={}",
-                    selected_group,
-                    payload.root.exists,
-                    payload.entries.len(),
-                    payload.root.has_children,
-                    payload.root.modified_time_us
-                );
                 let precedence = payload_precedence(event);
                 let replace = match (best_precedence, best.as_ref()) {
                     (None, _) => true,
                     (Some(_), None) => true,
                     (Some(current), Some(current_best)) => {
-                        if prefer_live_root_payload {
-                            let current_has_live_data = payload_has_live_data(current_best);
-                            let payload_has_live_data = payload_has_live_data(&payload);
-                            match (current_has_live_data, payload_has_live_data) {
-                                (false, true) => true,
-                                (true, false) => false,
-                                _ => precedence > current,
-                            }
-                        } else {
-                            precedence > current
+                        let current_has_live_data = payload_has_live_data(current_best);
+                        let payload_has_live_data = payload_has_live_data(&payload);
+                        match (current_has_live_data, payload_has_live_data) {
+                            (false, true) => true,
+                            (true, false) => false,
+                            _ => precedence > current,
                         }
                     }
                 };
@@ -13222,8 +13357,9 @@ impl TreePitGroupMachine<'_, '_> {
                 sink_group_summary
             );
         }
-        let events = match run_timed_query(
-            query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
+        let routed_events = match tokio::time::timeout(
+            stage_timeout,
+            query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions_with_route_info(
                 input.state,
                 input.policy,
                 tree_params.clone(),
@@ -13233,9 +13369,10 @@ impl TreePitGroupMachine<'_, '_> {
                 input.request_scoped_schedule_omitted_ready_groups,
                 group_plan,
             ),
-            stage_timeout,
         )
         .await
+        .map_err(|_| CnxError::Timeout)
+        .and_then(|result| result)
         {
             Ok(events) => events,
             Err(err) => match stage_timing.query_failure_action(group_plan, err) {
@@ -13277,7 +13414,8 @@ impl TreePitGroupMachine<'_, '_> {
                 state: input.state,
                 policy: input.policy,
                 tree_params: tree_params.clone(),
-                events: &events,
+                events: &routed_events.events,
+                events_from_generic_proxy_fallback: routed_events.from_generic_proxy_fallback,
                 selected_group_sink_status: selected_group_sink_status.as_ref(),
                 group_plan,
                 stage_timing,

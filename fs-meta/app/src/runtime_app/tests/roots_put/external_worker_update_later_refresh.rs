@@ -1,5 +1,6 @@
 #[tokio::test]
 async fn roots_put_returns_applied_root_count_even_when_live_logical_roots_snapshot_is_stale() {
+    let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
     let tmp = tempdir().expect("create temp dir");
     let bind_addr = reserve_bind_addr();
     let nfs1 = tmp.path().join("nfs1");
@@ -234,7 +235,8 @@ async fn roots_put_returns_applied_root_count_even_when_live_logical_roots_snaps
 
 #[tokio::test]
 async fn roots_put_before_response_does_not_reinflate_roots_count_after_later_old_roots_control_replay()
- {
+{
+    let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
     let tmp = tempdir().expect("create temp dir");
     let bind_addr = reserve_bind_addr();
     let nfs1 = tmp.path().join("nfs1");
@@ -429,6 +431,7 @@ async fn roots_put_before_response_does_not_reinflate_roots_count_after_later_ol
     crate::api::install_roots_put_before_response_hook(crate::api::RootsPutBeforeResponseHook {
         entered: entered.clone(),
         release: release.clone(),
+        selector_token: Some(fs_source_1.clone()),
     });
 
     let roots_body = json!({
@@ -515,6 +518,7 @@ async fn roots_put_before_response_does_not_reinflate_roots_count_after_later_ol
 #[tokio::test]
 async fn roots_put_returns_applied_root_count_while_peer_source_second_wave_followup_source_status_is_unavailable()
 {
+    let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
     let tmp = tempdir().expect("create temp dir");
     let bind_addr = reserve_bind_addr();
     let nfs1 = tmp.path().join("nfs1");
@@ -666,6 +670,27 @@ async fn roots_put_returns_applied_root_count_while_peer_source_second_wave_foll
     ])
     .await
     .expect("initial source/sink + peer source-status wave should succeed");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        app.api_control_gate.wait_management_write_ready(),
+    )
+    .await
+    .expect("initial full-management readiness should settle before roots_put response-latency assertion");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if app.api_control_gate.is_management_write_ready()
+                && !app.source.retained_replay_required().await
+                && !app.sink.retained_replay_required()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect(
+        "deferred retained replay recovery should settle before installing the source-status failure hook",
+    );
 
     let client = Client::new();
     let login = client
@@ -689,7 +714,12 @@ async fn roots_put_returns_applied_root_count_while_peer_source_second_wave_foll
         }
     }
     let _observability_reset = SourceWorkerObservabilityErrorHookReset;
-    crate::workers::source::install_source_worker_observability_error_hook(
+    let source_worker_instance_id = match &*app.source {
+        SourceFacade::Worker(client) => client.worker_instance_id_for_tests().await,
+        SourceFacade::Local(_) => panic!("expected external source worker client"),
+    };
+    crate::workers::source::install_source_worker_observability_error_hook_for_worker_instance(
+        source_worker_instance_id,
         crate::workers::source::SourceWorkerObservabilityErrorHook {
             err: CnxError::Timeout,
         },

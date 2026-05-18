@@ -1441,12 +1441,14 @@ struct RuntimeScopeExpectedGroups {
     sink_groups: std::collections::BTreeSet<String>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 enum RuntimeScopeConvergenceExpectation<'a> {
     ExpectedGroups(&'a RuntimeScopeExpectedGroups),
 }
 
 impl RuntimeScopeConvergenceObservation {
+    #[cfg(test)]
     fn matches_expected(&self, expected_groups: &RuntimeScopeExpectedGroups) -> bool {
         self.source_groups == expected_groups.source_groups
             && self.scan_groups == expected_groups.scan_groups
@@ -1489,6 +1491,7 @@ impl RuntimeScopeConvergenceObservation {
         ))
     }
 
+    #[cfg(test)]
     fn matches_expectation(
         self: &Self,
         expectation: RuntimeScopeConvergenceExpectation<'_>,
@@ -1928,10 +1931,13 @@ impl SinkRecoveryMachine {
         expected_scope_groups: Option<&RuntimeScopeExpectedGroups>,
         deadline: tokio::time::Instant,
     ) -> SinkRecoveryScopeConvergenceAction {
-        if expected_scope_groups.is_some_and(|expected_groups| {
+        let scope_converged = expected_scope_groups.is_some_and(|expected_groups| {
             observation.matches_node_local_source_scope(expected_groups)
-        }) && !self.post_recovery_source_rescan_pending()
-        {
+        });
+        let source_rescan_pending = self.post_recovery_source_rescan_pending();
+        if scope_converged && !source_rescan_pending {
+            SinkRecoveryScopeConvergenceAction::Converged
+        } else if scope_converged && tokio::time::Instant::now() >= deadline {
             SinkRecoveryScopeConvergenceAction::Converged
         } else if tokio::time::Instant::now() >= deadline {
             SinkRecoveryScopeConvergenceAction::ReturnTimeout
@@ -2292,8 +2298,6 @@ impl SinkRecoveryMachine {
             self.local_source_publication_satisfied(source_progress, expected_groups);
         let cached_ready_for_expected_groups =
             self.local_cached_ready_for_expected_groups(cached_sink_progress, expected_groups);
-        let sink_materialized_for_expected_groups =
-            self.local_sink_materialized_for_expected_groups(cached_sink_progress, expected_groups);
         if !scope_converged {
             return if self.remaining().is_zero() {
                 SinkRecoveryStep::ReturnTimeout
@@ -2314,7 +2318,7 @@ impl SinkRecoveryMachine {
             return SinkRecoveryStep::TriggerSourceToSinkConvergence;
         }
         if self.local_requires_probe_before_ready() {
-            if !source_publication_satisfied || !sink_materialized_for_expected_groups {
+            if !source_publication_satisfied {
                 return SinkRecoveryStep::WaitForRuntimeScopeConvergence;
             }
         } else if !source_request_observed {
@@ -2523,9 +2527,8 @@ impl SinkRecoveryMachine {
                     self.local_state_mut().source_publication_epoch_floor = None;
                 }
             }
-            let scope_converged = scope_observation.matches_expectation(
-                RuntimeScopeConvergenceExpectation::ExpectedGroups(&expected_scope_groups),
-            );
+            let scope_converged =
+                scope_observation.matches_node_local_source_scope(&expected_scope_groups);
             let cached_sink_progress = sink.cached_progress_snapshot_with_failure().ok();
             let source_request_observed = self.local_source_request_observed(&source_progress);
             let source_publication_satisfied =
@@ -3279,6 +3282,125 @@ fn local_sink_status_republish_timeout_defers_scheduled_only_zero_state() {
 }
 
 #[test]
+fn local_sink_status_republish_timeout_defers_incomplete_scheduled_group_state() {
+    let snapshot = crate::sink::SinkStatusSnapshot {
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            String::from("node-a"),
+            vec![String::from("g1"), String::from("g2")],
+        )]),
+        stream_received_batches_by_node: std::collections::BTreeMap::from([(
+            String::from("node-a"),
+            144,
+        )]),
+        stream_applied_control_events_by_node: std::collections::BTreeMap::from([(
+            String::from("node-a"),
+            2,
+        )]),
+        stream_applied_data_events_by_node: std::collections::BTreeMap::from([(
+            String::from("node-a"),
+            17_750,
+        )]),
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: String::from("g1"),
+                primary_object_ref: String::from("node-a::g1"),
+                total_nodes: 8_750,
+                live_nodes: 8_749,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 8_751,
+                estimated_heap_bytes: 0,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: String::from("g2"),
+                primary_object_ref: String::from("node-a::g2"),
+                total_nodes: 9_000,
+                live_nodes: 8_999,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 9_001,
+                estimated_heap_bytes: 0,
+            },
+        ],
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        !sink_status_snapshot_ready_for_expected_groups(
+            &snapshot,
+            &std::collections::BTreeSet::from([String::from("g1"), String::from("g2")])
+        ),
+        "precondition: pending scheduled groups are not query-service ready"
+    );
+    assert!(
+        FSMetaApp::sink_status_snapshot_should_defer_local_republish_after_retained_replay(
+            &snapshot
+        ),
+        "scheduled pending groups with retained stream replay evidence are local catch-up evidence, not a terminal republish failure"
+    );
+}
+
+#[test]
+fn local_sink_status_republish_timeout_does_not_defer_zero_pending_without_schedule_evidence() {
+    let snapshot = crate::sink::SinkStatusSnapshot {
+        groups: vec![
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: String::from("g1"),
+                primary_object_ref: String::from("node-a::g1"),
+                total_nodes: 0,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 0,
+                estimated_heap_bytes: 0,
+            },
+            crate::sink::SinkGroupStatusSnapshot {
+                group_id: String::from("g2"),
+                primary_object_ref: String::from("node-a::g2"),
+                total_nodes: 0,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_materialization: false,
+                readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+                materialized_revision: 0,
+                estimated_heap_bytes: 0,
+            },
+        ],
+        ..crate::sink::SinkStatusSnapshot::default()
+    };
+
+    assert!(
+        !FSMetaApp::sink_status_snapshot_should_defer_local_republish_after_retained_replay(
+            &snapshot
+        ),
+        "local republish must not treat zero pending rows without schedule/control evidence as restored sink ownership"
+    );
+}
+
+#[test]
 fn sink_recovery_machine_local_prioritizes_owned_retrigger_before_waiting_on_source_publication() {
     let runtime = SinkRecoveryMachine::new_local_pretriggered_with_deadline(
         LocalSinkStatusRepublishWaitMode::AllowCachedReadyFastPath,
@@ -3425,6 +3547,25 @@ fn sink_recovery_machine_local_require_probe_pretriggered_publication_ready_prob
 }
 
 #[test]
+fn sink_recovery_machine_local_require_probe_publication_ready_probes_before_sink_materialization()
+{
+    let runtime = SinkRecoveryMachine::new_local_pretriggered_with_deadline(
+        LocalSinkStatusRepublishWaitMode::RequireProbeBeforeReady,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        1,
+    );
+    let mut waiting_after_retrigger = runtime;
+    waiting_after_retrigger.local_state_mut().retrigger_state =
+        SinkRecoveryRetriggerState::Idle { count: 2 };
+
+    assert_eq!(
+        sink_recovery_test_local_step(&waiting_after_retrigger, true, true, true, false, false),
+        SinkRecoveryStep::ProbeReadiness,
+        "require-probe helpers must trigger the readiness probe and retained sink replay once source publication is satisfied; waiting for sink materialization first deadlocks the repair path",
+    );
+}
+
+#[test]
 fn sink_recovery_machine_removes_observation_bundle_phase_inputs() {
     let source = include_str!("runtime_app.rs");
     let production_source = source
@@ -3468,6 +3609,32 @@ fn sink_recovery_machine_post_recovery_waits_for_pretriggered_source_publication
         ),
         SinkRecoveryScopeConvergenceAction::Wait,
         "post-recovery readiness must keep waiting while the owned pretriggered source-rescan request has not yet been observed, even if runtime scope convergence arrives early",
+    );
+}
+
+#[test]
+fn sink_recovery_machine_post_recovery_hands_converged_scope_to_sink_gate_when_pretrigger_epoch_is_lost()
+ {
+    let pretriggered = SinkRecoveryMachine::new_post_recovery(Some(1));
+    let expected = RuntimeScopeExpectedGroups {
+        source_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        scan_groups: std::collections::BTreeSet::from([String::from("g1")]),
+        sink_groups: std::collections::BTreeSet::from([String::from("g1")]),
+    };
+    let converged = RuntimeScopeConvergenceObservation {
+        source_groups: expected.source_groups.clone(),
+        scan_groups: expected.scan_groups.clone(),
+        sink_groups: expected.sink_groups.clone(),
+    };
+
+    assert_eq!(
+        pretriggered.post_recovery_scope_action(
+            &converged,
+            Some(&expected),
+            tokio::time::Instant::now(),
+        ),
+        SinkRecoveryScopeConvergenceAction::Converged,
+        "if a worker restart loses the request epoch after scope convergence, recovery must continue into the sink readiness gate instead of failing before sink materialization can be retriggered",
     );
 }
 
@@ -3652,7 +3819,7 @@ impl ManagementWriteRecoveryContext {
         #[cfg(test)]
         note_sink_apply_entry_for_tests(self.instance_id);
         self.sink
-            .apply_orchestration_signals_with_total_timeout_with_failure(
+            .apply_retained_orchestration_signals_with_total_timeout_with_failure(
                 &signals,
                 SINK_CONTROL_RECOVERY_TOTAL_TIMEOUT,
             )
@@ -7936,7 +8103,9 @@ impl FSMetaApp {
         snapshot: &crate::sink::SinkStatusSnapshot,
     ) -> bool {
         FSMetaApp::sink_status_snapshot_has_scheduled_only_republish_evidence(snapshot)
-            || FSMetaApp::sink_status_snapshot_has_pending_republish_evidence(snapshot)
+            || FSMetaApp::sink_status_snapshot_has_incomplete_scheduled_group_republish_evidence(
+                snapshot,
+            )
     }
 
     async fn wait_for_runtime_progress_observation_window_until<F, Fut>(

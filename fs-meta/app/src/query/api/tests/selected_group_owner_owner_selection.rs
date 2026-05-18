@@ -247,6 +247,52 @@ fn filter_sink_status_snapshot_preserves_same_group_stream_owner_evidence() {
     );
 }
 
+#[test]
+fn current_owner_candidate_nodes_from_sink_status_uses_stream_evidence_without_primary_object_ref() {
+    let snapshot = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-forbidden::nfs1".to_string(),
+            total_nodes: 0,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+            materialized_revision: 0,
+            estimated_heap_bytes: 0,
+        }],
+        stream_applied_origin_counts_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["node-a::nfs1=7".to_string()],
+        )]),
+        stream_ready_origin_counts_by_node: BTreeMap::from([(
+            "node-b".to_string(),
+            vec!["node-b::nfs2=7".to_string()],
+        )]),
+        stream_received_origin_counts_by_node: BTreeMap::from([(
+            "node-empty".to_string(),
+            vec!["node-empty::nfs1=0".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    let candidates = current_owner_candidate_nodes_from_sink_status(
+        &snapshot,
+        &BTreeSet::from(["nfs1".to_string()]),
+    );
+
+    assert_eq!(
+        candidates,
+        vec![NodeId("node-a".to_string())],
+        "candidate routing may use positive same-group stream evidence, but must not infer a node from group.primary_object_ref"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_group_materialized_route_fans_out_candidate_owners_when_sink_status_is_fully_empty(
 ) {
@@ -652,6 +698,204 @@ async fn selected_group_materialized_route_fans_out_candidate_owners_when_sink_s
         boundary.send_batch_count(&proxy_route.0),
         0,
         "pending zero-node status is a collection gap; generic proxy must not be the first selected-group answer"
+    );
+
+    node_a_endpoint.shutdown(Duration::from_secs(2)).await;
+    node_c_endpoint.shutdown(Duration::from_secs(2)).await;
+    proxy_endpoint.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_group_materialized_route_uses_sink_stream_evidence_when_source_owner_is_stale() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_c_root = tmp.path().join("node-c");
+    fs::create_dir_all(node_c_root.join("layout")).expect("create node-c dir");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-c::nfs1".to_string(),
+        host_ref: "node-c".to_string(),
+        host_ip: "10.0.0.3".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: node_c_root,
+        fs_source: "nfs".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let source = source_facade_with_group("nfs1", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let node_a_route = sink_query_request_route_for("node-a");
+    let node_c_route = sink_query_request_route_for("node-c");
+    let proxy_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
+        .expect("resolve sink-query-proxy route");
+
+    let mut node_a_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_a_route.clone(),
+        "test-stream-evidence-node-a-candidate-sink-query-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            requests
+                .into_iter()
+                .map(|req| {
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(
+                        req.payload_bytes(),
+                    )
+                    .expect("decode node-a stream-evidence query request");
+                    let group_id = params
+                        .scope
+                        .selected_group
+                        .clone()
+                        .expect("selected group for node-a stream-evidence request");
+                    mk_event_with_correlation(
+                        &group_id,
+                        req.metadata()
+                            .correlation_id
+                            .expect("node-a request correlation"),
+                        real_materialized_tree_payload_for_test(&params.scope.path),
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+    let mut node_c_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_c_route.clone(),
+        "test-stream-evidence-node-c-candidate-sink-query-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            requests
+                .into_iter()
+                .map(|req| {
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(
+                        req.payload_bytes(),
+                    )
+                    .expect("decode node-c stream-evidence query request");
+                    let group_id = params
+                        .scope
+                        .selected_group
+                        .clone()
+                        .expect("selected group for node-c stream-evidence request");
+                    mk_event_with_correlation(
+                        &group_id,
+                        req.metadata()
+                            .correlation_id
+                            .expect("node-c request correlation"),
+                        empty_materialized_tree_payload_for_test(&params.scope.path),
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+    let mut proxy_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        proxy_route.clone(),
+        "test-stream-evidence-generic-proxy-sink-query-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            requests
+                .into_iter()
+                .map(|req| {
+                    let params = rmp_serde::from_slice::<InternalQueryRequest>(
+                        req.payload_bytes(),
+                    )
+                    .expect("decode proxy stream-evidence query request");
+                    let group_id = params
+                        .scope
+                        .selected_group
+                        .clone()
+                        .expect("selected group for proxy stream-evidence request");
+                    mk_event_with_correlation(
+                        &group_id,
+                        req.metadata()
+                            .correlation_id
+                            .expect("proxy request correlation"),
+                        empty_materialized_tree_payload_for_test(&params.scope.path),
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        boundary.clone(),
+        NodeId("api-node".to_string()),
+    );
+    let selected_group_sink_status = SinkStatusSnapshot {
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "unassigned".to_string(),
+            total_nodes: 0,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+            materialized_revision: 0,
+            estimated_heap_bytes: 0,
+        }],
+        stream_applied_origin_counts_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["node-a::nfs1=9".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+    let result = query_materialized_events_with_selected_group_owner_snapshot(
+        &state,
+        &ProjectionPolicy::default(),
+        build_materialized_tree_request(
+            b"/",
+            true,
+            None,
+            ReadClass::TrustedMaterialized,
+            Some("nfs1".to_string()),
+        ),
+        Duration::from_secs(2),
+        Some(selected_group_sink_status),
+        false,
+        false,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "selected-group trusted materialized route should try sink stream-evidence owner before settling generic empty proxy; node_a_calls={} node_c_calls={} proxy_calls={} err={:?}",
+        boundary.send_batch_count(&node_a_route.0),
+        boundary.send_batch_count(&node_c_route.0),
+        boundary.send_batch_count(&proxy_route.0),
+        result.as_ref().err(),
+    );
+    let payload = decode_materialized_selected_group_response(
+        &result.expect("stream-evidence candidate owner result"),
+        &ProjectionPolicy::default(),
+        "nfs1",
+        b"/",
+    )
+    .expect("decode stream-evidence candidate owner response");
+    assert!(
+        payload.root.exists,
+        "sink stream evidence must keep a stale source owner from masking a live materialized peer"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&node_a_route.0),
+        1,
+        "node with same-group stream-applied evidence should be queried as a candidate owner"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&proxy_route.0),
+        0,
+        "generic proxy must not settle an empty selected-group answer while stream-evidence candidates are available"
     );
 
     node_a_endpoint.shutdown(Duration::from_secs(2)).await;

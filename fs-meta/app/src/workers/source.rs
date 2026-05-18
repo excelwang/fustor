@@ -4539,8 +4539,20 @@ pub(crate) struct SourceWorkerObservabilityErrorHook {
 }
 
 #[cfg(test)]
+struct SourceWorkerObservabilityErrorHookState {
+    hook: SourceWorkerObservabilityErrorHook,
+    worker_instance_id: Option<u64>,
+}
+
+#[cfg(test)]
 pub(crate) struct SourceWorkerObservabilityDelayHook {
     pub delay: Duration,
+}
+
+#[cfg(test)]
+struct SourceWorkerObservabilityDelayHookState {
+    hook: SourceWorkerObservabilityDelayHook,
+    worker_instance_id: Option<u64>,
 }
 
 #[cfg(test)]
@@ -4705,16 +4717,16 @@ fn source_worker_status_error_hook_cell() -> &'static Mutex<Option<SourceWorkerS
 
 #[cfg(test)]
 fn source_worker_observability_error_hook_cell()
--> &'static Mutex<Option<SourceWorkerObservabilityErrorHook>> {
-    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerObservabilityErrorHook>>> =
+-> &'static Mutex<Option<SourceWorkerObservabilityErrorHookState>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerObservabilityErrorHookState>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
 
 #[cfg(test)]
 fn source_worker_observability_delay_hook_cell()
--> &'static Mutex<Option<SourceWorkerObservabilityDelayHook>> {
-    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerObservabilityDelayHook>>> =
+-> &'static Mutex<Option<SourceWorkerObservabilityDelayHookState>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerObservabilityDelayHookState>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
@@ -5088,11 +5100,30 @@ pub(crate) fn install_source_worker_status_error_hook(hook: SourceWorkerStatusEr
 pub(crate) fn install_source_worker_observability_error_hook(
     hook: SourceWorkerObservabilityErrorHook,
 ) {
+    install_source_worker_observability_error_hook_state(hook, None);
+}
+
+#[cfg(test)]
+pub(crate) fn install_source_worker_observability_error_hook_for_worker_instance(
+    worker_instance_id: u64,
+    hook: SourceWorkerObservabilityErrorHook,
+) {
+    install_source_worker_observability_error_hook_state(hook, Some(worker_instance_id));
+}
+
+#[cfg(test)]
+fn install_source_worker_observability_error_hook_state(
+    hook: SourceWorkerObservabilityErrorHook,
+    worker_instance_id: Option<u64>,
+) {
     let mut guard = match source_worker_observability_error_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    *guard = Some(hook);
+    *guard = Some(SourceWorkerObservabilityErrorHookState {
+        hook,
+        worker_instance_id,
+    });
 }
 
 #[cfg(test)]
@@ -5110,11 +5141,30 @@ pub(crate) fn install_source_worker_observability_call_count_hook(
 pub(crate) fn install_source_worker_observability_delay_hook(
     hook: SourceWorkerObservabilityDelayHook,
 ) {
+    install_source_worker_observability_delay_hook_state(hook, None);
+}
+
+#[cfg(test)]
+pub(crate) fn install_source_worker_observability_delay_hook_for_worker_instance(
+    worker_instance_id: u64,
+    hook: SourceWorkerObservabilityDelayHook,
+) {
+    install_source_worker_observability_delay_hook_state(hook, Some(worker_instance_id));
+}
+
+#[cfg(test)]
+fn install_source_worker_observability_delay_hook_state(
+    hook: SourceWorkerObservabilityDelayHook,
+    worker_instance_id: Option<u64>,
+) {
     let mut guard = match source_worker_observability_delay_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    *guard = Some(hook);
+    *guard = Some(SourceWorkerObservabilityDelayHookState {
+        hook,
+        worker_instance_id,
+    });
 }
 
 #[cfg(test)]
@@ -5333,21 +5383,35 @@ async fn maybe_pause_before_logical_roots_snapshot_rpc() -> Option<Vec<RootSpec>
 }
 
 #[cfg(test)]
-fn take_source_worker_observability_error_hook() -> Option<CnxError> {
+fn take_source_worker_observability_error_hook(
+    current_worker_instance_id: u64,
+) -> Option<CnxError> {
     let mut guard = match source_worker_observability_error_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.take().map(|hook| hook.err)
+    let hook = guard.as_ref()?;
+    if let Some(worker_instance_id) = hook.worker_instance_id
+        && worker_instance_id != current_worker_instance_id
+    {
+        return None;
+    }
+    guard.take().map(|hook| hook.hook.err)
 }
 
 #[cfg(test)]
-fn source_worker_observability_delay_hook() -> Option<Duration> {
+fn source_worker_observability_delay_hook(current_worker_instance_id: u64) -> Option<Duration> {
     let guard = match source_worker_observability_delay_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.as_ref().map(|hook| hook.delay)
+    let hook = guard.as_ref()?;
+    if let Some(worker_instance_id) = hook.worker_instance_id
+        && worker_instance_id != current_worker_instance_id
+    {
+        return None;
+    }
+    Some(hook.hook.delay)
 }
 
 #[cfg(test)]
@@ -7453,15 +7517,17 @@ impl SourceWorkerClientHandle {
         &self,
         timeout: Duration,
     ) -> std::result::Result<SourceWorkerResponse, CnxError> {
+        #[cfg(test)]
+        let worker_instance_id = self.worker_instance_id_for_tests().await;
         let attempt = self.with_started_retry_with_failure(|client| async move {
             #[cfg(test)]
             record_source_worker_observability_rpc_attempt();
             #[cfg(test)]
-            if let Some(delay) = source_worker_observability_delay_hook() {
+            if let Some(delay) = source_worker_observability_delay_hook(worker_instance_id) {
                 tokio::time::sleep(delay).await;
             }
             #[cfg(test)]
-            if let Some(err) = take_source_worker_observability_error_hook() {
+            if let Some(err) = take_source_worker_observability_error_hook(worker_instance_id) {
                 return Err(SourceFailure::from(err));
             }
             Self::call_worker_with_failure(

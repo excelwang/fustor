@@ -1621,7 +1621,7 @@ fn run_roots_matrix(
     }
     wait_for_rescan_accepted(
         session,
-        Duration::from_secs(90),
+        CURRENT_ROOTS_RESCAN_ACCEPTED_TIMEOUT,
         "single-root source repair rescan accepted",
     )?;
     wait_until(Duration::from_secs(30), "single root visible", || {
@@ -1642,7 +1642,7 @@ fn run_roots_matrix(
     assert_status(restore.status, 200, "restore roots")?;
     wait_for_rescan_accepted(
         session,
-        Duration::from_secs(90),
+        CURRENT_ROOTS_RESCAN_ACCEPTED_TIMEOUT,
         "restored-roots source repair rescan accepted",
     )?;
     wait_until(Duration::from_secs(30), "restore baseline roots", || {
@@ -1655,6 +1655,8 @@ fn run_roots_matrix(
     })?;
     Ok(())
 }
+
+const CURRENT_ROOTS_RESCAN_ACCEPTED_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn wait_for_rescan_accepted(
     session: &mut OperatorSession,

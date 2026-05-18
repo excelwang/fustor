@@ -8,6 +8,7 @@
         let _serial = roots_put_close_and_control_barrier_test_serial()
             .lock()
             .await;
+        let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -139,6 +140,7 @@
         crate::api::install_roots_put_pause_hook(crate::api::RootsPutPauseHook {
             entered: entered.clone(),
             release: release.clone(),
+            selector_token: Some(fs_source.clone()),
         });
 
         let roots_body = json!({
@@ -203,6 +205,7 @@
         let _serial = roots_put_close_and_control_barrier_test_serial()
             .lock()
             .await;
+        let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -329,6 +332,7 @@
         crate::api::install_roots_put_pause_hook(crate::api::RootsPutPauseHook {
             entered: entered.clone(),
             release: release.clone(),
+            selector_token: Some(fs_source.clone()),
         });
 
         let roots_body = json!({
@@ -568,6 +572,7 @@
         let _serial = roots_put_close_and_control_barrier_test_serial()
             .lock()
             .await;
+        let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -689,6 +694,7 @@
         crate::api::install_roots_put_pause_hook(crate::api::RootsPutPauseHook {
             entered: entered.clone(),
             release: release.clone(),
+            selector_token: Some(fs_source.clone()),
         });
 
         let close_started = Arc::new(Notify::new());
@@ -760,6 +766,7 @@
         let _serial = roots_put_close_and_control_barrier_test_serial()
             .lock()
             .await;
+        let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -883,6 +890,7 @@
         crate::api::install_roots_put_before_response_hook(crate::api::RootsPutBeforeResponseHook {
             entered: response_entered.clone(),
             release: response_release.clone(),
+            selector_token: Some(fs_source.clone()),
         });
 
         let shutdown_started = Arc::new(Notify::new());
@@ -956,6 +964,7 @@
         let _serial = roots_put_close_and_control_barrier_test_serial()
             .lock()
             .await;
+        let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -1128,6 +1137,7 @@
         let _serial = roots_put_close_and_control_barrier_test_serial()
             .lock()
             .await;
+        let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -1251,6 +1261,7 @@
         crate::api::install_roots_put_pause_hook(crate::api::RootsPutPauseHook {
             entered: entered.clone(),
             release: release.clone(),
+            selector_token: Some(fs_source.clone()),
         });
 
         let control_started = Arc::new(Notify::new());

@@ -2533,6 +2533,14 @@ impl SinkWorkerClientHandle {
         Ok(())
     }
 
+    fn cached_status_snapshot_with_republished_scheduled_groups(
+        &self,
+    ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
+        self.republish_cached_scheduled_groups_into_empty_status_summary()
+            .map_err(SinkFailure::from)?;
+        self.cached_status_snapshot_with_failure()
+    }
+
     fn retain_cached_status_for_surviving_roots(
         &self,
         roots: &[crate::source::config::RootSpec],
@@ -2822,20 +2830,6 @@ impl SinkWorkerClientHandle {
             }
         }
         result
-    }
-
-    async fn with_started_once_with_failure<T, F, Fut>(
-        &self,
-        op: F,
-    ) -> std::result::Result<T, SinkFailure>
-    where
-        F: FnOnce(TypedWorkerClient<SinkWorkerRpc>) -> Fut,
-        Fut: std::future::Future<Output = std::result::Result<T, SinkFailure>>,
-    {
-        self.worker_client()
-            .await
-            .with_started_once_mapped(op, SinkFailure::into_error)
-            .await
     }
 
     #[cfg(test)]
@@ -3206,6 +3200,7 @@ impl SinkWorkerClientHandle {
     ) -> std::result::Result<SinkStatusNonblockingEntryAction, SinkFailure> {
         let mut snapshot = self.cached_status_snapshot_with_failure()?;
         if self.control_op_inflight() {
+            snapshot = self.cached_status_snapshot_with_republished_scheduled_groups()?;
             return Ok(SinkStatusNonblockingEntryAction::ReturnCached {
                 snapshot,
                 access_path: SinkStatusAccessPath::ControlInflight,
@@ -3392,9 +3387,11 @@ impl SinkWorkerClientHandle {
         err: Option<SinkFailure>,
     ) -> std::result::Result<SinkStatusSnapshot, SinkFailure> {
         let outcome = evaluate_cached_sink_status_snapshot(&snapshot, access_path);
+        let mut snapshot = snapshot;
         if outcome.should_republish_zero_row_summary {
             self.republish_cached_scheduled_groups_into_empty_status_summary()
                 .map_err(SinkFailure::from)?;
+            snapshot = self.cached_status_snapshot_with_failure()?;
         }
         let err_cause = err.as_ref().map(SinkFailure::as_error);
         let reason =
@@ -3604,7 +3601,7 @@ impl SinkWorkerClientHandle {
         let control_inflight = self.control_op_inflight();
         if replay_required || control_inflight {
             let snapshot = self
-                .cached_status_snapshot_with_failure()
+                .cached_status_snapshot_with_republished_scheduled_groups()
                 .unwrap_or_else(|_| SinkStatusSnapshot::default());
             if debug_control_scope_capture_enabled() {
                 let reason = if replay_required {
@@ -3652,7 +3649,7 @@ impl SinkWorkerClientHandle {
             }
             Err(err) => {
                 let snapshot = self
-                    .cached_status_snapshot_with_failure()
+                    .cached_status_snapshot_with_republished_scheduled_groups()
                     .unwrap_or_else(|_| SinkStatusSnapshot::default());
                 if debug_control_scope_capture_enabled() {
                     eprintln!(
@@ -3667,7 +3664,7 @@ impl SinkWorkerClientHandle {
         };
         outcome.unwrap_or_else(|err| {
             let snapshot = self
-                .cached_status_snapshot_with_failure()
+                .cached_status_snapshot_with_republished_scheduled_groups()
                 .unwrap_or_else(|_| SinkStatusSnapshot::default());
             if debug_control_scope_capture_enabled() {
                 eprintln!(
@@ -4273,7 +4270,7 @@ impl SinkWorkerClientHandle {
             let attempt = if retained_replay_fail_closed {
                 tokio::time::timeout(
                     attempt_timeout,
-                    self.with_started_once_with_failure(|client| {
+                    self.with_started_retry_with_failure(|client| {
                         let envelopes = envelopes.clone();
                         async move {
                             #[cfg(test)]
@@ -4946,6 +4943,45 @@ impl SinkFacade {
                         envelopes,
                         control_frame_total_timeout,
                         rpc_timeout,
+                    )
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn apply_retained_orchestration_signals_with_total_timeout_with_failure(
+        &self,
+        signals: &[SinkControlSignal],
+        total_timeout: Duration,
+    ) -> std::result::Result<(), SinkFailure> {
+        if total_timeout.is_zero() {
+            return Err(SinkFailure::retry_budget_exhausted(
+                SinkRetryBudgetExhaustionKind::ControlFrameAttempt,
+            ));
+        }
+        match self {
+            Self::Local(sink) => map_sink_failure_timeout_result(
+                tokio::time::timeout(
+                    total_timeout,
+                    sink.apply_orchestration_signals_with_failure(signals),
+                )
+                .await,
+                SinkRetryBudgetExhaustionKind::ControlFrameAttempt,
+            ),
+            Self::Worker(client) => {
+                let control_frame_total_timeout = std::cmp::min(
+                    total_timeout,
+                    SINK_WORKER_EXISTING_CLIENT_CONTROL_RPC_TIMEOUT,
+                );
+                let envelopes = signals
+                    .iter()
+                    .map(SinkControlSignal::envelope)
+                    .collect::<Vec<_>>();
+                client
+                    .on_control_frame_retained_replay_with_timeouts_with_failure(
+                        envelopes,
+                        control_frame_total_timeout,
+                        control_frame_total_timeout,
                     )
                     .await
             }

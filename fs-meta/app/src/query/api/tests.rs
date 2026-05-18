@@ -232,6 +232,7 @@ struct SourceStatusOkSinkStatusTimeoutBoundary {
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
     source_reply_sent: std::sync::atomic::AtomicBool,
+    changed: tokio::sync::Notify,
 }
 
 struct SourceStatusSendMissingRouteStateSinkStatusOkBoundary {
@@ -255,6 +256,7 @@ struct SourceStatusRetryThenReplyBoundary {
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
     source_reply_sent: std::sync::atomic::AtomicBool,
     sink_reply_sent: std::sync::atomic::AtomicBool,
+    changed: tokio::sync::Notify,
 }
 
 struct SourceStatusMissingRouteStateThenReplyBoundary {
@@ -281,6 +283,7 @@ struct SourceStatusOkSinkStatusExplicitEmptyThenReadyBoundary {
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
     source_reply_sent: std::sync::atomic::AtomicBool,
+    changed: tokio::sync::Notify,
 }
 
 struct SinkStatusInternalRetryThenReplyBoundary {
@@ -290,8 +293,10 @@ struct SinkStatusInternalRetryThenReplyBoundary {
     recv_batches_by_channel: std::sync::Mutex<HashMap<String, usize>>,
     correlations_by_channel: std::sync::Mutex<HashMap<String, u64>>,
     sink_reply_sent: std::sync::atomic::AtomicBool,
+    retryable_gap_sent: std::sync::atomic::AtomicBool,
     first_retryable_gap_at: std::sync::Mutex<Option<std::time::Instant>>,
     second_send_at: std::sync::Mutex<Option<std::time::Instant>>,
+    changed: tokio::sync::Notify,
 }
 
 struct SinkStatusPeerTransportRetryThenReplyBoundary {
@@ -748,6 +753,31 @@ impl ReusableObservedRouteBoundary {
             .get(channel)
             .unwrap_or(&0)
     }
+
+    async fn wait_for_request_correlation(&self, channel: &str) -> u64 {
+        loop {
+            let notified = self.changed.notified();
+            {
+                let mut channels = self.channels.lock().await;
+                if let Some(events) = channels.remove(channel)
+                    && let Some(correlation) = events
+                        .first()
+                        .and_then(|event| event.metadata().correlation_id)
+                {
+                    return correlation;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    async fn enqueue_events(&self, channel: String, events: Vec<Event>) {
+        {
+            let mut channels = self.channels.lock().await;
+            channels.entry(channel).or_default().extend(events);
+        }
+        self.changed.notify_waiters();
+    }
 }
 
 impl SourceStatusTimeoutSinkStatusOkBoundary {
@@ -796,6 +826,7 @@ impl SourceStatusOkSinkStatusTimeoutBoundary {
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
             source_reply_sent: std::sync::atomic::AtomicBool::new(false),
+            changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -857,6 +888,7 @@ impl SourceStatusRetryThenReplyBoundary {
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
             source_reply_sent: std::sync::atomic::AtomicBool::new(false),
             sink_reply_sent: std::sync::atomic::AtomicBool::new(false),
+            changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -1029,6 +1061,7 @@ impl SourceStatusOkSinkStatusExplicitEmptyThenReadyBoundary {
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
             source_reply_sent: std::sync::atomic::AtomicBool::new(false),
+            changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -1054,8 +1087,10 @@ impl SinkStatusInternalRetryThenReplyBoundary {
             recv_batches_by_channel: std::sync::Mutex::new(HashMap::new()),
             correlations_by_channel: std::sync::Mutex::new(HashMap::new()),
             sink_reply_sent: std::sync::atomic::AtomicBool::new(false),
+            retryable_gap_sent: std::sync::atomic::AtomicBool::new(false),
             first_retryable_gap_at: std::sync::Mutex::new(None),
             second_send_at: std::sync::Mutex::new(None),
+            changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -1812,6 +1847,7 @@ impl ChannelIoSubset for SourceStatusOkSinkStatusTimeoutBoundary {
             .lock()
             .expect("source ok sink timeout boundary send batches lock");
         *send_batches.entry(request.channel_key.0).or_default() += 1;
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -1820,32 +1856,47 @@ impl ChannelIoSubset for SourceStatusOkSinkStatusTimeoutBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        let mut recv_batches = self
-            .recv_batches_by_channel
-            .lock()
-            .expect("source ok sink timeout boundary recv batches lock");
-        *recv_batches
-            .entry(request.channel_key.0.clone())
-            .or_default() += 1;
-        drop(recv_batches);
-        if request.channel_key.0 == self.source_reply_channel
-            && !self
-                .source_reply_sent
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            let request_channel = self.source_reply_channel.trim_end_matches(":reply");
-            let correlation = self
-                .correlations_by_channel
+            let mut recv_batches = self
+                .recv_batches_by_channel
                 .lock()
-                .expect("source ok sink timeout boundary correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
-            return Ok(vec![mk_event_with_correlation(
-                "node-b",
-                correlation,
-                self.source_status_payload.clone(),
-            )]);
+                .expect("source ok sink timeout boundary recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+        }
+        if request.channel_key.0 == self.source_reply_channel {
+            let request_channel = self.source_reply_channel.trim_end_matches(":reply");
+            loop {
+                if self
+                    .source_reply_sent
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(CnxError::Timeout);
+                }
+                let correlation = {
+                    self.correlations_by_channel
+                        .lock()
+                        .expect("source ok sink timeout boundary correlations lock")
+                        .get(request_channel)
+                        .copied()
+                };
+                let Some(correlation) = correlation else {
+                    self.changed.notified().await;
+                    continue;
+                };
+                if self
+                    .source_reply_sent
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(CnxError::Timeout);
+                }
+                return Ok(vec![mk_event_with_correlation(
+                    "node-b",
+                    correlation,
+                    self.source_status_payload.clone(),
+                )]);
+            }
         }
         Err(CnxError::Timeout)
     }
@@ -1949,6 +2000,7 @@ impl ChannelIoSubset for SourceStatusRetryThenReplyBoundary {
         *send_batches
             .entry(request.channel_key.0.clone())
             .or_default() += 1;
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -1957,24 +2009,31 @@ impl ChannelIoSubset for SourceStatusRetryThenReplyBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        let mut recv_batches = self
-            .recv_batches_by_channel
-            .lock()
-            .expect("source retry boundary recv batches lock");
-        *recv_batches
-            .entry(request.channel_key.0.clone())
-            .or_default() += 1;
-        drop(recv_batches);
+        {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("source retry boundary recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+        }
 
         if request.channel_key.0 == self.source_reply_channel {
             let request_channel = self.source_reply_channel.trim_end_matches(":reply");
-            let send_count = self
-                .send_batches_by_channel
-                .lock()
-                .expect("source retry boundary send batches lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or_default();
+            let send_count = loop {
+                let send_count = self
+                    .send_batches_by_channel
+                    .lock()
+                    .expect("source retry boundary send batches lock")
+                    .get(request_channel)
+                    .copied()
+                    .unwrap_or_default();
+                if send_count > 0 {
+                    break send_count;
+                }
+                self.changed.notified().await;
+            };
             if send_count < 2 {
                 return Err(CnxError::Timeout);
             }
@@ -1984,13 +2043,18 @@ impl ChannelIoSubset for SourceStatusRetryThenReplyBoundary {
             {
                 return Err(CnxError::Timeout);
             }
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("source retry boundary correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
+            let correlation = loop {
+                let correlation = self
+                    .correlations_by_channel
+                    .lock()
+                    .expect("source retry boundary correlations lock")
+                    .get(request_channel)
+                    .copied();
+                if let Some(correlation) = correlation {
+                    break correlation;
+                }
+                self.changed.notified().await;
+            };
             return Ok(vec![mk_event_with_correlation(
                 "node-b",
                 correlation,
@@ -2004,13 +2068,18 @@ impl ChannelIoSubset for SourceStatusRetryThenReplyBoundary {
                 .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
             let request_channel = self.sink_reply_channel.trim_end_matches(":reply");
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("source retry boundary correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
+            let correlation = loop {
+                let correlation = self
+                    .correlations_by_channel
+                    .lock()
+                    .expect("source retry boundary correlations lock")
+                    .get(request_channel)
+                    .copied();
+                if let Some(correlation) = correlation {
+                    break correlation;
+                }
+                self.changed.notified().await;
+            };
             return Ok(vec![mk_event_with_correlation(
                 "node-a",
                 correlation,
@@ -2149,6 +2218,7 @@ impl ChannelIoSubset for SourceStatusOkSinkStatusExplicitEmptyThenReadyBoundary 
             .lock()
             .expect("source/sink explicit-empty-then-ready boundary send batches lock");
         *send_batches.entry(request.channel_key.0).or_default() += 1;
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -2157,37 +2227,64 @@ impl ChannelIoSubset for SourceStatusOkSinkStatusExplicitEmptyThenReadyBoundary 
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        let mut recv_batches = self
-            .recv_batches_by_channel
-            .lock()
-            .expect("source/sink explicit-empty-then-ready boundary recv batches lock");
-        *recv_batches
-            .entry(request.channel_key.0.clone())
-            .or_default() += 1;
-        drop(recv_batches);
+        {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("source/sink explicit-empty-then-ready boundary recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+        }
 
         if request.channel_key.0 == self.source_reply_channel {
-            if self
-                .source_reply_sent
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(CnxError::Timeout);
-            }
             let request_channel = self.source_reply_channel.trim_end_matches(":reply");
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("source/sink explicit-empty-then-ready boundary correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
-            return Ok(vec![mk_event_with_correlation(
-                "node-a",
-                correlation,
-                self.source_status_payload.clone(),
-            )]);
+            loop {
+                if self
+                    .source_reply_sent
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(CnxError::Timeout);
+                }
+                let correlation = {
+                    self.correlations_by_channel
+                        .lock()
+                        .expect("source/sink explicit-empty-then-ready boundary correlations lock")
+                        .get(request_channel)
+                        .copied()
+                };
+                let Some(correlation) = correlation else {
+                    self.changed.notified().await;
+                    continue;
+                };
+                if self
+                    .source_reply_sent
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(CnxError::Timeout);
+                }
+                return Ok(vec![mk_event_with_correlation(
+                    "node-a",
+                    correlation,
+                    self.source_status_payload.clone(),
+                )]);
+            }
         }
         if request.channel_key.0 == self.sink_reply_channel {
+            let request_channel = self.sink_reply_channel.trim_end_matches(":reply");
+            let correlation = loop {
+                let correlation = {
+                    self.correlations_by_channel
+                        .lock()
+                        .expect("source/sink explicit-empty-then-ready boundary correlations lock")
+                        .get(request_channel)
+                        .copied()
+                };
+                if let Some(correlation) = correlation {
+                    break correlation;
+                }
+                self.changed.notified().await;
+            };
             let payload = self
                 .sink_status_payloads
                 .lock()
@@ -2197,14 +2294,6 @@ impl ChannelIoSubset for SourceStatusOkSinkStatusExplicitEmptyThenReadyBoundary 
             if payload.is_empty() {
                 return Err(CnxError::Timeout);
             }
-            let request_channel = self.sink_reply_channel.trim_end_matches(":reply");
-            let correlation = self
-                .correlations_by_channel
-                .lock()
-                .expect("source/sink explicit-empty-then-ready boundary correlations lock")
-                .get(request_channel)
-                .copied()
-                .unwrap_or(1);
             return Ok(vec![mk_event_with_correlation(
                 "node-a",
                 correlation,
@@ -2247,6 +2336,7 @@ impl ChannelIoSubset for SinkStatusInternalRetryThenReplyBoundary {
                 .lock()
                 .expect("sink retry boundary second send lock") = Some(std::time::Instant::now());
         }
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -2255,37 +2345,53 @@ impl ChannelIoSubset for SinkStatusInternalRetryThenReplyBoundary {
         _ctx: BoundaryContext,
         request: ChannelRecvRequest,
     ) -> capanix_app_sdk::Result<Vec<Event>> {
-        let mut recv_batches = self
-            .recv_batches_by_channel
-            .lock()
-            .expect("sink retry boundary recv batches lock");
-        *recv_batches
-            .entry(request.channel_key.0.clone())
-            .or_default() += 1;
-        drop(recv_batches);
+        {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("sink retry boundary recv batches lock");
+            *recv_batches
+                .entry(request.channel_key.0.clone())
+                .or_default() += 1;
+        }
 
         if request.channel_key.0 != self.sink_reply_channel {
             return Err(CnxError::Timeout);
         }
         let request_channel = self.sink_reply_channel.trim_end_matches(":reply");
-        let send_count = self
-            .send_batches_by_channel
-            .lock()
-            .expect("sink retry boundary send batches lock")
-            .get(request_channel)
-            .copied()
-            .unwrap_or_default();
-        if send_count < 2 {
-            let mut first_retryable_gap_at = self
-                .first_retryable_gap_at
-                .lock()
-                .expect("sink retry boundary first gap lock");
-            if first_retryable_gap_at.is_none() {
-                *first_retryable_gap_at = Some(std::time::Instant::now());
+        loop {
+            let send_count = {
+                self.send_batches_by_channel
+                    .lock()
+                    .expect("sink retry boundary send batches lock")
+                    .get(request_channel)
+                    .copied()
+                    .unwrap_or_default()
+            };
+            if send_count == 0
+                || (send_count < 2
+                    && self
+                        .retryable_gap_sent
+                        .load(std::sync::atomic::Ordering::SeqCst))
+            {
+                self.changed.notified().await;
+                continue;
             }
-            return Err(CnxError::Internal(
-                "simulated transient internal sink-status collect gap".into(),
-            ));
+            if send_count < 2 {
+                self.retryable_gap_sent
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let mut first_retryable_gap_at = self
+                    .first_retryable_gap_at
+                    .lock()
+                    .expect("sink retry boundary first gap lock");
+                if first_retryable_gap_at.is_none() {
+                    *first_retryable_gap_at = Some(std::time::Instant::now());
+                }
+                return Err(CnxError::Internal(
+                    "simulated transient internal sink-status collect gap".into(),
+                ));
+            }
+            break;
         }
         if self
             .sink_reply_sent
@@ -6491,7 +6597,7 @@ async fn owner_collection_gap_route_waits_for_l5_upgrade_primary_under_event_rep
 }
 
 #[test]
-fn decode_materialized_selected_group_response_prefers_newer_empty_same_path_payload_over_older_richer_payload()
+fn decode_materialized_selected_group_response_prefers_live_same_path_payload_over_newer_empty_payload()
  {
     let older_rich = Event::new(
         EventMetadata {
@@ -6528,12 +6634,12 @@ fn decode_materialized_selected_group_response_prefers_newer_empty_same_path_pay
     .expect("decode same-path duplicate selected-group response");
 
     assert!(
-        !payload.root.exists,
-        "newer empty same-path payload should beat an older richer payload so stale subtree data does not reopen a current empty /nested result"
+        payload.root.exists,
+        "same-path live payload should beat a newer empty payload so a stale empty duplicate does not hide materialized data"
     );
     assert!(
-        payload.entries.is_empty(),
-        "newer empty same-path payload should clear stale entries from older duplicate responses"
+        !payload.entries.is_empty(),
+        "same-path live payload should preserve richer entries from duplicate responses"
     );
 }
 
@@ -8010,6 +8116,407 @@ async fn trusted_materialized_status_fanin_uses_routed_source_observation_for_cu
         .shutdown(Duration::from_secs(2))
         .await;
     node_a_sink_status_endpoint
+        .shutdown(Duration::from_secs(2))
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trusted_materialized_status_fanin_uses_explicit_sink_primary_host_for_zero_pending_sink_status()
+ {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    let roots = vec![RootSpec::new("nfs1", nfs1)];
+    let source = source_facade_with_roots(roots.clone(), &[]);
+    let sink = sink_facade_with_group(&[]);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let source_status_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+        .expect("resolve source-status route");
+    let generic_sink_status_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+        .expect("resolve sink-status route");
+    let node_a_sink_status_route = sink_status_request_route_for("node-a");
+
+    let source_status_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+        lifecycle_state: "running".into(),
+        host_object_grants_version: 1,
+        grants: Vec::new(),
+        logical_roots: roots,
+        status: SourceStatusSnapshot {
+            current_stream_generation: Some(9),
+            logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".into(),
+                status: "ok".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            }],
+            ..SourceStatusSnapshot::default()
+        },
+        source_primary_by_group: BTreeMap::new(),
+        last_force_find_runner_by_group: BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: BTreeMap::new(),
+        scheduled_scan_groups_by_node: BTreeMap::new(),
+        last_control_frame_signals_by_node: BTreeMap::new(),
+        published_batches_by_node: BTreeMap::new(),
+        published_events_by_node: BTreeMap::new(),
+        published_control_events_by_node: BTreeMap::new(),
+        published_data_events_by_node: BTreeMap::new(),
+        last_published_at_us_by_node: BTreeMap::new(),
+        last_published_origins_by_node: BTreeMap::new(),
+        published_origin_counts_by_node: BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: BTreeMap::new(),
+        pending_path_origin_counts_by_node: BTreeMap::new(),
+        yielded_path_origin_counts_by_node: BTreeMap::new(),
+        summarized_path_origin_counts_by_node: BTreeMap::new(),
+        published_path_origin_counts_by_node: BTreeMap::new(),
+    })
+    .expect("encode source-status payload");
+    let mut zero_pending_group = sink_group_status("nfs1", false);
+    zero_pending_group.primary_object_ref = "node-a::nfs1".to_string();
+    zero_pending_group.total_nodes = 0;
+    zero_pending_group.live_nodes = 0;
+    zero_pending_group.shadow_time_us = 0;
+    let generic_sink_status_payload = rmp_serde::to_vec_named(&SinkStatusSnapshot {
+        primary_host_ref_by_group: BTreeMap::from([("nfs1".to_string(), "node-a".to_string())]),
+        groups: vec![zero_pending_group],
+        ..SinkStatusSnapshot::default()
+    })
+    .expect("encode generic sink-status payload");
+    let node_a_sink_status_payload = rmp_serde::to_vec_named(&SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        groups: vec![sink_group_status("nfs1", true)],
+        ..SinkStatusSnapshot::default()
+    })
+    .expect("encode node-a sink-status payload");
+
+    let mut source_status_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        source_status_route.clone(),
+        "test-sink-primary-host-source-status",
+        CancellationToken::new(),
+        move |requests| {
+            let source_status_payload = source_status_payload.clone();
+            async move {
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        mk_event_with_correlation(
+                            "source-status",
+                            req.metadata()
+                                .correlation_id
+                                .expect("source-status request correlation"),
+                            source_status_payload.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        },
+    );
+    let mut generic_sink_status_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        generic_sink_status_route.clone(),
+        "test-sink-primary-host-generic-sink-status",
+        CancellationToken::new(),
+        move |requests| {
+            let generic_sink_status_payload = generic_sink_status_payload.clone();
+            async move {
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        mk_event_with_correlation(
+                            "generic-sink-status",
+                            req.metadata()
+                                .correlation_id
+                                .expect("generic sink-status request correlation"),
+                            generic_sink_status_payload.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        },
+    );
+    let mut node_a_sink_status_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_a_sink_status_route.clone(),
+        "test-sink-primary-host-node-a-sink-status",
+        CancellationToken::new(),
+        move |requests| {
+            let node_a_sink_status_payload = node_a_sink_status_payload.clone();
+            async move {
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        mk_event_with_correlation(
+                            "node-a",
+                            req.metadata()
+                                .correlation_id
+                                .expect("node-a sink-status request correlation"),
+                            node_a_sink_status_payload.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        },
+    );
+
+    let state = ApiState {
+        backend: QueryBackend::Route {
+            sink: sink.clone(),
+            boundary: boundary.clone(),
+            origin_id: NodeId("api-node".to_string()),
+            source: source.clone(),
+        },
+        policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+        pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
+        force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+        force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
+        readiness_source: Some(source),
+        readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
+        materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
+        tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
+    };
+
+    let (_source_status, sink_status) = load_materialized_status_snapshots(&state)
+        .await
+        .expect("load materialized status snapshots");
+    let readiness_groups = BTreeSet::from(["nfs1".to_string()]);
+
+    assert!(
+        sink_status_covers_ready_readiness_groups(&sink_status, &readiness_groups),
+        "trusted-materialized readiness must use explicit sink primary_host_ref owner evidence when generic sink-status has only zero pending rows; sink_status={}",
+        summarize_sink_status_route_snapshot(&sink_status)
+    );
+    assert_eq!(
+        boundary.send_batch_count(&node_a_sink_status_route.0),
+        1,
+        "explicit sink primary_host_ref owner route should be queried for zero pending sink readiness"
+    );
+
+    source_status_endpoint
+        .shutdown(Duration::from_secs(2))
+        .await;
+    generic_sink_status_endpoint
+        .shutdown(Duration::from_secs(2))
+        .await;
+    node_a_sink_status_endpoint
+        .shutdown(Duration::from_secs(2))
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trusted_materialized_status_fanin_waits_for_late_owner_reply_after_same_route_empty_reply()
+{
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let nfs1 = tmp.path().join("nfs1");
+    fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+    let roots = vec![RootSpec::new("nfs1", nfs1)];
+    let source = source_facade_with_roots(roots.clone(), &[]);
+    let sink = sink_facade_with_group(&[]);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let source_status_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+        .expect("resolve source-status route");
+    let generic_sink_status_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+        .expect("resolve sink-status route");
+    let node_a_sink_status_route = sink_status_request_route_for("node-a");
+    let node_a_reply_channel = format!("{}:reply", node_a_sink_status_route.0);
+
+    let source_status_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+        lifecycle_state: "running".into(),
+        host_object_grants_version: 1,
+        grants: Vec::new(),
+        logical_roots: roots,
+        status: SourceStatusSnapshot {
+            current_stream_generation: Some(9),
+            logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: "nfs1".into(),
+                status: "ok".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "realtime_hotset_plus_audit".into(),
+            }],
+            ..SourceStatusSnapshot::default()
+        },
+        source_primary_by_group: BTreeMap::new(),
+        last_force_find_runner_by_group: BTreeMap::new(),
+        force_find_inflight_groups: Vec::new(),
+        scheduled_source_groups_by_node: BTreeMap::new(),
+        scheduled_scan_groups_by_node: BTreeMap::new(),
+        last_control_frame_signals_by_node: BTreeMap::new(),
+        published_batches_by_node: BTreeMap::new(),
+        published_events_by_node: BTreeMap::new(),
+        published_control_events_by_node: BTreeMap::new(),
+        published_data_events_by_node: BTreeMap::new(),
+        last_published_at_us_by_node: BTreeMap::new(),
+        last_published_origins_by_node: BTreeMap::new(),
+        published_origin_counts_by_node: BTreeMap::new(),
+        published_path_capture_target: None,
+        enqueued_path_origin_counts_by_node: BTreeMap::new(),
+        pending_path_origin_counts_by_node: BTreeMap::new(),
+        yielded_path_origin_counts_by_node: BTreeMap::new(),
+        summarized_path_origin_counts_by_node: BTreeMap::new(),
+        published_path_origin_counts_by_node: BTreeMap::new(),
+    })
+    .expect("encode source-status payload");
+    let mut zero_pending_group = sink_group_status("nfs1", false);
+    zero_pending_group.primary_object_ref = "node-a::nfs1".to_string();
+    zero_pending_group.total_nodes = 0;
+    zero_pending_group.live_nodes = 0;
+    zero_pending_group.shadow_time_us = 0;
+    let generic_sink_status_payload = rmp_serde::to_vec_named(&SinkStatusSnapshot {
+        primary_host_ref_by_group: BTreeMap::from([("nfs1".to_string(), "node-a".to_string())]),
+        groups: vec![zero_pending_group],
+        ..SinkStatusSnapshot::default()
+    })
+    .expect("encode generic sink-status payload");
+    let owner_empty_payload = rmp_serde::to_vec_named(&SinkStatusSnapshot::default())
+        .expect("encode empty owner sink-status payload");
+    let owner_ready_payload = rmp_serde::to_vec_named(&SinkStatusSnapshot {
+        scheduled_groups_by_node: BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        primary_host_ref_by_group: BTreeMap::from([("nfs1".to_string(), "node-a".to_string())]),
+        groups: vec![sink_group_status("nfs1", true)],
+        ..SinkStatusSnapshot::default()
+    })
+    .expect("encode owner ready sink-status payload");
+
+    let mut source_status_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        source_status_route.clone(),
+        "test-late-owner-source-status",
+        CancellationToken::new(),
+        move |requests| {
+            let source_status_payload = source_status_payload.clone();
+            async move {
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        mk_event_with_correlation(
+                            "source-status",
+                            req.metadata()
+                                .correlation_id
+                                .expect("source-status request correlation"),
+                            source_status_payload.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        },
+    );
+    let mut generic_sink_status_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        generic_sink_status_route.clone(),
+        "test-late-owner-generic-sink-status",
+        CancellationToken::new(),
+        move |requests| {
+            let generic_sink_status_payload = generic_sink_status_payload.clone();
+            async move {
+                requests
+                    .into_iter()
+                    .map(|req| {
+                        mk_event_with_correlation(
+                            "generic-sink-status",
+                            req.metadata()
+                                .correlation_id
+                                .expect("generic sink-status request correlation"),
+                            generic_sink_status_payload.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        },
+    );
+    let owner_boundary = boundary.clone();
+    let owner_request_channel = node_a_sink_status_route.0.clone();
+    let owner_reply_channel = node_a_reply_channel.clone();
+    let owner_reply_task = tokio::spawn(async move {
+        let correlation = owner_boundary
+            .wait_for_request_correlation(&owner_request_channel)
+            .await;
+        owner_boundary
+            .enqueue_events(
+                owner_reply_channel.clone(),
+                vec![mk_event_with_correlation(
+                    "node-a-facade",
+                    correlation,
+                    owner_empty_payload,
+                )],
+            )
+            .await;
+        tokio::time::sleep(LOAD_MATERIALIZED_SINK_STATUS_ROUTE_IDLE_GRACE * 2).await;
+        owner_boundary
+            .enqueue_events(
+                owner_reply_channel,
+                vec![mk_event_with_correlation(
+                    "node-a",
+                    correlation,
+                    owner_ready_payload,
+                )],
+            )
+            .await;
+    });
+
+    let state = ApiState {
+        backend: QueryBackend::Route {
+            sink: sink.clone(),
+            boundary: boundary.clone(),
+            origin_id: NodeId("api-node".to_string()),
+            source: source.clone(),
+        },
+        policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+        pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
+        force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        force_find_runner_evidence: crate::api::state::ForceFindRunnerEvidence::default(),
+        force_find_route_rr: Arc::new(Mutex::new(BTreeMap::new())),
+        readiness_source: Some(source),
+        readiness_sink: Some(sink),
+        materialized_source_status_cache: Arc::new(Mutex::new(None)),
+        materialized_sink_status_cache: Arc::new(Mutex::new(None)),
+        materialized_stats_cache: Arc::new(Mutex::new(None)),
+        materialized_tree_cache: Arc::new(Mutex::new(None)),
+        tree_query_serial: Arc::new(tokio::sync::Mutex::new(())),
+    };
+
+    let (_source_status, sink_status) = load_materialized_status_snapshots(&state)
+        .await
+        .expect("load materialized status snapshots");
+    owner_reply_task.await.expect("owner reply task");
+    let readiness_groups = BTreeSet::from(["nfs1".to_string()]);
+
+    assert!(
+        sink_status_covers_ready_readiness_groups(&sink_status, &readiness_groups),
+        "trusted-materialized readiness owner fan-in must not settle on an early same-route empty facade reply when a late worker owner reply follows; sink_status={}",
+        summarize_sink_status_route_snapshot(&sink_status)
+    );
+    assert_eq!(
+        boundary.send_batch_count(&node_a_sink_status_route.0),
+        1,
+        "explicit sink primary_host_ref owner route should be queried once"
+    );
+    assert_eq!(
+        boundary.recv_batch_count(&node_a_reply_channel),
+        2,
+        "owner-scoped sink-status collect should keep the correlation open for the late worker owner reply"
+    );
+
+    source_status_endpoint
+        .shutdown(Duration::from_secs(2))
+        .await;
+    generic_sink_status_endpoint
         .shutdown(Duration::from_secs(2))
         .await;
 }
@@ -9902,6 +10409,158 @@ async fn selected_group_materialized_route_reroutes_to_sink_primary_object_ref_w
         .shutdown(Duration::from_secs(2))
         .await;
     proxy_endpoint.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_untrusted_owner_collection_gap_fans_out_to_sink_primary_before_source_candidate_timeout()
+ {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let node_b_root = tmp.path().join("node-b");
+    fs::create_dir_all(node_b_root.join("layout-b")).expect("create node-b dir");
+    let grants = vec![GrantedMountRoot {
+        object_ref: "node-b::nfs4".to_string(),
+        host_ref: "node-b".to_string(),
+        host_ip: "10.0.0.2".to_string(),
+        host_name: None,
+        site: None,
+        zone: None,
+        host_labels: std::collections::BTreeMap::new(),
+        mount_point: node_b_root.clone(),
+        fs_source: "nfs".to_string(),
+        fs_type: "nfs".to_string(),
+        mount_options: Vec::new(),
+        interfaces: Vec::new(),
+        active: true,
+    }];
+    let source = source_facade_with_group("nfs4", &grants);
+    let sink = sink_facade_with_group(&grants);
+    let boundary = Arc::new(ReusableObservedRouteBoundary::default());
+    let node_a_route = sink_query_request_route_for("node-a");
+    let node_b_route = sink_query_request_route_for("node-b");
+    let proxy_route = default_route_bindings()
+        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY)
+        .expect("resolve sink-query-proxy route");
+
+    let mut primary_owner_endpoint = ManagedEndpointTask::spawn(
+        boundary.clone(),
+        node_a_route.clone(),
+        "test-sink-primary-collection-gap-sink-query-endpoint",
+        CancellationToken::new(),
+        move |requests| async move {
+            let mut responses = Vec::new();
+            for req in requests {
+                let params = rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                    .expect("decode node-a query request");
+                let group_id = params
+                    .scope
+                    .selected_group
+                    .clone()
+                    .expect("selected group for node-a request");
+                responses.push(mk_event_with_correlation(
+                    &group_id,
+                    req.metadata()
+                        .correlation_id
+                        .expect("node-a request correlation"),
+                    real_materialized_tree_payload_for_test(&params.scope.path),
+                ));
+            }
+            responses
+        },
+    );
+
+    let state = test_api_state_for_route_source(
+        source,
+        sink,
+        boundary.clone(),
+        NodeId("node-d".to_string()),
+    );
+    let selected_group_sink_status = SinkStatusSnapshot {
+        primary_host_ref_by_group: BTreeMap::from([("nfs4".to_string(), "node-a".to_string())]),
+        groups: vec![crate::sink::SinkGroupStatusSnapshot {
+            group_id: "nfs4".to_string(),
+            primary_object_ref: "node-a::nfs4".to_string(),
+            total_nodes: 0,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: crate::sink::GroupReadinessState::PendingMaterialization,
+            materialized_revision: 0,
+            estimated_heap_bytes: 0,
+        }],
+        ..SinkStatusSnapshot::default()
+    };
+    let group_plan = TreePitSessionPlan::new(Duration::from_millis(700), 1)
+        .selected_group_stage_plan(TreePitGroupPlanInput {
+            read_class: ReadClass::Materialized,
+            observation_state: ObservationState::MaterializedUntrusted,
+            selected_group_sink_reports_live_materialized: false,
+            prior_materialized_group_decoded: false,
+            prior_materialized_exact_file_decoded: false,
+            rank_index: 0,
+            is_last_ranked_group: true,
+            selected_group_sink_unready_empty: true,
+            empty_root_requires_fail_closed: false,
+        });
+
+    let result =
+        query_materialized_events_with_selected_group_owner_snapshot_and_request_scoped_omissions(
+            &state,
+            &ProjectionPolicy::default(),
+            build_materialized_tree_request(
+                b"/",
+                true,
+                None,
+                ReadClass::Materialized,
+                Some("nfs4".to_string()),
+            ),
+            Duration::from_millis(700),
+            None,
+            Some(selected_group_sink_status),
+            None,
+            group_plan,
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "materialized-untrusted owner-collection gap must fan out to explicit sink primary evidence before a stale source candidate can consume the stage budget; node_a_calls={} node_b_calls={} proxy_calls={} err={:?}",
+        boundary.send_batch_count(&node_a_route.0),
+        boundary.send_batch_count(&node_b_route.0),
+        boundary.send_batch_count(&proxy_route.0),
+        result.as_ref().err(),
+    );
+    let payload = decode_materialized_selected_group_response(
+        &result.expect("selected-group collection-gap primary result"),
+        &ProjectionPolicy::default(),
+        "nfs4",
+        b"/",
+    )
+    .expect("decode selected-group primary response");
+    assert!(payload.root.exists);
+    assert_eq!(
+        boundary.send_batch_count(&node_a_route.0),
+        1,
+        "sink primary route should be attempted inside the collection-gap candidate fanout"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&node_b_route.0),
+        1,
+        "configured source candidate should still be attempted"
+    );
+    assert_eq!(
+        boundary.send_batch_count(&proxy_route.0),
+        0,
+        "generic proxy should not be needed when sink primary data is available"
+    );
+
+    primary_owner_endpoint
+        .shutdown(Duration::from_secs(2))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

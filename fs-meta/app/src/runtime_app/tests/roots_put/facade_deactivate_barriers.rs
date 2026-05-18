@@ -1,6 +1,7 @@
     #[tokio::test]
     async fn facade_deactivate_waits_for_inflight_roots_put_after_sink_update_begins() {
         let _serial = facade_deactivate_barrier_test_serial().lock().await;
+        let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
 
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();

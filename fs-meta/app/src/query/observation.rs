@@ -50,12 +50,31 @@ fn source_concrete_root_blocks_materialized_observation(
 fn source_groups_with_current_owner_evidence(
     source_status: &SourceStatusSnapshot,
 ) -> BTreeSet<String> {
-    source_status
+    let concrete_candidate_groups = source_status
+        .concrete_roots
+        .iter()
+        .filter(|root| concrete_root_counts_as_materialized_candidate(root))
+        .map(|root| root.logical_root_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut groups = source_status
         .concrete_roots
         .iter()
         .filter(|root| source_concrete_root_has_current_owner_evidence(root))
         .map(|root| root.logical_root_id.clone())
-        .collect()
+        .collect::<BTreeSet<_>>();
+    groups.extend(
+        source_status
+            .logical_roots
+            .iter()
+            .filter(|root| {
+                !concrete_candidate_groups.contains(&root.root_id)
+                    && root.status == "ready"
+                    && root.matched_grants > 0
+                    && root.active_members > 0
+            })
+            .map(|root| root.root_id.clone()),
+    );
+    groups
 }
 
 fn group_has_local_sink_presence(

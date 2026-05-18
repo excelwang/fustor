@@ -260,6 +260,39 @@ fn sink_status_snapshot_concern_projection_reports_coverage_gap_from_stream_evid
     );
 }
 
+#[test]
+fn sink_status_ready_empty_root_with_valid_primary_counts_as_service_live_ready() {
+    let snapshot = SinkStatusSnapshot {
+        groups: vec![SinkGroupStatusSnapshot {
+            group_id: "nfs1".to_string(),
+            primary_object_ref: "node-a::nfs1".to_string(),
+            total_nodes: 1,
+            live_nodes: 0,
+            tombstoned_count: 0,
+            attested_count: 0,
+            suspect_count: 0,
+            blind_spot_count: 0,
+            shadow_time_us: 0,
+            shadow_lag_us: 0,
+            overflow_pending_materialization: false,
+            readiness: GroupReadinessState::Ready,
+            materialized_revision: 2,
+            estimated_heap_bytes: 0,
+        }],
+        scheduled_groups_by_node: std::collections::BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string()],
+        )]),
+        ..SinkStatusSnapshot::default()
+    };
+
+    assert_eq!(
+        snapshot.progress_snapshot().ready_groups,
+        std::collections::BTreeSet::from(["nfs1".to_string()]),
+        "an empty materialized root with a concrete primary object can serve materialized reads even when it has no live leaf nodes"
+    );
+}
+
 fn mk_control_event(origin: &str, control: ControlEvent, ts: u64) -> Event {
     let payload = rmp_serde::to_vec_named(&control).expect("encode control event");
     Event::new(

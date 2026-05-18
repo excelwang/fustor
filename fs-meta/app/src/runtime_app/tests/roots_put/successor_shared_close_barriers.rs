@@ -1,5 +1,6 @@
     #[tokio::test]
     async fn closing_successor_app_waits_for_inflight_roots_put_before_shared_source_close() {
+        let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -152,6 +153,7 @@
         crate::api::install_roots_put_pause_hook(crate::api::RootsPutPauseHook {
             entered: entered.clone(),
             release: release.clone(),
+            selector_token: Some(fs_source.clone()),
         });
 
         let close_started = Arc::new(Notify::new());
@@ -220,6 +222,7 @@
 
     #[tokio::test]
     async fn closing_successor_app_waits_for_inflight_roots_put_before_shared_sink_close() {
+        let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
         let tmp = tempdir().expect("create temp dir");
         let bind_addr = reserve_bind_addr();
         let (passwd_path, shadow_path) = write_auth_files(&tmp);

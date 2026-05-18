@@ -15,7 +15,7 @@ pub(crate) use handlers::{
     clear_rescan_pause_hook, clear_roots_put_before_response_hook, clear_roots_put_pause_hook,
     clear_status_pause_hook, clear_status_route_trace_capture, install_rescan_pause_hook,
     install_roots_put_before_response_hook, install_roots_put_pause_hook,
-    install_status_pause_hook, install_status_route_trace_capture,
+    install_status_pause_hook, install_status_route_trace_capture, roots_put_hook_test_guard,
 };
 pub use server::ApiServerHandle;
 #[cfg(test)]

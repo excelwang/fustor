@@ -1,5 +1,6 @@
 #[tokio::test]
 async fn roots_put_contraction_returns_single_root_count_after_external_worker_update() {
+    let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
     let tmp = tempdir().expect("create temp dir");
     let bind_addr = reserve_bind_addr();
     let nfs1 = tmp.path().join("nfs1");
@@ -178,7 +179,8 @@ async fn roots_put_contraction_returns_single_root_count_after_external_worker_u
 
 #[tokio::test]
 async fn roots_put_contraction_with_fs_source_selectors_returns_single_root_count_after_external_worker_update()
- {
+{
+    let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
     let tmp = tempdir().expect("create temp dir");
     let bind_addr = reserve_bind_addr();
     let nfs1 = tmp.path().join("nfs1");

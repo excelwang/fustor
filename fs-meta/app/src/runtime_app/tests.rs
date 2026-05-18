@@ -9582,11 +9582,11 @@ async fn external_worker_status_uses_cached_observation_reason_before_blocking_s
         "active external-worker fixture must keep observation untrusted"
     );
 
-    let primed_cached_sink = app
+    let (primed_cached_sink, _) = app
         .sink
-        .status_snapshot_nonblocking()
+        .status_snapshot_nonblocking_for_status_route()
         .await
-        .expect("prime cached local sink status");
+        .expect("prime cached local sink status through /status route path");
 
     app.on_control_frame(&[
         activate_envelope_with_route_key_and_scope_rows(
@@ -9741,10 +9741,16 @@ async fn external_worker_status_uses_cached_observation_reason_before_blocking_s
     );
     let gate_event = gate_event.expect("gate event already asserted");
     assert!(
-        !trace_events
+        trace_events
+            .iter()
+            .any(|event| event.contains("status.local.cached_sink_not_ready")),
+        "status should retain the cached local observation reason while attempting bounded remote fan-in; gate_event={gate_event}; trace_events={trace_events:?}; body={body}"
+    );
+    assert!(
+        trace_events
             .iter()
             .any(|event| event.contains("status.remote.begin")),
-        "status should fail closed before remote collection; gate_event={gate_event}; trace_events={trace_events:?}; body={body}"
+        "status should attempt bounded remote fan-in before fail-closing cached local sink fallback; gate_event={gate_event}; trace_events={trace_events:?}; body={body}"
     );
     assert!(
         body.contains(&expected_reason),
@@ -23889,12 +23895,18 @@ async fn manual_rescan_source_status_rearms_worker_scoped_rescan_endpoint_after_
         errs: VecDeque::from([CnxError::Timeout]),
     });
     let _observability_hook_reset = SourceWorkerObservabilityErrorHookReset;
-    crate::workers::source::install_source_worker_observability_error_hook(
+    let source_worker_instance_id = match &*app.source {
+        SourceFacade::Worker(client) => client.worker_instance_id_for_tests().await,
+        SourceFacade::Local(_) => panic!("expected external source worker client"),
+    };
+    crate::workers::source::install_source_worker_observability_error_hook_for_worker_instance(
+        source_worker_instance_id,
         crate::workers::source::SourceWorkerObservabilityErrorHook {
             err: CnxError::Timeout,
         },
     );
-    crate::workers::source::install_source_worker_observability_delay_hook(
+    crate::workers::source::install_source_worker_observability_delay_hook_for_worker_instance(
+        source_worker_instance_id,
         crate::workers::source::SourceWorkerObservabilityDelayHook {
             delay: Duration::from_secs(10),
         },
@@ -24632,7 +24644,12 @@ async fn worker_manual_rescan_status_exposes_route_proof_without_worker_delivery
             count: observability_count.clone(),
         },
     );
-    crate::workers::source::install_source_worker_observability_delay_hook(
+    let source_worker_instance_id = match &*app.source {
+        SourceFacade::Worker(client) => client.worker_instance_id_for_tests().await,
+        SourceFacade::Local(_) => panic!("expected external source worker client"),
+    };
+    crate::workers::source::install_source_worker_observability_delay_hook_for_worker_instance(
+        source_worker_instance_id,
         crate::workers::source::SourceWorkerObservabilityDelayHook {
             delay: Duration::from_secs(10),
         },
@@ -35409,6 +35426,51 @@ async fn management_recovery_retained_sink_replay_retryable_reset_does_not_reini
     );
 }
 
+#[test]
+fn management_recovery_app_retained_sink_replay_uses_retained_sink_facade_policy() {
+    let source = include_str!("../runtime_app.rs");
+    let start = source
+        .find("async fn replay_app_retained_sink_state_if_present(")
+        .expect("app retained sink replay helper should exist");
+    let end = start
+        + source[start..]
+            .find("async fn retained_sink_replay_signals_for_local_republish(")
+            .expect("local republish helper should follow app retained replay helper");
+    let helper = &source[start..end];
+
+    assert!(
+        helper.contains(".apply_retained_orchestration_signals_with_total_timeout_with_failure("),
+        "management recovery must replay app-retained sink state through the retained worker policy, not the ordinary fresh-bootstrap timeout path"
+    );
+    assert!(
+        !helper.contains(".apply_orchestration_signals_with_total_timeout_with_failure("),
+        "management recovery app-retained sink replay must not call the ordinary sink apply path"
+    );
+}
+
+#[test]
+fn local_sink_republish_recovery_uses_node_local_source_scope_convergence() {
+    let source = include_str!("../runtime_app.rs");
+    let start = source
+        .find("async fn run_local_republish(")
+        .expect("local sink-status republish runtime should exist");
+    let end = start
+        + source[start..]
+            .find("fn sink_recovery_test_expected_groups(")
+            .expect("sink recovery test helpers should follow local republish runtime");
+    let helper = &source[start..end];
+
+    assert!(
+        helper
+            .contains("scope_observation.matches_node_local_source_scope(&expected_scope_groups)"),
+        "local sink-status republish recovery must accept node-local source/scan subsets for distributed real-NFS groups"
+    );
+    assert!(
+        !helper.contains("scope_observation.matches_expectation("),
+        "local sink-status republish recovery must not require every source owner to schedule every sink group"
+    );
+}
+
 #[tokio::test]
 async fn cold_successor_source_candidate_retryable_reset_fail_closes_without_inline_replay_loop() {
     let tmp = tempdir().expect("create temp dir");
@@ -35782,7 +35844,8 @@ async fn source_repair_recovery_replays_worker_retained_source_state() {
     );
 
     let _observability_hook_reset = SourceWorkerObservabilityErrorHookReset;
-    crate::workers::source::install_source_worker_observability_error_hook(
+    crate::workers::source::install_source_worker_observability_error_hook_for_worker_instance(
+        source_client.worker_instance_id_for_tests().await,
         crate::workers::source::SourceWorkerObservabilityErrorHook {
             err: CnxError::Timeout,
         },
@@ -36213,6 +36276,8 @@ async fn management_write_recovery_clears_sink_replay_without_blocking_status_wh
     set_control_initialized_for_tests(&app, false);
     set_source_replay_required_for_tests(&app, false);
     set_sink_replay_required_for_tests(&app, true);
+    app.control_failure_uninitialized
+        .store(true, AtomicOrdering::Release);
     app.api_control_gate.set_ready_state(false, false);
     assert!(
         !app.sink.retained_replay_required(),
@@ -36267,6 +36332,23 @@ async fn management_write_recovery_replays_app_retained_sink_state_before_cleari
         NodeId("single-app-node".into()),
     )
     .expect("init app");
+
+    let source_signals = crate::runtime::orchestration::source_control_signals_from_envelopes(
+        &selected_group_source_control_wave(1, &[("test-root", &["single-app-node::root-1"])]),
+    )
+    .expect("source activate signals");
+    let fixed_bind_session = app.begin_fixed_bind_lifecycle_session().await;
+    app.apply_source_signals_with_recovery(
+        &fixed_bind_session,
+        &source_signals,
+        true,
+        SourceGenerationCutoverDisposition::None,
+    )
+    .await
+    .expect("seed source runtime scope before sink replay repair");
+    app.start()
+        .await
+        .expect("start source pump before sink replay repair readiness wait");
 
     let retained_sink_signals =
         crate::runtime::orchestration::sink_control_signals_from_envelopes(&[

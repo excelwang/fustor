@@ -47,6 +47,7 @@ enum SinkWorkerAction {
     },
     OnControlFrame {
         sink: Arc<SinkFileMeta>,
+        node_id: Option<NodeId>,
         envelopes: Vec<ControlEnvelope>,
     },
 }
@@ -696,7 +697,11 @@ fn plan_worker_request(
                         node_id, summary
                     );
                 }
-                SinkWorkerAction::OnControlFrame { sink, envelopes }
+                SinkWorkerAction::OnControlFrame {
+                    sink,
+                    node_id: state.node_id.clone(),
+                    envelopes,
+                }
             }
             None => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::Error("worker not initialized".into()),
@@ -706,7 +711,10 @@ fn plan_worker_request(
     }
 }
 
-async fn execute_worker_action(action: SinkWorkerAction) -> (SinkWorkerResponse, bool) {
+async fn execute_worker_action_with_runtime_boundary(
+    action: SinkWorkerAction,
+    runtime_io_boundary: Option<Arc<dyn ChannelIoSubset>>,
+) -> (SinkWorkerResponse, bool) {
     match action {
         SinkWorkerAction::Immediate(response, stop) => (response, stop),
         SinkWorkerAction::Send {
@@ -750,7 +758,20 @@ async fn execute_worker_action(action: SinkWorkerAction) -> (SinkWorkerResponse,
             Ok(events) => (SinkWorkerResponse::Events(events), false),
             Err(err) => (classify_sink_worker_failure(err), false),
         },
-        SinkWorkerAction::OnControlFrame { sink, envelopes } => {
+        SinkWorkerAction::OnControlFrame {
+            sink,
+            node_id,
+            envelopes,
+        } => {
+            if let (Some(boundary), Some(node_id)) =
+                (runtime_io_boundary.as_ref(), node_id.as_ref())
+            {
+                if let Err(err) =
+                    sink.start_runtime_endpoints_with_failure(boundary.clone(), node_id.clone())
+                {
+                    return (classify_sink_worker_failure(err), false);
+                }
+            }
             let traced_routes = if debug_sink_query_route_trace_enabled() {
                 sink_control_signals_from_envelopes(&envelopes)
                     .ok()
@@ -803,6 +824,11 @@ async fn execute_worker_action(action: SinkWorkerAction) -> (SinkWorkerResponse,
     }
 }
 
+#[cfg(test)]
+async fn execute_worker_action(action: SinkWorkerAction) -> (SinkWorkerResponse, bool) {
+    execute_worker_action_with_runtime_boundary(action, None).await
+}
+
 pub fn run_sink_worker_server(
     control_socket_path: &Path,
     data_socket_path: &Path,
@@ -838,7 +864,8 @@ impl TypedWorkerSession<SinkWorkerRpc> for SinkWorkerSession {
             let mut guard = self.state.lock().await;
             plan_worker_request(request, &mut guard)
         };
-        let (response, stop) = execute_worker_action(action).await;
+        let (response, stop) =
+            execute_worker_action_with_runtime_boundary(action, Some(_context.io_boundary())).await;
         Ok(if stop {
             WorkerLoopControl::Stop(response)
         } else {
@@ -851,15 +878,19 @@ impl TypedWorkerSession<SinkWorkerRpc> for SinkWorkerSession {
         envelopes: &[ControlEnvelope],
         _context: &WorkerSessionContext,
     ) -> capanix_app_sdk::Result<()> {
-        let sink = {
+        let (sink, node_id) = {
             let guard = self.state.lock().await;
-            guard.sink.clone()
+            (guard.sink.clone(), guard.node_id.clone())
         };
         let Some(sink) = sink else {
             return Err(CnxError::NotReady(
                 "worker runtime not initialized for runtime control frames".into(),
             ));
         };
+        if let Some(node_id) = node_id {
+            sink.start_runtime_endpoints_with_failure(_context.io_boundary(), node_id)
+                .map_err(SinkFailure::into_error)?;
+        }
         sink.on_control_frame_with_failure(envelopes)
             .await
             .map_err(SinkFailure::into_error)
@@ -1222,6 +1253,117 @@ mod tests {
         assert!(
             traced_after.contains("finished=false"),
             "bootstrap start should restore a live stream endpoint after pruning terminal predecessor endpoint tasks: {traced_after}"
+        );
+
+        bootstrap_stop_sink_runtime(&mut state).await;
+    }
+
+    #[tokio::test]
+    async fn on_control_frame_must_repair_terminal_stream_endpoint_before_ack() {
+        let node_id = NodeId("node-a".to_string());
+        let mut source_cfg = SourceConfig::default();
+        source_cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+        source_cfg.host_object_grants = vec![granted_mount_root(
+            "node-a::exp",
+            "node-a",
+            "10.0.0.11",
+            "/mnt/nfs1",
+            true,
+        )];
+        let sink = Arc::new(
+            SinkFileMeta::with_boundaries(node_id.clone(), None, source_cfg)
+                .expect("build sink runtime"),
+        );
+        let stream_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM)
+            .expect("resolve stream route")
+            .0;
+
+        sink.start_stream_endpoint(Arc::new(FailingBoundary), node_id.clone())
+            .expect("seed terminal stream endpoint");
+        sink.on_control_frame(&[encode_runtime_exec_control(&RuntimeExecControl::Activate(
+            RuntimeExecActivate {
+                route_key: stream_route.clone(),
+                unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![RuntimeBoundScope {
+                    scope_id: "nfs1".to_string(),
+                    resource_ids: Vec::new(),
+                }],
+            },
+        ))
+        .expect("encode sink events activate")])
+            .await
+            .expect("activate sink events route before terminal seeding");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let traced = sink
+                .debug_traced_route_state(&stream_route)
+                .expect("trace route state");
+            if traced.contains("finished=true") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failed to seed a terminal stream endpoint before control-frame repair check"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut state = SinkWorkerState {
+            sink: Some(sink.clone()),
+            node_id: Some(node_id),
+            pending_init: None,
+            endpoints_started: true,
+            send_tx: None,
+            last_control_frame_signals: Vec::new(),
+            received_stats: Arc::new(StdMutex::new(ReceivedBatchStats::default())),
+        };
+        let action = plan_worker_request(
+            SinkWorkerRequest::OnControlFrame {
+                envelopes: vec![
+                    encode_runtime_exec_control(&RuntimeExecControl::Activate(
+                        RuntimeExecActivate {
+                            route_key: stream_route.clone(),
+                            unit_id: crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID
+                                .to_string(),
+                            lease: None,
+                            generation: 3,
+                            expires_at_ms: 1,
+                            bound_scopes: vec![RuntimeBoundScope {
+                                scope_id: "nfs1".to_string(),
+                                resource_ids: Vec::new(),
+                            }],
+                        },
+                    ))
+                    .expect("encode sink events repair activate"),
+                ],
+            },
+            &mut state,
+        );
+
+        let (response, stop) =
+            execute_worker_action_with_runtime_boundary(action, Some(Arc::new(TimeoutBoundary)))
+                .await;
+        assert!(!stop, "worker on_control_frame should not stop the session");
+        assert!(
+            matches!(response, SinkWorkerResponse::Ack),
+            "worker on_control_frame should succeed after endpoint continuity repair: {response:?}"
+        );
+
+        let traced_after = sink
+            .debug_traced_route_state(&stream_route)
+            .expect("trace route state after control-frame repair");
+        assert!(
+            !traced_after.contains("finished=true"),
+            "control-frame handling must prune and repair terminal stream endpoint before ack: {traced_after}"
+        );
+        assert!(
+            traced_after.contains("finished=false"),
+            "control-frame repair should leave a live stream endpoint: {traced_after}"
         );
 
         bootstrap_stop_sink_runtime(&mut state).await;

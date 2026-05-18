@@ -172,6 +172,8 @@ async fn close_clears_process_wide_fixed_bind_owner_and_pending_handoff_state() 
 #[tokio::test]
 async fn pending_facade_exposure_confirmed_waits_for_inflight_roots_put_after_sink_update_begins()
  {
+    let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
+
     let tmp = tempdir().expect("create temp dir");
     let bind_addr = reserve_bind_addr();
     let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -382,6 +384,8 @@ async fn pending_facade_exposure_confirmed_waits_for_inflight_roots_put_after_si
 
 #[tokio::test]
 async fn roots_put_reaches_handler_while_control_route_replacement_awaits_runtime_exposure() {
+    let _roots_put_hook_serial = crate::api::roots_put_hook_test_guard().await;
+
     let tmp = tempdir().expect("create temp dir");
     let bind_addr = reserve_bind_addr();
     let (passwd_path, shadow_path) = write_auth_files(&tmp);
@@ -478,6 +482,7 @@ async fn roots_put_reaches_handler_while_control_route_replacement_awaits_runtim
     crate::api::install_roots_put_pause_hook(crate::api::RootsPutPauseHook {
         entered: entered.clone(),
         release: release.clone(),
+        selector_token: Some(fs_source.clone()),
     });
 
     let roots_body = json!({

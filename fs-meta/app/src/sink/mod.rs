@@ -606,7 +606,7 @@ impl SinkGroupStatusSnapshot {
     }
 
     pub(crate) fn has_live_materialized_owner(&self) -> bool {
-        self.live_nodes > 0
+        (self.live_nodes > 0 || self.total_nodes > 0)
             && !self.primary_object_ref.trim().is_empty()
             && self.primary_object_ref != "unassigned"
             && self.primary_object_ref != self.group_id
